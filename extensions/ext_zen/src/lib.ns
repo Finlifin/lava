@@ -1,0 +1,540 @@
+-- ext_zen: Distraction-Free Centered Focus & Code Dimming (`lava.org/ext_zen`).
+-- Inspired by `folke/zen-mode.nvim` and `folke/twilight.nvim`: snapshots and restores exact
+-- UI chrome & sidebar visibility on `:ZenMode [width]` (`<Space>z`), toggles `:Twilight`
+-- (`<Space>ut`), and combines Visual/block buffer narrowing with Zen focus via `:ZenNarrow` (`<Space>zn`).
+
+use @lava_core.{
+    ExtId, InteractiveEffects, KeyBindingEntry, KeyStroke, Keymap, ServiceEffects, SystemKernel,
+    status_emit
+}
+use @ext_document.{
+    Buffer, BufferId, EditorWorld, NarrowRegion, Pos, VisualKind, ext_document_id,
+    require_editor_world
+}
+use @ext_window.{SERVICE_WINDOW_MANAGER, WindowManager, ext_window_id}
+use @ext_vim.{
+    KEYMAP_VIM_LEADER, KEYMAP_VIM_VISUAL, ModalInterceptor, VimMode, VimState, ext_vim_id,
+    require_vim_state, sync_world_from_vim
+}
+
+pub const SERVICE_ZEN: String = "lava.zen.focus"
+pub const OWNER_ZEN: String = "ext_zen"
+
+pub struct ZenChromeSnapshot {
+    pub valid: bool,
+    pub number: bool,
+    pub relativenumber: bool,
+    pub signcolumn: bool,
+    pub indent_guides: bool,
+    pub left_sidebar_visible: bool,
+    pub right_sidebar_visible: bool,
+    pub statusline_left_extra: String,
+    pub statusline_right_extra: String,
+}
+
+impl ZenChromeSnapshot {
+    pub fn empty() -> ZenChromeSnapshot {
+        ZenChromeSnapshot {
+            valid: false,
+            number: true,
+            relativenumber: true,
+            signcolumn: true,
+            indent_guides: true,
+            left_sidebar_visible: false,
+            right_sidebar_visible: false,
+            statusline_left_extra: "",
+            statusline_right_extra: "",
+        }
+    }
+
+    pub fn capture(world: EditorWorld) -> ZenChromeSnapshot {
+        ZenChromeSnapshot {
+            valid: true,
+            number: world.options.number,
+            relativenumber: world.options.relativenumber,
+            signcolumn: world.options.signcolumn,
+            indent_guides: world.options.indent_guides,
+            left_sidebar_visible: world.left_sidebar.visible,
+            right_sidebar_visible: world.right_sidebar.visible,
+            statusline_left_extra: world.statusline_left_extra,
+            statusline_right_extra: world.statusline_right_extra,
+        }
+    }
+}
+
+pub struct ZenService {
+    pub snapshot: ZenChromeSnapshot,
+    pub narrowed_by_zen: bool,
+    pub narrowed_buf_id: ?BufferId,
+    pub prev_narrow: ?NarrowRegion,
+    pub leader_z_action: String,
+}
+
+impl ZenService {
+    pub fn new() -> ZenService {
+        ZenService {
+            snapshot: ZenChromeSnapshot.empty(),
+            narrowed_by_zen: false,
+            narrowed_buf_id: null,
+            prev_narrow: null,
+            leader_z_action: "",
+        }
+    }
+}
+
+pub fn require_zen_service(kernel: SystemKernel) -> !String ZenService {
+    let raw = kernel.require_service(SERVICE_ZEN)!
+    raw.as(ZenService)
+}
+
+fn sync_window_layout(kernel: SystemKernel, world: EditorWorld) {
+    let wm_opt = kernel.service(SERVICE_WINDOW_MANAGER)
+    if wm_opt != null {
+        let wm = wm_opt.as(WindowManager)
+        wm.sync_from_world(world)
+    }
+}
+
+fn clear_zen_interceptor_if_owned(vim: VimState) {
+    if vim.modal_interceptor != null {
+        if vim.modal_interceptor.as(ModalInterceptor).owner == OWNER_ZEN {
+            vim.clear_interceptor()
+        }
+    }
+}
+
+fn parse_optional_zen_width(args: List) -> i64 {
+    if args.is_empty() {
+        return 0
+    }
+    let raw = args.get(0).as(String).trim()
+    if raw == "" {
+        return 0
+    }
+    let parsed_opt = raw.parse_i64()
+    if parsed_opt == null {
+        return 0
+    }
+    let w = parsed_opt.as(i64)
+    if w >= 40 { w } else { 0 }
+}
+
+fn enter_zen_mode_core(kernel: SystemKernel, world: EditorWorld, svc: ZenService, width_arg: i64) {
+    if (not world.options.zen_mode) or (not svc.snapshot.valid) {
+        svc.snapshot = ZenChromeSnapshot.capture(world)
+    }
+    if width_arg >= 40 {
+        world.options.zen_width = width_arg
+    }
+    world.options.zen_mode = true
+    world.left_sidebar.visible = false
+    world.right_sidebar.visible = false
+    world.options.number = false
+    world.options.relativenumber = false
+    world.options.signcolumn = false
+    world.options.indent_guides = false
+    world.statusline_left_extra = ""
+    world.statusline_right_extra = ""
+    sync_window_layout(kernel, world)
+}
+
+fn restore_zen_narrow(world: EditorWorld, svc: ZenService) {
+    if not svc.narrowed_by_zen {
+        return
+    }
+    if svc.narrowed_buf_id != null {
+        let bid? = svc.narrowed_buf_id else {
+            return
+        }
+        let b_opt = world.buffer(bid)
+        if b_opt != null {
+            let b = b_opt.as(Buffer)
+            b.narrow = svc.prev_narrow
+            b.point = b.clamp_pos(b.point, insert_mode = false)
+        }
+    }
+    svc.narrowed_by_zen = false
+    svc.narrowed_buf_id = null
+    svc.prev_narrow = null
+}
+
+fn exit_zen_mode_core(kernel: SystemKernel, world: EditorWorld, svc: ZenService) {
+    world.options.zen_mode = false
+    restore_zen_narrow(world, svc)
+    if svc.snapshot.valid {
+        let snap = svc.snapshot
+        world.options.number = snap.number
+        world.options.relativenumber = snap.relativenumber
+        world.options.signcolumn = snap.signcolumn
+        world.options.indent_guides = snap.indent_guides
+        world.left_sidebar.visible = snap.left_sidebar_visible
+        world.right_sidebar.visible = snap.right_sidebar_visible
+        world.statusline_left_extra = snap.statusline_left_extra
+        world.statusline_right_extra = snap.statusline_right_extra
+        svc.snapshot.valid = false
+    }
+    sync_window_layout(kernel, world)
+    -- Allow statusline extensions (e.g. `ext_lualine`) to refresh live counters if buffer changed during Zen.
+    kernel.emit_hook("mode-changed", world.mode_name)
+}
+
+fn is_top_level_block_header(line: String) -> bool {
+    if line == "" {
+        return false
+    }
+    let first = line.slice(0, 1)
+    if first == " " or first == "\t" or first == "}}" or first == ")" or first == "]" {
+        return false
+    }
+    let trimmed = line.trim()
+    trimmed.starts_with("fn ")
+        or trimmed.starts_with("pub fn ")
+        or trimmed.starts_with("private fn ")
+        or trimmed.starts_with("async fn ")
+        or trimmed.starts_with("impl ")
+        or trimmed.starts_with("pub struct ")
+        or trimmed.starts_with("struct ")
+        or trimmed.starts_with("pub enum ")
+        or trimmed.starts_with("enum ")
+        or trimmed.starts_with("def ")
+        or trimmed.starts_with("class ")
+        or trimmed.ends_with("{{")
+}
+
+fn find_focus_block_range(buf: Buffer, cursor_row: i64) -> (i64, i64) {
+    let total = buf.line_count()
+    if total <= 1 {
+        return (0, 0)
+    }
+    var seed = if cursor_row < 0 {
+        0
+    } else if cursor_row >= total {
+        total - 1
+    } else {
+        cursor_row
+    }
+    if buf.line_at(seed).trim() == "" {
+        var down = seed + 1
+        while down < total and buf.line_at(down).trim() == "" {
+            down += 1
+        }
+        if down < total {
+            seed = down
+        } else {
+            var up = seed - 1
+            while up >= 0 and buf.line_at(up).trim() == "" {
+                up -= 1
+            }
+            if up >= 0 {
+                seed = up
+            } else {
+                return (0, total - 1)
+            }
+        }
+    }
+
+    -- Check if `seed` sits inside a top-level brace-delimited definition (`fn ...`, `impl ...`, etc.).
+    var header_row: i64 = -1
+    var scan_up = seed
+    while scan_up >= 0 {
+        let ln = buf.line_at(scan_up)
+        let tr = ln.trim()
+        if scan_up < seed and (ln.starts_with("}}") or tr == "}}") {
+            break
+        }
+        if is_top_level_block_header(ln) {
+            header_row = scan_up
+            break
+        }
+        scan_up -= 1
+    }
+
+    if header_row >= 0 {
+        let hdr = buf.line_at(header_row).trim()
+        if hdr.contains("{{") {
+            var scan_dn = header_row
+            while scan_dn < total {
+                let ln = buf.line_at(scan_dn)
+                if scan_dn > header_row and ln.starts_with("}}") {
+                    return (header_row, scan_dn)
+                }
+                scan_dn += 1
+            }
+        }
+    }
+
+    -- Fallback: contiguous non-blank paragraph block around `seed`.
+    var start_r = seed
+    while start_r > 0 and buf.line_at(start_r - 1).trim() != "" {
+        start_r -= 1
+    }
+    var end_r = seed
+    while end_r + 1 < total and buf.line_at(end_r + 1).trim() != "" {
+        end_r += 1
+    }
+    (start_r, end_r)
+}
+
+fn apply_narrow_around_cursor_or_selection(kernel: SystemKernel, world: EditorWorld, vim: VimState, svc: ZenService) -> (i64, i64) {
+    let buf = world.active_buffer()
+    var r1: i64 = 0
+    var r2: i64 = 0
+
+    let in_vim_visual = vim.mode == VimMode.VisualChar
+        or vim.mode == VimMode.VisualLine
+        or vim.mode == VimMode.VisualBlock
+    if in_vim_visual {
+        r1 = vim.visual_anchor.row
+        r2 = buf.point.row
+        vim.mode = VimMode.Normal
+        vim.clear_transient()
+        sync_world_from_vim(world, vim)
+    } else if world.visual.kind != VisualKind.None {
+        r1 = world.visual.anchor.row
+        r2 = world.visual.cursor.row
+        vim.mode = VimMode.Normal
+        vim.clear_transient()
+        sync_world_from_vim(world, vim)
+    } else if buf.mark_active and buf.mark != null {
+        let m = buf.mark.as(Pos)
+        r1 = m.row
+        r2 = buf.point.row
+        buf.mark_active = false
+    } else {
+        let (b_start, b_end) = find_focus_block_range(buf, buf.point.row)
+        r1 = b_start
+        r2 = b_end
+    }
+
+    if not svc.narrowed_by_zen {
+        svc.prev_narrow = buf.narrow
+        svc.narrowed_buf_id = buf.id
+        svc.narrowed_by_zen = true
+    }
+    buf.narrow_to_region(r1, r2)
+    sync_window_layout(kernel, world)
+    (buf.min_row(), buf.max_row())
+}
+
+-- One-stroke lookahead armed only after interactive Normal-mode `<Space> z` so `<Space> z n`
+-- seamlessly upgrades/toggles `zen-narrow-focus` while standalone `<Space> z` works immediately.
+fn zen_leader_z_lookahead(kernel: SystemKernel, stroke: KeyStroke) -> #ServiceEffects !String bool {
+    let vim = require_vim_state(kernel)!
+    clear_zen_interceptor_if_owned(vim)
+    let svc = require_zen_service(kernel)!
+    let action = svc.leader_z_action
+    svc.leader_z_action = ""
+
+    let is_plain_n = (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod) and stroke.key == "n"
+    if not is_plain_n {
+        return false
+    }
+
+    let world = require_editor_world(kernel)!
+    if action == "entered_zen" {
+        let (lo, hi) = apply_narrow_around_cursor_or_selection(kernel, world, vim, svc)
+        status_emit("Zen Narrow enabled (L" ++ (lo + 1).to_string() ++ ".." ++ (hi + 1).to_string() ++ ")")#
+        return true
+    }
+    if action == "exited_zen_narrow" {
+        status_emit("Zen Narrow disabled")#
+        return true
+    }
+    if action == "exited_zen" {
+        enter_zen_mode_core(kernel, world, svc, 0)
+        let (lo, hi) = apply_narrow_around_cursor_or_selection(kernel, world, vim, svc)
+        status_emit("Zen Narrow enabled (L" ++ (lo + 1).to_string() ++ ".." ++ (hi + 1).to_string() ++ ")")#
+        return true
+    }
+    true
+}
+
+fn run_zen_mode_toggle(kernel: SystemKernel, args: List, allow_leader_lookahead: bool) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_zen_service(kernel)!
+    clear_zen_interceptor_if_owned(vim)
+
+    let width_arg = parse_optional_zen_width(args)
+    if world.options.zen_mode and width_arg == 0 {
+        let was_narrow = svc.narrowed_by_zen
+        exit_zen_mode_core(kernel, world, svc)
+        if allow_leader_lookahead and args.is_empty() and vim.mode == VimMode.Normal {
+            svc.leader_z_action = if was_narrow { "exited_zen_narrow" } else { "exited_zen" }
+            vim.set_interceptor(OWNER_ZEN, zen_leader_z_lookahead)
+        }
+        status_emit("Zen Mode disabled")#
+        return ()
+    }
+
+    enter_zen_mode_core(kernel, world, svc, width_arg)
+    let active_w = world.options.zen_width
+    let _ = world.push_notification("info", "Zen Mode", "Focus enabled (" ++ active_w.to_string() ++ " cols)", ttl_ticks = 4)
+    if allow_leader_lookahead and args.is_empty() and vim.mode == VimMode.Normal {
+        svc.leader_z_action = "entered_zen"
+        vim.set_interceptor(OWNER_ZEN, zen_leader_z_lookahead)
+    }
+    status_emit("Zen Mode enabled (" ++ active_w.to_string() ++ " cols)")#
+    ()
+}
+
+fn cmd_zen_mode_interactive(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    run_zen_mode_toggle(kernel, args, true)#
+}
+
+fn cmd_zen_mode_ex(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    run_zen_mode_toggle(kernel, args, false)#
+}
+
+fn cmd_twilight_toggle(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    clear_zen_interceptor_if_owned(vim)
+    world.options.twilight_mode = not world.options.twilight_mode
+    if world.options.twilight_mode {
+        status_emit("Twilight mode enabled")#
+    } else {
+        status_emit("Twilight mode disabled")#
+    }
+    ()
+}
+
+fn cmd_zen_narrow(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_zen_service(kernel)!
+    clear_zen_interceptor_if_owned(vim)
+
+    if world.options.zen_mode and svc.narrowed_by_zen {
+        exit_zen_mode_core(kernel, world, svc)
+        status_emit("Zen Narrow disabled")#
+        return ()
+    }
+
+    -- Capture Visual selection BEFORE entering Zen Mode in case mode sync touches transient state.
+    let in_vis = vim.mode == VimMode.VisualChar
+        or vim.mode == VimMode.VisualLine
+        or vim.mode == VimMode.VisualBlock
+        or world.visual.kind != VisualKind.None
+    let saved_anchor = if vim.mode == VimMode.VisualChar or vim.mode == VimMode.VisualLine or vim.mode == VimMode.VisualBlock {
+        vim.visual_anchor
+    } else {
+        world.visual.anchor
+    }
+    let saved_cursor = world.active_buffer().point
+
+    if not world.options.zen_mode {
+        enter_zen_mode_core(kernel, world, svc, 0)
+    }
+
+    let buf = world.active_buffer()
+    var lo: i64 = 0
+    var hi: i64 = 0
+    if in_vis {
+        vim.mode = VimMode.Normal
+        vim.clear_transient()
+        sync_world_from_vim(world, vim)
+        if not svc.narrowed_by_zen {
+            svc.prev_narrow = buf.narrow
+            svc.narrowed_buf_id = buf.id
+            svc.narrowed_by_zen = true
+        }
+        buf.narrow_to_region(saved_anchor.row, saved_cursor.row)
+        sync_window_layout(kernel, world)
+        lo = buf.min_row()
+        hi = buf.max_row()
+    } else {
+        let (n_lo, n_hi) = apply_narrow_around_cursor_or_selection(kernel, world, vim, svc)
+        lo = n_lo
+        hi = n_hi
+    }
+
+    let _ = world.push_notification(
+        "info",
+        "Zen Narrow",
+        "Focused lines " ++ (lo + 1).to_string() ++ ".." ++ (hi + 1).to_string(),
+        ttl_ticks = 4,
+    )
+    status_emit("Zen Narrow enabled (L" ++ (lo + 1).to_string() ++ ".." ++ (hi + 1).to_string() ++ ")")#
+    ()
+}
+
+fn migrate_leader_u_prefix(leader_km: Keymap) {
+    let prev_opt = leader_km.bindings.get("<Space> u")
+    if prev_opt != null {
+        let prev = prev_opt.as(KeyBindingEntry)
+        if prev.command_name == "undo-tree-visualize" {
+            let _ = leader_km.unbind("<Space> u")
+            leader_km.bind("<Space> u u", prev.command_name, prev.owner, description = prev.description)
+        }
+    }
+}
+
+pub fn ext_zen_id() -> ExtId = ExtId("lava.org/ext_zen")
+
+pub fn register_zen_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_zen_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_zen",
+        "0.1.0",
+        "Distraction-free centered Zen Mode, Twilight code dimming, and narrowed focus workflows.",
+        [ext_document_id(), ext_window_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let svc = ZenService.new()
+            k.publish_service(SERVICE_ZEN, ext_id, svc)
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            migrate_leader_u_prefix(leader_km)
+            leader_km.bind("<Space> z", "zen-mode", ext_id, description = "Toggle Zen Mode")
+            leader_km.bind("<Space> z n", "zen-narrow-focus", ext_id, description = "Toggle Zen Narrow focus")
+            leader_km.bind("<Space> u t", "twilight-toggle", ext_id, description = "Toggle Twilight dimming")
+
+            let visual_km = k.ensure_keymap(KEYMAP_VIM_VISUAL)
+            visual_km.bind("<Space> z n", "zen-narrow-focus", ext_id, description = "Zen Narrow selection")
+
+            k.register_command("zen-mode", ext_id, "Toggle distraction-free Zen Mode (`:ZenMode [width]`).", cmd_zen_mode_interactive)
+            k.register_command("zen-mode-toggle", ext_id, "Toggle distraction-free Zen Mode.", cmd_zen_mode_interactive)
+            k.register_command("ex:ZenMode", ext_id, "Ex `:ZenMode [width]`.", cmd_zen_mode_ex, interactive = false)
+
+            k.register_command("twilight", ext_id, "Toggle Twilight inactive block dimming (`:Twilight`).", cmd_twilight_toggle)
+            k.register_command("twilight-toggle", ext_id, "Toggle Twilight inactive block dimming.", cmd_twilight_toggle)
+            k.register_command("ex:Twilight", ext_id, "Ex `:Twilight`.", cmd_twilight_toggle, interactive = false)
+
+            k.register_command("zen-narrow-focus", ext_id, "Toggle narrowed Zen Mode focus (`:ZenNarrow`).", cmd_zen_narrow)
+            k.register_command("ex:ZenNarrow", ext_id, "Ex `:ZenNarrow`.", cmd_zen_narrow, interactive = false)
+
+            k.add_hook("buffer-switched", ext_id, |kern: SystemKernel, _p: Any| -> Unit {
+                let v_opt = kern.service("lava.vim.state")
+                if v_opt != null {
+                    clear_zen_interceptor_if_owned(v_opt.as(VimState))
+                }
+            })
+
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            let s_opt = k.service(SERVICE_ZEN)
+            let v_opt = k.service("lava.vim.state")
+            if v_opt != null {
+                clear_zen_interceptor_if_owned(v_opt.as(VimState))
+            }
+            if w_opt != null {
+                let world = w_opt.as(EditorWorld)
+                if s_opt != null {
+                    let svc = s_opt.as(ZenService)
+                    if world.options.zen_mode or svc.narrowed_by_zen {
+                        exit_zen_mode_core(k, world, svc)
+                    }
+                } else {
+                    world.options.zen_mode = false
+                }
+                world.options.twilight_mode = false
+                world.clear_owner_ui(OWNER_ZEN)
+            }
+            ()
+        },
+    )
+}

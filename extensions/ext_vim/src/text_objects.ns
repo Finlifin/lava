@@ -1,0 +1,747 @@
+-- text_objects.ns: Evil-Vim inner (`i`) and around (`a`) text objects.
+-- Supports words (`w`/`W`), paragraphs (`p`), quotes (`"`, `'`, `` ` ``),
+-- nested-aware multi-line delimiters (`()b`, `[]`, `{}B`, `<>`),
+-- and indentation text objects (`ii`, `ai`, `iI`, `aI`).
+
+use @ext_document.{Buffer, Pos, Span}
+use .motions.{
+    char_category, infer_effective_indent, is_blank_char, is_blank_line, line_indent_cols
+}
+
+pub struct TextObjectRange {
+    pub span: Span,
+    pub linewise: bool,
+    pub start_row: i64,
+    pub end_row: i64,
+}
+
+pub fn is_text_object_target(obj_key: String) -> bool {
+    obj_key == "w"
+        or obj_key == "W"
+        or obj_key == "p"
+        or obj_key == "i"
+        or obj_key == "I"
+        or obj_key == "\""
+        or obj_key == "'"
+        or obj_key == "`"
+        or obj_key == "("
+        or obj_key == ")"
+        or obj_key == "b"
+        or obj_key == "["
+        or obj_key == "]"
+        or obj_key == "{{"
+        or obj_key == "}}"
+        or obj_key == "B"
+        or obj_key == "<"
+        or obj_key == ">"
+}
+
+pub fn resolve_text_object(
+    buf: Buffer,
+    pos: Pos,
+    around: bool,
+    obj_key: String,
+    count: i64,
+    .tabstop: i64 = 4,
+) -> ?TextObjectRange {
+    let eff_count = if count > 0 { count } else { 1 }
+    when {
+        obj_key == "w" => text_obj_word(buf, pos, around, false, eff_count),
+        obj_key == "W" => text_obj_word(buf, pos, around, true, eff_count),
+        obj_key == "p" => text_obj_paragraph(buf, pos, around, eff_count),
+        obj_key == "i" => text_obj_indent(buf, pos, around, false, eff_count, tabstop),
+        obj_key == "I" => text_obj_indent(buf, pos, around, true, eff_count, tabstop),
+        obj_key == "\"" or obj_key == "'" or obj_key == "`" => {
+            text_obj_quote(buf, pos, around, obj_key)
+        },
+        obj_key == "(" or obj_key == ")" or obj_key == "b" => {
+            text_obj_pair(buf, pos, around, "(", ")", eff_count)
+        },
+        obj_key == "[" or obj_key == "]" => {
+            text_obj_pair(buf, pos, around, "[", "]", eff_count)
+        },
+        obj_key == "{{" or obj_key == "}}" or obj_key == "B" => {
+            text_obj_pair(buf, pos, around, "{{", "}}", eff_count)
+        },
+        obj_key == "<" or obj_key == ">" => {
+            text_obj_pair(buf, pos, around, "<", ">", eff_count)
+        },
+        else => null,
+    }
+}
+
+fn text_obj_word(
+    buf: Buffer,
+    pos: Pos,
+    around: bool,
+    big_word: bool,
+    count: i64,
+) -> ?TextObjectRange {
+    let line = buf.line_at(pos.row)
+    let llen = line.char_len()
+    if llen == 0 {
+        return (TextObjectRange {
+            span: Span.normalized(Pos.new(pos.row, 0), Pos.new(pos.row, 0)),
+            linewise: false,
+            start_row: pos.row,
+            end_row: pos.row,
+        })
+    }
+
+    let c = if pos.col < llen { pos.col } else { llen - 1 }
+    let cat = char_category(line.slice(c, c + 1), big_word)
+
+    var sc = c
+    while sc > 0 and char_category(line.slice(sc - 1, sc), big_word) == cat {
+        sc -= 1
+    }
+    var ec = c + 1
+    while ec < llen and char_category(line.slice(ec, ec + 1), big_word) == cat {
+        ec += 1
+    }
+
+    if not around {
+        -- Extend `count - 1` additional runs on the same line
+        var extra = count - 1
+        while extra > 0 and ec < llen {
+            let next_cat = char_category(line.slice(ec, ec + 1), big_word)
+            while ec < llen and char_category(line.slice(ec, ec + 1), big_word) == next_cat {
+                ec += 1
+            }
+            extra -= 1
+        }
+        return (TextObjectRange {
+            span: Span.normalized(Pos.new(pos.row, sc), Pos.new(pos.row, ec)),
+            linewise: false,
+            start_row: pos.row,
+            end_row: pos.row,
+        })
+    }
+
+    -- Around word (`aw` / `aW`):
+    if cat == 0 {
+        -- Cursor on whitespace: include whitespace + following word (or preceding word if at EOL)
+        if ec < llen {
+            let wcat = char_category(line.slice(ec, ec + 1), big_word)
+            while ec < llen and char_category(line.slice(ec, ec + 1), big_word) == wcat {
+                ec += 1
+            }
+        } else if sc > 0 {
+            let wcat = char_category(line.slice(sc - 1, sc), big_word)
+            while sc > 0 and char_category(line.slice(sc - 1, sc), big_word) == wcat {
+                sc -= 1
+            }
+        }
+    } else {
+        -- Cursor on word/punct: repeat `count` words, then include trailing whitespace (else leading)
+        var rem = count - 1
+        while rem > 0 and ec < llen {
+            while ec < llen and is_blank_char(line.slice(ec, ec + 1)) {
+                ec += 1
+            }
+            if ec < llen {
+                let wcat = char_category(line.slice(ec, ec + 1), big_word)
+                while ec < llen and char_category(line.slice(ec, ec + 1), big_word) == wcat {
+                    ec += 1
+                }
+            }
+            rem -= 1
+        }
+        let before_ws = ec
+        while ec < llen and is_blank_char(line.slice(ec, ec + 1)) {
+            ec += 1
+        }
+        if ec == before_ws {
+            while sc > 0 and is_blank_char(line.slice(sc - 1, sc)) {
+                sc -= 1
+            }
+        }
+    }
+
+    TextObjectRange {
+        span: Span.normalized(Pos.new(pos.row, sc), Pos.new(pos.row, ec)),
+        linewise: false,
+        start_row: pos.row,
+        end_row: pos.row,
+    }
+}
+
+fn text_obj_paragraph(buf: Buffer, pos: Pos, around: bool, count: i64) -> ?TextObjectRange {
+    let min_r = buf.min_row()
+    let max_r = buf.max_row()
+    let blank = is_blank_line(buf, pos.row)
+
+    var sr = pos.row
+    while sr > min_r and is_blank_line(buf, sr - 1) == blank {
+        sr -= 1
+    }
+    var er = pos.row
+    while er < max_r and is_blank_line(buf, er + 1) == blank {
+        er += 1
+    }
+
+    var extra = count - 1
+    while extra > 0 and er < max_r {
+        let next_blank = is_blank_line(buf, er + 1)
+        er += 1
+        while er < max_r and is_blank_line(buf, er + 1) == next_blank {
+            er += 1
+        }
+        extra -= 1
+    }
+
+    if around {
+        if not blank {
+            if er < max_r and is_blank_line(buf, er + 1) {
+                while er < max_r and is_blank_line(buf, er + 1) {
+                    er += 1
+                }
+            } else if sr > min_r and is_blank_line(buf, sr - 1) {
+                while sr > min_r and is_blank_line(buf, sr - 1) {
+                    sr -= 1
+                }
+            }
+        } else {
+            if er < max_r and not is_blank_line(buf, er + 1) {
+                while er < max_r and not is_blank_line(buf, er + 1) {
+                    er += 1
+                }
+            }
+        }
+    }
+
+    let end_col = buf.line_char_len(er)
+    TextObjectRange {
+        span: Span.normalized(Pos.new(sr, 0), Pos.new(er, end_col)),
+        linewise: true,
+        start_row: sr,
+        end_row: er,
+    }
+}
+
+fn is_escaped_at(line: String, col: i64) -> bool {
+    var slashes: i64 = 0
+    var k = col - 1
+    while k >= 0 and line.slice(k, k + 1) == "\\" {
+        slashes += 1
+        k -= 1
+    }
+    slashes % 2 == 1
+}
+
+fn text_obj_quote(buf: Buffer, pos: Pos, around: bool, q: String) -> ?TextObjectRange {
+    let line = buf.line_at(pos.row)
+    let llen = line.char_len()
+    let cols = List()
+    for i in 0..llen {
+        if line.slice(i, i + 1) == q and not is_escaped_at(line, i) {
+            cols.push(i)
+        }
+    }
+    let n = cols.len()
+    if n < 2 {
+        return null
+    }
+
+    -- Check paired quotes `(q[2k], q[2k+1])` enclosing cursor or forward on same line
+    var open_c: i64 = -1
+    var close_c: i64 = -1
+    var k: i64 = 0
+    while k + 1 < n {
+        let qc1 = cols.get(k.as(usize)).as(i64)
+        let qc2 = cols.get((k + 1).as(usize)).as(i64)
+        if pos.col >= qc1 and pos.col <= qc2 {
+            open_c = qc1
+            close_c = qc2
+            break
+        }
+        if pos.col < qc1 {
+            open_c = qc1
+            close_c = qc2
+            break
+        }
+        k += 2
+    }
+
+    -- Fallback: any adjacent quote pair enclosing `pos.col`
+    if open_c < 0 {
+        for i in 0..(n - 1) {
+            let qc1 = cols.get(i.as(usize)).as(i64)
+            let qc2 = cols.get((i + 1).as(usize)).as(i64)
+            if pos.col >= qc1 and pos.col <= qc2 {
+                open_c = qc1
+                close_c = qc2
+                break
+            }
+        }
+    }
+
+    if open_c < 0 or close_c < 0 {
+        return null
+    }
+
+    if around {
+        return (TextObjectRange {
+            span: Span.normalized(Pos.new(pos.row, open_c), Pos.new(pos.row, close_c + 1)),
+            linewise: false,
+            start_row: pos.row,
+            end_row: pos.row,
+        })
+    }
+
+    TextObjectRange {
+        span: Span.normalized(Pos.new(pos.row, open_c + 1), Pos.new(pos.row, close_c)),
+        linewise: false,
+        start_row: pos.row,
+        end_row: pos.row,
+    }
+}
+
+fn find_matching_close_from(buf: Buffer, open_pos: Pos, open_ch: String, close_ch: String) -> ?Pos {
+    let max_r = buf.max_row()
+    var depth: i64 = 1
+    var r = open_pos.row
+    var c = open_pos.col + 1
+    while r <= max_r {
+        let line = buf.line_at(r)
+        let llen = line.char_len()
+        while c < llen {
+            let ch = line.slice(c, c + 1)
+            if ch == open_ch {
+                depth += 1
+            } else if ch == close_ch {
+                depth -= 1
+                if depth == 0 {
+                    return Pos.new(r, c)
+                }
+            }
+            c += 1
+        }
+        r += 1
+        c = 0
+    }
+    null
+}
+
+fn find_enclosing_open(
+    buf: Buffer,
+    pos: Pos,
+    open_ch: String,
+    close_ch: String,
+    level: i64,
+) -> ?Pos {
+    let min_r = buf.min_row()
+    let cur_line = buf.line_at(pos.row)
+    let cur_len = cur_line.char_len()
+
+    -- If cursor is directly on `open_ch` and `level == 1`, use `pos` itself!
+    if pos.col < cur_len and cur_line.slice(pos.col, pos.col + 1) == open_ch and level == 1 {
+        return pos
+    }
+
+    var rem_levels = level
+    var depth: i64 = 0
+    var r = pos.row
+    var c = if pos.col < cur_len { pos.col } else { cur_len - 1 }
+
+    -- If cursor is directly on `close_ch`, start scanning strictly before `pos.col` at depth 0
+    if c >= 0 and c < cur_len and cur_line.slice(c, c + 1) == close_ch {
+        c -= 1
+    }
+
+    while r >= min_r {
+        let line = buf.line_at(r)
+        while c >= 0 {
+            let ch = line.slice(c, c + 1)
+            if ch == close_ch {
+                -- Ignore `close_ch` at `pos` itself (already stepped before it above)
+                if not (r == pos.row and c == pos.col) {
+                    depth += 1
+                }
+            } else if ch == open_ch {
+                if depth > 0 {
+                    depth -= 1
+                } else {
+                    rem_levels -= 1
+                    if rem_levels == 0 {
+                        return Pos.new(r, c)
+                    }
+                }
+            }
+            c -= 1
+        }
+        r -= 1
+        if r >= min_r {
+            c = buf.line_char_len(r) - 1
+        }
+    }
+    null
+}
+
+fn text_obj_pair(
+    buf: Buffer,
+    pos: Pos,
+    around: bool,
+    open_ch: String,
+    close_ch: String,
+    count: i64,
+) -> ?TextObjectRange {
+    var open_opt = find_enclosing_open(buf, pos, open_ch, close_ch, count)
+
+    -- Fallback: scan forward on current line for the next `open_ch` (like Neovim/Evil `da(` from start of line)
+    if open_opt == null and count == 1 {
+        let line = buf.line_at(pos.row)
+        let llen = line.char_len()
+        var c = pos.col
+        while c < llen {
+            if line.slice(c, c + 1) == open_ch {
+                open_opt = Pos.new(pos.row, c)
+                break
+            }
+            c += 1
+        }
+    }
+
+    let open_pos? = open_opt else {
+        return null
+    }
+    let close_pos? = find_matching_close_from(buf, open_pos, open_ch, close_ch) else {
+        return null
+    }
+
+    if around {
+        return (TextObjectRange {
+            span: Span.normalized(open_pos, Pos.new(close_pos.row, close_pos.col + 1)),
+            linewise: false,
+            start_row: open_pos.row,
+            end_row: close_pos.row,
+        })
+    }
+
+    TextObjectRange {
+        span: Span.normalized(Pos.new(open_pos.row, open_pos.col + 1), close_pos),
+        linewise: false,
+        start_row: open_pos.row,
+        end_row: close_pos.row,
+    }
+}
+
+-- Compute contiguous row bounds `(sr, er)` around `seed_row` for lines with indent >= `target_indent`.
+-- When `bridge_blanks` is true, blank lines surrounded by non-blank lines >= `target_indent` are bridged.
+pub fn indent_block_bounds(
+    buf: Buffer,
+    seed_row: i64,
+    target_indent: i64,
+    bridge_blanks: bool,
+    tabstop: i64,
+) -> (i64, i64) {
+    let ts = if tabstop > 0 { tabstop } else { 4 }
+    let min_r = buf.min_row()
+    let max_r = buf.max_row()
+
+    if target_indent <= 0 {
+        if not bridge_blanks {
+            return (min_r, max_r)
+        }
+        if is_blank_line(buf, seed_row) {
+            return (seed_row, seed_row)
+        }
+        var sr0 = seed_row
+        while sr0 > min_r and not is_blank_line(buf, sr0 - 1) {
+            sr0 -= 1
+        }
+        var er0 = seed_row
+        while er0 < max_r and not is_blank_line(buf, er0 + 1) {
+            er0 += 1
+        }
+        return (sr0, er0)
+    }
+
+    -- Anchor onto a valid non-blank seed row if `seed_row` itself is blank
+    var anchor_r = seed_row
+    if is_blank_line(buf, anchor_r) {
+        var found = false
+        var up = anchor_r - 1
+        while up >= min_r {
+            if not is_blank_line(buf, up) {
+                if line_indent_cols(buf.line_at(up), ts) >= target_indent {
+                    anchor_r = up
+                    found = true
+                }
+                break
+            }
+            up -= 1
+        }
+        if not found {
+            var dn = anchor_r + 1
+            while dn <= max_r {
+                if not is_blank_line(buf, dn) {
+                    if line_indent_cols(buf.line_at(dn), ts) >= target_indent {
+                        anchor_r = dn
+                        found = true
+                    }
+                    break
+                }
+                dn += 1
+            }
+        }
+        if not found {
+            return (seed_row, seed_row)
+        }
+    }
+
+    var sr = anchor_r
+    var scan_up = anchor_r - 1
+    while scan_up >= min_r {
+        if is_blank_line(buf, scan_up) {
+            if not bridge_blanks {
+                break
+            }
+            var prev_nb = scan_up - 1
+            while prev_nb >= min_r and is_blank_line(buf, prev_nb) {
+                prev_nb -= 1
+            }
+            if prev_nb >= min_r and line_indent_cols(buf.line_at(prev_nb), ts) >= target_indent {
+                sr = prev_nb
+                scan_up = prev_nb - 1
+                continue
+            }
+            break
+        }
+        if line_indent_cols(buf.line_at(scan_up), ts) >= target_indent {
+            sr = scan_up
+            scan_up -= 1
+        } else {
+            break
+        }
+    }
+
+    var er = anchor_r
+    var scan_dn = anchor_r + 1
+    while scan_dn <= max_r {
+        if is_blank_line(buf, scan_dn) {
+            if not bridge_blanks {
+                break
+            }
+            var next_nb = scan_dn + 1
+            while next_nb <= max_r and is_blank_line(buf, next_nb) {
+                next_nb += 1
+            }
+            if next_nb <= max_r and line_indent_cols(buf.line_at(next_nb), ts) >= target_indent {
+                er = next_nb
+                scan_dn = next_nb + 1
+                continue
+            }
+            break
+        }
+        if line_indent_cols(buf.line_at(scan_dn), ts) >= target_indent {
+            er = scan_dn
+            scan_dn += 1
+        } else {
+            break
+        }
+    }
+
+    -- If started on a blank line between two valid indented neighbors, ensure `seed_row` is inside `sr..er`
+    if seed_row < sr {
+        sr = seed_row
+    }
+    if seed_row > er {
+        er = seed_row
+    }
+    (sr, er)
+}
+
+pub fn enclosing_parent_indent(
+    buf: Buffer,
+    sr: i64,
+    er: i64,
+    cur_indent: i64,
+    tabstop: i64,
+) -> i64 {
+    let ts = if tabstop > 0 { tabstop } else { 4 }
+    let min_r = buf.min_row()
+    let max_r = buf.max_row()
+    var above_ind: i64 = -1
+    var ur = sr - 1
+    while ur >= min_r {
+        if not is_blank_line(buf, ur) {
+            let ind = line_indent_cols(buf.line_at(ur), ts)
+            if ind < cur_indent {
+                above_ind = ind
+                break
+            }
+        }
+        ur -= 1
+    }
+    var below_ind: i64 = -1
+    var dr = er + 1
+    while dr <= max_r {
+        if not is_blank_line(buf, dr) {
+            let ind = line_indent_cols(buf.line_at(dr), ts)
+            if ind < cur_indent {
+                below_ind = ind
+                break
+            }
+        }
+        dr += 1
+    }
+    let best = if above_ind >= below_ind { above_ind } else { below_ind }
+    if best >= 0 {
+        best
+    } else {
+        -1
+    }
+}
+
+pub fn text_obj_indent_at_level(
+    buf: Buffer,
+    seed_row: i64,
+    target_indent: i64,
+    around: bool,
+    strict_or_closer: bool,
+    tabstop: i64,
+) -> TextObjectRange {
+    let ts = if tabstop > 0 { tabstop } else { 4 }
+    let min_r = buf.min_row()
+    let max_r = buf.max_row()
+
+    if target_indent <= 0 and strict_or_closer {
+        let end_col_all = buf.line_char_len(max_r)
+        return (TextObjectRange {
+            span: Span.normalized(Pos.new(min_r, 0), Pos.new(max_r, end_col_all)),
+            linewise: true,
+            start_row: min_r,
+            end_row: max_r,
+        })
+    }
+
+    let bridge = not ((not around) and strict_or_closer)
+    let (base_sr, base_er) = indent_block_bounds(buf, seed_row, target_indent, bridge, ts)
+    var sr = base_sr
+    var er = base_er
+
+    if around and target_indent > 0 {
+        if sr > min_r and not is_blank_line(buf, sr - 1) {
+            if line_indent_cols(buf.line_at(sr - 1), ts) < target_indent {
+                sr -= 1
+            }
+        }
+        if strict_or_closer and er < max_r and not is_blank_line(buf, er + 1) {
+            if line_indent_cols(buf.line_at(er + 1), ts) < target_indent {
+                er += 1
+            }
+        }
+    }
+
+    let end_col = buf.line_char_len(er)
+    TextObjectRange {
+        span: Span.normalized(Pos.new(sr, 0), Pos.new(er, end_col)),
+        linewise: true,
+        start_row: sr,
+        end_row: er,
+    }
+}
+
+pub fn text_obj_indent(
+    buf: Buffer,
+    pos: Pos,
+    around: bool,
+    strict_or_closer: bool,
+    count: i64,
+    tabstop: i64,
+) -> ?TextObjectRange {
+    let ts = if tabstop > 0 { tabstop } else { 4 }
+    var target_indent = infer_effective_indent(buf, pos.row, ts)
+    var extra = if count > 1 { count - 1 } else { 0 }
+    while extra > 0 and target_indent > 0 {
+        let (sr, er) = indent_block_bounds(buf, pos.row, target_indent, true, ts)
+        let parent_ind = enclosing_parent_indent(buf, sr, er, target_indent, ts)
+        if parent_ind < 0 {
+            target_indent = 0
+            break
+        }
+        target_indent = parent_ind
+        extra -= 1
+    }
+    text_obj_indent_at_level(buf, pos.row, target_indent, around, strict_or_closer, ts)
+}
+
+-- Collect `(inner_span, around_span)` pairs for quotes and brackets on `pos.row` strictly enclosing `pos`.
+-- Ordered from innermost delimiter pair to outermost delimiter pair.
+pub fn same_line_enclosing_spans(buf: Buffer, pos: Pos) -> List {
+    let r = pos.row
+    let line = buf.line_at(r)
+    let llen = line.char_len()
+    let pairs = List()
+    if llen == 0 {
+        return pairs
+    }
+
+    -- 1. Enclosing quote pairs (`"`, `'`, `` ` ``) on `r`
+    let quotes = ["\"", "'", "`"]
+    for qi in 0..quotes.len() {
+        let q = quotes.get(qi.as(usize)).as(String)
+        let cols = List()
+        for i in 0..llen {
+            if line.slice(i, i + 1) == q and not is_escaped_at(line, i) {
+                cols.push(i)
+            }
+        }
+        var k: i64 = 0
+        while k + 1 < cols.len() {
+            let oc = cols.get(k.as(usize)).as(i64)
+            let cc = cols.get((k + 1).as(usize)).as(i64)
+            if pos.col >= oc and pos.col <= cc {
+                pairs.push((oc, cc))
+                break
+            }
+            k += 2
+        }
+    }
+
+    -- 2. Enclosing bracket pairs (`()`, `[]`, `{}`) on `r`
+    let delims = [("(", ")"), ("[", "]"), ("{{", "}}")]
+    for di in 0..delims.len() {
+        let (och, cch) = delims.get(di.as(usize)).as((String, String))
+        for lvl in 1..6 {
+            let open_opt = find_enclosing_open(buf, pos, och, cch, lvl)
+            if open_opt == null {
+                break
+            }
+            let open_p = open_opt.as(Pos)
+            if open_p.row != r {
+                break
+            }
+            let close_opt = find_matching_close_from(buf, open_p, och, cch)
+            if close_opt == null {
+                break
+            }
+            let close_p = close_opt.as(Pos)
+            if close_p.row == r and pos.col >= open_p.col and pos.col <= close_p.col {
+                pairs.push((open_p.col, close_p.col))
+            }
+        }
+    }
+
+    -- Sort innermost first: larger `open_col` first, then smaller `close_col`
+    pairs.sort_by(|a: Any, b: Any| {
+        let (ao, ac) = a.as((i64, i64))
+        let (bo, bc) = b.as((i64, i64))
+        if ao != bo {
+            bo.cmp(ao)
+        } else {
+            ac.cmp(bc)
+        }
+    })
+
+    let spans = List()
+    for i in 0..pairs.len() {
+        let (oc, cc) = pairs.get(i.as(usize)).as((i64, i64))
+        if oc + 1 < cc {
+            spans.push(Span.normalized(Pos.new(r, oc + 1), Pos.new(r, cc)))
+        }
+        spans.push(Span.normalized(Pos.new(r, oc), Pos.new(r, cc + 1)))
+    }
+    spans
+}

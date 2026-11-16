@@ -1,0 +1,13 @@
+[package]
+name = "lava-server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "lava-server"
+path = "src/main.rs"
+
+[dependencies]
+lava-lsp.workspace = true
+lava-proto.workspace = true
+lava-vm.workspace = true

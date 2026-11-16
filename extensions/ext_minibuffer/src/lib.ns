@@ -1,0 +1,4130 @@
+-- ext_minibuffer: Continuation-Backed Interactive Minibuffer & Rich Vertico/Orderless/Marginalia/Consult Extension.
+-- Publishes service `"lava.minibuffer.controller"` (`MinibufferController`) and drives
+-- Emacs Orderless multi-token + multi-tier fuzzy scoring with character match positions,
+-- Marginalia rich metadata & reverse keymap chord discovery, multi-stage `:` Ex verb & argument completion,
+-- Vertico directory segment navigation, Consult live buffer/theme preview, and incsearch preview.
+
+use std.collections.{HashMap, Set}
+use std.env
+use std.fs
+use std.path
+use std.runtime
+use @lava_core.{
+    CommandSpec, ExtId, KeyBindingEntry, KeyStroke, Keymap, PromptKind, PromptRequest, PromptTurn,
+    SystemKernel, clipboard_get, clipboard_set, log_event, status_emit
+}
+use @lava_accel.{OrderlessHit, accel_doc_search_preview, accel_orderless_rank}
+use @lava_remote.{
+    RemoteConnectionInfo, RemoteDirItem, SshHostConfigEntry, parse_ssh_uri,
+    remote_discover_ssh_hosts, remote_list_connections, remote_readdir
+}
+use @ext_document.{
+    Buffer, BufferId, EditorWorld, MinibufferRichItem, MinibufferView, Pos, RegisterValue,
+    SERVICE_EDITOR_WORLD, ext_document_id, require_editor_world
+}
+
+pub const SERVICE_MINIBUFFER: String = "lava.minibuffer.controller"
+const DEFAULT_HINT_BAR: String = "Tab:complete  C-n/C-p:move  C-d:del/EOF  M-BS:up-dir  Enter:confirm  Esc:cancel"
+const MINIBUFFER_BATCH_CAP: i64 = 256
+const MINIBUFFER_QUERY_CAP: i64 = 48
+
+pub fn ext_minibuffer_id() -> ExtId = ExtId("lava.org/ext_minibuffer")
+
+-- ============================================================================
+-- 1. Emacs Orderless + Multi-Tier Fuzzy Matcher with `match_indices`
+-- ============================================================================
+
+private fn make_range_indices(start_idx: i64, end_idx: i64) -> List {
+    let out = List()
+    if end_idx <= start_idx {
+        return out
+    }
+    for i in start_idx..end_idx {
+        out.push(i)
+    }
+    out
+}
+
+private fn shift_indices(indices: List, offset: i64) -> List {
+    if offset == 0 {
+        return indices
+    }
+    let out = List()
+    for i in 0..indices.len() {
+        out.push(indices.get(i.as(usize)).as(i64) + offset)
+    }
+    out
+}
+
+private fn dedup_sorted_indices(raw: List, max_len: i64) -> List {
+    if raw.is_empty() {
+        return List()
+    }
+    let valid = List()
+    let seen = Set.new()
+    for i in 0..raw.len() {
+        let idx = raw.get(i.as(usize)).as(i64)
+        if idx >= 0 and idx < max_len and (not seen.contains(idx)) {
+            seen.insert(idx)
+            valid.push(idx)
+        }
+    }
+    valid.sort_by(|a: Any, b: Any| {
+        a.as(i64).cmp(b.as(i64))
+    })
+    valid
+}
+
+-- Emacs Orderless + Multi-tier candidate scoring returning `(score, sorted_unique_char_indices)`.
+-- Powered by native `lava-accel::orderless_rank_batch` (`O(Q * C)` DP + `!neg` / `^prefix` / `suffix$` / `=literal`).
+pub fn score_candidate_with_positions(query: String, candidate: String) -> (i64, List) {
+    let (_, hits) = accel_orderless_rank(query, [candidate], limit = 1)
+    if hits.is_empty() {
+        return (-1, List())
+    }
+    let h = hits.get(0).as(OrderlessHit)
+    (h.score, h.positions)
+}
+
+pub fn score_candidate(query: String, candidate: String) -> i64 {
+    let (sc, _) = score_candidate_with_positions(query, candidate)
+    sc
+}
+
+-- ============================================================================
+-- 2. Marginalia Helpers & Reverse Keymap Chord Discovery
+-- ============================================================================
+
+private fn prettify_chord_token(tok: String) -> String {
+    if tok == "<Space>" or tok == "<SPC>" {
+        return "SPC"
+    }
+    if tok == "<Return>" or tok == "<RET>" or tok == "<CR>" {
+        return "RET"
+    }
+    if tok == "<Escape>" or tok == "<ESC>" {
+        return "ESC"
+    }
+    if tok == "<BackSpace>" or tok == "<BS>" {
+        return "BS"
+    }
+    if tok == "<Tab>" or tok == "<TAB>" {
+        return "TAB"
+    }
+    let n = tok.char_len()
+    if n >= 3 and tok.starts_with("<") and tok.ends_with(">") {
+        let inner = tok.slice(1, n - 1)
+        if inner == "lt" {
+            return "<"
+        }
+        if inner == "gt" {
+            return ">"
+        }
+        return inner
+    }
+    tok
+}
+
+private fn prettify_chord(raw_chord: String) -> String {
+    let trimmed = raw_chord.trim()
+    if trimmed == "" {
+        return ""
+    }
+    let parts = trimmed.split(" ")
+    let out = List()
+    for i in 0..parts.len() {
+        let p = parts.get(i.as(usize)).as(String)
+        if p != "" {
+            out.push(prettify_chord_token(p))
+        }
+    }
+    out.join(" ")
+}
+
+private fn format_keymap_chord(mname: String, raw_chord: String) -> String {
+    let pretty = prettify_chord(raw_chord)
+    if mname.contains("leader") and pretty != "" and (not pretty.starts_with("SPC")) {
+        return "SPC " ++ pretty
+    }
+    pretty
+}
+
+private fn find_cmd_in_keymap(mname: String, km: Keymap, cmd_name: String) -> String {
+    let matches_list = List()
+    let keys = km.bindings.keys()
+    for i in 0..keys.len() {
+        let k = keys.get(i.as(usize)).as(String)
+        let entry = km.bindings.get(k).as(KeyBindingEntry)
+        if entry.command_name == cmd_name {
+            matches_list.push(entry.chord)
+        }
+    }
+    if matches_list.is_empty() {
+        return ""
+    }
+    matches_list.sort_by(|a: Any, b: Any| {
+        let sa = a.as(String)
+        let sb = b.as(String)
+        if sa.char_len() != sb.char_len() {
+            return sa.char_len().cmp(sb.char_len())
+        }
+        sa.cmp(sb)
+    })
+    format_keymap_chord(mname, matches_list.get(0).as(String))
+}
+
+private fn ordered_keymap_names(kernel: SystemKernel) -> List {
+    let priority_maps = [
+        "vim-leader",
+        "vim:leader",
+        "vim-normal",
+        "vim:normal",
+        "global",
+        "emacs-global",
+        "emacs-modeless",
+        "vim-insert",
+        "vim-visual",
+    ]
+    let out = List()
+    let checked = Set.new()
+    for i in 0..priority_maps.len() {
+        let mname = priority_maps.get(i.as(usize)).as(String)
+        checked.insert(mname)
+        if kernel.keymaps.contains_key(mname) {
+            out.push(mname)
+        }
+    }
+    let rest_names = kernel.keymaps.keys()
+    rest_names.sort()
+    for i in 0..rest_names.len() {
+        let mname = rest_names.get(i.as(usize)).as(String)
+        if not checked.contains(mname) {
+            out.push(mname)
+        }
+    }
+    out
+}
+
+private fn build_reverse_keybinding_map(kernel: SystemKernel) -> HashMap {
+    let best_raw = HashMap.new()
+    let map_names = ordered_keymap_names(kernel)
+    for mi in 0..map_names.len() {
+        let mname = map_names.get(mi.as(usize)).as(String)
+        let km = kernel.keymaps.get(mname).as(Keymap)
+        if not km.bindings.is_empty() {
+            let keys = km.bindings.keys()
+            for ki in 0..keys.len() {
+                let k = keys.get(ki.as(usize)).as(String)
+                let entry = km.bindings.get(k).as(KeyBindingEntry)
+                let cname = entry.command_name
+                let prev_opt = best_raw.get(cname)
+                if prev_opt == null {
+                    best_raw.insert(cname, (mi, mname, entry.chord))
+                } else {
+                    let (prev_mi, _, prev_chord) = prev_opt.as((i64, String, String))
+                    if prev_mi == mi and (entry.chord.char_len() < prev_chord.char_len() or
+                        (entry.chord.char_len() == prev_chord.char_len() and entry.chord < prev_chord)) {
+                        best_raw.insert(cname, (mi, mname, entry.chord))
+                    }
+                }
+            }
+        }
+    }
+    let rev = HashMap.new()
+    let cmd_keys = best_raw.keys()
+    for ci in 0..cmd_keys.len() {
+        let cname = cmd_keys.get(ci.as(usize)).as(String)
+        let (_, mname, raw_c) = best_raw.get(cname).as((i64, String, String))
+        rev.insert(cname, format_keymap_chord(mname, raw_c))
+    }
+    rev
+}
+
+-- Scan `kernel.keymaps` (`vim-leader`, `vim-normal`, `global`, `emacs-global`, `mode:*`, etc.)
+-- and return a concise keychord pill such as `"SPC f f"`, `"C-x C-f"`, `"-"`, `"C-\\"`, `"M-x"`.
+pub fn lookup_command_keybinding(kernel: SystemKernel, cmd_name: String) -> String {
+    if cmd_name == "" {
+        return ""
+    }
+    let map_names = ordered_keymap_names(kernel)
+    for i in 0..map_names.len() {
+        let mname = map_names.get(i.as(usize)).as(String)
+        let km = kernel.keymaps.get(mname).as(Keymap)
+        let hit = find_cmd_in_keymap(mname, km, cmd_name)
+        if hit != "" {
+            return hit
+        }
+    }
+    ""
+}
+
+pub fn format_human_size(bytes: i64, is_dir: bool) -> String {
+    if is_dir {
+        return "dir"
+    }
+    let safe_b = if bytes < 0 { 0 } else { bytes }
+    if safe_b < 1024 {
+        return safe_b.to_string() ++ "B"
+    }
+    if safe_b < 1048576 {
+        let tenths = (safe_b * 10) / 1024
+        return (tenths / 10).to_string() ++ "." ++ (tenths % 10).to_string() ++ "K"
+    }
+    if safe_b < 1073741824 {
+        let tenths = (safe_b * 10) / 1048576
+        return (tenths / 10).to_string() ++ "." ++ (tenths % 10).to_string() ++ "M"
+    }
+    let tenths = (safe_b * 10) / 1073741824
+    (tenths / 10).to_string() ++ "." ++ (tenths % 10).to_string() ++ "G"
+}
+
+private fn format_unix_mode(name: String, is_dir: bool, is_symlink: bool) -> String {
+    if is_dir {
+        return "drwxr-xr-x"
+    }
+    if is_symlink {
+        return "lrwxrwxrwx"
+    }
+    let lower = name.to_lower()
+    if lower.ends_with(".sh") or lower.ends_with(".bash") or lower.ends_with(".zsh") {
+        return "-rwxr-xr-x"
+    }
+    "-rw-r--r--"
+}
+
+private fn file_kind_badge(name: String, is_dir: bool) -> String {
+    if is_dir {
+        return "[dir]"
+    }
+    let lower = name.to_lower()
+    when {
+        lower.ends_with(".ns") => "[ns]",
+        lower.ends_with(".rs") => "[rs]",
+        lower.ends_with(".md") or lower.ends_with(".markdown") => "[md]",
+        lower.ends_with(".toml") => "[toml]",
+        lower.ends_with(".json") => "[json]",
+        lower.ends_with(".yaml") or lower.ends_with(".yml") => "[yaml]",
+        lower.ends_with(".py") => "[py]",
+        lower.ends_with(".ts") or lower.ends_with(".tsx") => "[ts]",
+        lower.ends_with(".js") or lower.ends_with(".jsx") => "[js]",
+        lower.ends_with(".org") => "[org]",
+        lower.ends_with(".sh") or lower.ends_with(".bash") or lower.ends_with(".zsh") => "[sh]",
+        lower.ends_with(".c") or lower.ends_with(".h") or lower.ends_with(".cpp") => "[c]",
+        else => "[file]",
+    }
+}
+
+private fn mode_badge_for_kind(kind: PromptKind) -> String {
+    kind match {
+        PromptKind.CommandName => "M-x",
+        PromptKind.ExCommand => "EX :",
+        PromptKind.FilePath => "FILE",
+        PromptKind.BufferName => "BUFFER",
+        PromptKind.Choice => "CHOICE",
+        PromptKind.SearchForward => "SEARCH",
+        PromptKind.SearchBackward => "SEARCH",
+        PromptKind.Confirm => "CONFIRM",
+        PromptKind.FreeText => "INPUT",
+    }
+}
+
+private fn hint_bar_for_kind(kind: PromptKind) -> String {
+    kind match {
+        PromptKind.Confirm => "y/n/!/q:confirm  Esc/C-g:cancel",
+        PromptKind.SearchForward => "C-s/C-r:next/prev  M-p/M-n:hist  Enter:accept  Esc:cancel",
+        PromptKind.SearchBackward => "C-s/C-r:next/prev  M-p/M-n:hist  Enter:accept  Esc:cancel",
+        _ => DEFAULT_HINT_BAR,
+    }
+}
+
+private fn clear_world_minibuffer(world: EditorWorld) {
+    world.minibuffer_view = MinibufferView.inactive()
+    world.minibuffer_rich_items = List()
+    world.minibuffer_mode_badge = ""
+    world.minibuffer_hint_bar = ""
+}
+
+-- ============================================================================
+-- 3. MinibufferController Service & History State
+-- ============================================================================
+
+private fn kind_history_key(kind: PromptKind) -> String {
+    kind match {
+        PromptKind.FreeText => "free-text",
+        PromptKind.CommandName => "command-name",
+        PromptKind.FilePath => "file-path",
+        PromptKind.BufferName => "buffer-name",
+        PromptKind.Choice => "choice",
+        PromptKind.Confirm => "confirm",
+        PromptKind.SearchForward => "search",
+        PromptKind.SearchBackward => "search",
+        PromptKind.ExCommand => "ex-command",
+    }
+}
+
+pub struct MinibufferController {
+    pub active: bool,
+    pub request: PromptRequest,
+    pub input_text: String,
+    pub cursor_col: i64,
+    pub items: List,
+    pub rich_items: List,
+    pub selected_idx: i64,
+    pub total_matches: i64,
+    pub selection_touched: bool,
+    pub histories: HashMap,
+    pub history_idx: i64,
+    pub saved_draft: String,
+    pub preview_buf_id: ?BufferId,
+    pub preview_orig_point: Pos,
+    pub preview_orig_last_search: String,
+    pub preview_orig_highlight: bool,
+    pub orig_active_buf_id: BufferId,
+    pub orig_theme_name: String,
+    pub buf_preview_active: bool,
+    pub theme_preview_active: bool,
+    pub mru_buffers: List,
+    pub last_observed_active: ?BufferId,
+    pub cached_doc_cwd: String,
+    pub cached_doc_nodes: ?List,
+    pub cached_help_catalog: ?List,
+    pub cached_help_cmd_count: i64,
+    pub cached_info_catalog: ?List,
+    pub cached_rev_keys: ?HashMap,
+    pub cached_cmd_specs: ?List,
+    pub cached_cmd_names: ?List,
+    pub cached_ex_stage1: ?List,
+    pub cached_ex_stage1_names: ?List,
+    pub cached_ex_empty: ?(List, List, i64),
+    pub cached_cmd_empty: ?(List, List, i64),
+    pub cached_path_dir: String,
+    pub cached_path_entries: ?List,
+}
+
+impl MinibufferController {
+    pub fn new() -> MinibufferController {
+        MinibufferController {
+            active: false,
+            request: PromptRequest.text("", ""),
+            input_text: "",
+            cursor_col: 0,
+            items: List(),
+            rich_items: List(),
+            selected_idx: 0,
+            total_matches: 0,
+            selection_touched: false,
+            histories: HashMap.new(),
+            history_idx: -1,
+            saved_draft: "",
+            preview_buf_id: null,
+            preview_orig_point: Pos.zero(),
+            preview_orig_last_search: "",
+            preview_orig_highlight: false,
+            orig_active_buf_id: BufferId(1),
+            orig_theme_name: "catppuccin-mocha",
+            buf_preview_active: false,
+            theme_preview_active: false,
+            mru_buffers: List(),
+            last_observed_active: null,
+            cached_doc_cwd: "",
+            cached_doc_nodes: null,
+            cached_help_catalog: null,
+            cached_help_cmd_count: -1,
+            cached_info_catalog: null,
+            cached_rev_keys: null,
+            cached_cmd_specs: null,
+            cached_cmd_names: null,
+            cached_ex_stage1: null,
+            cached_ex_stage1_names: null,
+            cached_ex_empty: null,
+            cached_cmd_empty: null,
+            cached_path_dir: "",
+            cached_path_entries: null,
+        }
+    }
+
+    pub fn note_buffer_visited(self, id: BufferId) {
+        let filtered = List()
+        filtered.push(id)
+        for i in 0..self.mru_buffers.len() {
+            let bid = self.mru_buffers.get(i.as(usize)).as(BufferId)
+            if bid != id {
+                filtered.push(bid)
+            }
+        }
+        self.mru_buffers = filtered
+        self.last_observed_active = id
+    }
+
+    pub fn history_list(self, kind: PromptKind) -> List {
+        let key = kind_history_key(kind)
+        if self.histories.contains_key(key) {
+            return self.histories.get(key).as(List)
+        }
+        let fresh = List()
+        self.histories.insert(key, fresh)
+        fresh
+    }
+
+    pub fn history_for(self, kind: PromptKind) -> List = self.history_list(kind)
+
+    pub fn record_history(self, kind: PromptKind, value: String) {
+        if value == "" or kind == PromptKind.Confirm {
+            return
+        }
+        let hist = self.history_list(kind)
+        if not hist.is_empty() {
+            let last_val = hist.get((hist.len() - 1).as(usize)).as(String)
+            if last_val == value {
+                return
+            }
+        }
+        hist.push(value)
+        if hist.len() > 100 {
+            let _ = hist.remove(0)
+        }
+        if kind == PromptKind.ExCommand {
+            self.cached_ex_empty = null
+        } else if kind == PromptKind.CommandName {
+            self.cached_cmd_empty = null
+        }
+    }
+
+    pub fn sync_to_world(self, world: EditorWorld) {
+        if not self.active {
+            clear_world_minibuffer(world)
+            return
+        }
+        world.minibuffer_view = MinibufferView {
+            active: true,
+            prompt_label: self.request.label,
+            input_text: self.input_text,
+            cursor_col: self.cursor_col,
+            items: self.items,
+            selected_idx: self.selected_idx,
+            total_matches: self.total_matches,
+        }
+        world.minibuffer_rich_items = self.rich_items
+        world.minibuffer_mode_badge = mode_badge_for_kind(self.request.kind)
+        world.minibuffer_hint_bar = hint_bar_for_kind(self.request.kind)
+    }
+}
+
+-- ============================================================================
+-- 4. Candidate Generation (Vertico + Marginalia + Full Multi-Stage `:` Ex)
+-- ============================================================================
+
+private struct RichScoredCandidate {
+    score: i64,
+    is_dir: bool,
+    cand: String,
+    detail: String,
+    rich: MinibufferRichItem,
+}
+
+private fn rich_cand_in_order(sa: RichScoredCandidate, sb: RichScoredCandidate) -> bool {
+    if sa.is_dir != sb.is_dir {
+        return sa.is_dir
+    }
+    if sa.score != sb.score {
+        return sa.score > sb.score
+    }
+    sa.cand <= sb.cand
+}
+
+private fn sort_rich_scored(scored: List) {
+    let n = scored.len()
+    if n <= 1 {
+        return
+    }
+    var already_sorted = true
+    var prev = scored.get(0).as(RichScoredCandidate)
+    for i in 1..n {
+        let cur = scored.get(i.as(usize)).as(RichScoredCandidate)
+        if not rich_cand_in_order(prev, cur) {
+            already_sorted = false
+            break
+        }
+        prev = cur
+    }
+    if already_sorted {
+        return
+    }
+    scored.sort_by(|a: Any, b: Any| {
+        let sa = a.as(RichScoredCandidate)
+        let sb = b.as(RichScoredCandidate)
+        if sa.is_dir and (not sb.is_dir) {
+            return Ordering.less
+        }
+        if (not sa.is_dir) and sb.is_dir {
+            return Ordering.greater
+        }
+        if sa.score != sb.score {
+            return sb.score.cmp(sa.score)
+        }
+        sa.cand.cmp(sb.cand)
+    })
+}
+
+private fn unpack_rich_scored_with_total(scored: List, total: i64) -> (List, List, i64) {
+    let pairs = List()
+    let rich_list = List()
+    let take_n = if scored.len() > MINIBUFFER_BATCH_CAP { MINIBUFFER_BATCH_CAP } else { scored.len() }
+    for i in 0..take_n {
+        let it = scored.get(i.as(usize)).as(RichScoredCandidate)
+        pairs.push((it.cand, it.detail))
+        rich_list.push(it.rich)
+    }
+    let eff_total = if total >= pairs.len() { total } else { pairs.len() }
+    (pairs, rich_list, eff_total)
+}
+
+private fn unpack_rich_scored(scored: List) -> (List, List, i64) {
+    unpack_rich_scored_with_total(scored, scored.len())
+}
+
+private fn ensure_session_rev_keys(kernel: SystemKernel, ctrl: MinibufferController) -> HashMap {
+    if ctrl.cached_rev_keys != null {
+        return ctrl.cached_rev_keys.as(HashMap)
+    }
+    let rk = build_reverse_keybinding_map(kernel)
+    ctrl.cached_rev_keys = rk
+    rk
+}
+
+private fn ensure_session_interactive_commands(
+    kernel: SystemKernel,
+    ctrl: MinibufferController,
+) -> (List, List) {
+    if ctrl.cached_cmd_specs != null and ctrl.cached_cmd_names != null {
+        return (ctrl.cached_cmd_specs.as(List), ctrl.cached_cmd_names.as(List))
+    }
+    let specs = collect_kernel_commands(kernel, true)
+    let names = List()
+    for i in 0..specs.len() {
+        names.push(specs.get(i.as(usize)).as(CommandSpec).name)
+    }
+    ctrl.cached_cmd_specs = specs
+    ctrl.cached_cmd_names = names
+    (specs, names)
+}
+
+private struct CachedDirEntry {
+    ename: String,
+    dir_flag: bool,
+    kbadge: String,
+    marg: String,
+}
+
+private fn ensure_cached_dir_entries(ctrl: MinibufferController, dir_to_read: String) -> List {
+    if ctrl.cached_path_dir == dir_to_read and ctrl.cached_path_entries != null {
+        return ctrl.cached_path_entries.as(List)
+    }
+    let dirs = List()
+    let files = List()
+    let entries_res = fs.read_dir_entries(dir_to_read)
+    entries_res match {
+        entries! => {
+            for i in 0..entries.len() {
+                let de = entries.get(i.as(usize)).as(fs.DirEntry)
+                let ename = de.name
+                let dir_flag = de.is_dir or (de.is_symlink and fs.is_dir(de.path))
+                let kbadge = file_kind_badge(ename, dir_flag)
+                let size_txt = format_human_size(de.size, dir_flag).pad_start(6, " ")
+                let mode_txt = format_unix_mode(ename, dir_flag, de.is_symlink)
+                let marg = size_txt ++ "  " ++ mode_txt
+                let item = CachedDirEntry {
+                    ename: ename,
+                    dir_flag: dir_flag,
+                    kbadge: kbadge,
+                    marg: marg,
+                }
+                if dir_flag {
+                    dirs.push(item)
+                } else {
+                    files.push(item)
+                }
+            }
+        },
+        error _ => (),
+    }
+    dirs.sort_by(|a: Any, b: Any| {
+        a.as(CachedDirEntry).ename.cmp(b.as(CachedDirEntry).ename)
+    })
+    files.sort_by(|a: Any, b: Any| {
+        a.as(CachedDirEntry).ename.cmp(b.as(CachedDirEntry).ename)
+    })
+    let out = List()
+    for i in 0..dirs.len() {
+        out.push(dirs.get(i.as(usize)))
+    }
+    for i in 0..files.len() {
+        out.push(files.get(i.as(usize)))
+    }
+    ctrl.cached_path_dir = dir_to_read
+    ctrl.cached_path_entries = out
+    out
+}
+
+private fn history_recency_bonus(ctrl: MinibufferController, kind: PromptKind, cand: String) -> i64 {
+    let hist = ctrl.history_list(kind)
+    let n = hist.len()
+    if n == 0 {
+        return 0
+    }
+    var idx = n - 1
+    while idx >= 0 {
+        if hist.get(idx.as(usize)).as(String) == cand {
+            return 250 + idx * 4
+        }
+        idx -= 1
+    }
+    0
+}
+
+pub fn collect_kernel_commands(kernel: SystemKernel, interactive_only: bool) -> List {
+    let via_api = kernel.list_commands(interactive_only = interactive_only)
+    if not via_api.is_empty() {
+        return via_api
+    }
+    let names = kernel.commands.keys()
+    names.sort()
+    let out = List()
+    for i in 0..names.len() {
+        let k = names.get(i.as(usize)).as(String)
+        let spec = kernel.commands.get(k).as(CommandSpec)
+        if (not interactive_only) or spec.interactive {
+            out.push(spec)
+        }
+    }
+    out
+}
+
+private fn home_directory(fallback_cwd: String) -> String {
+    env.get_or("HOME", fallback_cwd)
+}
+
+private fn expand_tilde_path(raw: String, fallback_cwd: String) -> String {
+    let home = home_directory(fallback_cwd)
+    if raw == "~" {
+        return path.normalize(home)
+    }
+    if raw.starts_with("~/") {
+        return path.normalize(path.join(home, raw.drop(2)))
+    }
+    raw
+}
+
+private fn split_file_input(raw_input: String, cwd: String) -> (String, String, String) {
+    -- Returns `(raw_dir_prefix, resolved_dir_to_read, base_prefix)` with `~/` expansion!
+    let n = raw_input.char_len()
+    var last_slash: i64 = -1
+    var i = n - 1
+    while i >= 0 {
+        let ch = raw_input.slice(i, i + 1)
+        if ch == "/" or ch == "\\" {
+            last_slash = i
+            break
+        }
+        i -= 1
+    }
+    if last_slash < 0 {
+        return ("", cwd, raw_input)
+    }
+    let raw_dir_prefix = raw_input.slice(0, last_slash + 1)
+    let base_prefix = raw_input.slice(last_slash + 1, n)
+    let dir_part = if last_slash == 0 {
+        "/"
+    } else {
+        raw_input.slice(0, last_slash)
+    }
+    let expanded_dir = expand_tilde_path(dir_part, cwd)
+    let resolved_dir = if path.is_absolute(expanded_dir) {
+        path.normalize(expanded_dir)
+    } else {
+        path.normalize(path.join(cwd, expanded_dir))
+    }
+    (raw_dir_prefix, resolved_dir, base_prefix)
+}
+
+private fn ensure_cached_remote_dir_entries(
+    ctrl: MinibufferController,
+    remote_dir_uri: String,
+    show_hidden: bool,
+) -> List {
+    let cache_key = if show_hidden {
+        remote_dir_uri ++ "#hidden"
+    } else {
+        remote_dir_uri
+    }
+    if ctrl.cached_path_dir == cache_key and ctrl.cached_path_entries != null {
+        return ctrl.cached_path_entries.as(List)
+    }
+    let dirs = List()
+    let files = List()
+    let entries_res = remote_readdir(remote_dir_uri, show_hidden = show_hidden)
+    entries_res match {
+        entries! => {
+            for i in 0..entries.len() {
+                let de = entries.get(i.as(usize)).as(RemoteDirItem)
+                let ename = de.name
+                let dir_flag = de.is_dir
+                let kbadge = file_kind_badge(ename, dir_flag)
+                let size_txt = format_human_size(de.size, dir_flag).pad_start(6, " ")
+                let mode_txt = format_unix_mode(ename, dir_flag, false)
+                let marg = size_txt ++ "  " ++ mode_txt ++ "  [ssh]"
+                let item = CachedDirEntry {
+                    ename: ename,
+                    dir_flag: dir_flag,
+                    kbadge: kbadge,
+                    marg: marg,
+                }
+                if dir_flag {
+                    dirs.push(item)
+                } else {
+                    files.push(item)
+                }
+            }
+        },
+        error _ => (),
+    }
+    dirs.sort_by(|a: Any, b: Any| {
+        a.as(CachedDirEntry).ename.cmp(b.as(CachedDirEntry).ename)
+    })
+    files.sort_by(|a: Any, b: Any| {
+        a.as(CachedDirEntry).ename.cmp(b.as(CachedDirEntry).ename)
+    })
+    let out = List()
+    for i in 0..dirs.len() {
+        out.push(dirs.get(i.as(usize)))
+    }
+    for i in 0..files.len() {
+        out.push(files.get(i.as(usize)))
+    }
+    ctrl.cached_path_dir = cache_key
+    ctrl.cached_path_entries = out
+    out
+}
+
+private fn is_ssh_host_stage_input(raw_input: String) -> bool {
+    let t = raw_input.trim_start()
+    if t == "ssh:" or t == "ssh:/" or t == "/ssh" {
+        return true
+    }
+    if t.starts_with("ssh://") {
+        return not t.drop(6).contains("/")
+    }
+    if t.starts_with("/ssh:") {
+        return not t.drop(5).contains(":")
+    }
+    false
+}
+
+private fn extract_ssh_host_query(raw_input: String) -> String {
+    let t = raw_input.trim_start()
+    if t.starts_with("ssh://") {
+        return t.drop(6).trim()
+    }
+    if t.starts_with("/ssh:") {
+        return t.drop(5).trim()
+    }
+    ""
+}
+
+private fn build_ssh_host_candidates(
+    raw_input: String,
+    insert_prefix: String,
+    legacy_pair_detail: bool,
+) -> (List, List, i64) {
+    let auth_q = extract_ssh_host_query(raw_input)
+    let conns = remote_list_connections()
+    let hosts = remote_discover_ssh_hosts()
+    let seen = Set.new()
+    -- `(authority, badge, marg, tier_bias)`
+    let rows = List()
+
+    for i in 0..conns.len() {
+        let c = conns.get(i.as(usize)).as(RemoteConnectionInfo)
+        if c.authority != "" and (not seen.contains(c.authority)) {
+            seen.insert(c.authority)
+            let mode_tag = "[" ++ c.mode ++ "]"
+            let sys_tag = if c.os != "" {
+                "  " ++ c.hostname ++ " (" ++ c.os ++ "/" ++ c.arch ++ ")"
+            } else {
+                "  " ++ c.hostname
+            }
+            rows.push((c.authority, "[CONN]", mode_tag ++ sys_tag, 200 - i))
+        }
+    }
+
+    for i in 0..hosts.len() {
+        let h = hosts.get(i.as(usize)).as(SshHostConfigEntry)
+        if h.alias_name == "" {
+            continue
+        }
+        var auth = ""
+        if h.user != "" {
+            auth = h.user ++ "@"
+        }
+        auth = auth ++ h.alias_name
+        if h.port > 0 and h.port != 22 {
+            auth = auth ++ ":" ++ h.port.to_string()
+        }
+        if (not seen.contains(auth)) and (not seen.contains(h.alias_name)) {
+            seen.insert(auth)
+            let user_part = if h.user != "" { h.user ++ "@" } else { "" }
+            let host_part = if h.hostname != "" { h.hostname } else { h.alias_name }
+            let port_part = if h.port > 0 { ":" ++ h.port.to_string() } else { ":22" }
+            let jump_part = if h.proxy_jump != "" { "  via " ++ h.proxy_jump } else { "" }
+            let marg = user_part ++ host_part ++ port_part ++ jump_part
+            rows.push((auth, "[SSH]", marg, 80 - i))
+        }
+    }
+
+    if rows.is_empty() {
+        return (List(), List(), 0)
+    }
+
+    let ssh_pfx = insert_prefix ++ "ssh://"
+    let ssh_pfx_len = ssh_pfx.char_len()
+
+    if auth_q == "" {
+        let pairs = List()
+        let rich_list = List()
+        for i in 0..rows.len() {
+            let (auth, badge, marg, _) = rows.get(i.as(usize)).as((String, String, String, i64))
+            let full_cand = ssh_pfx ++ auth ++ "/"
+            let pair_det = if legacy_pair_detail { "dir" } else { marg }
+            pairs.push((full_cand, pair_det))
+            rich_list.push(MinibufferRichItem {
+                kind_badge: badge,
+                badge_rgba: 0,
+                label: full_cand,
+                key_hint: "",
+                marginalia: marg,
+                match_indices: List(),
+            })
+        }
+        return (pairs, rich_list, rows.len())
+    }
+
+    let scored = List()
+    for i in 0..rows.len() {
+        let (auth, badge, marg, bias) = rows.get(i.as(usize)).as((String, String, String, i64))
+        let (sc, mpos) = score_candidate_with_positions(auth_q, auth)
+        if sc >= 0 {
+            let full_cand = ssh_pfx ++ auth ++ "/"
+            let pair_det = if legacy_pair_detail { "dir" } else { marg }
+            scored.push(RichScoredCandidate {
+                score: sc + bias,
+                is_dir: true,
+                cand: full_cand,
+                detail: pair_det,
+                rich: MinibufferRichItem {
+                    kind_badge: badge,
+                    badge_rgba: 0,
+                    label: full_cand,
+                    key_hint: "",
+                    marginalia: marg,
+                    match_indices: shift_indices(mpos, ssh_pfx_len),
+                },
+            })
+        }
+    }
+    sort_rich_scored(scored)
+    unpack_rich_scored(scored)
+}
+
+private fn split_remote_ssh_input(raw_input: String) -> ?(String, String, String) {
+    let t = raw_input.trim_start()
+    if t.starts_with("ssh://") {
+        let after = t.drop(6)
+        let slash_hits = after.find_indices("/")
+        if slash_hits.is_empty() {
+            return null
+        }
+        let first_sl = slash_hits.get(0).as(i64)
+        let last_sl = slash_hits.get((slash_hits.len() - 1).as(usize)).as(i64)
+        let auth_part = after.slice(0, first_sl)
+        let dir_subpath = after.slice(first_sl, last_sl + 1)
+        let base_prefix = after.slice(last_sl + 1, after.char_len())
+        let parsed! = parse_ssh_uri("ssh://" ++ auth_part ++ dir_subpath) else {
+            return null
+        }
+        let remote_dir_uri = if parsed.remote_path.ends_with("/") {
+            parsed.prefix ++ parsed.remote_path
+        } else {
+            parsed.prefix ++ parsed.remote_path ++ "/"
+        }
+        let raw_dir_prefix = t.slice(0, 6 + last_sl + 1)
+        return (raw_dir_prefix, remote_dir_uri, base_prefix)
+    }
+    if t.starts_with("/ssh:") {
+        let after = t.drop(5)
+        let sp? = after.split_once(":") else {
+            return null
+        }
+        let (auth_part, tramp_path) = sp
+        let slash_hits = tramp_path.find_indices("/")
+        let (dir_subpath, base_prefix) = if slash_hits.is_empty() {
+            ("/", tramp_path)
+        } else {
+            let last_sl = slash_hits.get((slash_hits.len() - 1).as(usize)).as(i64)
+            (tramp_path.slice(0, last_sl + 1), tramp_path.slice(last_sl + 1, tramp_path.char_len()))
+        }
+        let parsed! = parse_ssh_uri("/ssh:" ++ auth_part ++ ":" ++ dir_subpath) else {
+            return null
+        }
+        let remote_dir_uri = if parsed.remote_path.ends_with("/") {
+            parsed.prefix ++ parsed.remote_path
+        } else {
+            parsed.prefix ++ parsed.remote_path ++ "/"
+        }
+        return (remote_dir_uri, remote_dir_uri, base_prefix)
+    }
+    null
+}
+
+private fn vertico_up_directory(s: String) -> String {
+    if s == "" or s == "/" or s == "ssh:" or s == "ssh://" or s == "/ssh:" {
+        return s
+    }
+    if s.starts_with("ssh://") {
+        let after = s.drop(6)
+        let slash_hits = after.find_indices("/")
+        if slash_hits.is_empty() {
+            return "ssh://"
+        }
+        let first_sl = slash_hits.get(0).as(i64)
+        let auth_root = "ssh://" ++ after.slice(0, first_sl + 1)
+        if s == auth_root {
+            return "ssh://"
+        }
+        var trimmed_ssh = s
+        if trimmed_ssh.ends_with("/") and trimmed_ssh.char_len() > auth_root.char_len() {
+            trimmed_ssh = trimmed_ssh.slice(0, trimmed_ssh.char_len() - 1)
+        }
+        let n_ssh = trimmed_ssh.char_len()
+        var j = n_ssh - 1
+        while j >= 6 + first_sl {
+            if trimmed_ssh.slice(j, j + 1) == "/" {
+                return trimmed_ssh.slice(0, j + 1)
+            }
+            j -= 1
+        }
+        return auth_root
+    }
+    if s.starts_with("/ssh:") {
+        let after = s.drop(5)
+        let sp_opt = after.split_once(":")
+        if sp_opt == null {
+            return "/ssh:"
+        }
+        let (auth_part, rpath) = sp_opt.as((String, String))
+        let tramp_root = "/ssh:" ++ auth_part ++ ":/"
+        if s == tramp_root or rpath == "" or rpath == "/" {
+            return "/ssh:"
+        }
+        var trimmed_tr = rpath
+        if trimmed_tr.char_len() > 1 and trimmed_tr.ends_with("/") {
+            trimmed_tr = trimmed_tr.slice(0, trimmed_tr.char_len() - 1)
+        }
+        let n_tr = trimmed_tr.char_len()
+        var j = n_tr - 1
+        while j >= 0 {
+            if trimmed_tr.slice(j, j + 1) == "/" {
+                return "/ssh:" ++ auth_part ++ ":" ++ trimmed_tr.slice(0, j + 1)
+            }
+            j -= 1
+        }
+        return tramp_root
+    }
+    var trimmed = s
+    if trimmed.char_len() > 1 and (trimmed.ends_with("/") or trimmed.ends_with("\\")) {
+        trimmed = trimmed.slice(0, trimmed.char_len() - 1)
+    }
+    let n = trimmed.char_len()
+    var i = n - 1
+    while i >= 0 {
+        let ch = trimmed.slice(i, i + 1)
+        if ch == "/" or ch == "\\" {
+            return trimmed.slice(0, i + 1)
+        }
+        i -= 1
+    }
+    ""
+}
+
+-- Complete directory/file entries in `cwd` for `path_input`, prepending `insert_prefix`
+-- (empty `""` for `PromptKind.FilePath`, or `"<verb> "` for Stage 2 Ex file arguments).
+-- Preserves `"dir"` / `"file"` in `items` when `legacy_pair_detail == true` so `test_emacs` stays 100% intact!
+private fn build_path_candidates(
+    ctrl: MinibufferController,
+    path_input: String,
+    cwd: String,
+    insert_prefix: String,
+    legacy_pair_detail: bool,
+) -> (List, List, i64) {
+    if is_ssh_host_stage_input(path_input) {
+        return build_ssh_host_candidates(path_input, insert_prefix, legacy_pair_detail)
+    }
+    let remote_split_opt = split_remote_ssh_input(path_input)
+    let (raw_dir_prefix, dir_to_read, base_prefix) = if remote_split_opt != null {
+        remote_split_opt.as((String, String, String))
+    } else {
+        split_file_input(path_input, cwd)
+    }
+    let show_hidden = base_prefix.starts_with(".")
+    let label_prefix = insert_prefix ++ raw_dir_prefix
+    let prefix_offset = label_prefix.char_len()
+
+    let dir_entries = if remote_split_opt != null {
+        ensure_cached_remote_dir_entries(ctrl, dir_to_read, show_hidden)
+    } else {
+        ensure_cached_dir_entries(ctrl, dir_to_read)
+    }
+    if dir_entries.is_empty() {
+        return (List(), List(), 0)
+    }
+
+    let vis_entries = List()
+    let vis_names = List()
+    for i in 0..dir_entries.len() {
+        let ce = dir_entries.get(i.as(usize)).as(CachedDirEntry)
+        if show_hidden or (not ce.ename.starts_with(".")) {
+            vis_entries.push(ce)
+            vis_names.push(ce.ename)
+        }
+    }
+    if vis_names.is_empty() {
+        return (List(), List(), 0)
+    }
+
+    if base_prefix.trim() == "" {
+        let pairs = List()
+        let rich_list = List()
+        let take_n = if vis_entries.len() > MINIBUFFER_BATCH_CAP {
+            MINIBUFFER_BATCH_CAP
+        } else {
+            vis_entries.len()
+        }
+        for i in 0..take_n {
+            let ce = vis_entries.get(i.as(usize)).as(CachedDirEntry)
+            let suffix = if ce.dir_flag { "/" } else { "" }
+            let full_cand = label_prefix ++ ce.ename ++ suffix
+            let pair_det = if legacy_pair_detail {
+                if ce.dir_flag { "dir" } else { "file" }
+            } else {
+                ce.marg.trim()
+            }
+            pairs.push((full_cand, pair_det))
+            rich_list.push(MinibufferRichItem {
+                kind_badge: ce.kbadge,
+                badge_rgba: 0,
+                label: full_cand,
+                key_hint: "",
+                marginalia: ce.marg,
+                match_indices: List(),
+            })
+        }
+        return (pairs, rich_list, vis_entries.len())
+    }
+
+    let (total, hits) = accel_orderless_rank(base_prefix, vis_names, limit = MINIBUFFER_BATCH_CAP)
+    let scored = List()
+    for hi in 0..hits.len() {
+        let h = hits.get(hi.as(usize)).as(OrderlessHit)
+        let ce = vis_entries.get(h.index.as(usize)).as(CachedDirEntry)
+        let suffix = if ce.dir_flag { "/" } else { "" }
+        let full_cand = label_prefix ++ ce.ename ++ suffix
+        let pair_det = if legacy_pair_detail {
+            if ce.dir_flag { "dir" } else { "file" }
+        } else {
+            ce.marg.trim()
+        }
+        let eff_sc = if base_prefix.trim() == "" { 100 } else { h.score }
+        scored.push(RichScoredCandidate {
+            score: eff_sc,
+            is_dir: ce.dir_flag,
+            cand: full_cand,
+            detail: pair_det,
+            rich: MinibufferRichItem {
+                kind_badge: ce.kbadge,
+                badge_rgba: 0,
+                label: full_cand,
+                key_hint: "",
+                marginalia: ce.marg,
+                match_indices: shift_indices(h.positions, prefix_offset),
+            },
+        })
+    }
+
+    sort_rich_scored(scored)
+    unpack_rich_scored_with_total(scored, total)
+}
+
+private fn ordered_buffers_for_completion(world: EditorWorld, ctrl: MinibufferController) -> List {
+    let base_active = if ctrl.active { ctrl.orig_active_buf_id } else { world.active_buffer_id }
+    let ordered_ids = List()
+    let seen = Set.new()
+    for i in 0..ctrl.mru_buffers.len() {
+        let bid = ctrl.mru_buffers.get(i.as(usize)).as(BufferId)
+        if bid != base_active and world.buffers.contains_key(bid) and (not seen.contains(bid)) {
+            seen.insert(bid)
+            ordered_ids.push(bid)
+        }
+    }
+    var idx = world.buffer_order.len() - 1
+    while idx >= 0 {
+        let bid = world.buffer_order.get(idx.as(usize)).as(BufferId)
+        if bid != base_active and world.buffers.contains_key(bid) and (not seen.contains(bid)) {
+            seen.insert(bid)
+            ordered_ids.push(bid)
+        }
+        idx -= 1
+    }
+    if world.buffers.contains_key(base_active) and (not seen.contains(base_active)) {
+        ordered_ids.push(base_active)
+    }
+    ordered_ids
+}
+
+private fn build_buffer_candidates(
+    world: EditorWorld,
+    ctrl: MinibufferController,
+    query: String,
+    insert_prefix: String,
+) -> (List, List, i64) {
+    let q = query.trim()
+    let ordered_ids = ordered_buffers_for_completion(world, ctrl)
+    let pfx_len = insert_prefix.char_len()
+    if q == "" {
+        let pairs = List()
+        let rich_list = List()
+        for i in 0..ordered_ids.len() {
+            let bid = ordered_ids.get(i.as(usize)).as(BufferId)
+            let b = world.buffers.get(bid).as(Buffer)
+            let mod_tag = if b.modified { " [+]" } else { "" }
+            let pair_detail = b.major_mode ++ mod_tag
+            let path_part = if b.file_path != "" { "  " ++ b.file_path } else { "" }
+            let marg = (if b.modified { "[+] " } else { "" })
+                ++ b.line_count().to_string() ++ "L  "
+                ++ b.major_mode ++ path_part
+            let full_cand = insert_prefix ++ b.name
+            pairs.push((full_cand, pair_detail))
+            rich_list.push(MinibufferRichItem {
+                kind_badge: "[buf]",
+                badge_rgba: 0,
+                label: full_cand,
+                key_hint: "",
+                marginalia: marg,
+                match_indices: List(),
+            })
+        }
+        return (pairs, rich_list, pairs.len())
+    }
+
+    let bufs = List()
+    let bnames = List()
+    for i in 0..ordered_ids.len() {
+        let bid = ordered_ids.get(i.as(usize)).as(BufferId)
+        let b = world.buffers.get(bid).as(Buffer)
+        bufs.push(b)
+        bnames.push(b.name)
+    }
+    let (total, hits) = accel_orderless_rank(q, bnames, limit = MINIBUFFER_BATCH_CAP)
+    let scored = List()
+    for hi in 0..hits.len() {
+        let h = hits.get(hi.as(usize)).as(OrderlessHit)
+        let b = bufs.get(h.index.as(usize)).as(Buffer)
+        let mod_tag = if b.modified { " [+]" } else { "" }
+        let pair_detail = b.major_mode ++ mod_tag
+        let path_part = if b.file_path != "" { "  " ++ b.file_path } else { "" }
+        let marg = (if b.modified { "[+] " } else { "" })
+            ++ b.line_count().to_string() ++ "L  "
+            ++ b.major_mode ++ path_part
+        let full_cand = insert_prefix ++ b.name
+        scored.push(RichScoredCandidate {
+            score: h.score,
+            is_dir: false,
+            cand: full_cand,
+            detail: pair_detail,
+            rich: MinibufferRichItem {
+                kind_badge: "[buf]",
+                badge_rgba: 0,
+                label: full_cand,
+                key_hint: "",
+                marginalia: marg,
+                match_indices: shift_indices(h.positions, pfx_len),
+            },
+        })
+    }
+    sort_rich_scored(scored)
+    unpack_rich_scored_with_total(scored, total)
+}
+
+-- ============================================================================
+-- 5. Multi-Stage `:` Ex Verb & Context-Aware Argument Completion
+-- ============================================================================
+
+private fn split_ex_range_prefix(raw: String) -> (String, String) {
+    var s = raw
+    var leading_colon = ""
+    if s.starts_with(":") {
+        leading_colon = ":"
+        s = s.drop(1)
+    }
+    if s.starts_with("'<,'>") {
+        return (leading_colon ++ "'<,'>", s.drop(5))
+    }
+    let n = s.char_len()
+    var i: i64 = 0
+    while i < n {
+        let ch = s.slice(i, i + 1)
+        if ch.is_ascii_digit() or ch == "," or ch == ";" or ch == "." or ch == "$" {
+            i += 1
+        } else {
+            break
+        }
+    }
+    if i > 0 {
+        return (leading_colon ++ s.slice(0, i), s.slice(i, n))
+    }
+    if s.starts_with("%") and n > 1 and s != "%s" and (not s.starts_with("%s/")) {
+        return (leading_colon ++ "%", s.drop(1))
+    }
+    (leading_colon, s)
+}
+
+private fn normalize_ex_verb_base(raw_verb: String) -> String {
+    if raw_verb.ends_with("!") and raw_verb.char_len() > 1 {
+        return raw_verb.slice(0, raw_verb.char_len() - 1)
+    }
+    raw_verb
+}
+
+private fn is_ex_file_verb(v: String) -> bool {
+    v == "e" or v == "edit" or v == "w" or v == "write" or v == "sp" or v == "split"
+        or v == "vsp" or v == "vsplit" or v == "tabnew" or v == "cd"
+        or v == "Dirvish" or v == "Ranger" or v == "Ex" or v == "Explore"
+        or v == "Oil" or v == "saveas" or v == "r" or v == "read"
+        or v == "DiffFiles" or v == "RemoteBrowse" or v == "RemoteConnect" or v == "RemoteFiles"
+}
+
+private fn is_ex_buffer_verb(v: String) -> bool {
+    v == "b" or v == "buffer" or v == "bd" or v == "bdelete" or v == "sbuffer"
+}
+
+private fn is_ex_theme_verb(v: String) -> bool {
+    v == "colorscheme" or v == "colo" or v == "theme"
+}
+
+private fn is_ex_set_verb(v: String) -> bool {
+    v == "set" or v == "se"
+}
+
+private fn is_ex_telescope_verb(v: String) -> bool {
+    v == "Telescope" or v == "telescope"
+}
+
+private fn is_ex_help_verb(v: String) -> bool {
+    v == "h" or v == "help"
+}
+
+private fn is_ex_info_verb(v: String) -> bool {
+    v == "Info" or v == "info"
+}
+
+private fn is_ex_apropos_verb(v: String) -> bool {
+    v == "Apropos" or v == "apropos" or v == "AproposDocs" or v == "apropos-docs" or v == "apropos_docs"
+}
+
+private fn is_ex_shell_verb(v: String) -> bool {
+    v == "term" or v == "terminal" or v == "vterm"
+        or v == "TermSplit" or v == "TermVSplit" or v == "TermExec"
+}
+
+private fn ex_verb_expects_arg(raw_verb: String) -> bool {
+    let v = normalize_ex_verb_base(raw_verb)
+    if v == "w" or v == "write" {
+        -- `:w` is commonly executed without arguments; user types `:w ` for Stage 2 path completion.
+        return false
+    }
+    is_ex_file_verb(v) or is_ex_buffer_verb(v) or is_ex_theme_verb(v)
+        or is_ex_set_verb(v) or is_ex_telescope_verb(v)
+        or is_ex_help_verb(v) or is_ex_info_verb(v) or is_ex_apropos_verb(v)
+        or v == "term" or v == "terminal" or v == "vterm"
+}
+
+private fn builtin_ex_verbs() -> List {
+    [
+        ("w", "Write active buffer to disk  :w [file]"),
+        ("write", "Write active buffer to disk  :write [file]"),
+        ("q", "Quit active window or editor  :q"),
+        ("quit", "Quit active window or editor  :quit"),
+        ("q!", "Force quit discarding unsaved changes  :q!"),
+        ("wq", "Write buffer and quit  :wq [file]"),
+        ("x", "Write buffer if modified and quit  :x"),
+        ("qa", "Quit all windows  :qa"),
+        ("qall", "Quit all windows  :qall"),
+        ("qa!", "Force quit all discarding changes  :qa!"),
+        ("wqa", "Write all modified buffers and quit  :wqa"),
+        ("e", "Edit file or reload buffer  :e <path>"),
+        ("edit", "Edit file or reload buffer  :edit <path>"),
+        ("e!", "Reload current file discarding changes  :e!"),
+        ("b", "Switch to open buffer  :b <buffer>"),
+        ("buffer", "Switch to open buffer  :buffer <buffer>"),
+        ("bn", "Switch to next buffer  :bn"),
+        ("bnext", "Switch to next buffer  :bnext"),
+        ("bp", "Switch to previous buffer  :bp"),
+        ("bprev", "Switch to previous buffer  :bprev"),
+        ("bd", "Delete buffer  :bd [buffer]"),
+        ("bdelete", "Delete buffer  :bdelete [buffer]"),
+        ("bd!", "Force delete buffer discarding changes  :bd!"),
+        ("ls", "List all open buffers  :ls"),
+        ("buffers", "List all open buffers  :buffers"),
+        ("sp", "Split window horizontally  :sp [file]"),
+        ("split", "Split window horizontally  :split [file]"),
+        ("vsp", "Split window vertically  :vsp [file]"),
+        ("vsplit", "Split window vertically  :vsplit [file]"),
+        ("only", "Keep only active window pane  :only"),
+        ("close", "Close active window pane  :close"),
+        ("tabnew", "Open new workspace tab  :tabnew [file]"),
+        ("tabn", "Switch to next workspace tab  :tabn"),
+        ("tabnext", "Switch to next workspace tab  :tabnext"),
+        ("tabp", "Switch to previous workspace tab  :tabp"),
+        ("tabprev", "Switch to previous workspace tab  :tabprev"),
+        ("tabc", "Close active workspace tab  :tabc"),
+        ("tabclose", "Close active workspace tab  :tabclose"),
+        ("set", "Set or toggle editor option  :set <option>"),
+        ("colorscheme", "Switch color theme with live preview  :colorscheme <theme>"),
+        ("colo", "Switch color theme with live preview  :colo <theme>"),
+        ("theme", "Switch color theme with live preview  :theme <theme>"),
+        ("noh", "Clear search match highlighting  :noh"),
+        ("nohlsearch", "Clear search match highlighting  :nohlsearch"),
+        ("h", "[help]  Open Info manual / Helpful topic (:h <tag|cmd|opt>)"),
+        ("help", "[help]  Open Info manual / Helpful topic (:h <tag|cmd|opt>)"),
+        ("Info", "[help]  Browse Emacs Info hypertext manuals (:Info [node])"),
+        ("Apropos", "[help]  Search symbols, commands & options (:Apropos <query>)"),
+        ("AproposDocs", "[help]  Global full-text documentation search (:AproposDocs <query>)"),
+        ("marks", "Inspect local and global marks  :marks"),
+        ("registers", "Inspect Vim/Emacs registers  :registers"),
+        ("reg", "Inspect Vim/Emacs registers  :reg"),
+        ("jumps", "Inspect jump list locations  :jumps"),
+        ("changes", "Inspect buffer change history  :changes"),
+        ("undolist", "Inspect branching undo states  :undolist"),
+        ("undotree", "Open visual branching undo-tree  :undotree"),
+        ("cd", "Change editor working directory  :cd <dir>"),
+        ("pwd", "Print editor working directory  :pwd"),
+        ("Dirvish", "Open Dirvish directory navigator  :Dirvish [dir]"),
+        ("Ranger", "Open Ranger column file manager  :Ranger [dir]"),
+        ("Ex", "Explore directory in Dired  :Ex [dir]"),
+        ("Explore", "Explore directory in Dired  :Explore [dir]"),
+        ("Oil", "Edit filesystem directory as buffer  :Oil [dir]"),
+        ("term", "Open interactive terminal  :term [cmd]"),
+        ("terminal", "Open interactive terminal  :terminal [cmd]"),
+        ("vterm", "Open Emacs vterm buffer  :vterm [cmd]"),
+        ("TermSplit", "Open terminal in horizontal split  :TermSplit [cmd]"),
+        ("TermVSplit", "Open terminal in vertical split  :TermVSplit [cmd]"),
+        ("ToggleTerm", "Toggle persistent floating terminal  :ToggleTerm [id|cmd]"),
+        ("Lazy", "Open Lazy extension manager  :Lazy"),
+        ("Mason", "Open LSP preset & binary health dashboard  :Mason"),
+        ("LspInfo", "Inspect attached LSP clients & capabilities  :LspInfo"),
+        ("LspCheck", "Check 18-language LSP server presets on PATH  :LspCheck"),
+        ("LspConfig", "Open out-of-the-box LSP preset configuration panel  :LspConfig"),
+        ("LspStart", "Start or attach LSP server for active buffer  :LspStart"),
+        ("LspStop", "Stop attached LSP client session  :LspStop"),
+        ("LspRestart", "Restart LSP server for active buffer  :LspRestart"),
+        ("LspLog", "Inspect LSP JSON-RPC session logs  :LspLog"),
+        ("LspHover", "Show LSP hover documentation at cursor  :LspHover"),
+        ("LspDefinition", "Jump to LSP symbol definition  :LspDefinition"),
+        ("LspReferences", "Find LSP workspace references  :LspReferences"),
+        ("LspRename", "Rename symbol across workspace via LSP  :LspRename"),
+        ("LspCodeAction", "Run LSP code action at cursor  :LspCodeAction"),
+        ("LspSymbols", "Browse LSP document symbols  :LspSymbols"),
+        ("Telescope", "Open Telescope fuzzy picker  :Telescope <picker>"),
+        ("Neotree", "Toggle Neo-tree file explorer sidebar  :Neotree"),
+        ("Trouble", "Toggle Trouble diagnostics list  :Trouble"),
+        ("Aerial", "Toggle Aerial symbol outline sidebar  :Aerial"),
+        ("Magit", "Open Magit Git status dashboard  :Magit"),
+        ("Spectre", "Open Spectre project search & replace  :Spectre"),
+        ("Overseer", "Open Overseer task runner  :Overseer"),
+        ("ZenMode", "Toggle distraction-free Zen mode  :ZenMode"),
+        ("ConformFormat", "Format active buffer  :ConformFormat"),
+        ("TodoQuickFix", "Populate quickfix with TODO/FIXME items  :TodoQuickFix"),
+        ("s/%s", "Substitute pattern across line or buffer  :[%]s/pat/rep/g"),
+        ("%s/", "Substitute pattern across entire buffer  :%s/pat/rep/g"),
+    ]
+}
+
+private fn short_ext_badge(owner: ExtId) -> String {
+    let raw = owner.raw()
+    let slash_opt = raw.split_once("/")
+    if slash_opt != null {
+        let (_, name) = slash_opt.as((String, String))
+        return "[" ++ name ++ "]"
+    }
+    "[" ++ raw ++ "]"
+}
+
+private fn ensure_session_ex_stage1(
+    kernel: SystemKernel,
+    ctrl: MinibufferController,
+) -> (List, List) {
+    if ctrl.cached_ex_stage1 != null and ctrl.cached_ex_stage1_names != null {
+        return (ctrl.cached_ex_stage1.as(List), ctrl.cached_ex_stage1_names.as(List))
+    }
+    -- Collect `(verb_name, kind_badge, key_hint, marginalia, tier_bias)` once per prompt session
+    let catalog = List()
+    let vnames = List()
+    let seen = Set.new()
+
+    let builtins = builtin_ex_verbs()
+    for i in 0..builtins.len() {
+        let (vname, desc) = builtins.get(i.as(usize)).as((String, String))
+        if not seen.contains(vname) {
+            seen.insert(vname)
+            let vbadge = if desc.starts_with("[help]") { "[help]" } else { "[ex]" }
+            catalog.push((vname, vbadge, "", desc, 40))
+            vnames.push(vname)
+        }
+    }
+
+    let rev_keys = ensure_session_rev_keys(kernel, ctrl)
+
+    -- Single sorted command scan populates both `ex:<Name>` and interactive command caches!
+    let all_specs = collect_kernel_commands(kernel, false)
+    let inter_specs = List()
+    let inter_names = List()
+    for i in 0..all_specs.len() {
+        let sp = all_specs.get(i.as(usize)).as(CommandSpec)
+        if sp.interactive {
+            inter_specs.push(sp)
+            inter_names.push(sp.name)
+        }
+        if sp.name.starts_with("ex:") and sp.name.char_len() > 3 {
+            let clean_name = sp.name.drop(3)
+            let ext_tag = short_ext_badge(sp.owner)
+            let kh_opt = rev_keys.get(clean_name)
+            let kh = if kh_opt != null { kh_opt.as(String) } else { "" }
+            if not seen.contains(clean_name) {
+                seen.insert(clean_name)
+                catalog.push((clean_name, "[ex]", kh, ext_tag ++ "  " ++ sp.summary, 35))
+                vnames.push(clean_name)
+            }
+        }
+    }
+    if ctrl.cached_cmd_specs == null {
+        ctrl.cached_cmd_specs = inter_specs
+        ctrl.cached_cmd_names = inter_names
+    }
+
+    -- Interactive kernel commands as fallback commands with `[cmd]` badge & bound keychord pill
+    for i in 0..inter_specs.len() {
+        let sp = inter_specs.get(i.as(usize)).as(CommandSpec)
+        if not seen.contains(sp.name) {
+            seen.insert(sp.name)
+            let kh_opt = rev_keys.get(sp.name)
+            let kh = if kh_opt != null { kh_opt.as(String) } else { "" }
+            catalog.push((sp.name, "[cmd]", kh, sp.summary, 0))
+            vnames.push(sp.name)
+        }
+    }
+
+    ctrl.cached_ex_stage1 = catalog
+    ctrl.cached_ex_stage1_names = vnames
+    (catalog, vnames)
+}
+
+private fn build_ex_stage1_candidates(
+    kernel: SystemKernel,
+    ctrl: MinibufferController,
+    range_pfx: String,
+    verb_query: String,
+) -> (List, List, i64) {
+    let q = verb_query.trim()
+    if q == "" and range_pfx == "" and ctrl.cached_ex_empty != null {
+        return ctrl.cached_ex_empty.as((List, List, i64))
+    }
+    let (catalog, vnames) = ensure_session_ex_stage1(kernel, ctrl)
+    if q == "" {
+        let scored = List()
+        let hist = ctrl.history_list(PromptKind.ExCommand)
+        let has_hist = not hist.is_empty()
+        let scan_limit = if has_hist {
+            catalog.len()
+        } else if catalog.len() < MINIBUFFER_BATCH_CAP {
+            catalog.len()
+        } else {
+            MINIBUFFER_BATCH_CAP
+        }
+        for idx in 0..scan_limit {
+            let (vname, kbadge, khint, marg, bias) =
+                catalog.get(idx.as(usize)).as((String, String, String, String, i64))
+            let full_cand = range_pfx ++ vname
+            let rec_bonus = if has_hist {
+                history_recency_bonus(ctrl, PromptKind.ExCommand, full_cand)
+            } else {
+                0
+            }
+            if idx < MINIBUFFER_BATCH_CAP or rec_bonus > 0 {
+                scored.push(RichScoredCandidate {
+                    score: 100 + bias + rec_bonus,
+                    is_dir: false,
+                    cand: full_cand,
+                    detail: marg,
+                    rich: MinibufferRichItem {
+                        kind_badge: kbadge,
+                        badge_rgba: 0,
+                        label: full_cand,
+                        key_hint: khint,
+                        marginalia: marg,
+                        match_indices: List(),
+                    },
+                })
+            }
+        }
+        sort_rich_scored(scored)
+        let res = unpack_rich_scored_with_total(scored, catalog.len())
+        if range_pfx == "" {
+            ctrl.cached_ex_empty = res
+        }
+        return res
+    }
+
+    let pfx_len = range_pfx.char_len()
+    let (total, hits) = accel_orderless_rank(q, vnames, limit = MINIBUFFER_QUERY_CAP)
+    let scored = List()
+    for hi in 0..hits.len() {
+        let h = hits.get(hi.as(usize)).as(OrderlessHit)
+        let (vname, kbadge, khint, marg, bias) =
+            catalog.get(h.index.as(usize)).as((String, String, String, String, i64))
+        let full_cand = range_pfx ++ vname
+        let rec_bonus = history_recency_bonus(ctrl, PromptKind.ExCommand, full_cand)
+        scored.push(RichScoredCandidate {
+            score: h.score + bias + rec_bonus,
+            is_dir: false,
+            cand: full_cand,
+            detail: marg,
+            rich: MinibufferRichItem {
+                kind_badge: kbadge,
+                badge_rgba: 0,
+                label: full_cand,
+                key_hint: khint,
+                marginalia: marg,
+                match_indices: shift_indices(h.positions, pfx_len),
+            },
+        })
+    }
+    sort_rich_scored(scored)
+    unpack_rich_scored_with_total(scored, total)
+}
+
+private fn build_theme_arg_candidates(
+    ctrl: MinibufferController,
+    arg_query: String,
+    insert_prefix: String,
+) -> (List, List, i64) {
+    let orig_t = ctrl.orig_theme_name
+    let themes = [
+        ("catppuccin-mocha", "Soothing pastel dark mocha palette"),
+        ("gruvbox-dark", "Retro warm groove dark palette"),
+        ("one-dark", "Balanced Atom One Dark palette"),
+        ("solarized-light", "Precision warm daylight palette"),
+        ("tokyo-night", "Clean neon Tokyo Night dark palette"),
+        ("rose-pine", "Soho vibes muted pine dark palette"),
+        ("kanagawa", " Sumi-ink & wave-blue dark palette"),
+        ("nord", "Arctic north-bluish dark palette"),
+    ]
+    let q = arg_query.trim()
+    let pfx_len = insert_prefix.char_len()
+    if q == "" {
+        let pairs = List()
+        let rich_list = List()
+        for i in 0..themes.len() {
+            let (tname, desc) = themes.get(i.as(usize)).as((String, String))
+            let cur_tag = if tname == orig_t { "[active]  " } else { "" }
+            let marg = cur_tag ++ desc.trim()
+            let full_cand = insert_prefix ++ tname
+            pairs.push((full_cand, marg))
+            rich_list.push(MinibufferRichItem {
+                kind_badge: "[thm]",
+                badge_rgba: 0,
+                label: full_cand,
+                key_hint: "",
+                marginalia: marg,
+                match_indices: List(),
+            })
+        }
+        return (pairs, rich_list, pairs.len())
+    }
+
+    let scored = List()
+    for i in 0..themes.len() {
+        let (tname, desc) = themes.get(i.as(usize)).as((String, String))
+        let (sc, mpos) = score_candidate_with_positions(q, tname)
+        if sc >= 0 {
+            let cur_tag = if tname == orig_t { "[active]  " } else { "" }
+            let marg = cur_tag ++ desc.trim()
+            let full_cand = insert_prefix ++ tname
+            scored.push(RichScoredCandidate {
+                score: sc,
+                is_dir: false,
+                cand: full_cand,
+                detail: marg,
+                rich: MinibufferRichItem {
+                    kind_badge: "[thm]",
+                    badge_rgba: 0,
+                    label: full_cand,
+                    key_hint: "",
+                    marginalia: marg,
+                    match_indices: shift_indices(mpos, pfx_len),
+                },
+            })
+        }
+    }
+    sort_rich_scored(scored)
+    unpack_rich_scored(scored)
+}
+
+private fn build_set_option_candidates(
+    world: EditorWorld,
+    arg_text: String,
+    verb_prefix: String,
+) -> (List, List, i64) {
+    -- Support multiple space-separated options after `:set ` (e.g. `:set nonu tab`)
+    let n = arg_text.char_len()
+    var last_sp: i64 = -1
+    var i = n - 1
+    while i >= 0 {
+        if arg_text.slice(i, i + 1) == " " {
+            last_sp = i
+            break
+        }
+        i -= 1
+    }
+    let prior_opts = if last_sp >= 0 { arg_text.slice(0, last_sp + 1) } else { "" }
+    let opt_query = if last_sp >= 0 { arg_text.slice(last_sp + 1, n).trim() } else { arg_text.trim() }
+    let full_prefix = verb_prefix ++ prior_opts
+    let pfx_len = full_prefix.char_len()
+
+    let opts = world.options
+    let catalog = [
+        ("number", "number=" ++ opts.number.to_string(), "Show absolute line numbers"),
+        ("nonu", "number=" ++ opts.number.to_string(), "Hide absolute line numbers"),
+        ("relativenumber", "relativenumber=" ++ opts.relativenumber.to_string(), "Show relative line numbers"),
+        ("norelativenumber", "relativenumber=" ++ opts.relativenumber.to_string(), "Disable relative line numbers"),
+        ("wrap", "wrap=" ++ opts.wrap.to_string(), "Enable soft line wrapping"),
+        ("nowrap", "wrap=" ++ opts.wrap.to_string(), "Disable line wrapping"),
+        ("tabstop=4", "tabstop=" ++ opts.tabstop.to_string(), "Set tab display width to 4"),
+        ("tabstop=2", "tabstop=" ++ opts.tabstop.to_string(), "Set tab display width to 2"),
+        ("shiftwidth=4", "shiftwidth=" ++ opts.shiftwidth.to_string(), "Set auto-indent width to 4"),
+        ("shiftwidth=2", "shiftwidth=" ++ opts.shiftwidth.to_string(), "Set auto-indent width to 2"),
+        ("expandtab", "expandtab=" ++ opts.expandtab.to_string(), "Insert spaces instead of tabs"),
+        ("noexpandtab", "expandtab=" ++ opts.expandtab.to_string(), "Insert literal tab characters"),
+        ("ignorecase", "ignorecase=" ++ opts.ignorecase.to_string(), "Case-insensitive search"),
+        ("noignorecase", "ignorecase=" ++ opts.ignorecase.to_string(), "Case-sensitive search"),
+        ("smartcase", "smartcase=" ++ opts.smartcase.to_string(), "Override ignorecase when pattern has uppercase"),
+        ("cursorline", "cursorline=" ++ opts.cursorline.to_string(), "Highlight active cursor line"),
+        ("hlsearch", "hlsearch=" ++ opts.hlsearch.to_string(), "Highlight all search matches"),
+        ("nohlsearch", "hlsearch=" ++ opts.hlsearch.to_string(), "Disable search match highlight"),
+        ("incsearch", "incsearch=" ++ opts.incsearch.to_string(), "Live incremental search preview"),
+        ("scrolloff=5", "scrolloff=" ++ opts.scrolloff.to_string(), "Keep 5 context lines around cursor"),
+        ("theme=" ++ opts.theme_name, "theme=" ++ opts.theme_name, "Active editor color theme"),
+    ]
+
+    let scored = List()
+    for ci in 0..catalog.len() {
+        let (oname, live_val, desc) = catalog.get(ci.as(usize)).as((String, String, String))
+        let (sc, mpos) = if opt_query == "" {
+            (100 - ci, List())
+        } else {
+            score_candidate_with_positions(opt_query, oname)
+        }
+        if sc >= 0 {
+            let full_cand = full_prefix ++ oname
+            let marg = "[" ++ live_val ++ "]  " ++ desc
+            scored.push(RichScoredCandidate {
+                score: sc,
+                is_dir: false,
+                cand: full_cand,
+                detail: marg,
+                rich: MinibufferRichItem {
+                    kind_badge: "[opt]",
+                    badge_rgba: 0,
+                    label: full_cand,
+                    key_hint: "",
+                    marginalia: marg,
+                    match_indices: shift_indices(mpos, pfx_len),
+                },
+            })
+        }
+    }
+    sort_rich_scored(scored)
+    unpack_rich_scored(scored)
+}
+
+private fn build_static_subcmd_candidates(
+    entries: List,
+    badge: String,
+    arg_query: String,
+    verb_prefix: String,
+) -> (List, List, i64) {
+    let q = arg_query.trim()
+    let pfx_len = verb_prefix.char_len()
+    let scored = List()
+    for i in 0..entries.len() {
+        let (sub_name, desc) = entries.get(i.as(usize)).as((String, String))
+        let (sc, mpos) = if q == "" {
+            (100 - i, List())
+        } else {
+            score_candidate_with_positions(q, sub_name)
+        }
+        if sc >= 0 {
+            let full_cand = verb_prefix ++ sub_name
+            scored.push(RichScoredCandidate {
+                score: sc,
+                is_dir: false,
+                cand: full_cand,
+                detail: desc,
+                rich: MinibufferRichItem {
+                    kind_badge: badge,
+                    badge_rgba: 0,
+                    label: full_cand,
+                    key_hint: "",
+                    marginalia: desc,
+                    match_indices: shift_indices(mpos, pfx_len),
+                },
+            })
+        }
+    }
+    sort_rich_scored(scored)
+    unpack_rich_scored(scored)
+}
+
+private struct HelpDocNode {
+    node_id: String,
+    manual: String,
+    title: String,
+    level: i64,
+    file_path: String,
+    start_row: i64,
+    end_row: i64,
+    tags: List,
+    summary: String,
+}
+
+private struct HelpCatalogEntry {
+    topic: String,
+    kind_badge: String,
+    key_hint: String,
+    marginalia: String,
+    extra_search: String,
+    tier_bias: i64,
+}
+
+pub fn collect_help_doc_roots(world: EditorWorld) -> List {
+    let roots = List()
+    let cwd_docs = path.join(world.cwd, "docs")
+    if fs.exists(cwd_docs) and fs.is_dir(cwd_docs) {
+        roots.push(path.normalize(cwd_docs))
+    }
+    let isolated_marker = path.join(world.cwd, ".lava_isolated_doc_test")
+    if not fs.exists(isolated_marker) {
+        let lava_docs = "/home/fin/apps/lava/docs"
+        if fs.exists(lava_docs) and fs.is_dir(lava_docs) {
+            let norm_lava = path.normalize(lava_docs)
+            if not roots.contains(norm_lava) {
+                roots.push(norm_lava)
+            }
+        }
+        let nessa_docs = "/home/fin/nessa2/docs"
+        if fs.exists(nessa_docs) and fs.is_dir(nessa_docs) {
+            let norm_nessa = path.normalize(nessa_docs)
+            if not roots.contains(norm_nessa) {
+                roots.push(norm_nessa)
+            }
+        }
+    }
+    roots
+}
+
+private fn is_help_tag_char(ch: String) -> bool {
+    ch.is_alphanumeric() or ch == "-" or ch == "_" or ch == ":" or ch == "." or ch == "/"
+}
+
+private fn extract_help_star_tags(line: String, out: List) {
+    if not line.contains("*") {
+        return
+    }
+    let n = line.char_len()
+    var i: i64 = 0
+    while i < n {
+        let ch = line.slice(i, i + 1)
+        if ch == "*" {
+            if i + 1 < n and line.slice(i + 1, i + 2) == "*" {
+                i += 2
+                while i + 1 < n and (not (line.slice(i, i + 1) == "*" and line.slice(i + 1, i + 2) == "*")) {
+                    i += 1
+                }
+                i += 2
+                continue
+            }
+            let prev_ok = if i == 0 {
+                true
+            } else {
+                let p = line.slice(i - 1, i)
+                p == " " or p == "\t" or p == "(" or p == "[" or p == "`"
+            }
+            if prev_ok {
+                var j = i + 1
+                while j < n and is_help_tag_char(line.slice(j, j + 1)) {
+                    j += 1
+                }
+                let next_not_star = j + 1 >= n or line.slice(j + 1, j + 2) != "*"
+                if j > i + 1 and j < n and line.slice(j, j + 1) == "*" and next_not_star {
+                    let tag = line.slice(i + 1, j)
+                    if tag.char_len() >= 2 and (not out.contains(tag)) {
+                        out.push(tag)
+                    }
+                    i = j + 1
+                    continue
+                }
+            }
+        }
+        i += 1
+    }
+}
+
+private fn strip_trailing_help_tags(text: String) -> String {
+    var cur = text.trim()
+    while cur.ends_with("*") and (not cur.ends_with("**")) {
+        let n = cur.char_len()
+        if n < 4 {
+            break
+        }
+        var open_idx: i64 = n - 2
+        while open_idx >= 0 and cur.slice(open_idx, open_idx + 1) != "*" {
+            open_idx -= 1
+        }
+        if open_idx < 0 {
+            break
+        }
+        let cand = cur.slice(open_idx + 1, n - 1)
+        var valid = cand.char_len() >= 2
+        if valid {
+            for k in 0..cand.char_len() {
+                if not is_help_tag_char(cand.slice(k, k + 1)) {
+                    valid = false
+                    break
+                }
+            }
+        }
+        let ws_ok = open_idx == 0 or cur.slice(open_idx - 1, open_idx) == " " or cur.slice(open_idx - 1, open_idx) == "\t"
+        if valid and ws_ok {
+            cur = cur.slice(0, open_idx).trim_end()
+        } else {
+            break
+        }
+    }
+    cur.trim()
+}
+
+private fn slugify_help_title(title: String) -> String {
+    var slug = ""
+    var prev_dash = false
+    for i in 0..title.char_len() {
+        let ch = title.slice(i, i + 1)
+        if ch.is_alphanumeric() {
+            slug = slug ++ ch.to_lower()
+            prev_dash = false
+        } else if (not prev_dash) and slug != "" {
+            slug = slug ++ "-"
+            prev_dash = true
+        }
+    }
+    while slug.ends_with("-") {
+        slug = slug.slice(0, slug.char_len() - 1)
+    }
+    if slug == "" { "section" } else { slug }
+}
+
+private fn derive_help_manual_name(root: String, rel_path: String) -> String {
+    var stem = rel_path.replace("\\", "/")
+    if stem.ends_with(".md") {
+        stem = stem.slice(0, stem.char_len() - 3)
+    }
+    let norm_root = path.normalize(root)
+    if norm_root.contains("/nessa2/") or norm_root.ends_with("/nessa2/docs") {
+        return "nessa:" ++ stem
+    }
+    let base = path.file_name(norm_root) match {
+        b? => b,
+        null => "docs",
+    }
+    if base != "docs" {
+        let par = path.parent(norm_root) match {
+            p? => path.file_name(p) match {
+                pn? => pn,
+                null => base,
+            },
+            null => base,
+        }
+        return par ++ ":" ++ stem
+    }
+    stem
+}
+
+private fn parse_help_md_file(root: String, full_path: String, rel_path: String, out: List) {
+    let content! = fs.read_to_string(full_path) else {
+        return
+    }
+    let lines = content.replace("\r\n", "\n").split("\n")
+    if lines.is_empty() {
+        return
+    }
+    let manual = derive_help_manual_name(root, rel_path)
+    let headings = List()
+    var in_fence = false
+    for r in 0..lines.len() {
+        let ln = lines.get(r.as(usize)).as(String)
+        let t = ln.trim_start()
+        if t.starts_with("```") or t.starts_with("~~~") {
+            in_fence = not in_fence
+            continue
+        }
+        if in_fence {
+            continue
+        }
+        var hashes: i64 = 0
+        while hashes < t.char_len() and t.slice(hashes, hashes + 1) == "#" {
+            hashes += 1
+        }
+        if hashes >= 1 and hashes <= 3 and hashes < t.char_len() and t.slice(hashes, hashes + 1) == " " {
+            let raw_title = t.drop(hashes + 1).trim()
+            let htags = List()
+            extract_help_star_tags(raw_title, htags)
+            let clean = strip_trailing_help_tags(raw_title)
+            if clean != "" {
+                headings.push((r, hashes, clean, htags))
+            }
+        }
+    }
+    if headings.is_empty() {
+        let tags = List()
+        var summary = ""
+        for r in 0..lines.len() {
+            let ln = lines.get(r.as(usize)).as(String)
+            extract_help_star_tags(ln, tags)
+            let t = ln.trim()
+            if summary == "" and t != "" {
+                summary = t.take(120)
+            }
+        }
+        out.push(HelpDocNode {
+            node_id: manual ++ "#top",
+            manual: manual,
+            title: manual,
+            level: 1,
+            file_path: full_path,
+            start_row: 0,
+            end_row: lines.len() - 1,
+            tags: tags,
+            summary: summary,
+        })
+        return
+    }
+    let used = List()
+    for hi in 0..headings.len() {
+        let (srow, lvl, title, init_tags) = headings.get(hi.as(usize)).as((i64, i64, String, List))
+        let erow = if hi + 1 < headings.len() {
+            let (next_r, _, _, _) = headings.get((hi + 1).as(usize)).as((i64, i64, String, List))
+            if next_r > 0 { next_r - 1 } else { 0 }
+        } else {
+            lines.len() - 1
+        }
+        let slug = if hi == 0 and lvl == 1 { "top" } else { slugify_help_title(title) }
+        var nid = manual ++ "#" ++ slug
+        if used.contains(nid) {
+            nid = nid ++ "-" ++ (srow + 1).to_string()
+        }
+        used.push(nid)
+
+        let tags = List()
+        for ti in 0..init_tags.len() {
+            tags.push(init_tags.get(ti.as(usize)))
+        }
+        var summary = ""
+        var in_code = false
+        for r in srow..(erow + 1) {
+            let ln = lines.get(r.as(usize)).as(String)
+            let t = ln.trim()
+            if t.starts_with("```") or t.starts_with("~~~") {
+                in_code = not in_code
+                continue
+            }
+            if not in_code {
+                extract_help_star_tags(ln, tags)
+                if r > srow and summary == "" and t != "" and (not t.starts_with("#"))
+                    and (not t.starts_with("---")) and (not t.starts_with("|")) {
+                    let cleaned = strip_trailing_help_tags(t)
+                    if cleaned != "" {
+                        summary = cleaned.take(120)
+                    }
+                }
+            }
+        }
+        out.push(HelpDocNode {
+            node_id: nid,
+            manual: manual,
+            title: title,
+            level: lvl,
+            file_path: full_path,
+            start_row: srow,
+            end_row: erow,
+            tags: tags,
+            summary: summary,
+        })
+    }
+}
+
+private fn index_help_docs(doc_roots: List) -> List {
+    let raw! = runtime.host_call("accel_index_docs", [doc_roots]) else {
+        let seen = List()
+        let out = List()
+        for ri in 0..doc_roots.len() {
+            let root = doc_roots.get(ri.as(usize)).as(String)
+            if not fs.exists(root) {
+                continue
+            }
+            if fs.is_file(root) {
+                let norm = path.normalize(root)
+                if not seen.contains(norm) {
+                    seen.push(norm)
+                    let par = path.parent(norm) match {
+                        p? => p,
+                        null => ".",
+                    }
+                    let fname = path.file_name(norm) match {
+                        f? => f,
+                        null => norm,
+                    }
+                    parse_help_md_file(par, norm, fname, out)
+                }
+                continue
+            }
+            let walked! = fs.walk_dir(root, max_depth = 12, include_hidden = false) else {
+                continue
+            }
+            walked.sort_by(|a: Any, b: Any| a.as(String).cmp(b.as(String)))
+            for fi in 0..walked.len() {
+                let rel = walked.get(fi.as(usize)).as(String)
+                if (not rel.ends_with(".md"))
+                    or rel.starts_with("deprecated/") or rel.contains("/deprecated/")
+                    or rel.starts_with("TODO-jit/") or rel.contains("/TODO-jit/")
+                    or rel.starts_with(".git/") or rel.contains("/.git/")
+                    or rel.starts_with("target/") or rel.contains("/target/") {
+                    continue
+                }
+                let full = path.normalize(path.join(root, rel))
+                if not seen.contains(full) {
+                    seen.push(full)
+                    parse_help_md_file(root, full, rel, out)
+                }
+            }
+        }
+        return out
+    }
+    let arr = raw.as(List)
+    let out = List()
+    for i in 0..arr.len() {
+        let r = arr.get(i.as(usize)).as(List)
+        out.push(HelpDocNode {
+            node_id: r.get(0).as(String),
+            manual: r.get(1).as(String),
+            title: r.get(2).as(String),
+            level: r.get(3).as(i64),
+            file_path: r.get(4).as(String),
+            start_row: r.get(5).as(i64),
+            end_row: r.get(6).as(i64),
+            tags: r.get(7).as(List),
+            summary: r.get(8).as(String),
+        })
+    }
+    out
+}
+
+private fn ensure_session_doc_nodes(world: EditorWorld, ctrl: MinibufferController) -> List {
+    if ctrl.cached_doc_cwd == world.cwd and ctrl.cached_doc_nodes != null {
+        return ctrl.cached_doc_nodes.as(List)
+    }
+    let doc_roots = collect_help_doc_roots(world)
+    let nodes = index_help_docs(doc_roots)
+    ctrl.cached_doc_cwd = world.cwd
+    ctrl.cached_doc_nodes = nodes
+    ctrl.cached_help_catalog = null
+    ctrl.cached_info_catalog = null
+    nodes
+}
+
+private fn all_help_option_names() -> List {
+    [
+        "number",
+        "relativenumber",
+        "tabstop",
+        "shiftwidth",
+        "expandtab",
+        "ignorecase",
+        "smartcase",
+        "wrap",
+        "hlsearch",
+        "incsearch",
+        "scrolloff",
+        "sidescrolloff",
+        "cursorline",
+        "signcolumn",
+        "indent_guides",
+        "match_brackets",
+        "auto_indent",
+        "autopairs",
+        "clipboard_unnamedplus",
+        "mouse_enabled",
+        "zen_mode",
+        "zen_width",
+        "twilight_mode",
+        "format_on_save",
+        "theme_name",
+        "font_family",
+        "font_size_pt",
+        "cursor_blink",
+        "evil_mode",
+    ]
+}
+
+private fn ensure_session_help_catalog(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    ctrl: MinibufferController,
+) -> List {
+    let nodes = ensure_session_doc_nodes(world, ctrl)
+    let cmd_total = kernel.commands.len()
+    if ctrl.cached_help_catalog != null and ctrl.cached_help_cmd_count == cmd_total {
+        return ctrl.cached_help_catalog.as(List)
+    }
+    let catalog = List()
+    let seen_topics = Set.new()
+
+    -- 1. All `*help-tag*` anchors from `accel_index_docs(doc_roots)`
+    for ni in 0..nodes.len() {
+        let node = nodes.get(ni.as(usize)).as(HelpDocNode)
+        for ti in 0..node.tags.len() {
+            let tag = node.tags.get(ti.as(usize)).as(String)
+            let key = "tag:" ++ tag
+            if not seen_topics.contains(key) {
+                seen_topics.insert(key)
+                let marg = "[tag]  " ++ node.manual ++ " — " ++ node.title
+                catalog.push(HelpCatalogEntry {
+                    topic: tag,
+                    kind_badge: "[tag]",
+                    key_hint: "",
+                    marginalia: marg,
+                    extra_search: "*" ++ tag ++ "* " ++ node.manual ++ " " ++ node.title,
+                    tier_bias: 50,
+                })
+            }
+        }
+    }
+
+    -- 2. All manual `node_id`s (`manual#slug`)
+    for ni in 0..nodes.len() {
+        let node = nodes.get(ni.as(usize)).as(HelpDocNode)
+        let key = "info:" ++ node.node_id
+        if not seen_topics.contains(key) {
+            seen_topics.insert(key)
+            let marg = "[info] " ++ node.title
+            catalog.push(HelpCatalogEntry {
+                topic: node.node_id,
+                kind_badge: "[info]",
+                key_hint: "",
+                marginalia: marg,
+                extra_search: node.title ++ " " ++ node.manual ++ " " ++ node.summary,
+                tier_bias: 30,
+            })
+        }
+    }
+
+    -- 3. All registered commands (`kernel.list_commands()`)
+    let rev_keys = ensure_session_rev_keys(kernel, ctrl)
+    let specs = collect_kernel_commands(kernel, false)
+    for ci in 0..specs.len() {
+        let sp = specs.get(ci.as(usize)).as(CommandSpec)
+        let key = "cmd:" ++ sp.name
+        if not seen_topics.contains(key) {
+            seen_topics.insert(key)
+            let kh_opt = rev_keys.get(sp.name)
+            let chord = if kh_opt != null { kh_opt.as(String) } else { "" }
+            let chord_seg = if chord != "" { chord ++ "  " } else { "" }
+            let marg = "[cmd]  " ++ chord_seg ++ sp.summary
+            catalog.push(HelpCatalogEntry {
+                topic: sp.name,
+                kind_badge: "[cmd]",
+                key_hint: chord,
+                marginalia: marg,
+                extra_search: chord ++ " " ++ sp.summary,
+                tier_bias: 20,
+            })
+        }
+    }
+
+    -- 4. All editor option names
+    let opt_names = all_help_option_names()
+    for oi in 0..opt_names.len() {
+        let oname = opt_names.get(oi.as(usize)).as(String)
+        let key = "opt:" ++ oname
+        if not seen_topics.contains(key) {
+            seen_topics.insert(key)
+            catalog.push(HelpCatalogEntry {
+                topic: oname,
+                kind_badge: "[opt]",
+                key_hint: "",
+                marginalia: "[opt]  editor option",
+                extra_search: "editor option " ++ oname,
+                tier_bias: 15,
+            })
+        }
+    }
+
+    ctrl.cached_help_catalog = catalog
+    ctrl.cached_help_cmd_count = cmd_total
+    catalog
+}
+
+private fn ensure_session_info_catalog(
+    world: EditorWorld,
+    ctrl: MinibufferController,
+) -> List {
+    let nodes = ensure_session_doc_nodes(world, ctrl)
+    if ctrl.cached_info_catalog != null {
+        return ctrl.cached_info_catalog.as(List)
+    }
+    let catalog = List()
+    let seen = Set.new()
+
+    seen.insert("(dir)Top")
+    catalog.push(HelpCatalogEntry {
+        topic: "(dir)Top",
+        kind_badge: "[info]",
+        key_hint: "",
+        marginalia: "[info] Directory — Top-level Info manual directory",
+        extra_search: "dir top directory manuals index",
+        tier_bias: 60,
+    })
+
+    for ni in 0..nodes.len() {
+        let node = nodes.get(ni.as(usize)).as(HelpDocNode)
+        if not seen.contains(node.manual) {
+            seen.insert(node.manual)
+            let sum_part = if node.summary != "" { " — " ++ node.summary } else { "" }
+            catalog.push(HelpCatalogEntry {
+                topic: node.manual,
+                kind_badge: "[info]",
+                key_hint: "",
+                marginalia: "[info] " ++ node.title ++ sum_part,
+                extra_search: node.title ++ " " ++ node.summary,
+                tier_bias: 45,
+            })
+        }
+    }
+
+    for ni in 0..nodes.len() {
+        let node = nodes.get(ni.as(usize)).as(HelpDocNode)
+        if not seen.contains(node.node_id) {
+            seen.insert(node.node_id)
+            let sum_part = if node.summary != "" { " — " ++ node.summary } else { "" }
+            catalog.push(HelpCatalogEntry {
+                topic: node.node_id,
+                kind_badge: "[info]",
+                key_hint: "",
+                marginalia: "[info] " ++ node.title ++ sum_part,
+                extra_search: node.manual ++ " " ++ node.title ++ " " ++ node.summary,
+                tier_bias: 35,
+            })
+        }
+    }
+
+    ctrl.cached_info_catalog = catalog
+    catalog
+}
+
+private fn strip_star_query_tokens(q: String) -> String {
+    if not q.contains("*") {
+        return q
+    }
+    let parts = q.split(" ")
+    let out = List()
+    for i in 0..parts.len() {
+        let p = parts.get(i.as(usize)).as(String)
+        if p.char_len() >= 3 and p.starts_with("*") and p.ends_with("*") {
+            out.push(p.slice(1, p.char_len() - 1))
+        } else if p.char_len() >= 2 and p.starts_with("*") {
+            out.push(p.drop(1))
+        } else if p.char_len() >= 2 and p.ends_with("*") {
+            out.push(p.slice(0, p.char_len() - 1))
+        } else {
+            out.push(p)
+        }
+    }
+    out.join(" ")
+}
+
+private fn score_help_catalog_entries(
+    catalog: List,
+    arg_query: String,
+    insert_prefix: String,
+) -> (List, List, i64) {
+    let q = arg_query.trim()
+    let norm_q = strip_star_query_tokens(q)
+    let pfx_len = insert_prefix.char_len()
+    let scored = List()
+
+    if q == "" {
+        let cap = if catalog.len() < MINIBUFFER_BATCH_CAP {
+            catalog.len()
+        } else {
+            MINIBUFFER_BATCH_CAP
+        }
+        for i in 0..cap {
+            let e = catalog.get(i.as(usize)).as(HelpCatalogEntry)
+            let full_cand = insert_prefix ++ e.topic
+            scored.push(RichScoredCandidate {
+                score: 500 + e.tier_bias * 10 - i,
+                is_dir: false,
+                cand: full_cand,
+                detail: e.marginalia,
+                rich: MinibufferRichItem {
+                    kind_badge: e.kind_badge,
+                    badge_rgba: 0,
+                    label: full_cand,
+                    key_hint: e.key_hint,
+                    marginalia: e.marginalia,
+                    match_indices: List(),
+                },
+            })
+        }
+        sort_rich_scored(scored)
+        return unpack_rich_scored_with_total(scored, catalog.len())
+    }
+
+    -- Fast native batch pass 1: match directly against topic strings
+    let topics = List()
+    for i in 0..catalog.len() {
+        topics.push(catalog.get(i.as(usize)).as(HelpCatalogEntry).topic)
+    }
+    let (direct_total, direct_hits) = accel_orderless_rank(norm_q, topics, limit = MINIBUFFER_QUERY_CAP)
+    let matched_idx = Set.new()
+    for hi in 0..direct_hits.len() {
+        let hit = direct_hits.get(hi.as(usize)).as(OrderlessHit)
+        matched_idx.insert(hit.index)
+        let e = catalog.get(hit.index.as(usize)).as(HelpCatalogEntry)
+        let full_cand = insert_prefix ++ e.topic
+        scored.push(RichScoredCandidate {
+            score: hit.score + e.tier_bias,
+            is_dir: false,
+            cand: full_cand,
+            detail: e.marginalia,
+            rich: MinibufferRichItem {
+                kind_badge: e.kind_badge,
+                badge_rgba: 0,
+                label: full_cand,
+                key_hint: e.key_hint,
+                marginalia: e.marginalia,
+                match_indices: shift_indices(hit.positions, pfx_len),
+            },
+        })
+    }
+
+    var grand_total = direct_total
+    -- Only run composite fallback pass when direct topic matches are sparse (< 12)
+    if direct_hits.len() < 12 {
+        let comp_strings = List()
+        let comp_map = List()
+        for i in 0..catalog.len() {
+            if not matched_idx.contains(i) {
+                let e = catalog.get(i.as(usize)).as(HelpCatalogEntry)
+                comp_strings.push(e.topic ++ " " ++ e.kind_badge ++ " " ++ e.extra_search)
+                comp_map.push(i)
+            }
+        }
+        if not comp_strings.is_empty() {
+            let (comp_total, comp_hits) = accel_orderless_rank(norm_q, comp_strings, limit = 24)
+            grand_total += comp_total
+            for hi in 0..comp_hits.len() {
+                let hit = comp_hits.get(hi.as(usize)).as(OrderlessHit)
+                let orig_i = comp_map.get(hit.index.as(usize)).as(i64)
+                let e = catalog.get(orig_i.as(usize)).as(HelpCatalogEntry)
+                let full_cand = insert_prefix ++ e.topic
+                let topic_positions = dedup_sorted_indices(hit.positions, e.topic.char_len())
+                scored.push(RichScoredCandidate {
+                    score: (hit.score / 2) + e.tier_bias,
+                    is_dir: false,
+                    cand: full_cand,
+                    detail: e.marginalia,
+                    rich: MinibufferRichItem {
+                        kind_badge: e.kind_badge,
+                        badge_rgba: 0,
+                        label: full_cand,
+                        key_hint: e.key_hint,
+                        marginalia: e.marginalia,
+                        match_indices: shift_indices(topic_positions, pfx_len),
+                    },
+                })
+            }
+        }
+    }
+
+    sort_rich_scored(scored)
+    unpack_rich_scored_with_total(scored, grand_total)
+}
+
+private fn build_ex_candidates(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    ctrl: MinibufferController,
+    input_text: String,
+) -> (List, List, i64) {
+    let (range_pfx, rest) = split_ex_range_prefix(input_text)
+    let sp_opt = rest.split_once(" ")
+    if sp_opt == null {
+        return build_ex_stage1_candidates(kernel, ctrl, range_pfx, rest)
+    }
+
+    let (raw_verb, arg_part) = sp_opt.as((String, String))
+    let v = normalize_ex_verb_base(raw_verb)
+    let verb_prefix = range_pfx ++ raw_verb ++ " "
+
+    if is_ex_file_verb(v) {
+        if v == "DiffFiles" and arg_part.contains(" ") {
+            let sp_hits = arg_part.find_indices(" ")
+            let last_sp = sp_hits.get((sp_hits.len() - 1).as(usize)).as(i64)
+            let sub_pfx = verb_prefix ++ arg_part.slice(0, last_sp + 1)
+            let sub_arg = arg_part.slice(last_sp + 1, arg_part.char_len())
+            return build_path_candidates(ctrl, sub_arg, world.cwd, sub_pfx, false)
+        }
+        return build_path_candidates(ctrl, arg_part, world.cwd, verb_prefix, false)
+    }
+    if is_ex_buffer_verb(v) {
+        return build_buffer_candidates(world, ctrl, arg_part, verb_prefix)
+    }
+    if is_ex_theme_verb(v) {
+        return build_theme_arg_candidates(ctrl, arg_part, verb_prefix)
+    }
+    if is_ex_set_verb(v) {
+        return build_set_option_candidates(world, arg_part, verb_prefix)
+    }
+    if is_ex_help_verb(v) or is_ex_apropos_verb(v) {
+        let help_cat = ensure_session_help_catalog(kernel, world, ctrl)
+        return score_help_catalog_entries(help_cat, arg_part, verb_prefix)
+    }
+    if is_ex_info_verb(v) {
+        let info_cat = ensure_session_info_catalog(world, ctrl)
+        return score_help_catalog_entries(info_cat, arg_part, verb_prefix)
+    }
+    if is_ex_telescope_verb(v) {
+        let pickers = [
+            ("find_files", "Fuzzy find workspace files"),
+            ("files", "Fuzzy find workspace files"),
+            ("live_grep", "Search project text with ripgrep"),
+            ("buffers", "Switch open buffers with preview"),
+            ("symbols", "Jump to symbols in active buffer"),
+            ("help_tags", "Search self-documenting help tags & manuals"),
+            ("docs", "Global Orderless full-text documentation search"),
+            ("commands", "Fuzzy search & execute registered commands"),
+            ("oldfiles", "Browse recently opened files"),
+            ("keymaps", "Inspect active key bindings"),
+            ("diagnostics", "Jump to buffer/workspace diagnostics"),
+            ("git_status", "Inspect modified Git files"),
+            ("colorscheme", "Switch color theme with live preview"),
+            ("resume", "Resume previous Telescope picker session"),
+        ]
+        return build_static_subcmd_candidates(pickers, "[tel]", arg_part, verb_prefix)
+    }
+    if is_ex_shell_verb(v) or v == "ToggleTerm" {
+        let shells = [
+            ("/bin/bash", "GNU Bourne-Again SHell"),
+            ("/bin/sh", "POSIX standard shell"),
+            ("zsh", "Z shell interactive session"),
+            ("fish", "Friendly interactive shell"),
+            ("htop", "Interactive process viewer"),
+            ("git status", "Check working tree Git status"),
+            ("cargo test", "Run Rust workspace test suite"),
+        ]
+        return build_static_subcmd_candidates(shells, "[sh]", arg_part, verb_prefix)
+    }
+    (List(), List(), 0)
+}
+
+-- ============================================================================
+-- 6. Unified `compute_prompt_candidates` + Rich Metadata Builder
+-- ============================================================================
+
+private fn confirm_choices_of(req: PromptRequest) -> List {
+    let out = List()
+    if req.candidates.is_empty() {
+        out.push(("y", "yes"))
+        out.push(("n", "no"))
+        return out
+    }
+    for i in 0..req.candidates.len() {
+        let raw = req.candidates.get(i.as(usize))
+        if raw matches _: String {
+            let s = raw.as(String)
+            let hint = when {
+                s == "y" => "yes",
+                s == "n" => "no",
+                s == "!" => "replace all remaining",
+                s == "q" => "quit",
+                else => "confirm",
+            }
+            out.push((s, hint))
+        } else {
+            out.push(raw.as((String, String)))
+        }
+    }
+    out
+}
+
+private fn find_incsearch_forward(buf: Buffer, needle: String, orig: Pos, ignore_case: bool) -> ?Pos {
+    if needle == "" {
+        return null
+    }
+    let start_hits = buf.find_all_in_line(orig.row, needle, ignore_case)
+    for i in 0..start_hits.len() {
+        let (sc, _) = start_hits.get(i.as(usize)).as((i64, i64))
+        if sc >= orig.col {
+            return Pos.new(orig.row, sc)
+        }
+    }
+    buf.find_forward(needle, orig, ignore_case, true)
+}
+
+private fn find_incsearch_backward(buf: Buffer, needle: String, orig: Pos, ignore_case: bool) -> ?Pos {
+    if needle == "" {
+        return null
+    }
+    let start_hits = buf.find_all_in_line(orig.row, needle, ignore_case)
+    var idx = start_hits.len() - 1
+    while idx >= 0 {
+        let (sc, _) = start_hits.get(idx.as(usize)).as((i64, i64))
+        if sc <= orig.col {
+            return Pos.new(orig.row, sc)
+        }
+        idx -= 1
+    }
+    buf.find_backward(needle, orig, ignore_case, true)
+}
+
+private fn count_search_hits_rich(buf: Buffer, needle: String, ignore_case: bool) -> (List, List, i64) {
+    let previews = List()
+    let rich_list = List()
+    if needle == "" {
+        return (previews, rich_list, 0)
+    }
+    buf.sync_external_lines()
+    let lo = buf.min_row()
+    let hi = buf.max_row()
+    let nlen = needle.char_len()
+    let pat = if ignore_case { needle.to_lower() } else { needle }
+    let (total, raw_previews) = accel_doc_search_preview(buf.doc_id, needle, lo, hi, ignore_case, 12)
+    for i in 0..raw_previews.len() {
+        let (r, sc, clipped) = raw_previews.get(i.as(usize)).as((i64, i64, String))
+        let loc = "L" ++ (r + 1).to_string() ++ ":" ++ (sc + 1).to_string()
+        let hay = if ignore_case { clipped.to_lower() } else { clipped }
+        let clip_hits = hay.find_indices(pat)
+        let mpos = if not clip_hits.is_empty() {
+            let h0 = clip_hits.get(0).as(i64)
+            make_range_indices(h0, h0 + nlen)
+        } else {
+            List()
+        }
+        previews.push((clipped, loc))
+        rich_list.push(MinibufferRichItem {
+            kind_badge: "[hit]",
+            badge_rgba: 0,
+            label: clipped,
+            key_hint: "",
+            marginalia: loc,
+            match_indices: mpos,
+        })
+    }
+    (previews, rich_list, total)
+}
+
+private fn enrich_custom_help_detail(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    ctrl: MinibufferController,
+    is_info_prompt: bool,
+    is_help_prompt: bool,
+    cand: String,
+    raw_detail: String,
+) -> String {
+    if raw_detail != "" {
+        return raw_detail
+    }
+    if is_info_prompt {
+        let info_cat = ensure_session_info_catalog(world, ctrl)
+        for i in 0..info_cat.len() {
+            let e = info_cat.get(i.as(usize)).as(HelpCatalogEntry)
+            if e.topic == cand {
+                return e.marginalia
+            }
+        }
+        return "[info] Info manual node"
+    }
+    if is_help_prompt {
+        let stripped = strip_star_query_tokens(cand)
+        let help_cat = ensure_session_help_catalog(kernel, world, ctrl)
+        for i in 0..help_cat.len() {
+            let e = help_cat.get(i.as(usize)).as(HelpCatalogEntry)
+            if e.topic == cand or e.topic == stripped {
+                return e.marginalia
+            }
+        }
+        return "[tag]  Help tag"
+    }
+    raw_detail
+}
+
+private fn compute_prompt_candidates_with_rich(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    ctrl: MinibufferController,
+    req: PromptRequest,
+    input_text: String,
+) -> (List, List, i64) {
+    req.kind match {
+        PromptKind.CommandName => {
+            let q = input_text.trim()
+            if q == "" and ctrl.cached_cmd_empty != null {
+                return ctrl.cached_cmd_empty.as((List, List, i64))
+            }
+            let (specs, cmd_names) = ensure_session_interactive_commands(kernel, ctrl)
+            let rev_keys = ensure_session_rev_keys(kernel, ctrl)
+            let scored = List()
+            if q == "" {
+                let hist = ctrl.history_list(PromptKind.CommandName)
+                let has_hist = not hist.is_empty()
+                let scan_limit = if has_hist {
+                    specs.len()
+                } else if specs.len() < MINIBUFFER_BATCH_CAP {
+                    specs.len()
+                } else {
+                    MINIBUFFER_BATCH_CAP
+                }
+                for i in 0..scan_limit {
+                    let sp = specs.get(i.as(usize)).as(CommandSpec)
+                    let rec_bonus = if has_hist {
+                        history_recency_bonus(ctrl, PromptKind.CommandName, sp.name)
+                    } else {
+                        0
+                    }
+                    if i < MINIBUFFER_BATCH_CAP or rec_bonus > 0 {
+                        let kh_opt = rev_keys.get(sp.name)
+                        let khint = if kh_opt != null { kh_opt.as(String) } else { "" }
+                        let marg = if rec_bonus > 0 { "[recent]  " ++ sp.summary } else { sp.summary }
+                        scored.push(RichScoredCandidate {
+                            score: 100 + rec_bonus,
+                            is_dir: false,
+                            cand: sp.name,
+                            detail: sp.summary,
+                            rich: MinibufferRichItem {
+                                kind_badge: "[cmd]",
+                                badge_rgba: 0,
+                                label: sp.name,
+                                key_hint: khint,
+                                marginalia: marg,
+                                match_indices: List(),
+                            },
+                        })
+                    }
+                }
+                sort_rich_scored(scored)
+                let res = unpack_rich_scored_with_total(scored, specs.len())
+                ctrl.cached_cmd_empty = res
+                return res
+            }
+            let (raw_total, hits) = accel_orderless_rank(q, cmd_names, limit = MINIBUFFER_QUERY_CAP)
+            for hi in 0..hits.len() {
+                let hit = hits.get(hi.as(usize)).as(OrderlessHit)
+                let sp = specs.get(hit.index.as(usize)).as(CommandSpec)
+                let rec_bonus = history_recency_bonus(ctrl, PromptKind.CommandName, sp.name)
+                let kh_opt = rev_keys.get(sp.name)
+                let khint = if kh_opt != null { kh_opt.as(String) } else { "" }
+                let marg = if rec_bonus > 0 { "[recent]  " ++ sp.summary } else { sp.summary }
+                scored.push(RichScoredCandidate {
+                    score: hit.score + rec_bonus,
+                    is_dir: false,
+                    cand: sp.name,
+                    detail: sp.summary,
+                    rich: MinibufferRichItem {
+                        kind_badge: "[cmd]",
+                        badge_rgba: 0,
+                        label: sp.name,
+                        key_hint: khint,
+                        marginalia: marg,
+                        match_indices: hit.positions,
+                    },
+                })
+            }
+            sort_rich_scored(scored)
+            unpack_rich_scored_with_total(scored, raw_total)
+        },
+        PromptKind.BufferName => {
+            build_buffer_candidates(world, ctrl, input_text, "")
+        },
+        PromptKind.FilePath => {
+            build_path_candidates(ctrl, input_text, world.cwd, "", true)
+        },
+        PromptKind.ExCommand => {
+            build_ex_candidates(kernel, world, ctrl, input_text)
+        },
+        PromptKind.Choice => {
+            let label_low = req.label.to_lower()
+            if req.candidates.is_empty() {
+                if label_low == "info-node" or label_low.contains("info node") or label_low.starts_with("info:") {
+                    let info_cat = ensure_session_info_catalog(world, ctrl)
+                    return score_help_catalog_entries(info_cat, input_text, "")
+                }
+                if label_low == "help-tag" or label_low.contains("help tag") or label_low.contains("help topic") {
+                    let help_cat = ensure_session_help_catalog(kernel, world, ctrl)
+                    return score_help_catalog_entries(help_cat, input_text, "")
+                }
+            }
+            let q = input_text.trim()
+            let is_theme_choice = label_low.contains("theme")
+            let is_info_choice = label_low == "info-node" or label_low.contains("info node") or label_low.starts_with("info:")
+            let is_help_choice = label_low == "help-tag" or label_low.contains("help tag") or label_low.contains("help topic")
+            let default_badge = when {
+                is_theme_choice => "[thm]",
+                is_info_choice or label_low.contains("info") => "[info]",
+                is_help_choice or label_low.contains("help") or label_low.contains("tag") => "[tag]",
+                label_low.contains("apropos") => "[help]",
+                else => "[sel]",
+            }
+            if q == "" {
+                let pairs = List()
+                let rich_list = List()
+                let cap = if req.candidates.len() < MINIBUFFER_BATCH_CAP {
+                    req.candidates.len()
+                } else {
+                    MINIBUFFER_BATCH_CAP
+                }
+                for i in 0..cap {
+                    let raw = req.candidates.get(i.as(usize))
+                    let (c, d) = if raw matches _: String {
+                        let s = raw.as(String)
+                        (s, enrich_custom_help_detail(kernel, world, ctrl, is_info_choice, is_help_choice, s, ""))
+                    } else {
+                        let (s, d0) = raw.as((String, String))
+                        (s, enrich_custom_help_detail(kernel, world, ctrl, is_info_choice, is_help_choice, s, d0))
+                    }
+                    let marg = if is_theme_choice and d == "" and c == ctrl.orig_theme_name {
+                        "[active]"
+                    } else {
+                        d
+                    }
+                    let row_badge = if d.starts_with("[tag]") {
+                        "[tag]"
+                    } else if d.starts_with("[info]") {
+                        "[info]"
+                    } else if d.starts_with("[cmd]") {
+                        "[cmd]"
+                    } else if d.starts_with("[opt]") {
+                        "[opt]"
+                    } else {
+                        default_badge
+                    }
+                    pairs.push((c, d))
+                    rich_list.push(MinibufferRichItem {
+                        kind_badge: row_badge,
+                        badge_rgba: 0,
+                        label: c,
+                        key_hint: "",
+                        marginalia: marg,
+                        match_indices: List(),
+                    })
+                }
+                return (pairs, rich_list, req.candidates.len())
+            }
+            let cand_names = List()
+            let cand_raw_details = List()
+            for i in 0..req.candidates.len() {
+                let raw = req.candidates.get(i.as(usize))
+                if raw matches _: String {
+                    cand_names.push(raw.as(String))
+                    cand_raw_details.push("")
+                } else {
+                    let (s, d0) = raw.as((String, String))
+                    cand_names.push(s)
+                    cand_raw_details.push(d0)
+                }
+            }
+            let (raw_total, hits) = accel_orderless_rank(q, cand_names, limit = MINIBUFFER_BATCH_CAP)
+            let scored = List()
+            for hi in 0..hits.len() {
+                let hit = hits.get(hi.as(usize)).as(OrderlessHit)
+                let c = cand_names.get(hit.index.as(usize)).as(String)
+                let d0 = cand_raw_details.get(hit.index.as(usize)).as(String)
+                let d = enrich_custom_help_detail(kernel, world, ctrl, is_info_choice, is_help_choice, c, d0)
+                let rec_bonus = history_recency_bonus(ctrl, PromptKind.Choice, c)
+                let row_badge = if d.starts_with("[tag]") {
+                    "[tag]"
+                } else if d.starts_with("[info]") {
+                    "[info]"
+                } else if d.starts_with("[cmd]") {
+                    "[cmd]"
+                } else if d.starts_with("[opt]") {
+                    "[opt]"
+                } else {
+                    default_badge
+                }
+                scored.push(RichScoredCandidate {
+                    score: hit.score + rec_bonus,
+                    is_dir: false,
+                    cand: c,
+                    detail: d,
+                    rich: MinibufferRichItem {
+                        kind_badge: row_badge,
+                        badge_rgba: 0,
+                        label: c,
+                        key_hint: "",
+                        marginalia: d,
+                        match_indices: hit.positions,
+                    },
+                })
+            }
+            sort_rich_scored(scored)
+            unpack_rich_scored_with_total(scored, raw_total)
+        },
+        PromptKind.Confirm => {
+            let choices = confirm_choices_of(req)
+            let rich_list = List()
+            for i in 0..choices.len() {
+                let (ck, chint) = choices.get(i.as(usize)).as((String, String))
+                rich_list.push(MinibufferRichItem {
+                    kind_badge: "[key]",
+                    badge_rgba: 0,
+                    label: ck,
+                    key_hint: ck,
+                    marginalia: chint,
+                    match_indices: List(),
+                })
+            }
+            (choices, rich_list, choices.len())
+        },
+        PromptKind.SearchForward => {
+            let buf = world.active_buffer()
+            let ic = world.effective_ignore_case(input_text)
+            count_search_hits_rich(buf, input_text, ic)
+        },
+        PromptKind.SearchBackward => {
+            let buf = world.active_buffer()
+            let ic = world.effective_ignore_case(input_text)
+            count_search_hits_rich(buf, input_text, ic)
+        },
+        _ => {
+            let label_low = req.label.to_lower()
+            if req.candidates.is_empty() {
+                if label_low == "info-node" or label_low.contains("info node") {
+                    let info_cat = ensure_session_info_catalog(world, ctrl)
+                    return score_help_catalog_entries(info_cat, input_text, "")
+                }
+                if label_low == "help-tag" or label_low.contains("help tag") {
+                    let help_cat = ensure_session_help_catalog(kernel, world, ctrl)
+                    return score_help_catalog_entries(help_cat, input_text, "")
+                }
+            }
+            let fallback_badge = when {
+                label_low == "info-node" or label_low.contains("info") => "[info]",
+                label_low == "help-tag" or label_low.contains("help") or label_low.contains("tag") => "[tag]",
+                label_low.contains("apropos") => "[help]",
+                else => "[txt]",
+            }
+            if not req.candidates.is_empty() {
+                let q = input_text.trim()
+                let cand_names = List()
+                let cand_details = List()
+                for i in 0..req.candidates.len() {
+                    let raw = req.candidates.get(i.as(usize))
+                    let pair: (String, String) = if raw matches _: String {
+                        (raw.as(String), "")
+                    } else if raw matches _: (String, String) {
+                        raw.as((String, String))
+                    } else {
+                        (raw.to_string(), "")
+                    }
+                    let (c, d) = pair
+                    cand_names.push(c)
+                    cand_details.push(d)
+                }
+                let scored = List()
+                if q == "" {
+                    let cap = if cand_names.len() < MINIBUFFER_BATCH_CAP {
+                        cand_names.len()
+                    } else {
+                        MINIBUFFER_BATCH_CAP
+                    }
+                    for i in 0..cap {
+                        let c = cand_names.get(i.as(usize)).as(String)
+                        let d = cand_details.get(i.as(usize)).as(String)
+                        let row_badge = if d.starts_with("[tag]") {
+                            "[tag]"
+                        } else if d.starts_with("[info]") {
+                            "[info]"
+                        } else if d.starts_with("[cmd]") {
+                            "[cmd]"
+                        } else if d.starts_with("[opt]") {
+                            "[opt]"
+                        } else {
+                            fallback_badge
+                        }
+                        scored.push(RichScoredCandidate {
+                            score: 1000 - i,
+                            is_dir: false,
+                            cand: c,
+                            detail: d,
+                            rich: MinibufferRichItem {
+                                kind_badge: row_badge,
+                                badge_rgba: 0,
+                                label: c,
+                                key_hint: "",
+                                marginalia: d,
+                                match_indices: List(),
+                            },
+                        })
+                    }
+                    sort_rich_scored(scored)
+                    return unpack_rich_scored_with_total(scored, cand_names.len())
+                }
+                let (raw_total, hits) = accel_orderless_rank(q, cand_names, limit = MINIBUFFER_BATCH_CAP)
+                for hi in 0..hits.len() {
+                    let hit = hits.get(hi.as(usize)).as(OrderlessHit)
+                    let c = cand_names.get(hit.index.as(usize)).as(String)
+                    let d = cand_details.get(hit.index.as(usize)).as(String)
+                    let row_badge = if d.starts_with("[tag]") {
+                        "[tag]"
+                    } else if d.starts_with("[info]") {
+                        "[info]"
+                    } else if d.starts_with("[cmd]") {
+                        "[cmd]"
+                    } else if d.starts_with("[opt]") {
+                        "[opt]"
+                    } else {
+                        fallback_badge
+                    }
+                    scored.push(RichScoredCandidate {
+                        score: hit.score,
+                        is_dir: false,
+                        cand: c,
+                        detail: d,
+                        rich: MinibufferRichItem {
+                            kind_badge: row_badge,
+                            badge_rgba: 0,
+                            label: c,
+                            key_hint: "",
+                            marginalia: d,
+                            match_indices: hit.positions,
+                        },
+                    })
+                }
+                sort_rich_scored(scored)
+                return unpack_rich_scored_with_total(scored, raw_total)
+            }
+            (List(), List(), 0)
+        },
+    }
+}
+
+pub fn compute_prompt_candidates(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    ctrl: MinibufferController,
+    req: PromptRequest,
+    input_text: String,
+) -> (List, i64) {
+    let (items, _, total) = compute_prompt_candidates_with_rich(kernel, world, ctrl, req, input_text)
+    (items, total)
+}
+
+-- ============================================================================
+-- 7. Consult Live Buffer/Theme Preview & Incremental Search Preview
+-- ============================================================================
+
+private fn ensure_row_visible_in_viewport(world: EditorWorld, row: i64) {
+    let rows = if world.viewport_rows > 2 { world.viewport_rows - 2 } else { 1 }
+    if row < world.viewport_top_row {
+        world.viewport_top_row = row
+    } else if row >= world.viewport_top_row + rows {
+        world.viewport_top_row = row - rows + 1
+    }
+}
+
+private fn restore_consult_previews(world: EditorWorld, ctrl: MinibufferController) {
+    if ctrl.buf_preview_active {
+        if world.buffers.contains_key(ctrl.orig_active_buf_id) {
+            world.active_buffer_id = ctrl.orig_active_buf_id
+        }
+        ctrl.buf_preview_active = false
+    }
+    if ctrl.theme_preview_active {
+        world.options.theme_name = ctrl.orig_theme_name
+        ctrl.theme_preview_active = false
+    }
+}
+
+private fn selected_candidate_text(ctrl: MinibufferController) -> ?String {
+    if ctrl.items.is_empty() or ctrl.selected_idx < 0 or ctrl.selected_idx >= ctrl.items.len() {
+        return null
+    }
+    let (cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
+    cand
+}
+
+private fn apply_consult_preview(world: EditorWorld, ctrl: MinibufferController) {
+    let kind = ctrl.request.kind
+
+    -- 1. `PromptKind.BufferName` Consult live buffer preview
+    if kind == PromptKind.BufferName and (not ctrl.request.label.to_lower().contains("kill")) {
+        let sel_opt = selected_candidate_text(ctrl)
+        if sel_opt != null and (ctrl.selection_touched or ctrl.input_text != ctrl.request.initial) {
+            let b_opt = world.find_buffer_by_name(sel_opt.as(String))
+            if b_opt != null {
+                world.active_buffer_id = b_opt.as(Buffer).id
+                ctrl.buf_preview_active = true
+                return
+            }
+        }
+        if ctrl.buf_preview_active and world.buffers.contains_key(ctrl.orig_active_buf_id) {
+            world.active_buffer_id = ctrl.orig_active_buf_id
+            ctrl.buf_preview_active = false
+        }
+        return
+    }
+
+    -- 2. `PromptKind.Choice` theme picker Consult live theme preview
+    if kind == PromptKind.Choice and ctrl.request.label.to_lower().contains("theme") {
+        let sel_opt = selected_candidate_text(ctrl)
+        if sel_opt != null and (ctrl.selection_touched or ctrl.input_text.trim() != "") {
+            world.options.theme_name = sel_opt.as(String)
+            ctrl.theme_preview_active = true
+            return
+        }
+        if ctrl.theme_preview_active {
+            world.options.theme_name = ctrl.orig_theme_name
+            ctrl.theme_preview_active = false
+        }
+        return
+    }
+
+    -- 3. `PromptKind.ExCommand` Stage 2 (`:b <buf>` and `:colorscheme <theme>`) Consult live preview
+    if kind == PromptKind.ExCommand {
+        let (range_pfx, rest) = split_ex_range_prefix(ctrl.input_text)
+        let sp_opt = rest.split_once(" ")
+        if sp_opt != null {
+            let (raw_verb, arg_part) = sp_opt.as((String, String))
+            let v = normalize_ex_verb_base(raw_verb)
+            let pfx_len = (range_pfx ++ raw_verb ++ " ").char_len()
+
+            if v == "b" or v == "buffer" or v == "sbuffer" {
+                if ctrl.theme_preview_active {
+                    world.options.theme_name = ctrl.orig_theme_name
+                    ctrl.theme_preview_active = false
+                }
+                let sel_opt = selected_candidate_text(ctrl)
+                if sel_opt != null and (ctrl.selection_touched or arg_part.trim() != "") {
+                    let cand_str = sel_opt.as(String)
+                    let bname = if cand_str.char_len() >= pfx_len { cand_str.drop(pfx_len) } else { cand_str }
+                    let b_opt = world.find_buffer_by_name(bname)
+                    if b_opt != null {
+                        world.active_buffer_id = b_opt.as(Buffer).id
+                        ctrl.buf_preview_active = true
+                        return
+                    }
+                }
+                if ctrl.buf_preview_active and world.buffers.contains_key(ctrl.orig_active_buf_id) {
+                    world.active_buffer_id = ctrl.orig_active_buf_id
+                    ctrl.buf_preview_active = false
+                }
+                return
+            }
+
+            if is_ex_theme_verb(v) {
+                if ctrl.buf_preview_active and world.buffers.contains_key(ctrl.orig_active_buf_id) {
+                    world.active_buffer_id = ctrl.orig_active_buf_id
+                    ctrl.buf_preview_active = false
+                }
+                let sel_opt = selected_candidate_text(ctrl)
+                if sel_opt != null and (ctrl.selection_touched or arg_part.trim() != "") {
+                    let cand_str = sel_opt.as(String)
+                    let tname = if cand_str.char_len() >= pfx_len { cand_str.drop(pfx_len) } else { cand_str }
+                    if tname != "" {
+                        world.options.theme_name = tname
+                        ctrl.theme_preview_active = true
+                        return
+                    }
+                }
+                if ctrl.theme_preview_active {
+                    world.options.theme_name = ctrl.orig_theme_name
+                    ctrl.theme_preview_active = false
+                }
+                return
+            }
+        }
+        restore_consult_previews(world, ctrl)
+    }
+}
+
+private fn apply_incsearch_preview(world: EditorWorld, ctrl: MinibufferController) {
+    let kind = ctrl.request.kind
+    if kind != PromptKind.SearchForward and kind != PromptKind.SearchBackward {
+        return
+    }
+    let pbid_opt = ctrl.preview_buf_id
+    let b_opt = if pbid_opt != null {
+        let pbid? = pbid_opt else {
+            return
+        }
+        world.buffer(pbid)
+    } else {
+        world.active_buffer()
+    }
+    if b_opt == null {
+        return
+    }
+    let buf = b_opt.as(Buffer)
+    if ctrl.input_text == "" {
+        buf.point = buf.clamp_pos(ctrl.preview_orig_point, insert_mode = true)
+        world.last_search = ctrl.preview_orig_last_search
+        world.search_highlight_active = ctrl.preview_orig_highlight
+        ensure_row_visible_in_viewport(world, buf.point.row)
+        return
+    }
+    world.last_search = ctrl.input_text
+    world.last_search_forward = (kind == PromptKind.SearchForward)
+    world.search_highlight_active = world.options.hlsearch
+    if not world.options.incsearch {
+        return
+    }
+    let ic = world.effective_ignore_case(ctrl.input_text)
+    let hit_opt = if kind == PromptKind.SearchForward {
+        find_incsearch_forward(buf, ctrl.input_text, ctrl.preview_orig_point, ic)
+    } else {
+        find_incsearch_backward(buf, ctrl.input_text, ctrl.preview_orig_point, ic)
+    }
+    if hit_opt != null {
+        let hit = hit_opt.as(Pos)
+        buf.point = buf.clamp_pos(hit, insert_mode = true)
+        ensure_row_visible_in_viewport(world, buf.point.row)
+    } else {
+        buf.point = buf.clamp_pos(ctrl.preview_orig_point, insert_mode = true)
+    }
+}
+
+private fn refresh_controller(kernel: SystemKernel, world: EditorWorld, ctrl: MinibufferController) {
+    let (items, rich_items, total) = compute_prompt_candidates_with_rich(
+        kernel, world, ctrl, ctrl.request, ctrl.input_text,
+    )
+    ctrl.items = items
+    ctrl.rich_items = rich_items
+    ctrl.total_matches = total
+    if ctrl.items.is_empty() {
+        ctrl.selected_idx = 0
+    } else if ctrl.selected_idx < 0 or ctrl.selected_idx >= ctrl.items.len() {
+        ctrl.selected_idx = 0
+    }
+    apply_incsearch_preview(world, ctrl)
+    apply_consult_preview(world, ctrl)
+    ctrl.sync_to_world(world)
+}
+
+-- ============================================================================
+-- 8. Opening Prompts, Editing Keys & Continuation Submission
+-- ============================================================================
+
+pub fn stroke_printable_text(stroke: KeyStroke) -> ?String {
+    if stroke.ctrl or stroke.alt or stroke.super_mod {
+        return null
+    }
+    if stroke.key == "Space" {
+        return " "
+    }
+    if stroke.key.char_len() == 1 {
+        return stroke.key
+    }
+    if stroke.text != "" and
+        stroke.key != "Return" and
+        stroke.key != "Tab" and
+        stroke.key != "BackSpace" and
+        stroke.key != "Escape" and
+        stroke.key != "Delete" {
+        return stroke.text
+    }
+    null
+}
+
+private fn common_candidate_prefix(items: List) -> String {
+    if items.is_empty() {
+        return ""
+    }
+    let (first_cand, _) = items.get(0).as((String, String))
+    var prefix = first_cand
+    for i in 1..items.len() {
+        let (other, _) = items.get(i.as(usize)).as((String, String))
+        let max_len = if prefix.char_len() < other.char_len() {
+            prefix.char_len()
+        } else {
+            other.char_len()
+        }
+        var k: i64 = 0
+        while k < max_len {
+            if prefix.slice(k, k + 1) != other.slice(k, k + 1) {
+                break
+            }
+            k += 1
+        }
+        prefix = prefix.slice(0, k)
+        if prefix == "" {
+            break
+        }
+    }
+    prefix
+}
+
+private fn backward_word_col_in_text(s: String, col: i64) -> i64 {
+    var i = if col > s.char_len() { s.char_len() } else { col }
+    if i <= 0 {
+        return 0
+    }
+    while i > 0 {
+        let ch = s.slice(i - 1, i)
+        if ch == " " or ch == "\t" or ch == "/" or ch == "-" or ch == "_" or ch == "." {
+            i -= 1
+        } else {
+            break
+        }
+    }
+    while i > 0 {
+        let ch = s.slice(i - 1, i)
+        if ch == " " or ch == "\t" or ch == "/" or ch == "-" or ch == "_" or ch == "." {
+            break
+        }
+        i -= 1
+    }
+    i
+}
+
+private fn ensure_controller_instance(kernel: SystemKernel) -> MinibufferController {
+    let existing_opt = kernel.service(SERVICE_MINIBUFFER)
+    if existing_opt != null {
+        return existing_opt.as(MinibufferController)
+    }
+    let fresh = MinibufferController.new()
+    kernel.publish_service(SERVICE_MINIBUFFER, ext_minibuffer_id(), fresh)
+    fresh
+}
+
+-- Initialize `MinibufferController`, `world.minibuffer_view`, and rich Marginalia state
+-- whenever any command suspends into `PromptTurn.Suspended(req, _)`.
+pub fn open_prompt_view(kernel: SystemKernel, req: PromptRequest) {
+    let world_opt = kernel.service(SERVICE_EDITOR_WORLD)
+    if world_opt == null {
+        return
+    }
+    let world = world_opt.as(EditorWorld)
+    let ctrl = ensure_controller_instance(kernel)
+    if ctrl.last_observed_active == null {
+        ctrl.note_buffer_visited(world.active_buffer_id)
+    }
+    ctrl.active = true
+    ctrl.request = req
+    ctrl.input_text = req.initial
+    ctrl.cursor_col = req.initial.char_len()
+    ctrl.selected_idx = 0
+    ctrl.selection_touched = false
+    ctrl.history_idx = -1
+    ctrl.saved_draft = req.initial
+    ctrl.orig_active_buf_id = world.active_buffer_id
+    ctrl.orig_theme_name = world.options.theme_name
+    ctrl.buf_preview_active = false
+    ctrl.theme_preview_active = false
+    ctrl.cached_path_dir = ""
+    ctrl.cached_path_entries = null
+    let cmd_total = kernel.commands.len()
+    if ctrl.cached_help_cmd_count != cmd_total {
+        ctrl.cached_rev_keys = null
+        ctrl.cached_cmd_specs = null
+        ctrl.cached_cmd_names = null
+        ctrl.cached_ex_stage1 = null
+        ctrl.cached_ex_stage1_names = null
+        ctrl.cached_ex_empty = null
+        ctrl.cached_cmd_empty = null
+        ctrl.cached_help_catalog = null
+        ctrl.cached_help_cmd_count = cmd_total
+    }
+    if ctrl.cached_doc_cwd != world.cwd {
+        ctrl.cached_doc_cwd = ""
+        ctrl.cached_doc_nodes = null
+        ctrl.cached_help_catalog = null
+        ctrl.cached_info_catalog = null
+    }
+
+    if req.kind == PromptKind.SearchForward or req.kind == PromptKind.SearchBackward {
+        let buf = world.active_buffer()
+        ctrl.preview_buf_id = buf.id
+        ctrl.preview_orig_point = buf.point
+        ctrl.preview_orig_last_search = world.last_search
+        ctrl.preview_orig_highlight = world.search_highlight_active
+    } else {
+        ctrl.preview_buf_id = null
+    }
+
+    refresh_controller(kernel, world, ctrl)
+}
+
+pub fn run_command_with_minibuffer(
+    kernel: SystemKernel,
+    name: String,
+    args: List,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String PromptTurn {
+    let turn = kernel.dispatch_command(name, args)#!
+    turn match {
+        PromptTurn.Suspended(req, _) => {
+            open_prompt_view(kernel, req)
+        },
+        PromptTurn.Completed(_) => {
+            let world_opt = kernel.service(SERVICE_EDITOR_WORLD)
+            if world_opt != null {
+                let w = world_opt.as(EditorWorld)
+                if kernel.active_prompt == null {
+                    clear_world_minibuffer(w)
+                }
+            }
+        },
+    }
+    turn
+}
+
+private fn submit_and_transition(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    ctrl: MinibufferController,
+    answer: ?String,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String Unit {
+    restore_consult_previews(world, ctrl)
+    if answer != null {
+        ctrl.record_history(ctrl.request.kind, answer.as(String))
+    }
+    ctrl.active = false
+    clear_world_minibuffer(world)
+    let turn = kernel.submit_prompt_answer(answer)#!
+    turn match {
+        PromptTurn.Suspended(next_req, _) => {
+            open_prompt_view(kernel, next_req)
+        },
+        PromptTurn.Completed(_) => {
+            ctrl.active = false
+            clear_world_minibuffer(world)
+        },
+    }
+    ()
+}
+
+private fn resolve_submitted_value(ctrl: MinibufferController, cwd: String) -> String {
+    let kind = ctrl.request.kind
+    if kind == PromptKind.CommandName or kind == PromptKind.BufferName {
+        if (not ctrl.items.is_empty()) and ctrl.selected_idx >= 0 and ctrl.selected_idx < ctrl.items.len() {
+            let (cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
+            return cand
+        }
+        return ctrl.input_text
+    }
+    if kind == PromptKind.Choice {
+        let is_apropos_prompt = ctrl.request.label.to_lower().contains("apropos")
+        if is_apropos_prompt and (not ctrl.selection_touched) {
+            return ctrl.input_text
+        }
+        if (not ctrl.items.is_empty()) and ctrl.selected_idx >= 0 and ctrl.selected_idx < ctrl.items.len() {
+            let (cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
+            return cand
+        }
+        return ctrl.input_text
+    }
+    if kind == PromptKind.FilePath {
+        let raw_path = if ctrl.selection_touched and (not ctrl.items.is_empty()) and
+            ctrl.selected_idx >= 0 and ctrl.selected_idx < ctrl.items.len() {
+            let (cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
+            cand
+        } else {
+            ctrl.input_text
+        }
+        if raw_path == "~" or raw_path.starts_with("~/") {
+            return expand_tilde_path(raw_path, cwd)
+        }
+        return raw_path
+    }
+    if kind == PromptKind.ExCommand {
+        -- CRITICAL Ex Submission Rule: when `selection_touched == false`, submit `ctrl.input_text` literally!
+        let chosen = if ctrl.selection_touched and (not ctrl.items.is_empty()) and
+            ctrl.selected_idx >= 0 and ctrl.selected_idx < ctrl.items.len() {
+            let (cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
+            cand
+        } else {
+            ctrl.input_text
+        }
+        -- Expand `~/` in file-taking Ex commands so `world.open_file` resolves `$HOME` cleanly
+        let (range_pfx, rest) = split_ex_range_prefix(chosen)
+        let sp_opt = rest.split_once(" ")
+        if sp_opt != null {
+            let (raw_verb, arg_part) = sp_opt.as((String, String))
+            let trimmed_arg = arg_part.trim()
+            if is_ex_file_verb(normalize_ex_verb_base(raw_verb)) and
+                (trimmed_arg == "~" or trimmed_arg.starts_with("~/")) {
+                return range_pfx ++ raw_verb ++ " " ++ expand_tilde_path(trimmed_arg, cwd)
+            }
+        }
+        return chosen
+    }
+    if kind == PromptKind.SearchForward or kind == PromptKind.SearchBackward {
+        if ctrl.input_text == "" and ctrl.preview_orig_last_search != "" {
+            return ctrl.preview_orig_last_search
+        }
+        return ctrl.input_text
+    }
+    if kind == PromptKind.FreeText {
+        if ctrl.selection_touched and (not ctrl.items.is_empty()) and
+            ctrl.selected_idx >= 0 and ctrl.selected_idx < ctrl.items.len() {
+            let (cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
+            return cand
+        }
+        return ctrl.input_text
+    }
+    ctrl.input_text
+}
+
+-- Handle Vertico parent-directory jump (`<C-l>` or `<M-BackSpace>`) when in a path context.
+private fn try_vertico_directory_up(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    ctrl: MinibufferController,
+) -> bool {
+    if ctrl.request.kind == PromptKind.FilePath {
+        let popped = vertico_up_directory(ctrl.input_text)
+        ctrl.input_text = popped
+        ctrl.cursor_col = popped.char_len()
+        ctrl.selection_touched = false
+        ctrl.selected_idx = 0
+        refresh_controller(kernel, world, ctrl)
+        return true
+    }
+    if ctrl.request.kind == PromptKind.ExCommand {
+        let (range_pfx, rest) = split_ex_range_prefix(ctrl.input_text)
+        let sp_opt = rest.split_once(" ")
+        if sp_opt != null {
+            let (raw_verb, arg_part) = sp_opt.as((String, String))
+            let v = normalize_ex_verb_base(raw_verb)
+            if is_ex_file_verb(v) {
+                if v == "DiffFiles" and arg_part.contains(" ") {
+                    let sp_hits = arg_part.find_indices(" ")
+                    let last_sp = sp_hits.get((sp_hits.len() - 1).as(usize)).as(i64)
+                    let sub_pfx = arg_part.slice(0, last_sp + 1)
+                    let sub_arg = arg_part.slice(last_sp + 1, arg_part.char_len())
+                    let popped = vertico_up_directory(sub_arg)
+                    ctrl.input_text = range_pfx ++ raw_verb ++ " " ++ sub_pfx ++ popped
+                } else {
+                    let popped = vertico_up_directory(arg_part)
+                    ctrl.input_text = range_pfx ++ raw_verb ++ " " ++ popped
+                }
+                ctrl.cursor_col = ctrl.input_text.char_len()
+                ctrl.selection_touched = false
+                ctrl.selected_idx = 0
+                refresh_controller(kernel, world, ctrl)
+                return true
+            }
+        }
+    }
+    false
+}
+
+private fn cancel_minibuffer_prompt(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    ctrl: MinibufferController,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String bool {
+    if ctrl.request.kind == PromptKind.SearchForward or ctrl.request.kind == PromptKind.SearchBackward {
+        let pbid? = ctrl.preview_buf_id else {
+            world.last_search = ctrl.preview_orig_last_search
+            world.search_highlight_active = ctrl.preview_orig_highlight
+            submit_and_transition(kernel, world, ctrl, null)#!
+            world.status_message = "Quit"
+            status_emit("Quit")#
+            return true
+        }
+        let b_opt = world.buffer(pbid)
+        if b_opt != null {
+            let b = b_opt.as(Buffer)
+            b.point = b.clamp_pos(ctrl.preview_orig_point, insert_mode = true)
+            ensure_row_visible_in_viewport(world, b.point.row)
+        }
+        world.last_search = ctrl.preview_orig_last_search
+        world.search_highlight_active = ctrl.preview_orig_highlight
+    }
+    submit_and_transition(kernel, world, ctrl, null)#!
+    world.status_message = "Quit"
+    status_emit("Quit")#
+    true
+}
+
+pub fn minibuffer_handle_key(
+    kernel: SystemKernel,
+    stroke: KeyStroke,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String bool {
+    let world = require_editor_world(kernel)!
+    let ctrl = ensure_controller_instance(kernel)
+
+    if kernel.active_prompt == null {
+        if ctrl.active {
+            restore_consult_previews(world, ctrl)
+            ctrl.active = false
+            clear_world_minibuffer(world)
+        }
+        return false
+    }
+
+    if not ctrl.active {
+        let pending? = kernel.active_prompt else {
+            return false
+        }
+        let (pending_req, _) = pending
+        open_prompt_view(kernel, pending_req)
+    }
+
+    -- 1. Cancel (`<C-g>` or `<Escape>`) — restores Consult live previews & incsearch cursor
+    if (stroke.ctrl and (not stroke.alt) and stroke.key == "g") or
+        ((not stroke.ctrl) and (not stroke.alt) and stroke.key == "Escape") {
+        return cancel_minibuffer_prompt(kernel, world, ctrl)#!
+    }
+
+    -- 2. Single-keystroke `PromptKind.Confirm` (`y`/`n` or custom e.g. `y`/`n`/`!`/`q`, `<C-d>` EOF cancels)
+    if ctrl.request.kind == PromptKind.Confirm {
+        if stroke.ctrl and (not stroke.alt) and (not stroke.super_mod) and stroke.key == "d" {
+            return cancel_minibuffer_prompt(kernel, world, ctrl)#!
+        }
+        let choices = confirm_choices_of(ctrl.request)
+        let ch_opt = stroke_printable_text(stroke)
+        if ch_opt != null {
+            let pressed = ch_opt.as(String)
+            let pressed_lower = pressed.to_lower()
+            for i in 0..choices.len() {
+                let (ckey, _) = choices.get(i.as(usize)).as((String, String))
+                if pressed == ckey or pressed_lower == ckey.to_lower() {
+                    submit_and_transition(kernel, world, ctrl, ckey)#!
+                    return true
+                }
+            }
+        }
+        let keys_labels = List()
+        for i in 0..choices.len() {
+            let (ckey, _) = choices.get(i.as(usize)).as((String, String))
+            keys_labels.push(ckey)
+        }
+        let hint_msg = "Please answer one of [" ++ keys_labels.join(", ") ++ "] or C-g / C-d"
+        world.status_message = hint_msg
+        status_emit(hint_msg)#
+        return true
+    }
+
+    -- 3. Submit (`<Return>`, `<C-j>`, `<C-m>`)
+    if ((not stroke.ctrl) and (not stroke.alt) and stroke.key == "Return") or
+        (stroke.ctrl and (not stroke.alt) and (stroke.key == "j" or stroke.key == "m")) {
+        let chosen = resolve_submitted_value(ctrl, world.cwd)
+        submit_and_transition(kernel, world, ctrl, chosen)#!
+        return true
+    }
+
+    -- 4. Isearch repeat keys (`<C-s>` / `<C-r>`) while inside SearchForward / SearchBackward
+    if ctrl.request.kind == PromptKind.SearchForward or ctrl.request.kind == PromptKind.SearchBackward {
+        if stroke.ctrl and (not stroke.alt) and (stroke.key == "s" or stroke.key == "r") {
+            let forward_dir = stroke.key == "s"
+            if ctrl.input_text == "" and ctrl.preview_orig_last_search != "" {
+                ctrl.input_text = ctrl.preview_orig_last_search
+                ctrl.cursor_col = ctrl.input_text.char_len()
+                refresh_controller(kernel, world, ctrl)
+                return true
+            }
+            if ctrl.input_text != "" {
+                let buf = world.active_buffer()
+                let ic = world.effective_ignore_case(ctrl.input_text)
+                let next_hit = if forward_dir {
+                    buf.find_forward(ctrl.input_text, buf.point, ic, true)
+                } else {
+                    buf.find_backward(ctrl.input_text, buf.point, ic, true)
+                }
+                if next_hit != null {
+                    buf.point = buf.clamp_pos(next_hit.as(Pos), insert_mode = true)
+                    ensure_row_visible_in_viewport(world, buf.point.row)
+                }
+                ctrl.sync_to_world(world)
+                return true
+            }
+        }
+    }
+
+    -- 5. Candidate Navigation (`<C-n>`, `<Down>`, `<C-p>`, `<Up>`, `<Tab>`, `<S-Tab>`)
+    if (stroke.ctrl and (not stroke.alt) and stroke.key == "n") or
+        ((not stroke.ctrl) and (not stroke.alt) and stroke.key == "Down") {
+        if not ctrl.items.is_empty() {
+            ctrl.selected_idx = (ctrl.selected_idx + 1) % ctrl.items.len()
+            ctrl.selection_touched = true
+            apply_consult_preview(world, ctrl)
+            ctrl.sync_to_world(world)
+        }
+        return true
+    }
+
+    if (stroke.ctrl and (not stroke.alt) and stroke.key == "p") or
+        ((not stroke.ctrl) and (not stroke.alt) and stroke.key == "Up") {
+        if not ctrl.items.is_empty() {
+            let n = ctrl.items.len()
+            ctrl.selected_idx = (ctrl.selected_idx - 1 + n) % n
+            ctrl.selection_touched = true
+            apply_consult_preview(world, ctrl)
+            ctrl.sync_to_world(world)
+        }
+        return true
+    }
+
+    if (stroke.key == "Tab" and stroke.shift_mod) or
+        stroke.key == "BackTab" or
+        stroke.key == "ISO_Left_Tab" {
+        if not ctrl.items.is_empty() {
+            let n = ctrl.items.len()
+            ctrl.selected_idx = (ctrl.selected_idx - 1 + n) % n
+            ctrl.selection_touched = true
+            apply_consult_preview(world, ctrl)
+            ctrl.sync_to_world(world)
+        }
+        return true
+    }
+
+    if stroke.key == "Tab" and (not stroke.shift_mod) and (not stroke.ctrl) and (not stroke.alt) {
+        if ctrl.items.is_empty() {
+            return true
+        }
+
+        if ctrl.request.kind == PromptKind.ExCommand {
+            let (cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
+            let (range_pfx, rest_in) = split_ex_range_prefix(ctrl.input_text)
+            if not rest_in.contains(" ") {
+                -- Stage 1 verb completion
+                let cand_verb = if range_pfx != "" and cand.starts_with(range_pfx) {
+                    cand.drop(range_pfx.char_len())
+                } else {
+                    cand
+                }
+                if ex_verb_expects_arg(cand_verb) {
+                    ctrl.input_text = range_pfx ++ cand_verb ++ " "
+                    ctrl.cursor_col = ctrl.input_text.char_len()
+                    ctrl.selection_touched = false
+                    ctrl.selected_idx = 0
+                    refresh_controller(kernel, world, ctrl)
+                    return true
+                }
+                if ctrl.input_text == cand and ctrl.items.len() > 1 {
+                    ctrl.selected_idx = (ctrl.selected_idx + 1) % ctrl.items.len()
+                    let (next_cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
+                    ctrl.input_text = next_cand
+                    ctrl.cursor_col = next_cand.char_len()
+                    ctrl.selection_touched = true
+                    ctrl.sync_to_world(world)
+                    return true
+                }
+                ctrl.input_text = cand
+                ctrl.cursor_col = cand.char_len()
+                ctrl.selection_touched = false
+                refresh_controller(kernel, world, ctrl)
+                return true
+            }
+
+            -- Stage 2 argument completion
+            if cand.ends_with("/") {
+                ctrl.input_text = cand
+                ctrl.cursor_col = cand.char_len()
+                ctrl.selection_touched = false
+                ctrl.selected_idx = 0
+                refresh_controller(kernel, world, ctrl)
+                return true
+            }
+            if ctrl.input_text == cand and ctrl.items.len() > 1 {
+                ctrl.selected_idx = (ctrl.selected_idx + 1) % ctrl.items.len()
+                let (next_cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
+                ctrl.input_text = next_cand
+                ctrl.cursor_col = next_cand.char_len()
+                ctrl.selection_touched = true
+                apply_consult_preview(world, ctrl)
+                ctrl.sync_to_world(world)
+                return true
+            }
+            ctrl.input_text = cand
+            ctrl.cursor_col = cand.char_len()
+            ctrl.selection_touched = false
+            refresh_controller(kernel, world, ctrl)
+            return true
+        }
+
+        if ctrl.request.kind == PromptKind.FilePath {
+            if ctrl.selection_touched or ctrl.items.len() == 1 {
+                let (cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
+                ctrl.input_text = cand
+                ctrl.cursor_col = cand.char_len()
+                ctrl.selection_touched = false
+                ctrl.selected_idx = 0
+                refresh_controller(kernel, world, ctrl)
+                return true
+            }
+            let lcp = common_candidate_prefix(ctrl.items)
+            if lcp.char_len() > ctrl.input_text.char_len() {
+                ctrl.input_text = lcp
+                ctrl.cursor_col = lcp.char_len()
+                ctrl.selection_touched = false
+                ctrl.selected_idx = 0
+                refresh_controller(kernel, world, ctrl)
+                return true
+            }
+            let (cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
+            if ctrl.input_text == cand and ctrl.items.len() > 1 {
+                ctrl.selected_idx = (ctrl.selected_idx + 1) % ctrl.items.len()
+                let (next_cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
+                ctrl.input_text = next_cand
+                ctrl.cursor_col = next_cand.char_len()
+            } else {
+                ctrl.input_text = cand
+                ctrl.cursor_col = cand.char_len()
+            }
+            ctrl.selection_touched = false
+            refresh_controller(kernel, world, ctrl)
+            return true
+        }
+
+        -- CommandName / BufferName / Choice / others: fill single match or extend common prefix or cycle
+        if ctrl.items.len() == 1 {
+            let (cand, _) = ctrl.items.get(0).as((String, String))
+            ctrl.input_text = cand
+            ctrl.cursor_col = cand.char_len()
+            ctrl.selection_touched = true
+            refresh_controller(kernel, world, ctrl)
+            return true
+        }
+        let lcp = common_candidate_prefix(ctrl.items)
+        if ctrl.input_text != "" and
+            lcp.char_len() > ctrl.input_text.char_len() and
+            lcp.to_lower().starts_with(ctrl.input_text.to_lower()) {
+            ctrl.input_text = lcp
+            ctrl.cursor_col = lcp.char_len()
+            ctrl.selection_touched = false
+            refresh_controller(kernel, world, ctrl)
+            return true
+        }
+        ctrl.selected_idx = (ctrl.selected_idx + 1) % ctrl.items.len()
+        ctrl.selection_touched = true
+        apply_consult_preview(world, ctrl)
+        ctrl.sync_to_world(world)
+        return true
+    }
+
+    -- 5b. Vertico Directory Navigation (`<C-l>` or `<M-BackSpace>` pops one parent directory segment)
+    if stroke.ctrl and (not stroke.alt) and stroke.key == "l" {
+        if try_vertico_directory_up(kernel, world, ctrl) {
+            return true
+        }
+        return true
+    }
+
+    if stroke.alt and (not stroke.ctrl) and (stroke.key == "BackSpace" or stroke.key == "Delete") {
+        if try_vertico_directory_up(kernel, world, ctrl) {
+            return true
+        }
+        if ctrl.cursor_col > 0 {
+            let s = ctrl.input_text
+            let target_col = backward_word_col_in_text(s, ctrl.cursor_col)
+            let killed = s.slice(target_col, ctrl.cursor_col)
+            world.kill_ring.push(killed, linewise = false, append = false)
+            ctrl.input_text = s.slice(0, target_col) ++ s.slice(ctrl.cursor_col, s.char_len())
+            ctrl.cursor_col = target_col
+            ctrl.selection_touched = false
+            ctrl.selected_idx = 0
+            refresh_controller(kernel, world, ctrl)
+        }
+        return true
+    }
+
+    -- 6. History Navigation (`<M-p>` / `<M-n>`)
+    if stroke.alt and (not stroke.ctrl) and stroke.key == "p" {
+        let hist = ctrl.history_list(ctrl.request.kind)
+        if not hist.is_empty() {
+            if ctrl.history_idx < 0 {
+                ctrl.saved_draft = ctrl.input_text
+                ctrl.history_idx = hist.len() - 1
+            } else if ctrl.history_idx > 0 {
+                ctrl.history_idx -= 1
+            }
+            ctrl.input_text = hist.get(ctrl.history_idx.as(usize)).as(String)
+            ctrl.cursor_col = ctrl.input_text.char_len()
+            ctrl.selection_touched = false
+            ctrl.selected_idx = 0
+            refresh_controller(kernel, world, ctrl)
+        }
+        return true
+    }
+
+    if stroke.alt and (not stroke.ctrl) and stroke.key == "n" {
+        let hist = ctrl.history_list(ctrl.request.kind)
+        if ctrl.history_idx >= 0 {
+            if ctrl.history_idx + 1 < hist.len() {
+                ctrl.history_idx += 1
+                ctrl.input_text = hist.get(ctrl.history_idx.as(usize)).as(String)
+            } else {
+                ctrl.history_idx = -1
+                ctrl.input_text = ctrl.saved_draft
+            }
+            ctrl.cursor_col = ctrl.input_text.char_len()
+            ctrl.selection_touched = false
+            ctrl.selected_idx = 0
+            refresh_controller(kernel, world, ctrl)
+        }
+        return true
+    }
+
+    -- 7. Cursor Movement & Line Editing
+    if (stroke.ctrl and (not stroke.alt) and stroke.key == "a") or
+        ((not stroke.ctrl) and (not stroke.alt) and stroke.key == "Home") {
+        ctrl.cursor_col = 0
+        ctrl.sync_to_world(world)
+        return true
+    }
+
+    if (stroke.ctrl and (not stroke.alt) and stroke.key == "e") or
+        ((not stroke.ctrl) and (not stroke.alt) and stroke.key == "End") {
+        ctrl.cursor_col = ctrl.input_text.char_len()
+        ctrl.sync_to_world(world)
+        return true
+    }
+
+    if (stroke.ctrl and (not stroke.alt) and stroke.key == "b") or
+        ((not stroke.ctrl) and (not stroke.alt) and stroke.key == "Left") {
+        if ctrl.cursor_col > 0 {
+            ctrl.cursor_col -= 1
+            ctrl.sync_to_world(world)
+        }
+        return true
+    }
+
+    if (stroke.ctrl and (not stroke.alt) and stroke.key == "f") or
+        ((not stroke.ctrl) and (not stroke.alt) and stroke.key == "Right") {
+        if ctrl.cursor_col < ctrl.input_text.char_len() {
+            ctrl.cursor_col += 1
+            ctrl.sync_to_world(world)
+        }
+        return true
+    }
+
+    if ((not stroke.ctrl) and (not stroke.alt) and stroke.key == "BackSpace") or
+        (stroke.ctrl and (not stroke.alt) and stroke.key == "h") {
+        if ctrl.cursor_col > 0 {
+            let s = ctrl.input_text
+            ctrl.input_text = s.slice(0, ctrl.cursor_col - 1) ++ s.slice(ctrl.cursor_col, s.char_len())
+            ctrl.cursor_col -= 1
+            ctrl.selection_touched = false
+            ctrl.selected_idx = 0
+            refresh_controller(kernel, world, ctrl)
+        }
+        return true
+    }
+
+    if (not stroke.ctrl) and (not stroke.alt) and stroke.key == "Delete" {
+        let s = ctrl.input_text
+        if ctrl.cursor_col < s.char_len() {
+            ctrl.input_text = s.slice(0, ctrl.cursor_col) ++ s.slice(ctrl.cursor_col + 1, s.char_len())
+            ctrl.selection_touched = false
+            ctrl.selected_idx = 0
+            refresh_controller(kernel, world, ctrl)
+        }
+        return true
+    }
+
+    -- `<C-d>`: delete forward character when text exists ahead of cursor; otherwise send EOF (close Minibuffer)
+    if stroke.ctrl and (not stroke.alt) and (not stroke.super_mod) and stroke.key == "d" {
+        let s = ctrl.input_text
+        if ctrl.cursor_col < s.char_len() {
+            ctrl.input_text = s.slice(0, ctrl.cursor_col) ++ s.slice(ctrl.cursor_col + 1, s.char_len())
+            ctrl.selection_touched = false
+            ctrl.selected_idx = 0
+            refresh_controller(kernel, world, ctrl)
+            return true
+        }
+        return cancel_minibuffer_prompt(kernel, world, ctrl)#!
+    }
+
+    if stroke.ctrl and (not stroke.alt) and stroke.key == "k" {
+        let s = ctrl.input_text
+        if ctrl.cursor_col < s.char_len() {
+            let killed = s.slice(ctrl.cursor_col, s.char_len())
+            world.kill_ring.push(killed, linewise = false, append = false)
+            ctrl.input_text = s.slice(0, ctrl.cursor_col)
+            ctrl.selection_touched = false
+            ctrl.selected_idx = 0
+            refresh_controller(kernel, world, ctrl)
+        }
+        return true
+    }
+
+    if stroke.ctrl and (not stroke.alt) and stroke.key == "u" {
+        let s = ctrl.input_text
+        if ctrl.cursor_col > 0 {
+            ctrl.input_text = s.slice(ctrl.cursor_col, s.char_len())
+            ctrl.cursor_col = 0
+        } else {
+            ctrl.input_text = ""
+            ctrl.cursor_col = 0
+        }
+        ctrl.selection_touched = false
+        ctrl.selected_idx = 0
+        refresh_controller(kernel, world, ctrl)
+        return true
+    }
+
+    if stroke.ctrl and (not stroke.alt) and stroke.key == "w" {
+        if ctrl.cursor_col > 0 {
+            let s = ctrl.input_text
+            let target_col = backward_word_col_in_text(s, ctrl.cursor_col)
+            let killed = s.slice(target_col, ctrl.cursor_col)
+            world.kill_ring.push(killed, linewise = false, append = false)
+            ctrl.input_text = s.slice(0, target_col) ++ s.slice(ctrl.cursor_col, s.char_len())
+            ctrl.cursor_col = target_col
+            ctrl.selection_touched = false
+            ctrl.selected_idx = 0
+            refresh_controller(kernel, world, ctrl)
+        }
+        return true
+    }
+
+    if stroke.ctrl and (not stroke.alt) and stroke.key == "y" {
+        let rv_opt = world.kill_ring.current()
+        if rv_opt != null {
+            let ytext = rv_opt.as(RegisterValue).text.replace("\n", " ")
+            let s = ctrl.input_text
+            ctrl.input_text = s.slice(0, ctrl.cursor_col) ++ ytext ++ s.slice(ctrl.cursor_col, s.char_len())
+            ctrl.cursor_col += ytext.char_len()
+            ctrl.selection_touched = false
+            ctrl.selected_idx = 0
+            refresh_controller(kernel, world, ctrl)
+        }
+        return true
+    }
+
+    -- 8. Printable Text Insertion
+    let ch_opt = stroke_printable_text(stroke)
+    if ch_opt != null {
+        let ch = ch_opt.as(String)
+        let s = ctrl.input_text
+        ctrl.input_text = s.slice(0, ctrl.cursor_col) ++ ch ++ s.slice(ctrl.cursor_col, s.char_len())
+        ctrl.cursor_col += ch.char_len()
+        ctrl.selection_touched = false
+        ctrl.selected_idx = 0
+        refresh_controller(kernel, world, ctrl)
+        return true
+    }
+
+    true
+}
+
+-- ============================================================================
+-- 9. Extension Registration & Service Lookup
+-- ============================================================================
+
+pub fn require_minibuffer_controller(kernel: SystemKernel) -> !String MinibufferController {
+    let raw = kernel.require_service(SERVICE_MINIBUFFER)!
+    raw.as(MinibufferController)
+}
+
+-- Pre-warm reverse keybinding map, Ex Stage-1 catalog, and O(1) empty-query snapshots
+-- right after all extensions activate so the very first `:`, `M-x`, or `C-x C-f` opens in < 1 ms.
+pub fn prewarm_minibuffer(kernel: SystemKernel) {
+    let world_opt = kernel.service(SERVICE_EDITOR_WORLD)
+    if world_opt == null {
+        return
+    }
+    let world = world_opt.as(EditorWorld)
+    let ctrl = ensure_controller_instance(kernel)
+    let cmd_total = kernel.commands.len()
+    if ctrl.cached_help_cmd_count != cmd_total {
+        ctrl.cached_rev_keys = null
+        ctrl.cached_cmd_specs = null
+        ctrl.cached_cmd_names = null
+        ctrl.cached_ex_stage1 = null
+        ctrl.cached_ex_stage1_names = null
+        ctrl.cached_ex_empty = null
+        ctrl.cached_cmd_empty = null
+        ctrl.cached_help_catalog = null
+        ctrl.cached_help_cmd_count = cmd_total
+    }
+    let _ = build_ex_stage1_candidates(kernel, ctrl, "", "")
+    let _ = compute_prompt_candidates_with_rich(
+        kernel,
+        world,
+        ctrl,
+        PromptRequest {
+            label: "M-x ",
+            initial: "",
+            kind: PromptKind.CommandName,
+            candidates: List(),
+        },
+        "",
+    )
+}
+
+pub fn register_minibuffer_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_minibuffer_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_minibuffer",
+        "0.1.0",
+        "Vertico + Orderless + Marginalia + Consult interactive minibuffer, context-aware Ex completion, and live preview.",
+        [ext_document_id()],
+        |k: SystemKernel| -> !String Unit {
+            let world = require_editor_world(k)!
+            let ctrl = MinibufferController.new()
+            ctrl.note_buffer_visited(world.active_buffer_id)
+            k.publish_service(SERVICE_MINIBUFFER, ext_id, ctrl)
+
+            k.add_hook(
+                "buffer-switched",
+                ext_id,
+                |kern: SystemKernel, payload: Any| -> Unit {
+                    let c_opt = kern.service(SERVICE_MINIBUFFER)
+                    if c_opt != null and (payload matches _: BufferId) {
+                        c_opt.as(MinibufferController).note_buffer_visited(payload.as(BufferId))
+                    }
+                },
+            )
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service(SERVICE_EDITOR_WORLD)
+            if w_opt != null {
+                clear_world_minibuffer(w_opt.as(EditorWorld))
+            }
+            ()
+        },
+    )
+}

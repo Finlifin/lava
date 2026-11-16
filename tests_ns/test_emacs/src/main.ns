@@ -1,0 +1,519 @@
+-- Comprehensive integration & continuation test suite for `ext_minibuffer` and `ext_emacs`.
+
+use std.fs
+use std.path
+use @lava_sys.{CaretShape, mock_enable, mock_quit_requested}
+use @lava_core.{
+    CommandSpec, HostClipboardCap, KeyStroke, LogCollectorCap, StatusCollectorCap, SystemKernel,
+    clipboard_get, clipboard_set, log_event, parse_key_sequence, status_emit
+}
+use @ext_document.{
+    Buffer, BufferKind, EditorWorld, Pos, RegisterValue, register_document_extension,
+    require_editor_world
+}
+use @ext_minibuffer.{
+    MinibufferController, register_minibuffer_extension, require_minibuffer_controller,
+    score_candidate
+}
+use @ext_emacs.{
+    EmacsState, emacs_handle_key, register_emacs_extension, require_emacs_state
+}
+
+fn assert_true(cond: bool, msg: String) {
+    if not cond {
+        panic("ASSERTION FAILED: " ++ msg)
+    }
+}
+
+fn assert_eq_str(actual: String, expected: String, label: String) {
+    if actual != expected {
+        panic(
+            "ASSERT_EQ_STR FAILED [" ++ label ++ "]\n  actual:   `" ++ actual ++
+            "`\n  expected: `" ++ expected ++ "`"
+        )
+    }
+}
+
+fn assert_eq_i64(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        panic(
+            "ASSERT_EQ_I64 FAILED [" ++ label ++ "]: actual=" ++ actual.to_string() ++
+            ", expected=" ++ expected.to_string()
+        )
+    }
+}
+
+fn feed_keys(
+    kernel: SystemKernel,
+    spec: String,
+    clip_cap: HostClipboardCap,
+    log_cap: LogCollectorCap,
+    status_cap: StatusCollectorCap,
+) {
+    let strokes = parse_key_sequence(spec)
+    for i in 0..strokes.len() {
+        let st = strokes.get(i.as(usize)).as(KeyStroke)
+        let res: !String bool = (emacs_handle_key(kernel, st)#) # {
+            log_event(lvl, src, msg) => log_cap.record(lvl, src, msg),
+            status_emit(msg) => status_cap.emit(msg),
+            clipboard_get() => clip_cap.read_clip(),
+            clipboard_set(txt) => clip_cap.write_clip(txt),
+        }
+        let _ = res ! {
+            err => panic("emacs_handle_key failed on `" ++ st.notation() ++ "`: " ++ err),
+        }
+    }
+}
+
+fn feed_text(
+    kernel: SystemKernel,
+    text: String,
+    clip_cap: HostClipboardCap,
+    log_cap: LogCollectorCap,
+    status_cap: StatusCollectorCap,
+) {
+    let n = text.char_len()
+    for i in 0..n {
+        let ch = text.slice(i, i + 1)
+        let st = if ch == " " {
+            KeyStroke {
+                key: "Space",
+                ctrl: false,
+                alt: false,
+                shift_mod: false,
+                super_mod: false,
+                text: " ",
+            }
+        } else {
+            KeyStroke.plain(ch)
+        }
+        let res: !String bool = (emacs_handle_key(kernel, st)#) # {
+            log_event(lvl, src, msg) => log_cap.record(lvl, src, msg),
+            status_emit(msg) => status_cap.emit(msg),
+            clipboard_get() => clip_cap.read_clip(),
+            clipboard_set(txt) => clip_cap.write_clip(txt),
+        }
+        let _ = res ! {
+            err => panic("emacs_handle_key failed on text char `" ++ ch ++ "`: " ++ err),
+        }
+    }
+}
+
+fn setup_test_runtime() -> (SystemKernel, EditorWorld, MinibufferController, EmacsState) {
+    mock_enable(true)
+    let kernel = SystemKernel.new()
+    let _ = register_document_extension(kernel) ! { e => panic(e) }
+    let _ = register_minibuffer_extension(kernel) ! { e => panic(e) }
+    let _ = register_emacs_extension(kernel) ! { e => panic(e) }
+    let _ = kernel.activate_all() ! { e => panic(e) }
+
+    let world = require_editor_world(kernel) ! { e => panic(e) }
+    let mb = require_minibuffer_controller(kernel) ! { e => panic(e) }
+    let em = require_emacs_state(kernel) ! { e => panic(e) }
+    (kernel, world, mb, em)
+}
+
+fn test_fuzzy_scoring_tiers() {
+    -- Tier check: exact > exact prefix > word-boundary fuzzy > mid-word substring > subsequence
+    let exact_s = score_candidate("find-file", "find-file")
+    let prefix_s = score_candidate("find-", "find-file")
+    let wb_acronym_s = score_candidate("ff", "find-file")
+    let substr_mid_s = score_candidate("ff", "list-buffers")
+    let wb_seg_s = score_candidate("excom", "execute-extended-command")
+    let subseq_s = score_candidate("excmd", "execute-extended-command")
+    let nomatch_s = score_candidate("zzz", "execute-extended-command")
+
+    assert_true(exact_s > prefix_s, "exact > exact prefix")
+    assert_true(prefix_s > wb_acronym_s, "exact prefix > word-boundary fuzzy")
+    assert_true(wb_acronym_s > substr_mid_s, "word-boundary fuzzy (`ff` -> `find-file`) > mid-word substring (`list-buffers`)")
+    assert_true(wb_seg_s > subseq_s, "word-boundary segment > general subsequence")
+    assert_true(subseq_s > 0, "general subsequence matches positively")
+    assert_true(nomatch_s < 0, "unrelated query returns negative score")
+    println("[PASS] test_fuzzy_scoring_tiers")
+}
+
+fn test_mx_continuation_and_abort() {
+    let (kernel, world, mb, _em) = setup_test_runtime()
+    let clip_cap = HostClipboardCap {}
+    let log_cap = LogCollectorCap.new()
+    let status_cap = StatusCollectorCap.new()
+
+    let buf = world.active_buffer()
+    buf.set_lines(["first line", "second line", "third line"], record_undo = false)
+    buf.point = Pos.new(1, 3)
+
+    -- 1. Press `<M-x>` -> suspends `execute-extended-command` continuation!
+    feed_keys(kernel, "<M-x>", clip_cap, log_cap, status_cap)
+    assert_true(kernel.active_prompt != null, "M-x should suspend continuation on SystemKernel")
+    assert_true(world.minibuffer_view.active, "minibuffer_view should be active during M-x")
+    assert_eq_str(world.minibuffer_view.prompt_label, "M-x ", "M-x prompt label")
+    assert_true(world.minibuffer_view.total_matches >= 25, "M-x lists interactive commands")
+
+    -- 2. Abort suspended continuation cleanly with `<C-g>`
+    feed_keys(kernel, "<C-g>", clip_cap, log_cap, status_cap)
+    assert_true(kernel.active_prompt == null, "C-g clears active continuation")
+    assert_true(not world.minibuffer_view.active, "C-g closes minibuffer_view")
+    assert_eq_str(status_cap.latest, "Quit", "C-g emits Quit")
+
+    -- 3. `<M-x>` + word-boundary fuzzy `"mwb"` -> `mark-whole-buffer` + `<Return>`!
+    feed_keys(kernel, "<M-x>", clip_cap, log_cap, status_cap)
+    feed_text(kernel, "mwb", clip_cap, log_cap, status_cap)
+    assert_true(not world.minibuffer_view.items.is_empty(), "`mwb` matches mark-whole-buffer")
+    let (top_cmd, _) = world.minibuffer_view.items.get(0).as((String, String))
+    assert_eq_str(top_cmd, "mark-whole-buffer", "word-boundary acronym `mwb` selects mark-whole-buffer")
+    feed_keys(kernel, "<Return>", clip_cap, log_cap, status_cap)
+
+    assert_true(kernel.active_prompt == null, "M-x completed after Return")
+    assert_true(buf.mark_active, "mark-whole-buffer activated mark")
+    assert_eq_i64(buf.point.row, 0, "mark-whole-buffer moved point to top")
+    assert_eq_i64(buf.mark.as(Pos).row, 2, "mark-whole-buffer placed mark on last row")
+
+    -- 4. History `<M-p>` recalls `"mark-whole-buffer"` in `M-x`!
+    feed_keys(kernel, "<M-x> <M-p>", clip_cap, log_cap, status_cap)
+    assert_eq_str(mb.input_text, "mark-whole-buffer", "M-p recalls previous CommandName history")
+    feed_keys(kernel, "<Escape>", clip_cap, log_cap, status_cap)
+    assert_true(kernel.active_prompt == null, "Escape cancels M-x cleanly")
+
+    -- 5. Chained continuation: `M-x` -> `switch-to-buffer` (resumed M-x immediately suspends again!)
+    feed_keys(kernel, "<M-x>", clip_cap, log_cap, status_cap)
+    feed_text(kernel, "switch-to-buffer", clip_cap, log_cap, status_cap)
+    feed_keys(kernel, "<Return>", clip_cap, log_cap, status_cap)
+    assert_true(kernel.active_prompt != null, "M-x -> switch-to-buffer suspends into second prompt")
+    assert_eq_str(world.minibuffer_view.prompt_label, "Switch to buffer: ", "second continuation prompt label")
+    feed_text(kernel, "*Messages*", clip_cap, log_cap, status_cap)
+    feed_keys(kernel, "<Return>", clip_cap, log_cap, status_cap)
+    assert_eq_str(world.active_buffer().name, "*Messages*", "chained continuation switched to *Messages*")
+
+    println("[PASS] test_mx_continuation_and_abort")
+}
+
+fn test_filesystem_completion_and_find_file() {
+    let (kernel, world, _mb, _em) = setup_test_runtime()
+    let clip_cap = HostClipboardCap {}
+    let log_cap = LogCollectorCap.new()
+    let status_cap = StatusCollectorCap.new()
+
+    let tmp_file = fs.temp_file_path(prefix = "lava_emacs_fs_") ! { _ => "/tmp/lava_emacs_fs_fallback" }
+    let _ = fs.remove(tmp_file) ! { _ => () }
+    let tmp_dir = tmp_file ++ "_dir"
+    let sub_dir = path.join(tmp_dir, "alpha_dir")
+    let file_a = path.join(tmp_dir, "alpine_notes.txt")
+    let file_b = path.join(sub_dir, "nested_hello.ns")
+
+    let _ = fs.create_dir_all(sub_dir) ! { _ => panic("failed to create temp dir") }
+    defer {
+        let _ = fs.remove_dir_all(tmp_dir) ! { _ => () }
+    }
+    let _ = fs.write_string(file_a, "line one\nline two\n") ! { _ => panic("failed write file_a") }
+    let _ = fs.write_string(file_b, "fn greet() -> i64 = 42\n") ! { _ => panic("failed write file_b") }
+
+    world.cwd = tmp_dir
+
+    -- Invoke `<C-x> <C-f>` (`find-file`), check `which-key` after `<C-x>` first!
+    feed_keys(kernel, "<C-x>", clip_cap, log_cap, status_cap)
+    assert_eq_str(world.pending_keys_display, "<C-x>-", "C-x sets pending_keys_display")
+    assert_true(world.which_key_items.len() >= 10, "C-x populates which_key_items")
+
+    feed_keys(kernel, "<C-f>", clip_cap, log_cap, status_cap)
+    assert_true(world.minibuffer_view.active, "C-x C-f opens FilePath minibuffer")
+    assert_eq_i64(world.minibuffer_view.items.len(), 2, "temp dir has 2 entries")
+
+    -- Directories MUST sort first with trailing `/`!
+    let (first_cand, first_detail) = world.minibuffer_view.items.get(0).as((String, String))
+    assert_true(first_cand.ends_with("alpha_dir/"), "directory sorts first with trailing slash")
+    assert_eq_str(first_detail, "dir", "directory detail tag")
+
+    -- Type `"alp"` -> `<Tab>` completes common prefix `"alp"` (already common to `alpha_dir/` & `alpine_notes.txt`),
+    -- so `<Tab>` enters selected top candidate `alpha_dir/`, listing `nested_hello.ns`!
+    feed_text(kernel, "alp", clip_cap, log_cap, status_cap)
+    feed_keys(kernel, "<Tab>", clip_cap, log_cap, status_cap)
+    assert_true(world.minibuffer_view.input_text.ends_with("alpha_dir/"), "Tab completed into alpha_dir/")
+    assert_eq_i64(world.minibuffer_view.items.len(), 1, "inside alpha_dir/ has 1 file")
+
+    -- Second `<Tab>` completes the single file `nested_hello.ns`, `<Return>` opens it!
+    feed_keys(kernel, "<Tab> <Return>", clip_cap, log_cap, status_cap)
+    assert_true(not world.minibuffer_view.active, "find-file completed")
+    assert_eq_str(world.active_buffer().name, "nested_hello.ns", "opened nested_hello.ns")
+    assert_eq_str(world.active_buffer().major_mode, "nessa", "detected nessa major mode")
+    assert_eq_str(world.active_buffer().line_at(0), "fn greet() -> i64 = 42", "loaded file contents")
+
+    -- Modify buffer in Emacs mode and test `<C-x> s` (`save-some-buffers`) single-key `y` confirmation!
+    feed_keys(kernel, "<C-z>", clip_cap, log_cap, status_cap)
+    feed_keys(kernel, "<C-e>", clip_cap, log_cap, status_cap)
+    feed_text(kernel, " -- saved", clip_cap, log_cap, status_cap)
+    assert_true(world.active_buffer().modified, "buffer marked modified after edit")
+    feed_keys(kernel, "<C-x> s", clip_cap, log_cap, status_cap)
+    assert_true(world.minibuffer_view.active, "C-x s suspends on unsaved buffer")
+    feed_text(kernel, "y", clip_cap, log_cap, status_cap)
+    assert_true(not world.minibuffer_view.active, "single-key `y` resumed and finished save-some-buffers")
+    assert_true(not world.active_buffer().modified, "buffer saved and marked unmodified")
+    let disk_after = fs.read_to_string(file_b) ! { _ => "" }
+    assert_true(disk_after.contains("fn greet() -> i64 = 42 -- saved"), "disk file updated by C-x s")
+
+    println("[PASS] test_filesystem_completion_and_find_file")
+}
+
+fn test_multi_turn_query_replace_and_isearch() {
+    let (kernel, world, _mb, _em) = setup_test_runtime()
+    let clip_cap = HostClipboardCap {}
+    let log_cap = LogCollectorCap.new()
+    let status_cap = StatusCollectorCap.new()
+
+    let buf = world.active_buffer()
+    buf.set_lines(
+        [
+            "foo and foo on line 1",
+            "keep this foo untouched? no, test y/n/!",
+            "final foo and last foo here"
+        ],
+        record_undo = false,
+    )
+    buf.point = Pos.zero()
+
+    -- 1. Live `isearch-forward` (`<C-s>`) preview & `<C-g>` cursor restoration
+    feed_keys(kernel, "<C-s>", clip_cap, log_cap, status_cap)
+    feed_text(kernel, "final", clip_cap, log_cap, status_cap)
+    assert_eq_i64(buf.point.row, 2, "incsearch live preview moved cursor to row 2")
+    assert_eq_i64(buf.point.col, 0, "incsearch live preview col 0")
+    assert_true(world.search_highlight_active, "incsearch activated highlight")
+
+    -- Cancel `<C-g>` restores point back to `(0, 0)`!
+    feed_keys(kernel, "<C-g>", clip_cap, log_cap, status_cap)
+    assert_eq_i64(buf.point.row, 0, "C-g restored original point row 0")
+    assert_eq_i64(buf.point.col, 0, "C-g restored original point col 0")
+
+    -- 2. Multi-step continuation `query-replace` (`<M-%>`):
+    --    5 total occurrences of `"foo"`:
+    --      #1 (line 0, first):  `"y"` -> replaced with `"foobar"` (note replacement contains `"foo"`!)
+    --      #2 (line 0, second): `"n"` -> skipped!
+    --      #3 (line 1):         `"!"` -> replaces #3, #4, #5 automatically without further prompts!
+    feed_keys(kernel, "<M-%>", clip_cap, log_cap, status_cap)
+    assert_eq_str(world.minibuffer_view.prompt_label, "Query replace: ", "step 1 prompt")
+    feed_text(kernel, "foo", clip_cap, log_cap, status_cap)
+    feed_keys(kernel, "<Return>", clip_cap, log_cap, status_cap)
+
+    assert_eq_str(world.minibuffer_view.prompt_label, "Query replace foo with: ", "step 2 prompt")
+    feed_text(kernel, "foobar", clip_cap, log_cap, status_cap)
+    feed_keys(kernel, "<Return>", clip_cap, log_cap, status_cap)
+
+    -- Step 3: single-keystroke Confirm prompts (`y`, then `n`, then `!` — NO `<Return>` needed!)
+    assert_true(world.minibuffer_view.active, "suspended at match #1")
+    assert_eq_i64(buf.point.row, 0, "match #1 at row 0")
+    assert_eq_i64(buf.point.col, 0, "match #1 at col 0")
+
+    feed_text(kernel, "y", clip_cap, log_cap, status_cap)
+    assert_true(world.minibuffer_view.active, "suspended at match #2")
+    assert_eq_i64(buf.point.row, 0, "match #2 at row 0")
+    assert_eq_i64(buf.point.col, 11, "match #2 shifted by replacement length to col 11")
+
+    feed_text(kernel, "n", clip_cap, log_cap, status_cap)
+    assert_true(world.minibuffer_view.active, "suspended at match #3")
+    assert_eq_i64(buf.point.row, 1, "match #3 at row 1")
+
+    feed_text(kernel, "!", clip_cap, log_cap, status_cap)
+    assert_true(not world.minibuffer_view.active, "`!` replaced remaining matches and finished")
+    assert_true(kernel.active_prompt == null, "query-replace continuation finished")
+
+    assert_eq_str(buf.line_at(0), "foobar and foo on line 1", "line 0 after y then n")
+    assert_eq_str(buf.line_at(1), "keep this foobar untouched? no, test y/n/!", "line 1 after !")
+    assert_eq_str(buf.line_at(2), "final foobar and last foobar here", "line 2 after !")
+    assert_eq_str(status_cap.latest, "Replaced 4 occurrences", "reported 4 replacements")
+
+    println("[PASS] test_multi_turn_query_replace_and_isearch")
+}
+
+fn test_kill_ring_consecutive_ck_yank_and_yank_pop() {
+    let (kernel, world, _mb, _em) = setup_test_runtime()
+    let clip_cap = HostClipboardCap {}
+    let log_cap = LogCollectorCap.new()
+    let status_cap = StatusCollectorCap.new()
+
+    -- Toggle into Pure Emacs modeless mode via `<C-z>`
+    feed_keys(kernel, "<C-z>", clip_cap, log_cap, status_cap)
+    assert_true(not world.options.evil_mode, "C-z disabled evil_mode")
+    assert_eq_str(world.mode_name, "EMACS", "mode_name is EMACS")
+    assert_true(world.caret_shape == CaretShape.Beam, "caret_shape is Beam in EMACS mode")
+
+    let buf = world.active_buffer()
+    buf.set_lines(
+        [
+            "FIRST_ENTRY",
+            "SECOND_PART_A",
+            "SECOND_PART_B",
+            "TARGET:"
+        ],
+        record_undo = false,
+    )
+    buf.point = Pos.zero()
+
+    -- 1. Kill `"FIRST_ENTRY"` on row 0 (single `<C-k>`), then move down `<C-n>` to break kill streak!
+    feed_keys(kernel, "<C-k> <C-n>", clip_cap, log_cap, status_cap)
+    assert_eq_i64(world.kill_ring.entries.len(), 1, "1 entry in kill ring")
+
+    -- 2. On row 1 (`"SECOND_PART_A"`), press `<C-k>` THREE times consecutively:
+    --    1st `<C-k>` kills `"SECOND_PART_A"`
+    --    2nd `<C-k>` kills `"\n"` (joining `"SECOND_PART_B"`)
+    --    3rd `<C-k>` kills `"SECOND_PART_B"`
+    --    All 3 MUST merge into a single KillRing entry `"SECOND_PART_A\nSECOND_PART_B"`!
+    feed_keys(kernel, "<C-k> <C-k> <C-k>", clip_cap, log_cap, status_cap)
+    assert_eq_i64(world.kill_ring.entries.len(), 2, "consecutive C-k appended into entry #2")
+    assert_eq_str(
+        world.kill_ring.current().as(RegisterValue).text,
+        "SECOND_PART_A\nSECOND_PART_B",
+        "merged consecutive C-k entry",
+    )
+
+    -- 3. Move to end of buffer (`<M-gt>`) right after `"TARGET:"`, `<C-y>` yanks entry #2,
+    --    then `<M-y>` (`yank-pop`) replaces that multi-line yank with `"FIRST_ENTRY"`!
+    feed_keys(kernel, "<M-gt> <C-y>", clip_cap, log_cap, status_cap)
+    assert_true(buf.to_text().contains("TARGET:SECOND_PART_A\nSECOND_PART_B"), "C-y yanked merged entry")
+
+    feed_keys(kernel, "<M-y>", clip_cap, log_cap, status_cap)
+    assert_true(buf.to_text().ends_with("TARGET:FIRST_ENTRY"), "M-y yank-popped to FIRST_ENTRY")
+    assert_true(not buf.to_text().contains("SECOND_PART_A"), "M-y cleanly removed previous multi-line yank")
+
+    -- Cycling `<M-y>` once more wraps back around to `"SECOND_PART_A\nSECOND_PART_B"`!
+    feed_keys(kernel, "<M-y>", clip_cap, log_cap, status_cap)
+    assert_true(buf.to_text().ends_with("TARGET:SECOND_PART_A\nSECOND_PART_B"), "M-y cycled back to entry #2")
+
+    -- `<C-/>` (`undo`) undoes in Emacs mode, and `<C-u> 4 !` inserts `"!!!!"`!
+    feed_keys(kernel, "<C-u> 4 !", clip_cap, log_cap, status_cap)
+    assert_true(buf.to_text().ends_with("SECOND_PART_B!!!!"), "C-u 4 ! inserted 4 exclamation marks")
+    feed_keys(kernel, "<C-/>", clip_cap, log_cap, status_cap)
+    assert_true(buf.to_text().ends_with("SECOND_PART_B"), "C-/ undid self-insert")
+
+    println("[PASS] test_kill_ring_consecutive_ck_yank_and_yank_pop")
+}
+
+fn test_narrowing_and_widening() {
+    let (kernel, world, _mb, _em) = setup_test_runtime()
+    let clip_cap = HostClipboardCap {}
+    let log_cap = LogCollectorCap.new()
+    let status_cap = StatusCollectorCap.new()
+
+    -- Switch to Emacs mode
+    feed_keys(kernel, "<C-z>", clip_cap, log_cap, status_cap)
+    let buf = world.active_buffer()
+    buf.set_lines(
+        [
+            "row0: header tag",
+            "row1: inner tag one",
+            "row2: inner tag two",
+            "row3: footer tag"
+        ],
+        record_undo = false,
+    )
+    buf.point = Pos.new(1, 0)
+
+    -- `<C-Space>` sets mark at row 1, `<C-n>` moves point to row 2, `<C-x> n n` narrows to rows 1..2!
+    feed_keys(kernel, "<C-Space> <C-n>", clip_cap, log_cap, status_cap)
+    feed_keys(kernel, "<C-x> n", clip_cap, log_cap, status_cap)
+    assert_eq_str(world.pending_keys_display, "<C-x> n-", "nested prefix C-x n pending display")
+    feed_keys(kernel, "n", clip_cap, log_cap, status_cap)
+
+    assert_true(buf.is_narrowed(), "buffer is narrowed after C-x n n")
+    assert_eq_i64(buf.min_row(), 1, "narrowed min_row == 1")
+    assert_eq_i64(buf.max_row(), 2, "narrowed max_row == 2")
+
+    -- `<M-lt>` moves to start of narrowed region (row 1), NOT row 0!
+    feed_keys(kernel, "<M-lt>", clip_cap, log_cap, status_cap)
+    assert_eq_i64(buf.point.row, 1, "M-< respects narrowed min_row")
+
+    -- Run `query-replace` `"tag"` -> `"TAG"` with `"!"` inside narrowed region:
+    -- ONLY rows 1 and 2 may be modified; rows 0 and 3 MUST remain untouched!
+    feed_keys(kernel, "<M-%>", clip_cap, log_cap, status_cap)
+    feed_text(kernel, "tag", clip_cap, log_cap, status_cap)
+    feed_keys(kernel, "<Return>", clip_cap, log_cap, status_cap)
+    feed_text(kernel, "TAG", clip_cap, log_cap, status_cap)
+    feed_keys(kernel, "<Return>", clip_cap, log_cap, status_cap)
+    feed_text(kernel, "!", clip_cap, log_cap, status_cap)
+
+    -- `<C-x> n w` widens buffer back to all 4 lines!
+    feed_keys(kernel, "<C-x> n w", clip_cap, log_cap, status_cap)
+    assert_true(not buf.is_narrowed(), "buffer widened after C-x n w")
+    assert_eq_str(buf.line_at(0), "row0: header tag", "outside narrow row 0 untouched")
+    assert_eq_str(buf.line_at(1), "row1: inner TAG one", "inside narrow row 1 replaced")
+    assert_eq_str(buf.line_at(2), "row2: inner TAG two", "inside narrow row 2 replaced")
+    assert_eq_str(buf.line_at(3), "row3: footer tag", "outside narrow row 3 untouched")
+
+    println("[PASS] test_narrowing_and_widening")
+}
+
+fn test_self_documenting_help_and_kmacros() {
+    let (kernel, world, _mb, _em) = setup_test_runtime()
+    let clip_cap = HostClipboardCap {}
+    let log_cap = LogCollectorCap.new()
+    let status_cap = StatusCollectorCap.new()
+
+    -- 1. `<C-h> f` (`describe-function`) on `"query-replace"`
+    feed_keys(kernel, "<C-h> f", clip_cap, log_cap, status_cap)
+    assert_true(world.minibuffer_view.active, "C-h f opens CommandName minibuffer")
+    feed_text(kernel, "query-replace", clip_cap, log_cap, status_cap)
+    feed_keys(kernel, "<Return>", clip_cap, log_cap, status_cap)
+
+    let help_f = world.active_buffer()
+    assert_eq_str(help_f.name, "*Help*", "C-h f switched to *Help*")
+    let help_f_text = help_f.to_text()
+    assert_true(help_f_text.contains("lava.org/ext_emacs"), "C-h f shows owner ExtId")
+    assert_true(help_f_text.contains("<M-%>"), "C-h f lists active <M-%> keybinding")
+
+    -- 2. `<C-h> k` (`describe-key`) on `"<C-x> <C-f>"`
+    feed_keys(kernel, "<C-h> k", clip_cap, log_cap, status_cap)
+    feed_text(kernel, "<C-x> <C-f>", clip_cap, log_cap, status_cap)
+    feed_keys(kernel, "<Return>", clip_cap, log_cap, status_cap)
+    let help_k_text = world.active_buffer().to_text()
+    assert_true(help_k_text.contains("find-file"), "C-h k resolves <C-x> <C-f> -> find-file")
+
+    -- 3. `<C-h> b` (`describe-bindings`)
+    feed_keys(kernel, "<C-h> b", clip_cap, log_cap, status_cap)
+    let help_b_text = world.active_buffer().to_text()
+    assert_true(help_b_text.contains("Keymap: emacs-global"), "C-h b includes emacs-global")
+    assert_true(help_b_text.contains("Keymap: emacs-modeless"), "C-h b includes emacs-modeless")
+    assert_true(help_b_text.contains("execute-extended-command"), "C-h b lists M-x binding")
+
+    -- 4. `<C-h> p` (`describe-extensions`)
+    feed_keys(kernel, "<C-h> p", clip_cap, log_cap, status_cap)
+    let help_p_text = world.active_buffer().to_text()
+    assert_true(help_p_text.contains("lava.org/ext_document"), "C-h p lists ext_document")
+    assert_true(help_p_text.contains("lava.org/ext_minibuffer"), "C-h p lists ext_minibuffer")
+    assert_true(help_p_text.contains("lava.org/ext_emacs"), "C-h p lists ext_emacs")
+    assert_true(help_p_text.contains("lava.minibuffer.controller"), "C-h p lists published services")
+    assert_true(help_p_text.contains("buffer-switched"), "C-h p lists hook topics")
+
+    -- 5. Keyboard Macro `<C-x> (` ... `<C-x> )` ... `<C-u> 2 <C-x> e` + `<C-x> <C-b>` `list-buffers`
+    let work = world.create_buffer("macro.txt", BufferKind.Scratch)
+    let _ = world.switch_to_buffer(work.id)
+    work.set_lines(["a", "b", "c"], record_undo = false)
+    work.point = Pos.zero()
+    feed_keys(kernel, "<C-z>", clip_cap, log_cap, status_cap)
+
+    -- Record macro: `<C-e>` + `"!"` + `<C-n>` + `<C-a>`
+    feed_keys(kernel, "<C-x> ( <C-e> ! <C-n> <C-a> <C-x> )", clip_cap, log_cap, status_cap)
+    assert_eq_str(work.line_at(0), "a!", "macro recorded edit on line 0")
+    feed_keys(kernel, "<C-u> 2 <C-x> e", clip_cap, log_cap, status_cap)
+    assert_eq_str(work.line_at(1), "b!", "macro replayed #1 on line 1")
+    assert_eq_str(work.line_at(2), "c!", "macro replayed #2 on line 2")
+
+    -- `<C-x> <C-b>` opens `*Buffers*`
+    feed_keys(kernel, "<C-x> <C-b>", clip_cap, log_cap, status_cap)
+    assert_eq_str(world.active_buffer().name, "*Buffers*", "C-x C-b opened *Buffers*")
+    assert_true(world.active_buffer().to_text().contains("macro.txt"), "*Buffers* lists macro.txt")
+
+    -- `<C-x> <C-c>` with no unsaved FileKind buffers requests clean host quit!
+    feed_keys(kernel, "<C-x> <C-c>", clip_cap, log_cap, status_cap)
+    assert_true(world.quit_requested, "C-x C-c set world.quit_requested")
+    assert_true(mock_quit_requested() != null, "C-x C-c invoked host_request_quit")
+
+    println("[PASS] test_self_documenting_help_and_kmacros")
+}
+
+fn main() {
+    test_fuzzy_scoring_tiers()
+    test_mx_continuation_and_abort()
+    test_filesystem_completion_and_find_file()
+    test_multi_turn_query_replace_and_isearch()
+    test_kill_ring_consecutive_ck_yank_and_yank_pop()
+    test_narrowing_and_widening()
+    test_self_documenting_help_and_kmacros()
+    println("ALL EMACS & MINIBUFFER CONTINUATION TESTS PASSED!")
+}

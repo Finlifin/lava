@@ -1,0 +1,867 @@
+-- ext_yanky: Yank-Ring Cycling, Post-Yank Highlight & Interactive Yank Picker (`lava.org/ext_yanky`).
+-- Inspired by `gbprod/yanky.nvim` and Emacs `consult-yank-pop`: highlights yanked regions briefly,
+-- cycles pasted text across `world.registers.yank_history` via `[y` / `]y` (handling charwise <->
+-- linewise transitions cleanly), and provides a centered `"yanky-picker"` floating window (`<Space> p`,
+-- `:YankyRingHistory`) with live multi-line preview, paste (`<Return>`/`p`/`P`), pin (`m`), delete (`d`), and clear (`c`).
+
+use @lava_sys.{rgb, rgba}
+use @lava_core.{
+    ExtId, HookListener, InteractiveEffects, KeyBindingEntry, KeyStroke, Keymap, ServiceEffects,
+    SystemKernel, clipboard_set, log_event, status_emit
+}
+use @ext_document.{
+    Buffer, BufferId, EditorWorld, FloatingWindow, NarrowRegion, Pos, RegisterValue, Span,
+    ext_document_id, require_editor_world
+}
+use @ext_vim.{
+    KEYMAP_VIM_LEADER, KEYMAP_VIM_NORMAL, ModalInterceptor, VimMode, VimState, ext_vim_id,
+    require_vim_state, sync_world_from_vim
+}
+
+pub const SERVICE_YANKY: String = "lava.yanky.ring"
+pub const OWNER_YANKY: String = "ext_yanky"
+pub const FLOAT_ID_YANKY_PICKER: String = "yanky-picker"
+
+pub fn ext_yanky_id() -> ExtId = ExtId("lava.org/ext_yanky")
+
+pub struct YankyService {
+    pub ring_index: i64,
+    pub highlight_row: i64,
+    pub pinned_entries: List,
+    pub highlight_buf_id: ?BufferId,
+    pub highlight_origin_pos: Pos,
+    pub last_cycle_buf_id: ?BufferId,
+    pub last_cycle_span: ?Span,
+    pub picker_open: bool,
+    pub selected_row: i64,
+}
+
+impl YankyService {
+    pub fn new() -> YankyService {
+        YankyService {
+            ring_index: 0,
+            highlight_row: -1,
+            pinned_entries: List(),
+            highlight_buf_id: null,
+            highlight_origin_pos: Pos.zero(),
+            last_cycle_buf_id: null,
+            last_cycle_span: null,
+            picker_open: false,
+            selected_row: 0,
+        }
+    }
+
+    pub fn is_pinned(self, val: RegisterValue) -> bool {
+        for i in 0..self.pinned_entries.len() {
+            let p = self.pinned_entries.get(i.as(usize)).as(RegisterValue)
+            if p.text == val.text and p.linewise == val.linewise and p.blockwise == val.blockwise {
+                return true
+            }
+        }
+        false
+    }
+
+    pub fn toggle_pin(self, val: RegisterValue) -> bool {
+        for i in 0..self.pinned_entries.len() {
+            let p = self.pinned_entries.get(i.as(usize)).as(RegisterValue)
+            if p.text == val.text and p.linewise == val.linewise and p.blockwise == val.blockwise {
+                let _ = self.pinned_entries.remove(i.as(usize))
+                return false
+            }
+        }
+        self.pinned_entries.push(val)
+        true
+    }
+
+    pub fn unpin_value(self, val: RegisterValue) {
+        let kept = List()
+        for i in 0..self.pinned_entries.len() {
+            let p = self.pinned_entries.get(i.as(usize)).as(RegisterValue)
+            if not (p.text == val.text and p.linewise == val.linewise and p.blockwise == val.blockwise) {
+                kept.push(p)
+            }
+        }
+        self.pinned_entries = kept
+    }
+}
+
+pub fn require_yanky_service(kernel: SystemKernel) -> !String YankyService {
+    let raw = kernel.require_service(SERVICE_YANKY)!
+    raw.as(YankyService)
+}
+
+-- ============================================================================
+-- 1. Temporary Post-Yank Highlight Decor (`"vim-yank"` -> `"cursor-moved"` / `"buffer-modified"`)
+-- ============================================================================
+
+fn clear_yank_highlights(world: EditorWorld, svc: YankyService) {
+    for i in 0..world.buffer_order.len() {
+        let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+        let b_opt = world.buffer(bid)
+        if b_opt != null {
+            b_opt.as(Buffer).clear_owner_decors(OWNER_YANKY)
+        }
+    }
+    svc.highlight_row = -1
+    svc.highlight_buf_id = null
+}
+
+fn split_linewise_payload(text: String) -> List {
+    let normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    let clean = if normalized.ends_with("\n") {
+        normalized.slice(0, normalized.char_len() - 1)
+    } else {
+        normalized
+    }
+    let parts = clean.split("\n")
+    if parts.is_empty() {
+        parts.push("")
+    }
+    parts
+}
+
+fn apply_yank_highlight(world: EditorWorld, svc: YankyService) {
+    clear_yank_highlights(world, svc)
+    let hist = world.registers.yank_history
+    if hist.is_empty() {
+        return
+    }
+    let newest_idx = hist.len() - 1
+    svc.ring_index = newest_idx
+    let val = hist.get(newest_idx.as(usize)).as(RegisterValue)
+    let buf = world.active_buffer()
+    let bg = rgba(249, 226, 175, 95)
+
+    if val.linewise {
+        let lines = split_linewise_payload(val.text)
+        for i in 0..lines.len() {
+            let r = buf.point.row + i
+            if r <= buf.max_row() {
+                let llen = buf.line_char_len(r)
+                let end_c = if llen > 0 { llen } else { 1 }
+                buf.add_inline_decor(OWNER_YANKY, r, 0, end_c, bg_rgba = bg)
+            }
+        }
+    } else {
+        let parts = val.text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if parts.len() == 1 {
+            let r = buf.point.row
+            let sc = buf.point.col
+            let llen = buf.line_char_len(r)
+            let chunk_len = parts.get(0).as(String).char_len()
+            let raw_ec = sc + chunk_len
+            let ec = if raw_ec <= llen { raw_ec } else { llen }
+            if ec > sc {
+                buf.add_inline_decor(OWNER_YANKY, r, sc, ec, bg_rgba = bg)
+            }
+        } else {
+            for i in 0..parts.len() {
+                let r = buf.point.row + i
+                if r <= buf.max_row() {
+                    let llen = buf.line_char_len(r)
+                    let sc = if i == 0 { buf.point.col } else { 0 }
+                    let raw_ec = if i + 1 == parts.len() {
+                        parts.get(i.as(usize)).as(String).char_len()
+                    } else {
+                        llen
+                    }
+                    let ec = if raw_ec <= llen { raw_ec } else { llen }
+                    if ec > sc {
+                        buf.add_inline_decor(OWNER_YANKY, r, sc, ec, bg_rgba = bg)
+                    }
+                }
+            }
+        }
+    }
+
+    svc.highlight_row = buf.point.row
+    svc.highlight_buf_id = buf.id
+    svc.highlight_origin_pos = buf.point
+}
+
+-- ============================================================================
+-- 2. Post-Paste Yank-Ring Cycling (`[y` / `]y`) & Direct Register Paste
+-- ============================================================================
+
+fn extract_current_pasted_text(buf: Buffer, span: Span, linewise: bool) -> String {
+    if linewise {
+        let lo = if span.start.row < buf.min_row() { buf.min_row() } else { span.start.row }
+        let hi = if span.end.row > buf.max_row() { buf.max_row() } else { span.end.row }
+        if hi < lo {
+            return ""
+        }
+        let lines = List()
+        for r in lo..(hi + 1) {
+            lines.push(buf.line_at(r))
+        }
+        return lines.join("\n") ++ "\n"
+    }
+    buf.extract_span(span)
+}
+
+fn find_matching_history_index(hist: List, text: String, linewise: bool) -> i64 {
+    var i = hist.len() - 1
+    while i >= 0 {
+        let v = hist.get(i.as(usize)).as(RegisterValue)
+        if v.linewise == linewise and v.text == text {
+            return i
+        }
+        i -= 1
+    }
+    hist.len() - 1
+}
+
+fn splice_buffer_lines(buf: Buffer, start_row: i64, end_row: i64, new_lines: List) -> !String Span {
+    buf.ensure_writable()!
+    let lo = if start_row < buf.min_row() { buf.min_row() } else { start_row }
+    let hi = if end_row > buf.max_row() { buf.max_row() } else { end_row }
+    let old_count = if hi >= lo { hi - lo + 1 } else { 0 }
+    let clean_new = if new_lines.is_empty() { [""] } else { new_lines }
+    let new_count = clean_new.len()
+    let common = if old_count < new_count { old_count } else { new_count }
+    for i in 0..common {
+        buf.set_line_at(lo + i, clean_new.get(i.as(usize)).as(String))
+    }
+    if old_count > new_count {
+        for _ in 0..(old_count - new_count) {
+            let _ = buf.remove_line_at(lo + new_count)
+        }
+    } else if new_count > old_count {
+        for i in old_count..new_count {
+            buf.insert_line_at(lo + i, clean_new.get(i.as(usize)).as(String))
+        }
+    }
+    if buf.narrow != null {
+        let nr = buf.narrow.as(NarrowRegion)
+        let adj_end = nr.end_row + new_count - old_count
+        let safe_end = if adj_end < nr.start_row { nr.start_row } else { adj_end }
+        buf.narrow = NarrowRegion { start_row: nr.start_row, end_row: safe_end }
+    }
+    buf.modified = true
+    let end_r = lo + new_count - 1
+    Span.normalized(Pos.new(lo, 0), Pos.new(end_r, buf.line_char_len(end_r)))
+}
+
+fn replace_last_paste_in_buffer(
+    buf: Buffer,
+    vim: VimState,
+    old_span: Span,
+    prev_linewise: bool,
+    target_val: RegisterValue,
+) -> !String Span {
+    buf.ensure_writable()!
+    if (not prev_linewise) and (not target_val.linewise) {
+        let (ins_pos, _) = buf.delete_span(old_span)!
+        let new_end = buf.insert_text(ins_pos, target_val.text)!
+        let new_span = Span.normalized(ins_pos, new_end)
+        let landing_c = if new_end.col > 0 { new_end.col - 1 } else { 0 }
+        buf.point = buf.clamp_pos(Pos.new(new_end.row, landing_c), insert_mode = false)
+        vim.last_paste_buf_id = buf.id
+        vim.last_paste_span = new_span
+        vim.last_paste_linewise = false
+        return new_span
+    }
+
+    if prev_linewise and target_val.linewise {
+        let new_lines = split_linewise_payload(target_val.text)
+        let new_span = splice_buffer_lines(buf, old_span.start.row, old_span.end.row, new_lines)!
+        let start_r = new_span.start.row
+        buf.point = buf.clamp_pos(Pos.new(start_r, buf.first_non_blank_col(start_r)), insert_mode = false)
+        vim.last_paste_buf_id = buf.id
+        vim.last_paste_span = new_span
+        vim.last_paste_linewise = true
+        return new_span
+    }
+
+    if (not prev_linewise) and target_val.linewise {
+        let (ins_pos, _) = buf.delete_span(old_span)!
+        let new_lines = split_linewise_payload(target_val.text)
+        let next_p = buf.insert_lines_below(ins_pos.row, new_lines)!
+        let end_r = next_p.row + new_lines.len() - 1
+        let new_span = Span.normalized(Pos.new(next_p.row, 0), Pos.new(end_r, buf.line_char_len(end_r)))
+        buf.point = buf.clamp_pos(next_p, insert_mode = false)
+        vim.last_paste_buf_id = buf.id
+        vim.last_paste_span = new_span
+        vim.last_paste_linewise = true
+        return new_span
+    }
+
+    -- `prev_linewise == true` and `target_val.linewise == false`
+    let (del_pos, _) = buf.delete_lines(old_span.start.row, old_span.end.row)!
+    let ins_pos = buf.clamp_pos(del_pos, insert_mode = true)
+    let new_end = buf.insert_text(ins_pos, target_val.text)!
+    let new_span = Span.normalized(ins_pos, new_end)
+    let landing_c = if new_end.col > 0 { new_end.col - 1 } else { 0 }
+    buf.point = buf.clamp_pos(Pos.new(new_end.row, landing_c), insert_mode = false)
+    vim.last_paste_buf_id = buf.id
+    vim.last_paste_span = new_span
+    vim.last_paste_linewise = false
+    new_span
+}
+
+pub fn yanky_cycle(
+    world: EditorWorld,
+    vim: VimState,
+    delta: i64,
+    .svc: ?YankyService = null,
+) -> #[status_emit, clipboard_set] !String bool {
+    let buf = world.active_buffer()
+    let last_bid? = vim.last_paste_buf_id else {
+        status_emit("Yanky: no previous paste to cycle")#
+        return false
+    }
+    let old_span? = vim.last_paste_span else {
+        status_emit("Yanky: no previous paste span to cycle")#
+        return false
+    }
+    if last_bid != buf.id {
+        status_emit("Yanky: last paste was in a different buffer")#
+        return false
+    }
+    let hist = world.registers.yank_history
+    let n = hist.len()
+    if n == 0 {
+        status_emit("Yanky: yank history is empty")#
+        return false
+    }
+
+    if svc != null {
+        clear_yank_highlights(world, svc.as(YankyService))
+    } else {
+        buf.clear_owner_decors(OWNER_YANKY)
+    }
+
+    var base_idx = n - 1
+    var continuing_cycle = false
+    if svc != null {
+        let ys = svc.as(YankyService)
+        ys.last_cycle_buf_id match {
+            cbid? => {
+                ys.last_cycle_span match {
+                    cspan? => {
+                        if cbid == buf.id and cspan == old_span {
+                            continuing_cycle = true
+                            if ys.ring_index >= 0 and ys.ring_index < n {
+                                base_idx = ys.ring_index
+                            }
+                        }
+                    },
+                    null => (),
+                }
+            },
+            null => (),
+        }
+    }
+    if not continuing_cycle {
+        let cur_pasted = extract_current_pasted_text(buf, old_span, vim.last_paste_linewise)
+        base_idx = find_matching_history_index(hist, cur_pasted, vim.last_paste_linewise)
+    }
+
+    var next_idx = (base_idx + delta) % n
+    if next_idx < 0 {
+        next_idx += n
+    }
+
+    let target_val = hist.get(next_idx.as(usize)).as(RegisterValue)
+    let new_span = replace_last_paste_in_buffer(buf, vim, old_span, vim.last_paste_linewise, target_val)!
+
+    if svc != null {
+        let ys = svc.as(YankyService)
+        ys.ring_index = next_idx
+        ys.last_cycle_buf_id = buf.id
+        ys.last_cycle_span = new_span
+    }
+
+    world.registers.set_reg("\"", target_val)#
+    buf.preferred_col = buf.point.col
+    buf.named_marks.insert(".", buf.point)
+    buf.checkpoint(buf.point, "yanky-cycle")
+    sync_world_from_vim(world, vim)
+
+    let kind_tag = if target_val.linewise { "L" } else { "C" }
+    let msg = "Yanky [" ++ (next_idx + 1).to_string() ++ "/" ++ n.to_string() ++ "] (" ++ kind_tag ++ ")"
+    world.status_message = msg
+    status_emit(msg)#
+    true
+}
+
+fn paste_entry_from_picker(
+    world: EditorWorld,
+    vim: VimState,
+    svc: YankyService,
+    hist_idx: i64,
+    val: RegisterValue,
+    after_cursor: bool,
+) -> #[status_emit, clipboard_set] !String Unit {
+    let buf = world.active_buffer()
+    buf.ensure_writable()!
+    clear_yank_highlights(world, svc)
+
+    if val.linewise {
+        let lines = split_linewise_payload(val.text)
+        let next_p = if after_cursor {
+            buf.insert_lines_below(buf.point.row, lines)!
+        } else {
+            buf.insert_lines_above(buf.point.row, lines)!
+        }
+        let end_r = next_p.row + lines.len() - 1
+        let pspan = Span.normalized(Pos.new(next_p.row, 0), Pos.new(end_r, buf.line_char_len(end_r)))
+        vim.last_paste_buf_id = buf.id
+        vim.last_paste_span = pspan
+        vim.last_paste_linewise = true
+        svc.ring_index = hist_idx
+        svc.last_cycle_buf_id = buf.id
+        svc.last_cycle_span = pspan
+        buf.point = buf.clamp_pos(next_p, insert_mode = false)
+    } else {
+        let cur_len = buf.line_char_len(buf.point.row)
+        let ins_pos = if after_cursor and cur_len > 0 {
+            let c = if buf.point.col + 1 <= cur_len { buf.point.col + 1 } else { cur_len }
+            Pos.new(buf.point.row, c)
+        } else {
+            Pos.new(buf.point.row, buf.point.col)
+        }
+        let end_p = buf.insert_text(ins_pos, val.text)!
+        let pspan = Span.normalized(ins_pos, end_p)
+        vim.last_paste_buf_id = buf.id
+        vim.last_paste_span = pspan
+        vim.last_paste_linewise = false
+        svc.ring_index = hist_idx
+        svc.last_cycle_buf_id = buf.id
+        svc.last_cycle_span = pspan
+        let landing_c = if end_p.col > 0 { end_p.col - 1 } else { 0 }
+        buf.point = buf.clamp_pos(Pos.new(end_p.row, landing_c), insert_mode = false)
+    }
+
+    world.registers.set_reg("\"", val)#
+    buf.preferred_col = buf.point.col
+    buf.named_marks.insert(".", buf.point)
+    buf.checkpoint(buf.point, "yanky-picker-paste")
+    vim.mode = VimMode.Normal
+    vim.clear_transient()
+    sync_world_from_vim(world, vim)
+
+    let msg = "Yanky pasted entry #" ++ (hist_idx + 1).to_string()
+    world.status_message = msg
+    status_emit(msg)#
+    ()
+}
+
+-- ============================================================================
+-- 3. Interactive Yank History Picker (`"yanky-picker"`, `<Space> p`, `:YankyRingHistory`)
+-- ============================================================================
+
+fn single_line_preview(text: String, max_cols: i64) -> String {
+    let flat = text.replace("\r\n", "\n").replace("\r", "\n")
+    let clean = if flat.ends_with("\n") {
+        flat.slice(0, flat.char_len() - 1)
+    } else {
+        flat
+    }
+    let one_line = clean.replace("\n", " \\n ")
+    if one_line.char_len() > max_cols {
+        one_line.take(max_cols - 3) ++ "..."
+    } else {
+        one_line
+    }
+}
+
+fn clamp_picker_selection(svc: YankyService, count: i64) {
+    if count <= 0 {
+        svc.selected_row = 0
+        return
+    }
+    if svc.selected_row < 0 {
+        svc.selected_row = 0
+    } else if svc.selected_row >= count {
+        svc.selected_row = count - 1
+    }
+}
+
+fn history_index_for_picker_row(hist_len: i64, picker_row: i64) -> i64 {
+    hist_len - 1 - picker_row
+}
+
+fn render_picker_lines(world: EditorWorld, svc: YankyService) -> List {
+    let out = List()
+    let hist = world.registers.yank_history
+    let n = hist.len()
+    if n == 0 {
+        out.push("  (Yank ring is empty — yank text with `y` / `yy` first)")
+        out.push("────────────────────────────────────────────────────────────────────────")
+        out.push("  [q/Esc] close")
+        return out
+    }
+
+    clamp_picker_selection(svc, n)
+    for row_i in 0..n {
+        let hist_idx = history_index_for_picker_row(n, row_i)
+        let v = hist.get(hist_idx.as(usize)).as(RegisterValue)
+        let kind_tag = if v.blockwise {
+            "[B]"
+        } else if v.linewise {
+            "[L]"
+        } else {
+            "[C]"
+        }
+        let pin_mark = if svc.is_pinned(v) { "* " } else { "  " }
+        let idx_tag = "[#" ++ (row_i + 1).to_string() ++ "]"
+        let prev = single_line_preview(v.text, 54)
+        out.push(pin_mark ++ idx_tag ++ " " ++ kind_tag ++ " " ++ prev)
+    }
+
+    out.push("────────────────────────────────────────────────────────────────────────")
+    let sel_hist_idx = history_index_for_picker_row(n, svc.selected_row)
+    let sel_val = hist.get(sel_hist_idx.as(usize)).as(RegisterValue)
+    let mode_desc = if sel_val.blockwise {
+        "blockwise"
+    } else if sel_val.linewise {
+        "linewise"
+    } else {
+        "charwise"
+    }
+    out.push(
+        "Preview (" ++ mode_desc ++ ", " ++ sel_val.text.char_len().to_string()
+        ++ " chars) — [RET/p] paste  [P] before  [d] del  [m] pin  [c] clear  [q] close:"
+    )
+    let raw_lines = split_linewise_payload(sel_val.text)
+    let max_prev = if raw_lines.len() > 6 { 6 } else { raw_lines.len() }
+    for pi in 0..max_prev {
+        let pline = raw_lines.get(pi.as(usize)).as(String)
+        let clipped = if pline.char_len() > 70 { pline.take(67) ++ "..." } else { pline }
+        out.push("  " ++ clipped)
+    }
+    if raw_lines.len() > max_prev {
+        out.push("  ... (+" ++ (raw_lines.len() - max_prev).to_string() ++ " more lines)")
+    }
+    out
+}
+
+fn refresh_yanky_picker_float(world: EditorWorld, svc: YankyService) {
+    let hist_len = world.registers.yank_history.len()
+    clamp_picker_selection(svc, hist_len)
+    let lines = render_picker_lines(world, svc)
+    let h_rows = if lines.len() < 8 {
+        8
+    } else if lines.len() > 20 {
+        20
+    } else {
+        lines.len()
+    }
+    let sel_row = if hist_len > 0 { svc.selected_row } else { -1 }
+    world.set_floating_window(FloatingWindow {
+        id: FLOAT_ID_YANKY_PICKER,
+        owner: OWNER_YANKY,
+        title: "Yank Ring History",
+        anchor: "center",
+        width_cols: 76,
+        height_rows: h_rows,
+        lines: lines,
+        selected_row: sel_row,
+        border_rgba: rgb(249, 226, 175),
+    })
+}
+
+fn close_yanky_picker(world: EditorWorld, vim: VimState, svc: YankyService) {
+    svc.picker_open = false
+    let _ = world.remove_floating_window(FLOAT_ID_YANKY_PICKER)
+    if vim.modal_interceptor != null {
+        if vim.modal_interceptor.as(ModalInterceptor).owner == OWNER_YANKY {
+            vim.clear_interceptor()
+        }
+    }
+}
+
+fn yanky_picker_interceptor(
+    kernel: SystemKernel,
+    stroke: KeyStroke,
+) -> #ServiceEffects !String bool {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_yanky_service(kernel)!
+
+    if not svc.picker_open {
+        vim.clear_interceptor()
+        return false
+    }
+
+    let k = stroke.key
+    let plain = (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod)
+    let ctrl_only = stroke.ctrl and (not stroke.alt) and (not stroke.super_mod)
+
+    if k == "Escape" or (plain and k == "q") or (ctrl_only and (k == "[" or k == "c" or k == "g")) {
+        close_yanky_picker(world, vim, svc)
+        status_emit("Yank Ring closed")#
+        return true
+    }
+
+    let hist = world.registers.yank_history
+    let total = hist.len()
+    if total == 0 {
+        return true
+    }
+
+    if (plain and (k == "j" or k == "Down")) or (ctrl_only and k == "n") {
+        svc.selected_row = (svc.selected_row + 1) % total
+        refresh_yanky_picker_float(world, svc)
+        return true
+    }
+
+    if (plain and (k == "k" or k == "Up")) or (ctrl_only and k == "p") {
+        svc.selected_row = (svc.selected_row - 1 + total) % total
+        refresh_yanky_picker_float(world, svc)
+        return true
+    }
+
+    if k == "Return" or (ctrl_only and k == "m") or (plain and k == "p") {
+        clamp_picker_selection(svc, total)
+        let hist_idx = history_index_for_picker_row(total, svc.selected_row)
+        let val = hist.get(hist_idx.as(usize)).as(RegisterValue)
+        close_yanky_picker(world, vim, svc)
+        paste_entry_from_picker(world, vim, svc, hist_idx, val, true)#!
+        return true
+    }
+
+    if plain and k == "P" {
+        clamp_picker_selection(svc, total)
+        let hist_idx = history_index_for_picker_row(total, svc.selected_row)
+        let val = hist.get(hist_idx.as(usize)).as(RegisterValue)
+        close_yanky_picker(world, vim, svc)
+        paste_entry_from_picker(world, vim, svc, hist_idx, val, false)#!
+        return true
+    }
+
+    if plain and (k == "d" or k == "x") {
+        clamp_picker_selection(svc, total)
+        let hist_idx = history_index_for_picker_row(total, svc.selected_row)
+        let removed = hist.remove(hist_idx.as(usize)).as(RegisterValue)
+        svc.unpin_value(removed)
+        clamp_picker_selection(svc, hist.len())
+        refresh_yanky_picker_float(world, svc)
+        status_emit("Yank Ring: deleted entry")#
+        return true
+    }
+
+    if (plain and k == "m") or k == "Tab" {
+        clamp_picker_selection(svc, total)
+        let hist_idx = history_index_for_picker_row(total, svc.selected_row)
+        let val = hist.get(hist_idx.as(usize)).as(RegisterValue)
+        let pinned_now = svc.toggle_pin(val)
+        refresh_yanky_picker_float(world, svc)
+        status_emit(if pinned_now { "Yank Ring: pinned entry" } else { "Yank Ring: unpinned entry" })#
+        return true
+    }
+
+    if plain and k == "c" {
+        world.registers.yank_history = List()
+        svc.pinned_entries = List()
+        svc.selected_row = 0
+        svc.ring_index = 0
+        refresh_yanky_picker_float(world, svc)
+        status_emit("Yank Ring: cleared history")#
+        return true
+    }
+
+    true
+}
+
+-- ============================================================================
+-- 4. Command Handlers & Extension Registration
+-- ============================================================================
+
+fn cmd_yanky_cycle_prev(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_yanky_service(kernel)!
+    let _ = yanky_cycle(world, vim, -1, svc = svc)#!
+    ()
+}
+
+fn cmd_yanky_cycle_next(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_yanky_service(kernel)!
+    let _ = yanky_cycle(world, vim, 1, svc = svc)#!
+    ()
+}
+
+fn cmd_yanky_history(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_yanky_service(kernel)!
+
+    if svc.picker_open {
+        close_yanky_picker(world, vim, svc)
+        status_emit("Yank Ring closed")#
+        return ()
+    }
+
+    svc.selected_row = 0
+    svc.picker_open = true
+    refresh_yanky_picker_float(world, svc)
+    vim.set_interceptor(OWNER_YANKY, yanky_picker_interceptor)
+    let cnt = world.registers.yank_history.len()
+    log_event("info", OWNER_YANKY, "Opened Yank Ring picker (" ++ cnt.to_string() ++ " entries)")#
+    status_emit("Yank Ring History (" ++ cnt.to_string() ++ " entries)")#
+    ()
+}
+
+fn cmd_yanky_clear(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_yanky_service(kernel)!
+    world.registers.yank_history = List()
+    svc.pinned_entries = List()
+    svc.ring_index = 0
+    svc.selected_row = 0
+    if svc.picker_open {
+        refresh_yanky_picker_float(world, svc)
+    }
+    status_emit("Yank Ring: cleared all entries")#
+    ()
+}
+
+fn cleanup_extension_hooks_and_bindings(kernel: SystemKernel, ext_id: ExtId) {
+    for topic_any in kernel.hooks.keys() {
+        let topic = topic_any.as(String)
+        let list_opt = kernel.hooks.get(topic)
+        if list_opt != null {
+            let listeners = list_opt.as(List)
+            let kept = List()
+            for i in 0..listeners.len() {
+                let item = listeners.get(i.as(usize)).as(HookListener)
+                if item.owner != ext_id {
+                    kept.push(item)
+                }
+            }
+            kernel.hooks.insert(topic, kept)
+        }
+    }
+    for km_any in kernel.keymaps.keys() {
+        let km_name = km_any.as(String)
+        let km_opt = kernel.keymaps.get(km_name)
+        if km_opt != null {
+            let km = km_opt.as(Keymap)
+            for chord_any in km.bindings.keys() {
+                let chord = chord_any.as(String)
+                let entry_opt = km.bindings.get(chord)
+                if entry_opt != null and entry_opt.as(KeyBindingEntry).owner == ext_id {
+                    let _ = km.bindings.remove(chord)
+                }
+            }
+        }
+    }
+}
+
+pub fn register_yanky_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_yanky_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_yanky",
+        "0.1.0",
+        "Yank-ring post-paste cycling (`[y`/`]y`), yank region highlight, and interactive Yank Ring History picker (`<Space>p`).",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let svc = YankyService.new()
+            k.publish_service(SERVICE_YANKY, ext_id, svc)
+
+            let norm_km = k.ensure_keymap(KEYMAP_VIM_NORMAL)
+            norm_km.bind("[ y", "yanky-cycle-prev", ext_id, description = "Cycle paste to older yank")
+            norm_km.bind("] y", "yanky-cycle-next", ext_id, description = "Cycle paste to newer yank")
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> p", "yanky-history", ext_id, description = "Open Yank Ring History picker")
+
+            k.register_command("yanky-cycle-prev", ext_id, "Replace last paste with older yank-ring entry (`[y`).", cmd_yanky_cycle_prev)
+            k.register_command("ex:YankyCyclePrev", ext_id, "Ex `:YankyCyclePrev`.", cmd_yanky_cycle_prev, interactive = false)
+
+            k.register_command("yanky-cycle-next", ext_id, "Replace last paste with newer yank-ring entry (`]y`).", cmd_yanky_cycle_next)
+            k.register_command("ex:YankyCycleNext", ext_id, "Ex `:YankyCycleNext`.", cmd_yanky_cycle_next, interactive = false)
+
+            k.register_command("yanky-history", ext_id, "Open interactive Yank Ring History picker (`<Space>p`).", cmd_yanky_history)
+            k.register_command("yanky-ring-history", ext_id, "Open interactive Yank Ring History picker.", cmd_yanky_history)
+            k.register_command("ex:YankyRingHistory", ext_id, "Ex `:YankyRingHistory`.", cmd_yanky_history, interactive = false)
+            k.register_command("ex:YankyHistory", ext_id, "Ex `:YankyHistory`.", cmd_yanky_history, interactive = false)
+
+            k.register_command("yanky-clear", ext_id, "Clear Yank Ring history.", cmd_yanky_clear)
+            k.register_command("ex:YankyClearHistory", ext_id, "Ex `:YankyClearHistory`.", cmd_yanky_clear, interactive = false)
+
+            k.add_hook("vim-yank", ext_id, |kern: SystemKernel, _payload: Any| -> Unit {
+                let w_opt = kern.service("lava.document.world")
+                let s_opt = kern.service(SERVICE_YANKY)
+                if w_opt == null or s_opt == null {
+                    return
+                }
+                apply_yank_highlight(w_opt.as(EditorWorld), s_opt.as(YankyService))
+            })
+
+            k.add_hook("cursor-moved", ext_id, |kern: SystemKernel, _payload: Any| -> Unit {
+                let w_opt = kern.service("lava.document.world")
+                let s_opt = kern.service(SERVICE_YANKY)
+                if w_opt == null or s_opt == null {
+                    return
+                }
+                let w = w_opt.as(EditorWorld)
+                let ys = s_opt.as(YankyService)
+                if ys.highlight_row < 0 {
+                    return
+                }
+                let cur = w.active_buffer()
+                var moved_away = true
+                ys.highlight_buf_id match {
+                    hbid? => {
+                        if hbid == cur.id and ys.highlight_origin_pos == cur.point {
+                            moved_away = false
+                        }
+                    },
+                    null => (),
+                }
+                if moved_away {
+                    clear_yank_highlights(w, ys)
+                }
+            })
+
+            k.add_hook("buffer-modified", ext_id, |kern: SystemKernel, _payload: Any| -> Unit {
+                let w_opt = kern.service("lava.document.world")
+                let s_opt = kern.service(SERVICE_YANKY)
+                if w_opt == null or s_opt == null {
+                    return
+                }
+                let ys = s_opt.as(YankyService)
+                if ys.highlight_row >= 0 {
+                    clear_yank_highlights(w_opt.as(EditorWorld), ys)
+                }
+            })
+
+            k.add_hook("mode-changed", ext_id, |kern: SystemKernel, _payload: Any| -> Unit {
+                let w_opt = kern.service("lava.document.world")
+                let s_opt = kern.service(SERVICE_YANKY)
+                if w_opt == null or s_opt == null {
+                    return
+                }
+                let w = w_opt.as(EditorWorld)
+                let ys = s_opt.as(YankyService)
+                if ys.highlight_row >= 0 and w.mode_name != "NORMAL" {
+                    clear_yank_highlights(w, ys)
+                }
+            })
+
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            let v_opt = k.service("lava.vim.state")
+            if v_opt != null {
+                let vs = v_opt.as(VimState)
+                if vs.modal_interceptor != null and vs.modal_interceptor.as(ModalInterceptor).owner == OWNER_YANKY {
+                    vs.clear_interceptor()
+                }
+            }
+            if w_opt != null {
+                w_opt.as(EditorWorld).clear_owner_ui(OWNER_YANKY)
+            }
+            cleanup_extension_hooks_and_bindings(k, ext_id)
+            ()
+        },
+    )
+}

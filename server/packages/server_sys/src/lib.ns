@@ -1,0 +1,1403 @@
+-- server_sys: Host RPC framing ABI, workspace/git accelerators, and LSP bridge for `lava-server`.
+-- Bridges `LavaHostHandler` (`srv_rpc_*`, `accel_*`, `lsp_*`) via `std.runtime.host_call`,
+-- with deterministic in-memory RPC mocking and pure-Nessa `std.fs`/`std.process` fallbacks
+-- so standalone `nessa run` test suites execute identically without external host wiring.
+
+use std.collections.HashMap
+use std.env
+use std.fs
+use std.io
+use std.path
+use std.process
+use std.runtime
+
+-- ============================================================================
+-- 1. Stdio JSON-RPC Framing ABI & Deterministic Mock Transport
+-- ============================================================================
+
+private global _mock_mode: bool = false
+private global _mock_inbox: List = List()
+private global _mock_outbox: List = List()
+
+pub fn mock_enable(enabled: bool) {
+    _mock_mode = enabled
+    _mock_inbox = List()
+    _mock_outbox = List()
+}
+
+pub fn mock_is_enabled() -> bool = _mock_mode
+
+pub fn mock_push_rpc_request(raw_json: String) {
+    _mock_mode = true
+    _mock_inbox.push(raw_json)
+}
+
+pub fn mock_drain_rpc_responses() -> List {
+    let out = _mock_outbox
+    _mock_outbox = List()
+    out
+}
+
+pub fn srv_rpc_recv() -> (bool, String) {
+    if not _mock_inbox.is_empty() {
+        let raw_json = _mock_inbox.remove(0.as(usize)).as(String)
+        return (false, raw_json)
+    }
+    if _mock_mode {
+        return (true, "")
+    }
+    let raw! = runtime.host_call("srv_rpc_recv", List()) else {
+        return (true, "")
+    }
+    if not (raw matches _: List) {
+        return (true, "")
+    }
+    let arr = raw.as(List)
+    if arr.len() < 2 {
+        return (true, "")
+    }
+    (arr.get(0).as(bool), arr.get(1).as(String))
+}
+
+pub fn srv_rpc_send(raw_json: String) {
+    if _mock_mode {
+        _mock_outbox.push(raw_json)
+        return
+    }
+    let _ = runtime.host_call("srv_rpc_send", [raw_json]) ! {
+        _ => {
+            _mock_outbox.push(raw_json)
+        },
+    }
+}
+
+-- ============================================================================
+-- 2. Path Normalization & Upward Project Root Discovery
+-- ============================================================================
+
+pub fn expand_tilde(raw: String) -> String {
+    let home = env.get_or("HOME", "")
+    if home == "" {
+        return raw
+    }
+    if raw == "~" {
+        return home
+    }
+    if raw.starts_with("~/") {
+        return path.join(home, raw.drop(2))
+    }
+    raw
+}
+
+pub fn current_working_dir() -> String {
+    let d! = env.current_dir() else {
+        return env.get_or("PWD", ".")
+    }
+    d
+}
+
+pub fn resolve_server_path(raw: String) -> String {
+    let trimmed = raw.trim()
+    if trimmed == "" {
+        let cwd = current_working_dir()
+        let canon! = fs.canonicalize(cwd) else {
+            return path.normalize(cwd)
+        }
+        return canon
+    }
+    let expanded = expand_tilde(trimmed)
+    let abs = if path.is_absolute(expanded) {
+        path.normalize(expanded)
+    } else {
+        path.normalize(path.join(current_working_dir(), expanded))
+    }
+    if fs.exists(abs) {
+        let canon! = fs.canonicalize(abs) else {
+            return abs
+        }
+        return canon
+    }
+    -- If target does not exist yet, canonicalize longest existing ancestor if possible.
+    let par_opt = path.parent(abs)
+    let name_opt = path.file_name(abs)
+    if par_opt != null and name_opt != null {
+        let par = par_opt.as(String)
+        if fs.exists(par) {
+            let canon_par! = fs.canonicalize(par) else {
+                return abs
+            }
+            return path.join(canon_par, name_opt.as(String))
+        }
+    }
+    abs
+}
+
+pub fn find_project_root(start_path: String, markers: List) -> (String, String) {
+    let resolved_start = resolve_server_path(start_path)
+    let base = if fs.exists(resolved_start) and fs.is_dir(resolved_start) {
+        resolved_start
+    } else if fs.exists(resolved_start) {
+        let p_opt = path.parent(resolved_start)
+        if p_opt != null { p_opt.as(String) } else { resolved_start }
+    } else {
+        -- For non-existent file paths (e.g. unsaved buffer path), check if path looks like a file
+        let p_opt = path.parent(resolved_start)
+        if p_opt != null and fs.exists(p_opt.as(String)) and fs.is_dir(p_opt.as(String)) {
+            p_opt.as(String)
+        } else {
+            resolved_start
+        }
+    }
+
+    var cur = base
+    var guard: i64 = 0
+    while guard < 64 and cur != "" {
+        for mi in 0..markers.len() {
+            let marker = markers.get(mi.as(usize)).as(String).trim()
+            if marker != "" and fs.exists(path.join(cur, marker)) {
+                return (cur, marker)
+            }
+        }
+        let par_opt = path.parent(cur)
+        if par_opt == null {
+            break
+        }
+        let next_dir = par_opt.as(String)
+        if next_dir == cur {
+            break
+        }
+        cur = next_dir
+        guard += 1
+    }
+    (base, "")
+}
+
+-- ============================================================================
+-- 3. Workspace File Indexer, Fuzzy Ranker, Grep & Symbol Outline Wrappers
+-- ============================================================================
+
+pub struct SrvFuzzyHit {
+    pub index: i64,
+    pub score: i64,
+}
+derive Eq, PartialEq, Display for SrvFuzzyHit
+
+pub struct SrvGrepHit {
+    pub file_path: String,
+    pub row: i64,
+    pub col: i64,
+    pub line_text: String,
+}
+derive Eq, PartialEq, Display for SrvGrepHit
+
+pub struct SrvSymbolItem {
+    pub name: String,
+    pub kind: String,
+    pub row: i64,
+    pub col: i64,
+    pub level: i64,
+}
+derive Eq, PartialEq, Display for SrvSymbolItem
+
+pub struct SrvGitFileEntry {
+    pub index_status: String,
+    pub worktree_status: String,
+    pub rel_path: String,
+}
+derive Eq, PartialEq, Display for SrvGitFileEntry
+
+pub struct SrvGitStatus {
+    pub is_repo: bool,
+    pub root: String,
+    pub branch: String,
+    pub staged_count: i64,
+    pub modified_count: i64,
+    pub untracked_count: i64,
+    pub entries: List,
+}
+
+pub struct SrvGitBlame {
+    pub commit_short: String,
+    pub author: String,
+    pub date_ymd: String,
+    pub summary: String,
+}
+derive Eq, PartialEq, Display for SrvGitBlame
+
+private fn fallback_fuzzy_score(q_trim: String, q_low: String, cand: String) -> i64 {
+    if q_trim == "" {
+        return 100
+    }
+    let c_low = cand.to_lower()
+    if c_low == q_low {
+        return 20000
+    }
+    if c_low.starts_with(q_low) {
+        return 15000 - (c_low.char_len() - q_low.char_len())
+    }
+    let slash_hits = c_low.rfind_indices("/")
+    if not slash_hits.is_empty() {
+        let sp = slash_hits.get(0).as(i64)
+        let base = c_low.drop(sp + 1)
+        if base == q_low {
+            return 18000 - sp
+        }
+        if base.starts_with(q_low) {
+            return 13500 - (base.char_len() - q_low.char_len()) * 2 - sp
+        }
+    }
+    let sub_hits = c_low.find_indices(q_low)
+    if not sub_hits.is_empty() {
+        let pos = sub_hits.get(0).as(i64)
+        return 9500 - pos * 4 - c_low.char_len()
+    }
+    let qlen = q_low.char_len()
+    let clen = c_low.char_len()
+    if qlen > clen {
+        return -1
+    }
+    var qi: i64 = 0
+    var ci: i64 = 0
+    var bonus: i64 = 0
+    while qi < qlen and ci < clen {
+        if c_low.slice(ci, ci + 1) == q_low.slice(qi, qi + 1) {
+            if ci == 0 {
+                bonus += 45
+            } else {
+                let prev = c_low.slice(ci - 1, ci)
+                if prev == "/" or prev == "_" or prev == "-" or prev == "." or prev == " " {
+                    bonus += 45
+                }
+            }
+            qi += 1
+        }
+        ci += 1
+    }
+    if qi == qlen {
+        3000 + bonus - clen
+    } else {
+        -1
+    }
+}
+
+pub fn accel_fuzzy_rank(query: String, candidates: List, .limit: i64 = 100) -> List {
+    let raw! = runtime.host_call("accel_fuzzy_rank", [query, candidates, limit]) else {
+        let q_trim = query.trim()
+        let q_low = q_trim.to_lower()
+        let pairs = List()
+        for i in 0..candidates.len() {
+            let cand = candidates.get(i.as(usize)).as(String)
+            let sc = fallback_fuzzy_score(q_trim, q_low, cand)
+            if sc >= 0 {
+                pairs.push(SrvFuzzyHit { index: i, score: sc })
+            }
+        }
+        pairs.sort_by(|a: Any, b: Any| {
+            let fa = a.as(SrvFuzzyHit)
+            let fb = b.as(SrvFuzzyHit)
+            if fa.score != fb.score {
+                fb.score.cmp(fa.score)
+            } else {
+                fa.index.cmp(fb.index)
+            }
+        })
+        if limit > 0 and pairs.len() > limit {
+            return pairs.take(limit.as(usize))
+        }
+        return pairs
+    }
+    let arr = raw.as(List)
+    let out = List()
+    for i in 0..arr.len() {
+        let row = arr.get(i.as(usize)).as(List)
+        out.push(SrvFuzzyHit {
+            index: row.get(0).as(i64),
+            score: row.get(1).as(i64),
+        })
+    }
+    out
+}
+
+private fn is_ignored_rel_path(rel: String) -> bool {
+    rel.starts_with("target/")
+        or rel.starts_with("node_modules/")
+        or rel.starts_with(".git/")
+        or rel.contains("/target/")
+        or rel.contains("/node_modules/")
+        or rel.contains("/.git/")
+        or rel.ends_with(".nsbc")
+        or rel.ends_with(".o")
+        or rel.ends_with(".so")
+}
+
+pub fn accel_workspace_files(
+    root: String,
+    .max_files: i64 = 10000,
+    .include_hidden: bool = false,
+) -> List {
+    let raw! = runtime.host_call("accel_workspace_files", [root, max_files, include_hidden]) else {
+        if not fs.exists(root) or (not fs.is_dir(root)) {
+            return List()
+        }
+        let rg_args = List()
+        rg_args.push("--files")
+        rg_args.push("--color=never")
+        if include_hidden {
+            rg_args.push("--hidden")
+            rg_args.push("-g")
+            rg_args.push("!.git")
+        }
+        let rg_res = process.exec("rg", args = rg_args, cwd = root)
+        rg_res match {
+            rg_out! => {
+                if rg_out.status == 0 {
+                    let lines = rg_out.stdout.replace("\r\n", "\n").split("\n")
+                    let files = List()
+                    for i in 0..lines.len() {
+                        var rel = lines.get(i.as(usize)).as(String).trim()
+                        if rel.starts_with("./") {
+                            rel = rel.drop(2)
+                        }
+                        if rel != "" and (not is_ignored_rel_path(rel)) {
+                            files.push(rel)
+                            if max_files > 0 and files.len() >= max_files {
+                                break
+                            }
+                        }
+                    }
+                    files.sort()
+                    return files
+                }
+            },
+            error _ => (),
+        }
+        let walked! = fs.walk_dir(root, max_depth = 16, include_hidden = include_hidden) else {
+            return List()
+        }
+        let out = List()
+        for i in 0..walked.len() {
+            let rel = walked.get(i.as(usize)).as(String)
+            if not is_ignored_rel_path(rel) {
+                out.push(rel)
+                if max_files > 0 and out.len() >= max_files {
+                    break
+                }
+            }
+        }
+        out.sort()
+        return out
+    }
+    raw.as(List)
+}
+
+private fn parse_positive_i64(s: String) -> ?i64 {
+    let trimmed = s.trim()
+    if trimmed == "" {
+        return null
+    }
+    let val? = io.tonumber(trimmed, base = 10) else {
+        return null
+    }
+    val match {
+        n: i64 => n,
+        _ => null,
+    }
+}
+
+private fn byte_col_to_char_col(line: String, byte_col_0: i64) -> i64 {
+    if byte_col_0 <= 0 {
+        return 0
+    }
+    if byte_col_0 >= line.len() {
+        return line.char_len()
+    }
+    if line.is_char_boundary(byte_col_0) {
+        let prefix = line.get(0, byte_col_0).as(String)
+        return prefix.char_len()
+    }
+    let safe_b = line.floor_char_boundary(byte_col_0)
+    line.get(0, safe_b).as(String).char_len()
+}
+
+private fn parse_rg_vimgrep_line(raw_line: String) -> ?SrvGrepHit {
+    if raw_line == "" {
+        return null
+    }
+    -- Format from `rg --line-number --column --no-heading --color=never`:
+    -- `<path>:<line_1>:<col_1>:<line_text>`
+    let c1? = raw_line.byte_find(":") else { return null }
+    let rest1 = raw_line.get(c1 + 1, raw_line.len()).as(String)
+    let c2? = rest1.byte_find(":") else { return null }
+    let line_str = rest1.get(0, c2).as(String)
+    let rest2 = rest1.get(c2 + 1, rest1.len()).as(String)
+    let c3? = rest2.byte_find(":") else { return null }
+    let col_str = rest2.get(0, c3).as(String)
+    let text = rest2.get(c3 + 1, rest2.len()).as(String)
+
+    let line_1? = parse_positive_i64(line_str) else { return null }
+    let col_1? = parse_positive_i64(col_str) else { return null }
+
+    var rel = raw_line.get(0, c1).as(String)
+    if rel.starts_with("./") {
+        rel = rel.drop(2)
+    }
+    let row_0 = if line_1 > 0 { line_1 - 1 } else { 0 }
+    let byte_col_0 = if col_1 > 0 { col_1 - 1 } else { 0 }
+    let char_col_0 = byte_col_to_char_col(text, byte_col_0)
+
+    SrvGrepHit {
+        file_path: rel,
+        row: row_0,
+        col: char_col_0,
+        line_text: text,
+    }
+}
+
+private fn fallback_literal_grep(
+    root: String,
+    query: String,
+    case_sensitive: bool,
+    max_results: i64,
+    file_filter: String,
+) -> List {
+    let files = accel_workspace_files(root, max_files = 5000)
+    let filt_low = file_filter.trim().to_lower()
+    let q_cmp = if case_sensitive { query } else { query.to_lower() }
+    let out = List()
+    for i in 0..files.len() {
+        let rel = files.get(i.as(usize)).as(String)
+        if filt_low != "" and (not rel.to_lower().contains(filt_low)) {
+            continue
+        }
+        let full = path.join(root, rel)
+        let content! = fs.read_to_string(full) else {
+            continue
+        }
+        let lines = content.replace("\r\n", "\n").split("\n")
+        for r in 0..lines.len() {
+            let line = lines.get(r.as(usize)).as(String)
+            let hay = if case_sensitive { line } else { line.to_lower() }
+            let idxs = hay.find_indices(q_cmp)
+            if not idxs.is_empty() {
+                out.push(SrvGrepHit {
+                    file_path: rel,
+                    row: r,
+                    col: idxs.get(0).as(i64),
+                    line_text: line,
+                })
+                if max_results > 0 and out.len() >= max_results {
+                    return out
+                }
+            }
+        }
+    }
+    out
+}
+
+pub fn accel_workspace_grep(
+    root: String,
+    query: String,
+    .case_sensitive: bool = false,
+    .max_results: i64 = 300,
+    .file_filter: String = "",
+) -> List {
+    if query == "" or (not fs.exists(root)) {
+        return List()
+    }
+    let raw! = runtime.host_call(
+        "accel_workspace_grep",
+        [root, query, case_sensitive, max_results, file_filter]
+    ) else {
+        let rg_args = List()
+        rg_args.push("--line-number")
+        rg_args.push("--column")
+        rg_args.push("--no-heading")
+        rg_args.push("--color=never")
+        if case_sensitive {
+            rg_args.push("--case-sensitive")
+        } else {
+            rg_args.push("--ignore-case")
+        }
+        if file_filter.trim() != "" {
+            rg_args.push("-g")
+            rg_args.push("*" ++ file_filter.trim() ++ "*")
+        }
+        rg_args.push("--")
+        rg_args.push(query)
+        rg_args.push(".")
+
+        let rg_res = process.exec("rg", args = rg_args, cwd = root)
+        rg_res match {
+            rg_out! => {
+                -- `rg` exit code 1 means 0 matches found cleanly!
+                if rg_out.status == 1 {
+                    return List()
+                }
+                if rg_out.status == 0 {
+                    let raw_lines = rg_out.stdout.replace("\r\n", "\n").split("\n")
+                    let hits = List()
+                    for i in 0..raw_lines.len() {
+                        let ln = raw_lines.get(i.as(usize)).as(String)
+                        if ln == "" {
+                            continue
+                        }
+                        let parsed_opt = parse_rg_vimgrep_line(ln)
+                        if parsed_opt != null {
+                            hits.push(parsed_opt.as(SrvGrepHit))
+                            if max_results > 0 and hits.len() >= max_results {
+                                break
+                            }
+                        }
+                    }
+                    return hits
+                }
+            },
+            error _ => (),
+        }
+        return fallback_literal_grep(root, query, case_sensitive, max_results, file_filter)
+    }
+    let arr = raw.as(List)
+    let out = List()
+    for i in 0..arr.len() {
+        let row = arr.get(i.as(usize)).as(List)
+        out.push(SrvGrepHit {
+            file_path: row.get(0).as(String),
+            row: row.get(1).as(i64),
+            col: row.get(2).as(i64),
+            line_text: row.get(3).as(String),
+        })
+    }
+    out
+}
+
+private fn extract_ident_prefix(s: String) -> String {
+    let trimmed = s.trim_start()
+    let n = trimmed.char_len()
+    var j: i64 = 0
+    while j < n {
+        let ch = trimmed.slice(j, j + 1)
+        if ch.is_alphanumeric() or ch == "_" or ch == "-" {
+            j += 1
+        } else {
+            break
+        }
+    }
+    trimmed.slice(0, j)
+}
+
+private fn is_cpp_control_kw(name: String) -> bool {
+    name == "if"
+        or name == "for"
+        or name == "while"
+        or name == "switch"
+        or name == "catch"
+        or name == "return"
+        or name == "sizeof"
+        or name == "alignof"
+        or name == "decltype"
+        or name == "static_assert"
+}
+
+private fn try_extract_c_cpp_function(trimmed: String) -> ?String {
+    if trimmed.starts_with("//")
+        or trimmed.starts_with("/*")
+        or trimmed.starts_with("*")
+        or trimmed.starts_with("#")
+        or trimmed.ends_with(";") {
+        return null
+    }
+    let paren_hits = trimmed.find_indices("(")
+    if paren_hits.is_empty() {
+        return null
+    }
+    let open_p = paren_hits.get(0).as(i64)
+    if open_p <= 0 {
+        return null
+    }
+    let close_hits = trimmed.find_indices(")")
+    if close_hits.is_empty() {
+        return null
+    }
+    let before_paren = trimmed.slice(0, open_p).trim()
+    if before_paren == "" or before_paren.contains("=") {
+        return null
+    }
+    -- Require at least `<return_type> <func_name>` before `(`
+    let ws_parts = before_paren.split_whitespace()
+    if ws_parts.len() < 2 {
+        return null
+    }
+    var raw_name = ws_parts.last().as(String)
+    while raw_name.starts_with("*") or raw_name.starts_with("&") {
+        raw_name = raw_name.drop(1)
+    }
+    let sep_hits = raw_name.rfind_indices("::")
+    if not sep_hits.is_empty() {
+        let sp = sep_hits.get(0).as(i64)
+        raw_name = raw_name.drop(sp + 2)
+    }
+    let ident = extract_ident_prefix(raw_name)
+    if ident == "" or is_cpp_control_kw(ident) {
+        return null
+    }
+    ident
+}
+
+pub fn scan_symbols_pure(lines: List, major_mode: String) -> List {
+    let m = major_mode.to_lower()
+    let out = List()
+    for r in 0..lines.len() {
+        let line = lines.get(r.as(usize)).as(String)
+        let trimmed = line.trim_start()
+        if trimmed == "" {
+            continue
+        }
+        let indent = line.char_len() - trimmed.char_len()
+        if m == "markdown" or m == "org" {
+            let mk = if m == "org" { "*" } else { "#" }
+            var lvl: i64 = 0
+            while lvl < trimmed.char_len() and trimmed.slice(lvl, lvl + 1) == mk {
+                lvl += 1
+            }
+            if lvl > 0 and lvl < trimmed.char_len() and trimmed.slice(lvl, lvl + 1) == " " {
+                let title = trimmed.drop(lvl + 1).trim()
+                if title != "" {
+                    out.push(SrvSymbolItem { name: title, kind: "Heading", row: r, col: indent, level: lvl })
+                }
+            }
+            continue
+        }
+
+        var clean = trimmed
+        var stripped_mod = true
+        while stripped_mod {
+            stripped_mod = false
+            if clean.starts_with("pub(crate) ") {
+                clean = clean.drop(11).trim_start()
+                stripped_mod = true
+            } else if clean.starts_with("pub(super) ") {
+                clean = clean.drop(11).trim_start()
+                stripped_mod = true
+            } else if clean.starts_with("pub ") {
+                clean = clean.drop(4).trim_start()
+                stripped_mod = true
+            } else if clean.starts_with("private ") {
+                clean = clean.drop(8).trim_start()
+                stripped_mod = true
+            } else if clean.starts_with("export ") {
+                clean = clean.drop(7).trim_start()
+                stripped_mod = true
+            } else if clean.starts_with("async ") {
+                clean = clean.drop(6).trim_start()
+                stripped_mod = true
+            } else if clean.starts_with("unsafe ") {
+                clean = clean.drop(7).trim_start()
+                stripped_mod = true
+            }
+        }
+
+        let prefixes = [
+            ("fn ", "Function"),
+            ("def ", "Function"),
+            ("func ", "Function"),
+            ("function ", "Function"),
+            ("struct ", "Struct"),
+            ("class ", "Class"),
+            ("enum class ", "Enum"),
+            ("enum ", "Enum"),
+            ("trait ", "Trait"),
+            ("interface ", "Interface"),
+            ("impl ", "Impl"),
+            ("mod ", "Module"),
+            ("namespace ", "Namespace"),
+            ("newtype ", "Type"),
+            ("typealias ", "Type"),
+            ("const ", "Constant"),
+            ("global ", "Variable"),
+        ]
+        var matched_kw = false
+        for pi in 0..prefixes.len() {
+            let (kw, kind) = prefixes.get(pi.as(usize)).as((String, String))
+            if clean.starts_with(kw) {
+                let nm = extract_ident_prefix(clean.drop(kw.char_len()))
+                if nm != "" {
+                    let lvl = if indent > 0 { 2 } else { 1 }
+                    out.push(SrvSymbolItem { name: nm, kind: kind, row: r, col: indent, level: lvl })
+                    matched_kw = true
+                }
+                break
+            }
+        }
+
+        if (not matched_kw) and (m == "c" or m == "cpp" or m == "c++") {
+            let fn_opt = try_extract_c_cpp_function(clean)
+            if fn_opt != null {
+                let lvl = if indent > 0 { 2 } else { 1 }
+                out.push(SrvSymbolItem {
+                    name: fn_opt.as(String),
+                    kind: "Function",
+                    row: r,
+                    col: indent,
+                    level: lvl,
+                })
+            }
+        }
+    }
+    out
+}
+
+pub fn accel_scan_symbols(lines: List, major_mode: String) -> List {
+    let raw! = runtime.host_call("accel_scan_symbols", [lines, major_mode]) else {
+        return scan_symbols_pure(lines, major_mode)
+    }
+    let arr = raw.as(List)
+    let out = List()
+    let seen_rows = List()
+    for i in 0..arr.len() {
+        let r = arr.get(i.as(usize)).as(List)
+        let row_idx = r.get(2).as(i64)
+        seen_rows.push(row_idx)
+        out.push(SrvSymbolItem {
+            name: r.get(0).as(String),
+            kind: r.get(1).as(String),
+            row: row_idx,
+            col: r.get(3).as(i64),
+            level: r.get(4).as(i64),
+        })
+    }
+    -- Enrich C/C++ namespaces and free functions or Nessa `newtype`/`typealias` if host scan skipped them.
+    let m = major_mode.to_lower()
+    if m == "c" or m == "cpp" or m == "c++" or m == "nessa" {
+        let extra = scan_symbols_pure(lines, major_mode)
+        for j in 0..extra.len() {
+            let sym = extra.get(j.as(usize)).as(SrvSymbolItem)
+            if not seen_rows.contains(sym.row) {
+                out.push(sym)
+            }
+        }
+        out.sort_by(|a: Any, b: Any| {
+            let sa = a.as(SrvSymbolItem)
+            let sb = b.as(SrvSymbolItem)
+            sa.row.cmp(sb.row)
+        })
+    }
+    out
+}
+
+-- ============================================================================
+-- 4. Git Status, HEAD Blob Lines & Blame Wrappers
+-- ============================================================================
+
+private fn format_unix_secs_ymd(unix_secs: i64) -> String {
+    if unix_secs <= 0 {
+        return "working-tree"
+    }
+    let days = if unix_secs >= 0 {
+        unix_secs / 86400
+    } else {
+        (unix_secs - 86399) / 86400
+    }
+    let z = days + 719468
+    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 }
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let y = yoe + era * 400
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }
+    let year = if m <= 2 { y + 1 } else { y }
+    year.to_string().pad_start(4, "0")
+        ++ "-"
+        ++ m.to_string().pad_start(2, "0")
+        ++ "-"
+        ++ d.to_string().pad_start(2, "0")
+}
+
+pub fn accel_git_status(cwd: String) -> SrvGitStatus {
+    let raw! = runtime.host_call("accel_git_status", [cwd]) else {
+        let top! = process.exec("git", args = ["rev-parse", "--show-toplevel"], cwd = cwd) else {
+            return (SrvGitStatus {
+                is_repo: false,
+                root: "",
+                branch: "",
+                staged_count: 0,
+                modified_count: 0,
+                untracked_count: 0,
+                entries: List(),
+            })
+        }
+        if not top.success() {
+            return (SrvGitStatus {
+                is_repo: false,
+                root: "",
+                branch: "",
+                staged_count: 0,
+                modified_count: 0,
+                untracked_count: 0,
+                entries: List(),
+            })
+        }
+        let root = top.stdout.trim()
+        var branch = "HEAD"
+        let br_res = process.exec("git", args = ["symbolic-ref", "--short", "HEAD"], cwd = root)
+        br_res match {
+            b! => {
+                if b.success() and b.stdout.trim() != "" {
+                    branch = b.stdout.trim()
+                }
+            },
+            error _ => (),
+        }
+        var staged: i64 = 0
+        var modified: i64 = 0
+        var untracked: i64 = 0
+        let entries = List()
+        let st_res = process.exec("git", args = ["status", "--porcelain=v1", "-uall"], cwd = root)
+        st_res match {
+            st! => {
+                if st.success() {
+                    let lines = st.stdout.replace("\r\n", "\n").split("\n")
+                    for i in 0..lines.len() {
+                        let l = lines.get(i.as(usize)).as(String)
+                        if l.char_len() >= 3 {
+                            let x = l.slice(0, 1)
+                            let y = l.slice(1, 2)
+                            let rel = l.drop(3).trim()
+                            if x == "?" and y == "?" {
+                                untracked += 1
+                            } else {
+                                if x != " " and x != "?" { staged += 1 }
+                                if y != " " and y != "?" { modified += 1 }
+                            }
+                            entries.push(SrvGitFileEntry {
+                                index_status: x,
+                                worktree_status: y,
+                                rel_path: rel,
+                            })
+                        }
+                    }
+                }
+            },
+            error _ => (),
+        }
+        return (SrvGitStatus {
+            is_repo: true,
+            root: root,
+            branch: branch,
+            staged_count: staged,
+            modified_count: modified,
+            untracked_count: untracked,
+            entries: entries,
+        })
+    }
+    let arr = raw.as(List)
+    let raw_entries = arr.get(6).as(List)
+    let entries = List()
+    for i in 0..raw_entries.len() {
+        let e = raw_entries.get(i.as(usize)).as(List)
+        entries.push(SrvGitFileEntry {
+            index_status: e.get(0).as(String),
+            worktree_status: e.get(1).as(String),
+            rel_path: e.get(2).as(String),
+        })
+    }
+    SrvGitStatus {
+        is_repo: arr.get(0).as(bool),
+        root: arr.get(1).as(String),
+        branch: arr.get(2).as(String),
+        staged_count: arr.get(3).as(i64),
+        modified_count: arr.get(4).as(i64),
+        untracked_count: arr.get(5).as(i64),
+        entries: entries,
+    }
+}
+
+private fn resolve_repo_rel_path(repo_root: String, cwd: String, file_path: String) -> ?String {
+    if file_path == "" {
+        return null
+    }
+    if not path.is_absolute(file_path) {
+        -- Check if `file_path` is already relative to `repo_root` or relative to `cwd`
+        let from_cwd = resolve_server_path(path.join(cwd, file_path))
+        let canon_root = resolve_server_path(repo_root)
+        let prefix = canon_root ++ "/"
+        if from_cwd.starts_with(prefix) {
+            return from_cwd.drop(prefix.char_len())
+        }
+        return file_path
+    }
+    let canon_file = resolve_server_path(file_path)
+    let canon_root = resolve_server_path(repo_root)
+    let prefix = canon_root ++ "/"
+    if canon_file.starts_with(prefix) {
+        return canon_file.drop(prefix.char_len())
+    }
+    let norm_file = path.normalize(file_path)
+    let norm_root = path.normalize(repo_root) ++ "/"
+    if norm_file.starts_with(norm_root) {
+        return norm_file.drop(norm_root.char_len())
+    }
+    null
+}
+
+pub fn accel_git_head_lines(cwd: String, file_path: String, .rev: String = "HEAD") -> ?List {
+    if file_path == "" {
+        return null
+    }
+    let effective_rev = if rev.trim() == "" { "HEAD" } else { rev.trim() }
+    if effective_rev == "HEAD" {
+        let raw_res = runtime.host_call("accel_git_head_lines", [cwd, file_path])
+        raw_res match {
+            raw! => {
+                let arr = raw.as(List)
+                if not arr.get(0).as(bool) {
+                    return null
+                }
+                return arr.get(1).as(List)
+            },
+            error _ => (),
+        }
+    }
+    let st = accel_git_status(cwd)
+    if not st.is_repo {
+        return null
+    }
+    let rel? = resolve_repo_rel_path(st.root, cwd, file_path) else {
+        return null
+    }
+    let out! = process.exec("git", args = ["show", effective_rev ++ ":" ++ rel], cwd = st.root) else {
+        return null
+    }
+    if not out.success() {
+        return null
+    }
+    let norm = out.stdout.replace("\r\n", "\n")
+    if norm == "" {
+        return [""]
+    }
+    let parts = norm.split("\n")
+    if parts.len() > 1 and norm.ends_with("\n") {
+        let _ = parts.pop()
+    }
+    parts
+}
+
+pub fn accel_git_blame_line(cwd: String, file_path: String, row_0based: i64) -> ?SrvGitBlame {
+    if file_path == "" or row_0based < 0 {
+        return null
+    }
+    let raw! = runtime.host_call("accel_git_blame_line", [cwd, file_path, row_0based]) else {
+        let line_1 = (row_0based + 1).to_string()
+        let range = line_1 ++ "," ++ line_1
+        let out! = process.exec(
+            "git",
+            args = ["blame", "-L", range, "--porcelain", "--", file_path],
+            cwd = cwd,
+        ) else {
+            return null
+        }
+        if not out.success() {
+            return null
+        }
+        let lines = out.stdout.replace("\r\n", "\n").split("\n")
+        if lines.is_empty() {
+            return null
+        }
+        let hdr = lines.get(0).as(String).trim()
+        if hdr == "" {
+            return null
+        }
+        let hdr_parts = hdr.split_whitespace()
+        let commit_full = if hdr_parts.is_empty() { "" } else { hdr_parts.get(0).as(String) }
+        let commit_short = commit_full.take(7)
+        var author = "You"
+        var author_time: i64 = 0
+        var summary = ""
+        for i in 1..lines.len() {
+            let l = lines.get(i.as(usize)).as(String)
+            if l.starts_with("author ") {
+                author = l.drop(7).trim()
+            } else if l.starts_with("author-time ") {
+                let t_opt = parse_positive_i64(l.drop(12))
+                if t_opt != null {
+                    author_time = t_opt.as(i64)
+                }
+            } else if l.starts_with("summary ") {
+                summary = l.drop(8).trim()
+            }
+        }
+        if commit_short == "0000000" {
+            author = "Uncommitted"
+            summary = "Not committed yet"
+        }
+        return (SrvGitBlame {
+            commit_short: commit_short,
+            author: author,
+            date_ymd: format_unix_secs_ymd(author_time),
+            summary: summary,
+        })
+    }
+    let arr = raw.as(List)
+    if not arr.get(0).as(bool) {
+        return null
+    }
+    SrvGitBlame {
+        commit_short: arr.get(1).as(String),
+        author: arr.get(2).as(String),
+        date_ymd: arr.get(3).as(String),
+        summary: arr.get(4).as(String),
+    }
+}
+
+-- ============================================================================
+-- 5. Server-Side LSP Bridge (`lsp_*` Host Calls + Standalone Fallback)
+-- ============================================================================
+
+pub struct SrvLspStatus {
+    pub id: i64,
+    pub command: String,
+    pub root_dir: String,
+    pub pid: i64,
+    pub alive: bool,
+    pub initialized: bool,
+    pub server_name: String,
+    pub server_version: String,
+    pub capabilities: String,
+    pub pending_requests: i64,
+}
+
+private struct _FallbackLspSession {
+    id: i64,
+    command: String,
+    root_dir: String,
+    alive: bool,
+    docs: Map,
+    events: List,
+    next_req_id: i64,
+}
+
+private global _fb_lsp_sessions: HashMap = HashMap.new()
+private global _fb_lsp_next_id: i64 = 1
+
+pub fn lsp_available() -> bool {
+    let raw! = runtime.host_call("lsp_available", List()) else {
+        return false
+    }
+    raw.as(bool)
+}
+
+private fn is_executable_file(candidate: String) -> bool {
+    if not fs.exists(candidate) or fs.is_dir(candidate) {
+        return false
+    }
+    let res = process.exec("test", args = ["-x", candidate])
+    res match {
+        out! => out.success(),
+        error _ => true,
+    }
+}
+
+pub fn lsp_which(bin: String, .extra_dirs: List = List()) -> String {
+    let trimmed = bin.trim()
+    if trimmed == "" {
+        return ""
+    }
+    if extra_dirs.is_empty() {
+        let raw_res = runtime.host_call("lsp_which", [trimmed])
+        raw_res match {
+            v! => {
+                let s = v.as(String)
+                if s != "" {
+                    return s
+                }
+            },
+            error _ => (),
+        }
+    }
+    let expanded = expand_tilde(trimmed)
+    if expanded.contains("/") {
+        if is_executable_file(expanded) {
+            return resolve_server_path(expanded)
+        }
+        return ""
+    }
+
+    let search_dirs = List()
+    for i in 0..extra_dirs.len() {
+        let d = expand_tilde(extra_dirs.get(i.as(usize)).as(String).trim())
+        if d != "" and (not search_dirs.contains(d)) {
+            search_dirs.push(d)
+        }
+    }
+    let path_env = env.get_or("PATH", "")
+    if path_env != "" {
+        let parts = path_env.split(":")
+        for i in 0..parts.len() {
+            let d = expand_tilde(parts.get(i.as(usize)).as(String).trim())
+            if d != "" and (not search_dirs.contains(d)) {
+                search_dirs.push(d)
+            }
+        }
+    }
+    let home = env.get_or("HOME", "")
+    let std_dirs = List()
+    if home != "" {
+        std_dirs.push(path.join(home, ".cargo/bin"))
+        std_dirs.push(path.join(home, ".local/bin"))
+    }
+    std_dirs.push("/usr/local/bin")
+    std_dirs.push("/usr/bin")
+    std_dirs.push("/bin")
+    for i in 0..std_dirs.len() {
+        let d = std_dirs.get(i.as(usize)).as(String)
+        if not search_dirs.contains(d) {
+            search_dirs.push(d)
+        }
+    }
+
+    for i in 0..search_dirs.len() {
+        let dir = search_dirs.get(i.as(usize)).as(String)
+        let candidate = path.join(dir, trimmed)
+        if is_executable_file(candidate) {
+            return candidate
+        }
+    }
+    ""
+}
+
+pub fn lsp_find_root(start_path: String, markers: List) -> String {
+    let raw_res = runtime.host_call("lsp_find_root", [start_path, markers])
+    raw_res match {
+        v! => return v.as(String),
+        error _ => (),
+    }
+    let (root, _matched) = find_project_root(start_path, markers)
+    root
+}
+
+pub fn lsp_spawn(
+    cmd: String,
+    args: List,
+    cwd: String,
+    root_dir: String,
+    .init_options_json: String = "",
+) -> !String i64 {
+    if lsp_available() {
+        let raw = runtime.host_call("lsp_spawn", [cmd, args, cwd, root_dir, init_options_json])!
+        return raw.as(i64)
+    }
+    let resolved_bin = lsp_which(cmd)
+    if resolved_bin == "" {
+        return error ("LSP server binary not found: " ++ cmd)
+    }
+    let id = _fb_lsp_next_id
+    _fb_lsp_next_id += 1
+    let resolved_root = if root_dir.trim() == "" {
+        resolve_server_path(cwd)
+    } else {
+        resolve_server_path(root_dir)
+    }
+    let init_events = List()
+    init_events.push(["initialized", cmd, "fallback-0.1.0", "hover,definition,symbols,completion"])
+    let sess = _FallbackLspSession {
+        id: id,
+        command: resolved_bin,
+        root_dir: resolved_root,
+        alive: true,
+        docs: Map(),
+        events: init_events,
+        next_req_id: 1,
+    }
+    _fb_lsp_sessions.insert(id, sess)
+    id
+}
+
+private fn require_fb_session(session_id: i64) -> !String _FallbackLspSession {
+    let s_any? = _fb_lsp_sessions.get(session_id) else {
+        return error ("unknown LSP session_id: " ++ session_id.to_string())
+    }
+    let sess = s_any.as(_FallbackLspSession)
+    if not sess.alive {
+        return error ("LSP session is stopped: " ++ session_id.to_string())
+    }
+    sess
+}
+
+pub fn lsp_did_open(
+    session_id: i64,
+    file_path: String,
+    language_id: String,
+    version: i64,
+    text: String,
+) -> !String Unit {
+    if lsp_available() {
+        let _ = runtime.host_call("lsp_did_open", [session_id, file_path, language_id, version, text])!
+        return ()
+    }
+    let sess = require_fb_session(session_id)!
+    sess.docs.set(file_path, (language_id, version, text))
+    sess.events.push(["diagnostics", file_path, List()])
+    ()
+}
+
+pub fn lsp_did_change(
+    session_id: i64,
+    file_path: String,
+    version: i64,
+    full_text: String,
+) -> !String Unit {
+    if lsp_available() {
+        let _ = runtime.host_call("lsp_did_change", [session_id, file_path, version, full_text])!
+        return ()
+    }
+    let sess = require_fb_session(session_id)!
+    let prev_lang = if sess.docs.contains(file_path) {
+        let (l, _, _) = sess.docs.get(file_path).as((String, i64, String))
+        l
+    } else {
+        ""
+    }
+    sess.docs.set(file_path, (prev_lang, version, full_text))
+    ()
+}
+
+pub fn lsp_did_save(session_id: i64, file_path: String, text: String) -> !String Unit {
+    if lsp_available() {
+        let _ = runtime.host_call("lsp_did_save", [session_id, file_path, text])!
+        return ()
+    }
+    let sess = require_fb_session(session_id)!
+    if text != "" and sess.docs.contains(file_path) {
+        let (l, v, _) = sess.docs.get(file_path).as((String, i64, String))
+        sess.docs.set(file_path, (l, v + 1, text))
+    }
+    ()
+}
+
+pub fn lsp_did_close(session_id: i64, file_path: String) -> !String Unit {
+    if lsp_available() {
+        let _ = runtime.host_call("lsp_did_close", [session_id, file_path])!
+        return ()
+    }
+    let sess = require_fb_session(session_id)!
+    let _ = sess.docs.remove(file_path)
+    ()
+}
+
+pub fn lsp_request(
+    session_id: i64,
+    kind: String,
+    file_path: String,
+    row: i64,
+    col: i64,
+    .extra: String = "",
+) -> !String i64 {
+    if lsp_available() {
+        let raw = runtime.host_call("lsp_request", [session_id, kind, file_path, row, col, extra])!
+        return raw.as(i64)
+    }
+    let sess = require_fb_session(session_id)!
+    let req_id = sess.next_req_id
+    sess.next_req_id += 1
+    let doc_text = if sess.docs.contains(file_path) {
+        let (_, _, t) = sess.docs.get(file_path).as((String, i64, String))
+        t
+    } else {
+        fs.read_to_string(file_path) match {
+            t! => t,
+            error _ => "",
+        }
+    }
+    let lines = doc_text.replace("\r\n", "\n").split("\n")
+    when {
+        kind == "symbols" or kind == "documentSymbol" => {
+            let syms = scan_symbols_pure(lines, "")
+            let wire_syms = List()
+            for i in 0..syms.len() {
+                let s = syms.get(i.as(usize)).as(SrvSymbolItem)
+                wire_syms.push([s.name, s.kind, "", s.row, s.col, s.row])
+            }
+            sess.events.push(["symbols", req_id, wire_syms])
+        },
+        kind == "hover" => {
+            let ln = if row >= 0 and row < lines.len() {
+                lines.get(row.as(usize)).as(String).trim()
+            } else {
+                ""
+            }
+            sess.events.push(["hover", req_id, ln])
+        },
+        else => {
+            let _ = col
+            let _ = extra
+            sess.events.push(["locations", req_id, kind, List()])
+        },
+    }
+    req_id
+}
+
+pub fn lsp_poll_events(session_id: i64) -> !String List {
+    if lsp_available() {
+        let raw = runtime.host_call("lsp_poll_events", [session_id])!
+        return raw.as(List)
+    }
+    let sess = require_fb_session(session_id)!
+    let drained = sess.events
+    sess.events = List()
+    drained
+}
+
+pub fn lsp_status(session_id: i64) -> !String SrvLspStatus {
+    if lsp_available() {
+        let raw = runtime.host_call("lsp_status", [session_id])!
+        let f = raw.as(List)
+        return (SrvLspStatus {
+            id: f.get(0).as(i64),
+            command: f.get(1).as(String),
+            root_dir: f.get(2).as(String),
+            pid: f.get(3).as(i64),
+            alive: f.get(4).as(bool),
+            initialized: f.get(5).as(bool),
+            server_name: f.get(6).as(String),
+            server_version: f.get(7).as(String),
+            capabilities: f.get(8).as(String),
+            pending_requests: f.get(9).as(i64),
+        })
+    }
+    let s_any? = _fb_lsp_sessions.get(session_id) else {
+        return error ("unknown LSP session_id: " ++ session_id.to_string())
+    }
+    let sess = s_any.as(_FallbackLspSession)
+    SrvLspStatus {
+        id: sess.id,
+        command: sess.command,
+        root_dir: sess.root_dir,
+        pid: process.pid(),
+        alive: sess.alive,
+        initialized: sess.alive,
+        server_name: sess.command,
+        server_version: "fallback-0.1.0",
+        capabilities: "hover,definition,symbols,completion",
+        pending_requests: 0,
+    }
+}
+
+pub fn lsp_stop(session_id: i64) -> bool {
+    if lsp_available() {
+        let raw! = runtime.host_call("lsp_stop", [session_id]) else {
+            return false
+        }
+        return raw.as(bool)
+    }
+    let s_any? = _fb_lsp_sessions.get(session_id) else {
+        return false
+    }
+    let sess = s_any.as(_FallbackLspSession)
+    if not sess.alive {
+        return false
+    }
+    sess.alive = false
+    sess.events.push(["exited", 0])
+    true
+}

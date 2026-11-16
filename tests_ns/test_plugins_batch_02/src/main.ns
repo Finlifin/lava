@@ -1,0 +1,515 @@
+-- Deterministic End-to-End Test Suite for Lava Plugins 04-06 (Batch 02):
+--   Plugin 04: `ext_flash` (`gs` 2D viewport jump + next-char label exclusion, `gS` treesitter node select, jumplist `<C-o>`)
+--   Plugin 05: `ext_harpoon` (`<Space>ha`, `<Space>1..4`, `<Space>hm` floating menu reorder/delete, reopen cursor restore, JSON save/load)
+--   Plugin 06: `ext_multicursor` (`<C-n>`, `<C-x>`, `<Space>ma`, `<Space>mj`/`mk`, same-line `ciw...<Esc>`, `dw`, `x`, motions, atomic undo)
+
+use std.fs
+use @lava_sys.mock_enable
+use @lava_core.{
+    HostClipboardCap, KeyStroke, LogCollectorCap, StatusCollectorCap, SystemKernel, clipboard_get,
+    clipboard_set, log_event, status_emit
+}
+use @ext_document.{
+    Buffer, EditorWorld, FloatingWindow, InlineSpanDecor, Pos, register_document_extension,
+    require_editor_world
+}
+use @ext_vim.{
+    VimMode, VimState, execute_ex_command, register_vim_extension, require_vim_state, vim_feed_keys
+}
+use @ext_flash.{
+    FlashState, FlashTarget, OWNER_FLASH, SERVICE_FLASH, ext_flash_id, register_flash_extension,
+    require_flash_state
+}
+use @ext_harpoon.{
+    FLOAT_ID_HARPOON, HarpoonEntry, HarpoonState, OWNER_HARPOON, SERVICE_HARPOON, ext_harpoon_id,
+    harpoon_load, harpoon_save, register_harpoon_extension, require_harpoon_state
+}
+use @ext_multicursor.{
+    MultiCursorState, OWNER_MULTICURSOR, SERVICE_MULTICURSOR, ext_multicursor_id,
+    register_multicursor_extension, require_multicursor_state
+}
+
+fn fail_test(msg: String) -> NoReturn {
+    panic("TEST FAILED: " ++ msg)
+}
+
+fn assert_true(cond: bool, msg: String) {
+    if not cond {
+        fail_test(msg)
+    }
+}
+
+fn assert_str_eq(actual: String, expected: String, label: String) {
+    if actual != expected {
+        fail_test(
+            label ++ "\n  expected: " ++ expected.escape_debug()
+            ++ "\n  actual:   " ++ actual.escape_debug()
+        )
+    }
+}
+
+fn assert_i64_eq(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        fail_test(
+            label ++ " expected=" ++ expected.to_string() ++ " actual=" ++ actual.to_string()
+        )
+    }
+}
+
+fn assert_pos_eq(actual: Pos, expected_row: i64, expected_col: i64, label: String) {
+    if actual.row != expected_row or actual.col != expected_col {
+        fail_test(
+            label ++ " expected=(" ++ expected_row.to_string() ++ "," ++ expected_col.to_string()
+            ++ ") actual=(" ++ actual.row.to_string() ++ "," ++ actual.col.to_string() ++ ")"
+        )
+    }
+}
+
+fn unwrap_ok(res: !String Unit, ctx: String) {
+    let _! = res else {
+        fail_test(ctx ++ " returned unexpected error")
+    }
+}
+
+fn make_batch02_kernel() -> !String (SystemKernel, EditorWorld, VimState) {
+    mock_enable(true)
+    let kernel = SystemKernel.new()
+    register_document_extension(kernel)!
+    register_vim_extension(kernel)!
+    register_flash_extension(kernel)!
+    register_harpoon_extension(kernel)!
+    register_multicursor_extension(kernel)!
+    kernel.activate_all()!
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    (kernel, world, vim)
+}
+
+fn setup_buffer(world: EditorWorld, lines: List) -> Buffer {
+    let buf = world.active_buffer()
+    buf.read_only = false
+    buf.set_lines(lines, record_undo = false)
+    buf.modified = false
+    buf.point = Pos.zero()
+    buf.preferred_col = 0
+    buf.clear_all_decors()
+    buf
+}
+
+fn count_owner_label_decors(buf: Buffer, owner: String) -> i64 {
+    var cnt: i64 = 0
+    for i in 0..buf.inline_decors.len() {
+        let d = buf.inline_decors.get(i.as(usize)).as(InlineSpanDecor)
+        if d.owner == owner and d.replace_label != "" {
+            cnt += 1
+        }
+    }
+    cnt
+}
+
+fn count_owner_total_decors(buf: Buffer, owner: String) -> i64 {
+    var cnt: i64 = 0
+    for i in 0..buf.inline_decors.len() {
+        let d = buf.inline_decors.get(i.as(usize)).as(InlineSpanDecor)
+        if d.owner == owner {
+            cnt += 1
+        }
+    }
+    cnt
+}
+
+-- ============================================================================
+-- Suite 1: Extension Contracts & Lifecycle (`ext_flash`, `ext_harpoon`, `ext_multicursor`)
+-- ============================================================================
+
+fn test_extension_lifecycle() -> #[log_event, status_emit, clipboard_get, clipboard_set] !String Unit {
+    let (kernel, _world, _vim) = make_batch02_kernel()!
+
+    assert_str_eq(ext_flash_id().raw(), "lava.org/ext_flash", "ext_flash_id")
+    assert_str_eq(ext_harpoon_id().raw(), "lava.org/ext_harpoon", "ext_harpoon_id")
+    assert_str_eq(ext_multicursor_id().raw(), "lava.org/ext_multicursor", "ext_multicursor_id")
+
+    assert_true(kernel.is_extension_active(ext_flash_id()), "ext_flash active")
+    assert_true(kernel.is_extension_active(ext_harpoon_id()), "ext_harpoon active")
+    assert_true(kernel.is_extension_active(ext_multicursor_id()), "ext_multicursor active")
+
+    assert_true(kernel.service(SERVICE_FLASH) != null, "SERVICE_FLASH published")
+    assert_true(kernel.service(SERVICE_HARPOON) != null, "SERVICE_HARPOON published")
+    assert_true(kernel.service(SERVICE_MULTICURSOR) != null, "SERVICE_MULTICURSOR published")
+
+    -- Clean deactivation & re-activation roundtrip
+    kernel.deactivate_extension(ext_flash_id())!
+    assert_true(not kernel.is_extension_active(ext_flash_id()), "ext_flash deactivated")
+    assert_true(kernel.service(SERVICE_FLASH) == null, "SERVICE_FLASH removed on deactivate")
+    kernel.activate_extension(ext_flash_id())!
+    assert_true(kernel.is_extension_active(ext_flash_id()), "ext_flash re-activated")
+    assert_true(kernel.service(SERVICE_FLASH) != null, "SERVICE_FLASH restored on activate")
+    ()
+}
+
+-- ============================================================================
+-- Suite 2: Plugin 04 — `ext_flash` (`gs`, next-char exclusion, jumplist `<C-o>`, `gS` treesitter)
+-- ============================================================================
+
+fn test_ext_flash() -> #[log_event, status_emit, clipboard_get, clipboard_set] !String Unit {
+    let (kernel, world, vim) = make_batch02_kernel()!
+    let flash = require_flash_state(kernel)!
+
+    let buf = setup_buffer(world, [
+        "fn start_here() {{",
+        "    let alpha = 10",
+        "    let alsa_drv = 20",
+        "    let target_al = alpha + alsa_drv",
+        "}}"
+    ])
+    buf.point = Pos.new(0, 3)
+
+    -- 1. Trigger `gs` + 2-char pattern `"al"`:
+    -- Matches:
+    --   [0] row 1, col 8  ("alpha", next_char = 'p')
+    --   [1] row 2, col 8  ("alsa_drv", next_char = 's')  <-- 's' MUST be excluded from labels!
+    --   [2] row 3, col 15 ("al", next_char = ' ')
+    --   [3] row 3, col 20 ("alpha", next_char = 'p')
+    --   [4] row 3, col 28 ("alsa_drv", next_char = 's')
+    vim_feed_keys(kernel, "gsal")#!
+    assert_true(flash.active, "Flash active after gsal")
+    assert_str_eq(flash.query, "al", "Flash query is 'al'")
+    assert_i64_eq(flash.targets.len(), 5, "5 matches for 'al'")
+    assert_i64_eq(count_owner_label_decors(buf, OWNER_FLASH), 5, "5 replace_label pills in buf.inline_decors")
+    assert_true(count_owner_total_decors(buf, OWNER_FLASH) >= 10, "both match spans and label pills rendered")
+
+    -- Verify 's' (a continuation next_char for "alsa_drv") was EXCLUDED from assigned labels!
+    for i in 0..flash.targets.len() {
+        let tgt = flash.targets.get(i.as(usize)).as(FlashTarget)
+        assert_true(tgt.label != "s" and tgt.label != "p", "next_chars 's' and 'p' excluded from Flash labels")
+    }
+
+    -- Target #3 is row 3, col 20; grab its assigned label and press it!
+    let target3 = flash.targets.get(3).as(FlashTarget)
+    assert_pos_eq(target3.pos, 3, 20, "target #3 pos is (3, 20)")
+    let chosen_label = target3.label
+    assert_true(chosen_label != "", "target #3 has non-empty jump label")
+
+    vim_feed_keys(kernel, chosen_label)#!
+    assert_true(not flash.active, "Flash deactivated after pressing jump label")
+    assert_true(vim.modal_interceptor == null, "modal_interceptor cleared after Flash jump")
+    assert_i64_eq(count_owner_total_decors(buf, OWNER_FLASH), 0, "all ext_flash decors cleared")
+    assert_pos_eq(buf.point, 3, 20, "buf.point jumped to exact target (3, 20)")
+
+    -- 2. `<C-o>` returns to pre-jump origin `(0, 3)` via JumpList!
+    vim_feed_keys(kernel, "<C-o>")#!
+    assert_pos_eq(buf.point, 0, 3, "<C-o> jumps back to origin (0, 3)")
+
+    -- 3. Continuing pattern with `'s'` (`"als"`) narrows matches from 5 -> 2 instead of jumping early,
+    --    `<BackSpace>` widens back to 5, and `<Escape>` cancels cleanly!
+    vim_feed_keys(kernel, "gsals")#!
+    assert_true(flash.active, "typing 's' continued query instead of jumping")
+    assert_str_eq(flash.query, "als", "query narrowed to 'als'")
+    assert_i64_eq(flash.targets.len(), 2, "2 matches for 'als'")
+
+    vim_feed_keys(kernel, "<BackSpace>")#!
+    assert_str_eq(flash.query, "al", "BackSpace popped query back to 'al'")
+    assert_i64_eq(flash.targets.len(), 5, "5 matches restored after BackSpace")
+
+    vim_feed_keys(kernel, "<Escape>")#!
+    assert_true(not flash.active, "Escape cancelled Flash")
+    assert_i64_eq(count_owner_total_decors(buf, OWNER_FLASH), 0, "decors cleared on Escape")
+    assert_pos_eq(buf.point, 0, 3, "point unchanged on Escape")
+
+    -- 4. `:Flash` Ex command + `<Return>` jumps to first match forward
+    execute_ex_command(kernel, "Flash alsa")#!
+    assert_true(flash.active, ":Flash alsa activated Flash")
+    assert_i64_eq(flash.targets.len(), 2, "2 matches for 'alsa'")
+    vim_feed_keys(kernel, "<Return>")#!
+    assert_pos_eq(buf.point, 2, 8, "<Return> jumped to first 'alsa' match at (2, 8)")
+    assert_i64_eq(count_owner_total_decors(buf, OWNER_FLASH), 0, "decors cleared after <Return>")
+
+    -- 5. Visual mode `v` + `gs` extends selection!
+    buf.point = Pos.new(1, 4)
+    vim_feed_keys(kernel, "vgs20")#!
+    assert_true(flash.active, "Flash active in VisualChar")
+    assert_i64_eq(flash.targets.len(), 1, "1 match for '20'")
+    let lbl_vis = flash.targets.get(0).as(FlashTarget).label
+    vim_feed_keys(kernel, lbl_vis)#!
+    assert_true(vim.mode == VimMode.VisualChar, "remained in VisualChar after vgs jump")
+    assert_pos_eq(vim.visual_anchor, 1, 4, "visual_anchor preserved at (1, 4)")
+    assert_pos_eq(buf.point, 2, 19, "visual cursor extended to (2, 19)")
+    vim_feed_keys(kernel, "<Escape>")#!
+
+    -- 6. `gS` (`flash-treesitter`) labels enclosing structural nodes and selects in `VisualChar`!
+    let ts_buf = setup_buffer(world, [
+        "fn compute(val: i64) {{",
+        "    let res = (val + 42)",
+        "    res",
+        "}}"
+    ])
+    ts_buf.point = Pos.new(1, 15) -- inside `val` inside `(val + 42)` inside `{{ ... }}`
+    vim_feed_keys(kernel, "gS")#!
+    assert_true(flash.active and flash.treesitter_mode, "gS activated treesitter mode")
+    assert_true(flash.targets.len() >= 3, "gS found identifier, paren_expr, block, statement")
+    assert_true(count_owner_label_decors(ts_buf, OWNER_FLASH) >= 3, "gS rendered node label pills")
+
+    -- Find the `paren_expr` node `(val + 42)` at (1, 14)..(1, 23) and press its label
+    var paren_lbl = ""
+    for i in 0..flash.targets.len() {
+        let t = flash.targets.get(i.as(usize)).as(FlashTarget)
+        if t.kind == "paren_expr" and t.pos == Pos.new(1, 14) {
+            paren_lbl = t.label
+            break
+        }
+    }
+    assert_true(paren_lbl != "", "found paren_expr target in gS")
+    vim_feed_keys(kernel, paren_lbl)#!
+    assert_true(not flash.active, "gS finished after pressing node label")
+    assert_true(vim.mode == VimMode.VisualChar, "gS selected node in VisualChar")
+    assert_pos_eq(vim.visual_anchor, 1, 14, "gS visual_anchor at '(' (1, 14)")
+    assert_pos_eq(ts_buf.point, 1, 23, "gS point at ')' (1, 23)")
+    assert_i64_eq(count_owner_total_decors(ts_buf, OWNER_FLASH), 0, "gS cleared decors")
+    vim_feed_keys(kernel, "<Escape>")#!
+    ()
+}
+
+-- ============================================================================
+-- Suite 3: Plugin 05 — `ext_harpoon` (`<Space>ha`, `<Space>1..3`, `<Space>hm`, reorder/delete, save/load)
+-- ============================================================================
+
+fn test_ext_harpoon() -> #[log_event, status_emit, clipboard_get, clipboard_set] !String Unit {
+    let (kernel, world, vim) = make_batch02_kernel()!
+    let harpoon = require_harpoon_state(kernel)!
+
+    let tmp_dir = "/tmp/lava_test_harpoon_batch_02"
+    let _ = fs.create_dir_all(tmp_dir) ! { _ => () }
+    let f1 = tmp_dir ++ "/alpha.ns"
+    let f2 = tmp_dir ++ "/beta.ns"
+    let f3 = tmp_dir ++ "/gamma.ns"
+    let save_json = tmp_dir ++ "/harpoon_marks.json"
+
+    let _ = fs.write_string(f1, "let a0 = 1\nlet a1 = 2\nlet a2 = 3\n") ! { _ => () }
+    let _ = fs.write_string(f2, "fn b0() {{}}\nfn b1() {{}}\nfn b2() {{}}\nfn b3() {{}}\n") ! { _ => () }
+    let _ = fs.write_string(f3, "-- g0\n-- g1\n-- g2\n-- g3\n-- g4\n") ! { _ => () }
+
+    -- Open 3 files, position cursors, and mark each with `<Space>ha`
+    let b1 = world.open_file(f1)#!
+    b1.point = Pos.new(1, 4)
+    vim_feed_keys(kernel, "<Space>ha")#!
+    assert_i64_eq(harpoon.len(), 1, "1 Harpoon mark after first <Space>ha")
+    assert_true(world.status_message.contains("Harpoon: marked [1] alpha.ns"), "status for mark 1")
+    assert_true(not world.notifications.is_empty(), "toast notification pushed on <Space>ha")
+
+    let b2 = world.open_file(f2)#!
+    b2.point = Pos.new(2, 3)
+    vim_feed_keys(kernel, "<Space>ha")#!
+    assert_i64_eq(harpoon.len(), 2, "2 Harpoon marks after second <Space>ha")
+    assert_true(world.status_message.contains("Harpoon: marked [2] beta.ns"), "status for mark 2")
+
+    let b3 = world.open_file(f3)#!
+    b3.point = Pos.new(4, 2)
+    vim_feed_keys(kernel, "<Space>ha")#!
+    assert_i64_eq(harpoon.len(), 3, "3 Harpoon marks after third <Space>ha")
+    assert_true(world.status_message.contains("Harpoon: marked [3] gamma.ns"), "status for mark 3")
+
+    -- Jump rapidly with `<Space>1`, `<Space>2`, `<Space>3`
+    vim_feed_keys(kernel, "<Space>1")#!
+    assert_str_eq(world.active_buffer().name, "alpha.ns", "<Space>1 switched to alpha.ns")
+    assert_pos_eq(world.active_buffer().point, 1, 4, "alpha.ns point preserved at (1, 4)")
+
+    vim_feed_keys(kernel, "<Space>2")#!
+    assert_str_eq(world.active_buffer().name, "beta.ns", "<Space>2 switched to beta.ns")
+    assert_pos_eq(world.active_buffer().point, 2, 3, "beta.ns point preserved at (2, 3)")
+
+    vim_feed_keys(kernel, "<Space>3")#!
+    assert_str_eq(world.active_buffer().name, "gamma.ns", "<Space>3 switched to gamma.ns")
+    assert_pos_eq(world.active_buffer().point, 4, 2, "gamma.ns point preserved at (4, 2)")
+
+    -- Cycle with `<Space>hn` (wraps 3 -> 1) and `<Space>hp` (wraps 1 -> 3)
+    vim_feed_keys(kernel, "<Space>hn")#!
+    assert_str_eq(world.active_buffer().name, "alpha.ns", "<Space>hn cycled to alpha.ns")
+    vim_feed_keys(kernel, "<Space>hp")#!
+    assert_str_eq(world.active_buffer().name, "gamma.ns", "<Space>hp cycled back to gamma.ns")
+
+    -- Kill `beta.ns` buffer so it is NOT open in memory, then `<Space>2` reopens it and restores (2, 3)!
+    let _ = world.kill_buffer(b2.id, force = true)!
+    assert_true(world.find_buffer_by_path(f2) == null, "beta.ns closed")
+    vim_feed_keys(kernel, "<Space>2")#!
+    assert_str_eq(world.active_buffer().name, "beta.ns", "<Space>2 reopened beta.ns from disk")
+    assert_pos_eq(world.active_buffer().point, 2, 3, "<Space>2 restored saved (2, 3) on reopened file")
+
+    -- Open `<Space>hm` interactive floating menu, reorder (`K`), delete (`d`), and jump (`<Return>`)!
+    vim_feed_keys(kernel, "<Space>hm")#!
+    assert_true(harpoon.menu_open, "<Space>hm opened Harpoon menu")
+    let fw_opt = world.get_floating_window(FLOAT_ID_HARPOON)
+    assert_true(fw_opt != null, "harpoon-menu FloatingWindow exists in world.floating_windows")
+    let fw = fw_opt.as(FloatingWindow)
+    assert_str_eq(fw.owner, OWNER_HARPOON, "FloatingWindow owner is ext_harpoon")
+    assert_i64_eq(harpoon.selected_row, 1, "menu pre-selected active buffer beta.ns at row 1")
+
+    -- Press `K` to move `beta.ns` UP from slot 2 (index 1) -> slot 1 (index 0)!
+    vim_feed_keys(kernel, "K")#!
+    assert_i64_eq(harpoon.selected_row, 0, "selected_row moved to 0 after K")
+    assert_str_eq(
+        harpoon.entry_at(0).as(HarpoonEntry).buf_name,
+        "beta.ns",
+        "beta.ns reordered to slot 1",
+    )
+    assert_str_eq(
+        harpoon.entry_at(1).as(HarpoonEntry).buf_name,
+        "alpha.ns",
+        "alpha.ns shifted to slot 2",
+    )
+
+    -- Move selection down with `j` to `alpha.ns` (index 1), then `j` to `gamma.ns` (index 2), and press `d` to delete `gamma.ns`!
+    vim_feed_keys(kernel, "jjd")#!
+    assert_i64_eq(harpoon.len(), 2, "2 marks remain after deleting gamma.ns")
+    assert_i64_eq(harpoon.selected_row, 1, "selected_row clamped to 1 (alpha.ns)")
+
+    -- Press `<Return>` inside menu to jump to selected `alpha.ns` and close menu!
+    vim_feed_keys(kernel, "<Return>")#!
+    assert_true(not harpoon.menu_open, "menu closed on <Return>")
+    assert_true(world.get_floating_window(FLOAT_ID_HARPOON) == null, "FloatingWindow removed")
+    assert_true(vim.modal_interceptor == null, "interceptor cleared on menu close")
+    assert_str_eq(world.active_buffer().name, "alpha.ns", "menu <Return> jumped to alpha.ns")
+
+    -- Test JSON persistence roundtrip (`harpoon_save` / `harpoon_load` and `:HarpoonSave` / `:HarpoonLoad`)!
+    execute_ex_command(kernel, "HarpoonSave " ++ save_json)#!
+    assert_true(fs.exists(save_json), "Harpoon JSON file written to disk")
+
+    -- Clear state completely, verify empty, then reload via `:HarpoonLoad`!
+    execute_ex_command(kernel, "HarpoonClear")#!
+    assert_i64_eq(harpoon.len(), 0, "Harpoon cleared before load")
+
+    let loaded_cnt = harpoon_load(kernel, save_json)!
+    assert_i64_eq(loaded_cnt, 2, "harpoon_load restored 2 entries")
+    let e0 = harpoon.entry_at(0).as(HarpoonEntry)
+    let e1 = harpoon.entry_at(1).as(HarpoonEntry)
+    assert_str_eq(e0.buf_name, "beta.ns", "loaded slot 1 buf_name")
+    assert_i64_eq(e0.row, 2, "loaded slot 1 row")
+    assert_i64_eq(e0.col, 3, "loaded slot 1 col")
+    assert_str_eq(e1.buf_name, "alpha.ns", "loaded slot 2 buf_name")
+    assert_i64_eq(e1.row, 1, "loaded slot 2 row")
+    assert_i64_eq(e1.col, 4, "loaded slot 2 col")
+
+    -- Menu direct digit jump (`1`) and `q` close
+    vim_feed_keys(kernel, "<Space>hm1")#!
+    assert_true(not harpoon.menu_open, "menu closed on digit 1 jump")
+    assert_str_eq(world.active_buffer().name, "beta.ns", "digit 1 jumped to slot 1 (beta.ns)")
+    vim_feed_keys(kernel, "<Space>hmq")#!
+    assert_true(not harpoon.menu_open, "q closed Harpoon menu")
+    ()
+}
+
+-- ============================================================================
+-- Suite 4: Plugin 06 — `ext_multicursor` (`<C-n><C-n>`, same-line `ciwbar<Esc>`, `<Esc>`, `<C-x>`, `x`, `dw`, `<Space>ma`)
+-- ============================================================================
+
+fn test_ext_multicursor() -> #[log_event, status_emit, clipboard_get, clipboard_set] !String Unit {
+    let (kernel, world, vim) = make_batch02_kernel()!
+    let mc = require_multicursor_state(kernel)!
+
+    -- 1. Core requirement: `<C-n><C-n>` on repeated identifier `foo` (including multiple on the SAME line!)
+    --    selects 3 occurrences (`world.secondary_cursors.len() == 2`), `ciwbar<Escape>` renames all 3
+    --    simultaneously, and single `<Escape>` exits multi-cursor cleanly!
+    let buf = setup_buffer(world, [
+        "let foo = foo + 1",
+        "return foo * foo",
+    ])
+    buf.point = Pos.new(0, 4) -- on first `foo`
+
+    vim_feed_keys(kernel, "<C-n><C-n>")#!
+    assert_true(mc.active, "MultiCursor active after <C-n><C-n>")
+    assert_i64_eq(world.secondary_cursors.len(), 2, "3 occurrences selected => secondary_cursors.len() == 2")
+    assert_pos_eq(world.secondary_cursors.get(0).as(Pos), 0, 4, "secondary[0] at (0, 4)")
+    assert_pos_eq(world.secondary_cursors.get(1).as(Pos), 0, 10, "secondary[1] at (0, 10) on SAME line")
+    assert_pos_eq(buf.point, 1, 7, "primary point at 3rd occurrence (1, 7)")
+    assert_i64_eq(count_owner_total_decors(buf, OWNER_MULTICURSOR), 3, "3 inline decors for matched occurrences")
+
+    -- Rename all 3 occurrences simultaneously via `ciwbar<Escape>` (note: 4th `foo` at (1, 13) untouched!)
+    vim_feed_keys(kernel, "ciwbar<Escape>")#!
+    assert_str_eq(buf.line_at(0), "let bar = bar + 1", "both same-line occurrences renamed to 'bar'")
+    assert_str_eq(buf.line_at(1), "return bar * foo", "3rd occurrence renamed, 4th 'foo' untouched")
+    assert_true(mc.active, "still in MultiCursor Normal mode right after Insert <Escape>")
+    assert_i64_eq(world.secondary_cursors.len(), 2, "all 3 cursors still active after Insert <Escape>")
+
+    -- Single `<Escape>` in Multi-Cursor Normal mode exits multi-cursor cleanly!
+    vim_feed_keys(kernel, "<Escape>")#!
+    assert_true(not mc.active, "single <Escape> exited multi-cursor mode")
+    assert_i64_eq(world.secondary_cursors.len(), 0, "secondary_cursors cleared on <Escape>")
+    assert_i64_eq(count_owner_total_decors(buf, OWNER_MULTICURSOR), 0, "ext_multicursor decors cleared")
+    assert_true(vim.modal_interceptor == null, "vim.modal_interceptor cleared")
+
+    -- Single `u` undoes the entire 3-cursor `ciwbar<Escape>` in ONE atomic undo step!
+    vim_feed_keys(kernel, "u")#!
+    assert_str_eq(buf.line_at(0), "let foo = foo + 1", "single undo restored line 0")
+    assert_str_eq(buf.line_at(1), "return foo * foo", "single undo restored line 1")
+
+    -- 2. `<C-x>` skips current match and jumps to 4th `foo`! + `<BackSpace>` in synchronized Insert!
+    buf.point = Pos.new(0, 4)
+    vim_feed_keys(kernel, "<C-n><C-n><C-x>")#!
+    assert_i64_eq(world.secondary_cursors.len(), 2, "still 2 secondary cursors after <C-x> skip")
+    assert_pos_eq(buf.point, 1, 13, "<C-x> skipped (1, 7) and moved primary to (1, 13)")
+
+    -- Type `ciwquux<BackSpace>z<Escape>` -> `"quuz"` at (0, 4), (0, 10), and (1, 13), leaving (1, 7) as `foo`!
+    vim_feed_keys(kernel, "ciwquux<BackSpace>z<Escape><Escape>")#!
+    assert_str_eq(buf.line_at(0), "let quuz = quuz + 1", "same-line BackSpace + insert produced 'quuz'")
+    assert_str_eq(buf.line_at(1), "return foo * quuz", "skipped match stayed 'foo', 4th became 'quuz'")
+
+    -- 3. `<Space>ma` (`mc-add-all-matches`) + synchronized motions (`$`, `h`) + `x` + `A`!
+    let buf2 = setup_buffer(world, [
+        "item + item;",
+        "item;",
+    ])
+    buf2.point = Pos.new(0, 0)
+    vim_feed_keys(kernel, "<Space>ma")#!
+    assert_true(mc.active, "<Space>ma activated MultiCursor")
+    assert_i64_eq(world.secondary_cursors.len(), 2, "<Space>ma selected all 3 'item' occurrences")
+
+    vim_feed_keys(kernel, "dw<Escape>")#!
+    assert_str_eq(buf2.line_at(0), "+ ;", "dw deleted 'item ' and 'item' on line 0")
+    assert_str_eq(buf2.line_at(1), ";", "dw deleted 'item' on line 1")
+
+    -- 4. `<Space>mj` / `<Space>mk` vertical cursors + `I` / `A` synchronized insert + `x` + motions!
+    let buf3 = setup_buffer(world, [
+        "one",
+        "two",
+        "three",
+    ])
+    buf3.point = Pos.new(0, 0)
+    vim_feed_keys(kernel, "<Space>mj<Space>mj")#!
+    assert_i64_eq(world.secondary_cursors.len(), 2, "<Space>mj twice created 3 vertical cursors")
+    vim_feed_keys(kernel, "I-<Space><Escape>")#!
+    assert_str_eq(buf3.to_text(), "- one\n- two\n- three", "I inserted '- ' at start of all 3 lines")
+
+    -- Move right with `l`, delete space with `x`, append `!` at EOL with `A!<Escape>`, then exit with `<Escape>`
+    vim_feed_keys(kernel, "0lxA!<Escape><Escape>")#!
+    assert_str_eq(buf3.to_text(), "-one!\n-two!\n-three!", "0lxA! edited all 3 lines simultaneously")
+    assert_true(not mc.active, "clean exit after vertical multi-cursor edits")
+
+    -- Verify `<Space>mk` (`mc-add-cursor-up`) from bottom line upward
+    buf3.point = Pos.new(2, 1)
+    vim_feed_keys(kernel, "<Space>mk<Space>mk")#!
+    assert_i64_eq(world.secondary_cursors.len(), 2, "<Space>mk twice created 3 vertical cursors upward")
+    vim_feed_keys(kernel, "$x<Escape>")#!
+    assert_str_eq(buf3.to_text(), "-one\n-two\n-three", "$x removed trailing '!' across all 3 lines")
+    assert_true(not mc.active, "clean exit after <Space>mk test")
+    ()
+}
+
+fn run_all() -> #[log_event, status_emit, clipboard_get, clipboard_set] !String Unit {
+    println("[1/4] test_extension_lifecycle...")
+    test_extension_lifecycle()#!
+    println("[2/4] test_ext_flash...")
+    test_ext_flash()#!
+    println("[3/4] test_ext_harpoon...")
+    test_ext_harpoon()#!
+    println("[4/4] test_ext_multicursor...")
+    test_ext_multicursor()#!
+    ()
+}
+
+fn main() {
+    handles(clipboard_get) handles(clipboard_set) let _clip = HostClipboardCap {}
+    handles(log_event) let _logs = LogCollectorCap.new()
+    handles(status_emit) let _status = StatusCollectorCap.new()
+
+    unwrap_ok(run_all()#, "test_plugins_batch_02")
+    println("ALL BATCH 02 PLUGIN TESTS PASSED (4/4 suites: ext_flash, ext_harpoon, ext_multicursor)")
+}

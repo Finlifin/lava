@@ -1,0 +1,132 @@
+-- srv_exec: Server-Side Command Execution, Tool Discovery & System Info (`lava.server/srv_exec`).
+-- Implements `exec/run`, `exec/which`, and `exec/sysinfo`.
+
+use std.env
+use std.fs
+use std.process
+use @server_sys.{current_working_dir, lsp_which, resolve_server_path}
+use @server_core.{
+    JsonValue, ServerKernel, SrvExtId, expect_params_map, opt_nullable_str_param,
+    opt_str_list_param, require_str_param
+}
+
+pub fn srv_exec_id() -> SrvExtId = SrvExtId("lava.server/srv_exec")
+
+private fn detect_hostname() -> String {
+    if fs.exists("/etc/hostname") {
+        fs.read_to_string("/etc/hostname") match {
+            h! => {
+                let clean = h.trim()
+                if clean != "" {
+                    return clean
+                }
+            },
+            error _ => (),
+        }
+    }
+    process.exec("uname", args = ["-n"]) match {
+        u! => {
+            if u.success() and u.stdout.trim() != "" {
+                return u.stdout.trim()
+            }
+        },
+        error _ => (),
+    }
+    env.get_or("HOSTNAME", "localhost")
+}
+
+private fn detect_username() -> String {
+    let from_user = env.get_or("USER", "")
+    if from_user != "" {
+        return from_user
+    }
+    let from_logname = env.get_or("LOGNAME", "")
+    if from_logname != "" {
+        return from_logname
+    }
+    process.exec("id", args = ["-un"]) match {
+        u! => {
+            if u.success() and u.stdout.trim() != "" {
+                return u.stdout.trim()
+            }
+        },
+        error _ => (),
+    }
+    "unknown"
+}
+
+private fn rpc_exec_run(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let cmd = require_str_param(m, "cmd")!
+    let cwd_raw_opt = opt_nullable_str_param(m, "cwd")!
+    let stdin_opt = opt_nullable_str_param(m, "stdin")!
+
+    let cwd_opt: ?String = if cwd_raw_opt != null {
+        let raw_c = cwd_raw_opt.as(String).trim()
+        if raw_c == "" {
+            null
+        } else {
+            let resolved_c = resolve_server_path(raw_c)
+            if not fs.exists(resolved_c) or (not fs.is_dir(resolved_c)) {
+                return error ("exec/run cwd does not exist: " ++ resolved_c)
+            }
+            resolved_c
+        }
+    } else {
+        null
+    }
+
+    let cmd_out = process.shell(cmd, stdin_data = stdin_opt, cwd = cwd_opt) match {
+        v! => v,
+        error err => return error ("shell command failed to spawn: " ++ err.to_string()),
+    }
+
+    let out = Map()
+    out.set("exit_code", cmd_out.status)
+    out.set("stdout", cmd_out.stdout)
+    out.set("stderr", cmd_out.stderr)
+    out
+}
+
+private fn rpc_exec_which(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let bin = require_str_param(m, "bin")!
+    let extra_dirs = opt_str_list_param(m, "extra_dirs")!
+
+    let found_path = lsp_which(bin, extra_dirs = extra_dirs)
+    let out = Map()
+    out.set("found", found_path != "")
+    out.set("path", found_path)
+    out
+}
+
+private fn rpc_exec_sysinfo(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let _ = expect_params_map(params)!
+    let out = Map()
+    out.set("hostname", detect_hostname())
+    out.set("os", env.os())
+    out.set("arch", env.arch())
+    out.set("cwd", current_working_dir())
+    out.set("home", env.get_or("HOME", ""))
+    out.set("user", detect_username())
+    out
+}
+
+pub fn register_exec_extension(kernel: ServerKernel) -> !String Unit {
+    let ext_id = srv_exec_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.server",
+        "srv_exec",
+        "0.1.0",
+        "Server-side shell execution with stdin/cwd, tool resolution, and host sysinfo.",
+        List(),
+        |k: ServerKernel| -> !String Unit {
+            k.register_rpc("exec/run", ext_id, "Execute shell command on server with optional cwd and stdin.", rpc_exec_run)
+            k.register_rpc("exec/which", ext_id, "Locate executable binary on server PATH and tool directories.", rpc_exec_which)
+            k.register_rpc("exec/sysinfo", ext_id, "Query server hostname, OS, arch, cwd, home, and user.", rpc_exec_sysinfo)
+            ()
+        },
+        |_k: ServerKernel| -> !String Unit { () },
+    )
+}

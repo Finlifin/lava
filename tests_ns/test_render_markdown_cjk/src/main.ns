@@ -1,0 +1,730 @@
+-- Comprehensive Verification Suite for:
+-- 1. East-Asian Wide / Fullwidth Display Width (`char_display_width` & `str_display_width`)
+-- 2. CJK + Inline Span Non-Overlapping X-Coordinates & Wide Cursor Caret Placement
+-- 3. Multi-Line Fenced Code Blocks & Rich Inline Markdown Syntax Highlighting
+-- 4. Continuous Alignment Vertical Indent Guides (Bridging Blank Lines) + Active Scope Highlight
+-- 5. Unified Regular Font Weight Invariant (`bold == false` across 100% of `DrawCmd.TextRun`s)
+
+use @lava_sys.{CaretShape, DrawCmd, mock_enable, rgb, rgba}
+use @lava_core.{KeyBindingEntry, SystemKernel}
+use @ext_document.{
+    ActiveBgJob, BufferKind, CompletionItem, EditorWorld, FloatingWindow, GutterSign,
+    InlineSpanDecor, MinibufferRichItem, Pos, ToastNotification, VirtualTextDecor,
+    register_document_extension, require_editor_world
+}
+use @ext_window.{
+    WindowManager, compute_gutter_width, register_window_extension, require_window_manager
+}
+use @ext_render.{
+    char_col_to_visual_col, char_display_width, compose_frame, expand_tabs_from_col,
+    ext_render_id, register_render_extension, str_display_width, theme_by_name,
+    visual_col_to_char_col
+}
+
+fn assert_true(cond: bool, msg: String) {
+    if not cond {
+        panic("ASSERTION FAILED: " ++ msg)
+    }
+}
+
+fn assert_eq_i64(actual: i64, expected: i64, msg: String) {
+    if actual != expected {
+        panic(
+            "ASSERTION FAILED (" ++ msg ++ "): expected "
+            ++ expected.to_string() ++ ", got " ++ actual.to_string()
+        )
+    }
+}
+
+fn assert_near(actual: f64, expected: f64, eps: f64, msg: String) {
+    let diff = (actual - expected).abs()
+    if diff > eps {
+        panic(
+            "ASSERTION FAILED (" ++ msg ++ "): expected "
+            ++ expected.to_string() ++ ", got " ++ actual.to_string()
+        )
+    }
+}
+
+fn new_test_harness() -> (SystemKernel, EditorWorld, WindowManager) {
+    mock_enable(true)
+    let kernel = SystemKernel.new()
+    let _ = register_document_extension(kernel) ! { e => panic(e) }
+    let _ = register_window_extension(kernel) ! { e => panic(e) }
+    let _ = register_render_extension(kernel) ! { e => panic(e) }
+    let _ = kernel.activate_all() ! { e => panic(e) }
+
+    let world = require_editor_world(kernel) ! { e => panic(e) }
+    let wm = require_window_manager(kernel) ! { e => panic(e) }
+    wm.resize_viewport(1280, 800, world)
+    (kernel, world, wm)
+}
+
+fn test_display_width_and_column_mapping() {
+    -- ASCII & East-Asian Wide / Fullwidth & Box-Drawing / Symbols & Emoji
+    assert_eq_i64(char_display_width("a"), 1, "ASCII 'a' width == 1")
+    assert_eq_i64(char_display_width(" "), 1, "ASCII space width == 1")
+    assert_eq_i64(char_display_width("中"), 2, "CJK '中' width == 2")
+    assert_eq_i64(char_display_width("あ"), 2, "Hiragana 'あ' width == 2")
+    assert_eq_i64(char_display_width("한"), 2, "Hangul '한' width == 2")
+    assert_eq_i64(char_display_width("Ａ"), 2, "Fullwidth 'Ａ' width == 2")
+    assert_eq_i64(char_display_width("🚀"), 2, "Emoji '🚀' width == 2")
+    assert_eq_i64(char_display_width("─"), 1, "Box-drawing '─' width == 1")
+    assert_eq_i64(char_display_width("│"), 1, "Box-drawing '│' width == 1")
+    assert_eq_i64(char_display_width("▸"), 1, "UI triangle '▸' width == 1")
+    assert_eq_i64(char_display_width("●"), 1, "Bullet '●' width == 1")
+    assert_eq_i64(char_display_width("…"), 1, "Ellipsis '…' width == 1")
+
+    assert_eq_i64(str_display_width(""), 0, "empty string width == 0")
+    assert_eq_i64(str_display_width("中文"), 4, "'中文' display width == 4")
+    assert_eq_i64(str_display_width("Hello世界"), 9, "'Hello世界' display width == 9")
+    assert_eq_i64(str_display_width("── 标题 ──"), 10, "box-drawing + CJK display width == 10")
+
+    -- Tab expansion & visual <-> char column round-trip with CJK
+    let sample = "中文\t`ok`"
+    assert_eq_i64(char_col_to_visual_col(sample, 0, 4), 0, "col 0 -> vcol 0")
+    assert_eq_i64(char_col_to_visual_col(sample, 1, 4), 2, "after '中' -> vcol 2")
+    assert_eq_i64(char_col_to_visual_col(sample, 2, 4), 4, "after '中文' -> vcol 4")
+    assert_eq_i64(char_col_to_visual_col(sample, 3, 4), 8, "after tab from vcol 4 -> vcol 8")
+    assert_eq_i64(char_col_to_visual_col(sample, 4, 4), 9, "after '`' -> vcol 9")
+
+    assert_eq_i64(visual_col_to_char_col(sample, 0, 4), 0, "vcol 0 -> char 0")
+    assert_eq_i64(visual_col_to_char_col(sample, 1, 4), 0, "second cell of '中' -> char 0")
+    assert_eq_i64(visual_col_to_char_col(sample, 2, 4), 1, "vcol 2 -> char 1 ('文')")
+    assert_eq_i64(visual_col_to_char_col(sample, 3, 4), 1, "second cell of '文' -> char 1")
+    assert_eq_i64(visual_col_to_char_col(sample, 4, 4), 2, "vcol 4 -> tab char 2")
+    assert_eq_i64(visual_col_to_char_col(sample, 8, 4), 3, "vcol 8 -> char 3 ('`')")
+
+    let (expanded, end_vcol) = expand_tabs_from_col(sample, 0, 4)
+    assert_eq_i64(end_vcol, 12, "expanded '中文\\t`ok`' visual width == 12")
+    assert_eq_i64(str_display_width(expanded), 12, "expanded string display width == 12")
+    println("[PASS] test_display_width_and_column_mapping")
+}
+
+fn test_cjk_inline_code_x_alignment_and_caret() {
+    let (kernel, world, wm) = new_test_harness()
+    let theme = theme_by_name(world.options.theme_name)
+
+    let md_buf = world.create_buffer(
+        "cjk_align.md",
+        BufferKind.File,
+        file_path = "/tmp/cjk_align.md",
+        major_mode = "markdown",
+        initial_lines = [
+            "中文标题 `code` 尾部",
+            "- 中文标题 `item` 尾部",
+        ],
+    )
+    let _ = world.switch_to_buffer(md_buf.id)
+    kernel.emit_hook("buffer-switched", md_buf.id)
+
+    -- Place cursor right after "中文" on row 0 (`col == 2` -> `vcol == 4`)
+    let pane = wm.active_pane()
+    pane.cursor = Pos.new(0, 2)
+    md_buf.point = Pos.new(0, 2)
+    world.caret_shape = CaretShape.Block
+
+    let (_, cmds) = compose_frame(kernel, world, wm)
+    let pane_after = wm.active_pane()
+    let cell_w = wm.metrics.cell_width
+    let cell_h = wm.metrics.cell_height
+    let gutter_w = compute_gutter_width(md_buf, world.options, wm.metrics)
+    let text_x0 = pane_after.rect.x + gutter_w
+    let row0_y = pane_after.rect.y
+    let row1_y = pane_after.rect.y + cell_h
+    let pane_bottom_y = pane_after.rect.y + pane_after.rect.h - cell_h - 4.0
+
+    var code_x_row0: f64 = -1.0
+    var tail_x_row0: f64 = -1.0
+    var item_x_row1: f64 = -1.0
+    var caret_x: f64 = -1.0
+    var caret_w: f64 = -1.0
+    let row_runs = List()
+
+    for i in 0..cmds.len() {
+        let cmd = cmds.get(i.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.TextRun(tx, ty, txt, _, _, col, bold, _, _) => {
+                assert_true(not bold, "no bold in CJK markdown alignment frame")
+                if tx >= text_x0 - 0.5 and ty >= row0_y - 0.5 and ty < pane_bottom_y {
+                    let w_px = str_display_width(txt).as(f64) * cell_w
+                    row_runs.push((ty, tx, tx + w_px, txt))
+                }
+                if (ty - row0_y).abs() < 0.5 and txt == "`code`" and col == theme.syn_string {
+                    code_x_row0 = tx
+                }
+                if (ty - row0_y).abs() < 0.5 and txt == " 尾部" {
+                    tail_x_row0 = tx
+                }
+                if (ty - row1_y).abs() < 0.5 and txt == "`item`" and col == theme.syn_string {
+                    item_x_row1 = tx
+                }
+            },
+            DrawCmd.CursorCaret(cx, cy, cw, _, _, _) => {
+                if (cy - row0_y).abs() < 0.5 {
+                    caret_x = cx
+                    caret_w = cw
+                }
+            },
+            _ => (),
+        }
+    }
+
+    -- `"中文标题 "` = 4 * 2 + 1 = 9 cells; `` "`code`" `` = 6 cells -> `" 尾部"` at 15 cells!
+    assert_near(code_x_row0, text_x0 + 9.0 * cell_w, 0.5, "`code` X after '中文标题 ' == text_x0 + 9 * cell_w")
+    assert_near(tail_x_row0, text_x0 + 15.0 * cell_w, 0.5, "' 尾部' X after '`code`' == text_x0 + 15 * cell_w")
+    -- `"- 中文标题 "` = 2 + 9 = 11 cells (>= 10 cells)!
+    assert_near(item_x_row1, text_x0 + 11.0 * cell_w, 0.5, "`item` X after '- 中文标题 ' == text_x0 + 11 * cell_w")
+
+    -- Cursor at `col == 2` (on `'标'`) must sit at `text_x0 + 4 * cell_w` and span `2 * cell_w`!
+    assert_near(caret_x, text_x0 + 4.0 * cell_w, 0.5, "Caret X after '中文' == text_x0 + 4 * cell_w")
+    assert_near(caret_w, 2.0 * cell_w, 0.5, "Block Caret width on wide char '标' == 2 * cell_w")
+
+    -- Verify zero horizontal overlap across all TextRun intervals using display widths
+    for a in 0..row_runs.len() {
+        let (ay, ax0, ax1, astr) = row_runs.get(a.as(usize)).as((f64, f64, f64, String))
+        for b in (a + 1)..row_runs.len() {
+            let (by, bx0, bx1, bstr) = row_runs.get(b.as(usize)).as((f64, f64, f64, String))
+            if (ay - by).abs() < 0.5 {
+                let ov = (if ax1 < bx1 { ax1 } else { bx1 }) - (if ax0 > bx0 { ax0 } else { bx0 })
+                assert_true(
+                    ov <= 0.5,
+                    "TextRun '" ++ astr ++ "' must not overlap '" ++ bstr ++ "'",
+                )
+            }
+        }
+    }
+
+    -- Also verify FloatingWindow CJK row with `InlineSpanDecor` uses display columns
+    let span_bg = rgba(137, 180, 250, 90)
+    let span_fg = rgb(166, 227, 161)
+    world.set_floating_window(FloatingWindow {
+        id: "cjk_float",
+        owner: "test_render_markdown_cjk",
+        title: "浮动窗口 CJK",
+        anchor: "center",
+        width_cols: 40,
+        height_rows: 4,
+        lines: ["中文 $ PASS"],
+        selected_row: 0,
+        border_rgba: span_fg,
+    })
+    -- In `"中文 $ PASS"`, `'P'` is char index 5 (`'中'=0, '文'=1, ' '=2, '$'=3, ' '=4, 'P'=5..9`),
+    -- while its visual column is `2 + 2 + 1 + 1 + 1 = 7`!
+    world.floating_window_spans.insert("cjk_float", [
+        InlineSpanDecor {
+            owner: "test",
+            row: 0,
+            start_col: 5,
+            end_col: 9,
+            bg_rgba: span_bg,
+            fg_rgba: span_fg,
+            underline: true,
+            replace_label: "",
+        },
+    ])
+    let (_, fcmds) = compose_frame(kernel, world, wm)
+    var float_prefix_x: f64 = -1.0
+    var float_pass_x: f64 = -1.0
+    var float_bg_x: f64 = -1.0
+    for i in 0..fcmds.len() {
+        let cmd = fcmds.get(i.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.FillRect(rx, _, _, _, col, _) => {
+                if col == span_bg {
+                    float_bg_x = rx
+                }
+            },
+            DrawCmd.TextRun(tx, _, txt, _, _, col, _, _, ul) => {
+                if txt == "中文 $ " {
+                    float_prefix_x = tx
+                }
+                if txt == "PASS" and col == span_fg and ul {
+                    float_pass_x = tx
+                }
+            },
+            _ => (),
+        }
+    }
+    assert_true(float_prefix_x > 0.0, "floating CJK prefix rendered")
+    assert_near(float_pass_x, float_prefix_x + 7.0 * cell_w, 0.5, "floating 'PASS' TextRun X uses display width 7")
+    assert_near(float_bg_x, float_prefix_x + 7.0 * cell_w, 0.5, "floating 'PASS' FillRect X uses display width 7")
+    println("[PASS] test_cjk_inline_code_x_alignment_and_caret")
+}
+
+fn test_markdown_fenced_blocks_and_rich_inline() {
+    let (kernel, world, wm) = new_test_harness()
+    let theme = theme_by_name(world.options.theme_name)
+
+    let md_lines = [
+        "```rust",
+        "fn main() {{ let x = 42; }}",
+        "# not a heading",
+        "```",
+        "# 真标题 Heading",
+        "- [x] 完成 **重点** 与 *斜体* 及 `内联` 还有 [链接](https://example.com)",
+        "> 引用段落 `qcode`",
+        "| 列一 | `cell` |",
+        "---",
+    ]
+    let md_buf = world.create_buffer(
+        "guide.md",
+        BufferKind.File,
+        file_path = "/tmp/guide.md",
+        major_mode = "markdown",
+        initial_lines = md_lines,
+    )
+    let _ = world.switch_to_buffer(md_buf.id)
+    kernel.emit_hook("buffer-switched", md_buf.id)
+
+    let (_, cmds) = compose_frame(kernel, world, wm)
+    let pane = wm.active_pane()
+    let cell_h = wm.metrics.cell_height
+    let gutter_w = compute_gutter_width(md_buf, world.options, wm.metrics)
+    let text_x0 = pane.rect.x + gutter_w
+
+    let y_fence_open = pane.rect.y + 0.0 * cell_h
+    let y_rust_code = pane.rect.y + 1.0 * cell_h
+    let y_hash_in_fence = pane.rect.y + 2.0 * cell_h
+    let y_real_h1 = pane.rect.y + 4.0 * cell_h
+    let y_list_inline = pane.rect.y + 5.0 * cell_h
+    let y_quote = pane.rect.y + 6.0 * cell_h
+    let y_table = pane.rect.y + 7.0 * cell_h
+    let y_hr = pane.rect.y + 8.0 * cell_h
+
+    var saw_fence_bg_row1 = false
+    var saw_rust_fn_kw = false
+    var saw_rust_let_kw = false
+    var saw_rust_num = false
+    var hash_in_fence_is_h1 = false
+    var saw_hash_in_fence_text = false
+    var saw_real_h1 = false
+    var saw_checkbox = false
+    var saw_strong = false
+    var saw_italic = false
+    var saw_inline_code = false
+    var saw_link_text = false
+    var saw_link_url_ul = false
+    var saw_quote_italic = false
+    var saw_table_pipe = false
+    var saw_hr = false
+
+    for i in 0..cmds.len() {
+        let cmd = cmds.get(i.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.FillRect(rx, ry, _, _, col, _) => {
+                if (rx - text_x0).abs() < 0.5 and (ry - y_rust_code).abs() < 0.5 and col == theme.bg_alt {
+                    saw_fence_bg_row1 = true
+                }
+            },
+            DrawCmd.TextRun(tx, ty, txt, _, _, col, bold, italic, ul) => {
+                assert_true(not bold, "Markdown scene TextRun must never be bold")
+                if tx >= text_x0 - 0.5 {
+                    if (ty - y_fence_open).abs() < 0.5 and txt == "rust" and col == theme.syn_operator {
+                        -- fence info-string highlighted cleanly
+                    }
+                    if (ty - y_rust_code).abs() < 0.5 {
+                        if txt == "fn" and col == theme.syn_keyword {
+                            saw_rust_fn_kw = true
+                        }
+                        if txt == "let" and col == theme.syn_keyword {
+                            saw_rust_let_kw = true
+                        }
+                        if txt == "42" and col == theme.syn_number {
+                            saw_rust_num = true
+                        }
+                    }
+                    if (ty - y_hash_in_fence).abs() < 0.5 {
+                        if txt.contains("heading") {
+                            saw_hash_in_fence_text = true
+                            if col == theme.syn_fn {
+                                hash_in_fence_is_h1 = true
+                            }
+                        }
+                    }
+                    if (ty - y_real_h1).abs() < 0.5 and txt.contains("真标题") and col == theme.syn_fn {
+                        saw_real_h1 = true
+                    }
+                    if (ty - y_list_inline).abs() < 0.5 {
+                        if txt.contains("[x]") and col == theme.syn_string {
+                            saw_checkbox = true
+                        }
+                        if txt.contains("**重点**") and col == theme.syn_number and (not bold) {
+                            saw_strong = true
+                        }
+                        if txt.contains("*斜体*") and col == theme.syn_type and italic {
+                            saw_italic = true
+                        }
+                        if txt == "`内联`" and col == theme.syn_string {
+                            saw_inline_code = true
+                        }
+                        if txt == "链接" and col == theme.accent {
+                            saw_link_text = true
+                        }
+                        if txt == "https://example.com" and col == theme.syn_operator and ul {
+                            saw_link_url_ul = true
+                        }
+                    }
+                    if (ty - y_quote).abs() < 0.5 and txt.contains("引用段落") and col == theme.syn_comment and italic {
+                        saw_quote_italic = true
+                    }
+                    if (ty - y_table).abs() < 0.5 and txt == "|" and col == theme.accent {
+                        saw_table_pipe = true
+                    }
+                    if (ty - y_hr).abs() < 0.5 and txt == "---" and (col == theme.border or col == theme.fg_muted) {
+                        saw_hr = true
+                    }
+                }
+            },
+            _ => (),
+        }
+    }
+
+    assert_true(saw_fence_bg_row1, "fenced code block inner row rendered subtle bg_alt tint")
+    assert_true(saw_rust_fn_kw and saw_rust_let_kw, "Rust keywords 'fn' and 'let' highlighted inside ```rust fence")
+    assert_true(saw_rust_num, "Rust numeric literal '42' highlighted inside ```rust fence")
+    assert_true(saw_hash_in_fence_text, "'# not a heading' rendered inside ```rust fence")
+    assert_true(not hash_in_fence_is_h1, "'# not a heading' inside fence is NOT mis-parsed as Markdown H1")
+    assert_true(saw_real_h1, "'# 真标题 Heading' outside fence IS highlighted as Markdown H1")
+    assert_true(saw_checkbox, "task list '[x]' highlighted")
+    assert_true(saw_strong, "'**重点**' highlighted without bold weight")
+    assert_true(saw_italic, "'*斜体*' highlighted with italic == true")
+    assert_true(saw_inline_code, "'`内联`' inline code highlighted")
+    assert_true(saw_link_text, "Markdown '[链接]' label highlighted")
+    assert_true(saw_link_url_ul, "Markdown '(https://example.com)' URL highlighted and underlined")
+    assert_true(saw_quote_italic, "blockquote '> 引用段落' highlighted in italic comment style")
+    assert_true(saw_table_pipe, "Markdown table '|' separators highlighted")
+    assert_true(saw_hr, "Markdown '---' horizontal rule highlighted")
+    println("[PASS] test_markdown_fenced_blocks_and_rich_inline")
+}
+
+fn test_continuous_indent_guides_and_active_scope() {
+    let (kernel, world, wm) = new_test_harness()
+    let theme = theme_by_name(world.options.theme_name)
+    world.options.indent_guides = true
+    world.options.shiftwidth = 4
+    world.options.tabstop = 4
+
+    let code_buf = world.create_buffer(
+        "guides.ns",
+        BufferKind.File,
+        file_path = "/tmp/guides.ns",
+        major_mode = "nessa",
+        initial_lines = [
+            "fn outer() {{",
+            "    if inner {{",
+            "        let a = 1",
+            "",
+            "        let b = 2",
+            "    }}",
+            "}}",
+        ],
+    )
+    let _ = world.switch_to_buffer(code_buf.id)
+    kernel.emit_hook("buffer-switched", code_buf.id)
+
+    -- Focus cursor on Row 2 (`"        let a = 1"`):
+    -- Outer block guide (`vcol == 0`) spans Rows 1..5 in `theme.border`.
+    -- Inner active scope guide (`vcol == 4`) spans Rows 2..4 (including blank Row 3!) in `theme.accent`.
+    let pane = wm.active_pane()
+    pane.cursor = Pos.new(2, 8)
+    code_buf.point = Pos.new(2, 8)
+
+    let (_, cmds) = compose_frame(kernel, world, wm)
+    let pane_after = wm.active_pane()
+    let cell_w = wm.metrics.cell_width
+    let cell_h = wm.metrics.cell_height
+    let gutter_w = compute_gutter_width(code_buf, world.options, wm.metrics)
+    let text_x0 = pane_after.rect.x + gutter_w
+    let gx_outer = text_x0 + 1.0
+    let gx_inner = text_x0 + 4.0 * cell_w + 1.0
+
+    let y_row1 = pane_after.rect.y + 1.0 * cell_h
+    let y_row2 = pane_after.rect.y + 2.0 * cell_h
+    let y_blank_row3 = pane_after.rect.y + 3.0 * cell_h
+    let y_row4 = pane_after.rect.y + 4.0 * cell_h
+    let y_row5 = pane_after.rect.y + 5.0 * cell_h
+
+    var row1_outer_inactive = false
+    var row2_inner_active = false
+    var blank_row3_outer_inactive = false
+    var blank_row3_inner_active = false
+    var row4_inner_active = false
+    var row5_outer_inactive = false
+
+    for i in 0..cmds.len() {
+        let cmd = cmds.get(i.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.Line(x1, y1, x2, y2, col, _) => {
+                if (x1 - x2).abs() < 0.1 and ((y2 - y1) - cell_h).abs() < 0.5 {
+                    if (x1 - gx_outer).abs() < 0.5 and (y1 - y_row1).abs() < 0.5 and col == theme.border {
+                        row1_outer_inactive = true
+                    }
+                    if (x1 - gx_inner).abs() < 0.5 and (y1 - y_row2).abs() < 0.5 and col == theme.accent {
+                        row2_inner_active = true
+                    }
+                    if (x1 - gx_outer).abs() < 0.5 and (y1 - y_blank_row3).abs() < 0.5 and col == theme.border {
+                        blank_row3_outer_inactive = true
+                    }
+                    if (x1 - gx_inner).abs() < 0.5 and (y1 - y_blank_row3).abs() < 0.5 and col == theme.accent {
+                        blank_row3_inner_active = true
+                    }
+                    if (x1 - gx_inner).abs() < 0.5 and (y1 - y_row4).abs() < 0.5 and col == theme.accent {
+                        row4_inner_active = true
+                    }
+                    if (x1 - gx_outer).abs() < 0.5 and (y1 - y_row5).abs() < 0.5 and col == theme.border {
+                        row5_outer_inactive = true
+                    }
+                }
+            },
+            _ => (),
+        }
+    }
+
+    assert_true(row1_outer_inactive, "Row 1 outer indent guide drawn in theme.border")
+    assert_true(row2_inner_active, "Row 2 inner scope guide drawn in theme.accent")
+    assert_true(blank_row3_outer_inactive, "Blank Row 3 bridges outer indent guide continuously")
+    assert_true(blank_row3_inner_active, "Blank Row 3 bridges active inner scope guide in theme.accent")
+    assert_true(row4_inner_active, "Row 4 inner scope guide drawn in theme.accent")
+    assert_true(row5_outer_inactive, "Row 5 closing brace outer indent guide drawn in theme.border")
+
+    -- Verify tab-indented lines also render continuous guides across blank lines
+    let tab_buf = world.create_buffer(
+        "tabs.go",
+        BufferKind.File,
+        file_path = "/tmp/tabs.go",
+        major_mode = "go",
+        initial_lines = [
+            "func run() {{",
+            "\tif ok {{",
+            "\t\tx := 1",
+            "",
+            "\t\ty := 2",
+            "\t}}",
+            "}}",
+        ],
+    )
+    let _ = world.switch_to_buffer(tab_buf.id)
+    kernel.emit_hook("buffer-switched", tab_buf.id)
+    tab_buf.point = Pos.new(2, 2)
+    wm.active_pane().cursor = Pos.new(2, 2)
+    let (_, tab_cmds) = compose_frame(kernel, world, wm)
+    let tab_pane = wm.active_pane()
+    let tab_gx_inner = tab_pane.rect.x + compute_gutter_width(tab_buf, world.options, wm.metrics) + 4.0 * cell_w + 1.0
+    let tab_blank_y = tab_pane.rect.y + 3.0 * cell_h
+    var saw_tab_blank_active = false
+    for i in 0..tab_cmds.len() {
+        let cmd = tab_cmds.get(i.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.Line(x1, y1, x2, y2, col, _) => {
+                if (x1 - x2).abs() < 0.1 and (x1 - tab_gx_inner).abs() < 0.5 and (y1 - tab_blank_y).abs() < 0.5 and ((y2 - y1) - cell_h).abs() < 0.5 and col == theme.accent {
+                    saw_tab_blank_active = true
+                }
+            },
+            _ => (),
+        }
+    }
+    assert_true(saw_tab_blank_active, "Tab-indented block bridges blank line with active scope highlight")
+
+    -- Verify special UI modes (`dired`, `dirvish`, `terminal`, `help`, etc.) skip indent guides
+    tab_buf.major_mode = "dired"
+    let (_, dired_cmds) = compose_frame(kernel, world, wm)
+    var dired_guide_lines: i64 = 0
+    for i in 0..dired_cmds.len() {
+        let cmd = dired_cmds.get(i.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.Line(x1, y1, x2, y2, _, _) => {
+                if (x1 - x2).abs() < 0.1 and x1 >= tab_pane.rect.x + 20.0 and ((y2 - y1) - cell_h).abs() < 0.5 {
+                    dired_guide_lines += 1
+                }
+            },
+            _ => (),
+        }
+    }
+    assert_eq_i64(dired_guide_lines, 0, "special UI mode 'dired' skips indent guides")
+    println("[PASS] test_continuous_indent_guides_and_active_scope")
+}
+
+fn test_global_no_bold_invariant_across_all_surfaces() {
+    let (kernel, world, wm) = new_test_harness()
+    let theme = theme_by_name(world.options.theme_name)
+
+    let rich_buf = world.create_buffer(
+        "scene.md",
+        BufferKind.File,
+        file_path = "/tmp/scene.md",
+        major_mode = "markdown",
+        initial_lines = [
+            "# 一级标题 **加粗语义但统一字重** *斜体保留* [文档](https://lava.org)",
+            "  折叠详情行",
+            "```nessa",
+            "pub fn hello() -> i64 {{ return 1 }} -- 注释斜体",
+            "```",
+        ],
+    )
+    rich_buf.modified = true
+    rich_buf.read_only = true
+    rich_buf.folded_rows.insert(1)
+    rich_buf.signs.push(GutterSign {
+        owner: "git",
+        row: 0,
+        text: "+",
+        fg_rgba: theme.diag_ok,
+        priority: 10,
+    })
+    rich_buf.inline_decors.push(InlineSpanDecor {
+        owner: "flash",
+        row: 0,
+        start_col: 2,
+        end_col: 3,
+        bg_rgba: theme.diag_err,
+        fg_rgba: theme.bg,
+        underline: false,
+        replace_label: "s",
+    })
+    rich_buf.virt_texts.push(VirtualTextDecor {
+        owner: "blame",
+        row: 0,
+        text: "author • 2m ago",
+        fg_rgba: theme.fg_muted,
+        italic: true,
+    })
+
+    let _ = world.switch_to_buffer(rich_buf.id)
+    kernel.emit_hook("buffer-switched", rich_buf.id)
+
+    -- Activate background job, winbar breadcrumb, sidebars, floating window, toast, and rich minibuffer
+    world.active_jobs.push(ActiveBgJob {
+        job_id: 1,
+        title: "cargo check",
+        target_buffer: "scene.md",
+    })
+    world.winbar_text = "scene.md > 一级标题"
+    world.left_sidebar.visible = true
+    world.left_sidebar.title = "文件树 Explorer"
+    world.left_sidebar.lines = ["▾ src/", "  main.ns"]
+    world.left_sidebar.selected_row = 0
+
+    world.set_floating_window(FloatingWindow {
+        id: "float_demo",
+        owner: "test",
+        title: "终端浮窗",
+        anchor: "center",
+        width_cols: 36,
+        height_rows: 4,
+        lines: ["$ echo ok"],
+        selected_row: 0,
+        border_rgba: theme.accent,
+    })
+    world.floating_window_spans.insert("float_demo", [
+        InlineSpanDecor {
+            owner: "term:bold",
+            row: 0,
+            start_col: 0,
+            end_col: 2,
+            bg_rgba: 0,
+            fg_rgba: theme.diag_ok,
+            underline: true,
+            replace_label: "bold",
+        },
+    ])
+
+    world.notifications.push(ToastNotification {
+        id: 1,
+        level: "warn",
+        title: "构建提示",
+        message: "已完成检查",
+        ttl_ticks: 100,
+    })
+
+    world.minibuffer_mode_badge = "FILE"
+    world.minibuffer_hint_bar = "C-j/C-k move • RET open"
+    world.minibuffer_view.active = true
+    world.minibuffer_view.prompt_label = "Find file: "
+    world.minibuffer_view.input_text = "中文"
+    world.minibuffer_view.cursor_col = 2
+    world.minibuffer_view.items = ["中文文档.md"]
+    world.minibuffer_view.selected_idx = 0
+    world.minibuffer_view.total_matches = 1
+    world.minibuffer_rich_items = [
+        MinibufferRichItem {
+            label: "中文文档.md",
+            kind_badge: "[md]",
+            badge_rgba: theme.syn_string,
+            marginalia: "4.2 KB  rw-r--r--",
+            key_hint: "SPC f f",
+            match_indices: [0, 1],
+        },
+    ]
+
+    let (_, cmds) = compose_frame(kernel, world, wm)
+    var total_text_runs: i64 = 0
+    var italic_runs: i64 = 0
+    var underline_runs: i64 = 0
+    for i in 0..cmds.len() {
+        let cmd = cmds.get(i.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.TextRun(_, _, txt, _, _, _, bold, italic, ul) => {
+                total_text_runs += 1
+                if bold {
+                    panic("Unexpected bold == true on DrawCmd.TextRun: '" ++ txt ++ "'")
+                }
+                if italic {
+                    italic_runs += 1
+                }
+                if ul {
+                    underline_runs += 1
+                }
+            },
+            _ => (),
+        }
+    }
+
+    assert_true(total_text_runs >= 30, "rich composite frame emitted >= 30 TextRun commands")
+    assert_true(italic_runs >= 3, "italic TextRuns preserved for comments, *italic*, Marginalia, virtual text")
+    assert_true(underline_runs >= 2, "underline TextRuns preserved for link URLs, Orderless matches, and spans")
+
+    -- Also check in-buffer completion popup & which-key overlay when minibuffer is inactive
+    world.minibuffer_view.active = false
+    world.which_key_items = [KeyBindingEntry {
+        chord: "SPC f",
+        command_name: "find-file",
+        owner: ext_render_id(),
+        description: "Find file",
+    }]
+    world.completion_popup.active = true
+    world.completion_popup.replace_start_col = 0
+    world.completion_popup.selected_idx = 0
+    world.completion_popup.items = [CompletionItem {
+        label: "compose_frame",
+        insert_text: "compose_frame",
+        kind: "fn",
+        detail: "ext_render",
+    }]
+
+    let (_, cmds2) = compose_frame(kernel, world, wm)
+    var runs2: i64 = 0
+    for i in 0..cmds2.len() {
+        let cmd = cmds2.get(i.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.TextRun(_, _, txt, _, _, _, bold, _, _) => {
+                runs2 += 1
+                if bold {
+                    panic("Unexpected bold == true in popup/which-key frame: '" ++ txt ++ "'")
+                }
+            },
+            _ => (),
+        }
+    }
+    assert_true(runs2 >= 25, "which-key + completion popup frame emitted TextRuns with 0 bold")
+    println("[PASS] test_global_no_bold_invariant_across_all_surfaces")
+}
+
+fn main() {
+    test_display_width_and_column_mapping()
+    test_cjk_inline_code_x_alignment_and_caret()
+    test_markdown_fenced_blocks_and_rich_inline()
+    test_continuous_indent_guides_and_active_scope()
+    test_global_no_bold_invariant_across_all_surfaces()
+    println("ALL RENDER MARKDOWN + CJK WIDTH + INDENT GUIDES + NO-BOLD TESTS PASSED!")
+}

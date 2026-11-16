@@ -1,0 +1,455 @@
+-- srv_lsp: Server-Side LSP Session Manager & Multiplexer (`lava.server/srv_lsp`).
+-- Manages `clangd`, `rust-analyzer`, `pyright`, `gopls`, etc. on the remote/server machine
+-- and exposes `lsp/which`, `lsp/find_root`, `lsp/spawn`, `lsp/stop`, `lsp/status`,
+-- `lsp/did_open`, `lsp/did_change`, `lsp/did_save`, `lsp/did_close`, `lsp/request`,
+-- and `lsp/poll_events` over JSON-RPC 2.0.
+
+use @server_sys.{
+    SrvLspStatus, find_project_root, lsp_did_change, lsp_did_close, lsp_did_open, lsp_did_save,
+    lsp_find_root, lsp_poll_events, lsp_request, lsp_spawn, lsp_status, lsp_stop, lsp_which,
+    resolve_server_path
+}
+use @server_core.{
+    JsonValue, ServerKernel, SrvExtId, expect_params_map, invalid_params, opt_i64_param,
+    opt_nullable_i64_param, opt_str_list_param, opt_str_param, require_i64_param, require_str_param
+}
+
+pub const SERVICE_SRV_LSP: String = "lava.server.lsp"
+
+pub fn srv_lsp_id() -> SrvExtId = SrvExtId("lava.server/srv_lsp")
+
+pub struct SrvLspManager {
+    pub session_ids: List,
+}
+
+impl SrvLspManager {
+    pub fn new() -> SrvLspManager {
+        SrvLspManager { session_ids: List() }
+    }
+
+    pub fn track_session(self, session_id: i64) {
+        if not self.session_ids.contains(session_id) {
+            self.session_ids.push(session_id)
+        }
+    }
+
+    pub fn untrack_session(self, session_id: i64) {
+        let kept = List()
+        for i in 0..self.session_ids.len() {
+            let sid = self.session_ids.get(i.as(usize)).as(i64)
+            if sid != session_id {
+                kept.push(sid)
+            }
+        }
+        self.session_ids = kept
+    }
+
+    pub fn stop_all(self) {
+        for i in 0..self.session_ids.len() {
+            let sid = self.session_ids.get(i.as(usize)).as(i64)
+            let _ = lsp_stop(sid)
+        }
+        self.session_ids = List()
+    }
+}
+
+pub fn require_srv_lsp_manager(kernel: ServerKernel) -> !String SrvLspManager {
+    let svc = kernel.require_service(SERVICE_SRV_LSP)!
+    svc.as(SrvLspManager)
+}
+
+private fn require_file_path_param(m: Map) -> !String String {
+    if m.contains("file_path") {
+        return require_str_param(m, "file_path")!
+    }
+    if m.contains("path") {
+        return require_str_param(m, "path")!
+    }
+    error invalid_params("missing required string parameter 'file_path'")
+}
+
+private fn status_to_json(st: SrvLspStatus) -> Map {
+    let out = Map()
+    out.set("id", st.id)
+    out.set("session_id", st.id)
+    out.set("command", st.command)
+    out.set("root_dir", st.root_dir)
+    out.set("pid", st.pid)
+    out.set("alive", st.alive)
+    out.set("initialized", st.initialized)
+    out.set("server_name", st.server_name)
+    out.set("server_version", st.server_version)
+    out.set("capabilities", st.capabilities)
+    out.set("pending_requests", st.pending_requests)
+    out
+}
+
+private fn text_edits_to_json(raw_edits: List) -> List {
+    let edits = List()
+    for i in 0..raw_edits.len() {
+        let e = raw_edits.get(i.as(usize)).as(List)
+        let item = Map()
+        item.set("file_path", e.get(0).as(String))
+        item.set("start_row", e.get(1).as(i64))
+        item.set("start_col", e.get(2).as(i64))
+        item.set("end_row", e.get(3).as(i64))
+        item.set("end_col", e.get(4).as(i64))
+        item.set("new_text", e.get(5).as(String))
+        edits.push(item)
+    }
+    edits
+}
+
+private fn wire_event_to_json(rec: List) -> Map {
+    let ev = Map()
+    if rec.is_empty() {
+        ev.set("type", "unknown")
+        return ev
+    }
+    let tag = rec.get(0).as(String)
+    ev.set("type", tag)
+    when {
+        tag == "initialized" and rec.len() >= 4 => {
+            ev.set("server_name", rec.get(1).as(String))
+            ev.set("server_version", rec.get(2).as(String))
+            ev.set("capabilities", rec.get(3).as(String))
+        },
+        tag == "diagnostics" and rec.len() >= 3 => {
+            ev.set("file_path", rec.get(1).as(String))
+            let raw_items = rec.get(2).as(List)
+            let items = List()
+            for di in 0..raw_items.len() {
+                let d = raw_items.get(di.as(usize)).as(List)
+                let dm = Map()
+                dm.set("row", d.get(0).as(i64))
+                dm.set("col", d.get(1).as(i64))
+                dm.set("end_row", d.get(2).as(i64))
+                dm.set("end_col", d.get(3).as(i64))
+                dm.set("severity", d.get(4).as(String))
+                dm.set("source", d.get(5).as(String))
+                dm.set("code", d.get(6).as(String))
+                dm.set("message", d.get(7).as(String))
+                items.push(dm)
+            }
+            ev.set("items", items)
+        },
+        tag == "hover" and rec.len() >= 3 => {
+            ev.set("req_id", rec.get(1).as(i64))
+            ev.set("markdown", rec.get(2).as(String))
+        },
+        tag == "locations" and rec.len() >= 4 => {
+            ev.set("req_id", rec.get(1).as(i64))
+            ev.set("kind", rec.get(2).as(String))
+            let raw_locs = rec.get(3).as(List)
+            let locs = List()
+            for li in 0..raw_locs.len() {
+                let lc = raw_locs.get(li.as(usize)).as(List)
+                let lm = Map()
+                lm.set("file_path", lc.get(0).as(String))
+                lm.set("row", lc.get(1).as(i64))
+                lm.set("col", lc.get(2).as(i64))
+                lm.set("end_row", lc.get(3).as(i64))
+                lm.set("end_col", lc.get(4).as(i64))
+                locs.push(lm)
+            }
+            ev.set("items", locs)
+        },
+        tag == "symbols" and rec.len() >= 3 => {
+            ev.set("req_id", rec.get(1).as(i64))
+            let raw_syms = rec.get(2).as(List)
+            let syms = List()
+            for si in 0..raw_syms.len() {
+                let sy = raw_syms.get(si.as(usize)).as(List)
+                let sm = Map()
+                sm.set("name", sy.get(0).as(String))
+                sm.set("kind", sy.get(1).as(String))
+                sm.set("detail", sy.get(2).as(String))
+                sm.set("row", sy.get(3).as(i64))
+                sm.set("col", sy.get(4).as(i64))
+                sm.set("end_row", sy.get(5).as(i64))
+                syms.push(sm)
+            }
+            ev.set("items", syms)
+        },
+        tag == "completions" and rec.len() >= 3 => {
+            ev.set("req_id", rec.get(1).as(i64))
+            let raw_cmps = rec.get(2).as(List)
+            let cmps = List()
+            for ci in 0..raw_cmps.len() {
+                let cm = raw_cmps.get(ci.as(usize)).as(List)
+                let item = Map()
+                item.set("label", cm.get(0).as(String))
+                item.set("insert_text", cm.get(1).as(String))
+                item.set("kind", cm.get(2).as(String))
+                item.set("detail", cm.get(3).as(String))
+                cmps.push(item)
+            }
+            ev.set("items", cmps)
+        },
+        tag == "workspace_edit" and rec.len() >= 4 => {
+            ev.set("req_id", rec.get(1).as(i64))
+            ev.set("label", rec.get(2).as(String))
+            ev.set("edits", text_edits_to_json(rec.get(3).as(List)))
+        },
+        tag == "code_actions" and rec.len() >= 3 => {
+            ev.set("req_id", rec.get(1).as(i64))
+            let raw_acts = rec.get(2).as(List)
+            let acts = List()
+            for ai in 0..raw_acts.len() {
+                let ac = raw_acts.get(ai.as(usize)).as(List)
+                let item = Map()
+                item.set("title", ac.get(0).as(String))
+                item.set("kind", ac.get(1).as(String))
+                item.set("edits", text_edits_to_json(ac.get(2).as(List)))
+                acts.push(item)
+            }
+            ev.set("items", acts)
+        },
+        tag == "log" and rec.len() >= 3 => {
+            ev.set("level", rec.get(1).as(String))
+            ev.set("message", rec.get(2).as(String))
+        },
+        tag == "error" and rec.len() >= 4 => {
+            ev.set("req_id", rec.get(1).as(i64))
+            ev.set("method", rec.get(2).as(String))
+            ev.set("message", rec.get(3).as(String))
+        },
+        tag == "exited" and rec.len() >= 2 => {
+            ev.set("exit_code", rec.get(1).as(i64))
+        },
+        else => (),
+    }
+    ev
+}
+
+private fn rpc_lsp_which(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let bin = require_str_param(m, "bin")!
+    let extra_dirs = opt_str_list_param(m, "extra_dirs")!
+    let resolved = lsp_which(bin, extra_dirs = extra_dirs)
+    let out = Map()
+    out.set("found", resolved != "")
+    out.set("path", resolved)
+    out
+}
+
+private fn rpc_lsp_find_root(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let start_path = require_str_param(m, "start_path")!
+    let markers = opt_str_list_param(m, "markers")!
+    let effective_markers = if markers.is_empty() {
+        ["compile_commands.json", "Cargo.toml", "package.toml", "pyproject.toml", "go.mod", "package.json", ".git"]
+    } else {
+        markers
+    }
+    let (proj_root, matched_marker) = find_project_root(start_path, effective_markers)
+    -- Also allow host override if `matched_marker == ""` and host `lsp_find_root` resolves something specific.
+    let final_root = if matched_marker != "" {
+        proj_root
+    } else {
+        lsp_find_root(start_path, effective_markers)
+    }
+    let out = Map()
+    out.set("root", final_root)
+    out.set("matched_marker", matched_marker)
+    out
+}
+
+private fn rpc_lsp_spawn(k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let cmd = require_str_param(m, "cmd")!
+    let args = opt_str_list_param(m, "args")!
+    let raw_root = opt_str_param(m, "root_dir", "")!
+    let raw_cwd = opt_str_param(m, "cwd", "")!
+    let init_options_json = opt_str_param(m, "init_options_json", "")!
+
+    let root_dir = if raw_root.trim() != "" {
+        resolve_server_path(raw_root)
+    } else if raw_cwd.trim() != "" {
+        resolve_server_path(raw_cwd)
+    } else {
+        resolve_server_path(".")
+    }
+    let cwd = if raw_cwd.trim() != "" {
+        resolve_server_path(raw_cwd)
+    } else {
+        root_dir
+    }
+
+    let mgr = require_srv_lsp_manager(k)!
+    let session_id = lsp_spawn(cmd, args, cwd, root_dir, init_options_json = init_options_json)!
+    mgr.track_session(session_id)
+
+    let out = Map()
+    out.set("session_id", session_id)
+    out
+}
+
+private fn rpc_lsp_stop(k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let session_id = require_i64_param(m, "session_id")!
+    let mgr = require_srv_lsp_manager(k)!
+    let stopped = lsp_stop(session_id)
+    mgr.untrack_session(session_id)
+
+    let out = Map()
+    out.set("stopped", stopped)
+    out.set("session_id", session_id)
+    out
+}
+
+private fn rpc_lsp_status(k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let sid_opt = opt_nullable_i64_param(m, "session_id")!
+    if sid_opt != null {
+        let st = lsp_status(sid_opt.as(i64))!
+        return status_to_json(st)
+    }
+    let mgr = require_srv_lsp_manager(k)!
+    let sessions = List()
+    for i in 0..mgr.session_ids.len() {
+        let sid = mgr.session_ids.get(i.as(usize)).as(i64)
+        lsp_status(sid) match {
+            st! => sessions.push(status_to_json(st)),
+            error _ => (),
+        }
+    }
+    let out = Map()
+    out.set("sessions", sessions)
+    out
+}
+
+private fn rpc_lsp_did_open(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let session_id = require_i64_param(m, "session_id")!
+    let file_path = resolve_server_path(require_file_path_param(m)!)
+    let language_id = opt_str_param(m, "language_id", "")!
+    let version = opt_i64_param(m, "version", 1)!
+    let text = require_str_param(m, "text")!
+    lsp_did_open(session_id, file_path, language_id, version, text)!
+    let out = Map()
+    out.set("ok", true)
+    out
+}
+
+private fn rpc_lsp_did_change(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let session_id = require_i64_param(m, "session_id")!
+    let file_path = resolve_server_path(require_file_path_param(m)!)
+    let version = opt_i64_param(m, "version", 2)!
+    if (not m.contains("full_text")) and (not m.contains("text")) {
+        return error invalid_params("missing required string parameter 'full_text' or 'text'")
+    }
+    let full_text = if m.contains("full_text") {
+        require_str_param(m, "full_text")!
+    } else {
+        require_str_param(m, "text")!
+    }
+    lsp_did_change(session_id, file_path, version, full_text)!
+    let out = Map()
+    out.set("ok", true)
+    out
+}
+
+private fn rpc_lsp_did_save(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let session_id = require_i64_param(m, "session_id")!
+    let file_path = resolve_server_path(require_file_path_param(m)!)
+    let text = opt_str_param(m, "text", "")!
+    lsp_did_save(session_id, file_path, text)!
+    let out = Map()
+    out.set("ok", true)
+    out
+}
+
+private fn rpc_lsp_did_close(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let session_id = require_i64_param(m, "session_id")!
+    let file_path = resolve_server_path(require_file_path_param(m)!)
+    lsp_did_close(session_id, file_path)!
+    let out = Map()
+    out.set("ok", true)
+    out
+}
+
+private fn rpc_lsp_request(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let session_id = require_i64_param(m, "session_id")!
+    if (not m.contains("kind")) and (not m.contains("method")) {
+        return error invalid_params("missing required string parameter 'kind'")
+    }
+    let kind = if m.contains("kind") {
+        require_str_param(m, "kind")!
+    } else {
+        require_str_param(m, "method")!
+    }
+    let file_path = resolve_server_path(require_file_path_param(m)!)
+    let row = opt_i64_param(m, "row", 0)!
+    let col = opt_i64_param(m, "col", 0)!
+    let extra = opt_str_param(m, "extra", "")!
+
+    let req_id = lsp_request(session_id, kind, file_path, row, col, extra = extra)!
+    let out = Map()
+    out.set("req_id", req_id)
+    out
+}
+
+private fn rpc_lsp_poll_events(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let session_id = require_i64_param(m, "session_id")!
+    let raw_list = lsp_poll_events(session_id)!
+    let events = List()
+    for i in 0..raw_list.len() {
+        let rec = raw_list.get(i.as(usize)).as(List)
+        events.push(wire_event_to_json(rec))
+    }
+    let out = Map()
+    out.set("events", events)
+    out.set("raw_events", raw_list)
+    out
+}
+
+pub fn register_lsp_extension(kernel: ServerKernel) -> !String Unit {
+    let ext_id = srv_lsp_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.server",
+        "srv_lsp",
+        "0.1.0",
+        "Server-side LSP session multiplexer for clangd, rust-analyzer, pyright, gopls, and more.",
+        List(),
+        |k: ServerKernel| -> !String Unit {
+            let mgr = SrvLspManager.new()
+            k.publish_service(SERVICE_SRV_LSP, ext_id, mgr)
+            k.add_hook(
+                "server-shutdown",
+                ext_id,
+                |kern: ServerKernel, _payload: Any| -> Unit {
+                    let svc_opt = kern.service(SERVICE_SRV_LSP)
+                    if svc_opt != null {
+                        svc_opt.as(SrvLspManager).stop_all()
+                    }
+                },
+            )
+            k.register_rpc("lsp/which", ext_id, "Resolve language server binary on server.", rpc_lsp_which)
+            k.register_rpc("lsp/find_root", ext_id, "Find project root directory for LSP.", rpc_lsp_find_root)
+            k.register_rpc("lsp/spawn", ext_id, "Spawn a non-blocking server-side LSP session.", rpc_lsp_spawn)
+            k.register_rpc("lsp/stop", ext_id, "Stop a running server-side LSP session.", rpc_lsp_stop)
+            k.register_rpc("lsp/status", ext_id, "Query server-side LSP session status.", rpc_lsp_status)
+            k.register_rpc("lsp/did_open", ext_id, "Send textDocument/didOpen to server LSP.", rpc_lsp_did_open)
+            k.register_rpc("lsp/did_change", ext_id, "Send textDocument/didChange to server LSP.", rpc_lsp_did_change)
+            k.register_rpc("lsp/did_save", ext_id, "Send textDocument/didSave to server LSP.", rpc_lsp_did_save)
+            k.register_rpc("lsp/did_close", ext_id, "Send textDocument/didClose to server LSP.", rpc_lsp_did_close)
+            k.register_rpc("lsp/request", ext_id, "Dispatch an async LSP code-intelligence request.", rpc_lsp_request)
+            k.register_rpc("lsp/poll_events", ext_id, "Drain pending server-side LSP events.", rpc_lsp_poll_events)
+            ()
+        },
+        |k: ServerKernel| -> !String Unit {
+            let svc_opt = k.service(SERVICE_SRV_LSP)
+            if svc_opt != null {
+                svc_opt.as(SrvLspManager).stop_all()
+            }
+            ()
+        },
+    )
+}

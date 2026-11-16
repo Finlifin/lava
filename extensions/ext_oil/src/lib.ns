@@ -1,0 +1,732 @@
+-- ext_oil: Edit the Filesystem Like an Ordinary Vim Buffer (`lava.org/ext_oil`).
+-- Inspired by `oil.nvim`: opens directories with `major_mode = "oil"` using stable `/001` entry IDs,
+-- lets users rename (`ciw`), delete (`dd`), copy (`yyp`), and create nested files/folders (`o`)
+-- with standard Vim motions/operators, and applies the diff plan atomically on `:w` / `save-buffer`.
+
+use std.collections.{HashMap, Set}
+use std.fs
+use std.fs.DirEntry
+use std.path
+use @lava_core.{
+    ExtId, InteractiveEffects, SystemKernel, log_event, status_emit
+}
+use @ext_document.{
+    Buffer, BufferId, BufferKind, EditorWorld, Pos, ext_document_id, require_editor_world
+}
+use @ext_vim.{
+    KEYMAP_VIM_NORMAL, VimMode, VimState, ext_vim_id, require_vim_state, sync_world_from_vim
+}
+use @ext_render.ext_render_id
+
+pub const SERVICE_OIL: String = "lava.oil.state"
+pub const OIL_NAME_COL: i64 = 16
+
+pub fn ext_oil_id() -> ExtId = ExtId("lava.org/ext_oil")
+
+pub struct OilEntry {
+    pub id: i64,
+    pub name: String,
+    pub full_path: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+}
+
+pub struct OilSnapshot {
+    pub buf_id: BufferId,
+    pub dir_path: String,
+    pub entries_by_id: HashMap,
+    pub entry_order: List,
+}
+
+pub struct OilState {
+    pub snapshots: HashMap,
+    pub show_hidden: bool,
+}
+
+impl OilState {
+    pub fn new() -> OilState {
+        OilState {
+            snapshots: HashMap.new(),
+            show_hidden: false,
+        }
+    }
+
+    pub fn snapshot_for(self, buf_id: BufferId) -> ?OilSnapshot {
+        let s? = self.snapshots.get(buf_id) else {
+            return null
+        }
+        s.as(OilSnapshot)
+    }
+}
+
+pub fn require_oil_state(kernel: SystemKernel) -> !String OilState {
+    let raw = kernel.require_service(SERVICE_OIL)!
+    raw.as(OilState)
+}
+
+fn format_oil_id(id: i64) -> String {
+    "/" ++ id.to_string().pad_start(3, "0")
+}
+
+fn format_oil_perms(is_dir: bool, is_symlink: bool) -> String {
+    if is_dir {
+        "drwxr-xr-x"
+    } else if is_symlink {
+        "lrwxrwxrwx"
+    } else {
+        "-rw-r--r--"
+    }
+}
+
+fn format_oil_entry_line(entry: OilEntry) -> String {
+    let disp_name = if entry.is_dir { entry.name ++ "/" } else { entry.name }
+    format_oil_id(entry.id) ++ " " ++ format_oil_perms(entry.is_dir, entry.is_symlink) ++ " " ++ disp_name
+}
+
+fn is_perm_token(tok: String) -> bool {
+    if tok.char_len() != 10 {
+        return false
+    }
+    let first = tok.slice(0, 1)
+    if first != "-" and first != "d" and first != "l" {
+        return false
+    }
+    for i in 1..10 {
+        let ch = tok.slice(i, i + 1)
+        if ch != "r" and ch != "w" and ch != "x" and ch != "-" and ch != "s" and ch != "S" and ch != "t" and ch != "T" {
+            return false
+        }
+    }
+    true
+}
+
+fn strip_optional_perm_column(text: String) -> String {
+    let trimmed = text.trim_start()
+    if trimmed.char_len() >= 11 {
+        let cand_perm = trimmed.slice(0, 10)
+        let sep = trimmed.slice(10, 11)
+        if (sep == " " or sep == "\t") and is_perm_token(cand_perm) {
+            return trimmed.drop(11).trim_start()
+        }
+    }
+    if trimmed.char_len() == 10 and is_perm_token(trimmed) {
+        return ""
+    }
+    trimmed
+}
+
+fn parse_oil_id_prefix(trimmed_line: String) -> ?(i64, String) {
+    if not trimmed_line.starts_with("/") {
+        return null
+    }
+    let n = trimmed_line.char_len()
+    var j: i64 = 1
+    while j < n and trimmed_line.slice(j, j + 1).is_ascii_digit() {
+        j += 1
+    }
+    if j <= 1 {
+        return null
+    }
+    if j < n {
+        let sep = trimmed_line.slice(j, j + 1)
+        if sep != " " and sep != "\t" {
+            return null
+        }
+    }
+    let num_opt = trimmed_line.slice(1, j).parse_i64()
+    if num_opt == null {
+        return null
+    }
+    let rest = if j < n { trimmed_line.drop(j).trim_start() } else { "" }
+    (num_opt.as(i64), rest)
+}
+
+fn resolve_oil_child_path(dir_path: String, rel_or_abs: String) -> String {
+    if path.is_absolute(rel_or_abs) {
+        path.normalize(rel_or_abs)
+    } else {
+        path.normalize(path.join(dir_path, rel_or_abs))
+    }
+}
+
+fn populate_oil_buffer(
+    world: EditorWorld,
+    state: OilState,
+    dir_path: String,
+    .focus_name: String = "",
+) -> !String Buffer {
+    let norm_dir = path.normalize(dir_path)
+    if not fs.exists(norm_dir) {
+        return error ("Oil: directory does not exist: " ++ norm_dir)
+    }
+    if not fs.is_dir(norm_dir) {
+        return error ("Oil: not a directory: " ++ norm_dir)
+    }
+
+    let raw_entries! = fs.read_dir_entries(norm_dir) else {
+        return error ("Oil: failed reading directory: " ++ norm_dir)
+    }
+
+    let dirs = List()
+    let files = List()
+    for i in 0..raw_entries.len() {
+        let e = raw_entries.get(i.as(usize)).as(DirEntry)
+        if e.name == "" or e.name == "." or e.name == ".." {
+            continue
+        }
+        if (not state.show_hidden) and e.name.starts_with(".") {
+            continue
+        }
+        if e.is_dir {
+            dirs.push(e)
+        } else {
+            files.push(e)
+        }
+    }
+
+    dirs.sort_by(|a: Any, b: Any| {
+        let na = a.as(DirEntry).name
+        let nb = b.as(DirEntry).name
+        let la = na.to_lower()
+        let lb = nb.to_lower()
+        if la != lb { la.cmp(lb) } else { na.cmp(nb) }
+    })
+    files.sort_by(|a: Any, b: Any| {
+        let na = a.as(DirEntry).name
+        let nb = b.as(DirEntry).name
+        let la = na.to_lower()
+        let lb = nb.to_lower()
+        if la != lb { la.cmp(lb) } else { na.cmp(nb) }
+    })
+
+    let lines = List()
+    lines.push("-- oil://" ++ norm_dir ++ "  (<Return>: open, -: parent, :w: apply)")
+
+    let entries_by_id = HashMap.new()
+    let entry_order = List()
+    var next_id: i64 = 1
+    var focus_row: i64 = -1
+
+    for i in 0..dirs.len() {
+        let d = dirs.get(i.as(usize)).as(DirEntry)
+        let id = next_id
+        next_id += 1
+        let oe = OilEntry {
+            id: id,
+            name: d.name,
+            full_path: path.normalize(d.path),
+            is_dir: true,
+            is_symlink: d.is_symlink,
+        }
+        entries_by_id.insert(id, oe)
+        entry_order.push(id)
+        if focus_name != "" and (d.name == focus_name or (d.name ++ "/") == focus_name) {
+            focus_row = lines.len()
+        }
+        lines.push(format_oil_entry_line(oe))
+    }
+
+    for i in 0..files.len() {
+        let f = files.get(i.as(usize)).as(DirEntry)
+        let id = next_id
+        next_id += 1
+        let oe = OilEntry {
+            id: id,
+            name: f.name,
+            full_path: path.normalize(f.path),
+            is_dir: false,
+            is_symlink: f.is_symlink,
+        }
+        entries_by_id.insert(id, oe)
+        entry_order.push(id)
+        if focus_name != "" and f.name == focus_name {
+            focus_row = lines.len()
+        }
+        lines.push(format_oil_entry_line(oe))
+    }
+
+    let has_entries = not entry_order.is_empty()
+    if not has_entries {
+        lines.push("")
+    }
+
+    let buf_name = "oil://" ++ norm_dir
+    let existing_opt = world.find_buffer_by_name(buf_name)
+    let buf = if existing_opt != null {
+        let b = existing_opt.as(Buffer)
+        b.read_only = false
+        b.kind = BufferKind.Directory
+        b.major_mode = "oil"
+        b.set_lines(lines, record_undo = false)
+        b
+    } else {
+        world.create_buffer(
+            buf_name,
+            BufferKind.Directory,
+            major_mode = "oil",
+            initial_lines = lines,
+        )
+    }
+
+    let target_r = if focus_row >= 1 {
+        focus_row
+    } else {
+        1
+    }
+    let target_c = if has_entries { OIL_NAME_COL } else { 0 }
+    let init_pos = buf.clamp_pos(Pos.new(target_r, target_c), insert_mode = false)
+    buf.point = init_pos
+    buf.preferred_col = init_pos.col
+    buf.modified = false
+    buf.read_only = false
+    buf.undo_tree.reinit_doc(buf.doc_id, init_pos)
+
+    state.snapshots.insert(
+        buf.id,
+        OilSnapshot {
+            buf_id: buf.id,
+            dir_path: norm_dir,
+            entries_by_id: entries_by_id,
+            entry_order: entry_order,
+        },
+    )
+
+    buf
+}
+
+pub fn open_oil_directory(
+    kernel: SystemKernel,
+    raw_dir: String,
+    .focus_name: String = "",
+) -> #[log_event, status_emit] !String Buffer {
+    let world = require_editor_world(kernel)!
+    let state = require_oil_state(kernel)!
+    let resolved = world.resolve_path(raw_dir)
+    let cur = world.active_buffer()
+    world.jumps.record(cur.id, cur.file_path, cur.point)
+
+    let buf = populate_oil_buffer(world, state, resolved, focus_name = focus_name)!
+    let _ = world.switch_to_buffer(buf.id)
+    let vim_opt = kernel.service("lava.vim.state")
+    if vim_opt != null {
+        let vs = vim_opt.as(VimState)
+        vs.mode = VimMode.Normal
+        vs.clear_transient()
+        sync_world_from_vim(world, vs)
+    }
+    kernel.emit_hook("buffer-switched", buf.id)
+    log_event("info", "ext_oil", "Opened Oil directory " ++ resolved)#
+    status_emit("Oil: " ++ resolved)#
+    buf
+}
+
+fn ensure_parent_dirs(full_path: String) -> !String Unit {
+    let p_opt = path.parent(full_path)
+    if p_opt != null {
+        let pdir = p_opt.as(String)
+        if pdir != "" and (not fs.exists(pdir)) {
+            let res = fs.create_dir_all(pdir)
+            res match {
+                _! => (),
+                error err => return error ("Oil mkdir failed for " ++ pdir ++ ": " ++ err.to_string()),
+            }
+        }
+    }
+    ()
+}
+
+fn apply_oil_buffer_changes(kernel: SystemKernel, buf: Buffer) -> #[log_event, status_emit] !String Unit {
+    let world = require_editor_world(kernel)!
+    let state = require_oil_state(kernel)!
+    let snap? = state.snapshot_for(buf.id) else {
+        return error "Oil: missing directory snapshot for active Oil buffer"
+    }
+
+    let seen_ids = Set.new()
+    let renames = List()
+    let copies = List()
+    let creations = List()
+    var last_touched_name = ""
+
+    for r in 0..buf.line_count() {
+        let raw_line = buf.line_at(r)
+        let trimmed = raw_line.trim()
+        if trimmed == "" or trimmed.starts_with("--") {
+            continue
+        }
+
+        let id_pair_opt = parse_oil_id_prefix(trimmed)
+        if id_pair_opt != null {
+            let (id_num, after_id) = id_pair_opt.as((i64, String))
+            if snap.entries_by_id.contains_key(id_num) {
+                let orig = snap.entries_by_id.get(id_num).as(OilEntry)
+                let cleaned_rest = strip_optional_perm_column(after_id)
+                let clean_name = cleaned_rest.trim().trim_end_matches("/")
+                if clean_name == "" {
+                    continue
+                }
+                if not seen_ids.contains(id_num) {
+                    seen_ids.insert(id_num)
+                    if clean_name != orig.name {
+                        renames.push((orig, clean_name))
+                        let fn_opt = path.file_name(clean_name)
+                        if fn_opt != null {
+                            last_touched_name = fn_opt.as(String)
+                        }
+                    }
+                } else if clean_name != orig.name and (not orig.is_dir) {
+                    copies.push((orig, clean_name))
+                    let fn_opt = path.file_name(clean_name)
+                    if fn_opt != null {
+                        last_touched_name = fn_opt.as(String)
+                    }
+                }
+                continue
+            }
+        }
+
+        let spec = strip_optional_perm_column(trimmed).trim()
+        if spec != "" {
+            creations.push(spec)
+            let clean_spec = spec.trim_end_matches("/")
+            let fn_opt = path.file_name(clean_spec)
+            if fn_opt != null {
+                last_touched_name = fn_opt.as(String)
+            }
+        }
+    }
+
+    let deletions = List()
+    for i in 0..snap.entry_order.len() {
+        let id_num = snap.entry_order.get(i.as(usize)).as(i64)
+        if not seen_ids.contains(id_num) {
+            deletions.push(snap.entries_by_id.get(id_num).as(OilEntry))
+        }
+    }
+
+    var created_count: i64 = 0
+    var renamed_count: i64 = 0
+    var deleted_count: i64 = 0
+
+    -- 1. Execute duplicated `/NNN` file copies first while original paths are intact
+    for i in 0..copies.len() {
+        let (orig, dest_rel) = copies.get(i.as(usize)).as((OilEntry, String))
+        let dest_full = resolve_oil_child_path(snap.dir_path, dest_rel)
+        ensure_parent_dirs(dest_full)!
+        let cp_res = fs.copy(orig.full_path, dest_full)
+        cp_res match {
+            _! => { created_count += 1 },
+            error err => return error ("Oil copy failed (" ++ orig.name ++ " -> " ++ dest_rel ++ "): " ++ err.to_string()),
+        }
+    }
+
+    -- 2. Execute deletions for entries whose `/NNN` line was deleted
+    for i in 0..deletions.len() {
+        let ent = deletions.get(i.as(usize)).as(OilEntry)
+        if not fs.exists(ent.full_path) {
+            continue
+        }
+        if ent.is_dir {
+            let rm_res = fs.remove_dir_all(ent.full_path)
+            rm_res match {
+                _! => { deleted_count += 1 },
+                error err => return error ("Oil remove_dir_all failed (" ++ ent.full_path ++ "): " ++ err.to_string()),
+            }
+        } else {
+            let rm_res = fs.remove_file(ent.full_path)
+            rm_res match {
+                _! => { deleted_count += 1 },
+                error err => return error ("Oil remove_file failed (" ++ ent.full_path ++ "): " ++ err.to_string()),
+            }
+        }
+    }
+
+    -- 3. Execute renames/moves with two-phase staging if rename targets overlap rename sources
+    let rename_sources = Set.new()
+    for i in 0..renames.len() {
+        let (orig, _) = renames.get(i.as(usize)).as((OilEntry, String))
+        rename_sources.insert(orig.full_path)
+    }
+
+    let staged_renames = List()
+    for i in 0..renames.len() {
+        let (orig, dest_rel) = renames.get(i.as(usize)).as((OilEntry, String))
+        let dest_full = resolve_oil_child_path(snap.dir_path, dest_rel)
+        if dest_full == orig.full_path {
+            continue
+        }
+        if rename_sources.contains(dest_full) and fs.exists(dest_full) {
+            let tmp_path = path.join(
+                snap.dir_path,
+                ".oil_stage_" ++ i.to_string() ++ "_" ++ orig.id.to_string(),
+            )
+            let st_res = fs.rename(orig.full_path, tmp_path)
+            st_res match {
+                _! => (),
+                error err => return error ("Oil stage rename failed: " ++ err.to_string()),
+            }
+            staged_renames.push((orig, tmp_path, dest_full))
+        } else {
+            staged_renames.push((orig, orig.full_path, dest_full))
+        }
+    }
+
+    for i in 0..staged_renames.len() {
+        let (orig, cur_src, dest_full) = staged_renames.get(i.as(usize)).as((OilEntry, String, String))
+        ensure_parent_dirs(dest_full)!
+        let rn_res = fs.rename(cur_src, dest_full)
+        rn_res match {
+            _! => {
+                renamed_count += 1
+                let open_opt = world.find_buffer_by_path(orig.full_path)
+                if open_opt != null {
+                    let ob = open_opt.as(Buffer)
+                    ob.file_path = dest_full
+                    let bn_opt = path.file_name(dest_full)
+                    if bn_opt != null {
+                        ob.name = bn_opt.as(String)
+                    }
+                }
+            },
+            error err => return error ("Oil rename failed (" ++ orig.name ++ " -> " ++ dest_full ++ "): " ++ err.to_string()),
+        }
+    }
+
+    -- 4. Execute newly typed file and directory creations
+    for i in 0..creations.len() {
+        let spec = creations.get(i.as(usize)).as(String)
+        let is_dir_spec = spec.ends_with("/")
+        let clean_spec = spec.trim_end_matches("/")
+        if clean_spec == "" {
+            continue
+        }
+        let target_full = resolve_oil_child_path(snap.dir_path, clean_spec)
+        if is_dir_spec {
+            let mk_res = fs.create_dir_all(target_full)
+            mk_res match {
+                _! => { created_count += 1 },
+                error err => return error ("Oil create_dir_all failed (" ++ target_full ++ "): " ++ err.to_string()),
+            }
+        } else {
+            ensure_parent_dirs(target_full)!
+            if not fs.exists(target_full) {
+                let wr_res = fs.write_string(target_full, "")
+                wr_res match {
+                    _! => { created_count += 1 },
+                    error err => return error ("Oil write_string failed (" ++ target_full ++ "): " ++ err.to_string()),
+                }
+            }
+        }
+    }
+
+    let refreshed = populate_oil_buffer(world, state, snap.dir_path, focus_name = last_touched_name)!
+    let summary = "Oil: created " ++ created_count.to_string()
+        ++ ", renamed " ++ renamed_count.to_string()
+        ++ ", deleted " ++ deleted_count.to_string()
+    kernel.emit_hook("buffer-saved", refreshed.id)
+    log_event("info", "ext_oil", summary ++ " in " ++ snap.dir_path)#
+    status_emit(summary)#
+    ()
+}
+
+fn cmd_oil_open_parent(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let state = require_oil_state(kern)!
+    let buf = world.active_buffer()
+
+    if buf.major_mode == "oil" {
+        let snap? = state.snapshot_for(buf.id) else {
+            let _ = open_oil_directory(kern, world.cwd)#!
+            return ()
+        }
+        if buf.modified {
+            status_emit("Oil: buffer has unsaved filesystem edits (:w to apply or u to undo)")#
+            return ()
+        }
+        let parent_opt = path.parent(snap.dir_path)
+        if parent_opt == null or parent_opt.as(String) == snap.dir_path {
+            status_emit("Oil: already at filesystem root")#
+            return ()
+        }
+        let base_opt = path.file_name(snap.dir_path)
+        let focus = if base_opt != null { base_opt.as(String) } else { "" }
+        let _ = open_oil_directory(kern, parent_opt.as(String), focus_name = focus)#!
+        return ()
+    }
+
+    if buf.file_path != "" {
+        let parent_opt = path.parent(buf.file_path)
+        let target_dir = if parent_opt != null { parent_opt.as(String) } else { world.cwd }
+        let base_opt = path.file_name(buf.file_path)
+        let focus = if base_opt != null { base_opt.as(String) } else { "" }
+        let _ = open_oil_directory(kern, target_dir, focus_name = focus)#!
+        return ()
+    }
+
+    let _ = open_oil_directory(kern, world.cwd)#!
+    ()
+}
+
+fn cmd_oil_select_entry(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let state = require_oil_state(kern)!
+    let buf = world.active_buffer()
+
+    let snap? = state.snapshot_for(buf.id) else {
+        return ()
+    }
+    if buf.modified {
+        status_emit("Oil: save changes with :w before opening entry")#
+        return ()
+    }
+
+    let trimmed = buf.line_at(buf.point.row).trim()
+    if trimmed == "" or trimmed.starts_with("--") {
+        return ()
+    }
+
+    var target_path = ""
+    var target_is_dir = false
+    let id_pair_opt = parse_oil_id_prefix(trimmed)
+    if id_pair_opt != null {
+        let (id_num, _) = id_pair_opt.as((i64, String))
+        if snap.entries_by_id.contains_key(id_num) {
+            let ent = snap.entries_by_id.get(id_num).as(OilEntry)
+            target_path = ent.full_path
+            target_is_dir = ent.is_dir
+        }
+    }
+
+    if target_path == "" {
+        let spec = strip_optional_perm_column(trimmed).trim_end_matches("/")
+        if spec == "" {
+            return ()
+        }
+        target_path = resolve_oil_child_path(snap.dir_path, spec)
+        target_is_dir = fs.is_dir(target_path)
+    }
+
+    if target_is_dir {
+        let _ = open_oil_directory(kern, target_path)#!
+        return ()
+    }
+
+    world.jumps.record(buf.id, buf.file_path, buf.point)
+    let opened = world.open_file(target_path)#!
+    kern.emit_hook("buffer-switched", opened.id)
+    ()
+}
+
+fn cmd_oil_toggle_hidden(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let state = require_oil_state(kern)!
+    let buf = world.active_buffer()
+    if buf.major_mode != "oil" {
+        return ()
+    }
+    if buf.modified {
+        status_emit("Oil: save or undo edits before toggling hidden files")#
+        return ()
+    }
+    state.show_hidden = not state.show_hidden
+    let snap_opt = state.snapshot_for(buf.id)
+    if snap_opt != null {
+        let _ = populate_oil_buffer(world, state, snap_opt.as(OilSnapshot).dir_path)!
+    }
+    status_emit("Oil hidden files: " ++ (if state.show_hidden { "shown" } else { "hidden" }))#
+    ()
+}
+
+fn cmd_oil_entry(kern: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let raw = if not args.is_empty() { args.get(0).as(String).trim() } else { "" }
+    if raw == "" {
+        return cmd_oil_open_parent(kern, List())#
+    }
+    let resolved = world.resolve_path(raw)
+    if fs.exists(resolved) and (not fs.is_dir(resolved)) {
+        let p_opt = path.parent(resolved)
+        let dir_p = if p_opt != null { p_opt.as(String) } else { world.cwd }
+        let fn_opt = path.file_name(resolved)
+        let focus = if fn_opt != null { fn_opt.as(String) } else { "" }
+        let b = open_oil_directory(kern, dir_p, focus_name = focus)#!
+        return b.id
+    }
+    let b = open_oil_directory(kern, resolved)#!
+    b.id
+}
+
+fn cmd_write_oil_buffer(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let buf = world.active_buffer()
+    apply_oil_buffer_changes(kern, buf)#!
+    ()
+}
+
+pub fn register_oil_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_oil_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_oil",
+        "0.1.0",
+        "Editable Vim buffer filesystem explorer (`oil.nvim`) with deterministic `/NNN` entry IDs and atomic `:w` mutation plans.",
+        [ext_document_id(), ext_vim_id(), ext_render_id()],
+        |k: SystemKernel| -> !String Unit {
+            let state = OilState.new()
+            k.publish_service(SERVICE_OIL, ext_id, state)
+
+            k.register_command(
+                "oil",
+                ext_id,
+                "Open directory as an editable Oil buffer (`:Oil [dir]`).",
+                cmd_oil_entry,
+            )
+
+            k.register_command(
+                "oil-open-parent",
+                ext_id,
+                "Open parent directory in an editable Oil buffer (`-`).",
+                cmd_oil_open_parent,
+            )
+
+            k.register_command(
+                "oil-select-entry",
+                ext_id,
+                "Open file or enter subdirectory under cursor in an Oil buffer (`<Return>`).",
+                cmd_oil_select_entry,
+            )
+
+            k.register_command(
+                "oil-toggle-hidden",
+                ext_id,
+                "Toggle hidden dotfiles in Oil directory buffer (`H`).",
+                cmd_oil_toggle_hidden,
+            )
+
+            k.register_command(
+                "write-buffer-mode:oil",
+                ext_id,
+                "Compute and execute planned filesystem creates, renames, copies, and deletions for Oil buffer.",
+                cmd_write_oil_buffer,
+                interactive = false,
+            )
+
+            let oil_km = k.ensure_keymap("mode:oil")
+            oil_km.bind("<Return>", "oil-select-entry", ext_id, description = "Open Oil entry")
+            oil_km.bind("-", "oil-open-parent", ext_id, description = "Open parent directory in Oil")
+            oil_km.bind("H", "oil-toggle-hidden", ext_id, description = "Toggle hidden files in Oil")
+
+            let norm_km = k.ensure_keymap(KEYMAP_VIM_NORMAL)
+            norm_km.bind("<Space>fo", "oil-open-parent", ext_id, description = "Open parent directory in Oil")
+            k.ensure_keymap("vim-leader").bind("<Space> f o", "oil-open-parent", ext_id, description = "Open parent directory in Oil")
+            let _dj? = k.get_command("dirvish-jump") else {
+                norm_km.bind("-", "oil-open-parent", ext_id, description = "Open parent directory in Oil")
+                return ()
+            }
+
+            ()
+        },
+        |_k: SystemKernel| -> !String Unit { () },
+    )
+}

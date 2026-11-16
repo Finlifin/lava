@@ -1,0 +1,802 @@
+-- Comprehensive End-to-End Test Suite for `lava.org/ext_diff`:
+--   1. Extension registration, activation/deactivation roundtrip, `SERVICE_DIFF`, custom `register_diff_preset`.
+--   2. Real `/usr/bin/sed` & `/usr/bin/awk` stdio `Mapper` pipeline, `[VIEW: MAPPED]` vs `[VIEW: ORIGINAL]` (`v`),
+--      built-in presets (`strip-timestamps`, `strip-hex-addr`, etc.), and `--left` / `--right` side-scoped stages.
+--   3. Real `/usr/bin/rg` & `/usr/bin/sed` stdio `Filter` pipeline, 0-based `orig_row` preservation across dropped lines
+--      verified by `<Return>` (`diff-goto-source`), `rg` exit-code-1 (0 matches) handling, and invalid shell error recovery.
+--   4. Side-by-Side synchronized split (`WindowManager`), Unified patch toggle (`t`), context adjustment (`C`/`c`),
+--      whitespace toggle (`w`), intra-line word diff spans, and `do`/`dp` hunk patching with `UndoTree` revert.
+--   5. All 7 entry sources (`:DiffBuffers`, `:DiffFiles`, `:DiffSaved` local + `ssh://`, `:DiffHead`, `:DiffView`,
+--      `:DiffDirs`, `:DiffSelection`), `:DiffExportPatch`, interactive `ask_prompt` continuations, and `q` (`:DiffClose`).
+
+use std.fs
+use std.path
+use std.process
+use @lava_sys.mock_enable
+use @lava_core.{
+    HostClipboardCap, InteractiveEffects, LogCollectorCap, PromptTurn, ServiceEffects,
+    StatusCollectorCap, SystemKernel, ask_prompt, clipboard_get, clipboard_set, log_event,
+    resume_interactive_turn, start_interactive_turn, status_emit
+}
+use @ext_document.{
+    Buffer, BufferId, BufferKind, EditorWorld, InlineSpanDecor, Pos, register_document_extension,
+    require_editor_world
+}
+use @ext_window.{
+    SERVICE_WINDOW_MANAGER, WindowManager, WindowPane, register_window_extension,
+    require_window_manager
+}
+use @ext_vim.{
+    VimState, execute_ex_command, register_vim_extension, require_vim_state, vim_feed_keys
+}
+use @ext_diff.{
+    BUF_DIFF_DIRS, BUF_DIFF_LEFT, BUF_DIFF_PATCH, BUF_DIFF_RIGHT, BUF_DIFF_UNIFIED, BUF_DIFF_VIEW,
+    DiffDirEntry, DiffService, DiffStageKind, DiffViewEntry, FLOAT_DIFF_PIPELINE, OWNER_DIFF,
+    SERVICE_DIFF, TrackedDiffLine, ext_diff_id, open_diff_between_buffers, register_diff_extension,
+    register_diff_preset, require_diff_service
+}
+
+fn fail_test(msg: String) -> NoReturn {
+    panic("TEST FAILED: " ++ msg)
+}
+
+fn assert_true(cond: bool, msg: String) {
+    if not cond {
+        fail_test(msg)
+    }
+}
+
+fn assert_str_eq(actual: String, expected: String, label: String) {
+    if actual != expected {
+        fail_test(
+            label ++ "\n  expected: " ++ expected.escape_debug()
+            ++ "\n  actual:   " ++ actual.escape_debug()
+        )
+    }
+}
+
+fn assert_i64_eq(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        fail_test(
+            label ++ " expected=" ++ expected.to_string() ++ " actual=" ++ actual.to_string()
+        )
+    }
+}
+
+fn unwrap_ok(res: !String Unit, ctx: String) {
+    let res_err = res ! {
+        e => {
+            fail_test(ctx ++ " returned unexpected error: " ++ e)
+            ()
+        },
+    }
+    let _ = res_err
+}
+
+fn run_interactive_no_prompts(
+    thunk: fn() -> #ask_prompt !String Any,
+    ctx: String,
+) {
+    let turn = start_interactive_turn(|| -> #ask_prompt Any {
+        let r = thunk()# ! {
+            e => return ("__ERR__:" ++ e),
+        }
+        r
+    })
+    turn match {
+        PromptTurn.Completed(val) => {
+            val match {
+                s: String => {
+                    if s.starts_with("__ERR__:") {
+                        fail_test(ctx ++ " failed with error: " ++ s.slice(8, s.char_len()))
+                    }
+                },
+                _ => (),
+            }
+        },
+        PromptTurn.Suspended(req, _k) => {
+            fail_test(ctx ++ " unexpectedly suspended on prompt: " ++ req.label)
+        },
+    }
+}
+
+fn run_interactive_expect_error(
+    thunk: fn() -> #ask_prompt !String Any,
+    ctx: String,
+) -> String {
+    let turn = start_interactive_turn(|| -> #ask_prompt Any {
+        let _ = thunk()# ! {
+            e => return ("__ERR__:" ++ e),
+        }
+        "__OK__"
+    })
+    turn match {
+        PromptTurn.Completed(val) => {
+            val match {
+                s: String => {
+                    if s.starts_with("__ERR__:") {
+                        return s.slice(8, s.char_len())
+                    }
+                },
+                _ => (),
+            }
+            fail_test(ctx ++ " succeeded unexpectedly when an error was expected")
+        },
+        PromptTurn.Suspended(req, _k) => {
+            fail_test(ctx ++ " unexpectedly suspended on prompt: " ++ req.label)
+        },
+    }
+}
+
+fn run_interactive_with_answers(
+    answers: List,
+    thunk: fn() -> #ask_prompt !String Any,
+    ctx: String,
+) {
+    var turn = start_interactive_turn(|| -> #ask_prompt Any {
+        let r = thunk()# ! {
+            e => return ("__ERR__:" ++ e),
+        }
+        r
+    })
+    var idx: i64 = 0
+    while true {
+        var finished = false
+        turn match {
+            PromptTurn.Completed(val) => {
+                val match {
+                    s: String => {
+                        if s.starts_with("__ERR__:") {
+                            fail_test(ctx ++ " failed with error: " ++ s.slice(8, s.char_len()))
+                        }
+                    },
+                    _ => (),
+                }
+                finished = true
+            },
+            PromptTurn.Suspended(req, cont) => {
+                if idx >= answers.len() {
+                    fail_test(ctx ++ " ran out of scripted answers at prompt: " ++ req.label)
+                }
+                let ans = answers.get(idx.as(usize))
+                idx += 1
+                let ans_opt: ?String = if ans == null { null } else { ans.as(String) }
+                turn = resume_interactive_turn(cont, ans_opt)
+            },
+        }
+        if finished {
+            break
+        }
+    }
+}
+
+fn make_diff_kernel() -> !String (SystemKernel, EditorWorld, WindowManager, VimState, DiffService) {
+    mock_enable(true)
+    let kernel = SystemKernel.new()
+    register_document_extension(kernel)!
+    register_window_extension(kernel)!
+    register_vim_extension(kernel)!
+    register_diff_extension(kernel)!
+    kernel.activate_all()!
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let vim = require_vim_state(kernel)!
+    let diff = require_diff_service(kernel)!
+    (kernel, world, wm, vim, diff)
+}
+
+fn create_mem_buffer(world: EditorWorld, name: String, lines: List) -> Buffer {
+    let b = world.create_buffer(name, BufferKind.Scratch, initial_lines = lines)
+    b.read_only = false
+    b.modified = false
+    b.point = Pos.zero()
+    b.preferred_col = 0
+    b
+}
+
+fn feed_keys_ok(kernel: SystemKernel, seq: String, ctx: String) -> #ServiceEffects Unit {
+    run_interactive_no_prompts(
+        || -> #ask_prompt !String Any { vim_feed_keys(kernel, seq)# },
+        ctx,
+    )
+}
+
+fn exec_ex_ok(kernel: SystemKernel, cmdline: String, ctx: String) -> #ServiceEffects Unit {
+    run_interactive_no_prompts(
+        || -> #ask_prompt !String Any { execute_ex_command(kernel, cmdline)# },
+        ctx,
+    )
+}
+
+fn exec_ex_err(kernel: SystemKernel, cmdline: String, ctx: String) -> #ServiceEffects String {
+    run_interactive_expect_error(
+        || -> #ask_prompt !String Any { execute_ex_command(kernel, cmdline)# },
+        ctx,
+    )
+}
+
+-- ============================================================================
+-- Suite 1: Extension Contract, Lifecycle & Custom Preset Registration
+-- ============================================================================
+
+fn test_extension_lifecycle_and_presets() -> #ServiceEffects !String Unit {
+    let (kernel, world, _wm, _vim, diff) = make_diff_kernel()!
+
+    assert_str_eq(ext_diff_id().raw(), "lava.org/ext_diff", "ext_diff_id")
+    assert_true(kernel.is_extension_active(ext_diff_id()), "ext_diff active")
+    assert_true(kernel.service(SERVICE_DIFF) != null, "SERVICE_DIFF registered")
+    assert_true(diff.presets.len() >= 9, "9 built-in sed/awk/rg presets registered")
+
+    -- Verify custom preset registration (`init.ns` extensibility API)
+    register_diff_preset(
+        diff,
+        "strip-pid",
+        DiffStageKind.Mapper,
+        "sed -E 's/pid=[0-9]+/pid=<PID>/g'",
+        description = "Mask process IDs in logs",
+    )
+    let found_custom = diff.find_preset("strip-pid")
+    assert_true(found_custom != null, "custom strip-pid preset found")
+
+    -- Open a quick buffer diff so OWNER_DIFF decorations exist, then test clean deactivation/reactivation
+    let b1 = create_mem_buffer(world, "life_a.txt", ["alpha", "beta"])
+    let b2 = create_mem_buffer(world, "life_b.txt", ["alpha", "gamma"])
+    open_diff_between_buffers(kernel, b1.id, b2.id)#!
+    assert_true(diff.session.active, "diff session active before deactivate")
+
+    kernel.deactivate_extension(ext_diff_id())!
+    assert_true(not kernel.is_extension_active(ext_diff_id()), "ext_diff deactivated")
+    assert_true(kernel.service(SERVICE_DIFF) == null, "SERVICE_DIFF removed on deactivate")
+
+    kernel.activate_extension(ext_diff_id())!
+    assert_true(kernel.is_extension_active(ext_diff_id()), "ext_diff re-activated")
+    assert_true(kernel.service(SERVICE_DIFF) != null, "SERVICE_DIFF restored on activate")
+    ()
+}
+
+-- ============================================================================
+-- Suite 2: Real `/usr/bin/sed` & `/usr/bin/awk` Stdio `Mapper` Pipeline
+-- ============================================================================
+
+fn test_stdio_mappers_and_view_toggle() -> #ServiceEffects !String Unit {
+    let (kernel, world, _wm, _vim, diff) = make_diff_kernel()!
+
+    let log_left = create_mem_buffer(world, "run_left.log", [
+        "2026-11-15 12:00:01 INFO  worker=0x7fff1234 msg=boot_complete",
+        "2026-11-15 12:00:02 INFO  worker=0x7fff1234 status=OK latency=12ms",
+        "2026-11-15 12:00:03 INFO  worker=0x7fff5678 msg=heartbeat_clean",
+        "2026-11-15 12:00:04 INFO  worker=0x7fffabcd msg=shutdown_done",
+    ])
+    let log_right = create_mem_buffer(world, "run_right.log", [
+        "2026-11-15 19:45:59 INFO  worker=0x7fff9999 msg=boot_complete",
+        "2026-11-15 19:46:00 INFO  worker=0x7fff9999 status=TIMEOUT latency=12ms",
+        "2026-11-15 19:46:01 INFO  worker=0x7fffeeee msg=heartbeat_clean",
+        "2026-11-15 19:46:02 INFO  worker=0x7fff0001 msg=shutdown_done",
+    ])
+
+    open_diff_between_buffers(kernel, log_left.id, log_right.id)#!
+    -- Without Mappers, all 4 lines differ due to timestamps and hex addresses (1 big 4-line hunk)
+    assert_i64_eq(diff.session.hunk_count(), 1, "raw unmasked log diff has 1 hunk covering all 4 lines")
+    assert_i64_eq(diff.session.changed_count, 4, "all 4 lines initially marked changed")
+
+    -- Apply real `/usr/bin/sed` timestamp Mapper + hex-address Mapper via Ex commands!
+    exec_ex_ok(
+        kernel,
+        "DiffMap sed -E 's/[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}} [0-9:]+/<TS>/g'",
+        "DiffMap sed timestamps",
+    )#
+    exec_ex_ok(
+        kernel,
+        "DiffMap sed -E 's/0x[0-9a-fA-F]+/0xADDR/g'",
+        "DiffMap sed hex addresses",
+    )#
+
+    -- Lines 0, 2, 3 now compare as EQUAL; ONLY line 1 (`status=OK` vs `status=TIMEOUT`) differs!
+    assert_i64_eq(diff.session.hunk_count(), 1, "only 1 real payload hunk remains after sed Mappers")
+    assert_i64_eq(diff.session.changed_count, 1, "only 1 changed line remains after sed Mappers")
+    assert_true(diff.session.show_mapped_text, "show_mapped_text auto-enabled when Mapper added")
+
+    let lbuf = world.find_buffer_by_name(BUF_DIFF_LEFT).as(Buffer)
+    let rbuf = world.find_buffer_by_name(BUF_DIFF_RIGHT).as(Buffer)
+    assert_true(lbuf.line_at(1).contains("[VIEW: MAPPED]"), "header shows [VIEW: MAPPED]")
+    assert_true(lbuf.line_at(2).contains("<TS>") and lbuf.line_at(2).contains("0xADDR"), "mapped view displays <TS> and 0xADDR")
+
+    -- Press `v` (`diff-toggle-view-mapped`): inspect original unmasked text while keeping mapped equality!
+    feed_keys_ok(kernel, "v", "toggle view mapped -> original")#
+    assert_true(not diff.session.show_mapped_text, "v toggled show_mapped_text to false")
+    assert_i64_eq(diff.session.hunk_count(), 1, "hunk count stays 1 in [VIEW: ORIGINAL]")
+    assert_i64_eq(diff.session.changed_count, 1, "changed line count stays 1 in [VIEW: ORIGINAL]")
+    assert_true(lbuf.line_at(1).contains("[VIEW: ORIGINAL]"), "header shows [VIEW: ORIGINAL]")
+    assert_true(lbuf.line_at(2).contains("2026-11-15 12:00:01") and lbuf.line_at(2).contains("0x7fff1234"), "left pane shows original unmasked timestamp & hex")
+    assert_true(rbuf.line_at(2).contains("2026-11-15 19:45:59") and rbuf.line_at(2).contains("0x7fff9999"), "right pane shows original unmasked timestamp & hex")
+
+    -- Press `v` back to MAPPED, then `X` (`diff-clear-filters`) to restore unmasked 4-line diff
+    feed_keys_ok(kernel, "vX", "toggle back and clear pipeline with X")#
+    assert_i64_eq(diff.session.stages.len(), 0, "X cleared all pipeline stages")
+    assert_i64_eq(diff.session.changed_count, 4, "clearing Mappers restored all 4 changed lines")
+
+    -- Verify built-in presets `:DiffPreset strip-timestamps` + `:DiffPreset strip-hex-addr`
+    exec_ex_ok(kernel, "DiffPreset strip-timestamps", "preset strip-timestamps")#
+    exec_ex_ok(kernel, "DiffPreset strip-hex-addr", "preset strip-hex-addr")#
+    assert_i64_eq(diff.session.changed_count, 1, "built-in strip-timestamps + strip-hex-addr isolated single payload diff")
+
+    -- Verify real `/usr/bin/awk` column projection Mapper & `--left` side-specific Mapper!
+    let col_left = create_mem_buffer(world, "cols_a.txt", [
+        "seq=101 LEGACY_TAG alpha 100",
+        "seq=102 LEGACY_TAG beta  200",
+    ])
+    let col_right = create_mem_buffer(world, "cols_b.txt", [
+        "seq=999 MODERN_TAG alpha 100",
+        "seq=998 MODERN_TAG beta  999",
+    ])
+    open_diff_between_buffers(kernel, col_left.id, col_right.id)#!
+    assert_i64_eq(diff.session.changed_count, 2, "both rows differ before awk/left mappers")
+
+    -- `--left` normalizes `LEGACY_TAG` -> `MODERN_TAG` ONLY on Left, and `awk` projects columns 2..4!
+    exec_ex_ok(kernel, "DiffMap --left sed 's/LEGACY_TAG/MODERN_TAG/g'", "left-only sed Mapper")#
+    exec_ex_ok(kernel, "DiffMap awk '{{print $2, $3, $4}}'", "awk column Mapper")#
+    assert_i64_eq(diff.session.changed_count, 1, "awk + --left Mapper made row 0 equal and kept row 1 diff")
+    ()
+}
+
+-- ============================================================================
+-- Suite 3: Real `/usr/bin/rg` & `/usr/bin/sed` Stdio `Filter` Pipeline,
+--          `orig_row` Preservation (`<Return>`), `rg` Exit 1 & Error Recovery
+-- ============================================================================
+
+fn test_stdio_filters_orig_row_and_exit_codes() -> #ServiceEffects !String Unit {
+    let (kernel, world, _wm, _vim, diff) = make_diff_kernel()!
+
+    -- 17-line source buffers where lots of `#` comments, blanks, and `DEBUG` lines precede
+    -- a real `ERROR` diff at 0-based row 14 (1-based line 15)!
+    let src_left = create_mem_buffer(world, "service_left.log", [
+        "# header comment 1",
+        "# header comment 2",
+        "",
+        "DEBUG trace step 1",
+        "DEBUG trace step 2",
+        "INFO  startup listening on :8080",
+        "DEBUG trace step 3",
+        "# mid-file note",
+        "",
+        "DEBUG trace step 4",
+        "INFO  healthcheck green",
+        "DEBUG trace step 5",
+        "DEBUG trace step 6",
+        "# pre-error comment",
+        "ERROR db_conn_pool exhausted retries=3",
+        "DEBUG trailing debug",
+        "INFO  graceful drain",
+    ])
+    let src_right = create_mem_buffer(world, "service_right.log", [
+        "# header comment 1 (edited comment)",
+        "# header comment 2",
+        "",
+        "DEBUG trace step 1 noisy_diff_a",
+        "DEBUG trace step 2 noisy_diff_b",
+        "INFO  startup listening on :8080",
+        "DEBUG trace step 99 extra_debug",
+        "# mid-file note",
+        "",
+        "DEBUG trace step 4",
+        "INFO  healthcheck green",
+        "DEBUG trace step 500",
+        "DEBUG trace step 600",
+        "# pre-error comment",
+        "ERROR db_conn_pool exhausted retries=10",
+        "DEBUG trailing debug changed",
+        "INFO  graceful drain",
+    ])
+
+    open_diff_between_buffers(kernel, src_left.id, src_right.id)#!
+    assert_true(diff.session.hunk_count() >= 4, "noisy unfiltered logs produce >= 4 hunks")
+
+    -- Filter out DEBUG lines (`rg`), `#` comments (`sed`), and blank lines (`awk`)!
+    exec_ex_ok(kernel, "DiffFilter rg -v '^DEBUG'", "Filter rg -v '^DEBUG'")#
+    exec_ex_ok(kernel, "DiffFilter sed '/^#/d'", "Filter sed '/^#/d'")#
+    exec_ex_ok(kernel, "DiffFilter awk 'NF > 0'", "Filter awk 'NF > 0'")#
+
+    -- Only the 4 `INFO`/`ERROR` lines survive on each side, and ONLY `ERROR` (true source row 14!) differs!
+    assert_i64_eq(diff.session.left_tracked.len(), 4, "4 non-debug/non-comment lines survive on left")
+    assert_i64_eq(diff.session.right_tracked.len(), 4, "4 non-debug/non-comment lines survive on right")
+    assert_i64_eq(diff.session.hunk_count(), 1, "only 1 hunk (the ERROR line) remains after rg/sed/awk Filters")
+
+    -- Verify exact 0-based `orig_row` recovery on every surviving TrackedDiffLine (`5, 10, 14, 16`)!
+    let t0 = diff.session.right_tracked.get(0).as(TrackedDiffLine)
+    let t1 = diff.session.right_tracked.get(1).as(TrackedDiffLine)
+    let t2 = diff.session.right_tracked.get(2).as(TrackedDiffLine)
+    let t3 = diff.session.right_tracked.get(3).as(TrackedDiffLine)
+    assert_i64_eq(t0.orig_row, 5, "surviving line 0 maps to true unfiltered row 5")
+    assert_i64_eq(t1.orig_row, 10, "surviving line 1 maps to true unfiltered row 10")
+    assert_i64_eq(t2.orig_row, 14, "surviving ERROR line maps to true unfiltered row 14")
+    assert_i64_eq(t3.orig_row, 16, "surviving line 3 maps to true unfiltered row 16")
+
+    -- Focus Right pane, jump to hunk with `]c`, and press `<Return>` (`diff-goto-source`)!
+    -- Even though the diff buffer only has 6 total rows (2 header + 4 surviving lines),
+    -- `<Return>` MUST land on true unfiltered row 14 in `service_right.log`!
+    let rdiff_buf = world.find_buffer_by_name(BUF_DIFF_RIGHT).as(Buffer)
+    world.active_buffer_id = rdiff_buf.id
+    rdiff_buf.point = Pos.new(0, 0)
+    feed_keys_ok(kernel, "]c<Return>", "jump to filtered hunk and press <Return> goto-source")#
+
+    assert_str_eq(world.active_buffer().name, "service_right.log", "<Return> focused unfiltered source buffer")
+    assert_i64_eq(world.active_buffer().point.row, 14, "<Return> landed on exact unfiltered source row 14")
+    assert_str_eq(
+        world.active_buffer().line_at(world.active_buffer().point.row),
+        "ERROR db_conn_pool exhausted retries=10",
+        "landed line text matches exact ERROR line in unfiltered buffer",
+    )
+
+    -- Re-open diff and test `rg` exit code `1` with empty stderr (0 matching lines = valid empty result!)
+    open_diff_between_buffers(kernel, src_left.id, src_right.id)#!
+    exec_ex_ok(kernel, "DiffFilter rg 'TOKEN_THAT_NEVER_APPEARS_987654'", "rg 0-match Filter")#
+    assert_str_eq(diff.session.last_error, "", "rg exit code 1 treated as valid 0-line output without error")
+    assert_i64_eq(diff.session.left_tracked.len(), 0, "0 surviving left lines on rg no-match")
+    assert_i64_eq(diff.session.right_tracked.len(), 0, "0 surviving right lines on rg no-match")
+    assert_i64_eq(diff.session.hunk_count(), 0, "0 hunks when 0 lines survive")
+
+    -- Clear, add 1 valid Filter, then test invalid shell command (`sed` syntax error -> exit code >= 2)
+    exec_ex_ok(kernel, "DiffClearFilters", "clear filters")#
+    exec_ex_ok(kernel, "DiffFilter rg -v '^DEBUG'", "valid rg filter before error test")#
+    let stages_before_err = diff.session.stages.len()
+    let hunks_before_err = diff.session.hunk_count()
+    assert_i64_eq(stages_before_err, 1, "1 valid stage active before broken command")
+
+    let err_msg = exec_ex_err(kernel, "DiffFilter sed 's/unterminated_regex'", "broken sed Filter command")#
+    assert_true(err_msg.contains("Filter error"), "broken sed command surfaced Filter error message")
+    assert_true(diff.session.last_error.contains("Filter error"), "session.last_error recorded stderr details")
+    assert_i64_eq(diff.session.stages.len(), 1, "broken command preserved previous valid pipeline stage")
+    assert_i64_eq(diff.session.hunk_count(), hunks_before_err, "broken command preserved previous valid hunks")
+
+    -- Test `:DiffPipeline toggle 1`, `:DiffPipeline pop`, and interactive `f` / `P` / `F` continuation prompts!
+    let hunks_filtered = diff.session.hunk_count()
+    exec_ex_ok(kernel, "DiffPipeline toggle 1", "toggle stage 1 off")#
+    assert_true(diff.session.hunk_count() > hunks_filtered, "disabling stage 1 restored debug hunks")
+    exec_ex_ok(kernel, "DiffPipeline toggle 1", "toggle stage 1 back on")#
+    assert_i64_eq(diff.session.hunk_count(), hunks_filtered, "re-enabling stage 1 re-filtered debug hunks")
+
+    -- Interactive key `P` (`diff-preset`) via `kernel.active_prompt` delimited continuation + `F` (`diff-pipeline-manage`) inspector!
+    vim_feed_keys(kernel, "P")#!
+    assert_true(kernel.active_prompt != null, "P suspended on ask_prompt in kernel.active_prompt")
+    let _ = kernel.submit_prompt_answer(
+        "drop-comments  [Filter]  rg -v '^\\s*(#|//|--)' — Ignore #, //, and -- comment lines",
+    )#!
+    assert_true(kernel.active_prompt == null, "preset prompt completed cleanly")
+    assert_i64_eq(diff.session.stages.len(), 2, "interactive P appended drop-comments preset stage")
+
+    vim_feed_keys(kernel, "F")#!
+    assert_true(kernel.active_prompt != null, "F suspended on pipeline manager prompt")
+    assert_true(world.get_floating_window(FLOAT_DIFF_PIPELINE) != null, "F opened pipeline inspector floating window")
+    let _ = kernel.submit_prompt_answer("pop  — remove last stage")#!
+    assert_true(kernel.active_prompt == null, "pipeline manager prompt completed cleanly")
+    assert_i64_eq(diff.session.stages.len(), 1, "interactive F 'pop' removed last stage")
+    assert_true(world.get_floating_window(FLOAT_DIFF_PIPELINE) == null, "pipeline floating window cleaned up after prompt")
+    ()
+}
+
+-- ============================================================================
+-- Suite 4: Side-by-Side Sync, Unified Toggle, Intra-Line Spans & `do`/`dp` Undo
+-- ============================================================================
+
+fn count_intraline_accent_decors(buf: Buffer) -> i64 {
+    -- Full-row tints start at col 0 and span `max_col`; intra-line word accents span tighter columns (`start_col > 4`)!
+    var cnt: i64 = 0
+    for i in 0..buf.inline_decors.len() {
+        let d = buf.inline_decors.get(i.as(usize)).as(InlineSpanDecor)
+        if d.owner == OWNER_DIFF and d.start_col > 4 {
+            cnt += 1
+        }
+    }
+    cnt
+}
+
+fn test_layouts_intraline_and_hunk_patching() -> #ServiceEffects !String Unit {
+    let (kernel, world, wm, _vim, diff) = make_diff_kernel()!
+
+    let left_code = create_mem_buffer(world, "config_left.ns", [
+        "const HOST = \"127.0.0.1\"",
+        "DEBUG temporary diagnostics left",
+        "const MAX_RETRIES = 3",
+        "const TIMEOUT_MS  = 1500",
+        "const FOOTER = \"done\"",
+    ])
+    let right_code = create_mem_buffer(world, "config_right.ns", [
+        "const HOST = \"127.0.0.1\"",
+        "DEBUG temporary diagnostics right",
+        "const MAX_RETRIES = 8",
+        "const TIMEOUT_MS = 1500",
+        "const FOOTER = \"done\"",
+    ])
+
+    open_diff_between_buffers(kernel, left_code.id, right_code.id)#!
+
+    -- 1. Verify 2-pane Side-by-Side vertical split & synchronized scrolling/cursor row
+    assert_str_eq(diff.session.layout, "side-by-side", "default layout is side-by-side")
+    assert_i64_eq(wm.visible_panes().len(), 2, "WindowManager opened 2 Side-by-Side split panes")
+
+    let ldiff = world.find_buffer_by_name(BUF_DIFF_LEFT).as(Buffer)
+    let rdiff = world.find_buffer_by_name(BUF_DIFF_RIGHT).as(Buffer)
+    assert_true(count_intraline_accent_decors(ldiff) >= 1, "intra-line word accent span present on Left")
+    assert_true(count_intraline_accent_decors(rdiff) >= 1, "intra-line word accent span present on Right")
+
+    feed_keys_ok(kernel, "]c", "jump to hunk in side-by-side")#
+    assert_i64_eq(ldiff.point.row, rdiff.point.row, "Left and Right diff panes synced cursor row on ]c")
+
+    feed_keys_ok(kernel, "<Tab>", "switch active diff pane with <Tab>")#
+    assert_true(
+        world.active_buffer_id == ldiff.id or world.active_buffer_id == rdiff.id,
+        "<Tab> stayed inside Side-by-Side diff panes",
+    )
+
+    -- 2. Verify whitespace toggle (`w`): `TIMEOUT_MS  = 1500` vs `TIMEOUT_MS = 1500`
+    exec_ex_ok(kernel, "DiffFilter rg -v '^DEBUG'", "filter out DEBUG before whitespace & patch test")#
+    assert_i64_eq(diff.session.changed_count, 2, "with exact whitespace, MAX_RETRIES and TIMEOUT_MS both differ")
+    feed_keys_ok(kernel, "w", "toggle ignore_whitespace ON")#
+    assert_true(diff.session.ignore_whitespace, "ignore_whitespace enabled")
+    assert_i64_eq(diff.session.changed_count, 1, "with [WS: IGNORE], only MAX_RETRIES differs")
+
+    -- 3. Verify `t` toggles to Unified `*Diff*` + `C`/`c` context adjustment + `t` back to Side-by-Side!
+    feed_keys_ok(kernel, "t", "toggle to unified layout")#
+    assert_str_eq(diff.session.layout, "unified", "t switched layout to unified")
+    let udiff = world.find_buffer_by_name(BUF_DIFF_UNIFIED).as(Buffer)
+    assert_str_eq(world.active_buffer().name, BUF_DIFF_UNIFIED, "Unified *Diff* buffer active")
+    var saw_hunk_hdr = false
+    for i in 0..udiff.line_count() {
+        if udiff.line_at(i).starts_with("@@ -") {
+            saw_hunk_hdr = true
+        }
+    }
+    assert_true(saw_hunk_hdr, "Unified *Diff* buffer rendered @@ -l,c +r,c @@ hunk header")
+
+    let ctx_before = diff.session.context_lines
+    feed_keys_ok(kernel, "C", "increase unified context lines")#
+    assert_i64_eq(diff.session.context_lines, 6, "C stepped context_lines from 3 to 6")
+    feed_keys_ok(kernel, "c", "decrease unified context lines")#
+    assert_i64_eq(diff.session.context_lines, ctx_before, "c restored context_lines to 3")
+
+    feed_keys_ok(kernel, "t", "toggle back to side-by-side")#
+    assert_str_eq(diff.session.layout, "side-by-side", "t switched back to side-by-side")
+    assert_i64_eq(wm.visible_panes().len(), 2, "2 split panes restored on return to side-by-side")
+
+    -- 4. Verify `do` (`diff-obtain`) and `dp` (`diff-put`) patch exact unfiltered source lines AND support `undo()`!
+    -- Right pane is active; `rg -v '^DEBUG'` is STILL active, so line 1 (`DEBUG temporary diagnostics right`)
+    -- is hidden in the view while line 2 (`const MAX_RETRIES = 8`) is the active hunk!
+    world.active_buffer_id = rdiff.id
+    wm.active_pane().buffer_id = rdiff.id
+    rdiff.point = Pos.new(0, 0)
+    feed_keys_ok(kernel, "]cdo", "jump to MAX_RETRIES hunk and run `do` (obtain Left -> Right)")#
+
+    assert_str_eq(right_code.line_at(2), "const MAX_RETRIES = 3", "`do` patched MAX_RETRIES = 3 into right_code")
+    assert_str_eq(
+        right_code.line_at(1),
+        "DEBUG temporary diagnostics right",
+        "`do` preserved hidden filtered DEBUG line untouched in right_code",
+    )
+    assert_i64_eq(diff.session.hunk_count(), 0, "0 hunks remain after `do` resolved MAX_RETRIES")
+
+    -- Undo on `right_code` via `UndoTree`!
+    assert_true(right_code.undo()! != null, "right_code.undo() succeeded after `do` checkpoint")
+    assert_str_eq(right_code.line_at(2), "const MAX_RETRIES = 8", "undo() cleanly reverted `do` hunk patch")
+
+    -- Refresh diff (`R`), then test `dp` (`diff-put`) from Right pane -> puts Right's `8` into `left_code`!
+    feed_keys_ok(kernel, "R]cdp", "refresh diff, jump to hunk, and run `dp` (put Right -> Left)")#
+    assert_str_eq(left_code.line_at(2), "const MAX_RETRIES = 8", "`dp` patched MAX_RETRIES = 8 into left_code")
+    assert_str_eq(
+        left_code.line_at(1),
+        "DEBUG temporary diagnostics left",
+        "`dp` preserved hidden filtered DEBUG line untouched in left_code",
+    )
+    assert_true(left_code.undo()! != null, "left_code.undo() succeeded after `dp` checkpoint")
+    assert_str_eq(left_code.line_at(2), "const MAX_RETRIES = 3", "undo() cleanly reverted `dp` hunk patch")
+
+    -- Close diff with `q`
+    feed_keys_ok(kernel, "q", "quit diff with q")#
+    assert_true(not diff.session.active, "q deactivated diff session")
+    assert_i64_eq(wm.visible_panes().len(), 1, "q restored single window layout")
+    ()
+}
+
+-- ============================================================================
+-- Suite 5: All 7 Entry Commands (`:DiffFiles`, `:DiffSaved` local + `ssh://`,
+--          `:DiffHead`, `:DiffView`, `:DiffDirs`, `:DiffSelection`) & `:DiffExportPatch`
+-- ============================================================================
+
+fn run_git_checked(cwd: String, args: List, ctx: String) {
+    let out = process.exec("git", args = args, cwd = cwd) ! {
+        e => fail_test(ctx ++ " failed to exec git: " ++ e.to_string()),
+    }
+    if not out.success() {
+        fail_test(ctx ++ " git exited " ++ out.status.to_string() ++ ": " ++ out.stderr)
+    }
+}
+
+fn test_all_entry_sources_git_dirs_selection_and_export() -> #ServiceEffects !String Unit {
+    let (kernel, world, wm, _vim, diff) = make_diff_kernel()!
+
+    let tmp_root = "/tmp/lava_test_diff_plugin_" ++ process.pid().to_string()
+    if fs.exists(tmp_root) {
+        let _ = fs.remove_dir_all(tmp_root) ! { _ => () }
+    }
+    let _ = fs.create_dir_all(tmp_root) ! {
+        e => fail_test("create_dir_all tmp_root failed: " ++ e.to_string()),
+    }
+
+    -- 1. `:DiffFiles` comparing two disk files
+    let file_a = path.join(tmp_root, "alpha.txt")
+    let file_b = path.join(tmp_root, "beta.txt")
+    let _ = fs.write_string(file_a, "line1\nold_value\nline3\n") ! { _ => () }
+    let _ = fs.write_string(file_b, "line1\nnew_value\nline3\n") ! { _ => () }
+    world.cwd = tmp_root
+
+    exec_ex_ok(kernel, "DiffFiles " ++ file_a ++ " " ++ file_b, "DiffFiles two disk files")#
+    assert_true(diff.session.active, ":DiffFiles activated diff session")
+    assert_i64_eq(diff.session.changed_count, 1, ":DiffFiles detected 1 changed line")
+
+    -- 2. `:DiffExportPatch` to disk file AND to `*Diff Patch*` scratch buffer!
+    let patch_file = path.join(tmp_root, "changes.patch")
+    exec_ex_ok(kernel, "DiffExportPatch " ++ patch_file, "DiffExportPatch to file")#
+    assert_true(fs.is_file(patch_file), "exported .patch file exists on disk")
+    let patch_text = fs.read_to_string(patch_file) ! { _ => "" }
+    assert_true(patch_text.contains("--- a/"), "patch has --- a/ header")
+    assert_true(patch_text.contains("+++ b/"), "patch has +++ b/ header")
+    assert_true(patch_text.contains("-old_value") and patch_text.contains("+new_value"), "patch contains -old_value/+new_value")
+
+    exec_ex_ok(kernel, "DiffExportPatch", "DiffExportPatch to buffer")#
+    assert_str_eq(world.active_buffer().name, BUF_DIFF_PATCH, ":DiffExportPatch with no arg opened *Diff Patch*")
+    feed_keys_ok(kernel, "q", "close diff after patch export")#
+
+    -- 3. `:DiffSaved` (local unsaved edits vs disk + remote `ssh://` cached baseline!)
+    let saved_file = path.join(tmp_root, "saved_doc.txt")
+    let _ = fs.write_string(saved_file, "keep_1\ndisk_baseline\nkeep_2\n") ! { _ => () }
+    let sbuf = world.open_file(saved_file)#!
+    sbuf.set_lines(["keep_1", "unsaved_edit_in_ram", "keep_2", "extra_unsaved"], record_undo = true)
+    exec_ex_ok(kernel, "DiffSaved", "DiffSaved local buffer")#
+    assert_true(diff.session.active, ":DiffSaved opened diff")
+    assert_i64_eq(diff.session.added_count, 1, ":DiffSaved detected 1 added unsaved line")
+    assert_i64_eq(diff.session.changed_count, 1, ":DiffSaved detected 1 changed unsaved line")
+    feed_keys_ok(kernel, "q", "close DiffSaved")#
+
+    -- Verify `ssh://` `ssh_saved_lines` baseline integration for `:DiffSaved`
+    let ssh_buf = create_mem_buffer(world, "remote.conf", ["port = 8443", "tls = true"])
+    ssh_buf.file_path = "ssh://prod-box/etc/app/remote.conf"
+    ssh_buf.vars.insert("ssh_saved_lines", ["port = 8080", "tls = true"])
+    world.active_buffer_id = ssh_buf.id
+    wm.active_pane().buffer_id = ssh_buf.id
+    exec_ex_ok(kernel, "DiffSaved", "DiffSaved ssh:// buffer")#
+    assert_i64_eq(diff.session.changed_count, 1, ":DiffSaved on ssh:// buffer compared against ssh_saved_lines")
+    feed_keys_ok(kernel, "q", "close ssh DiffSaved")#
+
+    -- 4. `:DiffHead` & `:DiffView` inside a real temporary Git repository!
+    let repo_dir = path.join(tmp_root, "repo")
+    let _ = fs.create_dir_all(repo_dir) ! { _ => () }
+    run_git_checked(repo_dir, ["init"], "git init")
+    run_git_checked(repo_dir, ["config", "user.email", "test@lava.org"], "git config email")
+    run_git_checked(repo_dir, ["config", "user.name", "Lava Test"], "git config name")
+
+    let gfile1 = path.join(repo_dir, "main.ns")
+    let gfile2 = path.join(repo_dir, "util.ns")
+    let _ = fs.write_string(gfile1, "fn main() {{\n    println(\"v1\")\n}}\n") ! { _ => () }
+    let _ = fs.write_string(gfile2, "pub fn helper() -> i64 {{\n    1\n}}\n") ! { _ => () }
+    run_git_checked(repo_dir, ["add", "."], "git add initial")
+    run_git_checked(repo_dir, ["commit", "-m", "initial commit"], "git commit initial")
+
+    -- Modify both tracked files + create 1 untracked file
+    let _ = fs.write_string(gfile1, "fn main() {{\n    println(\"v2_modified\")\n}}\n") ! { _ => () }
+    let _ = fs.write_string(gfile2, "pub fn helper() -> i64 {{\n    42\n}}\n") ! { _ => () }
+    let gfile3 = path.join(repo_dir, "new_mod.ns")
+    let _ = fs.write_string(gfile3, "-- brand new untracked file\n") ! { _ => () }
+
+    world.cwd = repo_dir
+    let _ = world.open_file(gfile1)#!
+    exec_ex_ok(kernel, "DiffHead", "DiffHead against HEAD")#
+    assert_true(diff.session.active, ":DiffHead activated diff session")
+    assert_i64_eq(diff.session.changed_count, 1, ":DiffHead detected 1 modified line vs HEAD")
+    feed_keys_ok(kernel, "q", "close DiffHead")#
+
+    -- Open multi-file `:DiffView`, inspect entries, press `<Return>` on first file, and cycle files with `]f`!
+    exec_ex_ok(kernel, "DiffView", "open multi-file Git DiffView")#
+    assert_str_eq(world.active_buffer().name, BUF_DIFF_VIEW, ":DiffView opened *DiffView* buffer")
+    assert_str_eq(world.active_buffer().major_mode, "diffview", "*DiffView* has major_mode == diffview")
+    assert_i64_eq(diff.diffview_entries.len(), 3, "DiffView discovered all 3 changed/untracked repo files")
+
+    feed_keys_ok(kernel, "<Return>", "open first changed file from DiffView")#
+    assert_true(diff.session.active, "<Return> in DiffView opened Side-by-Side file diff")
+    let first_right_title = diff.session.right_source.title
+    feed_keys_ok(kernel, "]f", "cycle to next repo file diff with ]f")#
+    assert_true(diff.session.right_source.title != first_right_title, "]f cycled to next changed file in DiffView")
+    feed_keys_ok(kernel, "q", "close DiffView file session")#
+
+    -- 5. `:DiffDirs` recursive directory comparison (`[MODIFIED]`, `[ONLY LEFT]`, `[ONLY RIGHT]`)
+    let dir_l = path.join(tmp_root, "dir_left")
+    let dir_r = path.join(tmp_root, "dir_right")
+    let _ = fs.create_dir_all(path.join(dir_l, "sub")) ! { _ => () }
+    let _ = fs.create_dir_all(path.join(dir_r, "sub")) ! { _ => () }
+
+    let _ = fs.write_string(path.join(dir_l, "same.txt"), "identical\n") ! { _ => () }
+    let _ = fs.write_string(path.join(dir_r, "same.txt"), "identical\n") ! { _ => () }
+    let _ = fs.write_string(path.join(dir_l, "only_l.txt"), "left_only_content\n") ! { _ => () }
+    let _ = fs.write_string(path.join(dir_r, "only_r.txt"), "right_only_content\n") ! { _ => () }
+    let _ = fs.write_string(path.join(dir_l, "sub/mod.txt"), "shared_hdr\nv_left\n") ! { _ => () }
+    let _ = fs.write_string(path.join(dir_r, "sub/mod.txt"), "shared_hdr\nv_right\n") ! { _ => () }
+
+    exec_ex_ok(kernel, "DiffDirs " ++ dir_l ++ " " ++ dir_r, "DiffDirs recursive comparison")#
+    assert_str_eq(world.active_buffer().name, BUF_DIFF_DIRS, ":DiffDirs opened *DiffDirs* buffer")
+    assert_str_eq(world.active_buffer().major_mode, "diffdirs", "*DiffDirs* has major_mode == diffdirs")
+    assert_i64_eq(diff.diffdirs_entries.len(), 3, ":DiffDirs listed 3 differing entries and omitted identical file")
+    assert_i64_eq(diff.diffdirs_identical_count, 1, ":DiffDirs counted 1 identical file")
+
+    var saw_mod = false
+    var saw_only_l = false
+    var saw_only_r = false
+    for i in 0..diff.diffdirs_entries.len() {
+        let de = diff.diffdirs_entries.get(i.as(usize)).as(DiffDirEntry)
+        if de.status == "MODIFIED" and de.rel_path == "sub/mod.txt" {
+            saw_mod = true
+        }
+        if de.status == "ONLY LEFT" and de.rel_path == "only_l.txt" {
+            saw_only_l = true
+        }
+        if de.status == "ONLY RIGHT" and de.rel_path == "only_r.txt" {
+            saw_only_r = true
+        }
+    }
+    assert_true(saw_mod and saw_only_l and saw_only_r, "DiffDirs classified MODIFIED, ONLY LEFT, ONLY RIGHT accurately")
+
+    -- Press `<Return>` on first `*DiffDirs*` entry to open its Side-by-Side diff!
+    feed_keys_ok(kernel, "<Return>", "open file pair from *DiffDirs*")#
+    assert_true(diff.session.active, "<Return> in *DiffDirs* opened file-pair diff")
+    feed_keys_ok(kernel, "q", "close DiffDirs file-pair diff")#
+
+    -- 6. `:DiffSelection` (`V...<Space>dr` twice across two regions!)
+    let sel_buf = create_mem_buffer(world, "regions.ns", [
+        "fn block_one() {{",
+        "    let x = 10",
+        "    return x",
+        "}}",
+        "fn block_two() {{",
+        "    let x = 20",
+        "    return x",
+        "}}",
+    ])
+    world.active_buffer_id = sel_buf.id
+    wm.active_pane().buffer_id = sel_buf.id
+    wm.sync_from_world(world)
+
+    -- Select lines 0..3 (`Vjjj<Space>dr`) as Selection A, then lines 4..7 (`jjjjVjjj<Space>dr`) as Selection B!
+    sel_buf.point = Pos.new(0, 0)
+    feed_keys_ok(kernel, "Vjjj<Space>dr", "capture visual Selection A")#
+    assert_true(diff.captured_selection_lines != null, "first <Space>dr captured Left selection")
+
+    sel_buf.point = Pos.new(4, 0)
+    feed_keys_ok(kernel, "Vjjj<Space>dr", "diff visual Selection B against Selection A")#
+    assert_true(diff.session.active, "second <Space>dr opened Selection A vs Selection B diff")
+    assert_i64_eq(diff.session.changed_count, 2, "Selection diff highlighted fn header & let x = 10 vs 20")
+    feed_keys_ok(kernel, "q", "close Selection diff")#
+
+    -- Cleanup temporary directory
+    let _ = fs.remove_dir_all(tmp_root) ! { _ => () }
+    ()
+}
+
+fn run_all() -> #ServiceEffects !String Unit {
+    println("[1/5] test_extension_lifecycle_and_presets...")
+    test_extension_lifecycle_and_presets()#!
+    println("[2/5] test_stdio_mappers_and_view_toggle...")
+    test_stdio_mappers_and_view_toggle()#!
+    println("[3/5] test_stdio_filters_orig_row_and_exit_codes...")
+    test_stdio_filters_orig_row_and_exit_codes()#!
+    println("[4/5] test_layouts_intraline_and_hunk_patching...")
+    test_layouts_intraline_and_hunk_patching()#!
+    println("[5/5] test_all_entry_sources_git_dirs_selection_and_export...")
+    test_all_entry_sources_git_dirs_selection_and_export()#!
+    ()
+}
+
+fn main() {
+    handles(clipboard_get) handles(clipboard_set) let _clip = HostClipboardCap {}
+    handles(log_event) let _logs = LogCollectorCap.new()
+    handles(status_emit) let _status = StatusCollectorCap.new()
+
+    unwrap_ok(run_all()#, "test_diff_plugin")
+    println("ALL EXT_DIFF PLUGIN TESTS PASSED (5/5 suites)")
+}

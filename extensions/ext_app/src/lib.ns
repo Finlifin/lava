@@ -1,0 +1,961 @@
+-- ext_app: Top-Level Coordinator & Event-Loop Extension (`lava.org/ext_app`) for Lava.
+-- Dynamically composes all built-in Extensions (`ext_document`, `ext_window`, `ext_render`,
+-- `ext_minibuffer`, `ext_vim`, `ext_emacs`, `ext_tools`) alongside user Extensions (`init.ns`
+-- and `--ext-dir`) inside a single shared Nessa VM, installs effect capability handlers,
+-- routes platform UI events into Extension computations, and commits 2D `RenderFrame` scenes.
+
+use std.fs
+use @lava_sys.{
+    RawUiEvent, host_clipboard_get, host_clipboard_set, host_commit_frame, host_measure_font,
+    host_poll_events, host_request_quit, host_wait_events, mock_quit_requested
+}
+use @lava_core.{
+    ExtId, InteractiveEffects, KeyStroke, PromptRequest, ServiceEffects, SystemKernel,
+    clipboard_get, clipboard_set, log_event, parse_key_sequence, status_emit
+}
+use @ext_document.{
+    Buffer, EditorWorld, FloatingWindow, MinibufferView, Pos, RegisterValue, SidebarPanel, Span,
+    VisualKind, VisualSelection, ext_document_id, register_document_extension, require_editor_world
+}
+use @ext_window.{
+    WinId, WindowManager, WindowPane, char_display_width, ext_window_id, register_window_extension,
+    require_window_manager
+}
+use @ext_render.{compose_frame, ext_render_id, register_render_extension}
+use @ext_minibuffer.{
+    ext_minibuffer_id, minibuffer_handle_key, open_prompt_view, prewarm_minibuffer,
+    register_minibuffer_extension
+}
+use @ext_vim.{
+    VimMode, VimState, ext_vim_id, register_vim_extension, require_vim_state, sync_world_from_vim,
+    vim_handle_key
+}
+use @ext_emacs.{
+    EmacsState, emacs_handle_key, ext_emacs_id, register_emacs_extension, require_emacs_state
+}
+use @ext_tools.{
+    ToolsManager, ext_tools_id, register_tools_extension, require_tools_manager,
+    tools_handle_key, tools_on_async_job_done
+}
+
+pub fn ext_app_id() -> ExtId = ExtId("lava.org/ext_app")
+
+-- ============================================================================
+-- 1. Host Capability Provider (`handles(...)` for `ServiceEffects`)
+-- ============================================================================
+
+pub struct AppHostCap {
+    pub world: EditorWorld,
+}
+
+impl AppHostCap {
+    pub fn new(world: EditorWorld) -> AppHostCap {
+        AppHostCap { world: world }
+    }
+
+    pub fn on_log(self, level: String, source: String, message: String) -> Unit handles(log_event) {
+        self.world.append_message("[" ++ level ++ "] " ++ source ++ ": " ++ message)
+    }
+
+    pub fn on_status(self, message: String) -> Unit handles(status_emit) {
+        self.world.status_message = message
+        if message != "" {
+            self.world.append_message(message)
+        }
+    }
+
+    pub fn on_clip_get(self) -> String handles(clipboard_get) {
+        host_clipboard_get()
+    }
+
+    pub fn on_clip_set(self, text: String) -> Unit handles(clipboard_set) {
+        host_clipboard_set(text)
+    }
+}
+
+-- ============================================================================
+-- 2. Extension Registration & Single-VM Kernel Boot
+-- ============================================================================
+
+pub fn register_app_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_app_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_app",
+        "0.1.0",
+        "Top-level Lava session coordinator, UI event router, and frame commit loop.",
+        [
+            ext_document_id(),
+            ext_window_id(),
+            ext_render_id(),
+            ext_minibuffer_id(),
+            ext_vim_id(),
+            ext_emacs_id(),
+            ext_tools_id(),
+        ],
+        |k: SystemKernel| -> !String Unit {
+            k.register_command(
+                "redraw-display",
+                ext_id,
+                "Force immediate recomposition and commit of the current 2D RenderFrame.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let wm = require_window_manager(kern)!
+                    let (spec, cmds) = compose_frame(kern, w, wm)
+                    let gen = host_commit_frame(spec, cmds)
+                    status_emit("Redrawn frame #" ++ gen.to_string())#
+                    gen
+                },
+            )
+            ()
+        },
+        |_k: SystemKernel| -> !String Unit { () },
+    )
+}
+
+pub fn register_default_extensions(kernel: SystemKernel) -> !String Unit {
+    register_document_extension(kernel)!
+    register_window_extension(kernel)!
+    register_render_extension(kernel)!
+    register_minibuffer_extension(kernel)!
+    register_vim_extension(kernel)!
+    register_emacs_extension(kernel)!
+    register_tools_extension(kernel)!
+    register_app_extension(kernel)!
+    ()
+}
+
+pub fn boot_kernel() -> !String SystemKernel {
+    let kernel = SystemKernel.new()
+    register_default_extensions(kernel)!
+    kernel.activate_all()!
+    kernel
+}
+
+-- ============================================================================
+-- 3. Prompt Synchronization & Unified Key/Event Dispatch
+-- ============================================================================
+
+fn sync_prompt_view(kernel: SystemKernel, world: EditorWorld) {
+    if kernel.active_prompt != null {
+        if not world.minibuffer_view.active {
+            let (req, _) = kernel.active_prompt.as((PromptRequest, Continuation))
+            open_prompt_view(kernel, req)
+        }
+    } else if world.minibuffer_view.active {
+        world.minibuffer_view = MinibufferView.inactive()
+    }
+}
+
+fn should_try_special_tools_first(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    vim_opt: ?Any,
+    tools_opt: ?Any,
+) -> bool {
+    if tools_opt == null {
+        return false
+    }
+    let mgr = tools_opt.as(ToolsManager)
+    if mgr.pending_prefix != "" {
+        return true
+    }
+    if not world.options.evil_mode {
+        return true
+    }
+    if vim_opt == null {
+        return true
+    }
+    let vs = vim_opt.as(VimState)
+    vs.mode == VimMode.Normal
+        and vs.pending_prefix == ""
+        and vs.leader_strokes.is_empty()
+        and (not kernel.macros.is_recording())
+}
+
+fn route_stroke_inner(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    stroke: KeyStroke,
+) -> #ServiceEffects !String bool {
+    -- 1. Continuation-suspended interactive prompt (`ask_prompt`) owns input while active.
+    if kernel.active_prompt != null {
+        sync_prompt_view(kernel, world)
+        return minibuffer_handle_key(kernel, stroke)#!
+    }
+
+    -- 2. Active Emacs prefix chord (`C-x -`, `C-h -`) or `C-u` universal-argument accumulation.
+    let emacs_opt = kernel.service("lava.emacs.state")
+    if emacs_opt != null {
+        let es = emacs_opt.as(EmacsState)
+        if (not es.pending_strokes.is_empty()) or es.universal_active {
+            return emacs_handle_key(kernel, stroke)#!
+        }
+    }
+
+    -- 3. Mode-specific power tools (Dired, Grep/Compilation results, Org `<Tab>` / `C-c C-t`).
+    let vim_opt = kernel.service("lava.vim.state")
+    let tools_opt = kernel.service("lava.tools.manager")
+    if should_try_special_tools_first(kernel, world, vim_opt, tools_opt) {
+        let tools_handled = tools_handle_key(kernel, stroke)#!
+        if tools_handled {
+            return true
+        }
+    }
+
+    -- 4. Evil-Vim modal state machine (passes `<M-x>`, `<C-x>`, `<C-h>`, `<C-s>`, `<C-g>` through).
+    let vim_handled = vim_handle_key(kernel, stroke)#!
+    if vim_handled {
+        return true
+    }
+
+    -- 5. Emacs global/modeless keymaps and self-insert fallback.
+    emacs_handle_key(kernel, stroke)#!
+}
+
+private fn handle_stroke_with_world(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    wm_opt: ?Any,
+    stroke: KeyStroke,
+) -> #ServiceEffects Unit {
+    let outcome = route_stroke_inner(kernel, world, stroke)#
+    outcome match {
+        _! => (),
+        error err_msg => {
+            let msg = "Error: " ++ err_msg
+            world.status_message = msg
+            world.append_message(msg)
+        },
+    }
+    sync_prompt_view(kernel, world)
+    if wm_opt != null {
+        wm_opt.as(WindowManager).sync_from_world(world)
+    }
+    ()
+}
+
+pub fn app_handle_stroke(
+    kernel: SystemKernel,
+    stroke: KeyStroke,
+) -> #ServiceEffects !String Unit {
+    let world = require_editor_world(kernel)!
+    let wm_opt = kernel.service("lava.window.manager")
+    handle_stroke_with_world(kernel, world, wm_opt, stroke)#
+    ()
+}
+
+pub fn app_feed_keys(
+    kernel: SystemKernel,
+    key_spec: String,
+) -> #ServiceEffects !String Unit {
+    let strokes = parse_key_sequence(key_spec)
+    if strokes.is_empty() {
+        return ()
+    }
+    let world = require_editor_world(kernel)!
+    let wm_opt = kernel.service("lava.window.manager")
+    for i in 0..strokes.len() {
+        let stroke = strokes.get(i.as(usize)).as(KeyStroke)
+        handle_stroke_with_world(kernel, world, wm_opt, stroke)#
+        if world.quit_requested {
+            break
+        }
+    }
+    ()
+}
+
+fn is_word_cp(ch: String) -> bool {
+    ch == "_" or ch.is_alphanumeric()
+}
+
+fn select_word_at(buf: Buffer, pos: Pos) -> (Pos, Pos) {
+    let line = buf.line_at(pos.row)
+    let llen = line.char_len()
+    if llen == 0 {
+        return (Pos.new(pos.row, 0), Pos.new(pos.row, 0))
+    }
+    var c = if pos.col < llen { pos.col } else { llen - 1 }
+    if not is_word_cp(line.slice(c, c + 1)) {
+        return (Pos.new(pos.row, c), Pos.new(pos.row, c))
+    }
+    var sc = c
+    while sc > 0 and is_word_cp(line.slice(sc - 1, sc)) {
+        sc -= 1
+    }
+    var ec = c
+    while ec + 1 < llen and is_word_cp(line.slice(ec + 1, ec + 2)) {
+        ec += 1
+    }
+    (Pos.new(pos.row, sc), Pos.new(pos.row, ec))
+}
+
+fn display_col_to_char_col(line: String, target_disp_col: i64) -> i64 {
+    if target_disp_col <= 0 {
+        return 0
+    }
+    let n = line.char_len()
+    var disp: i64 = 0
+    var idx: i64 = 0
+    while idx < n {
+        let w = char_display_width(line.slice(idx, idx + 1))
+        if disp + w > target_disp_col {
+            return idx
+        }
+        disp += w
+        idx += 1
+    }
+    n
+}
+
+fn floating_window_box(world: EditorWorld, wm: WindowManager, fw: FloatingWindow) -> (f64, f64, f64, f64) {
+    let cell_w = if wm.metrics.cell_width > 1.0 { wm.metrics.cell_width } else { 9.0 }
+    let cell_h = if wm.metrics.cell_height > 1.0 { wm.metrics.cell_height } else { 19.0 }
+    let win_w = if wm.pixel_width > 80 { wm.pixel_width.as(f64) } else { 80.0 }
+    let win_h = if wm.pixel_height > 80 { wm.pixel_height.as(f64) } else { 80.0 }
+    let echo_y = win_h - 24.0
+    let raw_w = (fw.width_cols.as(f64) * cell_w + 20.0).floor()
+    let raw_h = ((fw.height_rows + 1).as(f64) * cell_h + 14.0).floor()
+    let box_w = if raw_w > win_w - 24.0 { win_w - 24.0 } else if raw_w < 160.0 { 160.0 } else { raw_w }
+    let max_avail_h = echo_y - 26.0 - 16.0
+    let box_h = if raw_h > max_avail_h { max_avail_h } else if raw_h < cell_h * 3.0 { cell_h * 3.0 } else { raw_h }
+    let box_x = if fw.anchor == "bottom" {
+        16.0
+    } else {
+        ((win_w - box_w) * 0.5).floor()
+    }
+    let box_y = if fw.anchor == "bottom" {
+        echo_y - box_h - 8.0
+    } else {
+        ((win_h - box_h) * 0.45).floor()
+    }
+    let _ = world
+    (box_x, box_y, box_w, box_h)
+}
+
+fn coords_in_floating_window(world: EditorWorld, wm: WindowManager, fw: FloatingWindow, px: f64, py: f64) -> (i64, i64) {
+    let cell_w = if wm.metrics.cell_width > 1.0 { wm.metrics.cell_width } else { 9.0 }
+    let cell_h = if wm.metrics.cell_height > 1.0 { wm.metrics.cell_height } else { 19.0 }
+    let (box_x, box_y, _box_w, _box_h) = floating_window_box(world, wm, fw)
+    let text_y0 = box_y + cell_h + 9.0
+    let text_x0 = box_x + 10.0
+    var row_idx = ((py - text_y0) / cell_h).floor().as(i64)
+    let total = fw.lines.len()
+    if total <= 0 {
+        return (0, 0)
+    }
+    if row_idx < 0 {
+        row_idx = 0
+    } else if row_idx >= total {
+        row_idx = total - 1
+    }
+    var disp_col = ((px - text_x0) / cell_w).floor().as(i64)
+    if disp_col < 0 {
+        disp_col = 0
+    }
+    let line = fw.lines.get(row_idx.as(usize)).as(String)
+    let char_col = display_col_to_char_col(line, disp_col)
+    (row_idx, char_col)
+}
+
+fn hit_test_floating_window(world: EditorWorld, wm: WindowManager, px: f64, py: f64) -> ?(FloatingWindow, i64, i64) {
+    if world.floating_windows.is_empty() {
+        return null
+    }
+    var fi = world.floating_windows.len() - 1
+    while fi >= 0 {
+        let fw = world.floating_windows.get(fi.as(usize)).as(FloatingWindow)
+        let (box_x, box_y, box_w, box_h) = floating_window_box(world, wm, fw)
+        if px >= box_x and px < box_x + box_w and py >= box_y and py < box_y + box_h {
+            let (row_idx, char_col) = coords_in_floating_window(world, wm, fw, px, py)
+            return (fw, row_idx, char_col)
+        }
+        fi -= 1
+    }
+    null
+}
+
+fn find_floating_window_by_id(world: EditorWorld, id: String) -> ?FloatingWindow {
+    for i in 0..world.floating_windows.len() {
+        let fw = world.floating_windows.get(i.as(usize)).as(FloatingWindow)
+        if fw.id == id {
+            return fw
+        }
+    }
+    null
+}
+
+fn flush_pending_yank(kernel: SystemKernel, world: EditorWorld) -> #ServiceEffects Unit {
+    let pending_opt = kernel.service("lava.app.pending_yank")
+    if pending_opt != null {
+        let text = pending_opt.as(String)
+        kernel.publish_service("lava.app.pending_yank", ext_app_id(), "")
+        if text != "" {
+            world.registers.yank_store(RegisterValue.chars(text), reg = "")#
+            status_emit("Yanked " ++ text.char_len().to_string() ++ " char(s) to clipboard")#
+        }
+    }
+    ()
+}
+
+fn yank_terminal_visual_selection_if_any(kernel: SystemKernel, world: EditorWorld) -> #ServiceEffects Unit {
+    let buf = world.active_buffer()
+    if buf.major_mode != "terminal" and buf.major_mode != "toggleterm" {
+        return ()
+    }
+    let vim_opt = kernel.service("lava.vim.state")
+    if vim_opt == null {
+        return ()
+    }
+    let vs = vim_opt.as(VimState)
+    if vs.mode == VimMode.VisualChar {
+        let a = vs.visual_anchor
+        let b = buf.point
+        let lo = if a <= b { a } else { b }
+        let hi = if a <= b { b } else { a }
+        let hlen = buf.line_char_len(hi.row)
+        let end_c = if hi.col < hlen { hi.col + 1 } else { hlen }
+        let selected = buf.extract_span(Span.normalized(lo, Pos.new(hi.row, end_c)))
+        if selected != "" {
+            world.registers.yank_store(RegisterValue.chars(selected), reg = "")#
+            status_emit("Yanked " ++ selected.char_len().to_string() ++ " char(s) to clipboard")#
+        }
+    } else if vs.mode == VimMode.VisualLine {
+        let a = vs.visual_anchor
+        let b = buf.point
+        let r1 = if a.row <= b.row { a.row } else { b.row }
+        let r2 = if a.row <= b.row { b.row } else { a.row }
+        let parts = List()
+        for r in r1..(r2 + 1) {
+            parts.push(buf.line_at(r))
+        }
+        let selected = parts.join("\n") ++ "\n"
+        world.registers.yank_store(RegisterValue.lines(selected), reg = "")#
+        status_emit("Yanked " ++ (r2 - r1 + 1).to_string() ++ " line(s) to clipboard")#
+    }
+    ()
+}
+
+fn handle_mouse_click(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    wm: WindowManager,
+    px: f64,
+    py: f64,
+    click_count: i64,
+) {
+    -- 0. Topmost floating window intercepts clicks before any underlying pane or sidebar!
+    let float_hit_opt = hit_test_floating_window(world, wm, px, py)
+    if float_hit_opt != null {
+        let (fw, row_idx, char_col) = float_hit_opt.as((FloatingWindow, i64, i64))
+        kernel.publish_service("lava.app.mouse_float_id", ext_app_id(), fw.id)
+        if row_idx >= 0 and row_idx < fw.lines.len() and (not world.floating_window_cursor.contains_key(fw.id)) {
+            fw.selected_row = row_idx
+        }
+        kernel.emit_hook("floating-window-mouse", ("press", fw.id, row_idx, char_col, click_count))
+        return
+    }
+    kernel.publish_service("lava.app.mouse_float_id", ext_app_id(), "")
+
+    let cw = if wm.metrics.cell_width > 1.0 { wm.metrics.cell_width } else { 9.0 }
+    let ch = if wm.metrics.cell_height > 1.0 { wm.metrics.cell_height } else { 19.0 }
+    let top_band_h = wm.top_tab_bar_height()
+
+    -- 1. Optional Top tab-bar click when enabled and multiple tabs are open
+    if world.options.show_tab_bar and wm.tabs.len() > 1 and py >= 0.0 and py < top_band_h {
+        let tab_w = (wm.pixel_width.as(f64)) / (wm.tabs.len().as(f64))
+        if tab_w > 1.0 {
+            let tidx = (px / tab_w).floor().as(i64)
+            if tidx >= 0 and tidx < wm.tabs.len() and tidx != wm.active_tab_idx {
+                wm.active_tab_idx = tidx
+                wm.relayout(world)
+                wm.sync_to_world(world)
+                kernel.emit_hook("buffer-switched", world.active_buffer_id)
+                return
+            }
+        }
+    }
+
+    -- 2. Docked left/right sidebar click
+    let hdr_h = ch + 6.0
+    if world.left_sidebar.visible {
+        let lsb = world.left_sidebar
+        let lsb_px = (lsb.width_cols.as(f64) * cw + 12.0).floor()
+        if px >= 0.0 and px < lsb_px and py >= top_band_h + hdr_h {
+            let row_idx = ((py - top_band_h - hdr_h - 2.0) / ch).floor().as(i64)
+            if row_idx >= 0 and row_idx < lsb.lines.len() {
+                lsb.selected_row = row_idx
+                kernel.emit_hook("sidebar-clicked", (lsb.owner, row_idx))
+            }
+            return
+        }
+    }
+    if world.right_sidebar.visible {
+        let rsb = world.right_sidebar
+        let rsb_px = (rsb.width_cols.as(f64) * cw + 12.0).floor()
+        let rx0 = (wm.pixel_width.as(f64)) - rsb_px
+        if px >= rx0 and py >= top_band_h + hdr_h {
+            let row_idx = ((py - top_band_h - hdr_h - 2.0) / ch).floor().as(i64)
+            if row_idx >= 0 and row_idx < rsb.lines.len() {
+                rsb.selected_row = row_idx
+                kernel.emit_hook("sidebar-clicked", (rsb.owner, row_idx))
+            }
+            return
+        }
+    }
+
+    -- 3. Pane grid hit-test (single click, double-click word, triple-click line)
+    let hit? = wm.hit_test(px, py, world) else {
+        return
+    }
+    let (win_id, target_pos) = hit
+    let prev_buf_id = world.active_buffer_id
+    let tab = wm.active_tab()
+    tab.active_win_id = win_id
+    let pane_opt = wm.panes.get(win_id)
+    if pane_opt != null {
+        let pane = pane_opt.as(WindowPane)
+        pane.cursor = target_pos
+        world.active_buffer_id = pane.buffer_id
+        let buf = world.active_buffer()
+        buf.point = target_pos
+        buf.preferred_col = target_pos.col
+
+        let vim_opt = kernel.service("lava.vim.state")
+        if vim_opt != null and world.options.evil_mode {
+            let vs = vim_opt.as(VimState)
+            let is_term_buf = buf.major_mode == "terminal" or buf.major_mode == "toggleterm"
+            if click_count == 2 {
+                if is_term_buf and vs.mode == VimMode.Insert {
+                    kernel.emit_hook("terminal-enter-normal-for-selection", target_pos)
+                }
+                let (w_start, w_end) = select_word_at(buf, target_pos)
+                vs.visual_anchor = w_start
+                buf.point = w_end
+                pane.cursor = w_end
+                vs.mode = VimMode.VisualChar
+                sync_world_from_vim(world, vs)
+            } else if click_count >= 3 {
+                if is_term_buf and vs.mode == VimMode.Insert {
+                    kernel.emit_hook("terminal-enter-normal-for-selection", target_pos)
+                }
+                vs.visual_anchor = Pos.new(target_pos.row, 0)
+                buf.point = Pos.new(target_pos.row, 0)
+                pane.cursor = buf.point
+                vs.mode = VimMode.VisualLine
+                sync_world_from_vim(world, vs)
+            } else if vs.mode == VimMode.VisualChar or vs.mode == VimMode.VisualLine or vs.mode == VimMode.VisualBlock {
+                vs.mode = VimMode.Normal
+                sync_world_from_vim(world, vs)
+            }
+        } else if click_count == 2 {
+            let (w_start, w_end) = select_word_at(buf, target_pos)
+            buf.point = w_end
+            pane.cursor = w_end
+            world.visual = VisualSelection {
+                kind: VisualKind.Char,
+                anchor: w_start,
+                cursor: w_end,
+            }
+        }
+    }
+    wm.sync_to_world(world)
+    if world.active_buffer_id != prev_buf_id {
+        kernel.emit_hook("buffer-switched", world.active_buffer_id)
+    }
+    kernel.emit_hook("cursor-moved", world.active_buffer_id)
+    kernel.emit_hook("window-focused", win_id)
+}
+
+fn handle_mouse_drag(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    wm: WindowManager,
+    px: f64,
+    py: f64,
+) -> bool {
+    if not world.options.mouse_enabled {
+        return false
+    }
+    let float_id_opt = kernel.service("lava.app.mouse_float_id")
+    if float_id_opt != null {
+        let fid = float_id_opt.as(String)
+        if fid != "" {
+            let fw_opt = find_floating_window_by_id(world, fid)
+            if fw_opt != null {
+                let fw = fw_opt.as(FloatingWindow)
+                let (row_idx, char_col) = coords_in_floating_window(world, wm, fw, px, py)
+                kernel.emit_hook("floating-window-mouse", ("drag", fid, row_idx, char_col, 1))
+                return true
+            }
+            return false
+        }
+    }
+    -- Also block drags from leaking through if pointer moves over an open floating window
+    if hit_test_floating_window(world, wm, px, py) != null {
+        return false
+    }
+
+    let hit? = wm.hit_test(px, py, world) else {
+        return false
+    }
+    let (win_id, target_pos) = hit
+    let tab = wm.active_tab()
+    if win_id != tab.active_win_id {
+        return false
+    }
+    let buf = world.active_buffer()
+    if target_pos == buf.point {
+        return false
+    }
+    let vim_opt = kernel.service("lava.vim.state")
+    if vim_opt != null and world.options.evil_mode {
+        let vs = vim_opt.as(VimState)
+        if vs.mode == VimMode.Insert and (buf.major_mode == "terminal" or buf.major_mode == "toggleterm") {
+            let anchor = buf.point
+            kernel.emit_hook("terminal-enter-normal-for-selection", anchor)
+            vs.visual_anchor = anchor
+            vs.mode = VimMode.VisualChar
+        } else if vs.mode == VimMode.Normal or vs.mode == VimMode.Insert {
+            vs.visual_anchor = buf.point
+            vs.mode = VimMode.VisualChar
+        }
+        buf.point = target_pos
+        buf.preferred_col = target_pos.col
+        let pane_opt = wm.panes.get(win_id)
+        if pane_opt != null {
+            pane_opt.as(WindowPane).cursor = target_pos
+        }
+        sync_world_from_vim(world, vs)
+        wm.sync_from_world(world)
+        kernel.emit_hook("cursor-moved", buf.id)
+        return true
+    }
+    false
+}
+
+fn handle_mouse_scroll(kernel: SystemKernel, world: EditorWorld, wm: WindowManager, dy: f64, px: f64, py: f64) {
+    let float_hit_opt = hit_test_floating_window(world, wm, px, py)
+    if float_hit_opt != null {
+        let (fw, _row_idx, _char_col) = float_hit_opt.as((FloatingWindow, i64, i64))
+        kernel.emit_hook("floating-window-scroll", (fw.id, dy))
+        return
+    }
+    wm.sync_from_world(world)
+    let pane = wm.active_pane()
+    let buf = world.active_buffer()
+    let step: i64 = if dy > 0.0 {
+        3
+    } else if dy < 0.0 {
+        -3
+    } else {
+        0
+    }
+    if step == 0 {
+        return
+    }
+    let lo = buf.min_row()
+    let hi = buf.max_row()
+    var next_top = pane.top_row + step
+    if next_top < lo {
+        next_top = lo
+    } else if next_top > hi {
+        next_top = hi
+    }
+    pane.top_row = next_top
+    let rows = wm.pane_rows(pane)
+    if buf.point.row < next_top {
+        buf.point = buf.clamp_pos(Pos.new(next_top, buf.point.col), insert_mode = false)
+    } else if buf.point.row >= next_top + rows {
+        let bottom_r = if next_top + rows - 1 <= hi { next_top + rows - 1 } else { hi }
+        buf.point = buf.clamp_pos(Pos.new(bottom_r, buf.point.col), insert_mode = false)
+    }
+    pane.cursor = buf.point
+    world.viewport_top_row = pane.top_row
+}
+
+pub fn app_step_event(
+    kernel: SystemKernel,
+    ev: RawUiEvent,
+) -> #ServiceEffects !String bool {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+
+    ev match {
+        RawUiEvent.Key(key, modifiers, text) => {
+            let stroke = KeyStroke.from_raw_event(key, modifiers, text)
+            app_handle_stroke(kernel, stroke)#!
+            true
+        },
+        RawUiEvent.Resize(width, height, _scale) => {
+            wm.resize_viewport(width, height, world)
+            true
+        },
+        RawUiEvent.MouseButton(is_press, button, x, y, _mods, count) => {
+            if button == 1 {
+                if is_press {
+                    kernel.publish_service("lava.app.mouse_down", ext_app_id(), true)
+                    kernel.publish_service("lava.app.mouse_dragged", ext_app_id(), false)
+                    handle_mouse_click(kernel, world, wm, x, y, count)
+                    flush_pending_yank(kernel, world)#
+                    if count >= 2 {
+                        yank_terminal_visual_selection_if_any(kernel, world)#
+                    }
+                    return true
+                } else {
+                    kernel.publish_service("lava.app.mouse_down", ext_app_id(), false)
+                    let dragged_opt = kernel.service("lava.app.mouse_dragged")
+                    let did_drag = dragged_opt != null and dragged_opt.as(bool)
+                    kernel.publish_service("lava.app.mouse_dragged", ext_app_id(), false)
+                    let float_id_opt = kernel.service("lava.app.mouse_float_id")
+                    if float_id_opt != null {
+                        let fid = float_id_opt.as(String)
+                        if fid != "" {
+                            kernel.publish_service("lava.app.mouse_float_id", ext_app_id(), "")
+                            let fw_opt = find_floating_window_by_id(world, fid)
+                            if fw_opt != null {
+                                let fw = fw_opt.as(FloatingWindow)
+                                let (row_idx, char_col) = coords_in_floating_window(world, wm, fw, x, y)
+                                kernel.emit_hook("floating-window-mouse", ("release", fid, row_idx, char_col, 0))
+                                flush_pending_yank(kernel, world)#
+                                return true
+                            }
+                        }
+                    }
+                    if did_drag {
+                        yank_terminal_visual_selection_if_any(kernel, world)#
+                        return true
+                    }
+                }
+            }
+            false
+        },
+        RawUiEvent.MouseMove(x, y, _mods) => {
+            let down_opt = kernel.service("lava.app.mouse_down")
+            if down_opt != null and down_opt.as(bool) {
+                let moved = handle_mouse_drag(kernel, world, wm, x, y)
+                if moved {
+                    kernel.publish_service("lava.app.mouse_dragged", ext_app_id(), true)
+                }
+                return moved
+            }
+            false
+        },
+        RawUiEvent.MouseScroll(_dx, dy, x, y, _mods) => {
+            handle_mouse_scroll(kernel, world, wm, dy, x, y)
+            true
+        },
+        RawUiEvent.Focus(_focused) => false,
+        RawUiEvent.Tick(timer_id, _now_ms) => {
+            let prev_n = world.notifications.len()
+            world.tick_notifications()
+            let expired = world.notifications.len() < prev_n
+            kernel.emit_hook("timer-tick", timer_id)
+            let pty_tick = timer_id == 1347705088
+            let lsp_tick = timer_id == 1280528384
+            let term_visible = world.active_buffer().major_mode == "terminal"
+                or world.floating_window_spans.contains_key("toggleterm")
+            expired or pty_tick or lsp_tick or term_visible
+        },
+        RawUiEvent.AsyncJobDone(job_id, ok, exit_code, stdout, stderr) => {
+            let res = tools_on_async_job_done(kernel, job_id, ok, exit_code, stdout, stderr)#
+            res match {
+                handled! => handled,
+                error err_msg => {
+                    world.status_message = "Job error: " ++ err_msg
+                    world.append_message("Job error: " ++ err_msg)
+                    true
+                },
+            }
+        },
+        RawUiEvent.CloseRequested => {
+            world.quit_requested = true
+            host_request_quit(world.exit_code)
+            true
+        },
+    }
+}
+
+pub fn app_commit_frame(kernel: SystemKernel) -> !String i64 {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let (win_spec, cmds) = compose_frame(kernel, world, wm)
+    host_commit_frame(win_spec, cmds)
+}
+
+-- ============================================================================
+-- 4. Full Session Runner (`run_session`)
+-- ============================================================================
+
+fn session_should_exit(world: EditorWorld) -> bool {
+    if world.quit_requested {
+        return true
+    }
+    mock_quit_requested() != null
+}
+
+fn run_session_with_caps(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    wm: WindowManager,
+    startup_files: List,
+    headless_keys: String,
+    headless: bool,
+) -> #ServiceEffects !String i64 {
+    -- 1. Measure monospace font cell metrics from PangoCairo (or mock metrics in headless tests).
+    wm.metrics = host_measure_font(world.options.font_family, world.options.font_size_pt)
+    wm.sync_from_world(world)
+
+    -- 2. Drain any initial platform events (e.g. initial window `Resize(width, height)`).
+    let init_events = host_poll_events()
+    for i in 0..init_events.len() {
+        let ev = init_events.get(i.as(usize)).as(RawUiEvent)
+        let _ = app_step_event(kernel, ev)#!
+    }
+
+    -- 3. Open any startup file or directory paths passed on the CLI.
+    var opened_any_startup = false
+    for i in 0..startup_files.len() {
+        let raw_path = startup_files.get(i.as(usize)).as(String)
+        if raw_path.trim() != "" {
+            let resolved_startup = world.resolve_path(raw_path)
+            if fs.exists(resolved_startup) and fs.is_dir(resolved_startup) {
+                if kernel.get_command("dirvish") != null {
+                    let _ = kernel.dispatch_command("dirvish", [resolved_startup])#!
+                    opened_any_startup = true
+                    wm.sync_from_world(world)
+                } else if kernel.get_command("dired") != null {
+                    let _ = kernel.dispatch_command("dired", [resolved_startup])#!
+                    opened_any_startup = true
+                    wm.sync_from_world(world)
+                }
+            } else {
+                let open_res = world.open_file(raw_path)#
+                open_res match {
+                    buf! => {
+                        opened_any_startup = true
+                        wm.sync_from_world(world)
+                        kernel.emit_hook("buffer-opened", buf.id)
+                        kernel.emit_hook("buffer-switched", buf.id)
+                    },
+                    error err_msg => {
+                        let msg = "Error opening " ++ raw_path ++ ": " ++ err_msg
+                        world.status_message = msg
+                        world.append_message(msg)
+                    },
+                }
+            }
+        }
+    }
+    if (not opened_any_startup) and headless_keys == "" {
+        kernel.emit_hook("session-empty-startup", headless)
+        wm.sync_from_world(world)
+    }
+
+    -- Pre-warm Minibuffer command/keymap/Ex snapshots so the first `:`, `M-x`, or `C-x C-f` is O(1).
+    if not headless {
+        prewarm_minibuffer(kernel)
+    }
+
+    -- 4. Inject `--headless-keys` startup key sequence if supplied.
+    if headless_keys != "" {
+        app_feed_keys(kernel, headless_keys)#!
+    }
+
+    -- 5. Commit initial 2D scene frame to `FrameSlot` for GTK4 / `--dump-frame-png`.
+    let _ = app_commit_frame(kernel)!
+
+    -- 6. In `--headless` mode, drain any background jobs spawned during startup keys,
+    --    commit the updated frame, and exit cleanly without blocking on an absent UI window.
+    if headless {
+        var wait_rounds: i64 = 0
+        while (not session_should_exit(world)) and (not world.active_jobs.is_empty()) and wait_rounds < 100 {
+            let job_evs = host_wait_events(50)
+            var dirty = false
+            for j in 0..job_evs.len() {
+                let jev = job_evs.get(j.as(usize)).as(RawUiEvent)
+                let step_dirty = app_step_event(kernel, jev)#!
+                if step_dirty {
+                    dirty = true
+                }
+            }
+            if dirty {
+                let _ = app_commit_frame(kernel)!
+            }
+            wait_rounds += 1
+        }
+        let term_active = world.active_buffer().major_mode == "terminal"
+            or world.floating_window_spans.contains_key("toggleterm")
+        if term_active and (not session_should_exit(world)) {
+            var pty_rounds: i64 = 0
+            while pty_rounds < 15 and (not session_should_exit(world)) {
+                let wait_t = if pty_rounds == 0 { 120 } else { 45 }
+                let pty_evs = host_wait_events(wait_t)
+                if pty_evs.is_empty() {
+                    break
+                }
+                var pty_dirty = false
+                for j in 0..pty_evs.len() {
+                    let pev = pty_evs.get(j.as(usize)).as(RawUiEvent)
+                    let step_dirty = app_step_event(kernel, pev)#!
+                    if step_dirty {
+                        pty_dirty = true
+                    }
+                }
+                if pty_dirty {
+                    let _ = app_commit_frame(kernel)!
+                }
+                pty_rounds += 1
+            }
+        }
+        let queued = host_poll_events()
+        var tail_dirty = false
+        for j in 0..queued.len() {
+            let qev = queued.get(j.as(usize)).as(RawUiEvent)
+            let step_dirty = app_step_event(kernel, qev)#!
+            if step_dirty {
+                tail_dirty = true
+            }
+        }
+        if tail_dirty {
+            let _ = app_commit_frame(kernel)!
+        }
+        host_request_quit(world.exit_code)
+        return world.exit_code
+    }
+
+    -- 7. Interactive event loop: suspend VM task via `host_wait_events` until UI/job wakeup.
+    while not session_should_exit(world) {
+        let wait_ms = if world.active_jobs.is_empty() { 250 } else { 50 }
+        let events = host_wait_events(wait_ms)
+        if not events.is_empty() {
+            var needs_redraw = false
+            for i in 0..events.len() {
+                let ev = events.get(i.as(usize)).as(RawUiEvent)
+                let step_dirty = app_step_event(kernel, ev)#!
+                if step_dirty {
+                    needs_redraw = true
+                }
+                if session_should_exit(world) {
+                    break
+                }
+            }
+            if needs_redraw {
+                let _ = app_commit_frame(kernel)!
+            }
+        }
+    }
+
+    host_request_quit(world.exit_code)
+    world.exit_code
+}
+
+pub fn run_session(kernel: SystemKernel, startup_files: List, headless_keys: String, headless: bool) -> !String i64 {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
+    let code = run_session_with_caps(kernel, world, wm, startup_files, headless_keys, headless)#!
+    let _ = cap
+    code
+}

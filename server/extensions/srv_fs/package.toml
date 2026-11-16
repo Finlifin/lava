@@ -1,0 +1,10 @@
+[package]
+name = "srv_fs"
+domain = "lava.server"
+version = "0.1.0"
+type = "lib"
+description = "Server-side filesystem RPC extension (stat, read, atomic write, readdir, root discovery)."
+
+[dependencies]
+"lava.server/server_sys" = { path = "../../packages/server_sys" }
+"lava.server/server_core" = { path = "../../packages/server_core" }

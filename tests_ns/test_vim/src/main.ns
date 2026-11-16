@@ -1,0 +1,545 @@
+-- Comprehensive End-to-End Test Suite for Evil-Vim Modal Extension (`lava.org/ext_vim`).
+-- Exercises Normal/Insert/Replace modes, motions, operators + nested text objects,
+-- Visual Char/Line & Rectangular Visual Block (`<C-v>` `I...<Esc>` and `d`/`p`),
+-- dot-repeat (`.`), registers & mock clipboard (`HostClipboardCap`), macros (`qa...q`, `3@a`, `@@`),
+-- `<Space>` leader keymap + `<C-w>` window dispatch, branching undo/redo (`u`, `<C-r>`, `g-`, `g+`),
+-- delimited-continuation `/` & `:` prompts, and the Ex command engine (`:%s`, `:g`, `:v`, `:set`, `:1,2d`).
+
+use @lava_sys.{CaretShape, host_clipboard_get, mock_enable}
+use @lava_core.{
+    HostClipboardCap, InteractiveEffects, KeyStroke, LogCollectorCap, PromptKind, PromptRequest,
+    PromptTurn, StatusCollectorCap, SystemKernel, clipboard_get, clipboard_set, log_event,
+    parse_key_sequence, status_emit
+}
+use @ext_document.{
+    Buffer, BufferKind, EditorWorld, Pos, QuickfixEntry, RegisterValue, VisualKind,
+    register_document_extension, require_editor_world
+}
+use @ext_vim.{
+    SERVICE_VIM, VimMode, VimState, execute_ex_command, ext_vim_id, register_vim_extension,
+    require_vim_state, vim_feed_keys, vim_handle_key
+}
+
+fn fail_test(msg: String) -> NoReturn {
+    panic("TEST FAILED: " ++ msg)
+}
+
+fn assert_true(cond: bool, msg: String) {
+    if not cond {
+        fail_test(msg)
+    }
+}
+
+fn assert_str_eq(actual: String, expected: String, label: String) {
+    if actual != expected {
+        fail_test(
+            label ++ "\n  expected: " ++ expected.escape_debug()
+            ++ "\n  actual:   " ++ actual.escape_debug()
+        )
+    }
+}
+
+fn assert_i64_eq(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        fail_test(
+            label ++ " expected=" ++ expected.to_string() ++ " actual=" ++ actual.to_string()
+        )
+    }
+}
+
+fn assert_pos_eq(actual: Pos, expected_row: i64, expected_col: i64, label: String) {
+    if actual.row != expected_row or actual.col != expected_col {
+        fail_test(
+            label ++ " expected=(" ++ expected_row.to_string() ++ "," ++ expected_col.to_string()
+            ++ ") actual=(" ++ actual.row.to_string() ++ "," ++ actual.col.to_string() ++ ")"
+        )
+    }
+}
+
+fn make_test_kernel() -> !String (SystemKernel, EditorWorld, VimState) {
+    mock_enable(true)
+    let kernel = SystemKernel.new()
+    register_document_extension(kernel)!
+    register_vim_extension(kernel)!
+    kernel.activate_all()!
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    (kernel, world, vim)
+}
+
+fn setup_buffer(world: EditorWorld, lines: List) -> Buffer {
+    let buf = world.active_buffer()
+    buf.read_only = false
+    buf.set_lines(lines, record_undo = false)
+    buf.modified = false
+    buf.point = Pos.zero()
+    buf.preferred_col = 0
+    buf
+}
+
+fn unwrap_ok(res: !String Unit, ctx: String) {
+    let _! = res else {
+        fail_test(ctx ++ " returned unexpected error")
+    }
+}
+
+-- ============================================================================
+-- 1. Modes, Toggle (`C-z`), Passthrough, Normal/Insert/Replace & Core Motions
+-- ============================================================================
+
+fn test_modes_and_motions() -> #[log_event, status_emit, clipboard_get, clipboard_set] !String Unit {
+    let (kernel, world, vim) = make_test_kernel()!
+    assert_true(kernel.service(SERVICE_VIM) != null, "SERVICE_VIM published")
+    assert_str_eq(ext_vim_id().raw(), "lava.org/ext_vim", "ext_vim_id")
+    assert_true(vim.mode == VimMode.Normal, "starts in Normal mode")
+    assert_str_eq(world.mode_name, "NORMAL", "initial mode_name")
+    assert_true(world.caret_shape == CaretShape.Block, "initial caret Block")
+
+    -- Emacs global chord passthrough in Normal mode vs Vim `<C-r>` / `<C-v>`
+    let mx = parse_key_sequence("<M-x>").get(0).as(KeyStroke)
+    let cx = parse_key_sequence("<C-x>").get(0).as(KeyStroke)
+    let cs = parse_key_sequence("<C-s>").get(0).as(KeyStroke)
+    assert_true(not (vim_handle_key(kernel, mx)#!), "<M-x> passes through")
+    assert_true(not (vim_handle_key(kernel, cx)#!), "<C-x> passes through")
+    assert_true(not (vim_handle_key(kernel, cs)#!), "<C-s> passes through")
+
+    -- `<C-z>` toggle between Evil-Vim and pure Emacs mode
+    vim_feed_keys(kernel, "<C-z>")#!
+    assert_true(not world.options.evil_mode, "C-z disables evil_mode")
+    assert_str_eq(world.mode_name, "EMACS", "EMACS mode_name")
+    assert_true(not (vim_handle_key(kernel, KeyStroke.plain("j"))#!), "plain j ignored in EMACS mode")
+    vim_feed_keys(kernel, "<C-z>")#!
+    assert_true(world.options.evil_mode, "second C-z re-enables evil_mode")
+    assert_str_eq(world.mode_name, "NORMAL", "restored NORMAL mode_name")
+
+    -- Motions: `w`, `b`, `e`, `ge`, `0`, `^`, `$`, `g_`, `f`, `t`, `;`, `,`, `%`, `gg`, `G`
+    let buf = setup_buffer(world, [
+        "  alpha beta_2 gamma;",
+        "fn calc(x: [i64; 3]) {{",
+        "    return (x[0] + 1)",
+        "}}"
+    ])
+
+    vim_feed_keys(kernel, "^")#!
+    assert_pos_eq(buf.point, 0, 2, "^ first non-blank")
+    vim_feed_keys(kernel, "w")#!
+    assert_pos_eq(buf.point, 0, 8, "w to beta_2")
+    vim_feed_keys(kernel, "e")#!
+    assert_pos_eq(buf.point, 0, 13, "e to end of beta_2")
+    vim_feed_keys(kernel, "w")#!
+    assert_pos_eq(buf.point, 0, 15, "w to gamma")
+    vim_feed_keys(kernel, "b")#!
+    assert_pos_eq(buf.point, 0, 8, "b back to beta_2")
+    vim_feed_keys(kernel, "ge")#!
+    assert_pos_eq(buf.point, 0, 6, "ge to end of alpha")
+
+    -- `f`, `t`, `;`, `,`
+    vim_feed_keys(kernel, "0fa")#!
+    assert_pos_eq(buf.point, 0, 2, "fa first 'a'")
+    vim_feed_keys(kernel, ";")#!
+    assert_pos_eq(buf.point, 0, 6, "; next 'a'")
+    vim_feed_keys(kernel, ";")#!
+    assert_pos_eq(buf.point, 0, 11, "; third 'a' in beta_2")
+    vim_feed_keys(kernel, ",")#!
+    assert_pos_eq(buf.point, 0, 6, ", reverse to second 'a'")
+    vim_feed_keys(kernel, "t;")#!
+    assert_pos_eq(buf.point, 0, 19, "t; stops right before semicolon")
+
+    -- Multi-line `%` bracket matching across `{{` ... `}}` and `(` ... `)`
+    vim_feed_keys(kernel, "j0f(%")#!
+    assert_pos_eq(buf.point, 1, 19, "% jumps to matching ')'")
+    vim_feed_keys(kernel, "f{{%")#!
+    assert_pos_eq(buf.point, 3, 0, "% jumps across lines to closing brace")
+    vim_feed_keys(kernel, "%")#!
+    assert_pos_eq(buf.point, 1, 21, "% jumps back to opening brace")
+
+    -- `G`, `gg`, `<count>G`
+    vim_feed_keys(kernel, "G")#!
+    assert_pos_eq(buf.point, 3, 0, "G to last line")
+    vim_feed_keys(kernel, "gg")#!
+    assert_pos_eq(buf.point, 0, 2, "gg to first line first non-blank")
+    vim_feed_keys(kernel, "3G")#!
+    assert_pos_eq(buf.point, 2, 4, "3G to line 3 first non-blank")
+
+    -- Normal/Insert/Replace editing (`i`, `A`, `o`, `R` with `<BackSpace>` restore, `r`, `~`, `J`)
+    let edit_buf = setup_buffer(world, ["hello", "world"])
+    vim_feed_keys(kernel, "iSay<Space><Escape>")#!
+    assert_str_eq(edit_buf.line_at(0), "Say hello", "Insert with i")
+    vim_feed_keys(kernel, "A!<Escape>")#!
+    assert_str_eq(edit_buf.line_at(0), "Say hello!", "Append with A")
+
+    -- Replace mode `R` + `<BackSpace>` restores original overwritten characters!
+    vim_feed_keys(kernel, "0RXYZ<BackSpace><Escape>")#!
+    assert_str_eq(edit_buf.line_at(0), "XYy hello!", "Replace mode R + BackSpace restores 'y'")
+
+    vim_feed_keys(kernel, "0rS03~J")#!
+    assert_str_eq(edit_buf.line_at(0), "syY hello! world", "rS + 3~ + J join lines")
+
+    -- Marks (`ma`, `'a`, `` `a ``) & Jumps (`<C-o>`, `<C-i>`) & Quickfix (`]q`, `[q`)
+    let m_buf = setup_buffer(world, ["line one", "  line two", "line three", "target word one"])
+    vim_feed_keys(kernel, "j^maG")#!
+    assert_pos_eq(m_buf.point, 3, 0, "at bottom before mark jump")
+    vim_feed_keys(kernel, "`a")#!
+    assert_pos_eq(m_buf.point, 1, 2, "backtick jumps to exact mark pos")
+    vim_feed_keys(kernel, "<C-o>")#!
+    assert_pos_eq(m_buf.point, 3, 0, "C-o jumps back in jumplist")
+    vim_feed_keys(kernel, "<C-i>")#!
+    assert_pos_eq(m_buf.point, 1, 2, "C-i jumps forward in jumplist")
+
+    -- `*` word search & `/` continuation prompt
+    vim_feed_keys(kernel, "gg0*")#!
+    assert_pos_eq(m_buf.point, 1, 2, "* finds next 'line'")
+    vim_feed_keys(kernel, "n")#!
+    assert_pos_eq(m_buf.point, 2, 0, "n finds third 'line'")
+
+    vim_feed_keys(kernel, "/")#!
+    let pending? = kernel.active_prompt else {
+        fail_test("/ suspends prompt continuation")
+    }
+    let (sreq, _) = pending
+    assert_true(sreq.kind == PromptKind.SearchForward, "SearchForward kind")
+    let _ = kernel.submit_prompt_answer("target")#!
+    assert_pos_eq(m_buf.point, 3, 0, "/ prompt jump lands on 'target'")
+
+    -- Quickfix `]q` / `[q`
+    world.quickfix = [
+        QuickfixEntry { file_path: "", row: 0, col: 5, text: "first hit" },
+        QuickfixEntry { file_path: "", row: 2, col: 5, text: "second hit" },
+    ]
+    world.quickfix_idx = 0
+    vim_feed_keys(kernel, "]q")#!
+    assert_pos_eq(m_buf.point, 2, 5, "]q jumps to second quickfix")
+    vim_feed_keys(kernel, "[q")#!
+    assert_pos_eq(m_buf.point, 0, 5, "[q jumps back to first quickfix")
+    ()
+}
+
+-- ============================================================================
+-- 2. Operators + Text Objects (`ciw`, `di"`, `da(`, `y2w`, `>>`, `gUiw`)
+-- ============================================================================
+
+fn test_operators_and_text_objects() -> #[log_event, status_emit, clipboard_get, clipboard_set] !String Unit {
+    let (kernel, world, _vim) = make_test_kernel()!
+
+    -- `ciw`
+    let buf = setup_buffer(world, ["let old_name = 42"])
+    vim_feed_keys(kernel, "wciwnew_val<Escape>")#!
+    assert_str_eq(buf.line_at(0), "let new_val = 42", "ciw replaces identifier")
+
+    -- `di"`
+    let qbuf = setup_buffer(world, ["msg = \"secret payload\";"])
+    vim_feed_keys(kernel, "0di\"")#!
+    assert_str_eq(qbuf.line_at(0), "msg = \"\";", "di\" empties string literal from line start")
+
+    -- `da(` with nested parentheses!
+    let pbuf = setup_buffer(world, ["res = outer(inner(1, 2), 3);"])
+    vim_feed_keys(kernel, "0f3da(")#!
+    assert_str_eq(pbuf.line_at(0), "res = outer;", "nested-aware da( removes outer(...) group")
+
+    -- `y2w` + `P`
+    let ybuf = setup_buffer(world, ["alpha beta gamma"])
+    vim_feed_keys(kernel, "0y2w$p")#!
+    assert_str_eq(ybuf.line_at(0), "alpha beta gammaalpha beta ", "y2w yanks two words")
+
+    -- `>>` & `<<` indentation + `gUiw` uppercase
+    let ibuf = setup_buffer(world, ["hello world", "second line"])
+    vim_feed_keys(kernel, "gUiw>>")#!
+    assert_str_eq(ibuf.line_at(0), "    HELLO world", "gUiw + >>")
+    vim_feed_keys(kernel, "<<")#!
+    assert_str_eq(ibuf.line_at(0), "HELLO world", "<< dedents line")
+    ()
+}
+
+-- ============================================================================
+-- 3. Visual Char, Visual Line & Rectangular Visual Block (`<C-v>` `I...<Esc>` & `d`/`p`)
+-- ============================================================================
+
+fn test_visual_and_visual_block() -> #[log_event, status_emit, clipboard_get, clipboard_set] !String Unit {
+    let (kernel, world, vim) = make_test_kernel()!
+
+    -- Visual Char `v` + `o` swap + `U`
+    let vbuf = setup_buffer(world, ["abcdef"])
+    vim_feed_keys(kernel, "lv2loU")#!
+    assert_str_eq(vbuf.line_at(0), "aBCDef", "VisualChar selection uppercase")
+    assert_true(vim.mode == VimMode.Normal, "returns to Normal after Visual U")
+
+    -- Visual Line `V` + `j` + `d`
+    let vlbuf = setup_buffer(world, ["keep0", "drop1", "drop2", "keep3"])
+    vim_feed_keys(kernel, "jVjd")#!
+    assert_i64_eq(vlbuf.line_count(), 2, "VisualLine deleted 2 lines")
+    assert_str_eq(vlbuf.to_text(), "keep0\nkeep3", "VisualLine remaining lines")
+
+    -- Visual Block `<C-v>` `I...<Escape>` multi-line prefix insert!
+    let bbuf = setup_buffer(world, [
+        "alpha = 1",
+        "beta  = 2",
+        "gamma = 3",
+        "delta = 4"
+    ])
+    vim_feed_keys(kernel, "<C-v>")#!
+    assert_true(vim.mode == VimMode.VisualBlock, "entered VisualBlock")
+    assert_true(world.visual.kind == VisualKind.Block, "world.visual is Block")
+    vim_feed_keys(kernel, "2jI--<Space><Escape>")#!
+    assert_str_eq(bbuf.line_at(0), "-- alpha = 1", "V-Block I row 0")
+    assert_str_eq(bbuf.line_at(1), "-- beta  = 2", "V-Block I row 1")
+    assert_str_eq(bbuf.line_at(2), "-- gamma = 3", "V-Block I row 2")
+    assert_str_eq(bbuf.line_at(3), "delta = 4", "V-Block I untouched row 3")
+
+    -- Visual Block `<C-v>` rectangular `d` delete!
+    vim_feed_keys(kernel, "gg0<C-v>2j2ld")#!
+    assert_str_eq(bbuf.line_at(0), "alpha = 1", "V-Block d stripped '-- ' on row 0")
+    assert_str_eq(bbuf.line_at(1), "beta  = 2", "V-Block d stripped '-- ' on row 1")
+    assert_str_eq(bbuf.line_at(2), "gamma = 3", "V-Block d stripped '-- ' on row 2")
+
+    -- Blockwise paste `P` at col 0!
+    vim_feed_keys(kernel, "gg0P")#!
+    assert_str_eq(bbuf.line_at(0), "-- alpha = 1", "Blockwise P restored row 0")
+    assert_str_eq(bbuf.line_at(1), "-- beta  = 2", "Blockwise P restored row 1")
+    assert_str_eq(bbuf.line_at(2), "-- gamma = 3", "Blockwise P restored row 2")
+    ()
+}
+
+-- ============================================================================
+-- 4. Dot Repeat (`.`) — Repeating `ciw` and `2dd` (+ Count Override)
+-- ============================================================================
+
+fn test_dot_repeat() -> #[log_event, status_emit, clipboard_get, clipboard_set] !String Unit {
+    let (kernel, world, _vim) = make_test_kernel()!
+
+    -- Repeat `ciw` across multiple words
+    let cbuf = setup_buffer(world, ["foo bar baz"])
+    vim_feed_keys(kernel, "ciwNEW<Escape>w.w.")#!
+    assert_str_eq(cbuf.line_at(0), "NEW NEW NEW", "dot-repeat of ciwNEW<Esc> across three words")
+
+    -- Repeat `2dd` (preserving count 2!) and `1.` (overriding count to 1!)
+    let dbuf = setup_buffer(world, ["L1", "L2", "L3", "L4", "L5", "L6"])
+    vim_feed_keys(kernel, "2dd")#!
+    assert_str_eq(dbuf.to_text(), "L3\nL4\nL5\nL6", "2dd removed L1,L2")
+    vim_feed_keys(kernel, ".")#!
+    assert_str_eq(dbuf.to_text(), "L5\nL6", "dot-repeat of 2dd removed L3,L4")
+    vim_feed_keys(kernel, "1.")#!
+    assert_str_eq(dbuf.to_text(), "L6", "1. count override removed single line L5")
+    ()
+}
+
+-- ============================================================================
+-- 5. Registers (`"ayy`, `"Ayj`, `"ap`, `"+y` with `HostClipboardCap` / Mock Clipboard)
+-- ============================================================================
+
+fn test_registers_and_clipboard() -> #[log_event, status_emit, clipboard_get, clipboard_set] !String Unit {
+    let (kernel, world, _vim) = make_test_kernel()!
+    let rbuf = setup_buffer(world, ["first", "second", "third", "anchor"])
+
+    -- `"ayy` yanks "first\n" into "a; `"Ayj` appends "second\nthird\n" onto "a!
+    vim_feed_keys(kernel, "\"ayyj\"AyjG\"ap")#!
+    assert_str_eq(
+        rbuf.to_text(),
+        "first\nsecond\nthird\nanchor\nfirst\nsecond\nthird",
+        "\"ayy + \"Ayj + \"ap register append and paste"
+    )
+
+    -- `"+y` writes to host/mock clipboard via `HostClipboardCap`!
+    vim_feed_keys(kernel, "gg\"+yy")#!
+    assert_str_eq(host_clipboard_get(), "first\n", "mock system clipboard populated by \"+yy")
+
+    -- Black-hole register `"_dd` does not clobber unnamed register `""`
+    vim_feed_keys(kernel, "G\"_dd")#!
+    let unnamed = world.registers.get_reg("")#
+    assert_true(unnamed != null, "unnamed register preserved")
+    assert_str_eq(unnamed.as(RegisterValue).text, "first\n", "black-hole delete kept unnamed")
+    ()
+}
+
+-- ============================================================================
+-- 6. Keyboard Macros (`qa...q`, `3@a`, `@@`) & Leader `<Space>` Keymap
+-- ============================================================================
+
+fn test_macros_and_leader() -> #[log_event, status_emit, clipboard_get, clipboard_set] !String Unit {
+    let (kernel, world, _vim) = make_test_kernel()!
+
+    -- Verify `<C-w> v` window dispatch on a fresh kernel first!
+    kernel.register_command(
+        "split-window-right",
+        ext_vim_id(),
+        "Mock split-window-right for test",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            kern.publish_service("test.split_right.count", ext_vim_id(), 1)
+            status_emit("mock split-window-right")#
+            ()
+        },
+    )
+    vim_feed_keys(kernel, "<C-w>")#!
+    assert_true(not world.which_key_items.is_empty(), "<C-w> populates window which_key_items")
+    vim_feed_keys(kernel, "v")#!
+    assert_true(kernel.service("test.split_right.count") != null, "<C-w> v dispatches split-window-right")
+
+    let mbuf = setup_buffer(world, [
+        "item_1",
+        "item_2",
+        "item_3",
+        "item_4",
+        "item_5"
+    ])
+
+    -- Record macro `a`: `I[x] <Escape>j0` on row 0, then replay `3@a` (rows 1..=3) and `@@` (row 4)!
+    vim_feed_keys(kernel, "qaI[x]<Space><Escape>j0q")#!
+    assert_str_eq(mbuf.line_at(0), "[x] item_1", "macro recorded row 0")
+    vim_feed_keys(kernel, "3@a")#!
+    assert_str_eq(mbuf.line_at(1), "[x] item_2", "3@a row 1")
+    assert_str_eq(mbuf.line_at(2), "[x] item_3", "3@a row 2")
+    assert_str_eq(mbuf.line_at(3), "[x] item_4", "3@a row 3")
+    vim_feed_keys(kernel, "@@")#!
+    assert_str_eq(mbuf.line_at(4), "[x] item_5", "@@ row 4")
+
+    -- `<Space>` leader keymap populates `world.which_key_items` & dispatches `<Space> u` (`undo-tree-visualize`)
+    vim_feed_keys(kernel, "<Space>")#!
+    assert_true(not world.which_key_items.is_empty(), "<Space> populates which_key_items")
+    vim_feed_keys(kernel, "f")#!
+    assert_i64_eq(world.which_key_items.len(), 3, "<Space> f shows ff, fg, fs hints")
+    vim_feed_keys(kernel, "<Escape>")#!
+    assert_true(world.which_key_items.is_empty(), "<Escape> clears which_key_items")
+
+    vim_feed_keys(kernel, "<Space>u")#!
+    assert_str_eq(world.active_buffer().name, "*undo-tree*", "<Space> u opens *undo-tree*")
+    ()
+}
+
+-- ============================================================================
+-- 7. Branching Undo / Redo (`u`, `<C-r>`, `g-`, `g+`)
+-- ============================================================================
+
+fn test_branching_undo_tree() -> #[log_event, status_emit, clipboard_get, clipboard_set] !String Unit {
+    let (kernel, world, _vim) = make_test_kernel()!
+    let ubuf = setup_buffer(world, ["base"])
+
+    -- Branch 1: `A_one<Esc>`
+    vim_feed_keys(kernel, "A_one<Escape>")#!
+    assert_str_eq(ubuf.to_text(), "base_one", "branch 1 applied")
+
+    -- Undo `u` and Redo `<C-r>`
+    vim_feed_keys(kernel, "u")#!
+    assert_str_eq(ubuf.to_text(), "base", "undo back to base")
+    vim_feed_keys(kernel, "<C-r>")#!
+    assert_str_eq(ubuf.to_text(), "base_one", "C-r redo back to base_one")
+
+    -- Undo back to `base`, then create diverging Branch 2: `A_two<Esc>`
+    vim_feed_keys(kernel, "u")#!
+    assert_str_eq(ubuf.to_text(), "base", "undo again")
+    vim_feed_keys(kernel, "A_two<Escape>")#!
+    assert_str_eq(ubuf.to_text(), "base_two", "diverging branch 2 applied")
+    assert_i64_eq(ubuf.undo_tree.branch_count_at_parent(), 2, "two sibling branches on root")
+
+    -- Switch sibling undo branches via `g-` and `g+`!
+    vim_feed_keys(kernel, "g-")#!
+    assert_str_eq(ubuf.to_text(), "base_one", "g- switches to earlier sibling branch_one")
+    vim_feed_keys(kernel, "g+")#!
+    assert_str_eq(ubuf.to_text(), "base_two", "g+ switches forward to branch_two")
+    ()
+}
+
+-- ============================================================================
+-- 8. Ex Command Engine (`:%s/foo/bar/g`, `:g/TODO/d`, `:set nonu`, `:1,2d`, `:q`, `:q!`)
+-- ============================================================================
+
+fn test_ex_commands() -> #[log_event, status_emit, clipboard_get, clipboard_set] !String Unit {
+    let (kernel, world, _vim) = make_test_kernel()!
+    let ebuf = setup_buffer(world, [
+        "foo = foo + 1",
+        "TODO: remove temporary debug",
+        "keep_line = foo",
+        "TODO: cleanup",
+        "tail_line = 0"
+    ])
+
+    -- Interactive `:` prompt via continuation + `:%s/foo/bar/g`
+    vim_feed_keys(kernel, ":")#!
+    assert_true(kernel.active_prompt != null, ": opens ExCommand prompt")
+    let _ = kernel.submit_prompt_answer("%s/foo/bar/g")#!
+    assert_str_eq(ebuf.line_at(0), "bar = bar + 1", ":%s/foo/bar/g row 0")
+    assert_str_eq(ebuf.line_at(2), "keep_line = bar", ":%s/foo/bar/g row 2")
+
+    -- `:g/TODO/d` deletes all matching lines in one undo checkpoint
+    let _ = kernel.dispatch_command("evil-ex", ["g/TODO/d"])#!
+    assert_str_eq(
+        ebuf.to_text(),
+        "bar = bar + 1\nkeep_line = bar\ntail_line = 0",
+        ":g/TODO/d filtered out TODO lines"
+    )
+
+    -- `:1,2d` range delete
+    let _ = kernel.dispatch_command("evil-ex", ["1,2d"])#!
+    assert_str_eq(ebuf.to_text(), "tail_line = 0", ":1,2d deleted lines 1..=2")
+
+    -- Single `u` undoes `:1,2d`!
+    vim_feed_keys(kernel, "u")#!
+    assert_i64_eq(ebuf.line_count(), 3, "undo restored :1,2d")
+
+    -- `:v/keep_line/d` inverted global filter
+    let _ = kernel.dispatch_command("evil-ex", ["v/keep_line/d"])#!
+    assert_str_eq(ebuf.to_text(), "keep_line = bar", ":v/keep_line/d kept only matching line")
+
+    -- `:set nonu rnu! ts=2 sw=2 noic` & `:noh` & `:theme`
+    assert_true(world.options.number, "number default true")
+    let _ = kernel.dispatch_command("evil-ex", ["set nonu ts=2 sw=2 noic"])#!
+    assert_true(not world.options.number, ":set nonu disabled line numbers")
+    assert_i64_eq(world.options.tabstop, 2, ":set ts=2")
+    assert_i64_eq(world.options.shiftwidth, 2, ":set sw=2")
+    assert_true(not world.options.ignorecase, ":set noic")
+
+    world.search_highlight_active = true
+    let _ = kernel.dispatch_command("evil-ex", ["noh"])#!
+    assert_true(not world.search_highlight_active, ":noh clears search highlight")
+
+    let _ = kernel.dispatch_command("evil-ex", ["theme gruvbox-dark"])#!
+    assert_str_eq(world.options.theme_name, "gruvbox-dark", ":theme updates theme_name")
+
+    -- `:q` warns on unsaved File buffer, `:q!` forces quit
+    ebuf.kind = BufferKind.File
+    ebuf.file_path = "/tmp/unsaved_test_lava.ns"
+    ebuf.modified = true
+    let _ = kernel.dispatch_command("evil-ex", ["q"])#!
+    assert_true(not world.quit_requested, ":q refuses to quit with unsaved file buffer")
+
+    let _ = kernel.dispatch_command("evil-ex", ["q!"])#!
+    assert_true(world.quit_requested, ":q! forces quit")
+
+    -- `:ext`, `:reg`, `:marks`, `:ls` special buffers
+    let _ = kernel.dispatch_command("evil-ex", ["ext"])#!
+    assert_str_eq(world.active_buffer().name, "*Extensions*", ":ext opens *Extensions*")
+    let _ = kernel.dispatch_command("evil-ex", ["reg"])#!
+    assert_str_eq(world.active_buffer().name, "*Registers*", ":reg opens *Registers*")
+    let _ = kernel.dispatch_command("evil-ex", ["marks"])#!
+    assert_str_eq(world.active_buffer().name, "*Marks*", ":marks opens *Marks*")
+    let _ = kernel.dispatch_command("evil-ex", ["ls"])#!
+    assert_str_eq(world.active_buffer().name, "*Buffers*", ":ls opens *Buffers*")
+    ()
+}
+
+fn run_all_suites() -> #[log_event, status_emit, clipboard_get, clipboard_set] !String Unit {
+    println("[1/8] test_modes_and_motions...")
+    test_modes_and_motions()#!
+    println("[2/8] test_operators_and_text_objects...")
+    test_operators_and_text_objects()#!
+    println("[3/8] test_visual_and_visual_block...")
+    test_visual_and_visual_block()#!
+    println("[4/8] test_dot_repeat...")
+    test_dot_repeat()#!
+    println("[5/8] test_registers_and_clipboard...")
+    test_registers_and_clipboard()#!
+    println("[6/8] test_macros_and_leader...")
+    test_macros_and_leader()#!
+    println("[7/8] test_branching_undo_tree...")
+    test_branching_undo_tree()#!
+    println("[8/8] test_ex_commands...")
+    test_ex_commands()#!
+    ()
+}
+
+fn main() {
+    handles(clipboard_get) handles(clipboard_set) let _clip = HostClipboardCap {}
+    handles(log_event) let _logs = LogCollectorCap.new()
+    handles(status_emit) let _status = StatusCollectorCap.new()
+
+    unwrap_ok(run_all_suites()#, "ext_vim test suite")
+    println("ALL ext_vim TESTS PASSED (8/8 suites)")
+}

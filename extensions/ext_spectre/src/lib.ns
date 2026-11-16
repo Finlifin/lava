@@ -1,0 +1,873 @@
+-- ext_spectre: Interactive Project Search & Selective Multi-File Replace (`lava.org/ext_spectre`).
+-- Inspired by nvim-spectre / Emacs wgrep: publishes `"lava.spectre.panel"` (`SpectreService`),
+-- searches workspace files via `@lava_accel.accel_workspace_grep`, renders live `=>` replacement
+-- previews with per-item and per-file `[x]`/`[ ]` toggles in `*Spectre*`, and applies enabled
+-- replacements atomically on disk + open `EditorWorld` buffers via `R` or `:w`.
+
+use std.collections.{HashMap, Set}
+use std.path
+use @lava_sys.{host_read_file_lines, host_write_file_lines}
+use @lava_core.{
+    ExtId, InteractiveEffects, Keymap, PromptRequest, SystemKernel, ask_prompt, log_event,
+    status_emit
+}
+use @lava_accel.{GrepHit, accel_workspace_grep}
+use @ext_document.{
+    Buffer, BufferId, EditorWorld, Pos, ext_document_id, require_editor_world
+}
+use @ext_vim.{
+    KEYMAP_VIM_LEADER, ext_vim_id
+}
+
+pub const SERVICE_SPECTRE: String = "lava.spectre.panel"
+pub const SPECTRE_BUF_NAME: String = "*Spectre*"
+
+pub fn ext_spectre_id() -> ExtId = ExtId("lava.org/ext_spectre")
+
+pub struct SpectreMatch {
+    pub file_path: String,
+    pub row: i64,
+    pub col: i64,
+    pub line_text: String,
+    pub enabled: bool,
+}
+
+pub struct SpectreRowTarget {
+    pub kind: String,
+    pub match_idx: i64,
+    pub file_path: String,
+}
+
+pub struct SpectreService {
+    pub root: String,
+    pub search_query: String,
+    pub replace_text: String,
+    pub case_sensitive: bool,
+    pub file_filter: String,
+    pub items: List,
+    pub row_targets: List,
+    pub prev_buf_id: BufferId,
+}
+
+fn is_word_ch(ch: String) -> bool {
+    if ch == "" {
+        return false
+    }
+    ch == "_" or ch.is_alphanumeric()
+}
+
+fn word_at_cursor(buf: Buffer) -> String {
+    let line = buf.line_at(buf.point.row)
+    let n = line.char_len()
+    if n == 0 {
+        return ""
+    }
+    var col = buf.point.col
+    if col >= n {
+        col = n - 1
+    }
+    if col < 0 or (not is_word_ch(line.slice(col, col + 1))) {
+        return ""
+    }
+    var sc = col
+    while sc > 0 and is_word_ch(line.slice(sc - 1, sc)) {
+        sc -= 1
+    }
+    var ec = col + 1
+    while ec < n and is_word_ch(line.slice(ec, ec + 1)) {
+        ec += 1
+    }
+    line.slice(sc, ec)
+}
+
+fn clone_str_list(src: List) -> List {
+    let out = List()
+    for i in 0..src.len() {
+        out.push(src.get(i.as(usize)).as(String))
+    }
+    out
+}
+
+fn build_preview_line(line: String, col: i64, qlen: i64, rep: String) -> String {
+    let llen = line.char_len()
+    if qlen <= 0 or col < 0 or col + qlen > llen {
+        return line
+    }
+    let flat_rep = rep.replace("\n", "\\n")
+    line.slice(0, col) ++ flat_rep ++ line.slice(col + qlen, llen)
+}
+
+fn make_match_key(file_path: String, row: i64, col: i64) -> String {
+    file_path ++ ":" ++ row.to_string() ++ ":" ++ col.to_string()
+}
+
+impl SpectreService {
+    pub fn new() -> SpectreService {
+        SpectreService {
+            root: ".",
+            search_query: "",
+            replace_text: "",
+            case_sensitive: false,
+            file_filter: "",
+            items: List(),
+            row_targets: List(),
+            prev_buf_id: BufferId(1),
+        }
+    }
+
+    pub fn enabled_count(self) -> i64 {
+        var cnt: i64 = 0
+        for i in 0..self.items.len() {
+            if self.items.get(i.as(usize)).as(SpectreMatch).enabled {
+                cnt += 1
+            }
+        }
+        cnt
+    }
+
+    pub fn refresh_matches(self, .disabled_keys: ?Set = null) {
+        self.items = List()
+        if self.search_query == "" {
+            return
+        }
+        let raw_filt = self.file_filter.trim()
+        let suffix_glob = if raw_filt.starts_with("*.") and raw_filt.char_len() > 2 {
+            raw_filt.slice(1, raw_filt.char_len()).to_lower()
+        } else {
+            ""
+        }
+        let accel_filt = if raw_filt == "*" {
+            ""
+        } else if suffix_glob != "" {
+            suffix_glob
+        } else {
+            raw_filt
+        }
+        let hits = accel_workspace_grep(
+            self.root,
+            self.search_query,
+            case_sensitive = self.case_sensitive,
+            max_results = 400,
+            file_filter = accel_filt,
+        )
+        let seen_file_rows = Set.new()
+        let q_cmp = if self.case_sensitive {
+            self.search_query
+        } else {
+            self.search_query.to_lower()
+        }
+        let qlen = self.search_query.char_len()
+
+        for i in 0..hits.len() {
+            let h = hits.get(i.as(usize)).as(GrepHit)
+            if suffix_glob != "" and (not h.file_path.to_lower().ends_with(suffix_glob)) {
+                continue
+            }
+            let fr_key = h.file_path ++ ":" ++ h.row.to_string()
+            if seen_file_rows.contains(fr_key) {
+                continue
+            }
+            seen_file_rows.insert(fr_key)
+            let hay = if self.case_sensitive { h.line_text } else { h.line_text.to_lower() }
+            let idxs = hay.find_indices(q_cmp)
+            if idxs.is_empty() {
+                let mkey = make_match_key(h.file_path, h.row, h.col)
+                let is_en = if disabled_keys != null {
+                    not disabled_keys.as(Set).contains(mkey)
+                } else {
+                    true
+                }
+                self.items.push(SpectreMatch {
+                    file_path: h.file_path,
+                    row: h.row,
+                    col: h.col,
+                    line_text: h.line_text,
+                    enabled: is_en,
+                })
+            } else {
+                var next_allowed: i64 = 0
+                for mi in 0..idxs.len() {
+                    let sc = idxs.get(mi.as(usize)).as(i64)
+                    if sc < next_allowed {
+                        continue
+                    }
+                    next_allowed = sc + (if qlen > 0 { qlen } else { 1 })
+                    let mkey = make_match_key(h.file_path, h.row, sc)
+                    let is_en = if disabled_keys != null {
+                        not disabled_keys.as(Set).contains(mkey)
+                    } else {
+                        true
+                    }
+                    self.items.push(SpectreMatch {
+                        file_path: h.file_path,
+                        row: h.row,
+                        col: sc,
+                        line_text: h.line_text,
+                        enabled: is_en,
+                    })
+                    if self.items.len() >= 500 {
+                        return
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn render_into_buffer(self, world: EditorWorld, .focus_first_match: bool = false) -> Buffer {
+        let lines = List()
+        let targets = List()
+
+        let total = self.items.len()
+        let en_cnt = self.enabled_count()
+        let skip_cnt = total - en_cnt
+        let file_set = Set.new()
+        for i in 0..total {
+            file_set.insert(self.items.get(i.as(usize)).as(SpectreMatch).file_path)
+        }
+        let case_label = if self.case_sensitive { "sensitive" } else { "insensitive" }
+        let filt_label = if self.file_filter == "" { "*" } else { self.file_filter }
+
+        let hdr = [
+            "╭── Spectre Project Search & Replace ──────────────────────────────────────╮",
+            "│ Search:  " ++ self.search_query,
+            "│ Replace: " ++ self.replace_text,
+            "│ Filter:  " ++ filt_label ++ "   |   Case: " ++ case_label,
+            "│ Matches: " ++ en_cnt.to_string() ++ " [x] enabled, " ++ skip_cnt.to_string() ++ " [ ] skipped (" ++ total.to_string() ++ " total in " ++ file_set.len().to_string() ++ " files)",
+            "│ Keys:    s search | r replace | f filter | I case | <Space>/t/x toggle | <CR> jump | R/:w apply | q close",
+            "╰──────────────────────────────────────────────────────────────────────────╯",
+        ]
+        for hi in 0..hdr.len() {
+            lines.push(hdr.get(hi.as(usize)).as(String))
+            targets.push(SpectreRowTarget {
+                kind: "header",
+                match_idx: -1,
+                file_path: "",
+            })
+        }
+
+        var first_match_row: i64 = -1
+        let qlen = self.search_query.char_len()
+
+        if total == 0 {
+            let empty_msg = if self.search_query == "" {
+                "  (No search query set — press 's' to search workspace)"
+            } else {
+                "  (0 matches found for '" ++ self.search_query ++ "')"
+            }
+            lines.push(empty_msg)
+            targets.push(SpectreRowTarget {
+                kind: "header",
+                match_idx: -1,
+                file_path: "",
+            })
+        } else {
+            var cur_file = ""
+            for idx in 0..total {
+                let m = self.items.get(idx.as(usize)).as(SpectreMatch)
+                if m.file_path != cur_file {
+                    cur_file = m.file_path
+                    var f_en: i64 = 0
+                    var f_tot: i64 = 0
+                    for k in idx..total {
+                        let km = self.items.get(k.as(usize)).as(SpectreMatch)
+                        if km.file_path != cur_file {
+                            break
+                        }
+                        f_tot += 1
+                        if km.enabled {
+                            f_en += 1
+                        }
+                    }
+                    let f_box = if f_en == f_tot {
+                        "[x]"
+                    } else if f_en == 0 {
+                        "[ ]"
+                    } else {
+                        "[-]"
+                    }
+                    lines.push(
+                        "▾ " ++ f_box ++ " " ++ cur_file
+                        ++ " (" ++ f_en.to_string() ++ "/" ++ f_tot.to_string() ++ ")"
+                    )
+                    targets.push(SpectreRowTarget {
+                        kind: "file",
+                        match_idx: -1,
+                        file_path: cur_file,
+                    })
+                }
+
+                if first_match_row < 0 {
+                    first_match_row = lines.len()
+                }
+                let box_s = if m.enabled { "[x]" } else { "[ ]" }
+                let loc = m.file_path ++ ":" ++ (m.row + 1).to_string() ++ ":" ++ (m.col + 1).to_string()
+                let preview = build_preview_line(m.line_text, m.col, qlen, self.replace_text)
+                lines.push("  " ++ box_s ++ " " ++ loc ++ " | " ++ m.line_text ++ "  =>  " ++ preview)
+                targets.push(SpectreRowTarget {
+                    kind: "match",
+                    match_idx: idx,
+                    file_path: m.file_path,
+                })
+            }
+        }
+
+        self.row_targets = targets
+        let existing_opt = world.find_buffer_by_name(SPECTRE_BUF_NAME)
+        let prev_point = if existing_opt != null {
+            existing_opt.as(Buffer).point
+        } else {
+            Pos.zero()
+        }
+        let buf = world.ensure_special_buffer(SPECTRE_BUF_NAME, "spectre", lines, read_only = true)
+        if focus_first_match and first_match_row >= 0 {
+            buf.point = buf.clamp_pos(Pos.new(first_match_row, 0), insert_mode = false)
+        } else {
+            buf.point = buf.clamp_pos(prev_point, insert_mode = false)
+        }
+        buf.preferred_col = buf.point.col
+        buf
+    }
+}
+
+pub fn require_spectre_service(kernel: SystemKernel) -> !String SpectreService {
+    let raw = kernel.require_service(SERVICE_SPECTRE)!
+    raw.as(SpectreService)
+}
+
+fn matches_at_col(line: String, col: i64, query: String, case_sensitive: bool) -> bool {
+    let qlen = query.char_len()
+    if qlen == 0 or col < 0 or col + qlen > line.char_len() {
+        return false
+    }
+    let sub = line.slice(col, col + qlen)
+    if case_sensitive {
+        sub == query
+    } else {
+        sub.to_lower() == query.to_lower()
+    }
+}
+
+fn apply_spectre_replacements(kernel: SystemKernel) -> #InteractiveEffects !String (i64, i64) {
+    let world = require_editor_world(kernel)!
+    let svc = require_spectre_service(kernel)!
+    if svc.search_query == "" {
+        status_emit("Spectre: search query is empty")#
+        return (0, 0)
+    }
+
+    -- Group enabled matches by `file_path` while tracking disabled matches for post-refresh preservation
+    let file_order = List()
+    let by_file = HashMap.new()
+    let disabled_by_file = HashMap.new()
+
+    for i in 0..svc.items.len() {
+        let m = svc.items.get(i.as(usize)).as(SpectreMatch)
+        if m.enabled {
+            if not by_file.contains_key(m.file_path) {
+                file_order.push(m.file_path)
+                by_file.insert(m.file_path, List())
+            }
+            by_file.get(m.file_path).as(List).push(m)
+        } else {
+            if not disabled_by_file.contains_key(m.file_path) {
+                disabled_by_file.insert(m.file_path, List())
+            }
+            disabled_by_file.get(m.file_path).as(List).push(m)
+        }
+    }
+
+    if file_order.is_empty() {
+        status_emit("Spectre: 0 enabled matches to apply")#
+        return (0, 0)
+    }
+
+    let qlen = svc.search_query.char_len()
+    let rep = svc.replace_text
+    let rep_parts = rep.split("\n")
+    let rep_extra_rows = rep_parts.len() - 1
+    var files_changed: i64 = 0
+    var total_applied: i64 = 0
+
+    let preserved_disabled = Set.new()
+    for dkey in disabled_by_file.keys() {
+        let dfp = dkey.as(String)
+        if not by_file.contains_key(dfp) {
+            let dlist = disabled_by_file.get(dfp).as(List)
+            for di in 0..dlist.len() {
+                let dm = dlist.get(di.as(usize)).as(SpectreMatch)
+                preserved_disabled.insert(make_match_key(dm.file_path, dm.row, dm.col))
+            }
+        }
+    }
+
+    for fi in 0..file_order.len() {
+        let rel_path = file_order.get(fi.as(usize)).as(String)
+        let full_path = if path.is_absolute(rel_path) {
+            path.normalize(rel_path)
+        } else {
+            path.normalize(path.join(svc.root, rel_path))
+        }
+        let (lines, _crlf) = host_read_file_lines(full_path)!
+        let fmatches = by_file.get(rel_path).as(List)
+
+        -- Sort bottom-to-top (`row DESC`), right-to-left (`col DESC`) so edits never invalidate earlier coordinates!
+        fmatches.sort_by(|a: Any, b: Any| {
+            let ma = a.as(SpectreMatch)
+            let mb = b.as(SpectreMatch)
+            if ma.row != mb.row {
+                mb.row.cmp(ma.row)
+            } else {
+                mb.col.cmp(ma.col)
+            }
+        })
+
+        let applied_in_file = List()
+        var file_repl_count: i64 = 0
+        for mi in 0..fmatches.len() {
+            let m = fmatches.get(mi.as(usize)).as(SpectreMatch)
+            if m.row < 0 or m.row >= lines.len() {
+                continue
+            }
+            let cur_line = lines.get(m.row.as(usize)).as(String)
+            if not matches_at_col(cur_line, m.col, svc.search_query, svc.case_sensitive) {
+                continue
+            }
+            let prefix = cur_line.slice(0, m.col)
+            let suffix = cur_line.slice(m.col + qlen, cur_line.char_len())
+            if rep_extra_rows == 0 {
+                lines.set(m.row.as(usize), prefix ++ rep ++ suffix)
+            } else {
+                lines.set(m.row.as(usize), prefix ++ rep_parts.get(0).as(String))
+                for pi in 1..rep_extra_rows {
+                    lines.insert((m.row + pi).as(usize), rep_parts.get(pi.as(usize)).as(String))
+                }
+                lines.insert(
+                    (m.row + rep_extra_rows).as(usize),
+                    rep_parts.get(rep_extra_rows.as(usize)).as(String) ++ suffix,
+                )
+            }
+            applied_in_file.push(m)
+            file_repl_count += 1
+        }
+
+        if file_repl_count > 0 {
+            let _ = host_write_file_lines(full_path, lines, true)!
+            files_changed += 1
+            total_applied += file_repl_count
+
+            -- Synchronize open buffer in `world.buffers` so open buffers never go stale!
+            let open_opt = world.find_buffer_by_path(full_path)
+            if open_opt != null {
+                let ob = open_opt.as(Buffer)
+                let was_ro = ob.read_only
+                ob.read_only = false
+                ob.set_lines(lines, record_undo = false)
+                ob.point = ob.clamp_pos(ob.point, insert_mode = false)
+                ob.preferred_col = ob.point.col
+                ob.modified = false
+                ob.read_only = was_ro
+                kernel.emit_hook("buffer-modified", ob.id)
+            }
+        }
+
+        -- Map disabled coordinates in this file across any row/col shifts
+        if disabled_by_file.contains_key(rel_path) {
+            let dlist = disabled_by_file.get(rel_path).as(List)
+            for di in 0..dlist.len() {
+                let dm = dlist.get(di.as(usize)).as(SpectreMatch)
+                var new_r = dm.row
+                var new_c = dm.col
+                for ai in 0..applied_in_file.len() {
+                    let am = applied_in_file.get(ai.as(usize)).as(SpectreMatch)
+                    if am.row < dm.row {
+                        new_r += rep_extra_rows
+                    } else if am.row == dm.row and am.col < dm.col {
+                        if rep_extra_rows == 0 {
+                            new_c += (rep.char_len() - qlen)
+                        } else {
+                            new_r += rep_extra_rows
+                            let last_part_len = rep_parts.get(rep_extra_rows.as(usize)).as(String).char_len()
+                            new_c = last_part_len + (dm.col - (am.col + qlen))
+                        }
+                    }
+                }
+                preserved_disabled.insert(make_match_key(rel_path, new_r, new_c))
+            }
+        }
+    }
+
+    svc.refresh_matches(disabled_keys = preserved_disabled)
+    let _ = svc.render_into_buffer(world, focus_first_match = false)
+
+    let summary = "Applied " ++ total_applied.to_string() ++ " replacement(s) across " ++ files_changed.to_string() ++ " file(s)"
+    let _ = world.push_notification("info", "Spectre", summary)
+    log_event("info", "ext_spectre", summary)#
+    status_emit("Spectre: " ++ summary)#
+    (files_changed, total_applied)
+}
+
+fn cmd_spectre_open(kern: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let svc = require_spectre_service(kern)!
+    let cur_buf = world.active_buffer()
+    if cur_buf.name != SPECTRE_BUF_NAME and cur_buf.major_mode != "spectre" {
+        svc.prev_buf_id = cur_buf.id
+    }
+    svc.root = world.cwd
+
+    var query_supplied = false
+    if not args.is_empty() {
+        let raw_arg = args.get(0).as(String).trim()
+        if raw_arg != "" {
+            svc.search_query = raw_arg
+            query_supplied = true
+        }
+    }
+
+    if not query_supplied {
+        if cur_buf.major_mode != "spectre" {
+            let w = word_at_cursor(cur_buf)
+            if w != "" {
+                svc.search_query = w
+                query_supplied = true
+            }
+        }
+    }
+
+    if (not query_supplied) and svc.search_query == "" {
+        let ans_opt = ask_prompt(PromptRequest.text("Spectre search: ", svc.search_query))#
+        if ans_opt == null {
+            status_emit("Spectre cancelled")#
+            return ()
+        }
+        svc.search_query = ans_opt.as(String)
+    }
+
+    svc.refresh_matches()
+    let sb = svc.render_into_buffer(world, focus_first_match = true)
+    let _ = world.switch_to_buffer(sb.id)
+    kern.emit_hook("buffer-switched", sb.id)
+    status_emit(
+        "Spectre: " ++ svc.items.len().to_string() ++ " match(es) for '" ++ svc.search_query ++ "'"
+    )#
+    sb.id
+}
+
+fn cmd_spectre_toggle_item(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let svc = require_spectre_service(kern)!
+    let buf = world.active_buffer()
+    if buf.major_mode != "spectre" {
+        return false
+    }
+    let r = buf.point.row
+    if r < 0 or r >= svc.row_targets.len() {
+        return false
+    }
+    let tgt = svc.row_targets.get(r.as(usize)).as(SpectreRowTarget)
+    if tgt.kind == "match" and tgt.match_idx >= 0 and tgt.match_idx < svc.items.len() {
+        let m = svc.items.get(tgt.match_idx.as(usize)).as(SpectreMatch)
+        let next_en = not m.enabled
+        svc.items.set(
+            tgt.match_idx.as(usize),
+            SpectreMatch {
+                file_path: m.file_path,
+                row: m.row,
+                col: m.col,
+                line_text: m.line_text,
+                enabled: next_en,
+            },
+        )
+        let saved_p = buf.point
+        let updated = svc.render_into_buffer(world, focus_first_match = false)
+        updated.point = updated.clamp_pos(saved_p, insert_mode = false)
+        updated.preferred_col = updated.point.col
+        return true
+    }
+    if tgt.kind == "file" and tgt.file_path != "" {
+        var any_enabled = false
+        for i in 0..svc.items.len() {
+            let m = svc.items.get(i.as(usize)).as(SpectreMatch)
+            if m.file_path == tgt.file_path and m.enabled {
+                any_enabled = true
+                break
+            }
+        }
+        let next_en = not any_enabled
+        for i in 0..svc.items.len() {
+            let m = svc.items.get(i.as(usize)).as(SpectreMatch)
+            if m.file_path == tgt.file_path {
+                svc.items.set(
+                    i.as(usize),
+                    SpectreMatch {
+                        file_path: m.file_path,
+                        row: m.row,
+                        col: m.col,
+                        line_text: m.line_text,
+                        enabled: next_en,
+                    },
+                )
+            }
+        }
+        let saved_p = buf.point
+        let updated = svc.render_into_buffer(world, focus_first_match = false)
+        updated.point = updated.clamp_pos(saved_p, insert_mode = false)
+        updated.preferred_col = updated.point.col
+        return true
+    }
+    false
+}
+
+fn cmd_spectre_set_search(kern: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let svc = require_spectre_service(kern)!
+    let prompt_lbl = if svc.search_query != "" {
+        "Spectre search [" ++ svc.search_query ++ "]: "
+    } else {
+        "Spectre search: "
+    }
+    let q = if not args.is_empty() {
+        args.get(0).as(String)
+    } else {
+        let ans? = ask_prompt(PromptRequest.text(prompt_lbl, ""))# else {
+            return ()
+        }
+        ans
+    }
+    svc.root = world.cwd
+    svc.search_query = q
+    svc.refresh_matches()
+    let sb = svc.render_into_buffer(world, focus_first_match = true)
+    let _ = world.switch_to_buffer(sb.id)
+    status_emit("Spectre search: '" ++ q ++ "' (" ++ svc.items.len().to_string() ++ " matches)")#
+    svc.items.len()
+}
+
+fn cmd_spectre_set_replace(kern: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let svc = require_spectre_service(kern)!
+    let prompt_lbl = if svc.replace_text != "" {
+        "Spectre replace [" ++ svc.replace_text ++ "]: "
+    } else {
+        "Spectre replace: "
+    }
+    let rep = if not args.is_empty() {
+        args.get(0).as(String)
+    } else {
+        let ans? = ask_prompt(PromptRequest.text(prompt_lbl, ""))# else {
+            return ()
+        }
+        ans
+    }
+    svc.replace_text = rep
+    let sb = svc.render_into_buffer(world, focus_first_match = false)
+    let _ = world.switch_to_buffer(sb.id)
+    status_emit("Spectre replace -> '" ++ rep ++ "'")#
+    rep
+}
+
+fn cmd_spectre_set_filter(kern: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let svc = require_spectre_service(kern)!
+    let prompt_lbl = if svc.file_filter != "" {
+        "Spectre file filter [" ++ svc.file_filter ++ "]: "
+    } else {
+        "Spectre file filter: "
+    }
+    let filt = if not args.is_empty() {
+        args.get(0).as(String)
+    } else {
+        let ans? = ask_prompt(PromptRequest.text(prompt_lbl, ""))# else {
+            return ()
+        }
+        ans
+    }
+    svc.root = world.cwd
+    svc.file_filter = filt.trim()
+    svc.refresh_matches()
+    let sb = svc.render_into_buffer(world, focus_first_match = true)
+    let _ = world.switch_to_buffer(sb.id)
+    status_emit("Spectre filter: '" ++ svc.file_filter ++ "' (" ++ svc.items.len().to_string() ++ " matches)")#
+    svc.items.len()
+}
+
+fn cmd_spectre_toggle_case(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let svc = require_spectre_service(kern)!
+    svc.root = world.cwd
+    svc.case_sensitive = not svc.case_sensitive
+    svc.refresh_matches()
+    let sb = svc.render_into_buffer(world, focus_first_match = false)
+    let _ = world.switch_to_buffer(sb.id)
+    let label = if svc.case_sensitive { "sensitive" } else { "insensitive" }
+    status_emit("Spectre case: " ++ label ++ " (" ++ svc.items.len().to_string() ++ " matches)")#
+    svc.case_sensitive
+}
+
+fn cmd_spectre_jump(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let svc = require_spectre_service(kern)!
+    let buf = world.active_buffer()
+    if buf.major_mode != "spectre" {
+        return ()
+    }
+    let r = buf.point.row
+    if r < 0 or r >= svc.row_targets.len() {
+        return ()
+    }
+    let tgt = svc.row_targets.get(r.as(usize)).as(SpectreRowTarget)
+    var target_match: ?SpectreMatch = null
+    if tgt.kind == "match" and tgt.match_idx >= 0 and tgt.match_idx < svc.items.len() {
+        target_match = svc.items.get(tgt.match_idx.as(usize)).as(SpectreMatch)
+    } else if tgt.kind == "file" and tgt.file_path != "" {
+        for i in 0..svc.items.len() {
+            let m = svc.items.get(i.as(usize)).as(SpectreMatch)
+            if m.file_path == tgt.file_path {
+                target_match = m
+                break
+            }
+        }
+    }
+    let m? = target_match else {
+        return ()
+    }
+    let full_path = if path.is_absolute(m.file_path) {
+        path.normalize(m.file_path)
+    } else {
+        path.normalize(path.join(svc.root, m.file_path))
+    }
+    world.jumps.record(buf.id, buf.file_path, buf.point)
+    let opened = world.open_file(full_path)#!
+    opened.point = opened.clamp_pos(Pos.new(m.row, m.col), insert_mode = false)
+    opened.preferred_col = opened.point.col
+    kern.emit_hook("buffer-switched", opened.id)
+    opened.id
+}
+
+fn cmd_spectre_apply(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    apply_spectre_replacements(kern)#!
+}
+
+fn cmd_spectre_close(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let svc = require_spectre_service(kern)!
+    let existing_opt = world.find_buffer_by_name(SPECTRE_BUF_NAME)
+    if existing_opt != null {
+        let sb = existing_opt.as(Buffer)
+        let _ = world.kill_buffer(sb.id, force = true)!
+        if world.buffers.contains_key(svc.prev_buf_id) {
+            let _ = world.switch_to_buffer(svc.prev_buf_id)
+        }
+        kern.emit_hook("buffer-switched", world.active_buffer_id)
+        status_emit("Closed *Spectre*")#
+    }
+    ()
+}
+
+pub fn register_spectre_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_spectre_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_spectre",
+        "0.1.0",
+        "Interactive workspace search & selective multi-file replace panel (`nvim-spectre` / `wgrep`).",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let svc = SpectreService.new()
+            k.publish_service(SERVICE_SPECTRE, ext_id, svc)
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> s R", "spectre-open", ext_id, description = "Project search & replace (Spectre)")
+
+            let spec_km = k.ensure_keymap("mode:spectre")
+            spec_km.bind("<Space>", "spectre-toggle-item", ext_id, description = "Toggle replacement item/file")
+            spec_km.bind("t", "spectre-toggle-item", ext_id, description = "Toggle replacement item/file")
+            spec_km.bind("x", "spectre-toggle-item", ext_id, description = "Toggle replacement item/file")
+            spec_km.bind("s", "spectre-set-search", ext_id, description = "Set search query")
+            spec_km.bind("r", "spectre-set-replace", ext_id, description = "Set replacement text")
+            spec_km.bind("f", "spectre-set-filter", ext_id, description = "Set file filter")
+            spec_km.bind("I", "spectre-toggle-case", ext_id, description = "Toggle case sensitivity")
+            spec_km.bind("<Return>", "spectre-jump", ext_id, description = "Jump to match location")
+            spec_km.bind("R", "spectre-apply", ext_id, description = "Apply enabled replacements")
+            spec_km.bind("q", "spectre-close", ext_id, description = "Close *Spectre* panel")
+
+            k.register_command(
+                "spectre",
+                ext_id,
+                "Open *Spectre* project search & replace panel (`:Spectre [query]`).",
+                cmd_spectre_open,
+            )
+            k.register_command(
+                "spectre-open",
+                ext_id,
+                "Open *Spectre* project search & replace panel (`<Space> s R`).",
+                cmd_spectre_open,
+            )
+            k.register_command(
+                "spectre-toggle-item",
+                ext_id,
+                "Toggle `[x]`/`[ ]` on match or file header under cursor in *Spectre*.",
+                cmd_spectre_toggle_item,
+            )
+            k.register_command(
+                "spectre-set-search",
+                ext_id,
+                "Set search query in *Spectre* (`s`).",
+                cmd_spectre_set_search,
+            )
+            k.register_command(
+                "spectre-set-replace",
+                ext_id,
+                "Set replacement text in *Spectre* (`r`).",
+                cmd_spectre_set_replace,
+            )
+            k.register_command(
+                "spectre-set-filter",
+                ext_id,
+                "Set file path filter in *Spectre* (`f`).",
+                cmd_spectre_set_filter,
+            )
+            k.register_command(
+                "spectre-toggle-case",
+                ext_id,
+                "Toggle case sensitivity in *Spectre* (`I`).",
+                cmd_spectre_toggle_case,
+            )
+            k.register_command(
+                "spectre-jump",
+                ext_id,
+                "Jump to source file & position of match under cursor in *Spectre* (`<Return>`).",
+                cmd_spectre_jump,
+            )
+            k.register_command(
+                "spectre-apply",
+                ext_id,
+                "Apply all `[x]` enabled replacements across workspace (`R`).",
+                cmd_spectre_apply,
+            )
+            k.register_command(
+                "write-buffer-mode:spectre",
+                ext_id,
+                "Apply all `[x]` enabled replacements when saving *Spectre* via `:w`.",
+                cmd_spectre_apply,
+                interactive = false,
+            )
+            k.register_command(
+                "spectre-close",
+                ext_id,
+                "Close *Spectre* buffer (`q`).",
+                cmd_spectre_close,
+            )
+
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let lkm_opt = k.keymaps.get(KEYMAP_VIM_LEADER)
+            if lkm_opt != null {
+                let _ = lkm_opt.as(Keymap).unbind("<Space> s R")
+            }
+            ()
+        },
+    )
+}

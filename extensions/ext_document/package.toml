@@ -1,0 +1,11 @@
+[package]
+name = "ext_document"
+domain = "lava.org"
+version = "0.1.0"
+type = "lib"
+
+[dependencies]
+"lava.org/lava_sys" = { path = "../../packages/lava_sys" }
+"lava.org/lava_core" = { path = "../../packages/lava_core" }
+"lava.org/lava_remote" = { path = "../../packages/lava_remote" }
+"lava.org/lava_accel" = { path = "../../packages/lava_accel" }

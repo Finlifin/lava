@@ -1,0 +1,3629 @@
+-- lava_accel: High-Performance Native Accelerator Library for Lava.
+-- Bridges `lava-accel` Rust hot-paths via `std.runtime.host_call` when running inside Lava,
+-- and provides deterministic Nessa fallbacks (using `std.fs.walk_dir` and `std.process.exec`)
+-- so standalone `nessa run` plugin test suites run identically without GTK/Host wiring.
+
+use std.collections.{HashMap, Set}
+use std.fs
+use std.path
+use std.process
+use std.runtime
+
+pub struct FuzzyHit {
+    pub index: i64,
+    pub score: i64,
+}
+derive Eq, PartialEq, Display for FuzzyHit
+
+pub struct OrderlessHit {
+    pub index: i64,
+    pub score: i64,
+    pub positions: List,
+}
+
+pub struct GrepHit {
+    pub file_path: String,
+    pub row: i64,
+    pub col: i64,
+    pub line_text: String,
+}
+derive Eq, PartialEq, Display for GrepHit
+
+pub struct DiffHunk {
+    pub old_start: i64,
+    pub old_count: i64,
+    pub new_start: i64,
+    pub new_count: i64,
+    pub kind: String,
+}
+derive Eq, PartialEq, Display for DiffHunk
+
+pub struct GitFileEntry {
+    pub index_status: String,
+    pub worktree_status: String,
+    pub rel_path: String,
+}
+derive Eq, PartialEq, Display for GitFileEntry
+
+pub struct GitStatusSummary {
+    pub is_repo: bool,
+    pub root: String,
+    pub branch: String,
+    pub staged_count: i64,
+    pub modified_count: i64,
+    pub untracked_count: i64,
+    pub entries: List,
+}
+
+pub struct GitBlame {
+    pub commit_short: String,
+    pub author: String,
+    pub date_ymd: String,
+    pub summary: String,
+}
+derive Eq, PartialEq, Display for GitBlame
+
+pub struct SymbolItem {
+    pub name: String,
+    pub kind: String,
+    pub row: i64,
+    pub col: i64,
+    pub level: i64,
+}
+derive Eq, PartialEq, Display for SymbolItem
+
+pub struct TodoItem {
+    pub file_path: String,
+    pub row: i64,
+    pub col: i64,
+    pub tag: String,
+    pub text: String,
+}
+derive Eq, PartialEq, Display for TodoItem
+
+pub struct DocNode {
+    pub node_id: String,
+    pub manual: String,
+    pub title: String,
+    pub level: i64,
+    pub file_path: String,
+    pub start_row: i64,
+    pub end_row: i64,
+    pub tags: List,
+    pub summary: String,
+}
+
+pub struct DocSearchHit {
+    pub node_id: String,
+    pub manual: String,
+    pub title: String,
+    pub file_path: String,
+    pub row: i64,
+    pub score: i64,
+    pub matched_tag: String,
+    pub snippet: String,
+}
+derive Eq, PartialEq, Display for DocSearchHit
+
+pub struct SymbolDefHit {
+    pub symbol: String,
+    pub kind: String,
+    pub file_path: String,
+    pub row: i64,
+    pub signature: String,
+    pub doc_comment: String,
+}
+derive Eq, PartialEq, Display for SymbolDefHit
+
+pub struct NativeDiagHit {
+    pub row: i64,
+    pub col: i64,
+    pub end_col: i64,
+    pub severity: String,
+    pub source: String,
+    pub message: String,
+}
+derive Eq, PartialEq, Display for NativeDiagHit
+
+pub struct SymbolOutlineSpan {
+    pub name: String,
+    pub kind: String,
+    pub row: i64,
+    pub col: i64,
+    pub level: i64,
+    pub end_row: i64,
+}
+derive Eq, PartialEq, Display for SymbolOutlineSpan
+
+pub struct NativeConflictHit {
+    pub start_row: i64,
+    pub base_row: i64,
+    pub sep_row: i64,
+    pub end_row: i64,
+    pub ours_label: String,
+    pub theirs_label: String,
+}
+derive Eq, PartialEq, Display for NativeConflictHit
+
+-- ============================================================================
+-- 1. Fuzzy Batch Ranker
+-- ============================================================================
+
+private fn fallback_fuzzy_score(q_trim: String, q_low: String, cand: String) -> i64 {
+    if q_trim == "" {
+        return 100
+    }
+    let c_low = cand.to_lower()
+    if c_low == q_low {
+        return 20000
+    }
+    if c_low.starts_with(q_low) {
+        return 15000 - (c_low.char_len() - q_low.char_len())
+    }
+    let hits = c_low.find_indices(q_low)
+    if not hits.is_empty() {
+        let pos = hits.get(0).as(i64)
+        return 9000 - pos * 4 - c_low.char_len()
+    }
+    let qlen = q_low.char_len()
+    let clen = c_low.char_len()
+    if qlen > clen {
+        return -1
+    }
+    var qi: i64 = 0
+    var ci: i64 = 0
+    var bonus: i64 = 0
+    while qi < qlen and ci < clen {
+        if c_low.slice(ci, ci + 1) == q_low.slice(qi, qi + 1) {
+            if ci == 0 {
+                bonus += 45
+            } else {
+                let prev = c_low.slice(ci - 1, ci)
+                if prev == "/" or prev == "_" or prev == "-" or prev == "." or prev == " " {
+                    bonus += 45
+                }
+            }
+            qi += 1
+        }
+        ci += 1
+    }
+    if qi == qlen {
+        3000 + bonus - clen
+    } else {
+        -1
+    }
+}
+
+pub fn accel_fuzzy_rank(query: String, candidates: List, .limit: i64 = 100) -> List {
+    let raw! = runtime.host_call("accel_fuzzy_rank", [query, candidates, limit]) else {
+        let q_trim = query.trim()
+        let q_low = q_trim.to_lower()
+        let pairs = List()
+        for i in 0..candidates.len() {
+            let cand = candidates.get(i.as(usize)).as(String)
+            let sc = fallback_fuzzy_score(q_trim, q_low, cand)
+            if sc >= 0 {
+                pairs.push(FuzzyHit { index: i, score: sc })
+            }
+        }
+        pairs.sort_by(|a: Any, b: Any| {
+            let fa = a.as(FuzzyHit)
+            let fb = b.as(FuzzyHit)
+            if fa.score != fb.score {
+                fb.score.cmp(fa.score)
+            } else {
+                fa.index.cmp(fb.index)
+            }
+        })
+        if limit > 0 and pairs.len() > limit {
+            let trimmed = List()
+            for j in 0..limit {
+                trimmed.push(pairs.get(j.as(usize)))
+            }
+            return trimmed
+        }
+        return pairs
+    }
+    let arr = raw.as(List)
+    let out = List()
+    for i in 0..arr.len() {
+        let row = arr.get(i.as(usize)).as(List)
+        out.push(FuzzyHit {
+            index: row.get(0).as(i64),
+            score: row.get(1).as(i64),
+        })
+    }
+    out
+}
+
+private fn ol_is_sep(ch: char) -> bool {
+    ch == '-' or ch == '_' or ch == '/' or ch == '.' or ch == ' ' or ch == ':' or ch == '*'
+}
+
+private fn ol_is_word_start(cs: List, idx: i64) -> bool {
+    if idx <= 0 {
+        return true
+    }
+    ol_is_sep(cs.get((idx - 1).as(usize)).as(char))
+}
+
+private fn ol_range_indices(s0: i64, e0: i64) -> List {
+    let out = List()
+    if e0 <= s0 {
+        return out
+    }
+    for i in s0..e0 {
+        out.push(i)
+    }
+    out
+}
+
+private fn ol_word_boundary_dp(qs: List, cs: List) -> (i64, List) {
+    let qlen = qs.len()
+    let clen = cs.len()
+    if qlen == 0 {
+        return (0, List())
+    }
+    if qlen > clen {
+        return (-1, List())
+    }
+    let stride = (clen + 1) * 2
+    let total_cells = (qlen + 1) * stride
+    let dp = List()
+    let choice = List()
+    for _ in 0..total_cells {
+        dp.push(-1)
+        choice.push(0)
+    }
+    for ci in 0..(clen + 1) {
+        dp.set((qlen * stride + ci * 2).as(usize), 0)
+        dp.set((qlen * stride + ci * 2 + 1).as(usize), 0)
+    }
+    var qi = qlen - 1
+    while qi >= 0 {
+        let qch = qs.get(qi.as(usize)).as(char)
+        let next_row = (qi + 1) * stride
+        let cur_row = qi * stride
+        var best_jump_sc: i64 = -1
+        var best_jump_pos: i64 = 0
+        var ci = clen - 1
+        while ci >= 0 {
+            let cch = cs.get(ci.as(usize)).as(char)
+            if ol_is_word_start(cs, ci) and cch == qch {
+                let sub = dp.get((next_row + (ci + 1) * 2 + 1).as(usize)).as(i64)
+                if sub >= 0 {
+                    let bonus = (if ci == 0 { 45 } else { 30 }) + sub
+                    if bonus >= best_jump_sc {
+                        best_jump_sc = bonus
+                        best_jump_pos = ci
+                    }
+                }
+            }
+            dp.set((cur_row + ci * 2).as(usize), best_jump_sc)
+            choice.set((cur_row + ci * 2).as(usize), best_jump_pos)
+
+            var best = best_jump_sc
+            var best_pos = best_jump_pos
+            if cch == qch {
+                let sub = dp.get((next_row + (ci + 1) * 2 + 1).as(usize)).as(i64)
+                if sub >= 0 {
+                    let cont = 25 + sub
+                    if cont >= best {
+                        best = cont
+                        best_pos = ci
+                    }
+                }
+            }
+            dp.set((cur_row + ci * 2 + 1).as(usize), best)
+            choice.set((cur_row + ci * 2 + 1).as(usize), best_pos)
+            ci -= 1
+        }
+        qi -= 1
+    }
+    let root_sc = dp.get(0).as(i64)
+    if root_sc < 0 {
+        return (-1, List())
+    }
+    let pos = List()
+    var cur_ci: i64 = 0
+    var in_run: i64 = 0
+    for qk in 0..qlen {
+        let mpos = choice.get((qk * stride + cur_ci * 2 + in_run).as(usize)).as(i64)
+        pos.push(mpos)
+        cur_ci = mpos + 1
+        in_run = 1
+    }
+    (root_sc, pos)
+}
+
+private fn ol_score_token(raw_tok: String, c: String, cs: List, clen: i64) -> (bool, i64, List) {
+    let tlen = raw_tok.char_len()
+    if tlen == 0 {
+        return (false, 100, List())
+    }
+    if raw_tok.starts_with("!") and tlen > 1 {
+        let neg = raw_tok.drop(1).to_lower()
+        if c.contains(neg) {
+            return (true, -1, List())
+        }
+        return (true, 200, List())
+    }
+    if raw_tok.starts_with("^") and tlen > 1 {
+        let anch = raw_tok.drop(1).to_lower()
+        let alen = anch.char_len()
+        if c.starts_with(anch) {
+            return (false, 8500 - (clen - alen), ol_range_indices(0, alen))
+        }
+        let slash_hits = c.find_indices("/" ++ anch)
+        if not slash_hits.is_empty() {
+            let h0 = slash_hits.get(0).as(i64) + 1
+            return (false, 7600 - (clen - alen), ol_range_indices(h0, h0 + alen))
+        }
+        return (false, -1, List())
+    }
+    if raw_tok.ends_with("$") and tlen > 1 {
+        let anch = raw_tok.slice(0, tlen - 1).to_lower()
+        let alen = anch.char_len()
+        if c.ends_with(anch) {
+            return (false, 7800 - (clen - alen), ol_range_indices(clen - alen, clen))
+        }
+        return (false, -1, List())
+    }
+    if raw_tok.starts_with("=") and tlen > 1 {
+        let lit = raw_tok.drop(1).to_lower()
+        let llen = lit.char_len()
+        if c == lit {
+            return (false, 10000, ol_range_indices(0, clen))
+        }
+        let hits = c.find_indices(lit)
+        if not hits.is_empty() {
+            let h0 = hits.get(0).as(i64)
+            return (false, 5000 - h0 * 5 - (clen - llen), ol_range_indices(h0, h0 + llen))
+        }
+        return (false, -1, List())
+    }
+    let q = raw_tok.to_lower()
+    let qs = q.chars()
+    let qlen = qs.len()
+    if c == q {
+        return (false, 10000, ol_range_indices(0, clen))
+    }
+    if c.starts_with(q) {
+        return (false, 8000 - (clen - qlen), ol_range_indices(0, qlen))
+    }
+    let (wb_bonus, wb_pos) = ol_word_boundary_dp(qs, cs)
+    if wb_bonus >= 0 {
+        return (false, 6000 + wb_bonus - clen, wb_pos)
+    }
+    let sub_hits = c.find_indices(q)
+    if not sub_hits.is_empty() {
+        let f0 = sub_hits.get(0).as(i64)
+        return (false, 4000 - f0 * 5 - (clen - qlen), ol_range_indices(f0, f0 + qlen))
+    }
+    if qlen > clen {
+        return (false, -1, List())
+    }
+    var qi: i64 = 0
+    var ci: i64 = 0
+    var prev_m: i64 = -2
+    var bonus: i64 = 0
+    var gaps: i64 = 0
+    let pos = List()
+    while qi < qlen and ci < clen {
+        if cs.get(ci.as(usize)).as(char) == qs.get(qi.as(usize)).as(char) {
+            if ol_is_word_start(cs, ci) {
+                bonus += 35
+            }
+            if prev_m + 1 == ci {
+                bonus += 20
+            } else if prev_m >= 0 {
+                gaps += (ci - prev_m - 1)
+            }
+            pos.push(ci)
+            prev_m = ci
+            qi += 1
+        }
+        ci += 1
+    }
+    if qi < qlen {
+        return (false, -1, List())
+    }
+    (false, 2000 + bonus - gaps * 3 - clen, pos)
+}
+
+private fn ol_dedup_sorted(raw: List, clen: i64) -> List {
+    if raw.is_empty() {
+        return List()
+    }
+    let tmp = List()
+    for i in 0..raw.len() {
+        let v = raw.get(i.as(usize)).as(i64)
+        if v >= 0 and v < clen {
+            tmp.push(v)
+        }
+    }
+    tmp.sort_by(|a: Any, b: Any| a.as(i64).cmp(b.as(i64)))
+    let out = List()
+    var prev: i64 = -1
+    for i in 0..tmp.len() {
+        let v = tmp.get(i.as(usize)).as(i64)
+        if v != prev {
+            out.push(v)
+            prev = v
+        }
+    }
+    out
+}
+
+private fn fallback_orderless_rank(query: String, candidates: List, limit: i64) -> (i64, List) {
+    let trimmed = query.trim()
+    let raw_parts = if trimmed == "" { List() } else { trimmed.split(" ") }
+    let tokens = List()
+    for i in 0..raw_parts.len() {
+        let p = raw_parts.get(i.as(usize)).as(String)
+        if p != "" {
+            tokens.push(p)
+        }
+    }
+    if tokens.is_empty() {
+        let total = candidates.len()
+        let take_n = if limit > 0 and limit < total { limit } else { total }
+        let out = List()
+        for i in 0..take_n {
+            out.push(OrderlessHit {
+                index: i,
+                score: 100 - i,
+                positions: List(),
+            })
+        }
+        return (total, out)
+    }
+
+    let hits = List()
+    let single = tokens.len() == 1
+    let tok0 = if single { tokens.get(0).as(String) } else { "" }
+    for idx in 0..candidates.len() {
+        let cand = candidates.get(idx.as(usize)).as(String)
+        let c = cand.to_lower()
+        let cs = c.chars()
+        let clen = cs.len()
+        if single {
+            let (_, sc0, pos0) = ol_score_token(tok0, c, cs, clen)
+            if sc0 >= 0 {
+                hits.push(OrderlessHit {
+                    index: idx,
+                    score: sc0,
+                    positions: ol_dedup_sorted(pos0, clen),
+                })
+            }
+        } else {
+            var ok = true
+            var pos_sum: i64 = 0
+            var pos_cnt: i64 = 0
+            let comb = List()
+            for ti in 0..tokens.len() {
+                let tok = tokens.get(ti.as(usize)).as(String)
+                let (is_neg, sc, tpos) = ol_score_token(tok, c, cs, clen)
+                if sc < 0 {
+                    ok = false
+                    break
+                }
+                if not is_neg {
+                    pos_sum += sc
+                    pos_cnt += 1
+                    for pi in 0..tpos.len() {
+                        comb.push(tpos.get(pi.as(usize)).as(i64))
+                    }
+                }
+            }
+            if ok {
+                let fsc = if pos_cnt > 0 {
+                    3500 + (pos_sum / pos_cnt) / 4 - clen
+                } else {
+                    200 - clen
+                }
+                hits.push(OrderlessHit {
+                    index: idx,
+                    score: fsc,
+                    positions: ol_dedup_sorted(comb, clen),
+                })
+            }
+        }
+    }
+
+    let total = hits.len()
+    hits.sort_by(|a: Any, b: Any| {
+        let ha = a.as(OrderlessHit)
+        let hb = b.as(OrderlessHit)
+        if ha.score != hb.score {
+            return hb.score.cmp(ha.score)
+        }
+        let ca = candidates.get(ha.index.as(usize)).as(String)
+        let cb = candidates.get(hb.index.as(usize)).as(String)
+        if ca != cb {
+            return ca.cmp(cb)
+        }
+        ha.index.cmp(hb.index)
+    })
+    if limit > 0 and hits.len() > limit {
+        let out = List()
+        for j in 0..limit {
+            out.push(hits.get(j.as(usize)))
+        }
+        return (total, out)
+    }
+    (total, hits)
+}
+
+pub fn accel_orderless_rank(query: String, candidates: List, .limit: i64 = 200) -> (i64, List) {
+    let raw! = runtime.host_call("accel_orderless_rank", [query, candidates, limit]) else {
+        return fallback_orderless_rank(query, candidates, limit)
+    }
+    let top = raw.as(List)
+    let total = top.get(0).as(i64)
+    let arr = top.get(1).as(List)
+    let out = List()
+    for i in 0..arr.len() {
+        let row = arr.get(i.as(usize)).as(List)
+        out.push(OrderlessHit {
+            index: row.get(0).as(i64),
+            score: row.get(1).as(i64),
+            positions: row.get(2).as(List),
+        })
+    }
+    (total, out)
+}
+
+-- ============================================================================
+-- 2. Workspace File Indexer, Live Grep & Atomic Multi-File Replace
+-- ============================================================================
+
+private fn is_ignored_rel_path(rel: String) -> bool {
+    rel.starts_with("target/")
+        or rel.starts_with("node_modules/")
+        or rel.starts_with(".git/")
+        or rel.contains("/target/")
+        or rel.contains("/node_modules/")
+        or rel.ends_with(".nsbc")
+        or rel.ends_with(".o")
+        or rel.ends_with(".so")
+}
+
+pub fn accel_workspace_files(
+    root: String,
+    .max_files: i64 = 10000,
+    .include_hidden: bool = false,
+) -> List {
+    let raw! = runtime.host_call("accel_workspace_files", [root, max_files, include_hidden]) else {
+        let walked! = fs.walk_dir(root, max_depth = 16, include_hidden = include_hidden) else {
+            return List()
+        }
+        let out = List()
+        for i in 0..walked.len() {
+            let rel = walked.get(i.as(usize)).as(String)
+            if not is_ignored_rel_path(rel) {
+                out.push(rel)
+                if max_files > 0 and out.len() >= max_files {
+                    break
+                }
+            }
+        }
+        return out
+    }
+    raw.as(List)
+}
+
+pub fn accel_workspace_grep(
+    root: String,
+    query: String,
+    .case_sensitive: bool = false,
+    .max_results: i64 = 300,
+    .file_filter: String = "",
+) -> List {
+    if query == "" {
+        return List()
+    }
+    let raw! = runtime.host_call(
+        "accel_workspace_grep",
+        [root, query, case_sensitive, max_results, file_filter]
+    ) else {
+        let files = accel_workspace_files(root, max_files = 3000)
+        let filt_low = file_filter.trim().to_lower()
+        let q_cmp = if case_sensitive { query } else { query.to_lower() }
+        let out = List()
+        for i in 0..files.len() {
+            let rel = files.get(i.as(usize)).as(String)
+            if filt_low != "" and (not rel.to_lower().contains(filt_low)) {
+                continue
+            }
+            let full = path.join(root, rel)
+            let content! = fs.read_to_string(full) else {
+                continue
+            }
+            let lines = content.replace("\r\n", "\n").split("\n")
+            for r in 0..lines.len() {
+                let line = lines.get(r.as(usize)).as(String)
+                let hay = if case_sensitive { line } else { line.to_lower() }
+                let idxs = hay.find_indices(q_cmp)
+                if not idxs.is_empty() {
+                    out.push(GrepHit {
+                        file_path: rel,
+                        row: r,
+                        col: idxs.get(0).as(i64),
+                        line_text: line,
+                    })
+                    if max_results > 0 and out.len() >= max_results {
+                        return out
+                    }
+                }
+            }
+        }
+        return out
+    }
+    let arr = raw.as(List)
+    let out = List()
+    for i in 0..arr.len() {
+        let row = arr.get(i.as(usize)).as(List)
+        out.push(GrepHit {
+            file_path: row.get(0).as(String),
+            row: row.get(1).as(i64),
+            col: row.get(2).as(i64),
+            line_text: row.get(3).as(String),
+        })
+    }
+    out
+}
+
+pub fn accel_workspace_replace(
+    root: String,
+    query: String,
+    replacement: String,
+    .case_sensitive: bool = true,
+    .file_filter: String = "",
+) -> !String (i64, i64) {
+    if query == "" {
+        return error "search query cannot be empty"
+    }
+    let raw! = runtime.host_call(
+        "accel_workspace_replace",
+        [root, query, replacement, case_sensitive, file_filter]
+    ) else {
+        let files = accel_workspace_files(root, max_files = 3000)
+        let filt_low = file_filter.trim().to_lower()
+        var files_changed: i64 = 0
+        var total_repl: i64 = 0
+        for i in 0..files.len() {
+            let rel = files.get(i.as(usize)).as(String)
+            if filt_low != "" and (not rel.to_lower().contains(filt_low)) {
+                continue
+            }
+            let full = path.join(root, rel)
+            let content! = fs.read_to_string(full) else {
+                continue
+            }
+            let hay = if case_sensitive { content } else { content.to_lower() }
+            let needle = if case_sensitive { query } else { query.to_lower() }
+            let idxs = hay.find_indices(needle)
+            if not idxs.is_empty() {
+                let nlen = query.char_len()
+                var rebuilt = ""
+                var last_end: i64 = 0
+                for mi in 0..idxs.len() {
+                    let sc = idxs.get(mi.as(usize)).as(i64)
+                    rebuilt = rebuilt ++ content.slice(last_end, sc) ++ replacement
+                    last_end = sc + nlen
+                }
+                rebuilt = rebuilt ++ content.slice(last_end, content.char_len())
+                let _! = fs.write_string(full, rebuilt) else {
+                    return error ("failed to write " ++ full)
+                }
+                files_changed += 1
+                total_repl += idxs.len()
+            }
+        }
+        return (files_changed, total_repl)
+    }
+    let pair = raw.as(List)
+    (pair.get(0).as(i64), pair.get(1).as(i64))
+}
+
+-- ============================================================================
+-- 3. Line Diff & Hunk Engine
+-- ============================================================================
+
+private fn fallback_diff_lines(old_lines: List, new_lines: List) -> List {
+    var pfx: i64 = 0
+    let olen = old_lines.len()
+    let nlen = new_lines.len()
+    while pfx < olen and pfx < nlen
+        and old_lines.get(pfx.as(usize)).as(String) == new_lines.get(pfx.as(usize)).as(String) {
+        pfx += 1
+    }
+    if pfx == olen and pfx == nlen {
+        return List()
+    }
+    var o_end = olen
+    var n_end = nlen
+    while o_end > pfx and n_end > pfx
+        and old_lines.get((o_end - 1).as(usize)).as(String) == new_lines.get((n_end - 1).as(usize)).as(String) {
+        o_end -= 1
+        n_end -= 1
+    }
+    let m = o_end - pfx
+    let n = n_end - pfx
+    if m * n > 40000 {
+        let kind = if m == 0 { "add" } else if n == 0 { "delete" } else { "change" }
+        return [DiffHunk {
+            old_start: pfx,
+            old_count: m,
+            new_start: pfx,
+            new_count: n,
+            kind: kind,
+        }]
+    }
+    let cols = n + 1
+    let dp = List()
+    for _ in 0..((m + 1) * cols) {
+        dp.push(0)
+    }
+    var i = m - 1
+    while i >= 0 {
+        var j = n - 1
+        while j >= 0 {
+            let ai = old_lines.get((pfx + i).as(usize)).as(String)
+            let bj = new_lines.get((pfx + j).as(usize)).as(String)
+            let v = if ai == bj {
+                dp.get(((i + 1) * cols + j + 1).as(usize)).as(i64) + 1
+            } else {
+                let d1 = dp.get(((i + 1) * cols + j).as(usize)).as(i64)
+                let d2 = dp.get((i * cols + j + 1).as(usize)).as(i64)
+                if d1 >= d2 { d1 } else { d2 }
+            }
+            dp.set((i * cols + j).as(usize), v)
+            j -= 1
+        }
+        i -= 1
+    }
+    let ops = List()
+    var ci: i64 = 0
+    var cj: i64 = 0
+    while ci < m and cj < n {
+        let ai = old_lines.get((pfx + ci).as(usize)).as(String)
+        let bj = new_lines.get((pfx + cj).as(usize)).as(String)
+        if ai == bj {
+            ops.push(0)
+            ci += 1
+            cj += 1
+        } else {
+            let d1 = dp.get(((ci + 1) * cols + cj).as(usize)).as(i64)
+            let d2 = dp.get((ci * cols + cj + 1).as(usize)).as(i64)
+            if d1 >= d2 {
+                ops.push(1)
+                ci += 1
+            } else {
+                ops.push(2)
+                cj += 1
+            }
+        }
+    }
+    while ci < m {
+        ops.push(1)
+        ci += 1
+    }
+    while cj < n {
+        ops.push(2)
+        cj += 1
+    }
+    let hunks = List()
+    var oi = pfx
+    var ni = pfx
+    var k: i64 = 0
+    while k < ops.len() {
+        let op = ops.get(k.as(usize)).as(i64)
+        if op == 0 {
+            oi += 1
+            ni += 1
+            k += 1
+            continue
+        }
+        let os = oi
+        let ns = ni
+        var dc: i64 = 0
+        var ic: i64 = 0
+        while k < ops.len() and ops.get(k.as(usize)).as(i64) != 0 {
+            if ops.get(k.as(usize)).as(i64) == 1 {
+                dc += 1
+                oi += 1
+            } else {
+                ic += 1
+                ni += 1
+            }
+            k += 1
+        }
+        let kind = if dc == 0 { "add" } else if ic == 0 { "delete" } else { "change" }
+        hunks.push(DiffHunk {
+            old_start: os,
+            old_count: dc,
+            new_start: ns,
+            new_count: ic,
+            kind: kind,
+        })
+    }
+    hunks
+}
+
+pub fn accel_diff_lines(old_lines: List, new_lines: List) -> List {
+    let raw! = runtime.host_call("accel_diff_lines", [old_lines, new_lines]) else {
+        return fallback_diff_lines(old_lines, new_lines)
+    }
+    let arr = raw.as(List)
+    let out = List()
+    for i in 0..arr.len() {
+        let r = arr.get(i.as(usize)).as(List)
+        out.push(DiffHunk {
+            old_start: r.get(0).as(i64),
+            old_count: r.get(1).as(i64),
+            new_start: r.get(2).as(i64),
+            new_count: r.get(3).as(i64),
+            kind: r.get(4).as(String),
+        })
+    }
+    out
+}
+
+-- ============================================================================
+-- 4. Git Porcelain Status, HEAD Lines & Blame
+-- ============================================================================
+
+pub fn accel_git_status(cwd: String) -> GitStatusSummary {
+    let raw! = runtime.host_call("accel_git_status", [cwd]) else {
+        let top! = process.exec("git", args = ["rev-parse", "--show-toplevel"], cwd = cwd) else {
+            return (GitStatusSummary {
+                is_repo: false, root: "", branch: "", staged_count: 0,
+                modified_count: 0, untracked_count: 0, entries: List(),
+            })
+        }
+        if not top.success() {
+            return (GitStatusSummary {
+                is_repo: false, root: "", branch: "", staged_count: 0,
+                modified_count: 0, untracked_count: 0, entries: List(),
+            })
+        }
+        let root = top.stdout.trim()
+        var branch = "HEAD"
+        let br_res = process.exec("git", args = ["symbolic-ref", "--short", "HEAD"], cwd = root)
+        br_res match {
+            b! => {
+                if b.success() and b.stdout.trim() != "" {
+                    branch = b.stdout.trim()
+                }
+            },
+            error _ => (),
+        }
+        var staged: i64 = 0
+        var modified: i64 = 0
+        var untracked: i64 = 0
+        let entries = List()
+        let st_res = process.exec("git", args = ["status", "--porcelain=v1", "-uall"], cwd = root)
+        st_res match {
+            st! => {
+                if st.success() {
+                    let lines = st.stdout.split("\n")
+                    for i in 0..lines.len() {
+                        let l = lines.get(i.as(usize)).as(String)
+                        if l.char_len() >= 3 {
+                            let x = l.slice(0, 1)
+                            let y = l.slice(1, 2)
+                            let rel = l.drop(3).trim()
+                            if x == "?" and y == "?" {
+                                untracked += 1
+                            } else {
+                                if x != " " and x != "?" { staged += 1 }
+                                if y != " " and y != "?" { modified += 1 }
+                            }
+                            entries.push(GitFileEntry { index_status: x, worktree_status: y, rel_path: rel })
+                        }
+                    }
+                }
+            },
+            error _ => (),
+        }
+        return (GitStatusSummary {
+            is_repo: true,
+            root: root,
+            branch: branch,
+            staged_count: staged,
+            modified_count: modified,
+            untracked_count: untracked,
+            entries: entries,
+        })
+    }
+    let arr = raw.as(List)
+    let raw_entries = arr.get(6).as(List)
+    let entries = List()
+    for i in 0..raw_entries.len() {
+        let e = raw_entries.get(i.as(usize)).as(List)
+        entries.push(GitFileEntry {
+            index_status: e.get(0).as(String),
+            worktree_status: e.get(1).as(String),
+            rel_path: e.get(2).as(String),
+        })
+    }
+    GitStatusSummary {
+        is_repo: arr.get(0).as(bool),
+        root: arr.get(1).as(String),
+        branch: arr.get(2).as(String),
+        staged_count: arr.get(3).as(i64),
+        modified_count: arr.get(4).as(i64),
+        untracked_count: arr.get(5).as(i64),
+        entries: entries,
+    }
+}
+
+pub fn accel_git_head_lines(cwd: String, file_path: String) -> ?List {
+    if file_path == "" {
+        return null
+    }
+    let raw! = runtime.host_call("accel_git_head_lines", [cwd, file_path]) else {
+        let st = accel_git_status(cwd)
+        if not st.is_repo {
+            return null
+        }
+        let full = if path.is_absolute(file_path) {
+            path.normalize(file_path)
+        } else {
+            path.normalize(path.join(cwd, file_path))
+        }
+        let root_prefix = st.root ++ "/"
+        if not full.starts_with(root_prefix) {
+            return null
+        }
+        let rel = full.drop(root_prefix.char_len())
+        let out! = process.exec("git", args = ["show", "HEAD:" ++ rel], cwd = st.root) else {
+            return null
+        }
+        if not out.success() {
+            return null
+        }
+        let norm = out.stdout.replace("\r\n", "\n")
+        let parts = norm.split("\n")
+        if parts.len() > 1 and norm.ends_with("\n") {
+            let _ = parts.pop()
+        }
+        return parts
+    }
+    let arr = raw.as(List)
+    if not arr.get(0).as(bool) {
+        return null
+    }
+    arr.get(1).as(List)
+}
+
+pub fn accel_git_blame_line(cwd: String, file_path: String, row_0based: i64) -> ?GitBlame {
+    if file_path == "" {
+        return null
+    }
+    let raw! = runtime.host_call("accel_git_blame_line", [cwd, file_path, row_0based]) else {
+        let line_1 = (row_0based + 1).to_string()
+        let range = line_1 ++ "," ++ line_1
+        let out! = process.exec(
+            "git",
+            args = ["blame", "-L", range, "--porcelain", "--", file_path],
+            cwd = cwd,
+        ) else {
+            return null
+        }
+        if not out.success() {
+            return null
+        }
+        let lines = out.stdout.split("\n")
+        if lines.is_empty() {
+            return null
+        }
+        let hdr = lines.get(0).as(String)
+        let commit_short = hdr.take(7)
+        var author = "You"
+        var summary = ""
+        for i in 1..lines.len() {
+            let l = lines.get(i.as(usize)).as(String)
+            if l.starts_with("author ") {
+                author = l.drop(7).trim()
+            } else if l.starts_with("summary ") {
+                summary = l.drop(8).trim()
+            }
+        }
+        if commit_short == "0000000" {
+            author = "Uncommitted"
+            summary = "Not committed yet"
+        }
+        return (GitBlame {
+            commit_short: commit_short,
+            author: author,
+            date_ymd: "recent",
+            summary: summary,
+        })
+    }
+    let arr = raw.as(List)
+    if not arr.get(0).as(bool) {
+        return null
+    }
+    GitBlame {
+        commit_short: arr.get(1).as(String),
+        author: arr.get(2).as(String),
+        date_ymd: arr.get(3).as(String),
+        summary: arr.get(4).as(String),
+    }
+}
+
+-- ============================================================================
+-- 5. Multi-Language Symbol Outline & TODO Scanners
+-- ============================================================================
+
+private fn extract_ident_prefix(s: String) -> String {
+    let trimmed = s.trim_start()
+    let n = trimmed.char_len()
+    var j: i64 = 0
+    while j < n {
+        let ch = trimmed.slice(j, j + 1)
+        if ch.is_alphanumeric() or ch == "_" or ch == "-" {
+            j += 1
+        } else {
+            break
+        }
+    }
+    trimmed.slice(0, j)
+}
+
+pub fn accel_scan_symbols(lines: List, major_mode: String) -> List {
+    let raw! = runtime.host_call("accel_scan_symbols", [lines, major_mode]) else {
+        let m = major_mode.to_lower()
+        let out = List()
+        for r in 0..lines.len() {
+            let line = lines.get(r.as(usize)).as(String)
+            let trimmed = line.trim_start()
+            if trimmed == "" {
+                continue
+            }
+            let indent = line.char_len() - trimmed.char_len()
+            if m == "markdown" or m == "org" {
+                let mk = if m == "org" { "*" } else { "#" }
+                var lvl: i64 = 0
+                while lvl < trimmed.char_len() and trimmed.slice(lvl, lvl + 1) == mk {
+                    lvl += 1
+                }
+                if lvl > 0 and lvl < trimmed.char_len() and trimmed.slice(lvl, lvl + 1) == " " {
+                    let title = trimmed.drop(lvl + 1).trim()
+                    if title != "" {
+                        out.push(SymbolItem { name: title, kind: "Heading", row: r, col: indent, level: lvl })
+                    }
+                }
+                continue
+            }
+            var clean = trimmed
+            if clean.starts_with("pub(crate) ") {
+                clean = clean.drop(11)
+            } else if clean.starts_with("pub ") {
+                clean = clean.drop(4)
+            } else if clean.starts_with("private ") {
+                clean = clean.drop(8)
+            } else if clean.starts_with("async ") {
+                clean = clean.drop(6)
+            }
+            let prefixes = [
+                ("fn ", "Function"),
+                ("def ", "Function"),
+                ("struct ", "Struct"),
+                ("class ", "Class"),
+                ("enum ", "Enum"),
+                ("trait ", "Trait"),
+                ("impl ", "Impl"),
+                ("mod ", "Module"),
+                ("const ", "Constant"),
+                ("global ", "Variable"),
+            ]
+            for pi in 0..prefixes.len() {
+                let (kw, kind) = prefixes.get(pi.as(usize)).as((String, String))
+                if clean.starts_with(kw) {
+                    let nm = extract_ident_prefix(clean.drop(kw.char_len()))
+                    if nm != "" {
+                        let lvl = if indent > 0 { 2 } else { 1 }
+                        out.push(SymbolItem { name: nm, kind: kind, row: r, col: indent, level: lvl })
+                    }
+                    break
+                }
+            }
+        }
+        return out
+    }
+    let arr = raw.as(List)
+    let out = List()
+    for i in 0..arr.len() {
+        let r = arr.get(i.as(usize)).as(List)
+        out.push(SymbolItem {
+            name: r.get(0).as(String),
+            kind: r.get(1).as(String),
+            row: r.get(2).as(i64),
+            col: r.get(3).as(i64),
+            level: r.get(4).as(i64),
+        })
+    }
+    out
+}
+
+pub fn accel_scan_buffer_todos(lines: List, file_path: String) -> List {
+    let raw! = runtime.host_call("accel_scan_buffer_todos", [lines, file_path]) else {
+        let tags = ["TODO", "FIXME", "HACK", "NOTE", "PERF", "WARN", "BUG"]
+        let out = List()
+        for r in 0..lines.len() {
+            let line = lines.get(r.as(usize)).as(String)
+            let llen = line.char_len()
+            var best_col: i64 = -1
+            var best_tag = ""
+            for ti in 0..tags.len() {
+                let tag = tags.get(ti.as(usize)).as(String)
+                let idxs = line.find_indices(tag)
+                for ii in 0..idxs.len() {
+                    let col = idxs.get(ii.as(usize)).as(i64)
+                    if best_col >= 0 and col >= best_col {
+                        break
+                    }
+                    let before_ok = if col == 0 {
+                        true
+                    } else {
+                        let bch = line.slice(col - 1, col)
+                        bch != "_" and (not bch.is_alphanumeric())
+                    }
+                    let after_idx = col + tag.char_len()
+                    let ok_after = if after_idx >= llen {
+                        true
+                    } else {
+                        let ch = line.slice(after_idx, after_idx + 1)
+                        ch == ":" or ch == "(" or ch == " " or ch == "\t" or ch == "!"
+                    }
+                    if before_ok and ok_after {
+                        best_col = col
+                        best_tag = tag
+                        break
+                    }
+                }
+            }
+            if best_col >= 0 {
+                out.push(TodoItem {
+                    file_path: file_path,
+                    row: r,
+                    col: best_col,
+                    tag: best_tag,
+                    text: line.drop(best_col).trim(),
+                })
+            }
+        }
+        return out
+    }
+    let arr = raw.as(List)
+    let out = List()
+    for i in 0..arr.len() {
+        let r = arr.get(i.as(usize)).as(List)
+        out.push(TodoItem {
+            file_path: r.get(0).as(String),
+            row: r.get(1).as(i64),
+            col: r.get(2).as(i64),
+            tag: r.get(3).as(String),
+            text: r.get(4).as(String),
+        })
+    }
+    out
+}
+
+pub fn accel_scan_workspace_todos(root: String, .max_results: i64 = 300) -> List {
+    let raw! = runtime.host_call("accel_scan_workspace_todos", [root, max_results]) else {
+        let files = accel_workspace_files(root, max_files = 3000)
+        let out = List()
+        for i in 0..files.len() {
+            let rel = files.get(i.as(usize)).as(String)
+            let full = path.join(root, rel)
+            let content! = fs.read_to_string(full) else {
+                continue
+            }
+            let lines = content.replace("\r\n", "\n").split("\n")
+            let hits = accel_scan_buffer_todos(lines, rel)
+            for hi in 0..hits.len() {
+                out.push(hits.get(hi.as(usize)))
+                if max_results > 0 and out.len() >= max_results {
+                    return out
+                }
+            }
+        }
+        return out
+    }
+    let arr = raw.as(List)
+    let out = List()
+    for i in 0..arr.len() {
+        let r = arr.get(i.as(usize)).as(List)
+        out.push(TodoItem {
+            file_path: r.get(0).as(String),
+            row: r.get(1).as(i64),
+            col: r.get(2).as(i64),
+            tag: r.get(3).as(String),
+            text: r.get(4).as(String),
+        })
+    }
+    out
+}
+
+-- ============================================================================
+-- 6. Global Documentation Section/Tag Indexer, Full-Text Search & Source Defs
+-- ============================================================================
+
+private fn is_tag_char(ch: String) -> bool {
+    ch.is_alphanumeric() or ch == "-" or ch == "_" or ch == ":" or ch == "." or ch == "/"
+}
+
+private fn extract_star_tags_line(line: String, out: List) -> Unit {
+    if not line.contains("*") {
+        return
+    }
+    let n = line.char_len()
+    var i: i64 = 0
+    while i < n {
+        let ch = line.slice(i, i + 1)
+        if ch == "*" {
+            if i + 1 < n and line.slice(i + 1, i + 2) == "*" {
+                i += 2
+                while i + 1 < n and (not (line.slice(i, i + 1) == "*" and line.slice(i + 1, i + 2) == "*")) {
+                    i += 1
+                }
+                i += 2
+                continue
+            }
+            let prev_ok = if i == 0 {
+                true
+            } else {
+                let p = line.slice(i - 1, i)
+                p == " " or p == "\t" or p == "(" or p == "[" or p == "`"
+            }
+            if prev_ok {
+                var j = i + 1
+                while j < n and is_tag_char(line.slice(j, j + 1)) {
+                    j += 1
+                }
+                let next_not_star = j + 1 >= n or line.slice(j + 1, j + 2) != "*"
+                if j > i + 1 and j < n and line.slice(j, j + 1) == "*" and next_not_star {
+                    let tag = line.slice(i + 1, j)
+                    if tag.char_len() >= 2 and (not out.contains(tag)) {
+                        out.push(tag)
+                    }
+                    i = j + 1
+                    continue
+                }
+            }
+        }
+        i += 1
+    }
+}
+
+private fn strip_trailing_tags(text: String) -> String {
+    var cur = text.trim()
+    while cur.ends_with("*") and (not cur.ends_with("**")) {
+        let n = cur.char_len()
+        if n < 4 {
+            break
+        }
+        var open_idx: i64 = n - 2
+        while open_idx >= 0 and cur.slice(open_idx, open_idx + 1) != "*" {
+            open_idx -= 1
+        }
+        if open_idx < 0 {
+            break
+        }
+        let cand = cur.slice(open_idx + 1, n - 1)
+        var valid = cand.char_len() >= 2
+        if valid {
+            for k in 0..cand.char_len() {
+                if not is_tag_char(cand.slice(k, k + 1)) {
+                    valid = false
+                    break
+                }
+            }
+        }
+        let ws_ok = open_idx == 0 or cur.slice(open_idx - 1, open_idx) == " " or cur.slice(open_idx - 1, open_idx) == "\t"
+        if valid and ws_ok {
+            cur = cur.slice(0, open_idx).trim_end()
+        } else {
+            break
+        }
+    }
+    cur.trim()
+}
+
+private fn slugify_title(title: String) -> String {
+    var slug = ""
+    var prev_dash = false
+    for i in 0..title.char_len() {
+        let ch = title.slice(i, i + 1)
+        if ch.is_alphanumeric() {
+            slug = slug ++ ch.to_lower()
+            prev_dash = false
+        } else if (not prev_dash) and slug != "" {
+            slug = slug ++ "-"
+            prev_dash = true
+        }
+    }
+    while slug.ends_with("-") {
+        slug = slug.slice(0, slug.char_len() - 1)
+    }
+    if slug == "" { "section" } else { slug }
+}
+
+private fn fallback_manual_name(root: String, rel_path: String) -> String {
+    var stem = rel_path.replace("\\", "/")
+    if stem.ends_with(".md") {
+        stem = stem.slice(0, stem.char_len() - 3)
+    }
+    let norm_root = path.normalize(root)
+    if norm_root.contains("/nessa2/") or norm_root.ends_with("/nessa2/docs") {
+        return "nessa:" ++ stem
+    }
+    let base = path.file_name(norm_root) match {
+        b? => b,
+        null => "docs",
+    }
+    if base != "docs" {
+        let par = path.parent(norm_root) match {
+            p? => path.file_name(p) match {
+                pn? => pn,
+                null => base,
+            },
+            null => base,
+        }
+        return par ++ ":" ++ stem
+    }
+    stem
+}
+
+private fn fallback_parse_md_file(root: String, full_path: String, rel_path: String, out: List) -> Unit {
+    let content! = fs.read_to_string(full_path) else {
+        return
+    }
+    let lines = content.replace("\r\n", "\n").split("\n")
+    if lines.is_empty() {
+        return
+    }
+    let manual = fallback_manual_name(root, rel_path)
+    let headings = List()
+    var in_fence = false
+    for r in 0..lines.len() {
+        let ln = lines.get(r.as(usize)).as(String)
+        let t = ln.trim_start()
+        if t.starts_with("```") or t.starts_with("~~~") {
+            in_fence = not in_fence
+            continue
+        }
+        if in_fence {
+            continue
+        }
+        var hashes: i64 = 0
+        while hashes < t.char_len() and t.slice(hashes, hashes + 1) == "#" {
+            hashes += 1
+        }
+        if hashes >= 1 and hashes <= 3 and hashes < t.char_len() and t.slice(hashes, hashes + 1) == " " {
+            let raw_title = t.drop(hashes + 1).trim()
+            let htags = List()
+            extract_star_tags_line(raw_title, htags)
+            let clean = strip_trailing_tags(raw_title)
+            if clean != "" {
+                headings.push((r, hashes, clean, htags))
+            }
+        }
+    }
+    if headings.is_empty() {
+        let tags = List()
+        var summary = ""
+        for r in 0..lines.len() {
+            let ln = lines.get(r.as(usize)).as(String)
+            extract_star_tags_line(ln, tags)
+            let t = ln.trim()
+            if summary == "" and t != "" {
+                summary = t.take(120)
+            }
+        }
+        out.push((DocNode {
+            node_id: manual ++ "#top",
+            manual: manual,
+            title: manual,
+            level: 1,
+            file_path: full_path,
+            start_row: 0,
+            end_row: lines.len() - 1,
+            tags: tags,
+            summary: summary,
+        }, lines))
+        return
+    }
+    let used = List()
+    for hi in 0..headings.len() {
+        let (srow, lvl, title, init_tags) = headings.get(hi.as(usize)).as((i64, i64, String, List))
+        let erow = if hi + 1 < headings.len() {
+            let (next_r, _, _, _) = headings.get((hi + 1).as(usize)).as((i64, i64, String, List))
+            if next_r > 0 { next_r - 1 } else { 0 }
+        } else {
+            lines.len() - 1
+        }
+        let slug = if hi == 0 and lvl == 1 { "top" } else { slugify_title(title) }
+        var nid = manual ++ "#" ++ slug
+        if used.contains(nid) {
+            nid = nid ++ "-" ++ (srow + 1).to_string()
+        }
+        used.push(nid)
+
+        let tags = List()
+        for ti in 0..init_tags.len() {
+            tags.push(init_tags.get(ti.as(usize)))
+        }
+        var summary = ""
+        var in_code = false
+        let sec_lines = List()
+        for r in srow..(erow + 1) {
+            let ln = lines.get(r.as(usize)).as(String)
+            sec_lines.push(ln)
+            let t = ln.trim()
+            if t.starts_with("```") or t.starts_with("~~~") {
+                in_code = not in_code
+                continue
+            }
+            if not in_code {
+                extract_star_tags_line(ln, tags)
+                if r > srow and summary == "" and t != "" and (not t.starts_with("#"))
+                    and (not t.starts_with("---")) and (not t.starts_with("|")) {
+                    let cleaned = strip_trailing_tags(t)
+                    if cleaned != "" {
+                        summary = cleaned.take(120)
+                    }
+                }
+            }
+        }
+        out.push((DocNode {
+            node_id: nid,
+            manual: manual,
+            title: title,
+            level: lvl,
+            file_path: full_path,
+            start_row: srow,
+            end_row: erow,
+            tags: tags,
+            summary: summary,
+        }, sec_lines))
+    }
+}
+
+private fn fallback_collect_doc_sections(doc_roots: List) -> List {
+    let seen = List()
+    let out = List()
+    for ri in 0..doc_roots.len() {
+        let root = doc_roots.get(ri.as(usize)).as(String)
+        if not fs.exists(root) {
+            continue
+        }
+        if fs.is_file(root) {
+            let norm = path.normalize(root)
+            if not seen.contains(norm) {
+                seen.push(norm)
+                let par = path.parent(norm) match {
+                    p? => p,
+                    null => ".",
+                }
+                let fname = path.file_name(norm) match {
+                    f? => f,
+                    null => norm,
+                }
+                fallback_parse_md_file(par, norm, fname, out)
+            }
+            continue
+        }
+        let walked! = fs.walk_dir(root, max_depth = 12, include_hidden = false) else {
+            continue
+        }
+        walked.sort_by(|a: Any, b: Any| a.as(String).cmp(b.as(String)))
+        for fi in 0..walked.len() {
+            let rel = walked.get(fi.as(usize)).as(String)
+            if (not rel.ends_with(".md"))
+                or rel.starts_with("deprecated/") or rel.contains("/deprecated/")
+                or rel.starts_with("TODO-jit/") or rel.contains("/TODO-jit/")
+                or is_ignored_rel_path(rel) {
+                continue
+            }
+            let full = path.normalize(path.join(root, rel))
+            if not seen.contains(full) {
+                seen.push(full)
+                fallback_parse_md_file(root, full, rel, out)
+            }
+        }
+    }
+    out
+}
+
+pub fn accel_index_docs(doc_roots: List) -> List {
+    let raw! = runtime.host_call("accel_index_docs", [doc_roots]) else {
+        let pairs = fallback_collect_doc_sections(doc_roots)
+        let out = List()
+        for i in 0..pairs.len() {
+            let (node, _) = pairs.get(i.as(usize)).as((DocNode, List))
+            out.push(node)
+        }
+        return out
+    }
+    let arr = raw.as(List)
+    let out = List()
+    for i in 0..arr.len() {
+        let r = arr.get(i.as(usize)).as(List)
+        out.push(DocNode {
+            node_id: r.get(0).as(String),
+            manual: r.get(1).as(String),
+            title: r.get(2).as(String),
+            level: r.get(3).as(i64),
+            file_path: r.get(4).as(String),
+            start_row: r.get(5).as(i64),
+            end_row: r.get(6).as(i64),
+            tags: r.get(7).as(List),
+            summary: r.get(8).as(String),
+        })
+    }
+    out
+}
+
+pub fn accel_search_docs(doc_roots: List, query: String, .limit: i64 = 100) -> List {
+    let raw! = runtime.host_call("accel_search_docs", [doc_roots, query, limit]) else {
+        let cap = if limit <= 0 { 100 } else { limit }
+        let q_trim = query.trim()
+        let pairs = fallback_collect_doc_sections(doc_roots)
+        if q_trim == "" {
+            let out = List()
+            for i in 0..pairs.len() {
+                if out.len() >= cap {
+                    break
+                }
+                let (node, _) = pairs.get(i.as(usize)).as((DocNode, List))
+                let tag0 = if node.tags.is_empty() { "" } else { node.tags.get(0).as(String) }
+                out.push(DocSearchHit {
+                    node_id: node.node_id,
+                    manual: node.manual,
+                    title: node.title,
+                    file_path: node.file_path,
+                    row: node.start_row,
+                    score: 100,
+                    matched_tag: tag0,
+                    snippet: node.summary,
+                })
+            }
+            return out
+        }
+        let q_low = q_trim.to_lower()
+        let raw_toks = q_low.split(" ")
+        let pos_toks = List()
+        let neg_toks = List()
+        for ti in 0..raw_toks.len() {
+            let tk = raw_toks.get(ti.as(usize)).as(String).trim()
+            if tk == "" {
+                continue
+            }
+            if tk.starts_with("!") {
+                let nt = tk.drop(1)
+                if nt != "" {
+                    neg_toks.push(nt)
+                }
+            } else {
+                pos_toks.push(tk)
+            }
+        }
+        let hits = List()
+        for pi in 0..pairs.len() {
+            let (node, sec_lines) = pairs.get(pi.as(usize)).as((DocNode, List))
+            let title_low = node.title.to_lower()
+            let manual_low = node.manual.to_lower()
+            let body_low = sec_lines.join("\n").to_lower()
+            var neg_matched = false
+            for ni in 0..neg_toks.len() {
+                let nt = neg_toks.get(ni.as(usize)).as(String)
+                if title_low.contains(nt) or manual_low.contains(nt) or body_low.contains(nt) {
+                    neg_matched = true
+                    break
+                }
+            }
+            if neg_matched {
+                continue
+            }
+            var matched_tag = ""
+            var score: i64 = 0
+            for tgi in 0..node.tags.len() {
+                let tg = node.tags.get(tgi.as(usize)).as(String)
+                let tl = tg.to_lower()
+                if tl == q_low {
+                    score = 25000
+                    matched_tag = tg
+                    break
+                } else if tl.starts_with(q_low) and score < 18000 {
+                    score = 18000
+                    matched_tag = tg
+                } else if tl.contains(q_low) and score < 12000 {
+                    score = 12000
+                    matched_tag = tg
+                }
+            }
+            let fsc = fallback_fuzzy_score(q_trim, q_low, node.manual ++ " " ++ node.title)
+            if fsc >= 0 and fsc + 2000 > score {
+                score = fsc + 2000
+            }
+            var all_pos = not pos_toks.is_empty()
+            var tf_bonus: i64 = 0
+            for pti in 0..pos_toks.len() {
+                let tok = pos_toks.get(pti.as(usize)).as(String)
+                let in_title = title_low.contains(tok)
+                let in_manual = manual_low.contains(tok)
+                var in_tag = false
+                for tgi in 0..node.tags.len() {
+                    let tg = node.tags.get(tgi.as(usize)).as(String)
+                    if tg.to_lower().contains(tok) {
+                        in_tag = true
+                        if matched_tag == "" {
+                            matched_tag = tg
+                        }
+                        break
+                    }
+                }
+                let b_hits = body_low.find_indices(tok).len()
+                if (not in_title) and (not in_manual) and (not in_tag) and b_hits == 0 {
+                    all_pos = false
+                    break
+                }
+                if in_tag { tf_bonus += 1400 }
+                if in_title { tf_bonus += 900 }
+                if in_manual { tf_bonus += 400 }
+                let capped = if b_hits > 12 { 12 } else { b_hits }
+                tf_bonus += capped * 75
+            }
+            if pos_toks.len() > 1 and (not all_pos) {
+                continue
+            }
+            if all_pos and 4000 + tf_bonus > score {
+                score = 4000 + tf_bonus
+            }
+            if score <= 0 {
+                continue
+            }
+            var best_row = node.start_row
+            var best_snip = node.summary
+            for lr in 0..sec_lines.len() {
+                let ln = sec_lines.get(lr.as(usize)).as(String).trim()
+                if ln == "" {
+                    continue
+                }
+                let ll = ln.to_lower()
+                var any_tok = ll.contains(q_low)
+                if not any_tok {
+                    for pti in 0..pos_toks.len() {
+                        if ll.contains(pos_toks.get(pti.as(usize)).as(String)) {
+                            any_tok = true
+                            break
+                        }
+                    }
+                }
+                if any_tok {
+                    best_row = node.start_row + lr
+                    best_snip = ln.take(120)
+                    if ll.contains(q_low) {
+                        break
+                    }
+                }
+            }
+            hits.push(DocSearchHit {
+                node_id: node.node_id,
+                manual: node.manual,
+                title: node.title,
+                file_path: node.file_path,
+                row: best_row,
+                score: score,
+                matched_tag: matched_tag,
+                snippet: best_snip,
+            })
+        }
+        hits.sort_by(|a: Any, b: Any| {
+            let ha = a.as(DocSearchHit)
+            let hb = b.as(DocSearchHit)
+            if ha.score != hb.score {
+                hb.score.cmp(ha.score)
+            } else if ha.manual != hb.manual {
+                ha.manual.cmp(hb.manual)
+            } else {
+                ha.row.cmp(hb.row)
+            }
+        })
+        if hits.len() > cap {
+            let trimmed = List()
+            for j in 0..cap {
+                trimmed.push(hits.get(j.as(usize)))
+            }
+            return trimmed
+        }
+        return hits
+    }
+    let arr = raw.as(List)
+    let out = List()
+    for i in 0..arr.len() {
+        let r = arr.get(i.as(usize)).as(List)
+        out.push(DocSearchHit {
+            node_id: r.get(0).as(String),
+            manual: r.get(1).as(String),
+            title: r.get(2).as(String),
+            file_path: r.get(3).as(String),
+            row: r.get(4).as(i64),
+            score: r.get(5).as(i64),
+            matched_tag: r.get(6).as(String),
+            snippet: r.get(7).as(String),
+        })
+    }
+    out
+}
+
+private fn fallback_extract_quoted(s: String) -> String {
+    let idxs = s.find_indices("\"")
+    if idxs.len() < 2 {
+        return ""
+    }
+    let q1 = idxs.get(0).as(i64)
+    let q2 = idxs.get(1).as(i64)
+    if q2 <= q1 + 1 {
+        ""
+    } else {
+        s.slice(q1 + 1, q2)
+    }
+}
+
+private fn fallback_preceding_doc(lines: List, row: i64) -> String {
+    let doc_rev = List()
+    var cur = row - 1
+    while cur >= 0 {
+        let t = lines.get(cur.as(usize)).as(String).trim()
+        if t.starts_with("--") {
+            let rest = t.drop(2).trim()
+            if (not rest.starts_with("====")) and (not rest.starts_with("----")) {
+                doc_rev.push(rest)
+            }
+        } else {
+            break
+        }
+        cur -= 1
+    }
+    let ordered = List()
+    var k = doc_rev.len() - 1
+    while k >= 0 {
+        ordered.push(doc_rev.get(k.as(usize)))
+        k -= 1
+    }
+    ordered.join("\n")
+}
+
+pub fn accel_find_symbol_defs(code_roots: List, query: String, .limit: i64 = 50) -> List {
+    let q_trim = query.trim()
+    if q_trim == "" {
+        return List()
+    }
+    let raw! = runtime.host_call("accel_find_symbol_defs", [code_roots, q_trim, limit]) else {
+        let cap = if limit <= 0 { 50 } else { limit }
+        let q_low = q_trim.to_lower()
+        let ns_files = List()
+        let seen = List()
+        for ri in 0..code_roots.len() {
+            let root = code_roots.get(ri.as(usize)).as(String)
+            if not fs.exists(root) {
+                continue
+            }
+            if fs.is_file(root) {
+                let norm = path.normalize(root)
+                if not seen.contains(norm) {
+                    seen.push(norm)
+                    ns_files.push(norm)
+                }
+                continue
+            }
+            let walked! = fs.walk_dir(root, max_depth = 12, include_hidden = false) else {
+                continue
+            }
+            for fi in 0..walked.len() {
+                let rel = walked.get(fi.as(usize)).as(String)
+                if rel.ends_with(".ns") and (not is_ignored_rel_path(rel)) {
+                    let full = path.normalize(path.join(root, rel))
+                    if not seen.contains(full) {
+                        seen.push(full)
+                        ns_files.push(full)
+                    }
+                }
+            }
+        }
+        let kws = [
+            ("fn ", "fn"),
+            ("struct ", "struct"),
+            ("enum ", "enum"),
+            ("trait ", "trait"),
+            ("effect ", "effect"),
+            ("const ", "const"),
+            ("type ", "type"),
+        ]
+        let scored = List()
+        for fi in 0..ns_files.len() {
+            let fp = ns_files.get(fi.as(usize)).as(String)
+            let content! = fs.read_to_string(fp) else {
+                continue
+            }
+            let lines = content.replace("\r\n", "\n").split("\n")
+            for r in 0..lines.len() {
+                let trimmed = lines.get(r.as(usize)).as(String).trim()
+                if trimmed == "" or trimmed.starts_with("--") {
+                    continue
+                }
+                if trimmed.contains("register_command(") {
+                    let rc_hits = trimmed.find_indices("register_command(")
+                    if not rc_hits.is_empty() {
+                        let pos = rc_hits.get(0).as(i64) + 17
+                        var cmd_name = fallback_extract_quoted(trimmed.drop(pos))
+                        if cmd_name == "" and r + 1 < lines.len() {
+                            cmd_name = fallback_extract_quoted(lines.get((r + 1).as(usize)).as(String).trim())
+                        }
+                        if cmd_name != "" {
+                            let sc = fallback_fuzzy_score(q_trim, q_low, cmd_name)
+                            if sc >= 0 {
+                                scored.push((sc + 500, SymbolDefHit {
+                                    symbol: cmd_name,
+                                    kind: "command",
+                                    file_path: fp,
+                                    row: r,
+                                    signature: trimmed.take(120),
+                                    doc_comment: fallback_preceding_doc(lines, r),
+                                }))
+                            }
+                        }
+                    }
+                }
+                var rest = trimmed
+                if rest.starts_with("pub(crate) ") {
+                    rest = rest.drop(11).trim_start()
+                } else if rest.starts_with("pub ") {
+                    rest = rest.drop(4).trim_start()
+                } else if rest.starts_with("private ") {
+                    rest = rest.drop(8).trim_start()
+                }
+                if rest.starts_with("async ") {
+                    rest = rest.drop(6).trim_start()
+                }
+                for ki in 0..kws.len() {
+                    let (kw, kind) = kws.get(ki.as(usize)).as((String, String))
+                    if rest.starts_with(kw) {
+                        let sym = extract_ident_prefix(rest.drop(kw.char_len()))
+                        if sym != "" {
+                            let sc = fallback_fuzzy_score(q_trim, q_low, sym)
+                            if sc >= 0 {
+                                let bonus: i64 = if trimmed.starts_with("pub ") { 250 } else { 0 }
+                                scored.push((sc + bonus, SymbolDefHit {
+                                    symbol: sym,
+                                    kind: kind,
+                                    file_path: fp,
+                                    row: r,
+                                    signature: trimmed.take(120),
+                                    doc_comment: fallback_preceding_doc(lines, r),
+                                }))
+                            }
+                        }
+                        break
+                    }
+                }
+            }
+        }
+        scored.sort_by(|a: Any, b: Any| {
+            let (sa, da) = a.as((i64, SymbolDefHit))
+            let (sb, db) = b.as((i64, SymbolDefHit))
+            if sa != sb {
+                sb.cmp(sa)
+            } else if da.symbol != db.symbol {
+                da.symbol.cmp(db.symbol)
+            } else {
+                da.file_path.cmp(db.file_path)
+            }
+        })
+        let out = List()
+        let take_n = if scored.len() > cap { cap } else { scored.len() }
+        for j in 0..take_n {
+            let (_, d) = scored.get(j.as(usize)).as((i64, SymbolDefHit))
+            out.push(d)
+        }
+        return out
+    }
+    let arr = raw.as(List)
+    let out = List()
+    for i in 0..arr.len() {
+        let r = arr.get(i.as(usize)).as(List)
+        out.push(SymbolDefHit {
+            symbol: r.get(0).as(String),
+            kind: r.get(1).as(String),
+            file_path: r.get(2).as(String),
+            row: r.get(3).as(i64),
+            signature: r.get(4).as(String),
+            doc_comment: r.get(5).as(String),
+        })
+    }
+    out
+}
+
+-- ============================================================================
+-- 7. Native Cow-Rope Document Store, IDE Buffer Accelerators & Direct LSP Sync
+-- ============================================================================
+
+private struct FallbackDocEntry {
+    pub lines: List,
+    pub version: i64,
+}
+
+private struct FallbackSnapEntry {
+    pub lines: List,
+    pub owner_doc_id: i64,
+}
+
+private global _fb_docs: ?HashMap = null
+private global _fb_snaps: ?HashMap = null
+private global _fb_next_doc_id: i64 = 1
+private global _fb_next_snap_id: i64 = 1
+
+private fn fb_docs_map() -> HashMap {
+    if _fb_docs == null {
+        _fb_docs = HashMap.new()
+    }
+    _fb_docs.as(HashMap)
+}
+
+private fn fb_snaps_map() -> HashMap {
+    if _fb_snaps == null {
+        _fb_snaps = HashMap.new()
+    }
+    _fb_snaps.as(HashMap)
+}
+
+private fn fb_clone_lines(lines: List) -> List {
+    let out = List()
+    for i in 0..lines.len() {
+        out.push(lines.get(i.as(usize)).as(String))
+    }
+    if out.is_empty() {
+        out.push("")
+    }
+    out
+}
+
+private fn fb_cap_str(s: String) -> String {
+    if s.len().as(i64) <= 490000 {
+        return s
+    }
+    s.take(120000)
+}
+
+private fn fb_get_doc(doc_id: i64) -> ?FallbackDocEntry {
+    let raw = fb_docs_map().get(doc_id)
+    if raw == null {
+        return null
+    }
+    raw.as(FallbackDocEntry)
+}
+
+private fn fb_clamp_pos(lines: List, row: i64, col: i64) -> (i64, i64) {
+    let max_r = lines.len() - 1
+    let r = if row < 0 { 0 } else if row > max_r { max_r } else { row }
+    let llen = lines.get(r.as(usize)).as(String).char_len()
+    let c = if col < 0 { 0 } else if col > llen { llen } else { col }
+    (r, c)
+}
+
+private fn fb_norm_span(
+    lines: List,
+    s_row: i64,
+    s_col: i64,
+    e_row: i64,
+    e_col: i64,
+) -> (i64, i64, i64, i64) {
+    let (sr, sc) = fb_clamp_pos(lines, s_row, s_col)
+    let (er, ec) = fb_clamp_pos(lines, e_row, e_col)
+    if sr < er or (sr == er and sc <= ec) {
+        (sr, sc, er, ec)
+    } else {
+        (er, ec, sr, sc)
+    }
+}
+
+private fn fb_extract_span_lines(
+    lines: List,
+    sr: i64,
+    sc: i64,
+    er: i64,
+    ec: i64,
+) -> String {
+    if sr == er and sc == ec {
+        return ""
+    }
+    if sr == er {
+        return fb_cap_str(lines.get(sr.as(usize)).as(String).slice(sc, ec))
+    }
+    let parts = List()
+    let first = lines.get(sr.as(usize)).as(String)
+    parts.push(first.slice(sc, first.char_len()))
+    for r in (sr + 1)..er {
+        parts.push(lines.get(r.as(usize)).as(String))
+    }
+    let last = lines.get(er.as(usize)).as(String)
+    parts.push(last.slice(0, ec))
+    fb_cap_str(parts.join("\n"))
+}
+
+pub fn accel_doc_new(initial_lines: List) -> i64 {
+    let raw! = runtime.host_call("accel_doc_new", [initial_lines]) else {
+        let id = _fb_next_doc_id
+        _fb_next_doc_id += 1
+        fb_docs_map().insert(id, FallbackDocEntry {
+            lines: fb_clone_lines(initial_lines),
+            version: 1,
+        })
+        return id
+    }
+    raw.as(i64)
+}
+
+pub fn accel_doc_open_file(file_path: String) -> !String (i64, i64, bool) {
+    let raw! = runtime.host_call("accel_doc_open_file", [file_path]) else {
+        let content! = fs.read_to_string(file_path) else {
+            return error ("cannot open file '" ++ file_path ++ "'")
+        }
+        let has_crlf = content.contains("\r\n")
+        let lines = if content == "" {
+            [""]
+        } else {
+            let norm = content.replace("\r\n", "\n").replace("\r", "\n")
+            let body = if norm.ends_with("\n") {
+                norm.slice(0, norm.char_len() - 1)
+            } else {
+                norm
+            }
+            let parts = body.split("\n")
+            if parts.is_empty() {
+                parts.push("")
+            }
+            parts
+        }
+        let id = accel_doc_new(lines)
+        return (id, lines.len(), has_crlf)
+    }
+    let arr = raw.as(List)
+    if not arr.get(0).as(bool) {
+        return error arr.get(1).as(String)
+    }
+    (arr.get(1).as(i64), arr.get(2).as(i64), arr.get(3).as(bool))
+}
+
+pub fn accel_doc_save_file(doc_id: i64, file_path: String, crlf: bool) -> !String i64 {
+    let raw! = runtime.host_call("accel_doc_save_file", [doc_id, file_path, crlf]) else {
+        let entry? = fb_get_doc(doc_id) else {
+            return error ("unknown document id " ++ doc_id.to_string())
+        }
+        let sep = if crlf { "\r\n" } else { "\n" }
+        let body = entry.lines.join(sep) ++ sep
+        let _! = fs.write_string(file_path, body) else {
+            return error ("cannot open file '" ++ file_path ++ "' for write")
+        }
+        return body.len().as(i64)
+    }
+    let arr = raw.as(List)
+    if not arr.get(0).as(bool) {
+        return error arr.get(1).as(String)
+    }
+    arr.get(1).as(i64)
+}
+
+pub fn accel_doc_clone_from_lines(doc_id: i64, lines: List) {
+    let _! = runtime.host_call("accel_doc_clone_from_lines", [doc_id, lines]) else {
+        let entry_opt = fb_get_doc(doc_id)
+        if entry_opt != null {
+            let entry = entry_opt.as(FallbackDocEntry)
+            entry.lines = fb_clone_lines(lines)
+            entry.version += 1
+        } else if doc_id > 0 {
+            if doc_id >= _fb_next_doc_id {
+                _fb_next_doc_id = doc_id + 1
+            }
+            fb_docs_map().insert(doc_id, FallbackDocEntry {
+                lines: fb_clone_lines(lines),
+                version: 1,
+            })
+        }
+        return
+    }
+}
+
+pub fn accel_doc_free(doc_id: i64) {
+    let _! = runtime.host_call("accel_doc_free", [doc_id]) else {
+        let _ = fb_docs_map().remove(doc_id)
+        let snaps = fb_snaps_map()
+        let dead = List()
+        for k in snaps.keys() {
+            let sid = k.as(i64)
+            let se = snaps.get(sid).as(FallbackSnapEntry)
+            if se.owner_doc_id == doc_id {
+                dead.push(sid)
+            }
+        }
+        for i in 0..dead.len() {
+            let _ = snaps.remove(dead.get(i.as(usize)).as(i64))
+        }
+        return
+    }
+}
+
+pub fn accel_doc_line_count(doc_id: i64) -> i64 {
+    let raw! = runtime.host_call("accel_doc_line_count", [doc_id]) else {
+        let entry? = fb_get_doc(doc_id) else {
+            return 0
+        }
+        return entry.lines.len()
+    }
+    raw.as(i64)
+}
+
+pub fn accel_doc_version(doc_id: i64) -> i64 {
+    let raw! = runtime.host_call("accel_doc_version", [doc_id]) else {
+        let entry? = fb_get_doc(doc_id) else {
+            return 0
+        }
+        return entry.version
+    }
+    raw.as(i64)
+}
+
+pub fn accel_doc_line_at(doc_id: i64, row: i64) -> String {
+    let raw! = runtime.host_call("accel_doc_line_at", [doc_id, row]) else {
+        let entry? = fb_get_doc(doc_id) else {
+            return ""
+        }
+        if row < 0 or row >= entry.lines.len() {
+            return ""
+        }
+        return fb_cap_str(entry.lines.get(row.as(usize)).as(String))
+    }
+    raw.as(String)
+}
+
+pub fn accel_doc_line_char_len(doc_id: i64, row: i64) -> i64 {
+    let raw! = runtime.host_call("accel_doc_line_char_len", [doc_id, row]) else {
+        let entry? = fb_get_doc(doc_id) else {
+            return 0
+        }
+        if row < 0 or row >= entry.lines.len() {
+            return 0
+        }
+        return entry.lines.get(row.as(usize)).as(String).char_len()
+    }
+    raw.as(i64)
+}
+
+pub fn accel_doc_slice_lines(doc_id: i64, start_row: i64, end_row_exclusive: i64) -> List {
+    let raw! = runtime.host_call("accel_doc_slice_lines", [doc_id, start_row, end_row_exclusive]) else {
+        let out = List()
+        let entry? = fb_get_doc(doc_id) else {
+            return out
+        }
+        let n = entry.lines.len()
+        let s = if start_row < 0 { 0 } else if start_row > n { n } else { start_row }
+        var e = if end_row_exclusive < s { s } else if end_row_exclusive > n { n } else { end_row_exclusive }
+        if e - s > 60000 {
+            e = s + 60000
+        }
+        for r in s..e {
+            out.push(fb_cap_str(entry.lines.get(r.as(usize)).as(String)))
+        }
+        return out
+    }
+    raw.as(List)
+}
+
+pub fn accel_doc_set_line(doc_id: i64, row: i64, text: String) {
+    let _! = runtime.host_call("accel_doc_set_line", [doc_id, row, text]) else {
+        let entry? = fb_get_doc(doc_id) else {
+            return
+        }
+        if row >= 0 and row < entry.lines.len() {
+            entry.lines.set(row.as(usize), text)
+            entry.version += 1
+        }
+        return
+    }
+}
+
+pub fn accel_doc_insert_line(doc_id: i64, row: i64, text: String) {
+    let _! = runtime.host_call("accel_doc_insert_line", [doc_id, row, text]) else {
+        let entry? = fb_get_doc(doc_id) else {
+            return
+        }
+        let n = entry.lines.len()
+        let idx = if row < 0 { 0 } else if row > n { n } else { row }
+        entry.lines.insert(idx.as(usize), text)
+        entry.version += 1
+        return
+    }
+}
+
+pub fn accel_doc_insert_lines(doc_id: i64, row: i64, lines: List) {
+    if lines.is_empty() {
+        return
+    }
+    let _! = runtime.host_call("accel_doc_insert_lines", [doc_id, row, lines]) else {
+        let entry? = fb_get_doc(doc_id) else {
+            return
+        }
+        let n = entry.lines.len()
+        var idx = if row < 0 { 0 } else if row > n { n } else { row }
+        for i in 0..lines.len() {
+            entry.lines.insert(idx.as(usize), lines.get(i.as(usize)).as(String))
+            idx += 1
+        }
+        entry.version += 1
+        return
+    }
+}
+
+pub fn accel_doc_remove_line(doc_id: i64, row: i64) -> String {
+    let raw! = runtime.host_call("accel_doc_remove_line", [doc_id, row]) else {
+        let entry? = fb_get_doc(doc_id) else {
+            return ""
+        }
+        if row < 0 or row >= entry.lines.len() {
+            return ""
+        }
+        if entry.lines.len() == 1 {
+            let old = entry.lines.get(0).as(String)
+            entry.lines.set(0, "")
+            entry.version += 1
+            return fb_cap_str(old)
+        }
+        let old = entry.lines.remove(row.as(usize)).as(String)
+        entry.version += 1
+        return fb_cap_str(old)
+    }
+    raw.as(String)
+}
+
+pub fn accel_doc_delete_lines(doc_id: i64, start_row: i64, end_row_inclusive: i64) -> String {
+    let raw! = runtime.host_call("accel_doc_delete_lines", [doc_id, start_row, end_row_inclusive]) else {
+        let entry? = fb_get_doc(doc_id) else {
+            return ""
+        }
+        let max_r = entry.lines.len() - 1
+        let lo = if start_row < 0 { 0 } else { start_row }
+        let hi = if end_row_inclusive > max_r { max_r } else { end_row_inclusive }
+        if hi < lo {
+            return ""
+        }
+        let captured = List()
+        for r in lo..(hi + 1) {
+            captured.push(entry.lines.get(r.as(usize)).as(String))
+        }
+        let removed = fb_cap_str(captured.join("\n") ++ "\n")
+        let cnt = hi - lo + 1
+        if cnt >= entry.lines.len() {
+            entry.lines = [""]
+        } else {
+            for _ in 0..cnt {
+                let _ = entry.lines.remove(lo.as(usize))
+            }
+        }
+        entry.version += 1
+        return removed
+    }
+    raw.as(String)
+}
+
+pub fn accel_doc_insert_text(doc_id: i64, row: i64, col: i64, text: String) -> (i64, i64) {
+    let raw! = runtime.host_call("accel_doc_insert_text", [doc_id, row, col, text]) else {
+        let entry? = fb_get_doc(doc_id) else {
+            return (0, 0)
+        }
+        let (r, c) = fb_clamp_pos(entry.lines, row, col)
+        if text == "" {
+            return (r, c)
+        }
+        let cur = entry.lines.get(r.as(usize)).as(String)
+        let prefix = cur.slice(0, c)
+        let suffix = cur.slice(c, cur.char_len())
+        let norm = text.replace("\r\n", "\n").replace("\r", "\n")
+        let parts = norm.split("\n")
+        let k = parts.len()
+        if k == 1 {
+            let chunk = parts.get(0).as(String)
+            entry.lines.set(r.as(usize), prefix ++ chunk ++ suffix)
+            entry.version += 1
+            return (r, c + chunk.char_len())
+        }
+        let first_p = parts.get(0).as(String)
+        let last_p = parts.get((k - 1).as(usize)).as(String)
+        entry.lines.set(r.as(usize), prefix ++ first_p)
+        var ins_idx = r + 1
+        for i in 1..(k - 1) {
+            entry.lines.insert(ins_idx.as(usize), parts.get(i.as(usize)).as(String))
+            ins_idx += 1
+        }
+        entry.lines.insert(ins_idx.as(usize), last_p ++ suffix)
+        entry.version += 1
+        return (r + k - 1, last_p.char_len())
+    }
+    let arr = raw.as(List)
+    (arr.get(0).as(i64), arr.get(1).as(i64))
+}
+
+pub fn accel_doc_delete_span(
+    doc_id: i64,
+    s_row: i64,
+    s_col: i64,
+    e_row: i64,
+    e_col: i64,
+) -> String {
+    let raw! = runtime.host_call("accel_doc_delete_span", [doc_id, s_row, s_col, e_row, e_col]) else {
+        let entry? = fb_get_doc(doc_id) else {
+            return ""
+        }
+        let (sr, sc, er, ec) = fb_norm_span(entry.lines, s_row, s_col, e_row, e_col)
+        if sr == er and sc == ec {
+            return ""
+        }
+        let removed = fb_extract_span_lines(entry.lines, sr, sc, er, ec)
+        if sr == er {
+            let cur = entry.lines.get(sr.as(usize)).as(String)
+            entry.lines.set(sr.as(usize), cur.slice(0, sc) ++ cur.slice(ec, cur.char_len()))
+            entry.version += 1
+            return removed
+        }
+        let first_prefix = entry.lines.get(sr.as(usize)).as(String).slice(0, sc)
+        let last_line = entry.lines.get(er.as(usize)).as(String)
+        let last_suffix = last_line.slice(ec, last_line.char_len())
+        let rows_removed = er - sr
+        for _ in 0..rows_removed {
+            let _ = entry.lines.remove((sr + 1).as(usize))
+        }
+        entry.lines.set(sr.as(usize), first_prefix ++ last_suffix)
+        entry.version += 1
+        return removed
+    }
+    raw.as(String)
+}
+
+pub fn accel_doc_extract_span(
+    doc_id: i64,
+    s_row: i64,
+    s_col: i64,
+    e_row: i64,
+    e_col: i64,
+) -> String {
+    let raw! = runtime.host_call("accel_doc_extract_span", [doc_id, s_row, s_col, e_row, e_col]) else {
+        let entry? = fb_get_doc(doc_id) else {
+            return ""
+        }
+        let (sr, sc, er, ec) = fb_norm_span(entry.lines, s_row, s_col, e_row, e_col)
+        return fb_extract_span_lines(entry.lines, sr, sc, er, ec)
+    }
+    raw.as(String)
+}
+
+pub fn accel_doc_to_text_capped(doc_id: i64, crlf: bool) -> String {
+    let raw! = runtime.host_call("accel_doc_to_text_capped", [doc_id, crlf]) else {
+        let entry? = fb_get_doc(doc_id) else {
+            return ""
+        }
+        let sep = if crlf { "\r\n" } else { "\n" }
+        return fb_cap_str(entry.lines.join(sep))
+    }
+    raw.as(String)
+}
+
+pub fn accel_doc_snapshot_take(doc_id: i64) -> i64 {
+    let raw! = runtime.host_call("accel_doc_snapshot_take", [doc_id]) else {
+        let entry? = fb_get_doc(doc_id) else {
+            return 0
+        }
+        let sid = _fb_next_snap_id
+        _fb_next_snap_id += 1
+        fb_snaps_map().insert(sid, FallbackSnapEntry {
+            lines: fb_clone_lines(entry.lines),
+            owner_doc_id: doc_id,
+        })
+        return sid
+    }
+    raw.as(i64)
+}
+
+pub fn accel_doc_snapshot_matches(doc_id: i64, snap_id: i64) -> bool {
+    let raw! = runtime.host_call("accel_doc_snapshot_matches", [doc_id, snap_id]) else {
+        let entry? = fb_get_doc(doc_id) else {
+            return false
+        }
+        let sraw = fb_snaps_map().get(snap_id)
+        if sraw == null {
+            return false
+        }
+        let snap = sraw.as(FallbackSnapEntry)
+        if entry.lines.len() != snap.lines.len() {
+            return false
+        }
+        for i in 0..entry.lines.len() {
+            if entry.lines.get(i.as(usize)).as(String) != snap.lines.get(i.as(usize)).as(String) {
+                return false
+            }
+        }
+        return true
+    }
+    raw.as(bool)
+}
+
+pub fn accel_doc_snapshot_restore(doc_id: i64, snap_id: i64) -> i64 {
+    let raw! = runtime.host_call("accel_doc_snapshot_restore", [doc_id, snap_id]) else {
+        let entry? = fb_get_doc(doc_id) else {
+            return 0
+        }
+        let sraw = fb_snaps_map().get(snap_id)
+        if sraw == null {
+            return 0
+        }
+        let snap = sraw.as(FallbackSnapEntry)
+        entry.lines = fb_clone_lines(snap.lines)
+        entry.version += 1
+        return entry.version
+    }
+    raw.as(i64)
+}
+
+pub fn accel_doc_find_forward(
+    doc_id: i64,
+    needle: String,
+    from_row: i64,
+    from_col: i64,
+    min_row: i64,
+    max_row: i64,
+    ignore_case: bool,
+    wrap: bool,
+) -> ?(i64, i64) {
+    if needle == "" {
+        return null
+    }
+    let raw! = runtime.host_call(
+        "accel_doc_find_forward",
+        [doc_id, needle, from_row, from_col, min_row, max_row, ignore_case, wrap],
+    ) else {
+        let entry? = fb_get_doc(doc_id) else {
+            return null
+        }
+        let max_v = entry.lines.len() - 1
+        let lo = if min_row < 0 { 0 } else if min_row > max_v { max_v } else { min_row }
+        let hi = if max_row < lo { lo } else if max_row > max_v { max_v } else { max_row }
+        let fr = if from_row < lo { lo } else if from_row > hi { hi } else { from_row }
+        let target = if ignore_case { needle.to_lower() } else { needle }
+        for r in fr..(hi + 1) {
+            let line = entry.lines.get(r.as(usize)).as(String)
+            let hay = if ignore_case { line.to_lower() } else { line }
+            let idxs = hay.find_indices(target)
+            for i in 0..idxs.len() {
+                let sc = idxs.get(i.as(usize)).as(i64)
+                if r > fr or sc > from_col {
+                    return (r, sc)
+                }
+            }
+        }
+        if wrap {
+            for wr in lo..(fr + 1) {
+                let line = entry.lines.get(wr.as(usize)).as(String)
+                let hay = if ignore_case { line.to_lower() } else { line }
+                let idxs = hay.find_indices(target)
+                for i in 0..idxs.len() {
+                    let sc = idxs.get(i.as(usize)).as(i64)
+                    if wr < fr or sc <= from_col {
+                        return (wr, sc)
+                    }
+                }
+            }
+        }
+        return null
+    }
+    let arr = raw.as(List)
+    if not arr.get(0).as(bool) {
+        return null
+    }
+    (arr.get(1).as(i64), arr.get(2).as(i64))
+}
+
+pub fn accel_doc_find_backward(
+    doc_id: i64,
+    needle: String,
+    from_row: i64,
+    from_col: i64,
+    min_row: i64,
+    max_row: i64,
+    ignore_case: bool,
+    wrap: bool,
+) -> ?(i64, i64) {
+    if needle == "" {
+        return null
+    }
+    let raw! = runtime.host_call(
+        "accel_doc_find_backward",
+        [doc_id, needle, from_row, from_col, min_row, max_row, ignore_case, wrap],
+    ) else {
+        let entry? = fb_get_doc(doc_id) else {
+            return null
+        }
+        let max_v = entry.lines.len() - 1
+        let lo = if min_row < 0 { 0 } else if min_row > max_v { max_v } else { min_row }
+        let hi = if max_row < lo { lo } else if max_row > max_v { max_v } else { max_row }
+        let fr = if from_row < lo { lo } else if from_row > hi { hi } else { from_row }
+        let target = if ignore_case { needle.to_lower() } else { needle }
+        var r = fr
+        while r >= lo {
+            let line = entry.lines.get(r.as(usize)).as(String)
+            let hay = if ignore_case { line.to_lower() } else { line }
+            let idxs = hay.find_indices(target)
+            var i = idxs.len() - 1
+            while i >= 0 {
+                let sc = idxs.get(i.as(usize)).as(i64)
+                if r < fr or sc < from_col {
+                    return (r, sc)
+                }
+                i -= 1
+            }
+            r -= 1
+        }
+        if wrap {
+            var wr = hi
+            while wr >= fr {
+                let line = entry.lines.get(wr.as(usize)).as(String)
+                let hay = if ignore_case { line.to_lower() } else { line }
+                let idxs = hay.find_indices(target)
+                var i = idxs.len() - 1
+                while i >= 0 {
+                    let sc = idxs.get(i.as(usize)).as(i64)
+                    if wr > fr or sc >= from_col {
+                        return (wr, sc)
+                    }
+                    i -= 1
+                }
+                wr -= 1
+            }
+        }
+        return null
+    }
+    let arr = raw.as(List)
+    if not arr.get(0).as(bool) {
+        return null
+    }
+    (arr.get(1).as(i64), arr.get(2).as(i64))
+}
+
+pub fn accel_doc_find_matching_bracket(
+    doc_id: i64,
+    row: i64,
+    col: i64,
+    min_row: i64,
+    max_row: i64,
+    max_scan_lines: i64,
+) -> ?(i64, i64) {
+    let raw! = runtime.host_call(
+        "accel_doc_find_matching_bracket",
+        [doc_id, row, col, min_row, max_row, max_scan_lines],
+    ) else {
+        let entry? = fb_get_doc(doc_id) else {
+            return null
+        }
+        if row < 0 or row >= entry.lines.len() {
+            return null
+        }
+        let max_v = entry.lines.len() - 1
+        let lo_b = if min_row < 0 { 0 } else if min_row > max_v { max_v } else { min_row }
+        let hi_b = if max_row < lo_b { lo_b } else if max_row > max_v { max_v } else { max_row }
+        if row < lo_b or row > hi_b {
+            return null
+        }
+        let line0 = entry.lines.get(row.as(usize)).as(String)
+        let llen = line0.char_len()
+        if llen == 0 {
+            return null
+        }
+        let c0 = if col >= llen { llen - 1 } else { col }
+        if c0 < 0 {
+            return null
+        }
+        let ch = line0.slice(c0, c0 + 1)
+        let (open_ch, close_ch, forward) = when {
+            ch == "(" => ("(", ")", true),
+            ch == "[" => ("[", "]", true),
+            ch == "{{" => ("{{", "}}", true),
+            ch == ")" => ("(", ")", false),
+            ch == "]" => ("[", "]", false),
+            ch == "}}" => ("{{", "}}", false),
+            else => ("", "", true),
+        }
+        if open_ch == "" {
+            return null
+        }
+        let lo_r = if max_scan_lines > 0 and row - max_scan_lines > lo_b {
+            row - max_scan_lines
+        } else {
+            lo_b
+        }
+        let hi_r = if max_scan_lines > 0 and row + max_scan_lines < hi_b {
+            row + max_scan_lines
+        } else {
+            hi_b
+        }
+        var depth: i64 = 0
+        if forward {
+            for r in row..(hi_r + 1) {
+                let l = entry.lines.get(r.as(usize)).as(String)
+                let start_c = if r == row { c0 } else { 0 }
+                for c in start_c..l.char_len() {
+                    let cur = l.slice(c, c + 1)
+                    if cur == open_ch {
+                        depth += 1
+                    } else if cur == close_ch {
+                        depth -= 1
+                        if depth == 0 {
+                            return (r, c)
+                        }
+                    }
+                }
+            }
+        } else {
+            var r = row
+            while r >= lo_r {
+                let l = entry.lines.get(r.as(usize)).as(String)
+                var c = if r == row { c0 } else { l.char_len() - 1 }
+                while c >= 0 {
+                    let cur = l.slice(c, c + 1)
+                    if cur == close_ch {
+                        depth += 1
+                    } else if cur == open_ch {
+                        depth -= 1
+                        if depth == 0 {
+                            return (r, c)
+                        }
+                    }
+                    c -= 1
+                }
+                r -= 1
+            }
+        }
+        return null
+    }
+    let arr = raw.as(List)
+    if not arr.get(0).as(bool) {
+        return null
+    }
+    (arr.get(1).as(i64), arr.get(2).as(i64))
+}
+
+private fn fb_is_code_mode(m: String) -> bool {
+    m != "text"
+        and m != "markdown"
+        and m != "org"
+        and m != "diff"
+        and m != "messages"
+        and m != "trouble"
+        and m != "magit"
+        and m != "dired"
+}
+
+private fn fb_line_cmt(m: String) -> String {
+    when {
+        m == "nessa" or m == "lua" or m == "sql" or m == "haskell" => "--",
+        m == "rust" or m == "c" or m == "cpp" or m == "go" or m == "javascript"
+            or m == "typescript" or m == "java" or m == "css" or m == "scss" or m == "jsonc" => "//",
+        m == "python" or m == "sh" or m == "shell" or m == "toml" or m == "yaml"
+            or m == "makefile" or m == "conf" => "#",
+        m == "lisp" or m == "elisp" or m == "scheme" => ";",
+        else => "",
+    }
+}
+
+private fn fb_blk_delims(m: String) -> (String, String) {
+    when {
+        m == "nessa" or m == "lua" => ("--[[", "]]"),
+        m == "rust" or m == "c" or m == "cpp" or m == "go" or m == "javascript"
+            or m == "typescript" or m == "java" or m == "css" or m == "scss" or m == "jsonc" => ("/*", "*/"),
+        else => ("", ""),
+    }
+}
+
+private fn fb_single_quote_mode(m: String) -> bool {
+    m == "python"
+        or m == "javascript"
+        or m == "typescript"
+        or m == "sh"
+        or m == "shell"
+        or m == "yaml"
+        or m == "toml"
+        or m == "css"
+        or m == "scss"
+}
+
+private fn fb_conflict_marker_kind(line: String) -> String {
+    when {
+        line.starts_with("<<<<<<<") => "<<<<<<<",
+        line == "=======" or line.starts_with("======= ") => "=======",
+        line.starts_with(">>>>>>>") => ">>>>>>>",
+        line.starts_with("|||||||") => "|||||||",
+        else => "",
+    }
+}
+
+pub fn accel_doc_analyze_diagnostics(
+    doc_id: i64,
+    major_mode: String,
+    max_items: i64,
+) -> (List, i64, i64) {
+    let raw! = runtime.host_call(
+        "accel_doc_analyze_diagnostics",
+        [doc_id, major_mode, max_items],
+    ) else {
+        let diags = List()
+        let entry? = fb_get_doc(doc_id) else {
+            return (diags, 0, 0)
+        }
+        let cap = if max_items <= 0 { 1000 } else { max_items }
+        let m = major_mode.to_lower()
+        let code_mode = fb_is_code_mode(m)
+        let line_cmt = fb_line_cmt(m)
+        let (blk_open, blk_close) = fb_blk_delims(m)
+        let sq_str = fb_single_quote_mode(m)
+        var errs: i64 = 0
+        var warns: i64 = 0
+        let bstack = List()
+        var in_blk = false
+
+        for r in 0..entry.lines.len() {
+            let line = entry.lines.get(r.as(usize)).as(String)
+            let llen = line.char_len()
+            let cm = fb_conflict_marker_kind(line)
+            if cm != "" {
+                errs += 1
+                diags.push(NativeDiagHit {
+                    row: r,
+                    col: 0,
+                    end_col: if llen > 0 { llen } else { 1 },
+                    severity: "ERROR",
+                    source: "git",
+                    message: "Unresolved git merge conflict marker '" ++ cm ++ "'",
+                })
+                continue
+            }
+            var saw_sp = false
+            var saw_tb = false
+            var ws_end: i64 = 0
+            while ws_end < llen {
+                let wch = line.slice(ws_end, ws_end + 1)
+                if wch == " " {
+                    saw_sp = true
+                    ws_end += 1
+                } else if wch == "\t" {
+                    saw_tb = true
+                    ws_end += 1
+                } else {
+                    break
+                }
+            }
+            if saw_sp and saw_tb {
+                warns += 1
+                diags.push(NativeDiagHit {
+                    row: r,
+                    col: 0,
+                    end_col: if ws_end > 0 { ws_end } else { 1 },
+                    severity: "WARN",
+                    source: "style",
+                    message: "Mixed tab and space indentation",
+                })
+            }
+            if code_mode {
+                let tlen = line.trim_end().char_len()
+                if tlen < llen {
+                    warns += 1
+                    diags.push(NativeDiagHit {
+                        row: r,
+                        col: tlen,
+                        end_col: llen,
+                        severity: "WARN",
+                        source: "style",
+                        message: "Trailing whitespace",
+                    })
+                }
+                var c: i64 = 0
+                while c < llen {
+                    if in_blk {
+                        if blk_close != "" and c + blk_close.char_len() <= llen
+                            and line.slice(c, c + blk_close.char_len()) == blk_close {
+                            in_blk = false
+                            c += blk_close.char_len()
+                        } else {
+                            c += 1
+                        }
+                        continue
+                    }
+                    if blk_open != "" and c + blk_open.char_len() <= llen
+                        and line.slice(c, c + blk_open.char_len()) == blk_open {
+                        in_blk = true
+                        c += blk_open.char_len()
+                        continue
+                    }
+                    if line_cmt != "" and c + line_cmt.char_len() <= llen
+                        and line.slice(c, c + line_cmt.char_len()) == line_cmt {
+                        break
+                    }
+                    let ch = line.slice(c, c + 1)
+                    if ch == "\"" or (sq_str and ch == "'") {
+                        let q = ch
+                        let start_c = c
+                        c += 1
+                        var closed = false
+                        while c < llen {
+                            let cur = line.slice(c, c + 1)
+                            if cur == "\\" {
+                                c += 2
+                            } else if cur == q {
+                                closed = true
+                                c += 1
+                                break
+                            } else {
+                                c += 1
+                            }
+                        }
+                        if not closed {
+                            errs += 1
+                            diags.push(NativeDiagHit {
+                                row: r,
+                                col: start_c,
+                                end_col: if llen > start_c { llen } else { start_c + 1 },
+                                severity: "ERROR",
+                                source: "syntax",
+                                message: "Unterminated string literal",
+                            })
+                        }
+                        continue
+                    }
+                    if (not sq_str) and ch == "'" {
+                        if c + 2 < llen and line.slice(c + 1, c + 2) != "\\" and line.slice(c + 2, c + 3) == "'" {
+                            c += 3
+                            continue
+                        }
+                        if c + 3 < llen and line.slice(c + 1, c + 2) == "\\" and line.slice(c + 3, c + 4) == "'" {
+                            c += 4
+                            continue
+                        }
+                    }
+                    if ch == "(" or ch == "[" or ch == "{{" {
+                        bstack.push((ch, r, c))
+                    } else if ch == ")" or ch == "]" or ch == "}}" {
+                        let want = if ch == ")" { "(" } else if ch == "]" { "[" } else { "{{" }
+                        if bstack.is_empty() {
+                            errs += 1
+                            diags.push(NativeDiagHit {
+                                row: r,
+                                col: c,
+                                end_col: c + 1,
+                                severity: "ERROR",
+                                source: "syntax",
+                                message: "Unmatched closing bracket '" ++ ch ++ "'",
+                            })
+                        } else {
+                            let (top_ch, top_r, _) = bstack.pop().as((String, i64, i64))
+                            if top_ch != want {
+                                let exp = if top_ch == "(" { ")" } else if top_ch == "[" { "]" } else { "}}" }
+                                errs += 1
+                                diags.push(NativeDiagHit {
+                                    row: r,
+                                    col: c,
+                                    end_col: c + 1,
+                                    severity: "ERROR",
+                                    source: "syntax",
+                                    message: "Mismatched bracket: expected '" ++ exp ++ "' for '" ++ top_ch
+                                        ++ "' at line " ++ (top_r + 1).to_string() ++ ", found '" ++ ch ++ "'",
+                                })
+                            }
+                        }
+                    }
+                    c += 1
+                }
+            }
+        }
+        for bi in 0..bstack.len() {
+            let (och, orow, ocol) = bstack.get(bi.as(usize)).as((String, i64, i64))
+            errs += 1
+            diags.push(NativeDiagHit {
+                row: orow,
+                col: ocol,
+                end_col: ocol + 1,
+                severity: "ERROR",
+                source: "syntax",
+                message: "Unclosed bracket '" ++ och ++ "'",
+            })
+        }
+        diags.sort_by(|a: Any, b: Any| {
+            let da = a.as(NativeDiagHit)
+            let db = b.as(NativeDiagHit)
+            let ra = if da.severity == "ERROR" { 0 } else { 1 }
+            let rb = if db.severity == "ERROR" { 0 } else { 1 }
+            if da.row != db.row {
+                da.row.cmp(db.row)
+            } else if da.col != db.col {
+                da.col.cmp(db.col)
+            } else {
+                ra.cmp(rb)
+            }
+        })
+        let capped = List()
+        let take_n = if diags.len() > cap { cap } else { diags.len() }
+        for i in 0..take_n {
+            capped.push(diags.get(i.as(usize)))
+        }
+        return (capped, errs, warns)
+    }
+    let arr = raw.as(List)
+    let raw_items = arr.get(0).as(List)
+    let out = List()
+    for i in 0..raw_items.len() {
+        let d = raw_items.get(i.as(usize)).as(List)
+        out.push(NativeDiagHit {
+            row: d.get(0).as(i64),
+            col: d.get(1).as(i64),
+            end_col: d.get(2).as(i64),
+            severity: d.get(3).as(String),
+            source: d.get(4).as(String),
+            message: d.get(5).as(String),
+        })
+    }
+    (out, arr.get(1).as(i64), arr.get(2).as(i64))
+}
+
+private fn fb_is_ident_char(ch: String) -> bool {
+    if ch == "" {
+        return false
+    }
+    ch == "_" or ch.is_alphanumeric()
+}
+
+pub fn accel_doc_scan_todos(doc_id: i64, file_path: String, max_items: i64) -> List {
+    let raw! = runtime.host_call("accel_doc_scan_todos", [doc_id, file_path, max_items]) else {
+        let out = List()
+        let entry? = fb_get_doc(doc_id) else {
+            return out
+        }
+        let cap = if max_items <= 0 { 500 } else { max_items }
+        let tags = ["TODO", "FIXME", "HACK", "NOTE", "PERF", "WARN", "BUG"]
+        for r in 0..entry.lines.len() {
+            let line = entry.lines.get(r.as(usize)).as(String)
+            let llen = line.char_len()
+            var best_col: i64 = -1
+            var best_tag = ""
+            for ti in 0..tags.len() {
+                let tag = tags.get(ti.as(usize)).as(String)
+                let idxs = line.find_indices(tag)
+                for ii in 0..idxs.len() {
+                    let col = idxs.get(ii.as(usize)).as(i64)
+                    if best_col >= 0 and col >= best_col {
+                        break
+                    }
+                    let before_ok = if col == 0 {
+                        true
+                    } else {
+                        not fb_is_ident_char(line.slice(col - 1, col))
+                    }
+                    let after_c = col + tag.char_len()
+                    let after_ok = if after_c >= llen {
+                        true
+                    } else {
+                        let ach = line.slice(after_c, after_c + 1)
+                        ach == ":" or ach == "(" or ach == " " or ach == "\t" or ach == "!"
+                    }
+                    if before_ok and after_ok {
+                        best_col = col
+                        best_tag = tag
+                        break
+                    }
+                }
+            }
+            if best_col >= 0 {
+                out.push(TodoItem {
+                    file_path: file_path,
+                    row: r,
+                    col: best_col,
+                    tag: best_tag,
+                    text: line.drop(best_col).trim(),
+                })
+                if out.len() >= cap {
+                    break
+                }
+            }
+        }
+        return out
+    }
+    let arr = raw.as(List)
+    let out = List()
+    for i in 0..arr.len() {
+        let r = arr.get(i.as(usize)).as(List)
+        out.push(TodoItem {
+            file_path: r.get(0).as(String),
+            row: r.get(1).as(i64),
+            col: r.get(2).as(i64),
+            tag: r.get(3).as(String),
+            text: r.get(4).as(String),
+        })
+    }
+    out
+}
+
+pub fn accel_doc_scan_symbol_spans(doc_id: i64, major_mode: String, max_items: i64) -> List {
+    let raw! = runtime.host_call("accel_doc_scan_symbol_spans", [doc_id, major_mode, max_items]) else {
+        let out = List()
+        let entry? = fb_get_doc(doc_id) else {
+            return out
+        }
+        let cap = if max_items <= 0 { 2000 } else { max_items }
+        let syms = accel_scan_symbols(entry.lines, major_mode)
+        let n = syms.len()
+        let max_row = entry.lines.len() - 1
+        let m = major_mode.to_lower()
+        let line_cmt = if m == "nessa" or m == "lua" {
+            "--"
+        } else if m == "toml" or m == "yaml" or m == "sh" or m == "shell" {
+            "#"
+        } else {
+            "//"
+        }
+        let take_n = if n > cap { cap } else { n }
+        for i in 0..take_n {
+            let sym = syms.get(i.as(usize)).as(SymbolItem)
+            var next_same: i64 = -1
+            for j in (i + 1)..n {
+                let cand = syms.get(j.as(usize)).as(SymbolItem)
+                if cand.level <= sym.level {
+                    next_same = cand.row
+                    break
+                }
+            }
+            if m == "markdown" or m == "org" {
+                let end_r = if next_same >= 0 {
+                    if next_same > sym.row { next_same - 1 } else { sym.row }
+                } else {
+                    max_row
+                }
+                out.push(SymbolOutlineSpan {
+                    name: sym.name,
+                    kind: sym.kind,
+                    row: sym.row,
+                    col: sym.col,
+                    level: sym.level,
+                    end_row: end_r,
+                })
+            } else if m == "python" {
+                var end_r = sym.row
+                for r in (sym.row + 1)..(max_row + 1) {
+                    let l = entry.lines.get(r.as(usize)).as(String)
+                    let tr = l.trim_start()
+                    if tr != "" and (not tr.starts_with("#")) {
+                        let ind = l.char_len() - tr.char_len()
+                        if ind <= sym.col {
+                            break
+                        }
+                        end_r = r
+                    }
+                }
+                out.push(SymbolOutlineSpan {
+                    name: sym.name,
+                    kind: sym.kind,
+                    row: sym.row,
+                    col: sym.col,
+                    level: sym.level,
+                    end_row: end_r,
+                })
+            } else {
+                let limit_r = if next_same >= 0 {
+                    if next_same - 1 >= sym.row { next_same - 1 } else { sym.row }
+                } else {
+                    max_row
+                }
+                var depth: i64 = 0
+                var saw_open = false
+                var end_r = sym.row
+                for r in sym.row..(limit_r + 1) {
+                    let l = entry.lines.get(r.as(usize)).as(String)
+                    let llen = l.char_len()
+                    var opens: i64 = 0
+                    var closes: i64 = 0
+                    var saw_semi_zero = false
+                    var running = depth
+                    var c: i64 = 0
+                    while c < llen {
+                        if line_cmt != "" and c + line_cmt.char_len() <= llen
+                            and l.slice(c, c + line_cmt.char_len()) == line_cmt {
+                            break
+                        }
+                        let ch = l.slice(c, c + 1)
+                        if ch == "\"" {
+                            c += 1
+                            while c < llen {
+                                let sc = l.slice(c, c + 1)
+                                if sc == "\\" {
+                                    c += 2
+                                } else if sc == "\"" {
+                                    c += 1
+                                    break
+                                } else {
+                                    c += 1
+                                }
+                            }
+                            continue
+                        }
+                        if ch == "{{" {
+                            opens += 1
+                            running += 1
+                        } else if ch == "}}" {
+                            closes += 1
+                            running -= 1
+                        } else if ch == ";" and running <= 0 {
+                            saw_semi_zero = true
+                        }
+                        c += 1
+                    }
+                    if opens > 0 {
+                        saw_open = true
+                    }
+                    depth += opens - closes
+                    if saw_open and depth <= 0 {
+                        end_r = r
+                        break
+                    }
+                    if not saw_open {
+                        if r == sym.row and saw_semi_zero {
+                            end_r = r
+                            break
+                        }
+                        if r > sym.row {
+                            if r > sym.row + 6 {
+                                end_r = sym.row
+                                break
+                            }
+                            let tr = l.trim()
+                            if tr == "" or (line_cmt != "" and tr.starts_with(line_cmt)) {
+                                end_r = sym.row
+                                break
+                            }
+                        }
+                    }
+                    end_r = r
+                }
+                out.push(SymbolOutlineSpan {
+                    name: sym.name,
+                    kind: sym.kind,
+                    row: sym.row,
+                    col: sym.col,
+                    level: sym.level,
+                    end_row: end_r,
+                })
+            }
+        }
+        return out
+    }
+    let arr = raw.as(List)
+    let out = List()
+    for i in 0..arr.len() {
+        let r = arr.get(i.as(usize)).as(List)
+        out.push(SymbolOutlineSpan {
+            name: r.get(0).as(String),
+            kind: r.get(1).as(String),
+            row: r.get(2).as(i64),
+            col: r.get(3).as(i64),
+            level: r.get(4).as(i64),
+            end_row: r.get(5).as(i64),
+        })
+    }
+    out
+}
+
+pub fn accel_doc_diff_head(
+    doc_id: i64,
+    file_path: String,
+    reload_head: bool,
+) -> ?(List, i64, i64, i64) {
+    if file_path == "" {
+        return null
+    }
+    let raw! = runtime.host_call("accel_doc_diff_head", [doc_id, file_path, reload_head]) else {
+        let entry? = fb_get_doc(doc_id) else {
+            return null
+        }
+        let dir_opt = path.parent(file_path)
+        let cwd = if dir_opt != null { dir_opt.as(String) } else { "." }
+        let head_opt = accel_git_head_lines(cwd, file_path)
+        let head_lines? = head_opt else {
+            return null
+        }
+        let hunks = accel_diff_lines(head_lines, entry.lines)
+        var added: i64 = 0
+        var changed: i64 = 0
+        var deleted: i64 = 0
+        for i in 0..hunks.len() {
+            let h = hunks.get(i.as(usize)).as(DiffHunk)
+            if h.kind == "add" {
+                added += h.new_count
+            } else if h.kind == "change" {
+                changed += if h.new_count >= h.old_count { h.new_count } else { h.old_count }
+            } else if h.kind == "delete" {
+                deleted += h.old_count
+            }
+        }
+        return (hunks, added, changed, deleted)
+    }
+    let arr = raw.as(List)
+    if not arr.get(0).as(bool) {
+        return null
+    }
+    let raw_hunks = arr.get(1).as(List)
+    let hunks = List()
+    for i in 0..raw_hunks.len() {
+        let h = raw_hunks.get(i.as(usize)).as(List)
+        hunks.push(DiffHunk {
+            old_start: h.get(0).as(i64),
+            old_count: h.get(1).as(i64),
+            new_start: h.get(2).as(i64),
+            new_count: h.get(3).as(i64),
+            kind: h.get(4).as(String),
+        })
+    }
+    (hunks, arr.get(2).as(i64), arr.get(3).as(i64), arr.get(4).as(i64))
+}
+
+pub fn accel_doc_scan_conflicts(doc_id: i64, max_items: i64) -> List {
+    let raw! = runtime.host_call("accel_doc_scan_conflicts", [doc_id, max_items]) else {
+        let out = List()
+        let entry? = fb_get_doc(doc_id) else {
+            return out
+        }
+        let cap = if max_items <= 0 { 500 } else { max_items }
+        var cur_start: i64 = -1
+        var cur_ours = ""
+        var cur_base: i64 = -1
+        var cur_sep: i64 = -1
+        for r in 0..entry.lines.len() {
+            let l = entry.lines.get(r.as(usize)).as(String)
+            if l == "<<<<<<<" or l.starts_with("<<<<<<< ") {
+                cur_start = r
+                let rest = if l.char_len() > 7 { l.drop(7).trim() } else { "" }
+                cur_ours = if rest == "" { "ours" } else { rest }
+                cur_base = -1
+                cur_sep = -1
+            } else if cur_start >= 0 and cur_sep < 0 and cur_base < 0
+                and (l == "|||||||" or l.starts_with("||||||| ")) {
+                cur_base = r
+            } else if cur_start >= 0 and cur_sep < 0
+                and (l == "=======" or l.starts_with("======= ")) {
+                cur_sep = r
+            } else if cur_start >= 0 and cur_sep >= 0
+                and (l == ">>>>>>>" or l.starts_with(">>>>>>> ")) {
+                let rest = if l.char_len() > 7 { l.drop(7).trim() } else { "" }
+                let theirs_lbl = if rest == "" { "theirs" } else { rest }
+                out.push(NativeConflictHit {
+                    start_row: cur_start,
+                    base_row: cur_base,
+                    sep_row: cur_sep,
+                    end_row: r,
+                    ours_label: cur_ours,
+                    theirs_label: theirs_lbl,
+                })
+                cur_start = -1
+                cur_base = -1
+                cur_sep = -1
+                if out.len() >= cap {
+                    break
+                }
+            }
+        }
+        return out
+    }
+    let arr = raw.as(List)
+    let out = List()
+    for i in 0..arr.len() {
+        let c = arr.get(i.as(usize)).as(List)
+        out.push(NativeConflictHit {
+            start_row: c.get(0).as(i64),
+            base_row: c.get(1).as(i64),
+            sep_row: c.get(2).as(i64),
+            end_row: c.get(3).as(i64),
+            ours_label: c.get(4).as(String),
+            theirs_label: c.get(5).as(String),
+        })
+    }
+    out
+}
+
+pub fn accel_doc_find_word_occurrences(
+    doc_id: i64,
+    word: String,
+    start_row: i64,
+    end_row_inclusive: i64,
+    max_items: i64,
+) -> List {
+    if word == "" {
+        return List()
+    }
+    let raw! = runtime.host_call(
+        "accel_doc_find_word_occurrences",
+        [doc_id, word, start_row, end_row_inclusive, max_items],
+    ) else {
+        let out = List()
+        let entry? = fb_get_doc(doc_id) else {
+            return out
+        }
+        let cap = if max_items <= 0 { 500 } else { max_items }
+        let max_v = entry.lines.len() - 1
+        let lo = if start_row < 0 { 0 } else { start_row }
+        let hi = if end_row_inclusive > max_v { max_v } else { end_row_inclusive }
+        if hi < lo {
+            return out
+        }
+        let wlen = word.char_len()
+        for r in lo..(hi + 1) {
+            let line = entry.lines.get(r.as(usize)).as(String)
+            let llen = line.char_len()
+            if llen < wlen {
+                continue
+            }
+            let idxs = line.find_indices(word)
+            for ii in 0..idxs.len() {
+                let sc = idxs.get(ii.as(usize)).as(i64)
+                let ec = sc + wlen
+                let left_ok = if sc == 0 {
+                    true
+                } else {
+                    not fb_is_ident_char(line.slice(sc - 1, sc))
+                }
+                let right_ok = if ec >= llen {
+                    true
+                } else {
+                    not fb_is_ident_char(line.slice(ec, ec + 1))
+                }
+                if left_ok and right_ok {
+                    out.push((r, sc, ec))
+                    if out.len() >= cap {
+                        return out
+                    }
+                }
+            }
+        }
+        return out
+    }
+    let arr = raw.as(List)
+    let out = List()
+    for i in 0..arr.len() {
+        let p = arr.get(i.as(usize)).as(List)
+        out.push((p.get(0).as(i64), p.get(1).as(i64), p.get(2).as(i64)))
+    }
+    out
+}
+
+private fn fb_collect_words_in_line(
+    line: String,
+    row: i64,
+    skip_row: i64,
+    skip_col: i64,
+    seen: Set,
+    out: List,
+    cap: i64,
+) {
+    let n = line.char_len()
+    var i: i64 = 0
+    while i < n and out.len() < cap {
+        let ch = line.slice(i, i + 1)
+        if ch == "_" or ch.is_alphabetic() {
+            let start = i
+            i += 1
+            while i < n and fb_is_ident_char(line.slice(i, i + 1)) {
+                i += 1
+            }
+            if i - start >= 2 and (not (row == skip_row and start == skip_col)) {
+                let tok = line.slice(start, i)
+                if not seen.contains(tok) {
+                    seen.insert(tok)
+                    out.push(tok)
+                }
+            }
+        } else {
+            i += 1
+        }
+    }
+}
+
+pub fn accel_doc_collect_words(
+    doc_id: i64,
+    center_row: i64,
+    radius_rows: i64,
+    skip_row: i64,
+    skip_col: i64,
+    max_words: i64,
+) -> List {
+    let raw! = runtime.host_call(
+        "accel_doc_collect_words",
+        [doc_id, center_row, radius_rows, skip_row, skip_col, max_words],
+    ) else {
+        let out = List()
+        let entry? = fb_get_doc(doc_id) else {
+            return out
+        }
+        let cap = if max_words <= 0 { 500 } else { max_words }
+        let total = entry.lines.len()
+        let rad = if radius_rows > 0 { radius_rows } else { 0 }
+        let wlo = if center_row - rad < 0 {
+            0
+        } else if center_row - rad >= total {
+            total - 1
+        } else {
+            center_row - rad
+        }
+        let whi_excl = if center_row + rad + 1 < 0 {
+            0
+        } else if center_row + rad + 1 > total {
+            total
+        } else {
+            center_row + rad + 1
+        }
+        let seen = Set.new()
+        for r in wlo..whi_excl {
+            let line = entry.lines.get(r.as(usize)).as(String)
+            fb_collect_words_in_line(line, r, skip_row, skip_col, seen, out, cap)
+            if out.len() >= cap {
+                return out
+            }
+        }
+        let top_excl = if total < 120 { total } else { 120 }
+        let p1 = if top_excl < wlo { top_excl } else { wlo }
+        for r in 0..p1 {
+            let line = entry.lines.get(r.as(usize)).as(String)
+            fb_collect_words_in_line(line, r, skip_row, skip_col, seen, out, cap)
+            if out.len() >= cap {
+                return out
+            }
+        }
+        if whi_excl < top_excl {
+            for r in whi_excl..top_excl {
+                let line = entry.lines.get(r.as(usize)).as(String)
+                fb_collect_words_in_line(line, r, skip_row, skip_col, seen, out, cap)
+                if out.len() >= cap {
+                    return out
+                }
+            }
+        }
+        return out
+    }
+    raw.as(List)
+}
+
+pub fn accel_doc_search_preview(
+    doc_id: i64,
+    needle: String,
+    min_row: i64,
+    max_row: i64,
+    ignore_case: bool,
+    max_previews: i64,
+) -> (i64, List) {
+    if needle == "" {
+        return (0, List())
+    }
+    let raw! = runtime.host_call(
+        "accel_doc_search_preview",
+        [doc_id, needle, min_row, max_row, ignore_case, max_previews],
+    ) else {
+        let out = List()
+        let entry? = fb_get_doc(doc_id) else {
+            return (0, out)
+        }
+        let n = entry.lines.len()
+        if n <= 0 {
+            return (0, out)
+        }
+        let lo = if min_row < 0 { 0 } else if min_row >= n { n - 1 } else { min_row }
+        let hi = if max_row < lo { lo } else if max_row >= n { n - 1 } else { max_row }
+        let pat = if ignore_case { needle.to_lower() } else { needle }
+        let cap = if max_previews <= 0 { 0 } else { max_previews }
+        var total: i64 = 0
+        for r in lo..(hi + 1) {
+            let line = entry.lines.get(r.as(usize)).as(String)
+            let hay = if ignore_case { line.to_lower() } else { line }
+            let hits = hay.find_indices(pat)
+            let hc = hits.len()
+            if hc > 0 {
+                total += hc
+                if out.len() < cap {
+                    let sc = hits.get(0).as(i64)
+                    let trimmed = line.trim()
+                    let clipped = if trimmed.char_len() > 60 {
+                        trimmed.take(60) ++ "..."
+                    } else {
+                        trimmed
+                    }
+                    out.push((r, sc, clipped))
+                }
+            }
+        }
+        return (total, out)
+    }
+    let pair = raw.as(List)
+    let total = pair.get(0).as(i64)
+    let raw_items = pair.get(1).as(List)
+    let out = List()
+    for i in 0..raw_items.len() {
+        let row_vec = raw_items.get(i.as(usize)).as(List)
+        out.push((
+            row_vec.get(0).as(i64),
+            row_vec.get(1).as(i64),
+            row_vec.get(2).as(String),
+        ))
+    }
+    (total, out)
+}
+
+pub fn accel_lsp_did_open_doc(
+    client_id: i64,
+    doc_id: i64,
+    file_path: String,
+    language_id: String,
+    version: i64,
+    crlf: bool,
+) -> bool {
+    if client_id <= 0 {
+        return false
+    }
+    let raw! = runtime.host_call(
+        "lsp_did_open_doc",
+        [client_id, doc_id, file_path, language_id, version, crlf],
+    ) else {
+        return false
+    }
+    raw.as(bool)
+}
+
+pub fn accel_lsp_did_change_doc(
+    client_id: i64,
+    doc_id: i64,
+    file_path: String,
+    version: i64,
+    crlf: bool,
+) -> bool {
+    if client_id <= 0 {
+        return false
+    }
+    let raw! = runtime.host_call(
+        "lsp_did_change_doc",
+        [client_id, doc_id, file_path, version, crlf],
+    ) else {
+        return false
+    }
+    raw.as(bool)
+}
+
+pub fn accel_lsp_did_save_doc(
+    client_id: i64,
+    doc_id: i64,
+    file_path: String,
+    crlf: bool,
+) -> bool {
+    if client_id <= 0 {
+        return false
+    }
+    let raw! = runtime.host_call(
+        "lsp_did_save_doc",
+        [client_id, doc_id, file_path, crlf],
+    ) else {
+        return false
+    }
+    raw.as(bool)
+}

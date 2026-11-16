@@ -1,0 +1,244 @@
+-- ext_autopairs: Smart Bracket & Quote Auto-Pairing Extension (`lava.org/ext_autopairs`) for Lava.
+-- Installs an InsertInterceptor on `VimState` supporting smart auto-close for `()`, `[]`, `{}`,
+-- `""`, `''`, `` `` ``, closing delimiter step-over, `<Space>` symmetric padding `( | )`,
+-- `<BackSpace>` pair/padding deletion, apostrophe/word context awareness, and `:AutopairsToggle`.
+
+use @lava_core.{
+    ExtId, InteractiveEffects, KeyStroke, ServiceEffects, SystemKernel, status_emit
+}
+use @ext_document.{
+    Pos, Span, ext_document_id, require_editor_world
+}
+use @ext_vim.{
+    SERVICE_VIM, VimMode, VimState, ext_vim_id, require_vim_state
+}
+
+pub fn ext_autopairs_id() -> ExtId = ExtId("lava.org/ext_autopairs")
+
+fn stroke_printable(stroke: KeyStroke) -> String {
+    if stroke.ctrl or stroke.alt or stroke.super_mod {
+        return ""
+    }
+    if stroke.key == "Space" {
+        return " "
+    }
+    if stroke.text != "" and stroke.text.char_len() == 1 {
+        return stroke.text
+    }
+    if stroke.key.char_len() == 1 {
+        return stroke.key
+    }
+    ""
+}
+
+fn is_word_or_alnum(ch: String) -> bool {
+    if ch == "" {
+        return false
+    }
+    ch == "_" or ch.is_alphanumeric()
+}
+
+fn is_escaped_before(line: String, col: i64) -> bool {
+    var slashes: i64 = 0
+    var k = col - 1
+    while k >= 0 and line.slice(k, k + 1) == "\\" {
+        slashes += 1
+        k -= 1
+    }
+    slashes % 2 == 1
+}
+
+fn is_bracket_pair(open_ch: String, close_ch: String) -> bool {
+    (open_ch == "(" and close_ch == ")")
+        or (open_ch == "[" and close_ch == "]")
+        or (open_ch == "{{" and close_ch == "}}")
+}
+
+fn is_any_pair(open_ch: String, close_ch: String) -> bool {
+    is_bracket_pair(open_ch, close_ch)
+        or (open_ch == "\"" and close_ch == "\"")
+        or (open_ch == "'" and close_ch == "'")
+        or (open_ch == "`" and close_ch == "`")
+}
+
+fn matching_bracket_close(open_ch: String) -> String {
+    if open_ch == "(" {
+        return ")"
+    }
+    if open_ch == "[" {
+        return "]"
+    }
+    if open_ch == "{{" {
+        return "}}"
+    }
+    ""
+}
+
+fn record_insert_change(vim: VimState, stroke: KeyStroke) {
+    if vim.recording_change and (not vim.replaying_dot) {
+        vim.change_strokes.push(stroke)
+    }
+}
+
+fn autopairs_insert_handler(
+    kernel: SystemKernel,
+    stroke: KeyStroke,
+) -> #ServiceEffects !String bool {
+    let world = require_editor_world(kernel)!
+    if not world.options.autopairs {
+        return false
+    }
+
+    let vim = require_vim_state(kernel)!
+    if vim.mode != VimMode.Insert or vim.block_insert_active {
+        return false
+    }
+
+    let buf = world.active_buffer()
+    if buf.read_only {
+        return false
+    }
+
+    if stroke.ctrl or stroke.alt or stroke.super_mod {
+        return false
+    }
+
+    let p = buf.clamp_pos(buf.point, insert_mode = true)
+    let row = p.row
+    let col = p.col
+    let line = buf.line_at(row)
+    let llen = line.char_len()
+    let prev_ch = if col > 0 { line.slice(col - 1, col) } else { "" }
+    let next_ch = if col < llen { line.slice(col, col + 1) } else { "" }
+    let prev2_ch = if col > 1 { line.slice(col - 2, col - 1) } else { "" }
+    let next2_ch = if col + 1 < llen { line.slice(col + 1, col + 2) } else { "" }
+
+    -- 1. `<BackSpace>` inside `( | )` -> `(|)`, or inside adjacent empty pair `(|)` / `"|"` -> empty
+    if stroke.key == "BackSpace" {
+        if prev_ch == " " and next_ch == " " and is_bracket_pair(prev2_ch, next2_ch) {
+            let _ = buf.delete_span(Span.normalized(Pos.new(row, col - 1), Pos.new(row, col + 1)))!
+            buf.point = Pos.new(row, col - 1)
+            buf.preferred_col = buf.point.col
+            record_insert_change(vim, stroke)
+            return true
+        }
+        if is_any_pair(prev_ch, next_ch) {
+            let _ = buf.delete_span(Span.normalized(Pos.new(row, col - 1), Pos.new(row, col + 1)))!
+            buf.point = Pos.new(row, col - 1)
+            buf.preferred_col = buf.point.col
+            record_insert_change(vim, stroke)
+            return true
+        }
+        return false
+    }
+
+    let ch = stroke_printable(stroke)
+    if ch == "" {
+        return false
+    }
+
+    -- 2. `<Space>` inside empty bracket pair `(|)`, `[|]`, `{{|}}` -> `( | )`
+    if ch == " " {
+        if is_bracket_pair(prev_ch, next_ch) {
+            let _ = buf.insert_text(Pos.new(row, col), "  ")!
+            buf.point = Pos.new(row, col + 1)
+            buf.preferred_col = buf.point.col
+            record_insert_change(vim, stroke)
+            return true
+        }
+        return false
+    }
+
+    -- 3. Symmetric quotes `"`, `'`, `` ` ``
+    if ch == "\"" or ch == "'" or ch == "`" {
+        let escaped = is_escaped_before(line, col)
+        if (not escaped) and next_ch == ch {
+            buf.point = Pos.new(row, col + 1)
+            buf.preferred_col = buf.point.col
+            record_insert_change(vim, stroke)
+            return true
+        }
+        if escaped {
+            return false
+        }
+        if ch == "'" {
+            -- Do not auto-close apostrophes (`don't`) or Rust lifetimes (`&'a`, `<'a>`)
+            if prev_ch.is_alphanumeric()
+                or prev_ch == "_"
+                or (buf.major_mode == "rust" and (prev_ch == "&" or prev_ch == "<")) {
+                return false
+            }
+        }
+        if is_word_or_alnum(next_ch) {
+            return false
+        }
+        let _ = buf.insert_text(Pos.new(row, col), ch ++ ch)!
+        buf.point = Pos.new(row, col + 1)
+        buf.preferred_col = buf.point.col
+        record_insert_change(vim, stroke)
+        return true
+    }
+
+    -- 4. Opening brackets `(`, `[`, `{{`
+    let close_br = matching_bracket_close(ch)
+    if close_br != "" {
+        if is_escaped_before(line, col) or is_word_or_alnum(next_ch) {
+            return false
+        }
+        let _ = buf.insert_text(Pos.new(row, col), ch ++ close_br)!
+        buf.point = Pos.new(row, col + 1)
+        buf.preferred_col = buf.point.col
+        record_insert_change(vim, stroke)
+        return true
+    }
+
+    -- 5. Closing bracket step-over `)`, `]`, `}}`
+    if ch == ")" or ch == "]" or ch == "}}" {
+        if (not is_escaped_before(line, col)) and next_ch == ch {
+            buf.point = Pos.new(row, col + 1)
+            buf.preferred_col = buf.point.col
+            record_insert_change(vim, stroke)
+            return true
+        }
+        return false
+    }
+
+    false
+}
+
+pub fn register_autopairs_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_autopairs_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_autopairs",
+        "0.1.0",
+        "Context-aware bracket/quote auto-pairing, step-over, symmetric space padding, and pair backspace.",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let vim = require_vim_state(k)!
+            vim.add_insert_interceptor(ext_id, autopairs_insert_handler)
+
+            k.register_command(
+                "autopairs-toggle",
+                ext_id,
+                "Toggle automatic bracket and quote pairing (`world.options.autopairs`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    world.options.autopairs = not world.options.autopairs
+                    let state_str = if world.options.autopairs { "enabled" } else { "disabled" }
+                    status_emit("Autopairs " ++ state_str)#
+                    world.options.autopairs
+                },
+            )
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let vim_opt = k.service(SERVICE_VIM)
+            if vim_opt != null {
+                vim_opt.as(VimState).remove_insert_interceptors(ext_id)
+            }
+            ()
+        },
+    )
+}

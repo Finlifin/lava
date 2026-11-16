@@ -1,0 +1,4513 @@
+-- ext_help: Emacs Info Hypertext Manual Reader (`*Info*`), Global Documentation Apropos (`*Apropos*`),
+-- and Emacs `helpful`-Style Deep Runtime & Source Introspection (`*Help*`) for Lava.
+-- Publishes service `"lava.help.state"` (`HelpState`) onto `SystemKernel`.
+
+use std.collections.{HashMap, Set}
+use std.fs
+use std.path
+use @lava_core.{
+    CommandSpec, ExtId, ExtensionRecord, HookListener, InteractiveEffects, KeyBindingEntry,
+    KeyStroke, Keymap, PromptKind, PromptRequest, ServiceEntry, SystemKernel, ask_prompt,
+    clipboard_get, clipboard_set, format_chord, log_event, parse_key_sequence, status_emit
+}
+use @lava_accel.{
+    DocNode, DocSearchHit, SymbolDefHit, accel_find_symbol_defs, accel_index_docs,
+    accel_search_docs
+}
+use @ext_document.{
+    Buffer, BufferId, BufferKind, EditorOptions, EditorWorld, Pos, detect_major_mode,
+    ext_document_id, require_editor_world
+}
+use @ext_window.{WindowManager, ext_window_id}
+use @ext_render.ext_render_id
+use @ext_vim.{
+    KEYMAP_VIM_INSERT, KEYMAP_VIM_LEADER, KEYMAP_VIM_NORMAL, SERVICE_VIM, VimMode, VimState,
+    ext_vim_id, sync_world_from_vim
+}
+use @ext_emacs.{KEYMAP_EMACS_GLOBAL, ext_emacs_id}
+
+pub const SERVICE_HELP_STATE: String = "lava.help.state"
+pub const INFO_BUF_NAME: String = "*Info*"
+pub const APROPOS_BUF_NAME: String = "*Apropos*"
+pub const HELP_BUF_NAME: String = "*Help*"
+pub const INFO_DIR_NODE: String = "(dir)Top"
+
+pub fn ext_help_id() -> ExtId = ExtId("lava.org/ext_help")
+
+-- ============================================================================
+-- 1. Core State & Structured Metadata Types
+-- ============================================================================
+
+pub struct InfoHistoryItem {
+    pub node_id: String,
+    pub cursor_row: i64,
+}
+
+pub struct AproposHit {
+    pub row: i64,
+    pub kind: String,
+    pub target_id: String,
+    pub file_path: String,
+    pub file_row: i64,
+    pub title: String,
+}
+
+pub struct HelpPageSpec {
+    pub page_kind: String,
+    pub target: String,
+    pub source_file: String,
+    pub source_row: i64,
+    pub cursor_row: i64,
+}
+
+pub struct OptionMeta {
+    pub name: String,
+    pub short_alias: String,
+    pub val_type: String,
+    pub set_example: String,
+    pub summary_en: String,
+    pub summary_zh: String,
+}
+
+struct HelpLink {
+    row: i64,
+    start_col: i64,
+    end_col: i64,
+    kind: String,
+    target: String,
+}
+
+pub struct HelpState {
+    pub extra_doc_roots: List,
+    pub override_doc_roots: List,
+    pub extra_code_roots: List,
+    pub override_code_roots: List,
+    pub origin_buf_id: ?BufferId,
+    pub current_info_node: String,
+    pub info_history: List,
+    pub info_history_idx: i64,
+    pub info_last_query: String,
+    pub info_search_hits: List,
+    pub info_search_idx: i64,
+    pub apropos_query: String,
+    pub apropos_mode_kind: String,
+    pub apropos_entries: List,
+    pub current_help_page: ?HelpPageSpec,
+    pub help_history: List,
+    pub help_history_idx: i64,
+}
+
+impl HelpState {
+    pub fn new() -> HelpState {
+        HelpState {
+            extra_doc_roots: List(),
+            override_doc_roots: List(),
+            extra_code_roots: List(),
+            override_code_roots: List(),
+            origin_buf_id: null,
+            current_info_node: "",
+            info_history: List(),
+            info_history_idx: -1,
+            info_last_query: "",
+            info_search_hits: List(),
+            info_search_idx: 0,
+            apropos_query: "",
+            apropos_mode_kind: "docs",
+            apropos_entries: List(),
+            current_help_page: null,
+            help_history: List(),
+            help_history_idx: -1,
+        }
+    }
+}
+
+pub fn require_help_state(kernel: SystemKernel) -> !String HelpState {
+    let raw = kernel.require_service(SERVICE_HELP_STATE)!
+    raw.as(HelpState)
+}
+
+-- ============================================================================
+-- 2. Documentation & Code Roots Discovery
+-- ============================================================================
+
+private fn push_unique_existing_path(out: List, raw_path: String, require_dir: bool) {
+    let trimmed = raw_path.trim()
+    if trimmed == "" or (not fs.exists(trimmed)) {
+        return
+    }
+    if require_dir and (not fs.is_dir(trimmed)) {
+        return
+    }
+    let norm = path.normalize(trimmed)
+    if not out.contains(norm) {
+        out.push(norm)
+    }
+}
+
+pub fn resolve_doc_roots(world: EditorWorld, .state: ?HelpState = null) -> List {
+    let out = List()
+    if state != null {
+        let st = state.as(HelpState)
+        if not st.override_doc_roots.is_empty() {
+            for i in 0..st.override_doc_roots.len() {
+                let p = st.override_doc_roots.get(i.as(usize)).as(String)
+                push_unique_existing_path(out, p, false)
+            }
+            return out
+        }
+    }
+
+    push_unique_existing_path(out, path.join(world.cwd, "docs"), true)
+    push_unique_existing_path(out, "/home/fin/apps/lava/docs", true)
+    push_unique_existing_path(out, "/home/fin/nessa2/docs", true)
+
+    if state != null {
+        let st = state.as(HelpState)
+        for i in 0..st.extra_doc_roots.len() {
+            let p = st.extra_doc_roots.get(i.as(usize)).as(String)
+            push_unique_existing_path(out, p, false)
+        }
+    }
+    out
+}
+
+pub fn resolve_code_roots(world: EditorWorld, .state: ?HelpState = null) -> List {
+    let out = List()
+    if state != null {
+        let st = state.as(HelpState)
+        if not st.override_code_roots.is_empty() {
+            for i in 0..st.override_code_roots.len() {
+                let p = st.override_code_roots.get(i.as(usize)).as(String)
+                push_unique_existing_path(out, p, false)
+            }
+            return out
+        }
+    }
+
+    let candidates = [
+        path.join(world.cwd, "packages"),
+        path.join(world.cwd, "extensions"),
+        path.join(world.cwd, "src"),
+        "/home/fin/apps/lava/packages",
+        "/home/fin/apps/lava/extensions",
+        "/home/fin/nessa2/library/std",
+    ]
+    for i in 0..candidates.len() {
+        push_unique_existing_path(out, candidates.get(i.as(usize)).as(String), true)
+    }
+
+    if state != null {
+        let st = state.as(HelpState)
+        for i in 0..st.extra_code_roots.len() {
+            let p = st.extra_code_roots.get(i.as(usize)).as(String)
+            push_unique_existing_path(out, p, false)
+        }
+    }
+    out
+}
+
+-- ============================================================================
+-- 3. Shared Formatting, Buffer/Window Switching & Orderless Scoring Helpers
+-- ============================================================================
+
+private fn emit_help_status(world: EditorWorld, msg: String) -> #status_emit Unit {
+    world.status_message = msg
+    status_emit(msg)#
+}
+
+private fn pad_right(s: String, width: i64) -> String {
+    let n = s.char_len()
+    if n >= width {
+        return s
+    }
+    s ++ " ".repeat(width - n)
+}
+
+private fn split_text_lines_clean(text: String) -> List {
+    if text == "" {
+        return [""]
+    }
+    let normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    let parts = normalized.split("\n")
+    if parts.len() > 1 and normalized.ends_with("\n") {
+        let _ = parts.pop()
+    }
+    if parts.is_empty() {
+        parts.push("")
+    }
+    parts
+}
+
+private fn ensure_row_visible(world: EditorWorld, row: i64) {
+    let vis_rows = if world.viewport_rows > 2 { world.viewport_rows - 2 } else { 1 }
+    if row < world.viewport_top_row {
+        world.viewport_top_row = row
+    } else if row >= world.viewport_top_row + vis_rows {
+        world.viewport_top_row = row - vis_rows + 1
+    }
+}
+
+private fn ensure_normal_modal_state(kernel: SystemKernel, world: EditorWorld) {
+    if not world.options.evil_mode {
+        return
+    }
+    let vim_opt = kernel.service(SERVICE_VIM)
+    if vim_opt != null {
+        let vs = vim_opt.as(VimState)
+        vs.mode = VimMode.Normal
+        vs.clear_transient()
+        sync_world_from_vim(world, vs)
+    }
+}
+
+private fn sync_window_pane_to_world(kernel: SystemKernel, world: EditorWorld) {
+    let wm_opt = kernel.service("lava.window.manager")
+    if wm_opt != null {
+        let wm = wm_opt.as(WindowManager)
+        let ap = wm.active_pane()
+        ap.buffer_id = world.active_buffer_id
+        ap.cursor = world.active_buffer().point
+        wm.sync_from_world(world)
+    }
+}
+
+private fn is_help_family_buffer(buf: Buffer) -> bool {
+    buf.name == INFO_BUF_NAME
+        or buf.name == APROPOS_BUF_NAME
+        or buf.name == HELP_BUF_NAME
+        or buf.major_mode == "info"
+        or buf.major_mode == "apropos"
+        or buf.major_mode == "help"
+}
+
+private fn remember_origin_buffer(world: EditorWorld, state: HelpState) {
+    let cur = world.active_buffer()
+    if (not is_help_family_buffer(cur)) and cur.id != world.messages_id {
+        state.origin_buf_id = cur.id
+    }
+}
+
+private fn fallback_non_help_buffer_id(world: EditorWorld) -> BufferId {
+    var i = world.buffer_order.len() - 1
+    while i >= 0 {
+        let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+        let b = world.buffers.get(bid).as(Buffer)
+        if (not is_help_family_buffer(b)) and bid != world.messages_id {
+            return bid
+        }
+        i -= 1
+    }
+    world.scratch_id
+}
+
+private fn quit_help_family_buffer(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    state: HelpState,
+) -> #status_emit Unit {
+    var target_id = fallback_non_help_buffer_id(world)
+    state.origin_buf_id match {
+        orig_id? => {
+            let ob_opt = world.buffer(orig_id)
+            if ob_opt != null and (not is_help_family_buffer(ob_opt.as(Buffer))) {
+                target_id = orig_id
+            }
+        },
+        null => {},
+    }
+    let _ = world.switch_to_buffer(target_id)
+    ensure_normal_modal_state(kernel, world)
+    ensure_row_visible(world, world.active_buffer().point.row)
+    sync_window_pane_to_world(kernel, world)
+    kernel.emit_hook("buffer-switched", target_id)
+    emit_help_status(world, "Buffer: " ++ world.active_buffer().name)#
+}
+
+private fn activate_special_buffer(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    name: String,
+    major_mode: String,
+    lines: List,
+    cursor_pos: Pos,
+) -> Buffer {
+    let safe_lines = if lines.is_empty() { [""] } else { lines }
+    let b = world.ensure_special_buffer(name, major_mode, safe_lines, read_only = true)
+    b.point = b.clamp_pos(cursor_pos, insert_mode = false)
+    b.preferred_col = b.point.col
+    let _ = world.switch_to_buffer(b.id)
+    ensure_normal_modal_state(kernel, world)
+    world.viewport_top_row = 0
+    ensure_row_visible(world, b.point.row)
+    sync_window_pane_to_world(kernel, world)
+    kernel.emit_hook("buffer-switched", b.id)
+    b
+}
+
+private fn open_file_at_row(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    raw_path: String,
+    row_zero_based: i64,
+) -> #[log_event, status_emit] !String Buffer {
+    let full_path = world.resolve_path(raw_path)
+    let cur = world.active_buffer()
+    world.jumps.record(cur.id, cur.file_path, cur.point)
+
+    var opened_opt = world.find_buffer_by_path(full_path)
+    if opened_opt != null {
+        let b = opened_opt.as(Buffer)
+        world.active_buffer_id = b.id
+    } else if fs.exists(full_path) and fs.is_file(full_path) {
+        let content! = fs.read_to_string(full_path) else {
+            return error ("cannot read file: " ++ full_path)
+        }
+        let base_opt = path.file_name(full_path)
+        let base_name = if base_opt != null { base_opt.as(String) } else { full_path }
+        let mode = detect_major_mode(full_path)
+        let file_lines = split_text_lines_clean(content)
+        let created = world.create_buffer(
+            base_name,
+            BufferKind.File,
+            file_path = full_path,
+            major_mode = mode,
+            initial_lines = file_lines,
+        )
+        created.crlf = content.contains("\r\n")
+        created.modified = false
+        world.active_buffer_id = created.id
+        opened_opt = created
+    } else {
+        let opened = world.open_file(full_path)#!
+        opened_opt = opened
+    }
+
+    let target_buf = world.active_buffer()
+    let clamped_r = if row_zero_based < 0 {
+        0
+    } else if row_zero_based > target_buf.max_row() {
+        target_buf.max_row()
+    } else {
+        row_zero_based
+    }
+    let col = target_buf.first_non_blank_col(clamped_r)
+    target_buf.point = target_buf.clamp_pos(Pos.new(clamped_r, col), insert_mode = false)
+    target_buf.preferred_col = target_buf.point.col
+    ensure_normal_modal_state(kernel, world)
+    ensure_row_visible(world, target_buf.point.row)
+    sync_window_pane_to_world(kernel, world)
+    kernel.emit_hook("buffer-switched", target_buf.id)
+    emit_help_status(
+        world,
+        "Opened " ++ target_buf.name ++ ":" ++ (clamped_r + 1).to_string(),
+    )#
+    target_buf
+}
+
+private fn pretty_stroke_notation(st: KeyStroke) -> String {
+    if (not st.ctrl) and (not st.alt) and (not st.shift_mod) and (not st.super_mod) {
+        if st.key.char_len() == 1 and st.key != "<" and st.key != ">" and st.key != " " {
+            return st.key
+        }
+        if st.key == "<" {
+            return "<lt>"
+        }
+        if st.key == ">" {
+            return "<gt>"
+        }
+        return "<" ++ st.key ++ ">"
+    }
+    st.notation()
+}
+
+private fn pretty_chord_string(raw_chord: String) -> String {
+    let seq = parse_key_sequence(raw_chord)
+    if seq.is_empty() {
+        return raw_chord
+    }
+    let parts = List()
+    for i in 0..seq.len() {
+        parts.push(pretty_stroke_notation(seq.get(i.as(usize)).as(KeyStroke)))
+    }
+    parts.join(" ")
+}
+
+private fn collect_bindings_for_command(kernel: SystemKernel, cmd_name: String) -> List {
+    let out = List()
+    let km_names = kernel.keymaps.keys()
+    km_names.sort()
+    for i in 0..km_names.len() {
+        let kname = km_names.get(i.as(usize)).as(String)
+        let km = kernel.keymaps.get(kname).as(Keymap)
+        let chords = km.bindings.keys()
+        chords.sort()
+        for j in 0..chords.len() {
+            let ch = chords.get(j.as(usize)).as(String)
+            let entry = km.bindings.get(ch).as(KeyBindingEntry)
+            if entry.command_name == cmd_name {
+                out.push((kname, entry))
+            }
+        }
+    }
+    out
+}
+
+private fn build_command_chords_map(kernel: SystemKernel) -> HashMap {
+    let list_map = HashMap.new()
+    let km_names = kernel.keymaps.keys()
+    km_names.sort()
+    for i in 0..km_names.len() {
+        let kname = km_names.get(i.as(usize)).as(String)
+        let km = kernel.keymaps.get(kname).as(Keymap)
+        let chords = km.bindings.keys()
+        chords.sort()
+        for j in 0..chords.len() {
+            let ch = chords.get(j.as(usize)).as(String)
+            let entry = km.bindings.get(ch).as(KeyBindingEntry)
+            let existing_opt = list_map.get(entry.command_name)
+            if existing_opt == null {
+                list_map.insert(entry.command_name, [entry.chord])
+            } else {
+                let arr = existing_opt.as(List)
+                if arr.len() < 4 and (not arr.contains(entry.chord)) {
+                    arr.push(entry.chord)
+                }
+            }
+        }
+    }
+    let out = HashMap.new()
+    for cmd_k in list_map.keys() {
+        let cname = cmd_k.as(String)
+        let arr = list_map.get(cname).as(List)
+        out.insert(cname, arr.join(", "))
+    }
+    out
+}
+
+-- Orderless multi-token scorer (`!neg`, `^prefix`, `suffix$`, `=exact`, substring & subsequence)
+private fn score_single_token(tok: String, primary_low: String, full_low: String) -> (bool, i64) {
+    let tlen = tok.char_len()
+    if tlen == 0 {
+        return (false, 50)
+    }
+    if tok.starts_with("!") and tlen > 1 {
+        let neg = tok.drop(1).to_lower()
+        if primary_low.contains(neg) or full_low.contains(neg) {
+            return (true, -1)
+        }
+        return (true, 100)
+    }
+    if tok.starts_with("^") and tlen > 1 {
+        let anch = tok.drop(1).to_lower()
+        if primary_low.starts_with(anch) {
+            return (false, 9000 - primary_low.char_len())
+        }
+        return (false, -1)
+    }
+    if tok.ends_with("$") and tlen > 1 {
+        let anch = tok.slice(0, tlen - 1).to_lower()
+        if primary_low.ends_with(anch) {
+            return (false, 8200 - primary_low.char_len())
+        }
+        return (false, -1)
+    }
+    let q = if tok.starts_with("=") and tlen > 1 { tok.drop(1).to_lower() } else { tok.to_lower() }
+    if primary_low == q {
+        return (false, 15000)
+    }
+    if primary_low.starts_with(q) {
+        return (false, 11000 - (primary_low.char_len() - q.char_len()))
+    }
+    let p_idx = primary_low.find(q)
+    if p_idx != null {
+        return (false, 7500 - p_idx.as(i64) * 8 - primary_low.char_len())
+    }
+    let f_idx = full_low.find(q)
+    if f_idx != null {
+        return (false, 4200 - (if f_idx.as(i64) > 200 { 200 } else { f_idx.as(i64) }))
+    }
+    if not tok.starts_with("=") {
+        -- Subsequence match against `primary_low`
+        var qi: i64 = 0
+        var ci: i64 = 0
+        let qlen = q.char_len()
+        let plen = primary_low.char_len()
+        while qi < qlen and ci < plen {
+            if primary_low.slice(ci, ci + 1) == q.slice(qi, qi + 1) {
+                qi += 1
+            }
+            ci += 1
+        }
+        if qi >= qlen and qlen >= 2 {
+            return (false, 1800 - plen)
+        }
+    }
+    (false, -1)
+}
+
+pub fn orderless_score(query: String, primary: String, secondary: String) -> i64 {
+    let q_trim = query.trim()
+    if q_trim == "" {
+        return 100
+    }
+    let p_low = primary.to_lower()
+    let full_low = (primary ++ " " ++ secondary).to_lower()
+    let raw_toks = q_trim.split_whitespace()
+    if raw_toks.is_empty() {
+        return 100
+    }
+    var total: i64 = 0
+    var pos_count: i64 = 0
+    for i in 0..raw_toks.len() {
+        let tk = raw_toks.get(i.as(usize)).as(String)
+        let (is_neg, sc) = score_single_token(tk, p_low, full_low)
+        if sc < 0 {
+            return -1
+        }
+        if not is_neg {
+            total += sc
+            pos_count += 1
+        }
+    }
+    if pos_count == 0 {
+        return 150
+    }
+    total
+}
+
+-- ============================================================================
+-- 4. Source Definition Discovery & Code Snippet Preview
+-- ============================================================================
+
+private fn find_command_source(
+    world: EditorWorld,
+    state: HelpState,
+    cmd_name: String,
+    owner: ExtId,
+) -> ?SymbolDefHit {
+    let roots = resolve_code_roots(world, state = state)
+    if roots.is_empty() {
+        return null
+    }
+    let hits = accel_find_symbol_defs(roots, cmd_name, limit = 30)
+    let owner_raw = owner.raw()
+    let owner_short = if owner_raw.contains("/") {
+        let pair_opt = owner_raw.rsplit_once("/")
+        if pair_opt != null {
+            let (_, s) = pair_opt.as((String, String))
+            s
+        } else {
+            owner_raw
+        }
+    } else {
+        owner_raw
+    }
+
+    -- 1. Exact `command` registration in owner's directory
+    for i in 0..hits.len() {
+        let h = hits.get(i.as(usize)).as(SymbolDefHit)
+        if h.kind == "command" and h.symbol == cmd_name and h.file_path.contains(owner_short) {
+            return h
+        }
+    }
+    -- 2. Exact `command` registration anywhere
+    for i in 0..hits.len() {
+        let h = hits.get(i.as(usize)).as(SymbolDefHit)
+        if h.kind == "command" and h.symbol == cmd_name {
+            return h
+        }
+    }
+    -- 3. Handler function `cmd_<snake_name>`
+    let snake_cmd = "cmd_" ++ cmd_name.replace("-", "_").replace(":", "_")
+    let fn_hits = accel_find_symbol_defs(roots, snake_cmd, limit = 15)
+    for i in 0..fn_hits.len() {
+        let h = fn_hits.get(i.as(usize)).as(SymbolDefHit)
+        if h.symbol == snake_cmd {
+            return h
+        }
+    }
+    null
+}
+
+private fn extract_ident_head(s: String) -> String {
+    let n = s.char_len()
+    var i: i64 = 0
+    while i < n {
+        let ch = s.slice(i, i + 1)
+        if ch.is_alphanumeric() or ch == "_" {
+            i += 1
+        } else {
+            break
+        }
+    }
+    s.slice(0, i)
+}
+
+private fn collect_preceding_doc_comment(lines: List, row: i64) -> String {
+    let rev = List()
+    var cur = row - 1
+    while cur >= 0 {
+        let t = lines.get(cur.as(usize)).as(String).trim()
+        if t.starts_with("--") {
+            let rest = t.drop(2).trim()
+            if (not rest.starts_with("====")) and (not rest.starts_with("----")) {
+                rev.push(rest)
+            }
+        } else {
+            break
+        }
+        cur -= 1
+    }
+    let out = List()
+    var k = rev.len() - 1
+    while k >= 0 {
+        out.push(rev.get(k.as(usize)))
+        k -= 1
+    }
+    out.join("\n")
+}
+
+-- Combines fast `accel_find_symbol_defs` with `--` doc-comment & Orderless symbol scanning!
+private fn search_source_symbols_apropos(code_roots: List, query: String, limit: i64) -> List {
+    let q_trim = query.trim()
+    if q_trim == "" or code_roots.is_empty() {
+        return List()
+    }
+    let seen = Set.new()
+    let scored = List()
+
+    -- Pass 1: Fast native/fallback `accel_find_symbol_defs` on full query and individual tokens
+    let direct = accel_find_symbol_defs(code_roots, q_trim, limit = limit * 2)
+    for i in 0..direct.len() {
+        let d = direct.get(i.as(usize)).as(SymbolDefHit)
+        if d.kind != "command" {
+            let key = d.file_path ++ ":" ++ d.row.to_string() ++ ":" ++ d.symbol
+            let sc = orderless_score(q_trim, d.symbol, d.kind ++ " " ++ d.signature ++ " " ++ d.doc_comment)
+            let eff_sc = if sc >= 0 { sc + 1000 } else { 3000 - i * 10 }
+            seen.insert(key)
+            scored.push((eff_sc, d))
+        }
+    }
+
+    let toks = q_trim.split_whitespace()
+    if toks.len() > 1 {
+        for ti in 0..toks.len() {
+            let tk = toks.get(ti.as(usize)).as(String)
+            if tk != "" and (not tk.starts_with("!")) {
+                let sub = accel_find_symbol_defs(code_roots, tk, limit = 25)
+                for si in 0..sub.len() {
+                    let d = sub.get(si.as(usize)).as(SymbolDefHit)
+                    if d.kind != "command" {
+                        let key = d.file_path ++ ":" ++ d.row.to_string() ++ ":" ++ d.symbol
+                        if not seen.contains(key) {
+                            let sc = orderless_score(q_trim, d.symbol, d.kind ++ " " ++ d.signature ++ " " ++ d.doc_comment)
+                            if sc >= 0 {
+                                seen.insert(key)
+                                scored.push((sc + 500, d))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    -- Pass 2: Scan `.ns` definitions + `--` doc comments so queries matching doc comments also surface!
+    let ns_files = List()
+    let seen_files = Set.new()
+    for ri in 0..code_roots.len() {
+        if ns_files.len() >= 180 {
+            break
+        }
+        let root = code_roots.get(ri.as(usize)).as(String)
+        if not fs.exists(root) {
+            continue
+        }
+        if fs.is_file(root) and root.ends_with(".ns") {
+            let norm = path.normalize(root)
+            if not seen_files.contains(norm) {
+                seen_files.insert(norm)
+                ns_files.push(norm)
+            }
+            continue
+        }
+        let walked! = fs.walk_dir(root, max_depth = 8, include_hidden = false) else {
+            continue
+        }
+        for fi in 0..walked.len() {
+            if ns_files.len() >= 180 {
+                break
+            }
+            let rel = walked.get(fi.as(usize)).as(String)
+            if rel.ends_with(".ns") and (not rel.contains("target/")) and (not rel.starts_with(".")) {
+                let full = path.normalize(path.join(root, rel))
+                if not seen_files.contains(full) {
+                    seen_files.insert(full)
+                    ns_files.push(full)
+                }
+            }
+        }
+    }
+
+    let kws = [
+        ("fn ", "fn"),
+        ("struct ", "struct"),
+        ("enum ", "enum"),
+        ("trait ", "trait"),
+        ("effect ", "effect"),
+        ("const ", "const"),
+        ("newtype ", "type"),
+        ("type ", "type"),
+    ]
+    let first_pos_tok = if toks.is_empty() {
+        q_trim.to_lower()
+    } else {
+        var ft = ""
+        for ti in 0..toks.len() {
+            let cand_t = toks.get(ti.as(usize)).as(String)
+            if not cand_t.starts_with("!") {
+                ft = cand_t.trim_start_matches("^").trim_start_matches("=").trim_end_matches("$").to_lower()
+                break
+            }
+        }
+        ft
+    }
+
+    for fi in 0..ns_files.len() {
+        let fp = ns_files.get(fi.as(usize)).as(String)
+        let content! = fs.read_to_string(fp) else {
+            continue
+        }
+        if first_pos_tok != "" and first_pos_tok.char_len() >= 3 and (not content.to_lower().contains(first_pos_tok)) {
+            continue
+        }
+        let lines = content.replace("\r\n", "\n").split("\n")
+        for r in 0..lines.len() {
+            let trimmed = lines.get(r.as(usize)).as(String).trim()
+            if trimmed == "" or trimmed.starts_with("--") {
+                continue
+            }
+            var rest = trimmed
+            if rest.starts_with("pub(crate) ") {
+                rest = rest.drop(11).trim_start()
+            } else if rest.starts_with("pub ") {
+                rest = rest.drop(4).trim_start()
+            } else if rest.starts_with("private ") {
+                rest = rest.drop(8).trim_start()
+            }
+            if rest.starts_with("async ") {
+                rest = rest.drop(6).trim_start()
+            }
+            for ki in 0..kws.len() {
+                let (kw, kind) = kws.get(ki.as(usize)).as((String, String))
+                if rest.starts_with(kw) {
+                    let sym = extract_ident_head(rest.drop(kw.char_len()))
+                    if sym != "" {
+                        let key = fp ++ ":" ++ r.to_string() ++ ":" ++ sym
+                        if not seen.contains(key) {
+                            let doc_c = collect_preceding_doc_comment(lines, r)
+                            let sc = orderless_score(q_trim, sym, kind ++ " " ++ trimmed ++ " " ++ doc_c)
+                            if sc >= 0 {
+                                let pub_bonus: i64 = if trimmed.starts_with("pub ") { 300 } else { 0 }
+                                seen.insert(key)
+                                scored.push((sc + pub_bonus, SymbolDefHit {
+                                    symbol: sym,
+                                    kind: kind,
+                                    file_path: fp,
+                                    row: r,
+                                    signature: trimmed.take(120),
+                                    doc_comment: doc_c,
+                                }))
+                            }
+                        }
+                    }
+                    break
+                }
+            }
+        }
+    }
+
+    scored.sort_by(|a: Any, b: Any| {
+        let (sa, da) = a.as((i64, SymbolDefHit))
+        let (sb, db) = b.as((i64, SymbolDefHit))
+        if sa != sb {
+            sb.cmp(sa)
+        } else if da.symbol != db.symbol {
+            da.symbol.cmp(db.symbol)
+        } else {
+            da.file_path.cmp(db.file_path)
+        }
+    })
+
+    let out = List()
+    let cap = if scored.len() > limit { limit } else { scored.len() }
+    for j in 0..cap {
+        let (_, hit) = scored.get(j.as(usize)).as((i64, SymbolDefHit))
+        out.push(hit)
+    }
+    out
+}
+
+private fn read_source_snippet_lines(file_path: String, def_row: i64, max_lines: i64) -> List {
+    let out = List()
+    if file_path == "" or (not fs.exists(file_path)) {
+        return out
+    }
+    let content! = fs.read_to_string(file_path) else {
+        return out
+    }
+    let lines = split_text_lines_clean(content)
+    let start_r = if def_row < 0 { 0 } else { def_row }
+    if start_r >= lines.len() {
+        return out
+    }
+    let end_r = if start_r + max_lines < lines.len() { start_r + max_lines } else { lines.len() }
+    for r in start_r..end_r {
+        let num_str = (r + 1).to_string().pad_start(5, " ")
+        let marker = if r == def_row { " > " } else { " | " }
+        out.push("  " ++ num_str ++ marker ++ lines.get(r.as(usize)).as(String))
+    }
+    out
+}
+
+-- ============================================================================
+-- 5. Complete 29-Variable `EditorOptions` Catalog & Live Introspection/Mutation
+-- ============================================================================
+
+pub fn all_option_metas() -> List {
+    [
+        OptionMeta {
+            name: "number",
+            short_alias: "nu",
+            val_type: "bool",
+            set_example: ":set number  |  :set nonumber  |  :set nu!",
+            summary_en: "Display absolute line numbers in the left window gutter.",
+            summary_zh: "在窗口左侧边栏显示绝对行号。",
+        },
+        OptionMeta {
+            name: "relativenumber",
+            short_alias: "rnu",
+            val_type: "bool",
+            set_example: ":set relativenumber  |  :set norelativenumber  |  :set rnu!",
+            summary_en: "Display relative line distances from cursor row (disabled by default; opt-in via :set rnu).",
+            summary_zh: "显示相对光标行的距离行号（默认关闭，可通过 :set rnu 开启）。",
+        },
+        OptionMeta {
+            name: "tabstop",
+            short_alias: "ts",
+            val_type: "i64",
+            set_example: ":set tabstop=4  |  :set ts=2",
+            summary_en: "Number of visual display columns occupied by a literal Tab ('\\t') character.",
+            summary_zh: "单个制表符 ('\\t') 在屏幕上占据的显示列宽。",
+        },
+        OptionMeta {
+            name: "shiftwidth",
+            short_alias: "sw",
+            val_type: "i64",
+            set_example: ":set shiftwidth=4  |  :set sw=2",
+            summary_en: "Number of columns used for each auto-indent and Evil '>>' / '<<' shift step.",
+            summary_zh: "自动缩进及 Evil '>>' / '<<' 缩进操作每级使用的空格列数。",
+        },
+        OptionMeta {
+            name: "expandtab",
+            short_alias: "et",
+            val_type: "bool",
+            set_example: ":set expandtab  |  :set noexpandtab  |  :set et",
+            summary_en: "Insert spaces instead of literal '\\t' characters when pressing Tab in Insert mode.",
+            summary_zh: "插入模式下按 Tab 键时将其展开为空格而非硬制表符。",
+        },
+        OptionMeta {
+            name: "ignorecase",
+            short_alias: "ic",
+            val_type: "bool",
+            set_example: ":set ignorecase  |  :set noignorecase  |  :set ic",
+            summary_en: "Perform case-insensitive pattern matching in search, substitute, and isearch.",
+            summary_zh: "搜索、替换及渐进搜索（isearch）时忽略大小写。",
+        },
+        OptionMeta {
+            name: "smartcase",
+            short_alias: "scs",
+            val_type: "bool",
+            set_example: ":set smartcase  |  :set nosmartcase  |  :set scs",
+            summary_en: "Override ignorecase automatically when the search pattern contains uppercase letters.",
+            summary_zh: "当搜索词包含大写字母时自动启用区分大小写匹配（需配合 ignorecase）。",
+        },
+        OptionMeta {
+            name: "wrap",
+            short_alias: "",
+            val_type: "bool",
+            set_example: ":set wrap  |  :set nowrap",
+            summary_en: "Soft-wrap lines longer than the window viewport width instead of horizontal scrolling.",
+            summary_zh: "当文本行超出窗口宽度时进行软换行显示。",
+        },
+        OptionMeta {
+            name: "hlsearch",
+            short_alias: "hls",
+            val_type: "bool",
+            set_example: ":set hlsearch  |  :set nohlsearch  |  :noh",
+            summary_en: "Highlight all matches of the most recent search pattern in the buffer.",
+            summary_zh: "高亮显示当前缓冲区中最近一次搜索模式的所有匹配项。",
+        },
+        OptionMeta {
+            name: "incsearch",
+            short_alias: "is",
+            val_type: "bool",
+            set_example: ":set incsearch  |  :set noincsearch",
+            summary_en: "Preview first search match live while typing in '/' , '?' , or 'C-s' / 'C-r'.",
+            summary_zh: "在输入搜索模式（/、?、C-s、C-r）的过程中实时跳转预览匹配位置。",
+        },
+        OptionMeta {
+            name: "scrolloff",
+            short_alias: "so",
+            val_type: "i64",
+            set_example: ":set scrolloff=5  |  :set so=8",
+            summary_en: "Minimum number of context screen lines to keep visible above and below the cursor.",
+            summary_zh: "光标上下方始终保留的最少上下文可视行数。",
+        },
+        OptionMeta {
+            name: "sidescrolloff",
+            short_alias: "siso",
+            val_type: "i64",
+            set_example: ":set sidescrolloff=8  |  :set siso=4",
+            summary_en: "Minimum number of horizontal columns to keep visible to the left and right of cursor.",
+            summary_zh: "水平滚动时光标左右两侧保留的最少上下文列数。",
+        },
+        OptionMeta {
+            name: "cursorline",
+            short_alias: "cul",
+            val_type: "bool",
+            set_example: ":set cursorline  |  :set nocursorline  |  :set cul",
+            summary_en: "Render subtle background highlight bar across the active cursor row.",
+            summary_zh: "高亮显示当前光标所在整行的背景。",
+        },
+        OptionMeta {
+            name: "signcolumn",
+            short_alias: "",
+            val_type: "bool",
+            set_example: ":set signcolumn  |  :set nosigncolumn",
+            summary_en: "Reserve gutter column for Git diff signs, diagnostics, bookmarks, and marks.",
+            summary_zh: "在行号旁保留符号列用于显示诊断标记、Git 变更和书签。",
+        },
+        OptionMeta {
+            name: "indent_guides",
+            short_alias: "indentguides",
+            val_type: "bool",
+            set_example: ":set indentguides  |  :set noindentguides",
+            summary_en: "Draw vertical indentation guide lines aligned to shiftwidth.",
+            summary_zh: "按照 shiftwidth 缩进层级绘制垂直缩进参考线。",
+        },
+        OptionMeta {
+            name: "match_brackets",
+            short_alias: "",
+            val_type: "bool",
+            set_example: "Press 'e' in *Help* to toggle match_brackets",
+            summary_en: "Highlight matching (), [], and {{}} delimiter pairs when cursor rests on a bracket.",
+            summary_zh: "当光标位于括号上时自动高亮配对的 ()、[] 或 {{}}。",
+        },
+        OptionMeta {
+            name: "auto_indent",
+            short_alias: "ai",
+            val_type: "bool",
+            set_example: ":set autoindent  |  :set noautoindent  |  :set ai",
+            summary_en: "Copy indentation from current line and smart-indent blocks on Return / 'o' / 'O'.",
+            summary_zh: "换行或使用 o/O 新开行时自动继承上一行缩进并识别代码块缩进。",
+        },
+        OptionMeta {
+            name: "autopairs",
+            short_alias: "",
+            val_type: "bool",
+            set_example: ":set autopairs  |  :set noautopairs",
+            summary_en: "Automatically insert and skip matching closing quotes and brackets in Insert mode.",
+            summary_zh: "在插入模式下自动补全和跳过配对的括号与引号。",
+        },
+        OptionMeta {
+            name: "clipboard_unnamedplus",
+            short_alias: "clipboard",
+            val_type: "bool",
+            set_example: ":set clipboard=unnamedplus  |  :set clipboard=",
+            summary_en: "Synchronize default yank/delete operations directly with the system clipboard.",
+            summary_zh: "将默认的复制与删除寄存器直接与操作系统剪贴板同步。",
+        },
+        OptionMeta {
+            name: "mouse_enabled",
+            short_alias: "mouse",
+            val_type: "bool",
+            set_example: "Press 'e' in *Help* to toggle mouse_enabled",
+            summary_en: "Enable mouse click positioning, drag visual selection, and wheel scrolling.",
+            summary_zh: "启用鼠标点击定位光标、拖拽选择文本及滚轮滚动支持。",
+        },
+        OptionMeta {
+            name: "zen_mode",
+            short_alias: "zen",
+            val_type: "bool",
+            set_example: ":set zen  |  :set nozen",
+            summary_en: "Center buffer content in distraction-free Zen layout column.",
+            summary_zh: "启用无干扰禅模式（Zen Mode）居中排版视图。",
+        },
+        OptionMeta {
+            name: "zen_width",
+            short_alias: "",
+            val_type: "i64",
+            set_example: "Press 'e' in *Help* to set zen_width (default 92)",
+            summary_en: "Target text column width when zen_mode distraction-free layout is active.",
+            summary_zh: "禅模式（zen_mode）激活时的居中文本区域目标列宽。",
+        },
+        OptionMeta {
+            name: "twilight_mode",
+            short_alias: "twilight",
+            val_type: "bool",
+            set_example: ":set twilight  |  :set notwilight",
+            summary_en: "Dim surrounding paragraphs/functions outside the active cursor block for focus.",
+            summary_zh: "聚光灯模式：暗化当前光标代码块以外的上下文文本以提升专注度。",
+        },
+        OptionMeta {
+            name: "format_on_save",
+            short_alias: "formatonsave",
+            val_type: "bool",
+            set_example: ":set formatonsave  |  :set noformatonsave",
+            summary_en: "Run registered buffer formatter automatically before writing files to disk.",
+            summary_zh: "保存文件前自动运行已注册的代码格式化器。",
+        },
+        OptionMeta {
+            name: "theme_name",
+            short_alias: "theme",
+            val_type: "String",
+            set_example: ":colorscheme catppuccin-mocha  |  :theme gruvbox-dark",
+            summary_en: "Active UI and syntax color palette name (e.g. catppuccin-mocha, tokyonight, gruvbox-dark).",
+            summary_zh: "当前激活的编辑器界面与语法高亮配色主题名称。",
+        },
+        OptionMeta {
+            name: "font_family",
+            short_alias: "",
+            val_type: "String",
+            set_example: "Press 'e' in *Help* to change font_family",
+            summary_en: "Primary monospace font family used by the 2D scene renderer.",
+            summary_zh: "2D 渲染器使用的主等宽字体族名称。",
+        },
+        OptionMeta {
+            name: "font_size_pt",
+            short_alias: "",
+            val_type: "f64",
+            set_example: "Press 'e' in *Help* to change font_size_pt (e.g. 13.0, 15.0)",
+            summary_en: "Editor text font size in typographic points.",
+            summary_zh: "编辑器文本字号大小（单位：磅 pt）。",
+        },
+        OptionMeta {
+            name: "cursor_blink",
+            short_alias: "",
+            val_type: "bool",
+            set_example: "Press 'e' in *Help* to toggle cursor_blink",
+            summary_en: "Enable smooth caret blinking animation in the active window.",
+            summary_zh: "控制活动窗口中的光标是否闪烁。",
+        },
+        OptionMeta {
+            name: "evil_mode",
+            short_alias: "evil",
+            val_type: "bool",
+            set_example: "Press C-z or 'e' in *Help* to toggle evil_mode",
+            summary_en: "Enable Evil-Vim modal editing (true) vs pure modeless Emacs keybindings (false).",
+            summary_zh: "启用 Evil-Vim 模态编辑（true）或切换为纯 Emacs 无模态键位（false）。",
+        },
+    ]
+}
+
+pub fn find_option_meta(raw_name: String) -> ?OptionMeta {
+    var q = raw_name.trim()
+    if q.starts_with("'") and q.ends_with("'") and q.char_len() > 2 {
+        q = q.slice(1, q.char_len() - 1)
+    }
+    if q.starts_with("option:") {
+        q = q.drop(7)
+    }
+    let q_low = q.to_lower()
+    let metas = all_option_metas()
+    for i in 0..metas.len() {
+        let m = metas.get(i.as(usize)).as(OptionMeta)
+        if m.name.to_lower() == q_low or (m.short_alias != "" and m.short_alias.to_lower() == q_low) {
+            return m
+        }
+    }
+    null
+}
+
+pub fn get_option_value_str(opts: EditorOptions, name: String) -> String {
+    when {
+        name == "number" => opts.number.to_string(),
+        name == "relativenumber" => opts.relativenumber.to_string(),
+        name == "tabstop" => opts.tabstop.to_string(),
+        name == "shiftwidth" => opts.shiftwidth.to_string(),
+        name == "expandtab" => opts.expandtab.to_string(),
+        name == "ignorecase" => opts.ignorecase.to_string(),
+        name == "smartcase" => opts.smartcase.to_string(),
+        name == "wrap" => opts.wrap.to_string(),
+        name == "hlsearch" => opts.hlsearch.to_string(),
+        name == "incsearch" => opts.incsearch.to_string(),
+        name == "scrolloff" => opts.scrolloff.to_string(),
+        name == "sidescrolloff" => opts.sidescrolloff.to_string(),
+        name == "cursorline" => opts.cursorline.to_string(),
+        name == "signcolumn" => opts.signcolumn.to_string(),
+        name == "indent_guides" => opts.indent_guides.to_string(),
+        name == "match_brackets" => opts.match_brackets.to_string(),
+        name == "auto_indent" => opts.auto_indent.to_string(),
+        name == "autopairs" => opts.autopairs.to_string(),
+        name == "clipboard_unnamedplus" => opts.clipboard_unnamedplus.to_string(),
+        name == "mouse_enabled" => opts.mouse_enabled.to_string(),
+        name == "zen_mode" => opts.zen_mode.to_string(),
+        name == "zen_width" => opts.zen_width.to_string(),
+        name == "twilight_mode" => opts.twilight_mode.to_string(),
+        name == "format_on_save" => opts.format_on_save.to_string(),
+        name == "theme_name" => "\"" ++ opts.theme_name ++ "\"",
+        name == "font_family" => "\"" ++ opts.font_family ++ "\"",
+        name == "font_size_pt" => opts.font_size_pt.to_string(),
+        name == "cursor_blink" => opts.cursor_blink.to_string(),
+        name == "evil_mode" => opts.evil_mode.to_string(),
+        else => "",
+    }
+}
+
+private fn get_raw_option_edit_str(opts: EditorOptions, name: String) -> String {
+    when {
+        name == "theme_name" => opts.theme_name,
+        name == "font_family" => opts.font_family,
+        else => get_option_value_str(opts, name),
+    }
+}
+
+private fn toggle_bool_option(kernel: SystemKernel, world: EditorWorld, name: String) -> ?bool {
+    let opts = world.options
+    var next_val = false
+    when {
+        name == "number" => { opts.number = not opts.number; next_val = opts.number },
+        name == "relativenumber" => { opts.relativenumber = not opts.relativenumber; next_val = opts.relativenumber },
+        name == "expandtab" => { opts.expandtab = not opts.expandtab; next_val = opts.expandtab },
+        name == "ignorecase" => { opts.ignorecase = not opts.ignorecase; next_val = opts.ignorecase },
+        name == "smartcase" => { opts.smartcase = not opts.smartcase; next_val = opts.smartcase },
+        name == "wrap" => { opts.wrap = not opts.wrap; next_val = opts.wrap },
+        name == "hlsearch" => {
+            opts.hlsearch = not opts.hlsearch
+            if not opts.hlsearch {
+                world.search_highlight_active = false
+            }
+            next_val = opts.hlsearch
+        },
+        name == "incsearch" => { opts.incsearch = not opts.incsearch; next_val = opts.incsearch },
+        name == "cursorline" => { opts.cursorline = not opts.cursorline; next_val = opts.cursorline },
+        name == "signcolumn" => { opts.signcolumn = not opts.signcolumn; next_val = opts.signcolumn },
+        name == "indent_guides" => { opts.indent_guides = not opts.indent_guides; next_val = opts.indent_guides },
+        name == "match_brackets" => { opts.match_brackets = not opts.match_brackets; next_val = opts.match_brackets },
+        name == "auto_indent" => { opts.auto_indent = not opts.auto_indent; next_val = opts.auto_indent },
+        name == "autopairs" => { opts.autopairs = not opts.autopairs; next_val = opts.autopairs },
+        name == "clipboard_unnamedplus" => {
+            opts.clipboard_unnamedplus = not opts.clipboard_unnamedplus
+            world.registers.unnamedplus = opts.clipboard_unnamedplus
+            next_val = opts.clipboard_unnamedplus
+        },
+        name == "mouse_enabled" => { opts.mouse_enabled = not opts.mouse_enabled; next_val = opts.mouse_enabled },
+        name == "zen_mode" => { opts.zen_mode = not opts.zen_mode; next_val = opts.zen_mode },
+        name == "twilight_mode" => { opts.twilight_mode = not opts.twilight_mode; next_val = opts.twilight_mode },
+        name == "format_on_save" => { opts.format_on_save = not opts.format_on_save; next_val = opts.format_on_save },
+        name == "cursor_blink" => { opts.cursor_blink = not opts.cursor_blink; next_val = opts.cursor_blink },
+        name == "evil_mode" => {
+            opts.evil_mode = not opts.evil_mode
+            let vim_opt = kernel.service(SERVICE_VIM)
+            if vim_opt != null {
+                let vs = vim_opt.as(VimState)
+                vs.mode = VimMode.Normal
+                vs.clear_transient()
+                sync_world_from_vim(world, vs)
+            }
+            next_val = opts.evil_mode
+        },
+        else => return null,
+    }
+    next_val
+}
+
+private fn apply_option_value_str(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    meta: OptionMeta,
+    raw_val: String,
+) -> !String String {
+    let trimmed = raw_val.trim()
+    let opts = world.options
+    if meta.val_type == "i64" {
+        let parsed? = trimmed.parse_i64() else {
+            return error ("Invalid integer for " ++ meta.name ++ ": " ++ trimmed)
+        }
+        when {
+            meta.name == "tabstop" => {
+                if parsed < 1 { return error "tabstop must be >= 1" }
+                opts.tabstop = parsed
+            },
+            meta.name == "shiftwidth" => {
+                if parsed < 1 { return error "shiftwidth must be >= 1" }
+                opts.shiftwidth = parsed
+            },
+            meta.name == "scrolloff" => {
+                if parsed < 0 { return error "scrolloff must be >= 0" }
+                opts.scrolloff = parsed
+            },
+            meta.name == "sidescrolloff" => {
+                if parsed < 0 { return error "sidescrolloff must be >= 0" }
+                opts.sidescrolloff = parsed
+            },
+            meta.name == "zen_width" => {
+                if parsed < 20 { return error "zen_width must be >= 20" }
+                opts.zen_width = parsed
+            },
+            else => return error ("Unknown integer option: " ++ meta.name),
+        }
+        return parsed.to_string()
+    }
+    if meta.val_type == "f64" {
+        let parsed_f? = trimmed.parse_f64() else {
+            return error ("Invalid float for " ++ meta.name ++ ": " ++ trimmed)
+        }
+        if meta.name == "font_size_pt" {
+            if parsed_f < 6.0 {
+                return error "font_size_pt must be >= 6.0"
+            }
+            opts.font_size_pt = parsed_f
+            return parsed_f.to_string()
+        }
+        return error ("Unknown float option: " ++ meta.name)
+    }
+    if meta.val_type == "String" {
+        if trimmed == "" {
+            return error (meta.name ++ " cannot be empty")
+        }
+        if meta.name == "theme_name" {
+            opts.theme_name = trimmed
+            kernel.emit_hook("theme-changed", trimmed)
+            return trimmed
+        }
+        if meta.name == "font_family" {
+            opts.font_family = trimmed
+            return trimmed
+        }
+    }
+    error ("Cannot set option: " ++ meta.name)
+}
+
+-- ============================================================================
+-- 6. Hyperlink Scanner (`[node_id]`, `[Source: path:line]`, `[text](path.md)`, etc.)
+-- ============================================================================
+
+private fn parse_source_target(spec: String) -> (String, i64) {
+    let trimmed = spec.trim()
+    let pair_opt = trimmed.rsplit_once(":")
+    if pair_opt != null {
+        let (p, line_s) = pair_opt.as((String, String))
+        let num_opt = line_s.trim().parse_i64()
+        if num_opt != null {
+            let line_1 = num_opt.as(i64)
+            return (p.trim(), if line_1 > 0 { line_1 - 1 } else { 0 })
+        }
+    }
+    (trimmed, 0)
+}
+
+private fn classify_bracket_inner(inner: String, known_nodes: Set, known_manuals: Set) -> ?(String, String) {
+    let t = inner.trim()
+    if t == "" {
+        return null
+    }
+    if t.starts_with("Source:") {
+        return ("source", t.drop(7).trim())
+    }
+    if t.starts_with("Info:") {
+        return ("info", t.drop(5).trim())
+    }
+    if t.starts_with("Command:") {
+        return ("command", t.drop(8).trim())
+    }
+    if t.starts_with("Variable:") {
+        return ("variable", t.drop(9).trim())
+    }
+    if t.starts_with("Extension:") {
+        return ("extension", t.drop(10).trim())
+    }
+    if t.starts_with("Symbol:") {
+        return ("symbol", t.drop(7).trim())
+    }
+    if t.starts_with("Up:") or t.starts_with("Dir:") or t.starts_with("Next:") or t.starts_with("Prev:") {
+        let pair_opt = t.split_once(":")
+        if pair_opt != null {
+            let (_, dest) = pair_opt.as((String, String))
+            let d = dest.trim()
+            if d != "" and d != "(none)" {
+                return ("info", d)
+            }
+        }
+        return null
+    }
+    if t == INFO_DIR_NODE {
+        return ("info", INFO_DIR_NODE)
+    }
+    if known_nodes.contains(t) or known_manuals.contains(t) or t.contains("#") {
+        -- Ignore decorative UI key-legend hints like `[RET]` or `[TAB]`
+        if t.contains("#") or known_nodes.contains(t) or known_manuals.contains(t) {
+            return ("info", t)
+        }
+    }
+    null
+}
+
+private fn scan_links_on_line(
+    line: String,
+    row: i64,
+    is_info_header_row: bool,
+    known_nodes: Set,
+    known_manuals: Set,
+) -> List {
+    let links = List()
+    let n = line.char_len()
+    if is_info_header_row {
+        -- Parse `Next: <id>`, `Prev: <id>`, `Up: <id>` on Info line 0
+        let keys = ["Next: ", "Prev: ", "Up: "]
+        for ki in 0..keys.len() {
+            let pfx = keys.get(ki.as(usize)).as(String)
+            let pos_opt = line.find(pfx)
+            if pos_opt != null {
+                let val_start = pos_opt.as(i64) + pfx.char_len()
+                var val_end = val_start
+                while val_end < n and line.slice(val_end, val_end + 1) != "," {
+                    val_end += 1
+                }
+                let target = line.slice(val_start, val_end).trim()
+                if target != "" and target != "(none)" {
+                    links.push(HelpLink {
+                        row: row,
+                        start_col: val_start,
+                        end_col: val_end,
+                        kind: "info",
+                        target: target,
+                    })
+                }
+            }
+        }
+        return links
+    }
+
+    var i: i64 = 0
+    while i < n {
+        if line.slice(i, i + 1) == "[" {
+            var close_idx: i64 = -1
+            var j = i + 1
+            while j < n {
+                let ch = line.slice(j, j + 1)
+                if ch == "[" {
+                    break
+                }
+                if ch == "]" {
+                    close_idx = j
+                    break
+                }
+                j += 1
+            }
+            if close_idx > i + 1 {
+                -- Check Markdown link `[label](url)`
+                if close_idx + 2 < n and line.slice(close_idx + 1, close_idx + 2) == "(" {
+                    var paren_end: i64 = -1
+                    var pj = close_idx + 2
+                    while pj < n {
+                        if line.slice(pj, pj + 1) == ")" {
+                            paren_end = pj
+                            break
+                        }
+                        pj += 1
+                    }
+                    if paren_end > close_idx + 2 {
+                        let md_url = line.slice(close_idx + 2, paren_end).trim()
+                        if md_url != "" and (not md_url.starts_with("http://")) and (not md_url.starts_with("https://")) {
+                            links.push(HelpLink {
+                                row: row,
+                                start_col: i,
+                                end_col: paren_end + 1,
+                                kind: "md",
+                                target: md_url,
+                            })
+                            i = paren_end + 1
+                            continue
+                        }
+                    }
+                }
+
+                let inner = line.slice(i + 1, close_idx)
+                let cls_opt = classify_bracket_inner(inner, known_nodes, known_manuals)
+                if cls_opt != null {
+                    let (lkind, ltarget) = cls_opt.as((String, String))
+                    links.push(HelpLink {
+                        row: row,
+                        start_col: i,
+                        end_col: close_idx + 1,
+                        kind: lkind,
+                        target: ltarget,
+                    })
+                    i = close_idx + 1
+                    continue
+                }
+            }
+        }
+        i += 1
+    }
+    links
+}
+
+private fn build_known_doc_sets(nodes: List) -> (Set, Set) {
+    let nset = Set.new()
+    let mset = Set.new()
+    nset.insert(INFO_DIR_NODE)
+    for i in 0..nodes.len() {
+        let nd = nodes.get(i.as(usize)).as(DocNode)
+        nset.insert(nd.node_id)
+        mset.insert(nd.manual)
+    }
+    (nset, mset)
+}
+
+private fn collect_all_buffer_links(buf: Buffer, skip_info_row0: bool, nodes: List) -> List {
+    let (nset, mset) = build_known_doc_sets(nodes)
+    let all = List()
+    let start_r: i64 = if skip_info_row0 { 1 } else { 0 }
+    for r in start_r..buf.line_count() {
+        let row_links = scan_links_on_line(buf.line_at(r), r, false, nset, mset)
+        for j in 0..row_links.len() {
+            all.push(row_links.get(j.as(usize)))
+        }
+    }
+    all
+}
+
+private fn jump_link_in_buffer(
+    world: EditorWorld,
+    buf: Buffer,
+    forward: bool,
+    skip_info_row0: bool,
+    nodes: List,
+) -> #status_emit Unit {
+    let links = collect_all_buffer_links(buf, skip_info_row0, nodes)
+    if links.is_empty() {
+        emit_help_status(world, "No links in buffer")#
+        return
+    }
+    let cur = buf.point
+    var chosen_opt: ?HelpLink = null
+    if forward {
+        for i in 0..links.len() {
+            let lk = links.get(i.as(usize)).as(HelpLink)
+            if lk.row > cur.row or (lk.row == cur.row and lk.start_col > cur.col) {
+                chosen_opt = lk
+                break
+            }
+        }
+        if chosen_opt == null {
+            chosen_opt = links.get(0).as(HelpLink)
+        }
+    } else {
+        var i = links.len() - 1
+        while i >= 0 {
+            let lk = links.get(i.as(usize)).as(HelpLink)
+            if lk.row < cur.row or (lk.row == cur.row and lk.start_col < cur.col) {
+                chosen_opt = lk
+                break
+            }
+            i -= 1
+        }
+        if chosen_opt == null {
+            chosen_opt = links.get((links.len() - 1).as(usize)).as(HelpLink)
+        }
+    }
+    let chosen = chosen_opt.as(HelpLink)
+    buf.point = buf.clamp_pos(Pos.new(chosen.row, chosen.start_col), insert_mode = false)
+    buf.preferred_col = buf.point.col
+    ensure_row_visible(world, buf.point.row)
+    emit_help_status(world, "Link -> " ++ chosen.target)#
+}
+
+private fn find_link_at_point(buf: Buffer, is_info_buf: bool, nodes: List) -> ?HelpLink {
+    let (nset, mset) = build_known_doc_sets(nodes)
+    let r = buf.point.row
+    let row_links = scan_links_on_line(buf.line_at(r), r, is_info_buf and r == 0, nset, mset)
+    if row_links.is_empty() {
+        return null
+    }
+    let c = buf.point.col
+    for i in 0..row_links.len() {
+        let lk = row_links.get(i.as(usize)).as(HelpLink)
+        if c >= lk.start_col and c <= lk.end_col {
+            return lk
+        }
+    }
+    row_links.get(0).as(HelpLink)
+}
+
+-- ============================================================================
+-- 7. Emacs Info Hypertext Manual Reader (`*Info*`, `major_mode = "info"`)
+-- ============================================================================
+
+private fn find_node_index(nodes: List, node_id: String) -> i64 {
+    let low = node_id.to_lower()
+    for i in 0..nodes.len() {
+        if nodes.get(i.as(usize)).as(DocNode).node_id == node_id {
+            return i
+        }
+    }
+    for i in 0..nodes.len() {
+        if nodes.get(i.as(usize)).as(DocNode).node_id.to_lower() == low {
+            return i
+        }
+    }
+    -1
+}
+
+private fn manual_top_node_id(nodes: List, manual_name: String) -> String {
+    for i in 0..nodes.len() {
+        let nd = nodes.get(i.as(usize)).as(DocNode)
+        if nd.manual == manual_name {
+            return nd.node_id
+        }
+    }
+    INFO_DIR_NODE
+}
+
+private fn compute_info_neighbors(nodes: List, idx: i64) -> (String, String, String) {
+    let nd = nodes.get(idx.as(usize)).as(DocNode)
+    let next_id = if idx + 1 < nodes.len() {
+        nodes.get((idx + 1).as(usize)).as(DocNode).node_id
+    } else {
+        "(none)"
+    }
+    let prev_id = if idx > 0 {
+        nodes.get((idx - 1).as(usize)).as(DocNode).node_id
+    } else {
+        INFO_DIR_NODE
+    }
+    var up_id = INFO_DIR_NODE
+    var k = idx - 1
+    while k >= 0 {
+        let cand = nodes.get(k.as(usize)).as(DocNode)
+        if cand.manual != nd.manual {
+            break
+        }
+        if cand.level < nd.level {
+            up_id = cand.node_id
+            break
+        }
+        k -= 1
+    }
+    if up_id == INFO_DIR_NODE {
+        let top_id = manual_top_node_id(nodes, nd.manual)
+        if top_id != nd.node_id {
+            up_id = top_id
+        }
+    }
+    (next_id, prev_id, up_id)
+}
+
+private fn collect_node_children(nodes: List, idx: i64) -> List {
+    let out = List()
+    if idx < 0 or idx >= nodes.len() {
+        return out
+    }
+    let parent = nodes.get(idx.as(usize)).as(DocNode)
+    var min_child_lvl: i64 = 99
+    var k = idx + 1
+    while k < nodes.len() {
+        let cand = nodes.get(k.as(usize)).as(DocNode)
+        if cand.manual != parent.manual or cand.level <= parent.level {
+            break
+        }
+        if cand.level < min_child_lvl {
+            min_child_lvl = cand.level
+        }
+        k += 1
+    }
+    if min_child_lvl == 99 {
+        return out
+    }
+    var j = idx + 1
+    while j < nodes.len() {
+        let cand = nodes.get(j.as(usize)).as(DocNode)
+        if cand.manual != parent.manual or cand.level <= parent.level {
+            break
+        }
+        if cand.level == min_child_lvl {
+            out.push(cand)
+        }
+        j += 1
+    }
+    out
+}
+
+private fn collect_manual_roots(nodes: List) -> List {
+    let seen = Set.new()
+    let out = List()
+    for i in 0..nodes.len() {
+        let nd = nodes.get(i.as(usize)).as(DocNode)
+        if not seen.contains(nd.manual) {
+            seen.insert(nd.manual)
+            out.push(nd)
+        }
+    }
+    out
+}
+
+private fn render_info_dir_lines(nodes: List) -> List {
+    let first_next = if nodes.is_empty() {
+        "(none)"
+    } else {
+        nodes.get(0).as(DocNode).node_id
+    }
+    let lines = List()
+    lines.push(
+        "File: dir,  Node: Top [(dir)Top],  Next: " ++ first_next ++ ",  Prev: (none),  Up: (none)"
+    )
+    lines.push("========================================================================")
+    lines.push("Lava Hypertext Info Manual Directory  (Emacs Info + Nessa & Lava Manuals)")
+    lines.push("")
+    lines.push("  Navigation:  RET follow link   TAB / S-TAB next/prev link   q quit Info")
+    lines.push("               n / p next/prev   u up   t manual top   d (dir)Top")
+    lines.push("               l / r history     g goto node   m menu   i index   s search")
+    lines.push("")
+    lines.push("* Menu:")
+    lines.push("")
+
+    let roots = collect_manual_roots(nodes)
+    let lava_roots = List()
+    let nessa_roots = List()
+    for i in 0..roots.len() {
+        let nd = roots.get(i.as(usize)).as(DocNode)
+        if nd.manual.starts_with("nessa:") {
+            nessa_roots.push(nd)
+        } else {
+            lava_roots.push(nd)
+        }
+    }
+
+    lines.push("--- Lava System & Editor Manuals ---")
+    if lava_roots.is_empty() {
+        lines.push("  (no Lava manuals indexed in current doc_roots)")
+    } else {
+        for i in 0..lava_roots.len() {
+            let nd = lava_roots.get(i.as(usize)).as(DocNode)
+            let desc = if nd.summary != "" { " — " ++ nd.summary } else { "" }
+            lines.push("* [" ++ nd.node_id ++ "]  " ++ nd.title ++ desc)
+        }
+    }
+
+    lines.push("")
+    lines.push("--- Nessa Language & Standard Library Manuals ---")
+    if nessa_roots.is_empty() {
+        lines.push("  (no Nessa manuals indexed in current doc_roots)")
+    } else {
+        for i in 0..nessa_roots.len() {
+            let nd = nessa_roots.get(i.as(usize)).as(DocNode)
+            let desc = if nd.summary != "" { " — " ++ nd.summary } else { "" }
+            lines.push("* [" ++ nd.node_id ++ "]  " ++ nd.title ++ desc)
+        }
+    }
+
+    lines.push("")
+    lines.push("--- Interactive Introspection & Global Search ---")
+    lines.push("* [Command: apropos-documentation]  Global Documentation Apropos (C-h d / :AproposDocs)")
+    lines.push("* [Command: help-for-help]          Emacs C-h & Evil :help Cheat-Sheet (C-h ? / <F1>)")
+    lines
+}
+
+private fn render_info_node_lines(nodes: List, idx: i64, focus_file_row: i64) -> (List, i64) {
+    let nd = nodes.get(idx.as(usize)).as(DocNode)
+    let (next_id, prev_id, up_id) = compute_info_neighbors(nodes, idx)
+    let lines = List()
+    lines.push(
+        "File: " ++ nd.manual
+        ++ ",  Node: " ++ nd.title ++ " [" ++ nd.node_id ++ "]"
+        ++ ",  Next: " ++ next_id
+        ++ ",  Prev: " ++ prev_id
+        ++ ",  Up: " ++ up_id
+    )
+    lines.push("========================================================================")
+    if not nd.tags.is_empty() {
+        let formatted_tags = List()
+        for i in 0..nd.tags.len() {
+            formatted_tags.push("*" ++ nd.tags.get(i.as(usize)).as(String) ++ "*")
+        }
+        lines.push("Tags: " ++ formatted_tags.join("  "))
+    }
+    lines.push("")
+
+    let body_start_buf_row = lines.len()
+    var target_buf_row: i64 = 0
+    if fs.exists(nd.file_path) {
+        let raw_res = fs.read_to_string(nd.file_path)
+        raw_res match {
+            content! => {
+                let file_lines = content.replace("\r\n", "\n").split("\n")
+                let sr = if nd.start_row < 0 { 0 } else { nd.start_row }
+                let er = if nd.end_row >= file_lines.len() { file_lines.len() - 1 } else { nd.end_row }
+                if sr <= er {
+                    for r in sr..(er + 1) {
+                        lines.push(file_lines.get(r.as(usize)).as(String))
+                    }
+                    if focus_file_row >= sr and focus_file_row <= er {
+                        target_buf_row = body_start_buf_row + (focus_file_row - sr)
+                    }
+                }
+            },
+            error _ => {
+                lines.push("(Unable to read manual file: " ++ nd.file_path ++ ")")
+            },
+        }
+    }
+
+    let children = collect_node_children(nodes, idx)
+    if not children.is_empty() {
+        lines.push("")
+        lines.push("------------------------------------------------------------------------")
+        lines.push("* Menu:")
+        lines.push("")
+        for ci in 0..children.len() {
+            let ch = children.get(ci.as(usize)).as(DocNode)
+            let desc = if ch.summary != "" { " — " ++ ch.summary } else { "" }
+            lines.push("* [" ++ ch.node_id ++ "]  " ++ ch.title ++ desc)
+        }
+    }
+
+    lines.push("")
+    lines.push("------------------------------------------------------------------------")
+    lines.push(
+        "[Source: " ++ nd.file_path ++ ":" ++ (nd.start_row + 1).to_string() ++ "]"
+        ++ "  |  [Up: " ++ up_id ++ "]  |  [Dir: (dir)Top]"
+    )
+    (lines, target_buf_row)
+}
+
+private fn save_current_info_cursor_in_history(world: EditorWorld, state: HelpState) {
+    let cur = world.active_buffer()
+    if cur.name == INFO_BUF_NAME and state.info_history_idx >= 0 and state.info_history_idx < state.info_history.len() {
+        let prev_item = state.info_history.get(state.info_history_idx.as(usize)).as(InfoHistoryItem)
+        state.info_history.set(
+            state.info_history_idx.as(usize),
+            InfoHistoryItem {
+                node_id: prev_item.node_id,
+                cursor_row: cur.point.row,
+            },
+        )
+    }
+}
+
+pub fn open_info_node(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    node_id: String,
+    .push_history: bool = true,
+    .focus_file_row: i64 = -1,
+    .override_cursor_row: i64 = -1,
+) -> #status_emit bool {
+    let state_opt = kernel.service(SERVICE_HELP_STATE)
+    let state = if state_opt != null {
+        state_opt.as(HelpState)
+    } else {
+        let fresh = HelpState.new()
+        kernel.publish_service(SERVICE_HELP_STATE, ext_help_id(), fresh)
+        fresh
+    }
+
+    remember_origin_buffer(world, state)
+    save_current_info_cursor_in_history(world, state)
+
+    let doc_roots = resolve_doc_roots(world, state = state)
+    let nodes = accel_index_docs(doc_roots)
+
+    let trimmed = node_id.trim()
+    let is_dir = trimmed == "" or trimmed == INFO_DIR_NODE or trimmed.to_lower() == "dir" or trimmed == "(dir)"
+    var canonical_id = INFO_DIR_NODE
+    var rendered_lines = List()
+    var initial_row: i64 = 0
+
+    if is_dir {
+        rendered_lines = render_info_dir_lines(nodes)
+    } else {
+        var idx = find_node_index(nodes, trimmed)
+        if idx < 0 {
+            -- Try matching manual name directly
+            let low = trimmed.to_lower()
+            for i in 0..nodes.len() {
+                let nd = nodes.get(i.as(usize)).as(DocNode)
+                if nd.manual.to_lower() == low or nd.manual.to_lower().ends_with(":" ++ low) or nd.manual.to_lower().ends_with("/" ++ low) {
+                    idx = i
+                    break
+                }
+            }
+        }
+        if idx < 0 {
+            emit_help_status(world, "Info node not found: " ++ trimmed)#
+            return false
+        }
+        canonical_id = nodes.get(idx.as(usize)).as(DocNode).node_id
+        let (ls, target_r) = render_info_node_lines(nodes, idx, focus_file_row)
+        rendered_lines = ls
+        initial_row = target_r
+    }
+
+    if override_cursor_row >= 0 {
+        initial_row = override_cursor_row
+    }
+
+    state.current_info_node = canonical_id
+    if push_history {
+        while state.info_history.len() > state.info_history_idx + 1 {
+            let _ = state.info_history.pop()
+        }
+        state.info_history.push(InfoHistoryItem {
+            node_id: canonical_id,
+            cursor_row: initial_row,
+        })
+        state.info_history_idx = state.info_history.len() - 1
+    }
+
+    let _ = activate_special_buffer(
+        kernel,
+        world,
+        INFO_BUF_NAME,
+        "info",
+        rendered_lines,
+        Pos.new(initial_row, 0),
+    )
+    emit_help_status(world, "Info: " ++ canonical_id)#
+    true
+}
+
+private fn find_tag_row_in_node(nd: DocNode, tag: String) -> i64 {
+    if not fs.exists(nd.file_path) {
+        return nd.start_row
+    }
+    let content! = fs.read_to_string(nd.file_path) else {
+        return nd.start_row
+    }
+    let lines = content.replace("\r\n", "\n").split("\n")
+    let sr = if nd.start_row < 0 { 0 } else { nd.start_row }
+    let er = if nd.end_row >= lines.len() { lines.len() - 1 } else { nd.end_row }
+    let star_needle = "*" ++ tag.to_lower() ++ "*"
+    for r in sr..(er + 1) {
+        if lines.get(r.as(usize)).as(String).to_lower().contains(star_needle) {
+            return r
+        }
+    }
+    nd.start_row
+}
+
+private fn resolve_and_open_info_topic(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    state: HelpState,
+    raw_topic: String,
+) -> #status_emit bool {
+    let topic = raw_topic.trim().trim_matches("*")
+    if topic == "" or topic == INFO_DIR_NODE or topic.to_lower() == "dir" or topic == "(dir)" or topic.to_lower() == "top" {
+        return open_info_node(kernel, world, INFO_DIR_NODE)#
+    }
+    let doc_roots = resolve_doc_roots(world, state = state)
+    let nodes = accel_index_docs(doc_roots)
+
+    -- 1. Exact node_id
+    let exact_idx = find_node_index(nodes, topic)
+    if exact_idx >= 0 {
+        return open_info_node(kernel, world, nodes.get(exact_idx.as(usize)).as(DocNode).node_id)#
+    }
+
+    -- 2. Exact tag match
+    let low = topic.to_lower()
+    for i in 0..nodes.len() {
+        let nd = nodes.get(i.as(usize)).as(DocNode)
+        for ti in 0..nd.tags.len() {
+            let tg = nd.tags.get(ti.as(usize)).as(String)
+            if tg.to_lower() == low {
+                let tag_row = find_tag_row_in_node(nd, tg)
+                return open_info_node(kernel, world, nd.node_id, focus_file_row = tag_row)#
+            }
+        }
+    }
+
+    -- 3. Manual stem match
+    for i in 0..nodes.len() {
+        let nd = nodes.get(i.as(usize)).as(DocNode)
+        let m_low = nd.manual.to_lower()
+        if m_low == low or m_low.ends_with(":" ++ low) or m_low.ends_with("/" ++ low) {
+            return open_info_node(kernel, world, nd.node_id)#
+        }
+    }
+
+    -- 4. Full-text search fallback
+    let hits = accel_search_docs(doc_roots, topic, limit = 5)
+    if not hits.is_empty() {
+        let top = hits.get(0).as(DocSearchHit)
+        return open_info_node(kernel, world, top.node_id, focus_file_row = top.row)#
+    }
+
+    emit_help_status(world, "No Info manual or section matching: " ++ raw_topic)#
+    false
+}
+
+-- ============================================================================
+-- 8. Emacs Helpful Deep Introspection (`*Help*`, `major_mode = "help"`)
+-- ============================================================================
+
+private fn save_current_help_cursor_in_history(world: EditorWorld, state: HelpState) {
+    let cur = world.active_buffer()
+    if cur.name == HELP_BUF_NAME and state.help_history_idx >= 0 and state.help_history_idx < state.help_history.len() {
+        let prev = state.help_history.get(state.help_history_idx.as(usize)).as(HelpPageSpec)
+        state.help_history.set(
+            state.help_history_idx.as(usize),
+            HelpPageSpec {
+                page_kind: prev.page_kind,
+                target: prev.target,
+                source_file: prev.source_file,
+                source_row: prev.source_row,
+                cursor_row: cur.point.row,
+            },
+        )
+    }
+}
+
+private fn render_help_page_lines(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    state: HelpState,
+    spec: HelpPageSpec,
+) -> (List, HelpPageSpec) {
+    if spec.page_kind == "command" {
+        return build_describe_command_lines(kernel, world, state, spec.target, spec.cursor_row)
+    }
+    if spec.page_kind == "variable" {
+        return build_describe_variable_lines(world, state, spec.target, spec.cursor_row)
+    }
+    if spec.page_kind == "symbol" {
+        return build_describe_symbol_lines(world, state, spec.target, spec.source_file, spec.source_row, spec.cursor_row)
+    }
+    if spec.page_kind == "extension" {
+        return build_describe_extension_lines(kernel, world, state, spec.target, spec.cursor_row)
+    }
+    if spec.page_kind == "mode" {
+        return build_describe_mode_lines(kernel, world, spec.target, spec.cursor_row)
+    }
+    (build_help_for_help_lines(world, state), spec)
+}
+
+private fn present_help_page(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    state: HelpState,
+    spec: HelpPageSpec,
+    push_history: bool,
+) -> #status_emit Unit {
+    remember_origin_buffer(world, state)
+    save_current_help_cursor_in_history(world, state)
+
+    let (lines, resolved_spec) = render_help_page_lines(kernel, world, state, spec)
+    state.current_help_page = resolved_spec
+
+    if push_history {
+        while state.help_history.len() > state.help_history_idx + 1 {
+            let _ = state.help_history.pop()
+        }
+        state.help_history.push(resolved_spec)
+        state.help_history_idx = state.help_history.len() - 1
+    } else if state.help_history_idx >= 0 and state.help_history_idx < state.help_history.len() {
+        state.help_history.set(state.help_history_idx.as(usize), resolved_spec)
+    }
+
+    let _ = activate_special_buffer(
+        kernel,
+        world,
+        HELP_BUF_NAME,
+        "help",
+        lines,
+        Pos.new(resolved_spec.cursor_row, 0),
+    )
+    emit_help_status(world, "Help: " ++ resolved_spec.target)#
+}
+
+private fn build_describe_command_lines(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    state: HelpState,
+    cmd_name: String,
+    cursor_row: i64,
+) -> (List, HelpPageSpec) {
+    let lines = List()
+    let spec_opt = kernel.get_command(cmd_name)
+    if spec_opt == null {
+        lines.push("Unknown command: " ++ cmd_name)
+        return (lines, HelpPageSpec {
+            page_kind: "command",
+            target: cmd_name,
+            source_file: "",
+            source_row: -1,
+            cursor_row: 0,
+        })
+    }
+    let cspec = spec_opt.as(CommandSpec)
+    let kind_label = if cspec.interactive { "an interactive command" } else { "an internal command" }
+    lines.push(cspec.name ++ " is " ++ kind_label ++ " defined in `" ++ cspec.owner.raw() ++ "`.")
+    lines.push("========================================================================")
+    lines.push("")
+    lines.push("Command:        " ++ cspec.name)
+    lines.push("Owner:          [Extension: " ++ cspec.owner.raw() ++ "]")
+    lines.push("Interactive:    " ++ cspec.interactive.to_string())
+    if cspec.name.starts_with("ex:") {
+        lines.push("Ex Invocation:  :" ++ cspec.name.drop(3))
+    } else {
+        lines.push("Ex Invocation:  :" ++ cspec.name ++ "   (or `M-x " ++ cspec.name ++ "`)")
+    }
+    lines.push("")
+    lines.push("Documentation:")
+    lines.push("  " ++ cspec.summary)
+
+    -- Check if any manual node documents this command via tag or title
+    let doc_roots = resolve_doc_roots(world, state = state)
+    let doc_hits = accel_search_docs(doc_roots, cspec.name, limit = 3)
+    if not doc_hits.is_empty() {
+        lines.push("")
+        lines.push("Manual References:")
+        for di in 0..doc_hits.len() {
+            let dh = doc_hits.get(di.as(usize)).as(DocSearchHit)
+            lines.push("  * [Info: " ++ dh.node_id ++ "]  " ++ dh.title ++ " (" ++ dh.manual ++ ")")
+        }
+    }
+
+    lines.push("")
+    lines.push("Keybindings Across All Keymaps:")
+    let bindings = collect_bindings_for_command(kernel, cspec.name)
+    if bindings.is_empty() {
+        lines.push("  (unbound — invoke via `M-x " ++ cspec.name ++ "` or `:" ++ cspec.name ++ "`)")
+    } else {
+        for bi in 0..bindings.len() {
+            let (kname, entry) = bindings.get(bi.as(usize)).as((String, KeyBindingEntry))
+            let desc_suffix = if entry.description != "" { " — " ++ entry.description } else { "" }
+            lines.push(
+                "  " ++ pad_right(pretty_chord_string(entry.chord), 22)
+                ++ " in [" ++ kname ++ "]" ++ desc_suffix
+            )
+        }
+    }
+
+    var src_file = ""
+    var src_row: i64 = -1
+    let src_opt = find_command_source(world, state, cspec.name, cspec.owner)
+    lines.push("")
+    lines.push("Source Definition:")
+    if src_opt != null {
+        let sh = src_opt.as(SymbolDefHit)
+        src_file = sh.file_path
+        src_row = sh.row
+        lines.push("  [Source: " ++ sh.file_path ++ ":" ++ (sh.row + 1).to_string() ++ "]")
+        if sh.doc_comment != "" {
+            let dlines = sh.doc_comment.split("\n")
+            for di in 0..dlines.len() {
+                lines.push("  -- " ++ dlines.get(di.as(usize)).as(String))
+            }
+        }
+        lines.push("  ----------------------------------------------------------------------")
+        let snippet = read_source_snippet_lines(sh.file_path, sh.row, 10)
+        for si in 0..snippet.len() {
+            lines.push(snippet.get(si.as(usize)).as(String))
+        }
+    } else {
+        lines.push("  (runtime-registered command; no static source file found in code_roots)")
+    }
+
+    lines.push("")
+    lines.push("------------------------------------------------------------------------")
+    lines.push("[Keys: RET follow link | s / gd jump to source | i Info | l/r back/fwd | q quit]")
+
+    (lines, HelpPageSpec {
+        page_kind: "command",
+        target: cspec.name,
+        source_file: src_file,
+        source_row: src_row,
+        cursor_row: cursor_row,
+    })
+}
+
+private fn build_describe_symbol_lines(
+    world: EditorWorld,
+    state: HelpState,
+    sym_name: String,
+    hint_file: String,
+    hint_row: i64,
+    cursor_row: i64,
+) -> (List, HelpPageSpec) {
+    let code_roots = resolve_code_roots(world, state = state)
+    let hits = accel_find_symbol_defs(code_roots, sym_name, limit = 20)
+    var chosen_opt: ?SymbolDefHit = null
+    for i in 0..hits.len() {
+        let h = hits.get(i.as(usize)).as(SymbolDefHit)
+        if hint_file != "" and h.file_path == hint_file and (hint_row < 0 or h.row == hint_row) {
+            chosen_opt = h
+            break
+        }
+    }
+    if chosen_opt == null {
+        for i in 0..hits.len() {
+            let h = hits.get(i.as(usize)).as(SymbolDefHit)
+            if h.symbol == sym_name {
+                chosen_opt = h
+                break
+            }
+        }
+    }
+    if chosen_opt == null and (not hits.is_empty()) {
+        chosen_opt = hits.get(0).as(SymbolDefHit)
+    }
+
+    let lines = List()
+    if chosen_opt == null {
+        lines.push("Symbol not found: " ++ sym_name)
+        return (lines, HelpPageSpec {
+            page_kind: "symbol",
+            target: sym_name,
+            source_file: hint_file,
+            source_row: hint_row,
+            cursor_row: 0,
+        })
+    }
+
+    let hit = chosen_opt.as(SymbolDefHit)
+    lines.push(hit.symbol ++ " is a Nessa `" ++ hit.kind ++ "` definition.")
+    lines.push("========================================================================")
+    lines.push("")
+    lines.push("Symbol:     " ++ hit.symbol)
+    lines.push("Kind:       " ++ hit.kind)
+    lines.push("Signature:  " ++ hit.signature)
+    lines.push("Location:   [Source: " ++ hit.file_path ++ ":" ++ (hit.row + 1).to_string() ++ "]")
+    if hit.doc_comment != "" {
+        lines.push("")
+        lines.push("Documentation:")
+        let dlines = hit.doc_comment.split("\n")
+        for di in 0..dlines.len() {
+            lines.push("  " ++ dlines.get(di.as(usize)).as(String))
+        }
+    }
+    lines.push("")
+    lines.push("Source Preview (10 lines):")
+    lines.push("  ----------------------------------------------------------------------")
+    let snippet = read_source_snippet_lines(hit.file_path, hit.row, 10)
+    for si in 0..snippet.len() {
+        lines.push(snippet.get(si.as(usize)).as(String))
+    }
+    lines.push("")
+    lines.push("------------------------------------------------------------------------")
+    lines.push("[Keys: s / gd jump to source | RET follow link | i Info | l/r back/fwd | q quit]")
+
+    (lines, HelpPageSpec {
+        page_kind: "symbol",
+        target: hit.symbol,
+        source_file: hit.file_path,
+        source_row: hit.row,
+        cursor_row: cursor_row,
+    })
+}
+
+private fn build_describe_variable_lines(
+    world: EditorWorld,
+    state: HelpState,
+    opt_name: String,
+    cursor_row: i64,
+) -> (List, HelpPageSpec) {
+    let lines = List()
+    let meta_opt = find_option_meta(opt_name)
+    if meta_opt == null {
+        lines.push("Unknown EditorOptions variable: " ++ opt_name)
+        return (lines, HelpPageSpec {
+            page_kind: "variable",
+            target: opt_name,
+            source_file: "",
+            source_row: -1,
+            cursor_row: 0,
+        })
+    }
+    let meta = meta_opt.as(OptionMeta)
+    let defaults = EditorOptions.defaults()
+    let cur_val = get_option_value_str(world.options, meta.name)
+    let def_val = get_option_value_str(defaults, meta.name)
+    let customized = if cur_val != def_val { "yes (customized)" } else { "no (at default)" }
+
+    lines.push(meta.name ++ " is a customizable `EditorOptions` variable (`" ++ meta.val_type ++ "`).")
+    lines.push("========================================================================")
+    lines.push("")
+    lines.push("Variable:       " ++ meta.name ++ (if meta.short_alias != "" { "  (short alias: `" ++ meta.short_alias ++ "`)" } else { "" }))
+    lines.push("Type:           " ++ meta.val_type)
+    lines.push("Current Value:  " ++ cur_val)
+    lines.push("Default Value:  " ++ def_val)
+    lines.push("Customized:     " ++ customized)
+    lines.push(":set Usage:     " ++ meta.set_example)
+    lines.push("")
+    lines.push("Interactive Action:")
+    lines.push("  [Press 'e' to change/toggle value]")
+    lines.push("")
+    lines.push("Documentation:")
+    lines.push("  " ++ meta.summary_en)
+    lines.push("  " ++ meta.summary_zh)
+
+    var src_file = ""
+    var src_row: i64 = -1
+    let code_roots = resolve_code_roots(world, state = state)
+    let def_hits = accel_find_symbol_defs(code_roots, "EditorOptions", limit = 5)
+    if not def_hits.is_empty() {
+        let dh = def_hits.get(0).as(SymbolDefHit)
+        src_file = dh.file_path
+        src_row = dh.row
+        lines.push("")
+        lines.push("Defined In:")
+        lines.push("  [Source: " ++ dh.file_path ++ ":" ++ (dh.row + 1).to_string() ++ "]")
+    }
+
+    lines.push("")
+    lines.push("------------------------------------------------------------------------")
+    lines.push("[Keys: e change/toggle value | s jump to EditorOptions | i Info | l/r back/fwd | q quit]")
+
+    (lines, HelpPageSpec {
+        page_kind: "variable",
+        target: meta.name,
+        source_file: src_file,
+        source_row: src_row,
+        cursor_row: cursor_row,
+    })
+}
+
+private fn build_describe_extension_lines(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    state: HelpState,
+    raw_ext_id: String,
+    cursor_row: i64,
+) -> (List, HelpPageSpec) {
+    let target_eid = ExtId(raw_ext_id.trim())
+    let lines = List()
+    let rec_any_opt = kernel.extensions.get(target_eid)
+    if rec_any_opt == null {
+        lines.push("Extension not found: " ++ raw_ext_id)
+        return (lines, HelpPageSpec {
+            page_kind: "extension",
+            target: raw_ext_id,
+            source_file: "",
+            source_row: -1,
+            cursor_row: 0,
+        })
+    }
+    let rec = rec_any_opt.as(ExtensionRecord)
+    lines.push("Extension `" ++ rec.id.raw() ++ "` v" ++ rec.version ++ " [" ++ rec.state.to_string() ++ "]")
+    lines.push("========================================================================")
+    lines.push("")
+    lines.push("Extension ID:  " ++ rec.id.raw())
+    lines.push("Name:          " ++ rec.name)
+    lines.push("Domain:        " ++ rec.domain)
+    lines.push("State:         " ++ rec.state.to_string())
+    lines.push("Description:   " ++ rec.description)
+
+    let deps = List()
+    for i in 0..rec.dependencies.len() {
+        let did = rec.dependencies.get(i.as(usize)).as(ExtId).raw()
+        deps.push("[Extension: " ++ did ++ "]")
+    }
+    lines.push("Dependencies:  " ++ (if deps.is_empty() { "(none)" } else { deps.join(", ") }))
+
+    lines.push("")
+    lines.push("Published Services:")
+    let skeys = kernel.services.keys()
+    skeys.sort()
+    var svc_count: i64 = 0
+    for i in 0..skeys.len() {
+        let sk = skeys.get(i.as(usize)).as(String)
+        let se = kernel.services.get(sk).as(ServiceEntry)
+        if se.owner == rec.id {
+            svc_count += 1
+            lines.push("  * " ++ se.name)
+        }
+    }
+    if svc_count == 0 {
+        lines.push("  (none)")
+    }
+
+    lines.push("")
+    lines.push("Registered Commands:")
+    let cmds = kernel.list_commands(interactive_only = false)
+    var cmd_count: i64 = 0
+    for i in 0..cmds.len() {
+        let cs = cmds.get(i.as(usize)).as(CommandSpec)
+        if cs.owner == rec.id {
+            cmd_count += 1
+            lines.push("  * [Command: " ++ cs.name ++ "]  — " ++ cs.summary)
+        }
+    }
+    if cmd_count == 0 {
+        lines.push("  (none)")
+    }
+
+    var src_file = ""
+    var src_row: i64 = 0
+    let code_roots = resolve_code_roots(world, state = state)
+    let reg_fn = "register_" ++ rec.name.trim_start_matches("ext_") ++ "_extension"
+    let sh_list = accel_find_symbol_defs(code_roots, reg_fn, limit = 5)
+    if not sh_list.is_empty() {
+        let sh = sh_list.get(0).as(SymbolDefHit)
+        src_file = sh.file_path
+        src_row = sh.row
+        lines.push("")
+        lines.push("Entry Point:")
+        lines.push("  [Source: " ++ sh.file_path ++ ":" ++ (sh.row + 1).to_string() ++ "]")
+    }
+
+    lines.push("")
+    lines.push("------------------------------------------------------------------------")
+    lines.push("[Keys: RET follow link | s jump to source | i Info | l/r back/fwd | q quit]")
+
+    (lines, HelpPageSpec {
+        page_kind: "extension",
+        target: rec.id.raw(),
+        source_file: src_file,
+        source_row: src_row,
+        cursor_row: cursor_row,
+    })
+}
+
+private fn build_describe_mode_lines(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    buf_name: String,
+    cursor_row: i64,
+) -> (List, HelpPageSpec) {
+    let target_buf_opt = world.find_buffer_by_name(buf_name)
+    let target_buf = if target_buf_opt != null {
+        target_buf_opt.as(Buffer)
+    } else {
+        world.active_buffer()
+    }
+
+    let lines = List()
+    lines.push(
+        "Buffer & Mode Introspection for `" ++ target_buf.name
+        ++ "` (major_mode: `" ++ target_buf.major_mode ++ "`)"
+    )
+    lines.push("========================================================================")
+    lines.push("")
+    lines.push("Buffer Name:    " ++ target_buf.name)
+    lines.push("Major Mode:     " ++ target_buf.major_mode)
+    lines.push(
+        "Modal State:    " ++ world.mode_name
+        ++ (if world.options.evil_mode { " (Evil-Vim modal)" } else { " (Emacs modeless)" })
+    )
+    lines.push("File Path:      " ++ (if target_buf.file_path != "" { target_buf.file_path } else { "(special / in-memory buffer)" }))
+    lines.push(
+        "Encoding/Lines: UTF-8 (" ++ (if target_buf.crlf { "CRLF" } else { "LF" }) ++ "), "
+        ++ target_buf.line_count().to_string() ++ " lines"
+        ++ (if target_buf.read_only { ", [read-only]" } else { "" })
+        ++ (if target_buf.modified { ", [modified]" } else { "" })
+    )
+
+    let mode_km_name = "mode:" ++ target_buf.major_mode
+    lines.push("")
+    lines.push("Mode-Local Keybindings (`" ++ mode_km_name ++ "`):")
+    lines.push("------------------------------------------------------------------------")
+    let mkm_opt = kernel.keymaps.get(mode_km_name)
+    if mkm_opt == null {
+        lines.push("  (no mode-local overrides; uses standard modal/global keymaps)")
+    } else {
+        let mkm = mkm_opt.as(Keymap)
+        let chords = mkm.bindings.keys()
+        chords.sort()
+        if chords.is_empty() {
+            lines.push("  (empty mode keymap)")
+        } else {
+            for i in 0..chords.len() {
+                let ch = chords.get(i.as(usize)).as(String)
+                let entry = mkm.bindings.get(ch).as(KeyBindingEntry)
+                let desc = if entry.description != "" { " — " ++ entry.description } else { "" }
+                lines.push(
+                    "  " ++ pad_right(pretty_chord_string(entry.chord), 18)
+                    ++ " -> [Command: " ++ entry.command_name ++ "]" ++ desc
+                )
+            }
+        }
+    }
+
+    lines.push("")
+    lines.push("Essential Global & Leader Shortcuts:")
+    lines.push("------------------------------------------------------------------------")
+    lines.push("  C-h i / <Space> h i   -> [Command: info]                   (Hypertext Info Reader)")
+    lines.push("  C-h d / <Space> h d   -> [Command: apropos-documentation]  (Global Doc Search)")
+    lines.push("  C-h f / <Space> h f   -> [Command: describe-function]      (Command + Source Help)")
+    lines.push("  C-h v / <Space> h v   -> [Command: describe-variable]      (Options + Live Edit)")
+    lines.push("  K / C-h .             -> [Command: helpful-at-point]       (Smart Help at Point)")
+
+    let hook_topics = kernel.hooks.keys()
+    hook_topics.sort()
+    lines.push("")
+    lines.push("Active Kernel Hooks (" ++ hook_topics.len().to_string() ++ " topics):")
+    lines.push("------------------------------------------------------------------------")
+    for i in 0..hook_topics.len() {
+        let topic = hook_topics.get(i.as(usize)).as(String)
+        let lst = kernel.hooks.get(topic).as(List)
+        lines.push("  " ++ pad_right(topic, 26) ++ " (" ++ lst.len().to_string() ++ " listener(s))")
+    }
+
+    let exts = kernel.list_extensions()
+    lines.push("")
+    lines.push("Loaded Extensions (" ++ exts.len().to_string() ++ "):")
+    lines.push("------------------------------------------------------------------------")
+    for i in 0..exts.len() {
+        let rec = exts.get(i.as(usize)).as(ExtensionRecord)
+        lines.push("  * [Extension: " ++ rec.id.raw() ++ "] [" ++ rec.state.to_string() ++ "] — " ++ rec.description)
+    }
+
+    lines.push("")
+    lines.push("------------------------------------------------------------------------")
+    lines.push("[Keys: RET follow link | i Info | l/r back/fwd | q quit]")
+
+    (lines, HelpPageSpec {
+        page_kind: "mode",
+        target: target_buf.name,
+        source_file: target_buf.file_path,
+        source_row: 0,
+        cursor_row: cursor_row,
+    })
+}
+
+private fn build_help_for_help_lines(world: EditorWorld, state: HelpState) -> List {
+    let lines = List()
+    lines.push("Lava Self-Documenting Help System  (`C-h ?`, `<F1>`, `<Space> h ?`, `:help`)")
+    lines.push("========================================================================")
+    lines.push("You have typed `C-h ?` (or `<F1>`). Select any `[...]` link with RET or press a key:")
+    lines.push("")
+    lines.push("1. Hypertext Info Manuals & Global Documentation Search:")
+    lines.push("------------------------------------------------------------------------")
+    lines.push("  C-h i  |  <Space> h i  |  :Info          -> [Info: (dir)Top]  Browse Lava & Nessa Manuals")
+    lines.push("  C-h d  |  <Space> h d  |  :AproposDocs   -> [Command: apropos-documentation]  Global 5-Domain Doc Search")
+    lines.push("  C-h a  |  <Space> h a                    -> [Command: apropos-command]        Search Commands & Keys")
+    lines.push("  C-h o  |  <Space> h o  |  :Apropos       -> [Command: apropos]                Unified Symbol/Tag Apropos")
+    lines.push("")
+    lines.push("2. Emacs `helpful` Deep Live Runtime & Source Introspection:")
+    lines.push("------------------------------------------------------------------------")
+    lines.push("  C-h .  |  Normal `K`   |  :h <topic>     -> [Command: helpful-at-point]       Context Help Under Cursor")
+    lines.push("  C-h f  |  C-h x        |  <Space> h f    -> [Command: describe-function]      Command Docs + Source Code")
+    lines.push("  C-h v  |  <Space> h v                    -> [Command: describe-variable]      29 Options + Live Toggle (`e`)")
+    lines.push("  C-h m  |  <Space> h m                    -> [Command: describe-mode]          Major Mode & Local Bindings")
+    lines.push("  C-h k  |  <Space> h k                    -> [Command: describe-key]           Full Key Chord Inspector")
+    lines.push("  C-h c  |  <Space> h c                    -> [Command: describe-key-briefly]   1-Line Key Summary in Echo")
+    lines.push("  C-h w  |  <Space> h w                    -> [Command: where-is]               Show All Keys for Command")
+    lines.push("  C-h b  |  <Space> h b                    -> [Command: describe-bindings]      Complete Keymap Reference")
+    lines.push("  C-h p  |  <Space> h p                    -> [Command: describe-extensions]    Live Kernel Graph & Services")
+    lines.push("  C-h e                                    -> [Command: view-echo-area-messages] Open `*Messages*` Log")
+
+    let doc_roots = resolve_doc_roots(world, state = state)
+    let nodes = accel_index_docs(doc_roots)
+    let roots = collect_manual_roots(nodes)
+    if not roots.is_empty() {
+        lines.push("")
+        lines.push("3. Indexed Manuals Quick-Jump:")
+        lines.push("------------------------------------------------------------------------")
+        let cap = if roots.len() > 14 { 14 } else { roots.len() }
+        for i in 0..cap {
+            let nd = roots.get(i.as(usize)).as(DocNode)
+            lines.push("  * [Info: " ++ nd.node_id ++ "]  " ++ nd.title ++ " (" ++ nd.manual ++ ")")
+        }
+    }
+
+    lines.push("")
+    lines.push("------------------------------------------------------------------------")
+    lines.push("[Keys: RET open link | TAB/S-TAB next/prev link | i Info | l/r back/fwd | q quit]")
+    lines
+}
+
+-- ============================================================================
+-- 9. Unified Link Follower (shared by `*Info*` and `*Help*`)
+-- ============================================================================
+
+private fn resolve_md_relative_link(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    state: HelpState,
+    raw_target: String,
+) -> #[log_event, status_emit] !String bool {
+    let doc_roots = resolve_doc_roots(world, state = state)
+    let nodes = accel_index_docs(doc_roots)
+    var cur_dir = world.cwd
+    if state.current_info_node != "" and state.current_info_node != INFO_DIR_NODE {
+        let cur_idx = find_node_index(nodes, state.current_info_node)
+        if cur_idx >= 0 {
+            let cur_fp = nodes.get(cur_idx.as(usize)).as(DocNode).file_path
+            let par_opt = path.parent(cur_fp)
+            if par_opt != null {
+                cur_dir = par_opt.as(String)
+            }
+        }
+    }
+
+    var path_part = raw_target
+    var anchor_part = ""
+    let hash_opt = raw_target.split_once("#")
+    if hash_opt != null {
+        let (p, a) = hash_opt.as((String, String))
+        path_part = p
+        anchor_part = a
+    }
+
+    if path_part == "" and anchor_part != "" {
+        -- Anchor inside current manual
+        let cur_idx = find_node_index(nodes, state.current_info_node)
+        if cur_idx >= 0 {
+            let cur_manual = nodes.get(cur_idx.as(usize)).as(DocNode).manual
+            let cand_id = cur_manual ++ "#" ++ anchor_part
+            if find_node_index(nodes, cand_id) >= 0 {
+                return open_info_node(kernel, world, cand_id)#
+            }
+        }
+    }
+
+    let resolved_fp = if path.is_absolute(path_part) {
+        path.normalize(path_part)
+    } else {
+        path.normalize(path.join(cur_dir, path_part))
+    }
+
+    for i in 0..nodes.len() {
+        let nd = nodes.get(i.as(usize)).as(DocNode)
+        if path.normalize(nd.file_path) == resolved_fp {
+            if anchor_part == "" or nd.node_id.ends_with("#" ++ anchor_part) {
+                return open_info_node(kernel, world, nd.node_id)#
+            }
+        }
+    }
+    for i in 0..nodes.len() {
+        let nd = nodes.get(i.as(usize)).as(DocNode)
+        if path.normalize(nd.file_path) == resolved_fp {
+            return open_info_node(kernel, world, nd.node_id)#
+        }
+    }
+    if fs.exists(resolved_fp) and fs.is_file(resolved_fp) {
+        let _ = open_file_at_row(kernel, world, resolved_fp, 0)#!
+        return true
+    }
+    false
+}
+
+private fn follow_help_link(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    state: HelpState,
+    link: HelpLink,
+) -> #[log_event, status_emit] !String Unit {
+    if link.kind == "source" {
+        let (fp, row0) = parse_source_target(link.target)
+        let _ = open_file_at_row(kernel, world, fp, row0)#!
+        return ()
+    }
+    if link.kind == "info" {
+        let _ = resolve_and_open_info_topic(kernel, world, state, link.target)#
+        return ()
+    }
+    if link.kind == "command" {
+        present_help_page(
+            kernel,
+            world,
+            state,
+            HelpPageSpec {
+                page_kind: "command",
+                target: link.target,
+                source_file: "",
+                source_row: -1,
+                cursor_row: 0,
+            },
+            true,
+        )#
+        return ()
+    }
+    if link.kind == "variable" {
+        present_help_page(
+            kernel,
+            world,
+            state,
+            HelpPageSpec {
+                page_kind: "variable",
+                target: link.target,
+                source_file: "",
+                source_row: -1,
+                cursor_row: 0,
+            },
+            true,
+        )#
+        return ()
+    }
+    if link.kind == "extension" {
+        present_help_page(
+            kernel,
+            world,
+            state,
+            HelpPageSpec {
+                page_kind: "extension",
+                target: link.target,
+                source_file: "",
+                source_row: -1,
+                cursor_row: 0,
+            },
+            true,
+        )#
+        return ()
+    }
+    if link.kind == "symbol" {
+        present_help_page(
+            kernel,
+            world,
+            state,
+            HelpPageSpec {
+                page_kind: "symbol",
+                target: link.target,
+                source_file: "",
+                source_row: -1,
+                cursor_row: 0,
+            },
+            true,
+        )#
+        return ()
+    }
+    if link.kind == "md" {
+        let ok = resolve_md_relative_link(kernel, world, state, link.target)#!
+        if not ok {
+            emit_help_status(world, "Link target not found: " ++ link.target)#
+        }
+        return ()
+    }
+    ()
+}
+
+-- ============================================================================
+-- 10. Global Documentation Search — Apropos Suite (`*Apropos*`, `major_mode = "apropos"`)
+-- ============================================================================
+
+pub fn run_apropos_report(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    state: HelpState,
+    query: String,
+    mode_kind: String,
+) -> #status_emit Unit {
+    remember_origin_buffer(world, state)
+    let q_trim = query.trim()
+    state.apropos_query = q_trim
+    state.apropos_mode_kind = mode_kind
+    state.apropos_entries = List()
+
+    let include_docs = mode_kind == "docs" or mode_kind == "all"
+    let include_cmds = true
+    let include_vars = mode_kind == "docs" or mode_kind == "all"
+    let include_exts = mode_kind == "docs" or mode_kind == "all"
+    let include_syms = mode_kind == "docs" or mode_kind == "all"
+
+    let doc_roots = resolve_doc_roots(world, state = state)
+    let code_roots = resolve_code_roots(world, state = state)
+
+    let doc_hits = if include_docs {
+        accel_search_docs(doc_roots, q_trim, limit = 40)
+    } else {
+        List()
+    }
+
+    -- Score Commands
+    let cmd_scored = List()
+    if include_cmds {
+        let chords_map = build_command_chords_map(kernel)
+        let all_cmds = kernel.list_commands(interactive_only = false)
+        for i in 0..all_cmds.len() {
+            let cs = all_cmds.get(i.as(usize)).as(CommandSpec)
+            let chords_opt = chords_map.get(cs.name)
+            let chords = if chords_opt != null { chords_opt.as(String) } else { "" }
+            let sc = orderless_score(
+                q_trim,
+                cs.name,
+                cs.owner.raw() ++ " " ++ chords ++ " " ++ cs.summary,
+            )
+            if sc >= 0 {
+                cmd_scored.push((sc, cs, chords))
+            }
+        }
+        cmd_scored.sort_by(|a: Any, b: Any| {
+            let (sa, ca, _) = a.as((i64, CommandSpec, String))
+            let (sb, cb, _) = b.as((i64, CommandSpec, String))
+            if sa != sb { sb.cmp(sa) } else { ca.name.cmp(cb.name) }
+        })
+    }
+
+    -- Score EditorOptions Variables (all 29)
+    let var_scored = List()
+    if include_vars {
+        let metas = all_option_metas()
+        for i in 0..metas.len() {
+            let m = metas.get(i.as(usize)).as(OptionMeta)
+            let cur_v = get_option_value_str(world.options, m.name)
+            let sc = orderless_score(
+                q_trim,
+                m.name,
+                m.short_alias ++ " " ++ m.val_type ++ " " ++ cur_v ++ " " ++ m.summary_en ++ " " ++ m.summary_zh,
+            )
+            if sc >= 0 {
+                var_scored.push((sc, m, cur_v))
+            }
+        }
+        var_scored.sort_by(|a: Any, b: Any| {
+            let (sa, ma, _) = a.as((i64, OptionMeta, String))
+            let (sb, mb, _) = b.as((i64, OptionMeta, String))
+            if sa != sb { sb.cmp(sa) } else { ma.name.cmp(mb.name) }
+        })
+    }
+
+    -- Score Extensions, Services & Hooks
+    let ext_scored = List()
+    if include_exts {
+        let exts = kernel.list_extensions()
+        let skeys = kernel.services.keys()
+        skeys.sort()
+        let htopics = kernel.hooks.keys()
+        htopics.sort()
+
+        for i in 0..exts.len() {
+            let rec = exts.get(i.as(usize)).as(ExtensionRecord)
+            let owned_svcs = List()
+            for si in 0..skeys.len() {
+                let sk = skeys.get(si.as(usize)).as(String)
+                let se = kernel.services.get(sk).as(ServiceEntry)
+                if se.owner == rec.id {
+                    owned_svcs.push(se.name)
+                }
+            }
+            let owned_hooks = List()
+            for hi in 0..htopics.len() {
+                let ht = htopics.get(hi.as(usize)).as(String)
+                let lst = kernel.hooks.get(ht).as(List)
+                for li in 0..lst.len() {
+                    if lst.get(li.as(usize)).as(HookListener).owner == rec.id {
+                        if not owned_hooks.contains(ht) {
+                            owned_hooks.push(ht)
+                        }
+                    }
+                }
+            }
+            let meta_blob = rec.name ++ " " ++ rec.description
+                ++ " services:" ++ owned_svcs.join(",")
+                ++ " hooks:" ++ owned_hooks.join(",")
+            let sc = orderless_score(q_trim, rec.id.raw(), meta_blob)
+            if sc >= 0 {
+                ext_scored.push((sc, rec, owned_svcs, owned_hooks))
+            }
+        }
+        ext_scored.sort_by(|a: Any, b: Any| {
+            let (sa, ra, _, _) = a.as((i64, ExtensionRecord, List, List))
+            let (sb, rb, _, _) = b.as((i64, ExtensionRecord, List, List))
+            if sa != sb { sb.cmp(sa) } else { ra.id.raw().cmp(rb.id.raw()) }
+        })
+    }
+
+    -- Score Source Symbols (`.ns` definitions + `--` doc comments)
+    let sym_hits = if include_syms {
+        search_source_symbols_apropos(code_roots, q_trim, 25)
+    } else {
+        List()
+    }
+
+    let total_hits = doc_hits.len() + cmd_scored.len() + var_scored.len() + ext_scored.len() + sym_hits.len()
+    let mode_banner = when {
+        mode_kind == "command" => "Emacs Command Apropos (`C-h a`)",
+        mode_kind == "all" => "Emacs Unified Symbol & Documentation Apropos (`C-h o`)",
+        else => "Emacs Global Documentation Apropos (`C-h d`)",
+    }
+
+    let lines = List()
+    lines.push(mode_banner ++ " — Query: `" ++ q_trim ++ "` (" ++ total_hits.to_string() ++ " matches)")
+    lines.push("========================================================================")
+    lines.push("  Keys: [RET] open Info/Help   [s] jump to source   [TAB]/[n] next   [S-TAB]/[p] prev   [g] new search   [q] quit")
+
+    let entries = List()
+    var first_entry_row: i64 = 0
+
+    -- 1. Manuals & Info Nodes
+    if include_docs and (not doc_hits.is_empty()) {
+        lines.push("")
+        lines.push("1. Manuals & Info Nodes (" ++ doc_hits.len().to_string() ++ "):")
+        lines.push("------------------------------------------------------------------------")
+        for i in 0..doc_hits.len() {
+            let dh = doc_hits.get(i.as(usize)).as(DocSearchHit)
+            let hit_row = lines.len()
+            if entries.is_empty() {
+                first_entry_row = hit_row
+            }
+            let tag_badge = if dh.matched_tag != "" { "  *" ++ dh.matched_tag ++ "*" } else { "" }
+            lines.push("  [DOC] [" ++ dh.node_id ++ "]  " ++ dh.title ++ tag_badge)
+            if dh.snippet != "" {
+                lines.push("        " ++ dh.snippet)
+            }
+            entries.push(AproposHit {
+                row: hit_row,
+                kind: "doc",
+                target_id: dh.node_id,
+                file_path: dh.file_path,
+                file_row: dh.row,
+                title: dh.title,
+            })
+        }
+    }
+
+    -- 2. Interactive Commands & Keybindings
+    if include_cmds and (not cmd_scored.is_empty()) {
+        let cmd_cap = if cmd_scored.len() > 40 { 40 } else { cmd_scored.len() }
+        lines.push("")
+        lines.push("2. Interactive Commands & Keybindings (" ++ cmd_cap.to_string() ++ "):")
+        lines.push("------------------------------------------------------------------------")
+        for i in 0..cmd_cap {
+            let (_, cs, chords) = cmd_scored.get(i.as(usize)).as((i64, CommandSpec, String))
+            let hit_row = lines.len()
+            if entries.is_empty() {
+                first_entry_row = hit_row
+            }
+            let key_info = if chords != "" { "  (" ++ chords ++ ")" } else { "  (M-x " ++ cs.name ++ ")" }
+            lines.push("  [CMD] " ++ pad_right(cs.name, 28) ++ key_info ++ "  [" ++ cs.owner.raw() ++ "]")
+            lines.push("        " ++ cs.summary)
+            entries.push(AproposHit {
+                row: hit_row,
+                kind: "command",
+                target_id: cs.name,
+                file_path: "",
+                file_row: -1,
+                title: cs.name,
+            })
+        }
+    }
+
+    -- 3. Editor Variables / Options
+    if include_vars and (not var_scored.is_empty()) {
+        lines.push("")
+        lines.push("3. Editor Variables / Options (" ++ var_scored.len().to_string() ++ "):")
+        lines.push("------------------------------------------------------------------------")
+        for i in 0..var_scored.len() {
+            let (_, m, cur_v) = var_scored.get(i.as(usize)).as((i64, OptionMeta, String))
+            let hit_row = lines.len()
+            if entries.is_empty() {
+                first_entry_row = hit_row
+            }
+            lines.push("  [VAR] " ++ pad_right(m.name, 24) ++ " : " ++ pad_right(m.val_type, 7) ++ " = " ++ cur_v)
+            lines.push("        " ++ m.summary_en ++ " / " ++ m.summary_zh)
+            entries.push(AproposHit {
+                row: hit_row,
+                kind: "variable",
+                target_id: m.name,
+                file_path: "",
+                file_row: -1,
+                title: m.name,
+            })
+        }
+    }
+
+    -- 4. Extensions, Services & Hooks
+    if include_exts and (not ext_scored.is_empty()) {
+        lines.push("")
+        lines.push("4. Extensions, Services & Hooks (" ++ ext_scored.len().to_string() ++ "):")
+        lines.push("------------------------------------------------------------------------")
+        for i in 0..ext_scored.len() {
+            let (_, rec, svcs, hks) = ext_scored.get(i.as(usize)).as((i64, ExtensionRecord, List, List))
+            let hit_row = lines.len()
+            if entries.is_empty() {
+                first_entry_row = hit_row
+            }
+            lines.push("  [EXT] " ++ rec.id.raw() ++ " [" ++ rec.state.to_string() ++ "]")
+            var extra_meta = rec.description
+            if not svcs.is_empty() {
+                extra_meta = extra_meta ++ " | services: " ++ svcs.join(", ")
+            }
+            if not hks.is_empty() {
+                extra_meta = extra_meta ++ " | hooks: " ++ hks.join(", ")
+            }
+            lines.push("        " ++ extra_meta)
+            entries.push(AproposHit {
+                row: hit_row,
+                kind: "extension",
+                target_id: rec.id.raw(),
+                file_path: "",
+                file_row: -1,
+                title: rec.id.raw(),
+            })
+        }
+    }
+
+    -- 5. Nessa & Lava Source Symbols
+    if include_syms and (not sym_hits.is_empty()) {
+        lines.push("")
+        lines.push("5. Nessa & Lava Source Symbols (" ++ sym_hits.len().to_string() ++ "):")
+        lines.push("------------------------------------------------------------------------")
+        for i in 0..sym_hits.len() {
+            let sh = sym_hits.get(i.as(usize)).as(SymbolDefHit)
+            let hit_row = lines.len()
+            if entries.is_empty() {
+                first_entry_row = hit_row
+            }
+            let base_opt = path.file_name(sh.file_path)
+            let short_f = if base_opt != null { base_opt.as(String) } else { sh.file_path }
+            lines.push(
+                "  [SYM] " ++ pad_right(sh.symbol, 26)
+                ++ " (" ++ sh.kind ++ ")  " ++ short_f ++ ":" ++ (sh.row + 1).to_string()
+            )
+            let detail_txt = if sh.doc_comment != "" {
+                sh.doc_comment.split("\n").get(0).as(String)
+            } else {
+                sh.signature
+            }
+            lines.push("        " ++ detail_txt)
+            entries.push(AproposHit {
+                row: hit_row,
+                kind: "symbol",
+                target_id: sh.symbol,
+                file_path: sh.file_path,
+                file_row: sh.row,
+                title: sh.symbol,
+            })
+        }
+    }
+
+    if entries.is_empty() {
+        lines.push("")
+        lines.push("  (No matches found across manuals, commands, options, extensions, or symbols.)")
+    }
+
+    state.apropos_entries = entries
+    let _ = activate_special_buffer(
+        kernel,
+        world,
+        APROPOS_BUF_NAME,
+        "apropos",
+        lines,
+        Pos.new(first_entry_row, 0),
+    )
+    emit_help_status(
+        world,
+        "Apropos `" ++ q_trim ++ "`: " ++ entries.len().to_string() ++ " matches",
+    )#
+}
+
+private fn find_apropos_hit_near_row(state: HelpState, cursor_row: i64) -> ?AproposHit {
+    if state.apropos_entries.is_empty() {
+        return null
+    }
+    -- Exact row match or indented description row immediately below headline
+    for i in 0..state.apropos_entries.len() {
+        let h = state.apropos_entries.get(i.as(usize)).as(AproposHit)
+        if h.row == cursor_row or h.row + 1 == cursor_row {
+            return h
+        }
+    }
+    -- Nearest preceding entry if below first entry
+    var best_opt: ?AproposHit = null
+    for i in 0..state.apropos_entries.len() {
+        let h = state.apropos_entries.get(i.as(usize)).as(AproposHit)
+        if h.row <= cursor_row {
+            best_opt = h
+        }
+    }
+    best_opt
+}
+
+-- ============================================================================
+-- 11. Smart Topic & Point Identifier Resolution (`helpful-at-point`, `:h`, `K`)
+-- ============================================================================
+
+private fn is_help_token_char(ch: String) -> bool {
+    ch.is_alphanumeric() or ch == "-" or ch == "_" or ch == "." or ch == ":" or ch == "*" or ch == "/"
+}
+
+private fn extract_help_token_at_point(buf: Buffer) -> String {
+    let line = buf.line_at(buf.point.row)
+    let n = line.char_len()
+    if n == 0 {
+        return ""
+    }
+    var col = if buf.point.col >= n { n - 1 } else { buf.point.col }
+    if col < 0 {
+        return ""
+    }
+    if not is_help_token_char(line.slice(col, col + 1)) {
+        return ""
+    }
+    var start_c = col
+    while start_c > 0 and is_help_token_char(line.slice(start_c - 1, start_c)) {
+        start_c -= 1
+    }
+    var end_c = col + 1
+    while end_c < n and is_help_token_char(line.slice(end_c, end_c + 1)) {
+        end_c += 1
+    }
+    line.slice(start_c, end_c)
+}
+
+private fn resolve_help_topic(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    state: HelpState,
+    raw_topic: String,
+    prefer_docs_first: bool,
+) -> #status_emit Unit {
+    let trimmed = raw_topic.trim()
+    if trimmed == "" {
+        present_help_page(
+            kernel,
+            world,
+            state,
+            HelpPageSpec {
+                page_kind: "overview",
+                target: "help-for-help",
+                source_file: "",
+                source_row: -1,
+                cursor_row: 0,
+            },
+            true,
+        )#
+        return
+    }
+
+    if trimmed.starts_with("?") and trimmed.char_len() > 1 {
+        run_apropos_report(kernel, world, state, trimmed.drop(1).trim(), "docs")#
+        return
+    }
+
+    let was_star_wrapped = trimmed.starts_with("*") and trimmed.ends_with("*") and trimmed.char_len() >= 3
+    let clean = trimmed.trim_matches("*").trim_matches("`").trim_matches("\"").trim_matches("'")
+    if clean == "" {
+        present_help_page(
+            kernel,
+            world,
+            state,
+            HelpPageSpec {
+                page_kind: "overview",
+                target: "help-for-help",
+                source_file: "",
+                source_row: -1,
+                cursor_row: 0,
+            },
+            true,
+        )#
+        return
+    }
+
+    let doc_roots = resolve_doc_roots(world, state = state)
+    let code_roots = resolve_code_roots(world, state = state)
+    let nodes = accel_index_docs(doc_roots)
+    let clean_low = clean.to_lower()
+
+    -- Helper checks
+    if prefer_docs_first or was_star_wrapped {
+        -- 1a. Exact node_id
+        let nidx = find_node_index(nodes, clean)
+        if nidx >= 0 {
+            let _ = open_info_node(kernel, world, nodes.get(nidx.as(usize)).as(DocNode).node_id)#
+            return
+        }
+        -- 1b. Exact `*help-tag*`
+        for i in 0..nodes.len() {
+            let nd = nodes.get(i.as(usize)).as(DocNode)
+            for ti in 0..nd.tags.len() {
+                let tg = nd.tags.get(ti.as(usize)).as(String)
+                if tg.to_lower() == clean_low {
+                    let trow = find_tag_row_in_node(nd, tg)
+                    let _ = open_info_node(kernel, world, nd.node_id, focus_file_row = trow)#
+                    return
+                }
+            }
+        }
+        -- 1c. Exact manual stem
+        for i in 0..nodes.len() {
+            let nd = nodes.get(i.as(usize)).as(DocNode)
+            let ml = nd.manual.to_lower()
+            if ml == clean_low or ml.ends_with(":" ++ clean_low) or ml.ends_with("/" ++ clean_low) {
+                let _ = open_info_node(kernel, world, nd.node_id)#
+                return
+            }
+        }
+    }
+
+    -- 2. Exact registered command
+    if kernel.get_command(clean) != null {
+        present_help_page(
+            kernel,
+            world,
+            state,
+            HelpPageSpec {
+                page_kind: "command",
+                target: clean,
+                source_file: "",
+                source_row: -1,
+                cursor_row: 0,
+            },
+            true,
+        )#
+        return
+    }
+
+    -- 3. Exact EditorOptions variable
+    let opt_meta = find_option_meta(clean)
+    if opt_meta != null {
+        present_help_page(
+            kernel,
+            world,
+            state,
+            HelpPageSpec {
+                page_kind: "variable",
+                target: opt_meta.as(OptionMeta).name,
+                source_file: "",
+                source_row: -1,
+                cursor_row: 0,
+            },
+            true,
+        )#
+        return
+    }
+
+    -- 4. Exact `*help-tag*` or `node_id` (when `prefer_docs_first == false`)
+    if not prefer_docs_first {
+        let nidx = find_node_index(nodes, clean)
+        if nidx >= 0 {
+            let _ = open_info_node(kernel, world, nodes.get(nidx.as(usize)).as(DocNode).node_id)#
+            return
+        }
+        for i in 0..nodes.len() {
+            let nd = nodes.get(i.as(usize)).as(DocNode)
+            for ti in 0..nd.tags.len() {
+                let tg = nd.tags.get(ti.as(usize)).as(String)
+                if tg.to_lower() == clean_low {
+                    let trow = find_tag_row_in_node(nd, tg)
+                    let _ = open_info_node(kernel, world, nd.node_id, focus_file_row = trow)#
+                    return
+                }
+            }
+        }
+    }
+
+    -- 5. Exact Nessa/Lava symbol definition in `code_roots`
+    let sym_hits = accel_find_symbol_defs(code_roots, clean, limit = 15)
+    for i in 0..sym_hits.len() {
+        let sh = sym_hits.get(i.as(usize)).as(SymbolDefHit)
+        if sh.symbol == clean and sh.kind != "command" {
+            present_help_page(
+                kernel,
+                world,
+                state,
+                HelpPageSpec {
+                    page_kind: "symbol",
+                    target: sh.symbol,
+                    source_file: sh.file_path,
+                    source_row: sh.row,
+                    cursor_row: 0,
+                },
+                true,
+            )#
+            return
+        }
+    }
+
+    -- 6. Full-text manual search via `accel_search_docs`
+    let doc_hits = accel_search_docs(doc_roots, clean, limit = 10)
+    if not doc_hits.is_empty() {
+        let top = doc_hits.get(0).as(DocSearchHit)
+        let _ = open_info_node(kernel, world, top.node_id, focus_file_row = top.row)#
+        return
+    }
+
+    -- 7. Fuzzy symbol fallback
+    if not sym_hits.is_empty() {
+        let sh = sym_hits.get(0).as(SymbolDefHit)
+        present_help_page(
+            kernel,
+            world,
+            state,
+            HelpPageSpec {
+                page_kind: "symbol",
+                target: sh.symbol,
+                source_file: sh.file_path,
+                source_row: sh.row,
+                cursor_row: 0,
+            },
+            true,
+        )#
+        return
+    }
+
+    emit_help_status(world, "No help topic, command, option, or symbol found for: " ++ clean)#
+}
+
+-- ============================================================================
+-- 12. Command Implementations
+-- ============================================================================
+
+-- 12.1 Info Reader Commands
+private fn cmd_info(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    if (not args.is_empty()) and (args.get(0) matches _: String) {
+        let arg = args.get(0).as(String).trim()
+        if arg != "" {
+            let _ = resolve_and_open_info_topic(kernel, world, state, arg)#
+            return ()
+        }
+    }
+    let resume_id = if state.current_info_node != "" {
+        state.current_info_node
+    } else {
+        INFO_DIR_NODE
+    }
+    let _ = open_info_node(kernel, world, resume_id)#
+    ()
+}
+
+private fn cmd_info_follow_at_point(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let buf = world.active_buffer()
+    let nodes = accel_index_docs(resolve_doc_roots(world, state = state))
+    let lk_opt = find_link_at_point(buf, true, nodes)
+    if lk_opt == null {
+        emit_help_status(world, "No Info cross-reference or link on current line")#
+        return ()
+    }
+    follow_help_link(kernel, world, state, lk_opt.as(HelpLink))#!
+    ()
+}
+
+private fn cmd_info_next_link(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let nodes = accel_index_docs(resolve_doc_roots(world, state = state))
+    jump_link_in_buffer(world, world.active_buffer(), true, true, nodes)#
+    sync_window_pane_to_world(kernel, world)
+    ()
+}
+
+private fn cmd_info_prev_link(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let nodes = accel_index_docs(resolve_doc_roots(world, state = state))
+    jump_link_in_buffer(world, world.active_buffer(), false, true, nodes)#
+    sync_window_pane_to_world(kernel, world)
+    ()
+}
+
+private fn cmd_info_next_node(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let nodes = accel_index_docs(resolve_doc_roots(world, state = state))
+    if state.current_info_node == "" or state.current_info_node == INFO_DIR_NODE {
+        if nodes.is_empty() {
+            emit_help_status(world, "No next Info node")#
+            return ()
+        }
+        let _ = open_info_node(kernel, world, nodes.get(0).as(DocNode).node_id)#
+        return ()
+    }
+    let idx = find_node_index(nodes, state.current_info_node)
+    if idx < 0 or idx + 1 >= nodes.len() {
+        emit_help_status(world, "No `Next` node from " ++ state.current_info_node)#
+        return ()
+    }
+    let _ = open_info_node(kernel, world, nodes.get((idx + 1).as(usize)).as(DocNode).node_id)#
+    ()
+}
+
+private fn cmd_info_prev_node(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let nodes = accel_index_docs(resolve_doc_roots(world, state = state))
+    if state.current_info_node == "" or state.current_info_node == INFO_DIR_NODE {
+        emit_help_status(world, "Already at Info top directory (dir)Top")#
+        return ()
+    }
+    let idx = find_node_index(nodes, state.current_info_node)
+    if idx <= 0 {
+        let _ = open_info_node(kernel, world, INFO_DIR_NODE)#
+        return ()
+    }
+    let _ = open_info_node(kernel, world, nodes.get((idx - 1).as(usize)).as(DocNode).node_id)#
+    ()
+}
+
+private fn cmd_info_up_node(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    if state.current_info_node == "" or state.current_info_node == INFO_DIR_NODE {
+        emit_help_status(world, "Already at top-level directory (dir)Top")#
+        return ()
+    }
+    let nodes = accel_index_docs(resolve_doc_roots(world, state = state))
+    let idx = find_node_index(nodes, state.current_info_node)
+    if idx < 0 {
+        let _ = open_info_node(kernel, world, INFO_DIR_NODE)#
+        return ()
+    }
+    let (_, _, up_id) = compute_info_neighbors(nodes, idx)
+    let _ = open_info_node(kernel, world, up_id)#
+    ()
+}
+
+private fn cmd_info_top_node(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    if state.current_info_node == "" or state.current_info_node == INFO_DIR_NODE {
+        let _ = open_info_node(kernel, world, INFO_DIR_NODE)#
+        return ()
+    }
+    let nodes = accel_index_docs(resolve_doc_roots(world, state = state))
+    let idx = find_node_index(nodes, state.current_info_node)
+    if idx < 0 {
+        let _ = open_info_node(kernel, world, INFO_DIR_NODE)#
+        return ()
+    }
+    let cur_manual = nodes.get(idx.as(usize)).as(DocNode).manual
+    let top_id = manual_top_node_id(nodes, cur_manual)
+    let _ = open_info_node(kernel, world, top_id)#
+    ()
+}
+
+private fn cmd_info_directory(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let _ = open_info_node(kernel, world, INFO_DIR_NODE)#
+    ()
+}
+
+private fn cmd_info_history_back(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    if state.info_history_idx <= 0 {
+        emit_help_status(world, "Beginning of Info history")#
+        return ()
+    }
+    save_current_info_cursor_in_history(world, state)
+    state.info_history_idx -= 1
+    let item = state.info_history.get(state.info_history_idx.as(usize)).as(InfoHistoryItem)
+    let _ = open_info_node(
+        kernel,
+        world,
+        item.node_id,
+        push_history = false,
+        override_cursor_row = item.cursor_row,
+    )#
+    ()
+}
+
+private fn cmd_info_history_forward(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    if state.info_history_idx + 1 >= state.info_history.len() {
+        emit_help_status(world, "End of Info history")#
+        return ()
+    }
+    save_current_info_cursor_in_history(world, state)
+    state.info_history_idx += 1
+    let item = state.info_history.get(state.info_history_idx.as(usize)).as(InfoHistoryItem)
+    let _ = open_info_node(
+        kernel,
+        world,
+        item.node_id,
+        push_history = false,
+        override_cursor_row = item.cursor_row,
+    )#
+    ()
+}
+
+private fn cmd_info_goto_node(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let nodes = accel_index_docs(resolve_doc_roots(world, state = state))
+    let chosen = if (not args.is_empty()) and (args.get(0) matches _: String) {
+        args.get(0).as(String)
+    } else {
+        let cands = List()
+        cands.push((INFO_DIR_NODE, "Top-Level Info Manual Directory"))
+        for i in 0..nodes.len() {
+            let nd = nodes.get(i.as(usize)).as(DocNode)
+            cands.push((nd.node_id, nd.title ++ " [" ++ nd.manual ++ "]"))
+        }
+        let ans? = ask_prompt(PromptRequest.with_candidates(
+            "Goto Info node: ",
+            "",
+            PromptKind.Choice,
+            cands,
+        ))# else {
+            emit_help_status(world, "Quit")#
+            return ()
+        }
+        ans
+    }
+    if chosen.trim() != "" {
+        let _ = resolve_and_open_info_topic(kernel, world, state, chosen)#
+    }
+    ()
+}
+
+private fn cmd_info_menu(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let nodes = accel_index_docs(resolve_doc_roots(world, state = state))
+    let chosen = if (not args.is_empty()) and (args.get(0) matches _: String) {
+        args.get(0).as(String)
+    } else {
+        let cands = List()
+        if state.current_info_node == "" or state.current_info_node == INFO_DIR_NODE {
+            let roots = collect_manual_roots(nodes)
+            for i in 0..roots.len() {
+                let nd = roots.get(i.as(usize)).as(DocNode)
+                cands.push((nd.node_id, nd.title ++ " — " ++ nd.summary))
+            }
+        } else {
+            let idx = find_node_index(nodes, state.current_info_node)
+            let children = if idx >= 0 { collect_node_children(nodes, idx) } else { List() }
+            if not children.is_empty() {
+                for i in 0..children.len() {
+                    let ch = children.get(i.as(usize)).as(DocNode)
+                    cands.push((ch.node_id, ch.title ++ " — " ++ ch.summary))
+                }
+            } else if idx >= 0 {
+                let cur_m = nodes.get(idx.as(usize)).as(DocNode).manual
+                for i in 0..nodes.len() {
+                    let nd = nodes.get(i.as(usize)).as(DocNode)
+                    if nd.manual == cur_m {
+                        cands.push((nd.node_id, nd.title ++ " — " ++ nd.summary))
+                    }
+                }
+            }
+        }
+        let ans? = ask_prompt(PromptRequest.with_candidates(
+            "Info menu item: ",
+            "",
+            PromptKind.Choice,
+            cands,
+        ))# else {
+            emit_help_status(world, "Quit")#
+            return ()
+        }
+        ans
+    }
+    if chosen.trim() != "" {
+        let _ = resolve_and_open_info_topic(kernel, world, state, chosen)#
+    }
+    ()
+}
+
+private fn cmd_info_index(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let nodes = accel_index_docs(resolve_doc_roots(world, state = state))
+    let chosen = if (not args.is_empty()) and (args.get(0) matches _: String) {
+        args.get(0).as(String)
+    } else {
+        let cands = List()
+        let seen = Set.new()
+        for i in 0..nodes.len() {
+            let nd = nodes.get(i.as(usize)).as(DocNode)
+            for ti in 0..nd.tags.len() {
+                let tg = nd.tags.get(ti.as(usize)).as(String)
+                if not seen.contains(tg) {
+                    seen.insert(tg)
+                    cands.push((tg, "Tag in " ++ nd.node_id ++ " — " ++ nd.title))
+                }
+            }
+        }
+        let metas = all_option_metas()
+        for i in 0..metas.len() {
+            let m = metas.get(i.as(usize)).as(OptionMeta)
+            if not seen.contains(m.name) {
+                seen.insert(m.name)
+                cands.push((m.name, "Option (" ++ m.val_type ++ ") — " ++ m.summary_en))
+            }
+        }
+        let cmds = kernel.list_commands(interactive_only = true)
+        for i in 0..cmds.len() {
+            let cs = cmds.get(i.as(usize)).as(CommandSpec)
+            if not seen.contains(cs.name) {
+                seen.insert(cs.name)
+                cands.push((cs.name, "Command [" ++ cs.owner.raw() ++ "] — " ++ cs.summary))
+            }
+        }
+        let ans? = ask_prompt(PromptRequest.with_candidates(
+            "Info index lookup: ",
+            "",
+            PromptKind.Choice,
+            cands,
+        ))# else {
+            emit_help_status(world, "Quit")#
+            return ()
+        }
+        ans
+    }
+    let clean = chosen.trim()
+    if clean != "" {
+        resolve_help_topic(kernel, world, state, clean, true)#
+    }
+    ()
+}
+
+private fn cmd_info_search(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let query = if (not args.is_empty()) and (args.get(0) matches _: String) {
+        args.get(0).as(String)
+    } else {
+        let ans? = ask_prompt(PromptRequest.text("Info search manuals: ", state.info_last_query))# else {
+            emit_help_status(world, "Quit")#
+            return ()
+        }
+        ans
+    }
+    let q_trim = query.trim()
+    if q_trim == "" {
+        return ()
+    }
+    let doc_roots = resolve_doc_roots(world, state = state)
+    let hits = accel_search_docs(doc_roots, q_trim, limit = 50)
+    state.info_last_query = q_trim
+    state.info_search_hits = hits
+    state.info_search_idx = 0
+    if hits.is_empty() {
+        emit_help_status(world, "Info search: no matches for `" ++ q_trim ++ "`")#
+        return ()
+    }
+    let h0 = hits.get(0).as(DocSearchHit)
+    let _ = open_info_node(kernel, world, h0.node_id, focus_file_row = h0.row)#
+    world.last_search = q_trim
+    world.search_highlight_active = world.options.hlsearch
+    emit_help_status(
+        world,
+        "Info search [1/" ++ hits.len().to_string() ++ "]: " ++ h0.node_id
+        ++ " (press ] / [ for next/prev, C-h d for full Apropos)",
+    )#
+    ()
+}
+
+private fn step_info_search_hit(kernel: SystemKernel, delta: i64) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let total = state.info_search_hits.len()
+    if total == 0 {
+        emit_help_status(world, "No active Info search (press `s` to search manuals)")#
+        return ()
+    }
+    var next_idx = (state.info_search_idx + delta) % total
+    if next_idx < 0 {
+        next_idx += total
+    }
+    state.info_search_idx = next_idx
+    let hit = state.info_search_hits.get(next_idx.as(usize)).as(DocSearchHit)
+    let _ = open_info_node(kernel, world, hit.node_id, focus_file_row = hit.row)#
+    emit_help_status(
+        world,
+        "Info search [" ++ (next_idx + 1).to_string() ++ "/" ++ total.to_string() ++ "]: " ++ hit.node_id,
+    )#
+    ()
+}
+
+private fn cmd_info_quit(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    quit_help_family_buffer(kernel, world, state)#
+    ()
+}
+
+-- 12.2 Global Apropos Commands
+private fn cmd_apropos_documentation(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let query = if (not args.is_empty()) and (args.get(0) matches _: String) {
+        args.get(0).as(String)
+    } else {
+        let ans? = ask_prompt(
+            PromptRequest.text("Apropos documentation (Orderless / tag / phrase): ", "")
+        )# else {
+            emit_help_status(world, "Quit")#
+            return ()
+        }
+        ans
+    }
+    if query.trim() == "" {
+        return ()
+    }
+    run_apropos_report(kernel, world, state, query, "docs")#
+    ()
+}
+
+private fn cmd_apropos_command(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let query = if (not args.is_empty()) and (args.get(0) matches _: String) {
+        args.get(0).as(String)
+    } else {
+        let ans? = ask_prompt(
+            PromptRequest.text("Apropos command (Orderless name / key / doc): ", "")
+        )# else {
+            emit_help_status(world, "Quit")#
+            return ()
+        }
+        ans
+    }
+    if query.trim() == "" {
+        return ()
+    }
+    run_apropos_report(kernel, world, state, query, "command")#
+    ()
+}
+
+private fn cmd_apropos(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let query = if (not args.is_empty()) and (args.get(0) matches _: String) {
+        args.get(0).as(String)
+    } else {
+        let ans? = ask_prompt(
+            PromptRequest.text("Apropos symbol / command / option / tag: ", "")
+        )# else {
+            emit_help_status(world, "Quit")#
+            return ()
+        }
+        ans
+    }
+    if query.trim() == "" {
+        return ()
+    }
+    run_apropos_report(kernel, world, state, query, "all")#
+    ()
+}
+
+private fn cmd_apropos_open_at_point(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let buf = world.active_buffer()
+    let hit? = find_apropos_hit_near_row(state, buf.point.row) else {
+        emit_help_status(world, "No Apropos entry on current line")#
+        return ()
+    }
+    if hit.kind == "doc" {
+        let _ = open_info_node(kernel, world, hit.target_id, focus_file_row = hit.file_row)#
+        return ()
+    }
+    if hit.kind == "command" {
+        present_help_page(
+            kernel,
+            world,
+            state,
+            HelpPageSpec {
+                page_kind: "command",
+                target: hit.target_id,
+                source_file: "",
+                source_row: -1,
+                cursor_row: 0,
+            },
+            true,
+        )#
+        return ()
+    }
+    if hit.kind == "variable" {
+        present_help_page(
+            kernel,
+            world,
+            state,
+            HelpPageSpec {
+                page_kind: "variable",
+                target: hit.target_id,
+                source_file: "",
+                source_row: -1,
+                cursor_row: 0,
+            },
+            true,
+        )#
+        return ()
+    }
+    if hit.kind == "extension" {
+        present_help_page(
+            kernel,
+            world,
+            state,
+            HelpPageSpec {
+                page_kind: "extension",
+                target: hit.target_id,
+                source_file: "",
+                source_row: -1,
+                cursor_row: 0,
+            },
+            true,
+        )#
+        return ()
+    }
+    if hit.kind == "symbol" {
+        present_help_page(
+            kernel,
+            world,
+            state,
+            HelpPageSpec {
+                page_kind: "symbol",
+                target: hit.target_id,
+                source_file: hit.file_path,
+                source_row: hit.file_row,
+                cursor_row: 0,
+            },
+            true,
+        )#
+        return ()
+    }
+    ()
+}
+
+private fn cmd_apropos_goto_source(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let buf = world.active_buffer()
+    let hit? = find_apropos_hit_near_row(state, buf.point.row) else {
+        emit_help_status(world, "No Apropos entry on current line")#
+        return ()
+    }
+    if hit.file_path != "" and fs.exists(hit.file_path) {
+        let _ = open_file_at_row(kernel, world, hit.file_path, hit.file_row)#!
+        return ()
+    }
+    if hit.kind == "command" {
+        let spec_opt = kernel.get_command(hit.target_id)
+        if spec_opt != null {
+            let cs = spec_opt.as(CommandSpec)
+            let src_opt = find_command_source(world, state, cs.name, cs.owner)
+            if src_opt != null {
+                let sh = src_opt.as(SymbolDefHit)
+                let _ = open_file_at_row(kernel, world, sh.file_path, sh.row)#!
+                return ()
+            }
+        }
+    }
+    if hit.kind == "variable" {
+        let defs = accel_find_symbol_defs(resolve_code_roots(world, state = state), "EditorOptions", limit = 5)
+        if not defs.is_empty() {
+            let sh = defs.get(0).as(SymbolDefHit)
+            let _ = open_file_at_row(kernel, world, sh.file_path, sh.row)#!
+            return ()
+        }
+    }
+    if hit.kind == "extension" {
+        let short_name = if hit.target_id.contains("/") {
+            let (_, s) = hit.target_id.rsplit_once("/").as((String, String))
+            s
+        } else {
+            hit.target_id
+        }
+        let reg_fn = "register_" ++ short_name.trim_start_matches("ext_") ++ "_extension"
+        let defs = accel_find_symbol_defs(resolve_code_roots(world, state = state), reg_fn, limit = 5)
+        if not defs.is_empty() {
+            let sh = defs.get(0).as(SymbolDefHit)
+            let _ = open_file_at_row(kernel, world, sh.file_path, sh.row)#!
+            return ()
+        }
+    }
+    emit_help_status(world, "No source file location found for " ++ hit.target_id)#
+    ()
+}
+
+private fn step_apropos_item(kernel: SystemKernel, forward: bool) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let entries = state.apropos_entries
+    if entries.is_empty() {
+        emit_help_status(world, "No entries in *Apropos*")#
+        return ()
+    }
+    let buf = world.active_buffer()
+    let cur_r = buf.point.row
+    var chosen_opt: ?AproposHit = null
+    if forward {
+        for i in 0..entries.len() {
+            let h = entries.get(i.as(usize)).as(AproposHit)
+            if h.row > cur_r {
+                chosen_opt = h
+                break
+            }
+        }
+        if chosen_opt == null {
+            chosen_opt = entries.get(0).as(AproposHit)
+        }
+    } else {
+        var i = entries.len() - 1
+        while i >= 0 {
+            let h = entries.get(i.as(usize)).as(AproposHit)
+            if h.row < cur_r {
+                chosen_opt = h
+                break
+            }
+            i -= 1
+        }
+        if chosen_opt == null {
+            chosen_opt = entries.get((entries.len() - 1).as(usize)).as(AproposHit)
+        }
+    }
+    let chosen = chosen_opt.as(AproposHit)
+    buf.point = buf.clamp_pos(Pos.new(chosen.row, 0), insert_mode = false)
+    buf.preferred_col = 0
+    ensure_row_visible(world, buf.point.row)
+    sync_window_pane_to_world(kernel, world)
+    emit_help_status(world, "[" ++ chosen.kind ++ "] " ++ chosen.title)#
+    ()
+}
+
+private fn cmd_apropos_refresh(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let ans? = ask_prompt(
+        PromptRequest.text("Apropos search: ", state.apropos_query)
+    )# else {
+        emit_help_status(world, "Quit")#
+        return ()
+    }
+    if ans.trim() != "" {
+        run_apropos_report(kernel, world, state, ans, state.apropos_mode_kind)#
+    }
+    ()
+}
+
+private fn cmd_apropos_quit(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    quit_help_family_buffer(kernel, world, state)#
+    ()
+}
+
+-- 12.3 Helpful Deep Introspection Commands (`*Help*`, `major_mode = "help"`)
+private fn cmd_describe_function(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let chosen = if (not args.is_empty()) and (args.get(0) matches _: String) {
+        args.get(0).as(String)
+    } else {
+        let ans? = ask_prompt(PromptRequest {
+            label: "Describe command: ",
+            initial: "",
+            kind: PromptKind.CommandName,
+            candidates: List(),
+        })# else {
+            emit_help_status(world, "Quit")#
+            return ()
+        }
+        ans
+    }
+    let clean = chosen.trim()
+    if clean == "" {
+        return ()
+    }
+    if kernel.get_command(clean) != null {
+        present_help_page(
+            kernel,
+            world,
+            state,
+            HelpPageSpec {
+                page_kind: "command",
+                target: clean,
+                source_file: "",
+                source_row: -1,
+                cursor_row: 0,
+            },
+            true,
+        )#
+        return ()
+    }
+    let code_roots = resolve_code_roots(world, state = state)
+    let sym_hits = accel_find_symbol_defs(code_roots, clean, limit = 5)
+    if not sym_hits.is_empty() {
+        let sh = sym_hits.get(0).as(SymbolDefHit)
+        present_help_page(
+            kernel,
+            world,
+            state,
+            HelpPageSpec {
+                page_kind: "symbol",
+                target: sh.symbol,
+                source_file: sh.file_path,
+                source_row: sh.row,
+                cursor_row: 0,
+            },
+            true,
+        )#
+        return ()
+    }
+    emit_help_status(world, "Unknown command: " ++ clean)#
+    ()
+}
+
+private fn cmd_describe_variable(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let chosen = if (not args.is_empty()) and (args.get(0) matches _: String) {
+        args.get(0).as(String)
+    } else {
+        let metas = all_option_metas()
+        let cands = List()
+        for i in 0..metas.len() {
+            let m = metas.get(i.as(usize)).as(OptionMeta)
+            let cur_v = get_option_value_str(world.options, m.name)
+            cands.push((m.name, "(" ++ m.val_type ++ " = " ++ cur_v ++ ") " ++ m.summary_en))
+        }
+        let ans? = ask_prompt(PromptRequest.with_candidates(
+            "Describe variable: ",
+            "",
+            PromptKind.Choice,
+            cands,
+        ))# else {
+            emit_help_status(world, "Quit")#
+            return ()
+        }
+        ans
+    }
+    let clean = chosen.trim()
+    if clean == "" {
+        return ()
+    }
+    let meta_opt = find_option_meta(clean)
+    if meta_opt == null {
+        emit_help_status(world, "Unknown variable: " ++ clean)#
+        return ()
+    }
+    present_help_page(
+        kernel,
+        world,
+        state,
+        HelpPageSpec {
+            page_kind: "variable",
+            target: meta_opt.as(OptionMeta).name,
+            source_file: "",
+            source_row: -1,
+            cursor_row: 0,
+        },
+        true,
+    )#
+    ()
+}
+
+private fn cmd_describe_mode(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let target_name = world.active_buffer().name
+    present_help_page(
+        kernel,
+        world,
+        state,
+        HelpPageSpec {
+            page_kind: "mode",
+            target: target_name,
+            source_file: "",
+            source_row: 0,
+            cursor_row: 0,
+        },
+        true,
+    )#
+    ()
+}
+
+private fn cmd_where_is(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let chosen = if (not args.is_empty()) and (args.get(0) matches _: String) {
+        args.get(0).as(String)
+    } else {
+        let ans? = ask_prompt(PromptRequest {
+            label: "Where is command: ",
+            initial: "",
+            kind: PromptKind.CommandName,
+            candidates: List(),
+        })# else {
+            emit_help_status(world, "Quit")#
+            return ()
+        }
+        ans
+    }
+    let clean = chosen.trim()
+    if clean == "" {
+        return ()
+    }
+    if kernel.get_command(clean) == null {
+        let msg = "Unknown command: " ++ clean
+        world.append_message(msg)
+        emit_help_status(world, msg)#
+        return ()
+    }
+    let bindings = collect_bindings_for_command(kernel, clean)
+    let msg = if bindings.is_empty() {
+        "`" ++ clean ++ "` is not on any key (invoke via `M-x " ++ clean ++ "` or `:" ++ clean ++ "`)"
+    } else {
+        let parts = List()
+        for i in 0..bindings.len() {
+            let (kname, entry) = bindings.get(i.as(usize)).as((String, KeyBindingEntry))
+            parts.push(pretty_chord_string(entry.chord) ++ " [" ++ kname ++ "]")
+        }
+        "`" ++ clean ++ "` is on " ++ parts.join(", ") ++ " (Ex: `:" ++ clean ++ "`)"
+    }
+    world.append_message(msg)
+    emit_help_status(world, msg)#
+    ()
+}
+
+private fn cmd_describe_key_briefly(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let raw_spec = if (not args.is_empty()) and (args.get(0) matches _: String) {
+        args.get(0).as(String)
+    } else {
+        let ans? = ask_prompt(
+            PromptRequest.text("Describe key chord briefly (e.g. <C-x> <C-f>, <Space> f f): ", "")
+        )# else {
+            emit_help_status(world, "Quit")#
+            return ()
+        }
+        ans
+    }
+    let seq = parse_key_sequence(raw_spec)
+    let canon = if seq.is_empty() { raw_spec.trim() } else { format_chord(seq) }
+    let disp = pretty_chord_string(canon)
+    if canon == "" {
+        return ()
+    }
+
+    let km_names = kernel.keymaps.keys()
+    km_names.sort()
+    let matches_list = List()
+    var prefix_count: i64 = 0
+    let pfx = canon ++ " "
+    for i in 0..km_names.len() {
+        let kname = km_names.get(i.as(usize)).as(String)
+        let km = kernel.keymaps.get(kname).as(Keymap)
+        let exact_opt = km.bindings.get(canon)
+        if exact_opt != null {
+            let e = exact_opt.as(KeyBindingEntry)
+            matches_list.push("`" ++ e.command_name ++ "` [" ++ kname ++ "]")
+        }
+        for k in km.bindings.keys() {
+            if k.as(String).starts_with(pfx) {
+                prefix_count += 1
+            }
+        }
+    }
+
+    let msg = if not matches_list.is_empty() {
+        disp ++ " runs " ++ matches_list.join(", ")
+    } else if prefix_count > 0 {
+        disp ++ " is a prefix key with " ++ prefix_count.to_string() ++ " sub-bindings"
+    } else {
+        disp ++ " is undefined"
+    }
+    world.append_message(msg)
+    emit_help_status(world, msg)#
+    ()
+}
+
+private fn cmd_help_for_help(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    present_help_page(
+        kernel,
+        world,
+        state,
+        HelpPageSpec {
+            page_kind: "overview",
+            target: "help-for-help",
+            source_file: "",
+            source_row: -1,
+            cursor_row: 0,
+        },
+        true,
+    )#
+    ()
+}
+
+private fn cmd_helpful_at_point(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    if (not args.is_empty()) and (args.get(0) matches _: String) {
+        let arg = args.get(0).as(String).trim()
+        if arg != "" {
+            resolve_help_topic(kernel, world, state, arg, true)#
+            return ()
+        }
+    }
+    let token = extract_help_token_at_point(world.active_buffer())
+    if token == "" {
+        present_help_page(
+            kernel,
+            world,
+            state,
+            HelpPageSpec {
+                page_kind: "overview",
+                target: "help-for-help",
+                source_file: "",
+                source_row: -1,
+                cursor_row: 0,
+            },
+            true,
+        )#
+        return ()
+    }
+    resolve_help_topic(kernel, world, state, token, false)#
+    ()
+}
+
+private fn cmd_ex_help(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    if args.is_empty() or (not (args.get(0) matches _: String)) or args.get(0).as(String).trim() == "" {
+        let _ = open_info_node(kernel, world, INFO_DIR_NODE)#
+        return ()
+    }
+    let topic = args.get(0).as(String).trim()
+    resolve_help_topic(kernel, world, state, topic, true)#
+    ()
+}
+
+-- 12.4 `*Help*` Buffer Local Commands (`mode:help`)
+private fn cmd_help_follow_at_point(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let buf = world.active_buffer()
+    let cur_line = buf.line_at(buf.point.row)
+    if cur_line.contains("Press 'e' to change/toggle value") {
+        let _ = cmd_help_edit_variable(kernel, List())#!
+        return ()
+    }
+    let nodes = accel_index_docs(resolve_doc_roots(world, state = state))
+    let lk_opt = find_link_at_point(buf, false, nodes)
+    if lk_opt == null {
+        emit_help_status(world, "No link on current line")#
+        return ()
+    }
+    follow_help_link(kernel, world, state, lk_opt.as(HelpLink))#!
+    ()
+}
+
+private fn cmd_help_goto_source(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let buf = world.active_buffer()
+    let nodes = accel_index_docs(resolve_doc_roots(world, state = state))
+    let lk_opt = find_link_at_point(buf, false, nodes)
+    if lk_opt != null and lk_opt.as(HelpLink).kind == "source" {
+        let (fp, r0) = parse_source_target(lk_opt.as(HelpLink).target)
+        let _ = open_file_at_row(kernel, world, fp, r0)#!
+        return ()
+    }
+    let page? = state.current_help_page else {
+        emit_help_status(world, "No source file associated with current *Help* page")#
+        return ()
+    }
+    if page.source_file == "" or (not fs.exists(page.source_file)) {
+        emit_help_status(world, "No source file found for " ++ page.target)#
+        return ()
+    }
+    let _ = open_file_at_row(kernel, world, page.source_file, page.source_row)#!
+    ()
+}
+
+private fn cmd_help_edit_variable(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let page? = state.current_help_page else {
+        emit_help_status(world, "Not viewing a customizable variable in *Help*")#
+        return ()
+    }
+    if page.page_kind != "variable" {
+        emit_help_status(world, "Current *Help* page is not a variable (use `C-h v` first)")#
+        return ()
+    }
+    let meta? = find_option_meta(page.target) else {
+        emit_help_status(world, "Unknown option: " ++ page.target)#
+        return ()
+    }
+
+    let keep_row = world.active_buffer().point.row
+    if meta.val_type == "bool" {
+        let toggled_opt = toggle_bool_option(kernel, world, meta.name)
+        if toggled_opt != null {
+            let new_val = toggled_opt.as(bool)
+            present_help_page(
+                kernel,
+                world,
+                state,
+                HelpPageSpec {
+                    page_kind: "variable",
+                    target: meta.name,
+                    source_file: page.source_file,
+                    source_row: page.source_row,
+                    cursor_row: keep_row,
+                },
+                false,
+            )#
+            emit_help_status(world, "Toggled " ++ meta.name ++ " = " ++ new_val.to_string())#
+        }
+        return ()
+    }
+
+    let raw_new = if (not args.is_empty()) and (args.get(0) matches _: String) {
+        args.get(0).as(String)
+    } else {
+        let cur_edit = get_raw_option_edit_str(world.options, meta.name)
+        let ans? = ask_prompt(
+            PromptRequest.text("Set " ++ meta.name ++ " (" ++ meta.val_type ++ "): ", cur_edit)
+        )# else {
+            emit_help_status(world, "Quit")#
+            return ()
+        }
+        ans
+    }
+
+    let applied! = apply_option_value_str(kernel, world, meta, raw_new) else {
+        emit_help_status(world, "Invalid value for " ++ meta.name ++ ": " ++ raw_new)#
+        return ()
+    }
+    present_help_page(
+        kernel,
+        world,
+        state,
+        HelpPageSpec {
+            page_kind: "variable",
+            target: meta.name,
+            source_file: page.source_file,
+            source_row: page.source_row,
+            cursor_row: keep_row,
+        },
+        false,
+    )#
+    emit_help_status(world, "Set " ++ meta.name ++ " = " ++ applied)#
+    ()
+}
+
+private fn cmd_help_history_back(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    if state.help_history_idx <= 0 {
+        emit_help_status(world, "Beginning of *Help* history")#
+        return ()
+    }
+    save_current_help_cursor_in_history(world, state)
+    state.help_history_idx -= 1
+    let spec = state.help_history.get(state.help_history_idx.as(usize)).as(HelpPageSpec)
+    present_help_page(kernel, world, state, spec, false)#
+    ()
+}
+
+private fn cmd_help_history_forward(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    if state.help_history_idx + 1 >= state.help_history.len() {
+        emit_help_status(world, "End of *Help* history")#
+        return ()
+    }
+    save_current_help_cursor_in_history(world, state)
+    state.help_history_idx += 1
+    let spec = state.help_history.get(state.help_history_idx.as(usize)).as(HelpPageSpec)
+    present_help_page(kernel, world, state, spec, false)#
+    ()
+}
+
+private fn cmd_help_next_link(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let nodes = accel_index_docs(resolve_doc_roots(world, state = state))
+    jump_link_in_buffer(world, world.active_buffer(), true, false, nodes)#
+    sync_window_pane_to_world(kernel, world)
+    ()
+}
+
+private fn cmd_help_prev_link(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    let nodes = accel_index_docs(resolve_doc_roots(world, state = state))
+    jump_link_in_buffer(world, world.active_buffer(), false, false, nodes)#
+    sync_window_pane_to_world(kernel, world)
+    ()
+}
+
+private fn cmd_help_quit(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_help_state(kernel)!
+    quit_help_family_buffer(kernel, world, state)#
+    ()
+}
+
+-- ============================================================================
+-- 13. Extension Registration & Keymap Composition
+-- ============================================================================
+
+pub fn register_help_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_help_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_help",
+        "0.1.0",
+        "Emacs Info hypertext manual reader (`*Info*`), global 5-domain documentation Apropos (`*Apropos*`), and `helpful`-style deep introspection (`*Help*`).",
+        [ext_document_id(), ext_window_id(), ext_render_id(), ext_vim_id(), ext_emacs_id()],
+        |k: SystemKernel| -> !String Unit {
+            let state = HelpState.new()
+            k.publish_service(SERVICE_HELP_STATE, ext_id, state)
+
+            -- 1. Emacs Info Hypertext Manual Reader commands
+            k.register_command("info", ext_id, "Open Emacs `*Info*` hypertext manual reader (`C-h i` / `:Info`).", cmd_info)
+            k.register_command("ex:Info", ext_id, "Open `*Info*` manual reader (`:Info [topic]`).", cmd_info, interactive = false)
+            k.register_command("info-follow-at-point", ext_id, "Follow `[node_id]`, `[Source: file:line]`, or Markdown link at point in `*Info*` (`RET`).", cmd_info_follow_at_point)
+            k.register_command("info-next-link", ext_id, "Move cursor to next cross-reference link in `*Info*` (`TAB`).", cmd_info_next_link)
+            k.register_command("info-prev-link", ext_id, "Move cursor to previous cross-reference link in `*Info*` (`S-TAB`).", cmd_info_prev_link)
+            k.register_command("info-next-node", ext_id, "Move to `Next` Info node (`n`).", cmd_info_next_node)
+            k.register_command("info-prev-node", ext_id, "Move to `Prev` Info node (`p`).", cmd_info_prev_node)
+            k.register_command("info-up-node", ext_id, "Move to `Up` parent Info node (`u`).", cmd_info_up_node)
+            k.register_command("info-top-node", ext_id, "Move to current manual's `Top` node (`t`).", cmd_info_top_node)
+            k.register_command("info-directory", ext_id, "Go to top-level `(dir)Top` Info directory (`d`).", cmd_info_directory)
+            k.register_command("info-history-back", ext_id, "Navigate backward in `*Info*` node history (`l`).", cmd_info_history_back)
+            k.register_command("info-history-forward", ext_id, "Navigate forward in `*Info*` node history (`r`).", cmd_info_history_forward)
+            k.register_command("info-goto-node", ext_id, "Prompt and jump to any Info node (`g`).", cmd_info_goto_node)
+            k.register_command("info-menu", ext_id, "Pick child `* Menu:` item in current Info node (`m`).", cmd_info_menu)
+            k.register_command("info-index", ext_id, "Look up `*help-tag*`, option, or command in Info index (`i`).", cmd_info_index)
+            k.register_command("info-search", ext_id, "Full-text search across all Info manuals (`s`).", cmd_info_search)
+            k.register_command("info-search-next", ext_id, "Jump to next Info full-text search hit (`]`).", |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any { step_info_search_hit(kern, 1)# })
+            k.register_command("info-search-prev", ext_id, "Jump to previous Info full-text search hit (`[`).", |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any { step_info_search_hit(kern, -1)# })
+            k.register_command("info-quit", ext_id, "Quit `*Info*` and return to previous editing buffer (`q`).", cmd_info_quit)
+
+            -- 2. Global Documentation Apropos commands (`*Apropos*`)
+            k.register_command("apropos-documentation", ext_id, "Global 5-domain documentation search across manuals, commands, options, extensions, and `.ns` symbols (`C-h d`).", cmd_apropos_documentation)
+            k.register_command("ex:AproposDocs", ext_id, "Global documentation search (`:AproposDocs <query>`).", cmd_apropos_documentation, interactive = false)
+            k.register_command("apropos-command", ext_id, "Search interactive and Ex commands by Orderless tokens across names, keys, and docstrings (`C-h a`).", cmd_apropos_command)
+            k.register_command("ex:AproposCommand", ext_id, "Command apropos (`:AproposCommand <query>`).", cmd_apropos_command, interactive = false)
+            k.register_command("apropos", ext_id, "Unified symbol, command, option, extension, and tag apropos in `*Apropos*` (`C-h o` / `:Apropos`).", cmd_apropos)
+            k.register_command("ex:Apropos", ext_id, "Unified apropos (`:Apropos <query>`).", cmd_apropos, interactive = false)
+            k.register_command("apropos-open-at-point", ext_id, "Open `*Info*` or `*Help*` inspector for Apropos entry at point (`RET`).", cmd_apropos_open_at_point)
+            k.register_command("apropos-goto-source", ext_id, "Jump directly to `.ns` or `.md` source definition for Apropos entry (`s`).", cmd_apropos_goto_source)
+            k.register_command("apropos-next-item", ext_id, "Move to next result entry in `*Apropos*` (`TAB` / `n`).", |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any { step_apropos_item(kern, true)# })
+            k.register_command("apropos-prev-item", ext_id, "Move to previous result entry in `*Apropos*` (`S-TAB` / `p`).", |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any { step_apropos_item(kern, false)# })
+            k.register_command("apropos-refresh", ext_id, "Run a new global Apropos query (`g`).", cmd_apropos_refresh)
+            k.register_command("apropos-quit", ext_id, "Quit `*Apropos*` and return to previous buffer (`q`).", cmd_apropos_quit)
+
+            -- 3. Emacs `helpful` Deep Introspection commands (`*Help*`)
+            k.register_command("describe-function", ext_id, "Inspect command/function with keybindings, owner, and 10-line `.ns` source preview in `*Help*` (`C-h f`).", cmd_describe_function)
+            k.register_command("describe-command", ext_id, "Inspect interactive command with keybindings and `.ns` source preview in `*Help*` (`C-h x`).", cmd_describe_function)
+            k.register_command("describe-variable", ext_id, "Inspect any of the 29 `EditorOptions` variables with live `e` toggle/edit in `*Help*` (`C-h v`).", cmd_describe_variable)
+            k.register_command("describe-mode", ext_id, "Display active buffer major mode, modal state, mode-local bindings, hooks, and extensions (`C-h m`).", cmd_describe_mode)
+            k.register_command("where-is", ext_id, "Show all keybindings and Ex invocation for a command in echo area (`C-h w`).", cmd_where_is)
+            k.register_command("describe-key-briefly", ext_id, "Show concise 1-line summary of key chord binding in echo area (`C-h c`).", cmd_describe_key_briefly)
+            k.register_command("help-for-help", ext_id, "Open Emacs `C-h` + Evil `:help` + Info + Apropos cheat-sheet in `*Help*` (`C-h ?` / `<F1>`).", cmd_help_for_help)
+            k.register_command("helpful-at-point", ext_id, "Smart context help for command, option, `*tag*`, or Nessa symbol at cursor (`C-h .` / Normal `K`).", cmd_helpful_at_point)
+            k.register_command("ex:help", ext_id, "Open Info manual or smart help for topic (`:help [topic]`).", cmd_ex_help, interactive = false)
+            k.register_command("ex:h", ext_id, "Open Info manual or smart help for topic (`:h [topic]`).", cmd_ex_help, interactive = false)
+
+            k.register_command("help-follow-at-point", ext_id, "Follow link at point in `*Help*` (`RET`).", cmd_help_follow_at_point)
+            k.register_command("help-goto-source", ext_id, "Jump directly to `[Source: file:line]` of current `*Help*` page (`s` / `gd`).", cmd_help_goto_source)
+            k.register_command("help-edit-variable", ext_id, "Toggle or edit current `EditorOptions` variable live in `*Help*` (`e`).", cmd_help_edit_variable)
+            k.register_command("help-history-back", ext_id, "Go back in `*Help*` page history (`l`).", cmd_help_history_back)
+            k.register_command("help-history-forward", ext_id, "Go forward in `*Help*` page history (`r`).", cmd_help_history_forward)
+            k.register_command("help-next-link", ext_id, "Jump to next link in `*Help*` (`TAB`).", cmd_help_next_link)
+            k.register_command("help-prev-link", ext_id, "Jump to previous link in `*Help*` (`S-TAB`).", cmd_help_prev_link)
+            k.register_command("help-quit", ext_id, "Quit `*Help*` and return to previous editing buffer (`q`).", cmd_help_quit)
+
+            -- 4. Global Emacs `C-h` + `<F1>` Keybindings
+            let em_km = k.ensure_keymap(KEYMAP_EMACS_GLOBAL)
+            em_km.bind("<C-h> i", "info", ext_id, description = "Info manual reader")
+            em_km.bind("<C-h> d", "apropos-documentation", ext_id, description = "Global documentation search")
+            em_km.bind("<C-h> a", "apropos-command", ext_id, description = "Apropos commands")
+            em_km.bind("<C-h> o", "apropos", ext_id, description = "Apropos symbols & tags")
+            em_km.bind("<C-h> f", "describe-function", ext_id, description = "Describe function/command")
+            em_km.bind("<C-h> x", "describe-command", ext_id, description = "Describe command")
+            em_km.bind("<C-h> v", "describe-variable", ext_id, description = "Describe variable/option")
+            em_km.bind("<C-h> m", "describe-mode", ext_id, description = "Describe buffer mode")
+            em_km.bind("<C-h> w", "where-is", ext_id, description = "Where is command bound")
+            em_km.bind("<C-h> c", "describe-key-briefly", ext_id, description = "Describe key briefly")
+            em_km.bind("<C-h> ?", "help-for-help", ext_id, description = "Help for help cheat-sheet")
+            em_km.bind("<C-h> <C-h>", "help-for-help", ext_id, description = "Help for help cheat-sheet")
+            em_km.bind("<C-h> .", "helpful-at-point", ext_id, description = "Helpful at point")
+            em_km.bind("<F1>", "help-for-help", ext_id, description = "Help for help cheat-sheet")
+
+            -- 5. Evil-Vim Leader (`<Space> h ...`) & Normal `K` / `<F1>` Keybindings
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> h i", "info", ext_id, description = "Info hypertext manuals")
+            leader_km.bind("<Space> h d", "apropos-documentation", ext_id, description = "Global doc search (Apropos)")
+            leader_km.bind("<Space> h h", "apropos-documentation", ext_id, description = "Global doc search (Apropos)")
+            leader_km.bind("<Space> h a", "apropos-command", ext_id, description = "Apropos commands")
+            leader_km.bind("<Space> h o", "apropos", ext_id, description = "Apropos symbols & tags")
+            leader_km.bind("<Space> h f", "describe-function", ext_id, description = "Describe command/function")
+            leader_km.bind("<Space> h x", "describe-command", ext_id, description = "Describe command")
+            leader_km.bind("<Space> h v", "describe-variable", ext_id, description = "Describe variable/option")
+            leader_km.bind("<Space> h m", "describe-mode", ext_id, description = "Describe mode")
+            leader_km.bind("<Space> h w", "where-is", ext_id, description = "Where is command")
+            leader_km.bind("<Space> h c", "describe-key-briefly", ext_id, description = "Describe key briefly")
+            leader_km.bind("<Space> h k", "describe-key", ext_id, description = "Describe key")
+            leader_km.bind("<Space> h b", "describe-bindings", ext_id, description = "Describe all bindings")
+            leader_km.bind("<Space> h p", "describe-extensions", ext_id, description = "Describe extensions")
+            leader_km.bind("<Space> h ?", "help-for-help", ext_id, description = "Help overview")
+            leader_km.bind("<Space> h .", "helpful-at-point", ext_id, description = "Helpful at point")
+
+            let norm_km = k.ensure_keymap(KEYMAP_VIM_NORMAL)
+            norm_km.bind("K", "helpful-at-point", ext_id, description = "Helpful documentation at point")
+            norm_km.bind("<F1>", "help-for-help", ext_id, description = "Help for help cheat-sheet")
+
+            let ins_km = k.ensure_keymap(KEYMAP_VIM_INSERT)
+            ins_km.bind("<F1>", "help-for-help", ext_id, description = "Help for help cheat-sheet")
+
+            -- 6. `mode:info` Keymap
+            let info_km = k.ensure_keymap("mode:info")
+            info_km.bind("<Return>", "info-follow-at-point", ext_id, description = "Follow Info link at point")
+            info_km.bind("<Tab>", "info-next-link", ext_id, description = "Next Info link")
+            info_km.bind("<S-Tab>", "info-prev-link", ext_id, description = "Previous Info link")
+            info_km.bind("<BackTab>", "info-prev-link", ext_id, description = "Previous Info link")
+            info_km.bind("n", "info-next-node", ext_id, description = "Next Info node")
+            info_km.bind("p", "info-prev-node", ext_id, description = "Previous Info node")
+            info_km.bind("u", "info-up-node", ext_id, description = "Up to parent Info node")
+            info_km.bind("^", "info-up-node", ext_id, description = "Up to parent Info node")
+            info_km.bind("t", "info-top-node", ext_id, description = "Top node of manual")
+            info_km.bind("d", "info-directory", ext_id, description = "Top Info directory (dir)Top")
+            info_km.bind("l", "info-history-back", ext_id, description = "Info history back")
+            info_km.bind("H", "info-history-back", ext_id, description = "Info history back")
+            info_km.bind("<C-o>", "info-history-back", ext_id, description = "Info history back")
+            info_km.bind("r", "info-history-forward", ext_id, description = "Info history forward")
+            info_km.bind("L", "info-history-forward", ext_id, description = "Info history forward")
+            info_km.bind("g", "info-goto-node", ext_id, description = "Goto Info node")
+            info_km.bind("m", "info-menu", ext_id, description = "Select Info menu item")
+            info_km.bind("i", "info-index", ext_id, description = "Look up in Info index")
+            info_km.bind("s", "info-search", ext_id, description = "Search Info manuals")
+            info_km.bind("]", "info-search-next", ext_id, description = "Next Info search hit")
+            info_km.bind("[", "info-search-prev", ext_id, description = "Previous Info search hit")
+            info_km.bind("?", "help-for-help", ext_id, description = "Help cheat-sheet")
+            info_km.bind("q", "info-quit", ext_id, description = "Quit Info")
+
+            -- 7. `mode:apropos` Keymap
+            let apropos_km = k.ensure_keymap("mode:apropos")
+            apropos_km.bind("<Return>", "apropos-open-at-point", ext_id, description = "Open Info/Help for Apropos hit")
+            apropos_km.bind("s", "apropos-goto-source", ext_id, description = "Jump to source file:line")
+            apropos_km.bind("o", "apropos-goto-source", ext_id, description = "Jump to source file:line")
+            apropos_km.bind("g d", "apropos-goto-source", ext_id, description = "Jump to source file:line")
+            apropos_km.bind("<Tab>", "apropos-next-item", ext_id, description = "Next Apropos result")
+            apropos_km.bind("n", "apropos-next-item", ext_id, description = "Next Apropos result")
+            apropos_km.bind("<S-Tab>", "apropos-prev-item", ext_id, description = "Previous Apropos result")
+            apropos_km.bind("<BackTab>", "apropos-prev-item", ext_id, description = "Previous Apropos result")
+            apropos_km.bind("p", "apropos-prev-item", ext_id, description = "Previous Apropos result")
+            apropos_km.bind("g", "apropos-refresh", ext_id, description = "New Apropos search")
+            apropos_km.bind("R", "apropos-refresh", ext_id, description = "New Apropos search")
+            apropos_km.bind("q", "apropos-quit", ext_id, description = "Quit Apropos")
+
+            -- 8. `mode:help` Keymap
+            let help_km = k.ensure_keymap("mode:help")
+            help_km.bind("<Return>", "help-follow-at-point", ext_id, description = "Follow link at point")
+            help_km.bind("s", "help-goto-source", ext_id, description = "Jump to source definition")
+            help_km.bind("g d", "help-goto-source", ext_id, description = "Jump to source definition")
+            help_km.bind("g g", "beginning-of-buffer", ext_id, description = "Beginning of *Help* buffer")
+            help_km.bind("e", "help-edit-variable", ext_id, description = "Toggle/edit variable value")
+            help_km.bind("i", "info", ext_id, description = "Open Info manual reader")
+            help_km.bind("l", "help-history-back", ext_id, description = "Help history back")
+            help_km.bind("H", "help-history-back", ext_id, description = "Help history back")
+            help_km.bind("<C-o>", "help-history-back", ext_id, description = "Help history back")
+            help_km.bind("r", "help-history-forward", ext_id, description = "Help history forward")
+            help_km.bind("L", "help-history-forward", ext_id, description = "Help history forward")
+            help_km.bind("<Tab>", "help-next-link", ext_id, description = "Next link in *Help*")
+            help_km.bind("<S-Tab>", "help-prev-link", ext_id, description = "Previous link in *Help*")
+            help_km.bind("<BackTab>", "help-prev-link", ext_id, description = "Previous link in *Help*")
+            help_km.bind("q", "help-quit", ext_id, description = "Quit *Help*")
+
+            ()
+        },
+        |_k: SystemKernel| -> !String Unit { () },
+    )
+}

@@ -1,0 +1,6 @@
+[package]
+name = "lava_term"
+domain = "lava.org"
+version = "0.1.0"
+type = "lib"
+description = "POSIX PTY & VT100/ANSI/TrueColor Terminal Emulator Bridge for Lava."

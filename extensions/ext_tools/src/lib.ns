@@ -1,0 +1,3268 @@
+-- ext_tools: Emacs Power Tools Extension for Lava (Principles 1, 3, 4, 5, 6).
+-- Provides Emacs Dired (`C-x d`, `:Ex`, `-`), `occur`, concurrent multi-shard
+-- `project-search` via Nessa `async effect` + `Future(T)` + `.await`, non-blocking
+-- OS background `grep` / `async-shell-command` / `compile` + Quickfix (`next-error` /
+-- `previous-error`), Org-Outline folding & TODO state cycling, and live `*scratch*`
+-- Single-VM expression & kernel introspection evaluator.
+
+use std.collections.{HashMap, Set}
+use std.fs
+use std.path
+use std.process
+use @lava_sys.{host_cancel_job, host_spawn_job}
+use @lava_core.{
+    CommandSpec, ExtId, ExtState, ExtensionRecord, InteractiveEffects, KeyStroke, PromptKind,
+    PromptRequest, PromptTurn, ServiceEffects, SystemKernel, ask_prompt, clipboard_get,
+    clipboard_set, log_event, status_emit
+}
+use @ext_document.{
+    ActiveBgJob, Buffer, BufferId, BufferKind, EditorWorld, Pos, QuickfixEntry,
+    ext_document_id, parse_quickfix_line, require_editor_world
+}
+
+pub const SERVICE_TOOLS: String = "lava.tools.manager"
+pub const DIRED_HEADER_ROWS: i64 = 2
+pub const DIRED_NAME_COL: i64 = 23
+
+pub fn ext_tools_id() -> ExtId = ExtId("lava.org/ext_tools")
+
+-- ============================================================================
+-- 1. Concurrent Project Search via Nessa `async effect` + `Future(T)` + `.await`
+-- ============================================================================
+
+pub async effect scan_file_shard(files: List, pattern: String, ignore_case: bool) -> List
+
+pub fn scan_shard_sync(files: List, pattern: String, ignore_case: bool) -> List {
+    let results = List()
+    if pattern == "" {
+        return results
+    }
+    let needle = if ignore_case { pattern.to_lower() } else { pattern }
+    let n_files = files.len()
+    for i in 0..n_files {
+        let full_path = files.get(i.as(usize)).as(String)
+        let raw! = fs.read_to_string(full_path) else {
+            continue
+        }
+        if raw.contains("\x00") {
+            continue
+        }
+        let normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
+        let lines = normalized.split("\n")
+        if lines.len() > 1 and normalized.ends_with("\n") {
+            let _ = lines.pop()
+        }
+        let line_count = lines.len()
+        for r in 0..line_count {
+            let line = lines.get(r.as(usize)).as(String)
+            let hay = if ignore_case { line.to_lower() } else { line }
+            let col_opt = hay.find(needle)
+            if col_opt != null {
+                let col_idx = col_opt.as(i64)
+                results.push(QuickfixEntry {
+                    file_path: full_path,
+                    row: r,
+                    col: col_idx,
+                    text: line,
+                })
+            }
+        }
+    }
+    results
+}
+
+pub fn parallel_project_scan(
+    shards: List,
+    pattern: String,
+    ignore_case: bool,
+) -> #scan_file_shard List {
+    let futures = List()
+    for i in 0..shards.len() {
+        let f: Future(List) = scan_file_shard(
+            shards.get(i.as(usize)).as(List),
+            pattern,
+            ignore_case,
+        )#
+        futures.push(f)
+    }
+    let combined = List()
+    for i in 0..futures.len() {
+        let part = futures.get(i.as(usize)).as(Future(List)).await
+        for j in 0..part.len() {
+            combined.push(part.get(j.as(usize)))
+        }
+    }
+    combined
+}
+
+private fn should_skip_walk_dir(dir_name: String) -> bool {
+    dir_name == ".git"
+        or dir_name == "target"
+        or dir_name == "node_modules"
+        or dir_name == "__pycache__"
+}
+
+private fn walk_dir_recursive(cur_dir: String, out: List, depth: i64) {
+    if depth > 24 or out.len() >= 10000 {
+        return
+    }
+    let names! = fs.read_dir(cur_dir) else {
+        return
+    }
+    names.sort()
+    let n = names.len()
+    for i in 0..n {
+        let name = names.get(i.as(usize)).as(String)
+        if name == "" or name == "." or name == ".." {
+            continue
+        }
+        let full = path.join(cur_dir, name)
+        if fs.is_dir(full) {
+            if not should_skip_walk_dir(name) {
+                walk_dir_recursive(full, out, depth + 1)
+            }
+        } else if fs.is_file(full) {
+            out.push(full)
+        }
+    }
+}
+
+pub fn collect_workspace_files(root_dir: String) -> List {
+    let files = List()
+    if root_dir == "" or (not fs.exists(root_dir)) {
+        return files
+    }
+    if fs.is_file(root_dir) {
+        files.push(root_dir)
+        return files
+    }
+    walk_dir_recursive(root_dir, files, 0)
+    files
+}
+
+private fn partition_into_four_shards(files: List) -> List {
+    let shards = List()
+    let total = files.len()
+    let shard_count: i64 = 4
+    var start_idx: i64 = 0
+    for s in 0..shard_count {
+        let remaining_items = total - start_idx
+        let remaining_shards = shard_count - s
+        let take_n = if remaining_items <= 0 {
+            0
+        } else {
+            (remaining_items + remaining_shards - 1) / remaining_shards
+        }
+        let bucket = List()
+        for k in 0..take_n {
+            bucket.push(files.get((start_idx + k).as(usize)))
+        }
+        start_idx += take_n
+        shards.push(bucket)
+    }
+    shards
+}
+
+-- ============================================================================
+-- 2. ToolsManager Service & State Models
+-- ============================================================================
+
+pub struct DiredEntry {
+    pub name: String,
+    pub full_path: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub size: i64,
+    pub mark_flag: String,
+    pub line_row: i64,
+}
+
+pub struct DiredState {
+    pub buf_id: BufferId,
+    pub dir_path: String,
+    pub entries: List,
+}
+
+pub struct BgJobMeta {
+    pub job_id: i64,
+    pub kind: String,
+    pub command: String,
+    pub cwd: String,
+    pub title: String,
+    pub target_buffer: String,
+}
+
+pub struct ToolsManager {
+    pub dired_states: HashMap,
+    pub jobs: HashMap,
+    pub qf_row_map: HashMap,
+    pub qf_visited_current: bool,
+    pub last_compile_cmd: String,
+    pub last_shell_cmd: String,
+    pub pending_prefix: String,
+    pub scratch_env: HashMap,
+}
+
+impl ToolsManager {
+    pub fn new() -> ToolsManager {
+        ToolsManager {
+            dired_states: HashMap.new(),
+            jobs: HashMap.new(),
+            qf_row_map: HashMap.new(),
+            qf_visited_current: false,
+            last_compile_cmd: "nessa check .",
+            last_shell_cmd: "",
+            pending_prefix: "",
+            scratch_env: HashMap.new(),
+        }
+    }
+
+    pub fn clear_qf_rows_for_buffer(self, buf_id: BufferId) {
+        let prefix = buf_id.raw().to_string() ++ ":"
+        let keys = self.qf_row_map.keys()
+        let n = keys.len()
+        for i in 0..n {
+            let k = keys.get(i.as(usize)).as(String)
+            if k.starts_with(prefix) {
+                let _ = self.qf_row_map.remove(k)
+            }
+        }
+    }
+
+    pub fn bind_qf_row(self, buf_id: BufferId, row: i64, qf_idx: i64) {
+        let k = buf_id.raw().to_string() ++ ":" ++ row.to_string()
+        self.qf_row_map.insert(k, qf_idx)
+    }
+
+    pub fn lookup_qf_row(self, buf_id: BufferId, row: i64) -> ?i64 {
+        let k = buf_id.raw().to_string() ++ ":" ++ row.to_string()
+        let v? = self.qf_row_map.get(k) else {
+            return null
+        }
+        v.as(i64)
+    }
+}
+
+pub fn require_tools_manager(kernel: SystemKernel) -> !String ToolsManager {
+    let raw = kernel.require_service(SERVICE_TOOLS)!
+    raw.as(ToolsManager)
+}
+
+pub fn tools_dispatch_command(
+    kernel: SystemKernel,
+    name: String,
+    args: List,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String PromptTurn {
+    kernel.dispatch_command(name, args)#
+}
+
+pub fn tools_submit_prompt_answer(
+    kernel: SystemKernel,
+    answer: ?String,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String PromptTurn {
+    kernel.submit_prompt_answer(answer)#
+}
+
+-- ============================================================================
+-- 3. Emacs Dired (`dired`, marks, file operations, navigation)
+-- ============================================================================
+
+pub fn format_human_size(bytes: i64) -> String {
+    if bytes < 0 {
+        return "0B"
+    }
+    if bytes < 1024 {
+        return bytes.to_string() ++ "B"
+    }
+    if bytes < 1048576 {
+        let tenths = (bytes * 10) / 1024
+        return (tenths / 10).to_string() ++ "." ++ (tenths % 10).to_string() ++ "K"
+    }
+    if bytes < 1073741824 {
+        let tenths = (bytes * 10) / 1048576
+        return (tenths / 10).to_string() ++ "." ++ (tenths % 10).to_string() ++ "M"
+    }
+    let tenths = (bytes * 10) / 1073741824
+    (tenths / 10).to_string() ++ "." ++ (tenths % 10).to_string() ++ "G"
+}
+
+private fn render_dired_entry_line(entry: DiredEntry) -> String {
+    let flag = if entry.mark_flag == "" { " " } else { entry.mark_flag.take(1) }
+    let perms = if entry.is_dir {
+        "drwxr-xr-x"
+    } else if entry.is_symlink {
+        "lrwxrwxrwx"
+    } else {
+        "-rw-r--r--"
+    }
+    let size_text = if entry.name == ".." {
+        "<UP>".pad_start(8, " ")
+    } else {
+        format_human_size(entry.size).pad_start(8, " ")
+    }
+    let disp_name = if entry.name == ".." {
+        ".."
+    } else if entry.is_dir {
+        entry.name ++ "/"
+    } else {
+        entry.name
+    }
+    flag ++ " " ++ perms ++ " " ++ size_text ++ "  " ++ disp_name
+}
+
+private fn build_dired_listing(dir_path: String, preserved_marks: HashMap) -> !String (List, List) {
+    let names! = fs.read_dir(dir_path) else {
+        return error ("cannot read directory: " ++ dir_path)
+    }
+    names.sort()
+    let parent_opt = path.parent(dir_path)
+    let parent_dir = if parent_opt != null { parent_opt.as(String) } else { dir_path }
+
+    let subdirs = List()
+    let reg_files = List()
+    let n = names.len()
+    for i in 0..n {
+        let nm = names.get(i.as(usize)).as(String)
+        if nm == "" or nm == "." or nm == ".." {
+            continue
+        }
+        let full = path.join(dir_path, nm)
+        var sz: i64 = 0
+        var is_d = fs.is_dir(full)
+        var is_sym = false
+        let meta_res = fs.metadata(full)
+        meta_res match {
+            m! => {
+                sz = m.size
+                is_d = m.is_dir
+                is_sym = m.is_symlink
+            },
+            error _ => (),
+        }
+        let prev_mark_opt = preserved_marks.get(full)
+        let mflag = if prev_mark_opt != null { prev_mark_opt.as(String) } else { " " }
+        let item = DiredEntry {
+            name: nm,
+            full_path: full,
+            is_dir: is_d,
+            is_symlink: is_sym,
+            size: sz,
+            mark_flag: mflag,
+            line_row: 0,
+        }
+        if is_d {
+            subdirs.push(item)
+        } else {
+            reg_files.push(item)
+        }
+    }
+
+    let entries = List()
+    let up_entry = DiredEntry {
+        name: "..",
+        full_path: parent_dir,
+        is_dir: true,
+        is_symlink: false,
+        size: 0,
+        mark_flag: " ",
+        line_row: DIRED_HEADER_ROWS,
+    }
+    entries.push(up_entry)
+
+    var row_cursor = DIRED_HEADER_ROWS + 1
+    for i in 0..subdirs.len() {
+        let d = subdirs.get(i.as(usize)).as(DiredEntry)
+        d.line_row = row_cursor
+        row_cursor += 1
+        entries.push(d)
+    }
+    for i in 0..reg_files.len() {
+        let f = reg_files.get(i.as(usize)).as(DiredEntry)
+        f.line_row = row_cursor
+        row_cursor += 1
+        entries.push(f)
+    }
+
+    let lines = List()
+    lines.push("  " ++ dir_path ++ ":")
+    lines.push(
+        "  total " ++ (subdirs.len() + reg_files.len()).to_string() ++ " items ("
+        ++ subdirs.len().to_string() ++ " dirs, " ++ reg_files.len().to_string()
+        ++ " files)  [RET:open ^:up m:mark d:del u:unmark U:clear x:exec +:mkdir R:rename C:copy g:refresh q:quit]"
+    )
+    for i in 0..entries.len() {
+        let ent = entries.get(i.as(usize)).as(DiredEntry)
+        lines.push(render_dired_entry_line(ent))
+    }
+    (entries, lines)
+}
+
+private fn find_dired_buffer_for_dir(world: EditorWorld, dir_path: String) -> ?Buffer {
+    let n = world.buffer_order.len()
+    for i in 0..n {
+        let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+        let b = world.buffers.get(bid).as(Buffer)
+        if b.kind == BufferKind.Directory and b.file_path == dir_path {
+            return b
+        }
+    }
+    null
+}
+
+pub fn refresh_dired_buffer(
+    kernel: SystemKernel,
+    buf_id: BufferId,
+    .preserve_marks: bool = true,
+    .focus_name: String = "",
+) -> !String Unit {
+    let world = require_editor_world(kernel)!
+    let mgr = require_tools_manager(kernel)!
+    let buf? = world.buffer(buf_id) else {
+        return error ("unknown dired buffer: " ++ buf_id.to_string())
+    }
+    let state_opt = mgr.dired_states.get(buf_id)
+    let dir_path = if state_opt != null {
+        state_opt.as(DiredState).dir_path
+    } else if buf.file_path != "" {
+        buf.file_path
+    } else {
+        world.cwd
+    }
+    let preserved = HashMap.new()
+    if preserve_marks and state_opt != null {
+        let old_entries = state_opt.as(DiredState).entries
+        for i in 0..old_entries.len() {
+            let oe = old_entries.get(i.as(usize)).as(DiredEntry)
+            if oe.mark_flag != " " and oe.name != ".." {
+                preserved.insert(oe.full_path, oe.mark_flag)
+            }
+        }
+    }
+    let prev_row = buf.point.row
+    let (entries, lines) = build_dired_listing(dir_path, preserved)!
+    let new_state = DiredState {
+        buf_id: buf.id,
+        dir_path: dir_path,
+        entries: entries,
+    }
+    mgr.dired_states.insert(buf.id, new_state)
+    buf.vars.insert("dired_dir", dir_path)
+
+    buf.read_only = false
+    buf.major_mode = "dired"
+    buf.kind = BufferKind.Directory
+    buf.file_path = dir_path
+    buf.set_lines(lines, record_undo = false)
+    buf.modified = false
+    buf.read_only = true
+
+    var target_row = prev_row
+    if focus_name != "" {
+        for i in 0..entries.len() {
+            let e = entries.get(i.as(usize)).as(DiredEntry)
+            if e.name == focus_name {
+                target_row = e.line_row
+                break
+            }
+        }
+    }
+    let max_r = buf.line_count() - 1
+    if target_row < DIRED_HEADER_ROWS {
+        target_row = if entries.len() > 1 { DIRED_HEADER_ROWS + 1 } else { DIRED_HEADER_ROWS }
+    }
+    if target_row > max_r {
+        target_row = max_r
+    }
+    buf.point = buf.clamp_pos(Pos.new(target_row, DIRED_NAME_COL), insert_mode = false)
+    buf.preferred_col = buf.point.col
+    ()
+}
+
+pub fn open_dired(
+    kernel: SystemKernel,
+    raw_path: String,
+    .focus_name: String = "",
+) -> #[log_event, status_emit] !String Buffer {
+    let world = require_editor_world(kernel)!
+    let mgr = require_tools_manager(kernel)!
+
+    var resolved = if raw_path.trim() != "" {
+        world.resolve_path(raw_path)
+    } else {
+        let cur_buf = world.active_buffer()
+        if cur_buf.file_path != "" {
+            if fs.is_dir(cur_buf.file_path) {
+                cur_buf.file_path
+            } else {
+                let p_opt = path.parent(cur_buf.file_path)
+                if p_opt != null { p_opt.as(String) } else { world.cwd }
+            }
+        } else {
+            world.cwd
+        }
+    }
+
+    var target_focus = focus_name
+    if fs.exists(resolved) and fs.is_file(resolved) {
+        if target_focus == "" {
+            let fn_opt = path.file_name(resolved)
+            if fn_opt != null {
+                target_focus = fn_opt.as(String)
+            }
+        }
+        let p_opt = path.parent(resolved)
+        resolved = if p_opt != null { p_opt.as(String) } else { world.cwd }
+    }
+    if (not fs.exists(resolved)) or (not fs.is_dir(resolved)) {
+        return error ("not a directory: " ++ resolved)
+    }
+
+    let existing_opt = find_dired_buffer_for_dir(world, resolved)
+    if existing_opt != null {
+        let b = existing_opt.as(Buffer)
+        refresh_dired_buffer(kernel, b.id, preserve_marks = true, focus_name = target_focus)!
+        world.active_buffer_id = b.id
+        kernel.emit_hook("buffer-switched", b.id)
+        status_emit("Dired: " ++ resolved)#
+        return b
+    }
+
+    let (entries, lines) = build_dired_listing(resolved, HashMap.new())!
+    let base_opt = path.file_name(resolved)
+    let dir_label = if base_opt != null { base_opt.as(String) } else { resolved }
+    let buf = world.create_buffer(
+        "*Dired: " ++ dir_label ++ "*",
+        BufferKind.Directory,
+        file_path = resolved,
+        major_mode = "dired",
+        initial_lines = lines,
+    )
+    buf.modified = false
+    buf.read_only = true
+    buf.vars.insert("dired_dir", resolved)
+    mgr.dired_states.insert(buf.id, DiredState {
+        buf_id: buf.id,
+        dir_path: resolved,
+        entries: entries,
+    })
+
+    var initial_row = if entries.len() > 1 { DIRED_HEADER_ROWS + 1 } else { DIRED_HEADER_ROWS }
+    if target_focus != "" {
+        for i in 0..entries.len() {
+            let e = entries.get(i.as(usize)).as(DiredEntry)
+            if e.name == target_focus {
+                initial_row = e.line_row
+                break
+            }
+        }
+    }
+    buf.point = buf.clamp_pos(Pos.new(initial_row, DIRED_NAME_COL), insert_mode = false)
+    buf.preferred_col = buf.point.col
+
+    world.active_buffer_id = buf.id
+    kernel.emit_hook("buffer-switched", buf.id)
+    log_event("info", "ext_tools", "Opened Dired for " ++ resolved)#
+    status_emit("Dired: " ++ resolved ++ " (" ++ (entries.len() - 1).to_string() ++ " items)")#
+    buf
+}
+
+private fn dired_entry_at_row(state: DiredState, row: i64) -> ?DiredEntry {
+    let idx = row - DIRED_HEADER_ROWS
+    if idx < 0 or idx >= state.entries.len() {
+        return null
+    }
+    state.entries.get(idx.as(usize)).as(DiredEntry)
+}
+
+private fn dired_move_row(buf: Buffer, delta: i64) {
+    let max_r = buf.line_count() - 1
+    if max_r < DIRED_HEADER_ROWS {
+        return
+    }
+    var next_r = buf.point.row + delta
+    if next_r < DIRED_HEADER_ROWS {
+        next_r = DIRED_HEADER_ROWS
+    }
+    if next_r > max_r {
+        next_r = max_r
+    }
+    buf.point = buf.clamp_pos(Pos.new(next_r, DIRED_NAME_COL), insert_mode = false)
+    buf.preferred_col = buf.point.col
+}
+
+private fn dired_set_row_mark(buf: Buffer, state: DiredState, row: i64, flag: String) -> ?DiredEntry {
+    let ent? = dired_entry_at_row(state, row) else {
+        return null
+    }
+    if ent.name == ".." and flag != " " {
+        return ent
+    }
+    ent.mark_flag = flag
+    buf.read_only = false
+    buf.set_line_at(row, render_dired_entry_line(ent))
+    buf.modified = false
+    buf.read_only = true
+    ent
+}
+
+private fn dired_marked_or_current_entries(state: DiredState, row: i64) -> List {
+    let marked = List()
+    for i in 0..state.entries.len() {
+        let e = state.entries.get(i.as(usize)).as(DiredEntry)
+        if e.mark_flag == "*" and e.name != ".." {
+            marked.push(e)
+        }
+    }
+    if not marked.is_empty() {
+        return marked
+    }
+    let cur_opt = dired_entry_at_row(state, row)
+    if cur_opt != null {
+        let cur = cur_opt.as(DiredEntry)
+        if cur.name != ".." {
+            marked.push(cur)
+        }
+    }
+    marked
+}
+
+private fn resolve_in_dir(base_dir: String, raw: String) -> String {
+    let trimmed = raw.trim()
+    if trimmed == "" {
+        return base_dir
+    }
+    if path.is_absolute(trimmed) {
+        return path.normalize(trimmed)
+    }
+    path.normalize(path.join(base_dir, trimmed))
+}
+
+-- ============================================================================
+-- 4. Occur, Concurrent Project Search, Background Grep/Shell/Compile & Quickfix
+-- ============================================================================
+
+private fn shell_quote(arg: String) -> String {
+    "'" ++ arg.replace("'", "'\"'\"'") ++ "'"
+}
+
+private fn wrap_cmd_in_cwd(cmd: String, cwd: String) -> String {
+    if cwd.trim() == "" {
+        return cmd
+    }
+    "cd " ++ shell_quote(cwd) ++ " && (" ++ cmd ++ ")"
+}
+
+private fn display_rel_path(full_path: String, root_dir: String) -> String {
+    if root_dir != "" {
+        let prefix = if root_dir.ends_with("/") { root_dir } else { root_dir ++ "/" }
+        if full_path.starts_with(prefix) {
+            return full_path.drop(prefix.char_len())
+        }
+    }
+    full_path
+}
+
+private fn populate_quickfix_buffer(
+    world: EditorWorld,
+    mgr: ToolsManager,
+    buf_name: String,
+    major_mode: String,
+    header_lines: List,
+    qf_entries: List,
+    title: String,
+    root_dir: String,
+) -> Buffer {
+    let lines = List()
+    for i in 0..header_lines.len() {
+        lines.push(header_lines.get(i.as(usize)).as(String))
+    }
+    let first_entry_row = lines.len()
+    for i in 0..qf_entries.len() {
+        let e = qf_entries.get(i.as(usize)).as(QuickfixEntry)
+        let label = if e.file_path.starts_with("buffer:") {
+            e.file_path.drop(7)
+        } else {
+            display_rel_path(e.file_path, root_dir)
+        }
+        lines.push(
+            label ++ ":" ++ (e.row + 1).to_string() ++ ":" ++ (e.col + 1).to_string()
+            ++ ":" ++ e.text
+        )
+    }
+    let b = world.ensure_special_buffer(buf_name, major_mode, lines, read_only = true)
+    mgr.clear_qf_rows_for_buffer(b.id)
+    for i in 0..qf_entries.len() {
+        mgr.bind_qf_row(b.id, first_entry_row + i, i)
+    }
+    world.quickfix = qf_entries
+    world.quickfix_idx = 0
+    world.quickfix_title = title
+    mgr.qf_visited_current = false
+
+    if not qf_entries.is_empty() {
+        b.point = b.clamp_pos(Pos.new(first_entry_row, 0), insert_mode = false)
+    } else {
+        b.point = Pos.zero()
+    }
+    b
+}
+
+pub fn run_occur(
+    kernel: SystemKernel,
+    pattern: String,
+) -> #[log_event, status_emit] !String i64 {
+    let world = require_editor_world(kernel)!
+    let mgr = require_tools_manager(kernel)!
+    if pattern == "" {
+        status_emit("Occur: empty pattern")#
+        return 0
+    }
+    let src = world.active_buffer()
+    let ignore_case = world.effective_ignore_case(pattern)
+    world.last_search = pattern
+
+    let target_ref = if src.file_path != "" {
+        src.file_path
+    } else {
+        "buffer:" ++ src.name
+    }
+    let qf_entries = List()
+    for r in src.min_row()..(src.max_row() + 1) {
+        let hits = src.find_all_in_line(r, pattern, ignore_case)
+        if not hits.is_empty() {
+            let (first_col, _) = hits.get(0).as((i64, i64))
+            qf_entries.push(QuickfixEntry {
+                file_path: target_ref,
+                row: r,
+                col: first_col,
+                text: src.line_at(r),
+            })
+        }
+    }
+
+    let headers = [
+        qf_entries.len().to_string() ++ " matches for \"" ++ pattern ++ "\" in buffer: " ++ src.name,
+        "------------------------------------------------------------",
+    ]
+    let occur_buf = populate_quickfix_buffer(
+        world,
+        mgr,
+        "*Occur*",
+        "grep",
+        headers,
+        qf_entries,
+        "Occur: " ++ pattern,
+        world.cwd,
+    )
+    let _ = world.switch_to_buffer(occur_buf.id)
+    kernel.emit_hook("buffer-switched", occur_buf.id)
+    status_emit("Occur found " ++ qf_entries.len().to_string() ++ " match(es) in " ++ src.name)#
+    qf_entries.len()
+}
+
+pub fn run_project_search(
+    kernel: SystemKernel,
+    pattern: String,
+    .root_dir: String = "",
+) -> #[log_event, status_emit] !String i64 {
+    let world = require_editor_world(kernel)!
+    let mgr = require_tools_manager(kernel)!
+    if pattern == "" {
+        status_emit("Project search: empty pattern")#
+        return 0
+    }
+    let search_root = if root_dir.trim() != "" {
+        world.resolve_path(root_dir)
+    } else {
+        world.cwd
+    }
+    let ignore_case = world.effective_ignore_case(pattern)
+    world.last_search = pattern
+
+    let all_files = collect_workspace_files(search_root)
+    let shards = partition_into_four_shards(all_files)
+    let qf_entries = parallel_project_scan(shards, pattern, ignore_case) # {
+        async scan_file_shard(files, p, ic_flag) => scan_shard_sync(files, p, ic_flag),
+    }
+
+    let headers = [
+        "-*- mode: grep; default-directory: \"" ++ search_root ++ "\" -*-",
+        "Project search (4 async shards, " ++ all_files.len().to_string()
+            ++ " files) for \"" ++ pattern ++ "\": " ++ qf_entries.len().to_string() ++ " match(es)",
+        "------------------------------------------------------------",
+    ]
+    let grep_buf = populate_quickfix_buffer(
+        world,
+        mgr,
+        "*Grep*",
+        "grep",
+        headers,
+        qf_entries,
+        "Project Search: " ++ pattern,
+        search_root,
+    )
+    let _ = world.switch_to_buffer(grep_buf.id)
+    kernel.emit_hook("buffer-switched", grep_buf.id)
+    log_event(
+        "info",
+        "ext_tools",
+        "project-search scanned " ++ all_files.len().to_string() ++ " files across 4 futures",
+    )#
+    status_emit(
+        "Project search: " ++ qf_entries.len().to_string()
+        ++ " match(es) across " ++ all_files.len().to_string() ++ " files"
+    )#
+    qf_entries.len()
+}
+
+private fn register_bg_job(
+    world: EditorWorld,
+    mgr: ToolsManager,
+    job_id: i64,
+    kind: String,
+    cmd: String,
+    cwd: String,
+    title: String,
+    target_buffer: String,
+) {
+    world.active_jobs.push(ActiveBgJob {
+        job_id: job_id,
+        title: title,
+        target_buffer: target_buffer,
+    })
+    mgr.jobs.insert(job_id, BgJobMeta {
+        job_id: job_id,
+        kind: kind,
+        command: cmd,
+        cwd: cwd,
+        title: title,
+        target_buffer: target_buffer,
+    })
+}
+
+private fn remove_active_job_from_world(world: EditorWorld, job_id: i64) -> ?ActiveBgJob {
+    var found: ?ActiveBgJob = null
+    let remaining = List()
+    for i in 0..world.active_jobs.len() {
+        let j = world.active_jobs.get(i.as(usize)).as(ActiveBgJob)
+        if j.job_id == job_id {
+            found = j
+        } else {
+            remaining.push(j)
+        }
+    }
+    world.active_jobs = remaining
+    found
+}
+
+pub fn spawn_grep_job(
+    kernel: SystemKernel,
+    pattern: String,
+) -> #[log_event, status_emit] !String i64 {
+    let world = require_editor_world(kernel)!
+    let mgr = require_tools_manager(kernel)!
+    if pattern == "" {
+        return error "grep pattern cannot be empty"
+    }
+    world.last_search = pattern
+    let qpat = shell_quote(pattern)
+    let ic_flag = if world.effective_ignore_case(pattern) { "-i " } else { "" }
+    let raw_cmd =
+        "if command -v rg >/dev/null 2>&1; then rg -n --column --no-heading --color=never "
+        ++ ic_flag ++ "-- " ++ qpat ++ " .; else grep -rn " ++ ic_flag ++ "-- " ++ qpat ++ " .; fi"
+    let full_cmd = wrap_cmd_in_cwd(raw_cmd, world.cwd)
+
+    let init_lines = [
+        "-*- mode: grep; default-directory: \"" ++ world.cwd ++ "\" -*-",
+        "[Running grep for \"" ++ pattern ++ "\"...]",
+    ]
+    let gbuf = world.ensure_special_buffer("*Grep*", "grep", init_lines, read_only = true)
+    mgr.clear_qf_rows_for_buffer(gbuf.id)
+
+    let job_id = host_spawn_job(full_cmd, world.cwd, "")
+    register_bg_job(
+        world,
+        mgr,
+        job_id,
+        "grep",
+        raw_cmd,
+        world.cwd,
+        "Grep: " ++ pattern,
+        "*Grep*",
+    )
+    let _ = world.switch_to_buffer(gbuf.id)
+    kernel.emit_hook("buffer-switched", gbuf.id)
+    log_event("info", "ext_tools", "Spawned async grep job #" ++ job_id.to_string())#
+    status_emit("[Running grep (job #" ++ job_id.to_string() ++ ")...]")#
+    job_id
+}
+
+pub fn run_shell_command_sync(
+    kernel: SystemKernel,
+    cmd: String,
+) -> #[log_event, status_emit] !String String {
+    let world = require_editor_world(kernel)!
+    let mgr = require_tools_manager(kernel)!
+    let trimmed_cmd = cmd.trim()
+    if trimmed_cmd == "" {
+        return error "shell command cannot be empty"
+    }
+    mgr.last_shell_cmd = trimmed_cmd
+    let full_cmd = wrap_cmd_in_cwd(trimmed_cmd, world.cwd)
+    let out! = process.shell(full_cmd) else {
+        return error ("failed to execute shell command: " ++ trimmed_cmd)
+    }
+    var combined = out.stdout
+    if out.stderr != "" {
+        if combined != "" and (not combined.ends_with("\n")) {
+            combined = combined ++ "\n"
+        }
+        combined = combined ++ out.stderr
+    }
+    let clean = combined.replace("\r\n", "\n").trim_end_matches("\n")
+    let out_lines = if clean == "" {
+        ["(Shell command finished with exit code " ++ out.status.to_string() ++ ")"]
+    } else {
+        clean.split("\n")
+    }
+    let sbuf = world.ensure_special_buffer("*Shell Command Output*", "text", out_lines, read_only = true)
+    if clean == "" {
+        status_emit("(Shell command succeeded with no output)")#
+    } else if not clean.contains("\n") {
+        status_emit(clean)#
+    } else {
+        let _ = world.switch_to_buffer(sbuf.id)
+        kernel.emit_hook("buffer-switched", sbuf.id)
+        status_emit(
+            "Shell command output (" ++ out_lines.len().to_string()
+            ++ " lines, exit " ++ out.status.to_string() ++ ")"
+        )#
+    }
+    clean
+}
+
+pub fn spawn_async_shell_job(
+    kernel: SystemKernel,
+    cmd: String,
+) -> #[log_event, status_emit] !String i64 {
+    let world = require_editor_world(kernel)!
+    let mgr = require_tools_manager(kernel)!
+    let trimmed_cmd = cmd.trim()
+    if trimmed_cmd == "" {
+        return error "async shell command cannot be empty"
+    }
+    mgr.last_shell_cmd = trimmed_cmd
+    let init_lines = [
+        "-*- mode: compilation; default-directory: \"" ++ world.cwd ++ "\" -*-",
+        "$ " ++ trimmed_cmd,
+        "[Running async shell command...]",
+    ]
+    let abuf = world.ensure_special_buffer("*Async Shell Command*", "compilation", init_lines, read_only = true)
+    mgr.clear_qf_rows_for_buffer(abuf.id)
+
+    let job_id = host_spawn_job(wrap_cmd_in_cwd(trimmed_cmd, world.cwd), world.cwd, "")
+    register_bg_job(
+        world,
+        mgr,
+        job_id,
+        "async-shell",
+        trimmed_cmd,
+        world.cwd,
+        "Async Shell: " ++ trimmed_cmd,
+        "*Async Shell Command*",
+    )
+    let _ = world.switch_to_buffer(abuf.id)
+    kernel.emit_hook("buffer-switched", abuf.id)
+    status_emit("[Running async shell job #" ++ job_id.to_string() ++ "...]")#
+    job_id
+}
+
+pub fn spawn_compile_job(
+    kernel: SystemKernel,
+    cmd: String,
+) -> #[log_event, status_emit] !String i64 {
+    let world = require_editor_world(kernel)!
+    let mgr = require_tools_manager(kernel)!
+    let trimmed_cmd = cmd.trim()
+    if trimmed_cmd == "" {
+        return error "compile command cannot be empty"
+    }
+    mgr.last_compile_cmd = trimmed_cmd
+    let init_lines = [
+        "-*- mode: compilation; default-directory: \"" ++ world.cwd ++ "\" -*-",
+        "Compilation started: " ++ trimmed_cmd,
+        "[Running compilation...]",
+    ]
+    let cbuf = world.ensure_special_buffer("*Compilation*", "compilation", init_lines, read_only = true)
+    mgr.clear_qf_rows_for_buffer(cbuf.id)
+
+    let job_id = host_spawn_job(wrap_cmd_in_cwd(trimmed_cmd, world.cwd), world.cwd, "")
+    register_bg_job(
+        world,
+        mgr,
+        job_id,
+        "compile",
+        trimmed_cmd,
+        world.cwd,
+        "Compile: " ++ trimmed_cmd,
+        "*Compilation*",
+    )
+    let _ = world.switch_to_buffer(cbuf.id)
+    kernel.emit_hook("buffer-switched", cbuf.id)
+    log_event("info", "ext_tools", "Started compilation job #" ++ job_id.to_string() ++ ": " ++ trimmed_cmd)#
+    status_emit("[Compiling (job #" ++ job_id.to_string() ++ "): " ++ trimmed_cmd ++ "...]")#
+    job_id
+}
+
+pub fn tools_cancel_active_jobs(
+    kernel: SystemKernel,
+) -> #[log_event, status_emit] !String i64 {
+    let world = require_editor_world(kernel)!
+    let mgr = require_tools_manager(kernel)!
+    let count = world.active_jobs.len()
+    if count == 0 {
+        status_emit("No active background jobs")#
+        return 0
+    }
+    for i in 0..count {
+        let j = world.active_jobs.get(i.as(usize)).as(ActiveBgJob)
+        let _ = host_cancel_job(j.job_id)
+        let _ = mgr.jobs.remove(j.job_id)
+        let b_opt = world.find_buffer_by_name(j.target_buffer)
+        if b_opt != null {
+            let b = b_opt.as(Buffer)
+            b.read_only = false
+            b.push_line("[Interrupt: cancelled job #" ++ j.job_id.to_string() ++ "]")
+            b.modified = false
+            b.read_only = true
+        }
+    }
+    world.active_jobs = List()
+    log_event("info", "ext_tools", "Cancelled " ++ count.to_string() ++ " background job(s)")#
+    status_emit("Cancelled " ++ count.to_string() ++ " background job(s)")#
+    count
+}
+
+private fn parse_arrow_diagnostic_line(line: String) -> ?QuickfixEntry {
+    let trimmed = line.trim_start()
+    if not trimmed.starts_with("--> ") {
+        return null
+    }
+    let rest = trimmed.drop(4).trim()
+    parse_quickfix_line(rest ++ ": diagnostic")
+}
+
+private fn parse_job_diagnostic_line(line: String, job_cwd: String) -> ?QuickfixEntry {
+    let trimmed = line.trim()
+    if trimmed == "" or trimmed.starts_with("-*-") or trimmed.starts_with("[") {
+        return null
+    }
+    let arrow_opt = parse_arrow_diagnostic_line(line)
+    let raw_entry? = if arrow_opt != null {
+        arrow_opt
+    } else {
+        parse_quickfix_line(line)
+    } else {
+        return null
+    }
+    var fpath = raw_entry.file_path
+    if fpath.starts_with("./") {
+        fpath = fpath.drop(2)
+    }
+    if fpath == "" or fpath.contains(" ") {
+        return null
+    }
+    let resolved_path = if path.is_absolute(fpath) {
+        path.normalize(fpath)
+    } else if job_cwd != "" {
+        path.normalize(path.join(job_cwd, fpath))
+    } else {
+        fpath
+    }
+    QuickfixEntry {
+        file_path: resolved_path,
+        row: raw_entry.row,
+        col: raw_entry.col,
+        text: raw_entry.text,
+    }
+}
+
+pub fn tools_on_async_job_done(
+    kernel: SystemKernel,
+    job_id: i64,
+    ok: bool,
+    exit_code: i64,
+    stdout: String,
+    stderr: String,
+) -> #[log_event, status_emit] !String bool {
+    let world = require_editor_world(kernel)!
+    let mgr = require_tools_manager(kernel)!
+
+    let meta_any_opt = mgr.jobs.remove(job_id)
+    let world_job_opt = remove_active_job_from_world(world, job_id)
+    if meta_any_opt == null and world_job_opt == null {
+        return false
+    }
+
+    let meta = if meta_any_opt != null {
+        meta_any_opt.as(BgJobMeta)
+    } else {
+        let wj = world_job_opt.as(ActiveBgJob)
+        let inferred_kind = if wj.target_buffer == "*Grep*" { "grep" } else { "compile" }
+        BgJobMeta {
+            job_id: job_id,
+            kind: inferred_kind,
+            command: wj.title,
+            cwd: world.cwd,
+            title: wj.title,
+            target_buffer: wj.target_buffer,
+        }
+    }
+
+    let mode = if meta.kind == "grep" { "grep" } else { "compilation" }
+    let lines = List()
+    lines.push("-*- mode: " ++ mode ++ "; default-directory: \"" ++ meta.cwd ++ "\" -*-")
+    lines.push("$ " ++ meta.command)
+    lines.push("")
+
+    let raw_chunks = List()
+    if stdout != "" {
+        let norm_out = stdout.replace("\r\n", "\n").replace("\r", "\n").trim_end_matches("\n")
+        if norm_out != "" {
+            let out_split = norm_out.split("\n")
+            for i in 0..out_split.len() {
+                raw_chunks.push(out_split.get(i.as(usize)).as(String))
+            }
+        }
+    }
+    if stderr != "" {
+        let norm_err = stderr.replace("\r\n", "\n").replace("\r", "\n").trim_end_matches("\n")
+        if norm_err != "" {
+            let err_split = norm_err.split("\n")
+            for i in 0..err_split.len() {
+                raw_chunks.push(err_split.get(i.as(usize)).as(String))
+            }
+        }
+    }
+
+    let qf_entries = List()
+    let qf_rows = List()
+    var first_diag_row: i64 = -1
+    for i in 0..raw_chunks.len() {
+        let ln = raw_chunks.get(i.as(usize)).as(String)
+        let buf_row = lines.len()
+        lines.push(ln)
+        let qf_opt = parse_job_diagnostic_line(ln, meta.cwd)
+        if qf_opt != null {
+            let qf_idx = qf_entries.len()
+            qf_entries.push(qf_opt.as(QuickfixEntry))
+            qf_rows.push((buf_row, qf_idx))
+            if first_diag_row < 0 {
+                first_diag_row = buf_row
+            }
+        }
+    }
+
+    lines.push("")
+    if meta.kind == "grep" {
+        if qf_entries.is_empty() and (not ok) and exit_code == 1 {
+            lines.push("Grep finished with no matches found")
+        } else if ok or (not qf_entries.is_empty()) {
+            lines.push("Grep finished (" ++ qf_entries.len().to_string() ++ " match(es))")
+        } else {
+            lines.push("Grep exited abnormally with code " ++ exit_code.to_string())
+        }
+    } else if ok {
+        lines.push("Compilation finished (exit 0, " ++ qf_entries.len().to_string() ++ " diagnostic(s))")
+    } else {
+        lines.push(
+            "Compilation exited abnormally with code " ++ exit_code.to_string()
+            ++ " (" ++ qf_entries.len().to_string() ++ " diagnostic(s))"
+        )
+    }
+
+    let target_buf = world.ensure_special_buffer(meta.target_buffer, mode, lines, read_only = true)
+    mgr.clear_qf_rows_for_buffer(target_buf.id)
+    for i in 0..qf_rows.len() {
+        let (r_idx, q_idx) = qf_rows.get(i.as(usize)).as((i64, i64))
+        mgr.bind_qf_row(target_buf.id, r_idx, q_idx)
+    }
+
+    if meta.kind == "grep" or meta.kind == "compile" or (not qf_entries.is_empty()) {
+        world.quickfix = qf_entries
+        world.quickfix_idx = 0
+        world.quickfix_title = meta.title
+        mgr.qf_visited_current = false
+    }
+
+    if first_diag_row >= 0 {
+        target_buf.point = target_buf.clamp_pos(Pos.new(first_diag_row, 0), insert_mode = false)
+    }
+
+    log_event(
+        "info",
+        "ext_tools",
+        "Async job #" ++ job_id.to_string() ++ " (" ++ meta.kind ++ ") finished: exit=" ++ exit_code.to_string(),
+    )#
+    if meta.kind == "grep" {
+        status_emit("Grep finished: " ++ qf_entries.len().to_string() ++ " match(es)")#
+    } else if ok {
+        status_emit(meta.title ++ " finished (" ++ qf_entries.len().to_string() ++ " diagnostic(s))")#
+    } else {
+        status_emit(
+            meta.title ++ " failed (exit " ++ exit_code.to_string()
+            ++ ", " ++ qf_entries.len().to_string() ++ " diagnostic(s))"
+        )#
+    }
+    kernel.emit_hook("async-job-done", job_id)
+    true
+}
+
+private fn open_and_jump_to_entry(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    entry: QuickfixEntry,
+    idx_display: i64,
+    total_display: i64,
+) -> #[log_event, status_emit] !String bool {
+    let cur_buf = world.active_buffer()
+    world.jumps.record(cur_buf.id, cur_buf.file_path, cur_buf.point)
+
+    let dest_buf = if entry.file_path.starts_with("buffer:") {
+        let bname = entry.file_path.drop(7)
+        let b? = world.find_buffer_by_name(bname) else {
+            return error ("target buffer no longer exists: " ++ bname)
+        }
+        let _ = world.switch_to_buffer(b.id)
+        b
+    } else {
+        world.open_file(entry.file_path)#!
+    }
+
+    dest_buf.point = dest_buf.clamp_pos(Pos.new(entry.row, entry.col), insert_mode = false)
+    dest_buf.preferred_col = dest_buf.point.col
+    world.jumps.record(dest_buf.id, dest_buf.file_path, dest_buf.point)
+    kernel.emit_hook("buffer-switched", dest_buf.id)
+    status_emit(
+        "(" ++ idx_display.to_string() ++ "/" ++ total_display.to_string() ++ ") "
+        ++ dest_buf.name ++ ":" ++ (entry.row + 1).to_string() ++ ":" ++ (entry.col + 1).to_string()
+        ++ ": " ++ entry.text.trim()
+    )#
+    true
+}
+
+pub fn jump_quickfix_at(
+    kernel: SystemKernel,
+    idx: i64,
+) -> #[log_event, status_emit] !String bool {
+    let world = require_editor_world(kernel)!
+    let mgr = require_tools_manager(kernel)!
+    let total = world.quickfix.len()
+    if total == 0 {
+        status_emit("No quickfix/error entries")#
+        return false
+    }
+    let clamped = if idx < 0 {
+        0
+    } else if idx >= total {
+        total - 1
+    } else {
+        idx
+    }
+    world.quickfix_idx = clamped
+    mgr.qf_visited_current = true
+    let entry = world.quickfix.get(clamped.as(usize)).as(QuickfixEntry)
+    open_and_jump_to_entry(kernel, world, entry, clamped + 1, total)#!
+}
+
+pub fn jump_next_error(
+    kernel: SystemKernel,
+) -> #[log_event, status_emit] !String bool {
+    let world = require_editor_world(kernel)!
+    let mgr = require_tools_manager(kernel)!
+    let total = world.quickfix.len()
+    if total == 0 {
+        status_emit("No quickfix/error entries")#
+        return false
+    }
+    var target_idx = world.quickfix_idx
+    if target_idx < 0 or target_idx >= total {
+        target_idx = 0
+    } else if mgr.qf_visited_current {
+        if target_idx + 1 < total {
+            target_idx += 1
+        } else {
+            status_emit("Moved past last error (" ++ total.to_string() ++ "/" ++ total.to_string() ++ ")")#
+            return false
+        }
+    }
+    jump_quickfix_at(kernel, target_idx)#!
+}
+
+pub fn jump_previous_error(
+    kernel: SystemKernel,
+) -> #[log_event, status_emit] !String bool {
+    let world = require_editor_world(kernel)!
+    let mgr = require_tools_manager(kernel)!
+    let total = world.quickfix.len()
+    if total == 0 {
+        status_emit("No quickfix/error entries")#
+        return false
+    }
+    var target_idx = world.quickfix_idx
+    if target_idx < 0 or target_idx >= total {
+        target_idx = 0
+    } else if mgr.qf_visited_current {
+        if target_idx > 0 {
+            target_idx -= 1
+        } else {
+            status_emit("At first error (1/" ++ total.to_string() ++ ")")#
+            return false
+        }
+    }
+    jump_quickfix_at(kernel, target_idx)#!
+}
+
+private fn jump_from_results_buffer_row(
+    kernel: SystemKernel,
+    buf: Buffer,
+) -> #[log_event, status_emit] !String bool {
+    let world = require_editor_world(kernel)!
+    let mgr = require_tools_manager(kernel)!
+    let row = buf.point.row
+    let mapped_opt = mgr.lookup_qf_row(buf.id, row)
+    if mapped_opt != null {
+        let q_idx = mapped_opt.as(i64)
+        if q_idx >= 0 and q_idx < world.quickfix.len() {
+            return jump_quickfix_at(kernel, q_idx)#!
+        }
+    }
+    let parsed_opt = parse_job_diagnostic_line(buf.line_at(row), world.cwd)
+    if parsed_opt != null {
+        let entry = parsed_opt.as(QuickfixEntry)
+        return open_and_jump_to_entry(kernel, world, entry, 1, 1)#!
+    }
+    status_emit("No location on current line")#
+    false
+}
+
+-- ============================================================================
+-- 5. Org-Outline Mode (`org-cycle` <Tab> folding & `org-todo` state cycling)
+-- ============================================================================
+
+private fn count_leading_marker(line: String, marker: String) -> i64 {
+    let n = line.char_len()
+    var count: i64 = 0
+    while count < n and line.slice(count, count + 1) == marker {
+        count += 1
+    }
+    if count > 0 and count < n and line.slice(count, count + 1) == " " {
+        return count
+    }
+    0
+}
+
+pub fn heading_level(line: String, major_mode: String) -> i64 {
+    if major_mode == "markdown" {
+        return count_leading_marker(line, "#")
+    }
+    if major_mode == "org" {
+        return count_leading_marker(line, "*")
+    }
+    let stars = count_leading_marker(line, "*")
+    if stars > 0 {
+        return stars
+    }
+    count_leading_marker(line, "#")
+}
+
+private fn subtree_end_row_for_heading(buf: Buffer, heading_row: i64, level: i64) -> i64 {
+    let total = buf.line_count()
+    var r = heading_row + 1
+    while r < total {
+        let lvl = heading_level(buf.line_at(r), buf.major_mode)
+        if lvl > 0 and lvl <= level {
+            return r - 1
+        }
+        r += 1
+    }
+    total - 1
+}
+
+pub fn org_cycle_at_point(kernel: SystemKernel) -> #status_emit !String bool {
+    let world = require_editor_world(kernel)!
+    let buf = world.active_buffer()
+    let row = buf.point.row
+    let level = heading_level(buf.line_at(row), buf.major_mode)
+    if level <= 0 {
+        return false
+    }
+    let end_row = subtree_end_row_for_heading(buf, row, level)
+    if end_row <= row {
+        status_emit("EMPTY SUBTREE")#
+        return true
+    }
+    var any_folded = false
+    for r in (row + 1)..(end_row + 1) {
+        if buf.folded_rows.contains(r) {
+            any_folded = true
+            break
+        }
+    }
+    if any_folded {
+        for r in (row + 1)..(end_row + 1) {
+            let _ = buf.folded_rows.remove(r)
+        }
+        status_emit("SUBTREE EXPANDED")#
+    } else {
+        for r in (row + 1)..(end_row + 1) {
+            let _ = buf.folded_rows.insert(r)
+        }
+        status_emit("FOLDED (" ++ (end_row - row).to_string() ++ " lines)")#
+    }
+    true
+}
+
+pub fn org_todo_at_point(kernel: SystemKernel) -> #status_emit !String String {
+    let world = require_editor_world(kernel)!
+    let buf = world.active_buffer()
+    buf.ensure_writable()!
+
+    var target_row: i64 = -1
+    var level: i64 = 0
+    var scan_r = buf.point.row
+    while scan_r >= 0 {
+        let lvl = heading_level(buf.line_at(scan_r), buf.major_mode)
+        if lvl > 0 {
+            target_row = scan_r
+            level = lvl
+            break
+        }
+        scan_r -= 1
+    }
+    if target_row < 0 {
+        status_emit("Not on or under an outline heading")#
+        return ""
+    }
+
+    let line = buf.line_at(target_row)
+    let prefix = line.slice(0, level + 1)
+    let rest = line.drop(level + 1)
+
+    var next_state = ""
+    var updated_rest = rest
+    if rest.starts_with("TODO ") {
+        next_state = "DONE"
+        updated_rest = "DONE " ++ rest.drop(5)
+    } else if rest == "TODO" {
+        next_state = "DONE"
+        updated_rest = "DONE"
+    } else if rest.starts_with("DONE ") {
+        next_state = "NONE"
+        updated_rest = rest.drop(5)
+    } else if rest == "DONE" {
+        next_state = "NONE"
+        updated_rest = ""
+    } else {
+        next_state = "TODO"
+        updated_rest = if rest == "" { "TODO" } else { "TODO " ++ rest }
+    }
+
+    buf.set_line_at(target_row, prefix ++ updated_rest)
+    buf.modified = true
+    buf.checkpoint(buf.point, "org-todo")
+    status_emit("Heading TODO state -> " ++ next_state)#
+    next_state
+}
+
+-- ============================================================================
+-- 6. Live `*scratch*` Single-VM Expression & Kernel Introspection Evaluator
+-- ============================================================================
+
+private enum ExprTok {
+    pub IntLit(val: i64),
+    pub FloatLit(val: f64),
+    pub StrLit(val: String),
+    pub Ident(name: String),
+    pub Op(sym: String),
+    pub LParen,
+    pub RParen,
+    pub LBracket,
+    pub RBracket,
+    pub Comma,
+}
+
+private struct ExprStream {
+    pub tokens: List,
+    pub pos: i64,
+}
+
+private fn strip_comment_outside_quotes(line: String) -> String {
+    let n = line.char_len()
+    var in_str = false
+    var escaped = false
+    var i: i64 = 0
+    while i < n {
+        let ch = line.slice(i, i + 1)
+        if in_str {
+            if escaped {
+                escaped = false
+            } else if ch == "\\" {
+                escaped = true
+            } else if ch == "\"" {
+                in_str = false
+            }
+            i += 1
+            continue
+        }
+        if ch == "\"" {
+            in_str = true
+            i += 1
+            continue
+        }
+        if ch == "-" and i + 1 < n and line.slice(i + 1, i + 2) == "-" {
+            return line.slice(0, i).trim_end()
+        }
+        i += 1
+    }
+    line.trim_end()
+}
+
+private fn is_ident_start_char(ch: String) -> bool {
+    ch == "_" or ch.is_alphabetic()
+}
+
+private fn is_ident_continue_char(ch: String) -> bool {
+    ch == "_" or ch == "-" or ch == "." or ch.is_alphanumeric()
+}
+
+private fn tokenize_expr(src: String) -> !String List {
+    let tokens = List()
+    let n = src.char_len()
+    var i: i64 = 0
+    while i < n {
+        let ch = src.slice(i, i + 1)
+        if ch == " " or ch == "\t" or ch == "\n" or ch == "\r" {
+            i += 1
+            continue
+        }
+        if ch == "(" {
+            tokens.push(ExprTok.LParen)
+            i += 1
+            continue
+        }
+        if ch == ")" {
+            tokens.push(ExprTok.RParen)
+            i += 1
+            continue
+        }
+        if ch == "[" {
+            tokens.push(ExprTok.LBracket)
+            i += 1
+            continue
+        }
+        if ch == "]" {
+            tokens.push(ExprTok.RBracket)
+            i += 1
+            continue
+        }
+        if ch == "," {
+            tokens.push(ExprTok.Comma)
+            i += 1
+            continue
+        }
+        if ch == "\"" {
+            var j = i + 1
+            var buf = ""
+            var closed = false
+            while j < n {
+                let c = src.slice(j, j + 1)
+                if c == "\\" and j + 1 < n {
+                    let esc = src.slice(j + 1, j + 2)
+                    if esc == "n" {
+                        buf = buf ++ "\n"
+                    } else if esc == "t" {
+                        buf = buf ++ "\t"
+                    } else {
+                        buf = buf ++ esc
+                    }
+                    j += 2
+                    continue
+                }
+                if c == "\"" {
+                    closed = true
+                    j += 1
+                    break
+                }
+                buf = buf ++ c
+                j += 1
+            }
+            if not closed {
+                return error "unterminated string literal"
+            }
+            tokens.push(ExprTok.StrLit(buf))
+            i = j
+            continue
+        }
+        if i + 1 < n {
+            let two = src.slice(i, i + 2)
+            if two == "++" or two == "==" or two == "!=" or two == "<=" or two == ">=" {
+                tokens.push(ExprTok.Op(two))
+                i += 2
+                continue
+            }
+        }
+        if ch == "+" or ch == "-" or ch == "*" or ch == "/" or ch == "%" or ch == "<" or ch == ">" {
+            tokens.push(ExprTok.Op(ch))
+            i += 1
+            continue
+        }
+        if ch.is_ascii_digit() {
+            var j = i + 1
+            var has_dot = false
+            while j < n {
+                let c = src.slice(j, j + 1)
+                if c.is_ascii_digit() {
+                    j += 1
+                } else if c == "." and (not has_dot) and j + 1 < n and src.slice(j + 1, j + 2).is_ascii_digit() {
+                    has_dot = true
+                    j += 1
+                } else {
+                    break
+                }
+            }
+            let num_txt = src.slice(i, j)
+            if has_dot {
+                let fv? = num_txt.parse_f64() else {
+                    return error ("invalid float literal: " ++ num_txt)
+                }
+                tokens.push(ExprTok.FloatLit(fv))
+            } else {
+                let iv? = num_txt.parse_i64() else {
+                    return error ("invalid integer literal: " ++ num_txt)
+                }
+                tokens.push(ExprTok.IntLit(iv))
+            }
+            i = j
+            continue
+        }
+        if is_ident_start_char(ch) {
+            var j = i + 1
+            while j < n {
+                let c = src.slice(j, j + 1)
+                -- Stop before `-` if followed by space or digit when used as subtraction,
+                -- allow kebab-case identifiers when followed by alphabetic char.
+                if c == "-" {
+                    if j + 1 < n and src.slice(j + 1, j + 2).is_alphabetic() {
+                        j += 1
+                        continue
+                    }
+                    break
+                }
+                if is_ident_continue_char(c) {
+                    j += 1
+                } else {
+                    break
+                }
+            }
+            let ident = src.slice(i, j)
+            if ident == "and" or ident == "or" or ident == "not" {
+                tokens.push(ExprTok.Op(ident))
+            } else {
+                tokens.push(ExprTok.Ident(ident))
+            }
+            i = j
+            continue
+        }
+        return error ("unexpected character in expression: " ++ ch)
+    }
+    tokens
+}
+
+private fn format_eval_value(val: Any) -> String {
+    if val == null {
+        return "null"
+    }
+    if val matches _: String {
+        return val.as(String)
+    }
+    if val matches _: bool {
+        return if val.as(bool) { "true" } else { "false" }
+    }
+    if val matches _: i64 {
+        return val.as(i64).to_string()
+    }
+    if val matches _: f64 {
+        return val.as(f64).to_string()
+    }
+    if val matches _: List {
+        let lst = val.as(List)
+        let parts = List()
+        for i in 0..lst.len() {
+            let item = lst.get(i.as(usize))
+            if item matches _: String {
+                parts.push("\"" ++ item.as(String) ++ "\"")
+            } else {
+                parts.push(format_eval_value(item))
+            }
+        }
+        return "[" ++ parts.join(", ") ++ "]"
+    }
+    val.to_string()
+}
+
+private fn format_options_summary(world: EditorWorld) -> String {
+    let o = world.options
+    "theme=" ++ o.theme_name
+        ++ " tabstop=" ++ o.tabstop.to_string()
+        ++ " shiftwidth=" ++ o.shiftwidth.to_string()
+        ++ " expandtab=" ++ o.expandtab.to_string()
+        ++ " number=" ++ o.number.to_string()
+        ++ " relativenumber=" ++ o.relativenumber.to_string()
+        ++ " ignorecase=" ++ o.ignorecase.to_string()
+        ++ " smartcase=" ++ o.smartcase.to_string()
+        ++ " wrap=" ++ o.wrap.to_string()
+        ++ " evil_mode=" ++ o.evil_mode.to_string()
+}
+
+private fn lookup_option_value(world: EditorWorld, key: String) -> ?Any {
+    let o = world.options
+    when {
+        key == "tabstop" => o.tabstop,
+        key == "shiftwidth" => o.shiftwidth,
+        key == "expandtab" => o.expandtab,
+        key == "number" => o.number,
+        key == "relativenumber" => o.relativenumber,
+        key == "ignorecase" => o.ignorecase,
+        key == "smartcase" => o.smartcase,
+        key == "wrap" => o.wrap,
+        key == "hlsearch" => o.hlsearch,
+        key == "incsearch" => o.incsearch,
+        key == "theme" or key == "theme_name" => o.theme_name,
+        key == "font_family" => o.font_family,
+        key == "font_size_pt" => o.font_size_pt,
+        key == "cursor_blink" => o.cursor_blink,
+        key == "evil_mode" => o.evil_mode,
+        key == "cwd" => world.cwd,
+        else => null,
+    }
+}
+
+private fn parse_bool_val(v: Any) -> !String bool {
+    if v matches _: bool {
+        return v.as(bool)
+    }
+    if v matches _: i64 {
+        return v.as(i64) != 0
+    }
+    let s = format_eval_value(v).trim().to_lower()
+    if s == "true" or s == "on" or s == "1" or s == "yes" {
+        return true
+    }
+    if s == "false" or s == "off" or s == "0" or s == "no" {
+        return false
+    }
+    error ("expected boolean value, got: " ++ s)
+}
+
+private fn parse_int_val(v: Any) -> !String i64 {
+    if v matches _: i64 {
+        return v.as(i64)
+    }
+    let s = format_eval_value(v).trim()
+    let parsed? = s.parse_i64() else {
+        return error ("expected integer value, got: " ++ s)
+    }
+    parsed
+}
+
+private fn apply_set_option(kernel: SystemKernel, world: EditorWorld, key: String, val: Any) -> !String String {
+    let o = world.options
+    when {
+        key == "tabstop" => { o.tabstop = parse_int_val(val)! },
+        key == "shiftwidth" => { o.shiftwidth = parse_int_val(val)! },
+        key == "expandtab" => { o.expandtab = parse_bool_val(val)! },
+        key == "number" => { o.number = parse_bool_val(val)! },
+        key == "relativenumber" => { o.relativenumber = parse_bool_val(val)! },
+        key == "ignorecase" => { o.ignorecase = parse_bool_val(val)! },
+        key == "smartcase" => { o.smartcase = parse_bool_val(val)! },
+        key == "wrap" => { o.wrap = parse_bool_val(val)! },
+        key == "hlsearch" => { o.hlsearch = parse_bool_val(val)! },
+        key == "incsearch" => { o.incsearch = parse_bool_val(val)! },
+        key == "theme" or key == "theme_name" => { o.theme_name = format_eval_value(val) },
+        key == "font_family" => { o.font_family = format_eval_value(val) },
+        key == "cursor_blink" => { o.cursor_blink = parse_bool_val(val)! },
+        key == "evil_mode" => { o.evil_mode = parse_bool_val(val)! },
+        key == "cwd" => { world.cwd = world.resolve_path(format_eval_value(val)) },
+        else => { return error ("unknown option: " ++ key) },
+    }
+    kernel.emit_hook("option-changed", key)
+    let updated = lookup_option_value(world, key)
+    key ++ " = " ++ format_eval_value(updated)
+}
+
+private fn inspect_symbol(kernel: SystemKernel, world: EditorWorld, mgr: ToolsManager, name: String) -> !String Any {
+    if name == "true" {
+        return true
+    }
+    if name == "false" {
+        return false
+    }
+    if name == "null" {
+        return null
+    }
+    if name == "commands" {
+        let specs = kernel.list_commands()
+        let names = List()
+        for i in 0..specs.len() {
+            names.push(specs.get(i.as(usize)).as(CommandSpec).name)
+        }
+        return "Commands (" ++ names.len().to_string() ++ "): " ++ names.join(", ")
+    }
+    if name == "extensions" {
+        let parts = List()
+        for i in 0..kernel.ext_order.len() {
+            let id = kernel.ext_order.get(i.as(usize)).as(ExtId)
+            let rec = kernel.extensions.get(id).as(ExtensionRecord)
+            let st_label = rec.state match {
+                ExtState.Registered => "Registered",
+                ExtState.Active => "Active",
+                ExtState.Disabled => "Disabled",
+                ExtState.Failed(reason) => "Failed(" ++ reason ++ ")",
+            }
+            parts.push(id.raw() ++ "[" ++ st_label ++ "]")
+        }
+        return "Extensions (" ++ parts.len().to_string() ++ "): " ++ parts.join(", ")
+    }
+    if name == "services" {
+        let keys = kernel.services.keys()
+        keys.sort()
+        return "Services (" ++ keys.len().to_string() ++ "): " ++ keys.join(", ")
+    }
+    if name == "buffers" {
+        let parts = List()
+        for i in 0..world.buffer_order.len() {
+            let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+            let b = world.buffers.get(bid).as(Buffer)
+            let cur_mark = if bid == world.active_buffer_id { "*" } else { "" }
+            parts.push(cur_mark ++ b.name ++ "(" ++ b.major_mode ++ ")")
+        }
+        return "Buffers (" ++ parts.len().to_string() ++ "): " ++ parts.join(", ")
+    }
+    if name == "options" {
+        return format_options_summary(world)
+    }
+    if name == "keymaps" {
+        let kms = kernel.keymaps.keys()
+        kms.sort()
+        return "Keymaps (" ++ kms.len().to_string() ++ "): " ++ kms.join(", ")
+    }
+    if name == "jobs" {
+        return "Active jobs (" ++ world.active_jobs.len().to_string() ++ ")"
+    }
+    if name == "quickfix" {
+        return "Quickfix (" ++ world.quickfix.len().to_string() ++ ")"
+    }
+    if name == "cwd" {
+        return world.cwd
+    }
+    if name == "mode" {
+        return world.mode_name ++ ":" ++ world.active_buffer().major_mode
+    }
+    if name == "point" {
+        return world.active_buffer().point.to_string()
+    }
+    if mgr.scratch_env.contains_key(name) {
+        return mgr.scratch_env.get(name)
+    }
+    let opt_v = lookup_option_value(world, name)
+    if opt_v != null {
+        return opt_v
+    }
+    error ("unknown identifier: " ++ name)
+}
+
+private fn eval_builtin_call(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    fn_name: String,
+    args: List,
+) -> !String Any {
+    when {
+        fn_name == "len" and args.len() == 1 => {
+            let v = args.get(0)
+            if v matches _: String {
+                return v.as(String).char_len()
+            }
+            if v matches _: List {
+                return v.as(List).len()
+            }
+            error "len() expects String or List"
+        },
+        fn_name == "upper" and args.len() == 1 => format_eval_value(args.get(0)).to_upper(),
+        fn_name == "lower" and args.len() == 1 => format_eval_value(args.get(0)).to_lower(),
+        fn_name == "trim" and args.len() == 1 => format_eval_value(args.get(0)).trim(),
+        fn_name == "buffer_count" and args.is_empty() => world.buffer_order.len(),
+        fn_name == "command_count" and args.is_empty() => kernel.commands.keys().len(),
+        fn_name == "extension_count" and args.is_empty() => kernel.ext_order.len(),
+        fn_name == "service_count" and args.is_empty() => kernel.services.keys().len(),
+        fn_name == "active_buffer" and args.is_empty() => world.active_buffer().name,
+        fn_name == "option" and args.len() == 1 => {
+            let k = format_eval_value(args.get(0))
+            let ov? = lookup_option_value(world, k) else {
+                return error ("unknown option: " ++ k)
+            }
+            ov
+        },
+        else => error ("unknown function or wrong arity: " ++ fn_name),
+    }
+}
+
+private fn peek_tok(st: ExprStream) -> ?ExprTok {
+    if st.pos >= st.tokens.len() {
+        return null
+    }
+    st.tokens.get(st.pos.as(usize)).as(ExprTok)
+}
+
+private fn match_op(st: ExprStream, sym: String) -> bool {
+    let t? = peek_tok(st) else {
+        return false
+    }
+    t match {
+        ExprTok.Op(s) => {
+            if s == sym {
+                st.pos += 1
+                true
+            } else {
+                false
+            }
+        },
+        _ => false,
+    }
+}
+
+private fn eval_or_expr(
+    st: ExprStream,
+    kernel: SystemKernel,
+    world: EditorWorld,
+    mgr: ToolsManager,
+) -> !String Any {
+    var lhs = eval_and_expr(st, kernel, world, mgr)!
+    while match_op(st, "or") {
+        let rhs = eval_and_expr(st, kernel, world, mgr)!
+        lhs = parse_bool_val(lhs)! or parse_bool_val(rhs)!
+    }
+    lhs
+}
+
+private fn eval_and_expr(
+    st: ExprStream,
+    kernel: SystemKernel,
+    world: EditorWorld,
+    mgr: ToolsManager,
+) -> !String Any {
+    var lhs = eval_cmp_expr(st, kernel, world, mgr)!
+    while match_op(st, "and") {
+        let rhs = eval_cmp_expr(st, kernel, world, mgr)!
+        lhs = parse_bool_val(lhs)! and parse_bool_val(rhs)!
+    }
+    lhs
+}
+
+private fn as_num_f64(v: Any) -> ?f64 {
+    if v matches _: i64 {
+        return v.as(i64).as(f64)
+    }
+    if v matches _: f64 {
+        return v.as(f64)
+    }
+    null
+}
+
+private fn eval_cmp_expr(
+    st: ExprStream,
+    kernel: SystemKernel,
+    world: EditorWorld,
+    mgr: ToolsManager,
+) -> !String Any {
+    var lhs = eval_add_expr(st, kernel, world, mgr)!
+    while true {
+        let t? = peek_tok(st) else {
+            break
+        }
+        let op_sym = t match {
+            ExprTok.Op(s) => {
+                if s == "==" or s == "!=" or s == "<" or s == "<=" or s == ">" or s == ">=" {
+                    s
+                } else {
+                    ""
+                }
+            },
+            _ => "",
+        }
+        if op_sym == "" {
+            break
+        }
+        st.pos += 1
+        let rhs = eval_add_expr(st, kernel, world, mgr)!
+        if op_sym == "==" {
+            lhs = lhs == rhs
+        } else if op_sym == "!=" {
+            lhs = lhs != rhs
+        } else {
+            let ln? = as_num_f64(lhs) else {
+                return error ("ordered comparison requires numbers")
+            }
+            let rn? = as_num_f64(rhs) else {
+                return error ("ordered comparison requires numbers")
+            }
+            lhs = when {
+                op_sym == "<" => ln < rn,
+                op_sym == "<=" => ln <= rn,
+                op_sym == ">" => ln > rn,
+                else => ln >= rn,
+            }
+        }
+    }
+    lhs
+}
+
+private fn eval_add_expr(
+    st: ExprStream,
+    kernel: SystemKernel,
+    world: EditorWorld,
+    mgr: ToolsManager,
+) -> !String Any {
+    var lhs = eval_mul_expr(st, kernel, world, mgr)!
+    while true {
+        if match_op(st, "++") {
+            let rhs = eval_mul_expr(st, kernel, world, mgr)!
+            lhs = format_eval_value(lhs) ++ format_eval_value(rhs)
+        } else if match_op(st, "+") {
+            let rhs = eval_mul_expr(st, kernel, world, mgr)!
+            if (lhs matches _: i64) and (rhs matches _: i64) {
+                lhs = lhs.as(i64) + rhs.as(i64)
+            } else {
+                let lf? = as_num_f64(lhs) else {
+                    return error "operator '+' requires numeric operands (use '++' for strings)"
+                }
+                let rf? = as_num_f64(rhs) else {
+                    return error "operator '+' requires numeric operands (use '++' for strings)"
+                }
+                lhs = lf + rf
+            }
+        } else if match_op(st, "-") {
+            let rhs = eval_mul_expr(st, kernel, world, mgr)!
+            if (lhs matches _: i64) and (rhs matches _: i64) {
+                lhs = lhs.as(i64) - rhs.as(i64)
+            } else {
+                let lf? = as_num_f64(lhs) else {
+                    return error "operator '-' requires numeric operands"
+                }
+                let rf? = as_num_f64(rhs) else {
+                    return error "operator '-' requires numeric operands"
+                }
+                lhs = lf - rf
+            }
+        } else {
+            break
+        }
+    }
+    lhs
+}
+
+private fn eval_mul_expr(
+    st: ExprStream,
+    kernel: SystemKernel,
+    world: EditorWorld,
+    mgr: ToolsManager,
+) -> !String Any {
+    var lhs = eval_unary_expr(st, kernel, world, mgr)!
+    while true {
+        if match_op(st, "*") {
+            let rhs = eval_unary_expr(st, kernel, world, mgr)!
+            if (lhs matches _: i64) and (rhs matches _: i64) {
+                lhs = lhs.as(i64) * rhs.as(i64)
+            } else {
+                let lf? = as_num_f64(lhs) else {
+                    return error "operator '*' requires numeric operands"
+                }
+                let rf? = as_num_f64(rhs) else {
+                    return error "operator '*' requires numeric operands"
+                }
+                lhs = lf * rf
+            }
+        } else if match_op(st, "/") {
+            let rhs = eval_unary_expr(st, kernel, world, mgr)!
+            if (lhs matches _: i64) and (rhs matches _: i64) {
+                let ri = rhs.as(i64)
+                if ri == 0 {
+                    return error "division by zero"
+                }
+                lhs = lhs.as(i64) / ri
+            } else {
+                let lf? = as_num_f64(lhs) else {
+                    return error "operator '/' requires numeric operands"
+                }
+                let rf? = as_num_f64(rhs) else {
+                    return error "operator '/' requires numeric operands"
+                }
+                if rf == 0.0 {
+                    return error "division by zero"
+                }
+                lhs = lf / rf
+            }
+        } else if match_op(st, "%") {
+            let rhs = eval_unary_expr(st, kernel, world, mgr)!
+            if (lhs matches _: i64) and (rhs matches _: i64) {
+                let ri = rhs.as(i64)
+                if ri == 0 {
+                    return error "modulo by zero"
+                }
+                lhs = lhs.as(i64) % ri
+            } else {
+                return error "operator '%' requires integer operands"
+            }
+        } else {
+            break
+        }
+    }
+    lhs
+}
+
+private fn eval_unary_expr(
+    st: ExprStream,
+    kernel: SystemKernel,
+    world: EditorWorld,
+    mgr: ToolsManager,
+) -> !String Any {
+    if match_op(st, "-") {
+        let v = eval_unary_expr(st, kernel, world, mgr)!
+        if v matches _: i64 {
+            return -(v.as(i64))
+        }
+        let f? = as_num_f64(v) else {
+            return error "unary '-' requires numeric operand"
+        }
+        return -f
+    }
+    if match_op(st, "not") {
+        let v = eval_unary_expr(st, kernel, world, mgr)!
+        return not parse_bool_val(v)!
+    }
+    eval_primary_expr(st, kernel, world, mgr)
+}
+
+private fn eval_primary_expr(
+    st: ExprStream,
+    kernel: SystemKernel,
+    world: EditorWorld,
+    mgr: ToolsManager,
+) -> !String Any {
+    let tok? = peek_tok(st) else {
+        return error "unexpected end of expression"
+    }
+    st.pos += 1
+    tok match {
+        ExprTok.IntLit(n) => n,
+        ExprTok.FloatLit(f) => f,
+        ExprTok.StrLit(s) => s,
+        ExprTok.LParen => {
+            let inner = eval_or_expr(st, kernel, world, mgr)!
+            let close_opt = peek_tok(st)
+            if close_opt == null or (not (close_opt.as(ExprTok) matches ExprTok.RParen)) {
+                return error "expected ')'"
+            }
+            st.pos += 1
+            inner
+        },
+        ExprTok.LBracket => {
+            let items = List()
+            let next_opt = peek_tok(st)
+            if next_opt != null and (next_opt.as(ExprTok) matches ExprTok.RBracket) {
+                st.pos += 1
+                return items
+            }
+            while true {
+                items.push(eval_or_expr(st, kernel, world, mgr)!)
+                let sep_opt = peek_tok(st)
+                if sep_opt != null and (sep_opt.as(ExprTok) matches ExprTok.Comma) {
+                    st.pos += 1
+                    continue
+                }
+                if sep_opt != null and (sep_opt.as(ExprTok) matches ExprTok.RBracket) {
+                    st.pos += 1
+                    break
+                }
+                return error "expected ',' or ']' in list literal"
+            }
+            items
+        },
+        ExprTok.Ident(name) => {
+            let next_opt = peek_tok(st)
+            if next_opt != null and (next_opt.as(ExprTok) matches ExprTok.LParen) {
+                st.pos += 1
+                let call_args = List()
+                let after_lp = peek_tok(st)
+                if after_lp != null and (after_lp.as(ExprTok) matches ExprTok.RParen) {
+                    st.pos += 1
+                    return eval_builtin_call(kernel, world, name, call_args)!
+                }
+                while true {
+                    call_args.push(eval_or_expr(st, kernel, world, mgr)!)
+                    let sep_opt = peek_tok(st)
+                    if sep_opt != null and (sep_opt.as(ExprTok) matches ExprTok.Comma) {
+                        st.pos += 1
+                        continue
+                    }
+                    if sep_opt != null and (sep_opt.as(ExprTok) matches ExprTok.RParen) {
+                        st.pos += 1
+                        break
+                    }
+                    return error ("expected ',' or ')' in call to " ++ name)
+                }
+                return eval_builtin_call(kernel, world, name, call_args)!
+            }
+            inspect_symbol(kernel, world, mgr, name)!
+        },
+        _ => error "unexpected token in expression",
+    }
+}
+
+private fn split_call_words(src: String) -> List {
+    let words = List()
+    let n = src.char_len()
+    var i: i64 = 0
+    while i < n {
+        while i < n and (src.slice(i, i + 1) == " " or src.slice(i, i + 1) == "\t") {
+            i += 1
+        }
+        if i >= n {
+            break
+        }
+        if src.slice(i, i + 1) == "\"" {
+            var j = i + 1
+            var w = ""
+            while j < n {
+                let c = src.slice(j, j + 1)
+                if c == "\\" and j + 1 < n {
+                    w = w ++ src.slice(j + 1, j + 2)
+                    j += 2
+                    continue
+                }
+                if c == "\"" {
+                    j += 1
+                    break
+                }
+                w = w ++ c
+                j += 1
+            }
+            words.push(w)
+            i = j
+        } else {
+            var j = i
+            while j < n and src.slice(j, j + 1) != " " and src.slice(j, j + 1) != "\t" {
+                j += 1
+            }
+            words.push(src.slice(i, j))
+            i = j
+        }
+    }
+    words
+}
+
+private fn eval_parsed_rhs(
+    rhs: String,
+    kernel: SystemKernel,
+    world: EditorWorld,
+    mgr: ToolsManager,
+) -> !String Any {
+    let toks = tokenize_expr(rhs)!
+    if toks.is_empty() {
+        return error "empty expression"
+    }
+    let st = ExprStream { tokens: toks, pos: 0 }
+    let val = eval_or_expr(st, kernel, world, mgr)!
+    if st.pos < st.tokens.len() {
+        return error "unexpected trailing tokens in expression"
+    }
+    val
+}
+
+pub fn eval_lava_expression(
+    kernel: SystemKernel,
+    expr: String,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String String {
+    let world = require_editor_world(kernel)!
+    let mgr = require_tools_manager(kernel)!
+    let clean = strip_comment_outside_quotes(expr).trim()
+    if clean == "" {
+        return ""
+    }
+
+    if clean.starts_with("let ") {
+        let rest = clean.drop(4).trim()
+        let pair? = rest.split_once("=") else {
+            return error "syntax error in let binding: expected 'let <name> = <expr>'"
+        }
+        let (raw_name, raw_rhs) = pair
+        let var_name = raw_name.trim()
+        if var_name == "" {
+            return error "empty variable name in let binding"
+        }
+        let val = eval_parsed_rhs(raw_rhs.trim(), kernel, world, mgr)!
+        mgr.scratch_env.insert(var_name, val)
+        return format_eval_value(val)
+    }
+
+    if clean.starts_with("set ") {
+        let rest = clean.drop(4).trim()
+        let eq_opt = rest.split_once("=")
+        if eq_opt != null {
+            let (k_part, v_part) = eq_opt.as((String, String))
+            let val = eval_parsed_rhs(v_part.trim(), kernel, world, mgr)!
+            return apply_set_option(kernel, world, k_part.trim(), val)!
+        }
+        let sp_opt = rest.split_once(" ")
+        if sp_opt != null {
+            let (k_part, v_part) = sp_opt.as((String, String))
+            let val = eval_parsed_rhs(v_part.trim(), kernel, world, mgr)!
+            return apply_set_option(kernel, world, k_part.trim(), val)!
+        }
+        return error "syntax error in set: expected 'set <option> = <value>'"
+    }
+
+    if clean.starts_with("call ") {
+        let words = split_call_words(clean.drop(5))
+        if words.is_empty() {
+            return error "syntax error in call: expected 'call <command> [args...]'"
+        }
+        let cmd_name = words.get(0).as(String)
+        let cmd_args = List()
+        for i in 1..words.len() {
+            cmd_args.push(words.get(i.as(usize)).as(String))
+        }
+        let turn = tools_dispatch_command(kernel, cmd_name, cmd_args)#!
+        return turn match {
+            PromptTurn.Completed(v) => {
+                if v == () or v == null {
+                    "ok (" ++ cmd_name ++ ")"
+                } else {
+                    format_eval_value(v)
+                }
+            },
+            PromptTurn.Suspended(req, _) => "suspended (" ++ req.label ++ ")",
+        }
+    }
+
+    let val = eval_parsed_rhs(clean, kernel, world, mgr)!
+    format_eval_value(val)
+}
+
+pub fn eval_scratch_at_point(
+    kernel: SystemKernel,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String String {
+    let world = require_editor_world(kernel)!
+    let buf = world.active_buffer()
+    let row = buf.point.row
+    let raw_line = buf.line_at(row)
+    let expr_part = strip_comment_outside_quotes(raw_line).trim()
+    if expr_part == "" {
+        status_emit("(No expression on current line)")#
+        return ""
+    }
+    let result_str = eval_lava_expression(kernel, expr_part)#!
+    if not buf.read_only {
+        let annotated = expr_part ++ " -- => " ++ result_str
+        buf.set_line_at(row, annotated)
+        buf.modified = true
+        buf.point = buf.clamp_pos(Pos.new(row, annotated.char_len()), insert_mode = true)
+        buf.checkpoint(buf.point, "eval-scratch-line")
+    } else {
+        let scratch_opt = world.buffer(world.scratch_id)
+        if scratch_opt != null {
+            let sb = scratch_opt.as(Buffer)
+            sb.push_line(expr_part ++ " -- => " ++ result_str)
+            sb.modified = true
+        }
+    }
+    status_emit("=> " ++ result_str)#
+    result_str
+}
+
+-- ============================================================================
+-- 7. Mode-Specific Special Buffer Key Handler (`tools_handle_key`)
+-- ============================================================================
+
+private fn handle_dired_key(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    mgr: ToolsManager,
+    buf: Buffer,
+    stroke: KeyStroke,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String bool {
+    if stroke.alt or stroke.super_mod {
+        return false
+    }
+    let state? = mgr.dired_states.get(buf.id) else {
+        refresh_dired_buffer(kernel, buf.id, preserve_marks = false)!
+        return true
+    }
+    let dstate = state.as(DiredState)
+
+    if stroke.ctrl {
+        if stroke.key == "n" {
+            dired_move_row(buf, 1)
+            return true
+        }
+        if stroke.key == "p" {
+            dired_move_row(buf, -1)
+            return true
+        }
+        return false
+    }
+
+    let k = stroke.key
+    if k == "j" or k == "n" or k == "Down" {
+        dired_move_row(buf, 1)
+        return true
+    }
+    if k == "k" or k == "p" or k == "Up" {
+        dired_move_row(buf, -1)
+        return true
+    }
+    if k == "Return" or k == "o" {
+        let ent? = dired_entry_at_row(dstate, buf.point.row) else {
+            return true
+        }
+        if ent.is_dir {
+            let focus = if ent.name == ".." {
+                let fn_opt = path.file_name(dstate.dir_path)
+                if fn_opt != null { fn_opt.as(String) } else { "" }
+            } else {
+                ""
+            }
+            let _ = open_dired(kernel, ent.full_path, focus_name = focus)#!
+        } else {
+            world.jumps.record(buf.id, buf.file_path, buf.point)
+            let opened = world.open_file(ent.full_path)#!
+            world.jumps.record(opened.id, opened.file_path, opened.point)
+            kernel.emit_hook("buffer-switched", opened.id)
+        }
+        return true
+    }
+    if k == "^" or k == "-" {
+        let parent_opt = path.parent(dstate.dir_path)
+        if parent_opt != null {
+            let cur_base_opt = path.file_name(dstate.dir_path)
+            let cur_base = if cur_base_opt != null { cur_base_opt.as(String) } else { "" }
+            let _ = open_dired(kernel, parent_opt.as(String), focus_name = cur_base)#!
+        } else {
+            status_emit("Already at filesystem root")#
+        }
+        return true
+    }
+    if k == "m" {
+        let ent_opt = dired_set_row_mark(buf, dstate, buf.point.row, "*")
+        dired_move_row(buf, 1)
+        if ent_opt != null {
+            let ent = ent_opt.as(DiredEntry)
+            if ent.name != ".." {
+                status_emit("Marked " ++ ent.name)#
+            }
+        }
+        return true
+    }
+    if k == "d" {
+        let ent_opt = dired_set_row_mark(buf, dstate, buf.point.row, "D")
+        dired_move_row(buf, 1)
+        if ent_opt != null {
+            let ent = ent_opt.as(DiredEntry)
+            if ent.name != ".." {
+                status_emit("Flagged " ++ ent.name ++ " for deletion")#
+            }
+        }
+        return true
+    }
+    if k == "u" {
+        let ent_opt = dired_set_row_mark(buf, dstate, buf.point.row, " ")
+        dired_move_row(buf, 1)
+        if ent_opt != null {
+            status_emit("Unmarked " ++ ent_opt.as(DiredEntry).name)#
+        }
+        return true
+    }
+    if k == "U" {
+        buf.read_only = false
+        for i in 0..dstate.entries.len() {
+            let e = dstate.entries.get(i.as(usize)).as(DiredEntry)
+            e.mark_flag = " "
+            buf.set_line_at(e.line_row, render_dired_entry_line(e))
+        }
+        buf.modified = false
+        buf.read_only = true
+        status_emit("Unmarked all items")#
+        return true
+    }
+    if k == "x" {
+        let _ = tools_dispatch_command(kernel, "dired-do-flagged-delete", [])#!
+        return true
+    }
+    if k == "+" {
+        let _ = tools_dispatch_command(kernel, "dired-create-directory", [])#!
+        return true
+    }
+    if k == "R" {
+        let _ = tools_dispatch_command(kernel, "dired-do-rename", [])#!
+        return true
+    }
+    if k == "C" {
+        let _ = tools_dispatch_command(kernel, "dired-do-copy", [])#!
+        return true
+    }
+    if k == "g" {
+        refresh_dired_buffer(kernel, buf.id, preserve_marks = true)!
+        status_emit("Reverted dired " ++ dstate.dir_path)#
+        return true
+    }
+    if k == "q" {
+        let next_id = world.cycle_buffer(-1)
+        kernel.emit_hook("buffer-switched", next_id)
+        status_emit("Buried dired buffer")#
+        return true
+    }
+    false
+}
+
+private fn handle_results_key(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    buf: Buffer,
+    stroke: KeyStroke,
+) -> #[log_event, status_emit] !String bool {
+    if stroke.ctrl and (not stroke.alt) and stroke.key == "g" {
+        if not world.active_jobs.is_empty() {
+            let _ = tools_cancel_active_jobs(kernel)#!
+            return true
+        }
+        return false
+    }
+    if stroke.alt or stroke.super_mod {
+        return false
+    }
+    if stroke.ctrl {
+        if stroke.key == "n" {
+            buf.point = buf.clamp_pos(Pos.new(buf.point.row + 1, 0), insert_mode = false)
+            return true
+        }
+        if stroke.key == "p" {
+            buf.point = buf.clamp_pos(Pos.new(buf.point.row - 1, 0), insert_mode = false)
+            return true
+        }
+        return false
+    }
+    let k = stroke.key
+    if k == "j" or k == "n" or k == "Down" {
+        buf.point = buf.clamp_pos(Pos.new(buf.point.row + 1, 0), insert_mode = false)
+        return true
+    }
+    if k == "k" or k == "p" or k == "Up" {
+        buf.point = buf.clamp_pos(Pos.new(buf.point.row - 1, 0), insert_mode = false)
+        return true
+    }
+    if k == "Return" or k == "o" {
+        let _ = jump_from_results_buffer_row(kernel, buf)#!
+        return true
+    }
+    if k == "q" {
+        let next_id = world.cycle_buffer(-1)
+        kernel.emit_hook("buffer-switched", next_id)
+        status_emit("Closed " ++ buf.name)#
+        return true
+    }
+    false
+}
+
+private fn handle_org_key(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    mgr: ToolsManager,
+    buf: Buffer,
+    stroke: KeyStroke,
+) -> #status_emit !String bool {
+    if mgr.pending_prefix == "C-c" {
+        mgr.pending_prefix = ""
+        world.pending_keys_display = ""
+        if (stroke.ctrl and stroke.key == "t") or ((not stroke.ctrl) and stroke.key == "t") {
+            let _ = org_todo_at_point(kernel)#!
+            return true
+        }
+        if (stroke.ctrl and stroke.key == "g") or stroke.key == "Escape" {
+            status_emit("Quit")#
+            return true
+        }
+        return false
+    }
+
+    if stroke.ctrl and (not stroke.alt) and (not stroke.super_mod) and stroke.key == "c" {
+        mgr.pending_prefix = "C-c"
+        world.pending_keys_display = "<C-c>"
+        status_emit("C-c-")#
+        return true
+    }
+
+    if (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod) {
+        if stroke.key == "Tab" or stroke.key == "\t" {
+            if heading_level(buf.line_at(buf.point.row), buf.major_mode) > 0 {
+                return org_cycle_at_point(kernel)#!
+            }
+        }
+    }
+    false
+}
+
+pub fn tools_handle_key(
+    kernel: SystemKernel,
+    stroke: KeyStroke,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String bool {
+    if not kernel.is_extension_active(ext_tools_id()) {
+        return false
+    }
+    let world = require_editor_world(kernel)!
+    let mgr = require_tools_manager(kernel)!
+    let buf = world.active_buffer()
+    let mode = buf.major_mode
+
+    if mode == "dired" {
+        mgr.pending_prefix = ""
+        return handle_dired_key(kernel, world, mgr, buf, stroke)#!
+    }
+    if mode == "grep" or mode == "compilation" {
+        mgr.pending_prefix = ""
+        return handle_results_key(kernel, world, buf, stroke)#!
+    }
+    if mode == "org" or mode == "markdown" {
+        return handle_org_key(kernel, world, mgr, buf, stroke)#!
+    }
+    mgr.pending_prefix = ""
+    false
+}
+
+-- ============================================================================
+-- 8. Extension Registration (`lava.org/ext_tools`)
+-- ============================================================================
+
+private fn join_string_args(args: List) -> String {
+    if args.is_empty() {
+        return ""
+    }
+    let parts = List()
+    for i in 0..args.len() {
+        parts.push(args.get(i.as(usize)).as(String))
+    }
+    parts.join(" ")
+}
+
+private fn cmd_dired(kern: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let raw = if not args.is_empty() { args.get(0).as(String) } else { "" }
+    let b = open_dired(kern, raw)#!
+    b.id
+}
+
+private fn cmd_dired_up_directory(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let w = require_editor_world(kern)!
+    let m = require_tools_manager(kern)!
+    let b = w.active_buffer()
+    let ds_opt = m.dired_states.get(b.id)
+    let cur_dir = if ds_opt != null {
+        ds_opt.as(DiredState).dir_path
+    } else if b.file_path != "" {
+        b.file_path
+    } else {
+        w.cwd
+    }
+    let parent_opt = path.parent(cur_dir)
+    if parent_opt != null {
+        let base_opt = path.file_name(cur_dir)
+        let base = if base_opt != null { base_opt.as(String) } else { "" }
+        let _ = open_dired(kern, parent_opt.as(String), focus_name = base)#!
+    } else {
+        status_emit("Already at filesystem root")#
+    }
+    ()
+}
+
+private fn cmd_dired_do_flagged_delete(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let w = require_editor_world(kern)!
+    let m = require_tools_manager(kern)!
+    let b = w.active_buffer()
+    let ds? = m.dired_states.get(b.id) else {
+        status_emit("Not in a Dired buffer")#
+        return 0
+    }
+    let dstate = ds.as(DiredState)
+    let flagged = List()
+    for i in 0..dstate.entries.len() {
+        let e = dstate.entries.get(i.as(usize)).as(DiredEntry)
+        if e.mark_flag == "D" and e.name != ".." {
+            flagged.push(e)
+        }
+    }
+    if flagged.is_empty() {
+        status_emit("(No deletions requested)")#
+        return 0
+    }
+    let prompt_label = "Delete " ++ flagged.len().to_string() ++ " flagged item(s)? (y/n)"
+    let ans? = ask_prompt(PromptRequest {
+        label: prompt_label,
+        initial: "",
+        kind: PromptKind.Confirm,
+        candidates: ["y", "n"],
+    })# else {
+        status_emit("Deletion cancelled")#
+        return 0
+    }
+    let norm = ans.trim().to_lower()
+    if norm != "y" and norm != "yes" {
+        status_emit("Deletion cancelled")#
+        return 0
+    }
+    var deleted: i64 = 0
+    for i in 0..flagged.len() {
+        let item = flagged.get(i.as(usize)).as(DiredEntry)
+        if item.is_dir {
+            let res = fs.remove_dir_all(item.full_path)
+            res match {
+                _! => { deleted += 1 },
+                error err => {
+                    log_event("warn", "ext_tools", "Failed removing dir " ++ item.full_path ++ ": " ++ err.to_string())#
+                },
+            }
+        } else {
+            let res = fs.remove_file(item.full_path)
+            res match {
+                _! => { deleted += 1 },
+                error err => {
+                    log_event("warn", "ext_tools", "Failed removing file " ++ item.full_path ++ ": " ++ err.to_string())#
+                },
+            }
+        }
+    }
+    refresh_dired_buffer(kern, b.id, preserve_marks = true)!
+    status_emit("Deleted " ++ deleted.to_string() ++ " item(s)")#
+    deleted
+}
+
+private fn cmd_dired_create_directory(kern: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let w = require_editor_world(kern)!
+    let m = require_tools_manager(kern)!
+    let b = w.active_buffer()
+    let ds? = m.dired_states.get(b.id) else {
+        return error "dired-create-directory requires an active Dired buffer"
+    }
+    let dstate = ds.as(DiredState)
+    let raw_name = if (not args.is_empty()) and args.get(0).as(String).trim() != "" {
+        args.get(0).as(String)
+    } else {
+        let ans? = ask_prompt(PromptRequest {
+            label: "Create directory: ",
+            initial: "",
+            kind: PromptKind.FilePath,
+            candidates: List(),
+        })# else {
+            status_emit("Quit")#
+            return ()
+        }
+        ans
+    }
+    if raw_name.trim() == "" {
+        status_emit("Empty directory name")#
+        return ()
+    }
+    let target = resolve_in_dir(dstate.dir_path, raw_name)
+    let res = fs.create_dir_all(target)
+    res match {
+        _! => (),
+        error err => return error ("create_dir_all failed: " ++ err.to_string()),
+    }
+    let fn_opt = path.file_name(target)
+    let focus = if fn_opt != null { fn_opt.as(String) } else { "" }
+    refresh_dired_buffer(kern, b.id, preserve_marks = true, focus_name = focus)!
+    status_emit("Created directory: " ++ target)#
+    target
+}
+
+private fn cmd_dired_do_rename(kern: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let w = require_editor_world(kern)!
+    let m = require_tools_manager(kern)!
+    let b = w.active_buffer()
+    let ds? = m.dired_states.get(b.id) else {
+        return error "dired-do-rename requires an active Dired buffer"
+    }
+    let dstate = ds.as(DiredState)
+    let targets = dired_marked_or_current_entries(dstate, b.point.row)
+    if targets.is_empty() {
+        status_emit("No file or directory selected to rename")#
+        return ()
+    }
+    let first = targets.get(0).as(DiredEntry)
+    let raw_dest = if (not args.is_empty()) and args.get(0).as(String).trim() != "" {
+        args.get(0).as(String)
+    } else {
+        let prompt_lbl = if targets.len() == 1 {
+            "Rename " ++ first.name ++ " to: "
+        } else {
+            "Move " ++ targets.len().to_string() ++ " items into directory: "
+        }
+        let ans? = ask_prompt(PromptRequest {
+            label: prompt_lbl,
+            initial: if targets.len() == 1 { first.name } else { "" },
+            kind: PromptKind.FilePath,
+            candidates: List(),
+        })# else {
+            status_emit("Quit")#
+            return ()
+        }
+        ans
+    }
+    if raw_dest.trim() == "" {
+        status_emit("Rename cancelled")#
+        return ()
+    }
+    let base_dest = resolve_in_dir(dstate.dir_path, raw_dest)
+    var last_name = ""
+    for i in 0..targets.len() {
+        let ent = targets.get(i.as(usize)).as(DiredEntry)
+        let final_dest = if targets.len() > 1 or (fs.exists(base_dest) and fs.is_dir(base_dest)) {
+            path.join(base_dest, ent.name)
+        } else {
+            base_dest
+        }
+        let res = fs.rename(ent.full_path, final_dest)
+        res match {
+            _! => {
+                let open_opt = w.find_buffer_by_path(ent.full_path)
+                if open_opt != null {
+                    let ob = open_opt.as(Buffer)
+                    ob.file_path = final_dest
+                    let bn_opt = path.file_name(final_dest)
+                    if bn_opt != null {
+                        ob.name = bn_opt.as(String)
+                    }
+                }
+                let fn_opt = path.file_name(final_dest)
+                if fn_opt != null {
+                    last_name = fn_opt.as(String)
+                }
+            },
+            error err => return error ("rename failed: " ++ err.to_string()),
+        }
+    }
+    refresh_dired_buffer(kern, b.id, preserve_marks = false, focus_name = last_name)!
+    status_emit("Renamed/moved " ++ targets.len().to_string() ++ " item(s) -> " ++ base_dest)#
+    base_dest
+}
+
+private fn cmd_dired_do_copy(kern: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let w = require_editor_world(kern)!
+    let m = require_tools_manager(kern)!
+    let b = w.active_buffer()
+    let ds? = m.dired_states.get(b.id) else {
+        return error "dired-do-copy requires an active Dired buffer"
+    }
+    let dstate = ds.as(DiredState)
+    let targets = dired_marked_or_current_entries(dstate, b.point.row)
+    if targets.is_empty() {
+        status_emit("No file selected to copy")#
+        return ()
+    }
+    let first = targets.get(0).as(DiredEntry)
+    if first.is_dir {
+        status_emit("Directory recursive copy not supported; select a file")#
+        return ()
+    }
+    let raw_dest = if (not args.is_empty()) and args.get(0).as(String).trim() != "" {
+        args.get(0).as(String)
+    } else {
+        let ans? = ask_prompt(PromptRequest {
+            label: "Copy " ++ first.name ++ " to: ",
+            initial: "",
+            kind: PromptKind.FilePath,
+            candidates: List(),
+        })# else {
+            status_emit("Quit")#
+            return ()
+        }
+        ans
+    }
+    if raw_dest.trim() == "" {
+        status_emit("Copy cancelled")#
+        return ()
+    }
+    let base_dest = resolve_in_dir(dstate.dir_path, raw_dest)
+    var copied_count: i64 = 0
+    var last_name = ""
+    for i in 0..targets.len() {
+        let ent = targets.get(i.as(usize)).as(DiredEntry)
+        if ent.is_dir {
+            continue
+        }
+        let final_dest = if targets.len() > 1 or (fs.exists(base_dest) and fs.is_dir(base_dest)) {
+            path.join(base_dest, ent.name)
+        } else {
+            base_dest
+        }
+        let res = fs.copy(ent.full_path, final_dest)
+        res match {
+            _! => {
+                copied_count += 1
+                let fn_opt = path.file_name(final_dest)
+                if fn_opt != null {
+                    last_name = fn_opt.as(String)
+                }
+            },
+            error err => return error ("copy failed: " ++ err.to_string()),
+        }
+    }
+    refresh_dired_buffer(kern, b.id, preserve_marks = false, focus_name = last_name)!
+    status_emit("Copied " ++ copied_count.to_string() ++ " file(s) -> " ++ base_dest)#
+    base_dest
+}
+
+private fn cmd_occur(kern: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let w = require_editor_world(kern)!
+    let pat = if (not args.is_empty()) and args.get(0).as(String) != "" {
+        args.get(0).as(String)
+    } else {
+        let ans? = ask_prompt(PromptRequest.text("List lines matching: ", w.last_search))# else {
+            status_emit("Quit")#
+            return 0
+        }
+        ans
+    }
+    run_occur(kern, pat)#!
+}
+
+private fn cmd_project_search(kern: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let w = require_editor_world(kern)!
+    let pat = if (not args.is_empty()) and args.get(0).as(String) != "" {
+        args.get(0).as(String)
+    } else {
+        let ans? = ask_prompt(PromptRequest.text("Project search: ", w.last_search))# else {
+            status_emit("Quit")#
+            return 0
+        }
+        ans
+    }
+    let custom_root = if args.len() >= 2 { args.get(1).as(String) } else { "" }
+    run_project_search(kern, pat, root_dir = custom_root)#!
+}
+
+private fn cmd_grep(kern: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let w = require_editor_world(kern)!
+    let pat = if (not args.is_empty()) and args.get(0).as(String) != "" {
+        join_string_args(args)
+    } else {
+        let ans? = ask_prompt(PromptRequest.text("Grep pattern: ", w.last_search))# else {
+            status_emit("Quit")#
+            return 0
+        }
+        ans
+    }
+    if pat.trim() == "" {
+        status_emit("Grep cancelled")#
+        return 0
+    }
+    spawn_grep_job(kern, pat)#!
+}
+
+private fn cmd_next_error(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    jump_next_error(kern)#!
+}
+
+private fn cmd_previous_error(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    jump_previous_error(kern)#!
+}
+
+private fn cmd_shell_command(kern: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let m = require_tools_manager(kern)!
+    let cmd = if (not args.is_empty()) and join_string_args(args).trim() != "" {
+        join_string_args(args)
+    } else {
+        let ans? = ask_prompt(PromptRequest.text("Shell command: ", m.last_shell_cmd))# else {
+            status_emit("Quit")#
+            return ""
+        }
+        ans
+    }
+    if cmd.trim() == "" {
+        status_emit("Shell command cancelled")#
+        return ""
+    }
+    run_shell_command_sync(kern, cmd)#!
+}
+
+private fn cmd_async_shell_command(kern: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let m = require_tools_manager(kern)!
+    let cmd = if (not args.is_empty()) and join_string_args(args).trim() != "" {
+        join_string_args(args)
+    } else {
+        let ans? = ask_prompt(PromptRequest.text("Async shell command: ", m.last_shell_cmd))# else {
+            status_emit("Quit")#
+            return 0
+        }
+        ans
+    }
+    if cmd.trim() == "" {
+        status_emit("Async shell command cancelled")#
+        return 0
+    }
+    spawn_async_shell_job(kern, cmd)#!
+}
+
+private fn cmd_compile(kern: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let m = require_tools_manager(kern)!
+    let cmd = if (not args.is_empty()) and join_string_args(args).trim() != "" {
+        join_string_args(args)
+    } else {
+        let ans? = ask_prompt(PromptRequest.text("Compile command: ", m.last_compile_cmd))# else {
+            status_emit("Quit")#
+            return 0
+        }
+        ans
+    }
+    if cmd.trim() == "" {
+        status_emit("Compile cancelled")#
+        return 0
+    }
+    spawn_compile_job(kern, cmd)#!
+}
+
+private fn cmd_cancel_bg_jobs(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    tools_cancel_active_jobs(kern)#!
+}
+
+private fn cmd_org_cycle(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    org_cycle_at_point(kern)#!
+}
+
+private fn cmd_org_todo(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    org_todo_at_point(kern)#!
+}
+
+private fn cmd_eval_expression(kern: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let expr = if (not args.is_empty()) and join_string_args(args).trim() != "" {
+        join_string_args(args)
+    } else {
+        let ans? = ask_prompt(PromptRequest.text("Eval: ", ""))# else {
+            status_emit("Quit")#
+            return ""
+        }
+        ans
+    }
+    let res = eval_lava_expression(kern, expr)#!
+    if res != "" {
+        status_emit("=> " ++ res)#
+    }
+    res
+}
+
+private fn cmd_eval_scratch_line(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    eval_scratch_at_point(kern)#!
+}
+
+private fn on_tools_activate(k: SystemKernel) -> !String Unit {
+    let ext_id = ext_tools_id()
+    let mgr = ToolsManager.new()
+    k.publish_service(SERVICE_TOOLS, ext_id, mgr)
+
+    -- Document mode & global Emacs power-tool keybindings (`C-x C-e`, `M-:`, `M-!`, `M-&`)
+    let global_km = k.ensure_keymap("emacs-global")
+    global_km.bind("<C-x> <C-e>", "eval-scratch-line", ext_id, description = "Evaluate expression on current line")
+    global_km.bind("<M-:>", "eval-expression", ext_id, description = "Evaluate live Lava expression")
+    global_km.bind("<M-!>", "shell-command", ext_id, description = "Run synchronous shell command")
+    global_km.bind("<M-&>", "async-shell-command", ext_id, description = "Run asynchronous shell command")
+
+    let dired_km = k.ensure_keymap("dired")
+    dired_km.bind("<Return>", "dired-find-entry", ext_id, description = "Open file or enter directory")
+    dired_km.bind("^", "dired-up-directory", ext_id, description = "Go to parent directory")
+    dired_km.bind("x", "dired-do-flagged-delete", ext_id, description = "Execute flagged deletions")
+    dired_km.bind("+", "dired-create-directory", ext_id, description = "Create directory")
+    dired_km.bind("R", "dired-do-rename", ext_id, description = "Rename or move entry")
+    dired_km.bind("C", "dired-do-copy", ext_id, description = "Copy file")
+
+    -- 1. Dired commands
+    k.register_command(
+        "dired",
+        ext_id,
+        "Open interactive Emacs Dired directory editor (`C-x d`, `:Ex`, `-`).",
+        cmd_dired,
+    )
+    k.register_command(
+        "dired-jump",
+        ext_id,
+        "Jump to Dired buffer for active file's parent directory (`-`).",
+        cmd_dired,
+    )
+    k.register_command(
+        "dired-up-directory",
+        ext_id,
+        "Open parent directory in Dired (`^`).",
+        cmd_dired_up_directory,
+    )
+    k.register_command(
+        "dired-do-flagged-delete",
+        ext_id,
+        "Prompt for confirmation and delete all `D`-flagged entries in Dired (`x`).",
+        cmd_dired_do_flagged_delete,
+    )
+    k.register_command(
+        "dired-create-directory",
+        ext_id,
+        "Create a new directory inside current Dired directory (`+`).",
+        cmd_dired_create_directory,
+    )
+    k.register_command(
+        "dired-do-rename",
+        ext_id,
+        "Rename or move marked/current Dired entry (`R`).",
+        cmd_dired_do_rename,
+    )
+    k.register_command(
+        "dired-do-copy",
+        ext_id,
+        "Copy marked/current file in Dired (`C`).",
+        cmd_dired_do_copy,
+    )
+
+    -- 2. Occur, Concurrent Project Search, Background Grep & Quickfix
+    k.register_command(
+        "occur",
+        ext_id,
+        "List all lines in active buffer matching pattern in `*Occur*` (`M-x occur`).",
+        cmd_occur,
+    )
+    k.register_command(
+        "project-search",
+        ext_id,
+        "Concurrent 4-shard Nessa `async effect` + `Future` workspace search (`M-x project-search`).",
+        cmd_project_search,
+    )
+    k.register_command(
+        "grep",
+        ext_id,
+        "Run non-blocking background `rg`/`grep` and populate `*Grep*` & quickfix (`M-x grep`, `:grep`).",
+        cmd_grep,
+    )
+    k.register_command(
+        "next-error",
+        ext_id,
+        "Jump to next quickfix/grep/compilation diagnostic (`M-x next-error`, `]q`).",
+        cmd_next_error,
+    )
+    k.register_command(
+        "cnext",
+        ext_id,
+        "Jump to next quickfix entry (`:cnext`).",
+        cmd_next_error,
+    )
+    k.register_command(
+        "previous-error",
+        ext_id,
+        "Jump to previous quickfix/grep/compilation diagnostic (`M-x previous-error`, `[q`).",
+        cmd_previous_error,
+    )
+    k.register_command(
+        "cprev",
+        ext_id,
+        "Jump to previous quickfix entry (`:cprev`).",
+        cmd_previous_error,
+    )
+
+    -- 3. Shell Command, Async Shell & Compile
+    k.register_command(
+        "shell-command",
+        ext_id,
+        "Run synchronous shell command and show output in echo area or `*Shell Command Output*` (`M-!`).",
+        cmd_shell_command,
+    )
+    k.register_command(
+        "async-shell-command",
+        ext_id,
+        "Spawn non-blocking background shell command into `*Async Shell Command*` (`M-&`).",
+        cmd_async_shell_command,
+    )
+    k.register_command(
+        "compile",
+        ext_id,
+        "Spawn non-blocking compilation job into `*Compilation*` and populate quickfix (`M-x compile`, `:make`).",
+        cmd_compile,
+    )
+    k.register_command(
+        "make",
+        ext_id,
+        "Run compilation command (`:make`).",
+        cmd_compile,
+    )
+    k.register_command(
+        "cancel-bg-jobs",
+        ext_id,
+        "Cancel running background compilation/grep/shell jobs (`C-g`).",
+        cmd_cancel_bg_jobs,
+    )
+    k.register_command(
+        "kill-compilation",
+        ext_id,
+        "Cancel running compilation job.",
+        cmd_cancel_bg_jobs,
+    )
+
+    -- 4. Org-Outline & Live `*scratch*` Evaluator
+    k.register_command(
+        "org-cycle",
+        ext_id,
+        "Toggle subtree visibility (`buf.folded_rows`) on Org/Markdown heading (`<Tab>`).",
+        cmd_org_cycle,
+    )
+    k.register_command(
+        "org-todo",
+        ext_id,
+        "Cycle heading state `* Title` -> `* TODO Title` -> `* DONE Title` -> `* Title` (`C-c C-t`).",
+        cmd_org_todo,
+    )
+    k.register_command(
+        "eval-expression",
+        ext_id,
+        "Evaluate live Lava/SystemKernel expression in the shared VM (`M-x eval-expression`).",
+        cmd_eval_expression,
+    )
+    k.register_command(
+        "eval-scratch-line",
+        ext_id,
+        "Evaluate current `*scratch*` line in live VM and append `-- => <result>` (`C-x C-e`).",
+        cmd_eval_scratch_line,
+    )
+    k.register_command(
+        "eval-last-sexp",
+        ext_id,
+        "Evaluate expression on current line (`C-x C-e`).",
+        cmd_eval_scratch_line,
+    )
+    ()
+}
+
+private fn on_tools_deactivate(_k: SystemKernel) -> !String Unit = ()
+
+pub fn register_tools_extension(kernel: SystemKernel) -> !String Unit {
+    kernel.register_extension(
+        ext_tools_id(),
+        "lava.org",
+        "ext_tools",
+        "0.1.0",
+        "Emacs Power Tools: Dired, Occur, async Future-sharded project-search, background grep/compile/shell, Org outline, and live *scratch* evaluator.",
+        [ext_document_id()],
+        on_tools_activate,
+        on_tools_deactivate,
+    )
+}

@@ -1,0 +1,705 @@
+-- server_core: Headless Extension Kernel, Service Registry, and JSON-RPC 2.0 Protocol Router
+-- for `lava-server` (`lava.server/server_core`).
+
+use std.collections.{HashMap, Set}
+use std.json
+
+pub typealias JsonValue = Any
+
+pub const SERVER_NAME: String = "lava-server"
+pub const SERVER_VERSION: String = "0.1.0"
+
+pub const RPC_PARSE_ERROR: i64 = -32700
+pub const RPC_INVALID_REQUEST: i64 = -32600
+pub const RPC_METHOD_NOT_FOUND: i64 = -32601
+pub const RPC_INVALID_PARAMS: i64 = -32602
+pub const RPC_SERVER_ERROR: i64 = -32000
+
+pub const INVALID_PARAMS_PREFIX: String = "INVALID_PARAMS: "
+
+pub fn invalid_params(msg: String) -> String = INVALID_PARAMS_PREFIX ++ msg
+
+-- ============================================================================
+-- 1. Extension Identity & Lifecycle Metadata
+-- ============================================================================
+
+pub newtype SrvExtId = String
+derive Eq, PartialEq, Ord, PartialOrd, Display, Hash for SrvExtId
+
+impl SrvExtId {
+    pub fn raw(self) -> String {
+        let SrvExtId(s) = self
+        s
+    }
+}
+
+pub enum SrvExtState {
+    pub Registered,
+    pub Active,
+    pub Disabled,
+    pub Failed(reason: String),
+}
+derive Eq, PartialEq, Display for SrvExtState
+
+pub struct SrvExtensionRecord {
+    pub id: SrvExtId,
+    pub domain: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub dependencies: List,
+    pub state: SrvExtState,
+    pub on_activate: fn(ServerKernel) -> !String Unit,
+    pub on_deactivate: fn(ServerKernel) -> !String Unit,
+}
+
+pub struct SrvServiceEntry {
+    pub name: String,
+    pub owner: SrvExtId,
+    pub provider: Any,
+}
+
+pub struct SrvRpcSpec {
+    pub method: String,
+    pub owner: SrvExtId,
+    pub doc: String,
+    pub handler: fn(ServerKernel, JsonValue) -> !String JsonValue,
+}
+
+pub struct SrvHookListener {
+    pub owner: SrvExtId,
+    pub priority: i64,
+    pub callback: fn(ServerKernel, Any) -> Unit,
+}
+
+-- ============================================================================
+-- 2. ServerKernel: Topological Extensions, Services, Hooks & RPC Router
+-- ============================================================================
+
+pub struct ServerKernel {
+    pub extensions: HashMap,
+    pub ext_order: List,
+    pub services: HashMap,
+    pub rpc_methods: HashMap,
+    pub hooks: HashMap,
+    pub shutdown_requested: bool,
+}
+
+pub fn server_core_id() -> SrvExtId = SrvExtId("lava.server/server_core")
+
+impl ServerKernel {
+    pub fn new() -> ServerKernel {
+        let kernel = ServerKernel {
+            extensions: HashMap.new(),
+            ext_order: List(),
+            services: HashMap.new(),
+            rpc_methods: HashMap.new(),
+            hooks: HashMap.new(),
+            shutdown_requested: false,
+        }
+        kernel.install_builtin_rpcs()
+        kernel
+    }
+
+    private fn install_builtin_rpcs(self) {
+        let core_id = server_core_id()
+        self.register_rpc(
+            "server/ping",
+            core_id,
+            "Health check and active extension summary for lava-server.",
+            |k: ServerKernel, _params: JsonValue| -> !String JsonValue {
+                let active_ids = List()
+                let exts = k.list_extensions()
+                for i in 0..exts.len() {
+                    let rec = exts.get(i.as(usize)).as(SrvExtensionRecord)
+                    if rec.state == SrvExtState.Active {
+                        active_ids.push(rec.id.raw())
+                    }
+                }
+                let out = Map()
+                out.set("pong", true)
+                out.set("server", SERVER_NAME)
+                out.set("version", SERVER_VERSION)
+                out.set("extensions", active_ids)
+                out
+            },
+        )
+
+        self.register_rpc(
+            "server/capabilities",
+            core_id,
+            "List all registered JSON-RPC 2.0 methods and active server extensions.",
+            |k: ServerKernel, _params: JsonValue| -> !String JsonValue {
+                let methods = k.list_rpc_method_names()
+                let active_ids = List()
+                let ext_details = List()
+                let exts = k.list_extensions()
+                for i in 0..exts.len() {
+                    let rec = exts.get(i.as(usize)).as(SrvExtensionRecord)
+                    let is_active = rec.state == SrvExtState.Active
+                    if is_active {
+                        active_ids.push(rec.id.raw())
+                    }
+                    let info = Map()
+                    info.set("id", rec.id.raw())
+                    info.set("domain", rec.domain)
+                    info.set("name", rec.name)
+                    info.set("version", rec.version)
+                    info.set("description", rec.description)
+                    info.set("active", is_active)
+                    ext_details.push(info)
+                }
+                let out = Map()
+                out.set("server", SERVER_NAME)
+                out.set("version", SERVER_VERSION)
+                out.set("methods", methods)
+                out.set("extensions", active_ids)
+                out.set("extension_details", ext_details)
+                out
+            },
+        )
+
+        self.register_rpc(
+            "server/shutdown",
+            core_id,
+            "Gracefully shut down lava-server and stop managed child sessions.",
+            |k: ServerKernel, _params: JsonValue| -> !String JsonValue {
+                k.shutdown_requested = true
+                k.emit_hook("server-shutdown", null)
+                let out = Map()
+                out.set("ok", true)
+                out.set("shutting_down", true)
+                out
+            },
+        )
+    }
+
+    pub fn register_extension(
+        self,
+        id: SrvExtId,
+        domain: String,
+        name: String,
+        version: String,
+        description: String,
+        dependencies: List,
+        on_activate: fn(ServerKernel) -> !String Unit,
+        on_deactivate: fn(ServerKernel) -> !String Unit,
+    ) -> !String Unit {
+        if self.extensions.contains_key(id) {
+            return error ("duplicate server extension id: " ++ id.to_string())
+        }
+        let rec = SrvExtensionRecord {
+            id: id,
+            domain: domain,
+            name: name,
+            version: version,
+            description: description,
+            dependencies: dependencies,
+            state: SrvExtState.Registered,
+            on_activate: on_activate,
+            on_deactivate: on_deactivate,
+        }
+        self.extensions.insert(id, rec)
+        self.ext_order.push(id)
+        ()
+    }
+
+    pub fn activate_extension(self, id: SrvExtId) -> !String Unit {
+        let visiting = Set.new()
+        self.activate_dfs(id, visiting)
+    }
+
+    private fn activate_dfs(self, id: SrvExtId, visiting: Set) -> !String Unit {
+        let rec_any? = self.extensions.get(id) else {
+            return error ("unknown server extension dependency: " ++ id.to_string())
+        }
+        let rec = rec_any.as(SrvExtensionRecord)
+        if rec.state == SrvExtState.Active {
+            return ()
+        }
+        if visiting.contains(id) {
+            return error ("cyclic server extension dependency involving: " ++ id.to_string())
+        }
+        visiting.insert(id)
+        for i in 0..rec.dependencies.len() {
+            let dep_id = rec.dependencies.get(i.as(usize)).as(SrvExtId)
+            self.activate_dfs(dep_id, visiting)!
+        }
+        let _ = visiting.remove(id)
+        let activate_fn = rec.on_activate
+        activate_fn(self) ! {
+            err => {
+                rec.state = SrvExtState.Failed(err)
+                return error ("server extension " ++ id.to_string() ++ " failed to activate: " ++ err)
+            },
+        }
+        rec.state = SrvExtState.Active
+        self.emit_hook("extension-activated", id)
+        ()
+    }
+
+    pub fn activate_all(self) -> !String Unit {
+        for i in 0..self.ext_order.len() {
+            let id = self.ext_order.get(i.as(usize)).as(SrvExtId)
+            let rec = self.extensions.get(id).as(SrvExtensionRecord)
+            if rec.state == SrvExtState.Registered {
+                self.activate_extension(id)!
+            }
+        }
+        ()
+    }
+
+    pub fn deactivate_extension(self, id: SrvExtId) -> !String Unit {
+        let rec_any? = self.extensions.get(id) else {
+            return error ("unknown server extension: " ++ id.to_string())
+        }
+        let rec = rec_any.as(SrvExtensionRecord)
+        if rec.state != SrvExtState.Active {
+            return ()
+        }
+        for i in 0..self.ext_order.len() {
+            let other_id = self.ext_order.get(i.as(usize)).as(SrvExtId)
+            if other_id == id {
+                continue
+            }
+            let other = self.extensions.get(other_id).as(SrvExtensionRecord)
+            if other.state == SrvExtState.Active {
+                for j in 0..other.dependencies.len() {
+                    if other.dependencies.get(j.as(usize)).as(SrvExtId) == id {
+                        return error (
+                            "cannot deactivate " ++ id.to_string()
+                            ++ ": active extension " ++ other_id.to_string() ++ " depends on it"
+                        )
+                    }
+                }
+            }
+        }
+        let deactivate_fn = rec.on_deactivate
+        deactivate_fn(self)!
+        for svc_key in self.services.keys() {
+            let sk = svc_key.as(String)
+            let entry = self.services.get(sk).as(SrvServiceEntry)
+            if entry.owner == id {
+                let _ = self.services.remove(sk)
+            }
+        }
+        for rpc_key in self.rpc_methods.keys() {
+            let rk = rpc_key.as(String)
+            let rspec = self.rpc_methods.get(rk).as(SrvRpcSpec)
+            if rspec.owner == id {
+                let _ = self.rpc_methods.remove(rk)
+            }
+        }
+        rec.state = SrvExtState.Disabled
+        self.emit_hook("extension-deactivated", id)
+        ()
+    }
+
+    pub fn is_extension_active(self, id: SrvExtId) -> bool {
+        let rec_any? = self.extensions.get(id) else {
+            return false
+        }
+        rec_any.as(SrvExtensionRecord).state == SrvExtState.Active
+    }
+
+    pub fn list_extensions(self) -> List {
+        let out = List()
+        for i in 0..self.ext_order.len() {
+            let id = self.ext_order.get(i.as(usize)).as(SrvExtId)
+            let rec_opt = self.extensions.get(id)
+            if rec_opt != null {
+                out.push(rec_opt.as(SrvExtensionRecord))
+            }
+        }
+        out
+    }
+
+    -- Service Registry
+    pub fn publish_service(self, name: String, owner: SrvExtId, provider: Any) {
+        self.services.insert(
+            name,
+            SrvServiceEntry {
+                name: name,
+                owner: owner,
+                provider: provider,
+            },
+        )
+    }
+
+    pub fn service(self, name: String) -> ?Any {
+        let entry_any? = self.services.get(name) else {
+            return null
+        }
+        entry_any.as(SrvServiceEntry).provider
+    }
+
+    pub fn require_service(self, name: String) -> !String Any {
+        let svc? = self.service(name) else {
+            return error ("required server service not available: " ++ name)
+        }
+        svc
+    }
+
+    -- RPC Method Router
+    pub fn register_rpc(
+        self,
+        method: String,
+        owner: SrvExtId,
+        doc: String,
+        handler: fn(ServerKernel, JsonValue) -> !String JsonValue,
+    ) {
+        self.rpc_methods.insert(
+            method,
+            SrvRpcSpec {
+                method: method,
+                owner: owner,
+                doc: doc,
+                handler: handler,
+            },
+        )
+    }
+
+    pub fn has_rpc(self, method: String) -> bool = self.rpc_methods.contains_key(method)
+
+    pub fn get_rpc(self, method: String) -> ?SrvRpcSpec {
+        let s? = self.rpc_methods.get(method) else {
+            return null
+        }
+        s.as(SrvRpcSpec)
+    }
+
+    pub fn list_rpc_method_names(self) -> List {
+        let names = self.rpc_methods.keys()
+        names.sort()
+        names
+    }
+
+    pub fn list_rpc_specs(self) -> List {
+        let names = self.list_rpc_method_names()
+        let out = List()
+        for i in 0..names.len() {
+            let m = names.get(i.as(usize)).as(String)
+            let spec_opt = self.rpc_methods.get(m)
+            if spec_opt != null {
+                out.push(spec_opt.as(SrvRpcSpec))
+            }
+        }
+        out
+    }
+
+    pub fn dispatch_rpc(self, method: String, params: JsonValue) -> !String JsonValue {
+        let spec? = self.get_rpc(method) else {
+            return error ("unknown RPC method: " ++ method)
+        }
+        let h = spec.handler
+        h(self, params)
+    }
+
+    -- Hooks
+    pub fn add_hook(
+        self,
+        topic: String,
+        owner: SrvExtId,
+        callback: fn(ServerKernel, Any) -> Unit,
+        .priority: i64 = 0,
+    ) {
+        let listeners = if self.hooks.contains_key(topic) {
+            self.hooks.get(topic).as(List)
+        } else {
+            let fresh = List()
+            self.hooks.insert(topic, fresh)
+            fresh
+        }
+        listeners.push(SrvHookListener {
+            owner: owner,
+            priority: priority,
+            callback: callback,
+        })
+        listeners.sort_by(|a: Any, b: Any| {
+            let pa = a.as(SrvHookListener).priority
+            let pb = b.as(SrvHookListener).priority
+            pa.cmp(pb)
+        })
+    }
+
+    pub fn emit_hook(self, topic: String, payload: Any) {
+        let list_any? = self.hooks.get(topic) else {
+            return
+        }
+        let listeners = list_any.as(List)
+        for i in 0..listeners.len() {
+            let item = listeners.get(i.as(usize)).as(SrvHookListener)
+            if item.owner == server_core_id() or self.is_extension_active(item.owner) {
+                let cb = item.callback
+                cb(self, payload)
+            }
+        }
+    }
+}
+
+-- ============================================================================
+-- 3. JSON-RPC 2.0 Parameter Extraction & Framing Helpers
+-- ============================================================================
+
+pub fn expect_params_map(params: JsonValue) -> !String Map {
+    if params == null {
+        return Map()
+    }
+    params match {
+        m: Map => m,
+        _ => error invalid_params("expected JSON object for params"),
+    }
+}
+
+pub fn require_str_param(m: Map, key: String) -> !String String {
+    if not m.contains(key) {
+        return error invalid_params("missing required string parameter '" ++ key ++ "'")
+    }
+    let val = m.get(key)
+    val match {
+        s: String => s,
+        _ => error invalid_params("parameter '" ++ key ++ "' must be a string"),
+    }
+}
+
+pub fn opt_str_param(m: Map, key: String, default: String) -> !String String {
+    if not m.contains(key) {
+        return default
+    }
+    let val = m.get(key)
+    if val == null {
+        return default
+    }
+    val match {
+        s: String => s,
+        _ => error invalid_params("parameter '" ++ key ++ "' must be a string"),
+    }
+}
+
+pub fn opt_nullable_str_param(m: Map, key: String) -> !String ?String {
+    if not m.contains(key) {
+        return null
+    }
+    let val = m.get(key)
+    if val == null {
+        return null
+    }
+    val match {
+        s: String => s,
+        _ => error invalid_params("parameter '" ++ key ++ "' must be a string or null"),
+    }
+}
+
+pub fn require_i64_param(m: Map, key: String) -> !String i64 {
+    if not m.contains(key) {
+        return error invalid_params("missing required integer parameter '" ++ key ++ "'")
+    }
+    let val = m.get(key)
+    val match {
+        n: i64 => n,
+        _ => error invalid_params("parameter '" ++ key ++ "' must be an integer"),
+    }
+}
+
+pub fn opt_i64_param(m: Map, key: String, default: i64) -> !String i64 {
+    if not m.contains(key) {
+        return default
+    }
+    let val = m.get(key)
+    if val == null {
+        return default
+    }
+    val match {
+        n: i64 => n,
+        _ => error invalid_params("parameter '" ++ key ++ "' must be an integer"),
+    }
+}
+
+pub fn opt_nullable_i64_param(m: Map, key: String) -> !String ?i64 {
+    if not m.contains(key) {
+        return null
+    }
+    let val = m.get(key)
+    if val == null {
+        return null
+    }
+    val match {
+        n: i64 => n,
+        _ => error invalid_params("parameter '" ++ key ++ "' must be an integer or null"),
+    }
+}
+
+pub fn opt_bool_param(m: Map, key: String, default: bool) -> !String bool {
+    if not m.contains(key) {
+        return default
+    }
+    let val = m.get(key)
+    if val == null {
+        return default
+    }
+    val match {
+        b: bool => b,
+        _ => error invalid_params("parameter '" ++ key ++ "' must be a boolean"),
+    }
+}
+
+pub fn require_str_list_param(m: Map, key: String) -> !String List {
+    if not m.contains(key) {
+        return error invalid_params("missing required array parameter '" ++ key ++ "'")
+    }
+    let val = m.get(key)
+    let raw_list = val match {
+        arr: List => arr,
+        _ => return error invalid_params("parameter '" ++ key ++ "' must be an array of strings"),
+    }
+    let out = List()
+    for i in 0..raw_list.len() {
+        raw_list.get(i.as(usize)) match {
+            s: String => out.push(s),
+            _ => return error invalid_params("parameter '" ++ key ++ "' elements must be strings"),
+        }
+    }
+    out
+}
+
+pub fn opt_str_list_param(m: Map, key: String) -> !String List {
+    if not m.contains(key) {
+        return List()
+    }
+    let val = m.get(key)
+    if val == null {
+        return List()
+    }
+    let raw_list = val match {
+        arr: List => arr,
+        _ => return error invalid_params("parameter '" ++ key ++ "' must be an array of strings"),
+    }
+    let out = List()
+    for i in 0..raw_list.len() {
+        raw_list.get(i.as(usize)) match {
+            s: String => out.push(s),
+            _ => return error invalid_params("parameter '" ++ key ++ "' elements must be strings"),
+        }
+    }
+    out
+}
+
+pub fn opt_nullable_str_list_param(m: Map, key: String) -> !String ?List {
+    if not m.contains(key) {
+        return null
+    }
+    let val = m.get(key)
+    if val == null {
+        return null
+    }
+    let raw_list = val match {
+        arr: List => arr,
+        _ => return error invalid_params("parameter '" ++ key ++ "' must be an array of strings"),
+    }
+    let out = List()
+    for i in 0..raw_list.len() {
+        raw_list.get(i.as(usize)) match {
+            s: String => out.push(s),
+            _ => return error invalid_params("parameter '" ++ key ++ "' elements must be strings"),
+        }
+    }
+    out
+}
+
+pub fn format_rpc_result(req_id: JsonValue, result: JsonValue) -> String {
+    let env = Map()
+    env.set("jsonrpc", "2.0")
+    env.set("id", req_id)
+    env.set("result", result)
+    json.stringify(env) match {
+        s! => s,
+        error err => format_rpc_error(req_id, RPC_SERVER_ERROR, "JSON serialize error: " ++ err.to_string()),
+    }
+}
+
+pub fn format_rpc_error(req_id: JsonValue, code: i64, message: String) -> String {
+    let err_obj = Map()
+    err_obj.set("code", code)
+    err_obj.set("message", message)
+    let env = Map()
+    env.set("jsonrpc", "2.0")
+    env.set("id", req_id)
+    env.set("error", err_obj)
+    json.stringify(env) match {
+        s! => s,
+        error _ => "\x7b\"jsonrpc\":\"2.0\",\"id\":null,\"error\":\x7b\"code\":-32603,\"message\":\"internal serialization error\"\x7d\x7d",
+    }
+}
+
+pub fn handle_jsonrpc_message(kernel: ServerKernel, raw_json: String) -> String {
+    let trimmed = raw_json.trim()
+    if trimmed == "" {
+        return ""
+    }
+    let parsed = json.parse(trimmed) match {
+        v! => v,
+        error parse_err => {
+            return format_rpc_error(null, RPC_PARSE_ERROR, "Parse error: " ++ parse_err.to_string())
+        },
+    }
+    let req_map = parsed match {
+        m: Map => m,
+        _ => {
+            return format_rpc_error(null, RPC_INVALID_REQUEST, "Invalid Request: expected JSON object")
+        },
+    }
+
+    let has_id = req_map.contains("id")
+    let req_id = if has_id { req_map.get("id") } else { null }
+
+    if not req_map.contains("method") {
+        if has_id {
+            return format_rpc_error(req_id, RPC_INVALID_REQUEST, "Invalid Request: missing 'method'")
+        }
+        return ""
+    }
+    let method = req_map.get("method") match {
+        s: String => s,
+        _ => {
+            if has_id {
+                return format_rpc_error(req_id, RPC_INVALID_REQUEST, "Invalid Request: 'method' must be a string")
+            }
+            return ""
+        },
+    }
+
+    let params = if req_map.contains("params") { req_map.get("params") } else { Map() }
+    if (params != null) and (not (params matches _: Map)) and (not (params matches _: List)) {
+        if has_id {
+            return format_rpc_error(req_id, RPC_INVALID_PARAMS, "Invalid params: expected structured object or array")
+        }
+        return ""
+    }
+
+    if not kernel.has_rpc(method) {
+        if has_id {
+            return format_rpc_error(req_id, RPC_METHOD_NOT_FOUND, "Unknown method: " ++ method)
+        }
+        return ""
+    }
+
+    kernel.dispatch_rpc(method, params) match {
+        res! => {
+            if has_id {
+                format_rpc_result(req_id, res)
+            } else {
+                ""
+            }
+        },
+        error err_msg => {
+            if not has_id {
+                return ""
+            }
+            if err_msg.starts_with(INVALID_PARAMS_PREFIX) {
+                format_rpc_error(req_id, RPC_INVALID_PARAMS, err_msg.drop(INVALID_PARAMS_PREFIX.len()))
+            } else {
+                format_rpc_error(req_id, RPC_SERVER_ERROR, err_msg)
+            }
+        },
+    }
+}

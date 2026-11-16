@@ -1,0 +1,507 @@
+-- End-to-end integration test suite for Lava Batch 04 Git Plugins (10–12):
+--   10. `ext_gitsigns` (`gitsigns.nvim`: live hunk signs, `]c`/`[c`, preview, stage, reset, blame)
+--   11. `ext_magit` (`Magit`/`Neogit`: `*magit*` status, `<Tab>` diff, `s`/`u`/`c`/`l`/`q`)
+--   12. `ext_git_conflict` (`git-conflict.nvim`: 2-way/3-way decorations, `]x`/`[x`, ours/theirs/both/none, undo, qf)
+
+use std.fs
+use std.path
+use std.process
+use std.time
+use @lava_sys.{RawUiEvent, mock_enable, mock_last_frame_cmds}
+use @lava_core.{SystemKernel, clipboard_get, clipboard_set, log_event, status_emit}
+use @lava_accel.{accel_git_head_lines, accel_git_status}
+use @ext_document.{
+    Buffer, BufferKind, EditorWorld, FloatingWindow, GutterSign, InlineSpanDecor, MinibufferView,
+    VirtualTextDecor, require_editor_world
+}
+use @ext_app.{AppHostCap, app_commit_frame, app_feed_keys, app_step_event, boot_kernel}
+use @ext_gitsigns.{
+    FLOAT_GITSIGNS_PREVIEW, GitsignsState, OWNER_GITSIGNS, register_gitsigns_extension,
+    require_gitsigns_state, rgba_hex
+}
+use @ext_magit.{MAGIT_BUF_NAME, MAGIT_LOG_BUF_NAME, register_magit_extension}
+use @ext_git_conflict.{
+    CONFLICT_HINT_TEXT, GitConflictState, OWNER_GIT_CONFLICT, register_git_conflict_extension,
+    require_git_conflict_state
+}
+
+fn check_true(cond: bool, label: String) {
+    if not cond {
+        panic("FAILED: " ++ label)
+    }
+}
+
+fn check_eq_str(actual: String, expected: String, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual='" ++ actual ++ "' expected='" ++ expected ++ "'")
+    }
+}
+
+fn check_eq_i64(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual=" ++ actual.to_string() ++ " expected=" ++ expected.to_string())
+    }
+}
+
+fn run_git_checked(cwd: String, args: List) -> String {
+    let out_res = process.exec("git", args = args, cwd = cwd)
+    out_res match {
+        out! => {
+            if out.status != 0 {
+                panic(
+                    "git " ++ args.join(" ") ++ " failed (code "
+                    ++ out.status.to_string() ++ "): " ++ out.stderr,
+                )
+            }
+            out.stdout
+        },
+        error err => panic("git exec error: " ++ err.to_string()),
+    }
+}
+
+fn boot_batch04_kernel() -> SystemKernel {
+    let kernel: SystemKernel = (boot_kernel() ! { e => panic(e) }).as(SystemKernel)
+    let _ = register_gitsigns_extension(kernel) ! { e => panic(e) }
+    let _ = register_magit_extension(kernel) ! { e => panic(e) }
+    let _ = register_git_conflict_extension(kernel) ! { e => panic(e) }
+    let _ = kernel.activate_all() ! { e => panic(e) }
+    kernel
+}
+
+fn count_owner_signs(buf: Buffer, owner: String) -> i64 {
+    var count: i64 = 0
+    for i in 0..buf.signs.len() {
+        let s = buf.signs.get(i.as(usize)).as(GutterSign)
+        if s.owner == owner {
+            count += 1
+        }
+    }
+    count
+}
+
+fn has_owner_sign(buf: Buffer, owner: String, text: String, fg_rgba: i64) -> bool {
+    for i in 0..buf.signs.len() {
+        let s = buf.signs.get(i.as(usize)).as(GutterSign)
+        if s.owner == owner and s.text == text and s.fg_rgba == fg_rgba {
+            return true
+        }
+    }
+    false
+}
+
+fn count_owner_inline_decors(buf: Buffer, owner: String) -> i64 {
+    var count: i64 = 0
+    for i in 0..buf.inline_decors.len() {
+        let d = buf.inline_decors.get(i.as(usize)).as(InlineSpanDecor)
+        if d.owner == owner {
+            count += 1
+        }
+    }
+    count
+}
+
+fn count_owner_virt_texts(buf: Buffer, owner: String) -> i64 {
+    var count: i64 = 0
+    for i in 0..buf.virt_texts.len() {
+        let vt = buf.virt_texts.get(i.as(usize)).as(VirtualTextDecor)
+        if vt.owner == owner {
+            count += 1
+        }
+    }
+    count
+}
+
+fn find_owner_virt_text_at_row(buf: Buffer, owner: String, row: i64) -> String {
+    for i in 0..buf.virt_texts.len() {
+        let vt = buf.virt_texts.get(i.as(usize)).as(VirtualTextDecor)
+        if vt.owner == owner and vt.row == row {
+            return vt.text
+        }
+    }
+    ""
+}
+
+fn buffer_contains_line_substr(buf: Buffer, needle: String) -> bool {
+    for i in 0..buf.line_count() {
+        if buf.line_at(i).contains(needle) {
+            return true
+        }
+    }
+    false
+}
+
+fn find_row_containing(buf: Buffer, needle: String) -> i64 {
+    for i in 0..buf.line_count() {
+        if buf.line_at(i).contains(needle) {
+            return i
+        }
+    }
+    -1
+}
+
+fn test_batch_04_git_plugins() {
+    mock_enable(true)
+
+    -- 1. Create a real temporary git repository with an initial committed file
+    let tmp_dir = "/tmp/lava_batch04_" ++ time.unix_millis().to_string()
+    let _ = fs.create_dir_all(tmp_dir) ! { e => panic(e.to_string()) }
+
+    let _ = run_git_checked(tmp_dir, ["init"])
+    let _ = run_git_checked(tmp_dir, ["config", "user.email", "test@lava.org"])
+    let _ = run_git_checked(tmp_dir, ["config", "user.name", "Tester"])
+
+    let app_file = path.join(tmp_dir, "app.ns")
+    let initial_app_text = [
+        "fn alpha() -> i64 {{",
+        "    let a = 1",
+        "    a",
+        "}}",
+        "fn beta() -> i64 {{",
+        "    let b = 2",
+        "    b",
+        "}}",
+        "fn gamma() -> i64 {{",
+        "    let c = 3",
+        "    c",
+        "}}",
+    ].join("\n") ++ "\n"
+    let _ = fs.write_string(app_file, initial_app_text) ! { e => panic(e.to_string()) }
+    let _ = run_git_checked(tmp_dir, ["add", "app.ns"])
+    let _ = run_git_checked(tmp_dir, ["commit", "-m", "chore: initial commit"])
+
+    -- 2. Boot kernel with all built-in + Batch 04 extensions
+    let kernel = boot_batch04_kernel()
+    check_eq_i64(kernel.list_extensions().len(), 11, "11 active extensions (8 core + 3 batch04)")
+
+    let world: EditorWorld = (require_editor_world(kernel) ! { e => panic(e) }).as(EditorWorld)
+    world.cwd = tmp_dir
+    let gs_state: GitsignsState = (require_gitsigns_state(kernel) ! { e => panic(e) }).as(GitsignsState)
+    let gc_state: GitConflictState = (require_git_conflict_state(kernel) ! { e => panic(e) }).as(GitConflictState)
+
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
+    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+
+    -- ========================================================================
+    -- PART A: Plugin 10 — `ext_gitsigns`
+    -- ========================================================================
+    app_feed_keys(kernel, ":e<Space>" ++ app_file ++ "<Return>")# ! { e => panic(e) }
+    let buf = world.active_buffer()
+    check_eq_str(buf.name, "app.ns", "opened app.ns")
+    check_eq_i64(count_owner_signs(buf, OWNER_GITSIGNS), 0, "clean HEAD has 0 gitsigns")
+
+    -- Make 3 distinct edits in `app.ns`:
+    --   (1) Change line 1 (`let a = 1` -> `let a = 100`) -> `"change"` hunk
+    --   (2) Add a new line below line 5 (`let b_extra = 20`) -> `"add"` hunk (`o` auto-indents 4 spaces)
+    --   (3) Delete line 10 (`    let c = 3` after insertion shifted it to row 10) -> `"delete"` hunk
+    app_feed_keys(kernel, "ggj0f1ciw100<Escape>")# ! { e => panic(e) }
+    check_eq_str(buf.line_at(1), "    let a = 100", "changed line 1")
+
+    app_feed_keys(kernel, "gg5jolet<Space>b_extra<Space>=<Space>20<Escape>")# ! { e => panic(e) }
+    check_eq_str(buf.line_at(6), "    let b_extra = 20", "added line at row 6")
+
+    let c_row = find_row_containing(buf, "let c = 3")
+    check_true(c_row > 0, "found let c = 3 row")
+    app_feed_keys(kernel, (c_row + 1).to_string() ++ "Gdd")# ! { e => panic(e) }
+    check_true(not buffer_contains_line_substr(buf, "let c = 3"), "deleted let c = 3")
+
+    -- Verify `ext_gitsigns` added green add, blue change, and red delete GutterSigns + service stats!
+    let add_fg = rgba_hex(0x9ECE6A, 255)
+    let change_fg = rgba_hex(0x7AA2F7, 255)
+    let delete_fg = rgba_hex(0xF7768E, 255)
+    check_true(has_owner_sign(buf, OWNER_GITSIGNS, "▍", change_fg), "has blue change sign ▍")
+    check_true(has_owner_sign(buf, OWNER_GITSIGNS, "▍", add_fg), "has green add sign ▍")
+    check_true(has_owner_sign(buf, OWNER_GITSIGNS, "▁", delete_fg), "has red delete sign ▁")
+
+    let (cnt_add, cnt_chg, cnt_del) = gs_state.hunk_counts(buf.id)
+    check_eq_i64(cnt_add, 1, "gitsigns added count")
+    check_eq_i64(cnt_chg, 1, "gitsigns changed count")
+    check_eq_i64(cnt_del, 1, "gitsigns deleted count")
+
+    -- Navigate hunks with `]c` and `[c`
+    app_feed_keys(kernel, "gg0]c")# ! { e => panic(e) }
+    let first_hunk_row = buf.point.row
+    check_eq_i64(first_hunk_row, 1, "]c jumped to first hunk (change at row 1)")
+
+    app_feed_keys(kernel, "]c")# ! { e => panic(e) }
+    let second_hunk_row = buf.point.row
+    check_eq_i64(second_hunk_row, 6, "]c jumped to second hunk (add at row 6)")
+
+    app_feed_keys(kernel, "]c")# ! { e => panic(e) }
+    let third_hunk_row = buf.point.row
+    check_true(third_hunk_row > second_hunk_row, "]c jumped to third hunk (delete)")
+
+    app_feed_keys(kernel, "[c")# ! { e => panic(e) }
+    check_eq_i64(buf.point.row, second_hunk_row, "[c jumped back to second hunk")
+
+    app_feed_keys(kernel, "[c")# ! { e => panic(e) }
+    check_eq_i64(buf.point.row, first_hunk_row, "[c jumped back to first hunk")
+
+    -- Preview hunk floating window via `<Space> h p`
+    app_feed_keys(kernel, "<Space>hp")# ! { e => panic(e) }
+    let preview_opt = world.get_floating_window(FLOAT_GITSIGNS_PREVIEW)
+    check_true(preview_opt != null, "gitsigns-preview floating window opened")
+    let preview_win = preview_opt.as(FloatingWindow)
+    let preview_joined = preview_win.lines.join("\n")
+    check_true(preview_joined.contains("@@"), "preview contains unified hunk header")
+    check_true(preview_joined.contains("-    let a = 1"), "preview contains removed HEAD line")
+    check_true(preview_joined.contains("+    let a = 100"), "preview contains added buffer line")
+
+    -- Commit a frame while preview float + signs are active to verify scene rendering
+    let gen1 = app_commit_frame(kernel) ! { e => panic(e) }
+    check_true(gen1 >= 1 and mock_last_frame_cmds().len() > 20, "rendered frame with gitsigns")
+
+    -- Stage first hunk into git index via `<Space> h s` and verify git index staged count, then unstage & `:Gitsigns refresh`
+    app_feed_keys(kernel, "<Space>hs")# ! { e => panic(e) }
+    let st_after_hunk_stage = accel_git_status(tmp_dir)
+    check_eq_i64(st_after_hunk_stage.staged_count, 1, "gitsigns-stage-hunk staged hunk in git index")
+    let _ = run_git_checked(tmp_dir, ["reset", "HEAD", "--", "app.ns"])
+    app_feed_keys(kernel, ":Gitsigns<Space>refresh<Return>")# ! { e => panic(e) }
+
+    -- Reset first hunk via `<Space> h r` and verify line reverts to HEAD (`let a = 1`)!
+    app_feed_keys(kernel, "<Space>hr")# ! { e => panic(e) }
+    check_eq_str(buf.line_at(1), "    let a = 1", "gitsigns-reset-hunk restored line 1 to HEAD")
+    let (_, cnt_chg_after_reset, _) = gs_state.hunk_counts(buf.id)
+    check_eq_i64(cnt_chg_after_reset, 0, "changed hunk cleared after reset")
+
+    -- Reset remaining two hunks (`]c` -> `<Space>hr` twice) so buffer matches HEAD cleanly
+    app_feed_keys(kernel, "gg0]c<Space>hrgg0]c<Space>hr")# ! { e => panic(e) }
+    check_eq_i64(count_owner_signs(buf, OWNER_GITSIGNS), 0, "all hunks reset back to HEAD")
+    check_true(buffer_contains_line_substr(buf, "let c = 3"), "deleted line restored by hunk reset")
+
+    -- Toggle current-line EOL blame via `<Space> g b`
+    app_feed_keys(kernel, "gg0<Space>gb")# ! { e => panic(e) }
+    let blame_vt = find_owner_virt_text_at_row(buf, OWNER_GITSIGNS, 0)
+    check_true(
+        blame_vt.contains("Tester") and blame_vt.contains("chore: initial commit"),
+        "blame virtual text='" ++ blame_vt ++ "'",
+    )
+    -- Toggle blame off
+    app_feed_keys(kernel, "<Space>gb")# ! { e => panic(e) }
+    check_eq_str(find_owner_virt_text_at_row(buf, OWNER_GITSIGNS, 0), "", "blame toggled off")
+
+    -- ========================================================================
+    -- PART B: Plugin 11 — `ext_magit`
+    -- ========================================================================
+    -- Modify `app.ns` on disk (unstaged) and create untracked `notes.txt`
+    let modified_app_text = initial_app_text.replace("let a = 1", "let a = 42")
+    let _ = fs.write_string(app_file, modified_app_text) ! { e => panic(e.to_string()) }
+    let notes_file = path.join(tmp_dir, "notes.txt")
+    let _ = fs.write_string(notes_file, "Magit porcelain notes\n") ! { e => panic(e.to_string()) }
+
+    -- Open `*magit*` via `<Space> g g`
+    app_feed_keys(kernel, "<Space>gg")# ! { e => panic(e) }
+    let magit_buf = world.active_buffer()
+    check_eq_str(magit_buf.name, MAGIT_BUF_NAME, "opened *magit* buffer")
+    check_eq_str(magit_buf.major_mode, "magit", "*magit* major_mode")
+    check_true(buffer_contains_line_substr(magit_buf, "Head:"), "*magit* has Head header")
+    check_true(buffer_contains_line_substr(magit_buf, "Untracked files (1)"), "*magit* shows 1 untracked")
+    check_true(buffer_contains_line_substr(magit_buf, "Unstaged changes (1)"), "*magit* shows 1 unstaged")
+    check_true(buffer_contains_line_substr(magit_buf, "Recent commits"), "*magit* shows Recent commits")
+
+    -- Move cursor to `app.ns` under Unstaged changes and press `<Tab>` to expand inline diff!
+    let unstaged_app_row = find_row_containing(magit_buf, "modified   app.ns")
+    check_true(unstaged_app_row >= 0, "found modified app.ns row in *magit*")
+    app_feed_keys(kernel, (unstaged_app_row + 1).to_string() ++ "G<Tab>")# ! { e => panic(e) }
+    check_true(buffer_contains_line_substr(magit_buf, "@@"), "<Tab> expanded inline @@ diff")
+    check_true(buffer_contains_line_substr(magit_buf, "+    let a = 42"), "<Tab> shows +let a = 42")
+
+    -- Press `s` on `app.ns` to stage it, and `s` on `notes.txt` to stage untracked file!
+    let unstaged_app_row2 = find_row_containing(magit_buf, "modified   app.ns")
+    app_feed_keys(kernel, (unstaged_app_row2 + 1).to_string() ++ "Gs")# ! { e => panic(e) }
+    check_true(buffer_contains_line_substr(magit_buf, "Staged changes (1)"), "staged app.ns")
+
+    let untracked_notes_row = find_row_containing(magit_buf, "notes.txt")
+    check_true(untracked_notes_row >= 0, "found untracked notes.txt row")
+    app_feed_keys(kernel, (untracked_notes_row + 1).to_string() ++ "Gs")# ! { e => panic(e) }
+    check_true(buffer_contains_line_substr(magit_buf, "Staged changes (2)"), "staged both files")
+
+    -- Test `u` (unstage file), `U` (unstage all), and `S` (stage all) before committing!
+    let staged_notes_row = find_row_containing(magit_buf, "notes.txt")
+    app_feed_keys(kernel, (staged_notes_row + 1).to_string() ++ "Gu")# ! { e => panic(e) }
+    check_true(buffer_contains_line_substr(magit_buf, "Untracked files (1)"), "u unstaged notes.txt")
+    app_feed_keys(kernel, "U")# ! { e => panic(e) }
+    check_true(buffer_contains_line_substr(magit_buf, "Unstaged changes (1)"), "U unstaged all")
+    app_feed_keys(kernel, "S")# ! { e => panic(e) }
+    check_true(buffer_contains_line_substr(magit_buf, "Staged changes (2)"), "S staged all")
+
+    -- Expand staged inline diff with `<Tab>` on staged `app.ns`
+    let staged_app_row = find_row_containing(magit_buf, "modified   app.ns")
+    check_true(staged_app_row >= 0, "found staged app.ns row")
+    app_feed_keys(kernel, (staged_app_row + 1).to_string() ++ "G<Tab>")# ! { e => panic(e) }
+    check_true(buffer_contains_line_substr(magit_buf, "+    let a = 42"), "staged diff expanded")
+
+    -- Press `c` to start commit prompt (suspends via `ask_prompt`), then submit via `kernel.submit_prompt_answer`!
+    app_feed_keys(kernel, "c")# ! { e => panic(e) }
+    check_true(kernel.active_prompt != null, "magit commit suspended on ask_prompt")
+    let _ = kernel.submit_prompt_answer("feat: magit commit")# ! { e => panic(e) }
+    world.minibuffer_view = MinibufferView.inactive()
+
+    -- Verify `Recent commits` contains `"feat: magit commit"` and working tree is clean!
+    check_true(
+        buffer_contains_line_substr(magit_buf, "feat: magit commit"),
+        "Recent commits updated with 'feat: magit commit'",
+    )
+    check_true(
+        buffer_contains_line_substr(magit_buf, "Working tree clean"),
+        "*magit* reports Working tree clean",
+    )
+    let clean_st = accel_git_status(tmp_dir)
+    check_eq_i64(clean_st.staged_count, 0, "git clean staged == 0")
+    check_eq_i64(clean_st.modified_count, 0, "git clean modified == 0")
+    check_eq_i64(clean_st.untracked_count, 0, "git clean untracked == 0")
+
+    -- Test `b` branch creation/checkout (`feat/batch04`) via `ask_prompt`!
+    app_feed_keys(kernel, "b")# ! { e => panic(e) }
+    check_true(kernel.active_prompt != null, "magit branch suspended on ask_prompt")
+    let _ = kernel.submit_prompt_answer("feat/batch04")# ! { e => panic(e) }
+    world.minibuffer_view = MinibufferView.inactive()
+    check_true(buffer_contains_line_substr(magit_buf, "Head:     feat/batch04"), "switched to feat/batch04")
+
+    -- Test `x` discard unstaged file changes (with `y` confirmation) & `<Return>` visit!
+    let _ = fs.write_string(notes_file, "Temporary dirty edit\n") ! { e => panic(e.to_string()) }
+    app_feed_keys(kernel, "g")# ! { e => panic(e) }
+    let dirty_notes_row = find_row_containing(magit_buf, "modified   notes.txt")
+    check_true(dirty_notes_row >= 0, "magit g detected dirty notes.txt")
+    app_feed_keys(kernel, (dirty_notes_row + 1).to_string() ++ "Gx")# ! { e => panic(e) }
+    check_true(kernel.active_prompt != null, "magit discard suspended on confirmation")
+    let _ = kernel.submit_prompt_answer("y")# ! { e => panic(e) }
+    world.minibuffer_view = MinibufferView.inactive()
+    check_true(buffer_contains_line_substr(magit_buf, "Working tree clean"), "x discarded dirty notes.txt")
+
+    -- Press `l` to inspect `*magit-log*`, `q` back to `*magit*`, `q` to bury `*magit*`, and `<C-x> g` Emacs binding!
+    app_feed_keys(kernel, "l")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, MAGIT_LOG_BUF_NAME, "opened *magit-log*")
+    check_true(buffer_contains_line_substr(world.active_buffer(), "feat: magit commit"), "log shows commit")
+    app_feed_keys(kernel, "qq")# ! { e => panic(e) }
+    check_true(world.active_buffer().name != MAGIT_BUF_NAME, "q buried *magit*")
+    app_feed_keys(kernel, "<C-x> g")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, MAGIT_BUF_NAME, "<C-x> g reopened *magit*")
+    app_feed_keys(kernel, "q")# ! { e => panic(e) }
+
+    -- ========================================================================
+    -- PART C: Plugin 12 — `ext_git_conflict`
+    -- ========================================================================
+    let conflict_lines = [
+        "fn greet() -> String {{",
+        "<<<<<<< HEAD",
+        "    let prefix = \"Hello\"",
+        "=======",
+        "    let prefix = \"Hi\"",
+        ">>>>>>> feature",
+        "    let sep = \", \"",
+        "<<<<<<< HEAD",
+        "    let target = \"World\"",
+        "=======",
+        "    let target = \"Lava\"",
+        ">>>>>>> feature",
+        "    prefix ++ sep ++ target",
+        "}}",
+    ]
+    let cbuf = world.create_buffer(
+        "conflict.ns",
+        BufferKind.File,
+        file_path = path.join(tmp_dir, "conflict.ns"),
+        major_mode = "nessa",
+        initial_lines = conflict_lines,
+    )
+    let _ = world.switch_to_buffer(cbuf.id)
+    kernel.emit_hook("buffer-opened", cbuf.id)
+    kernel.emit_hook("buffer-switched", cbuf.id)
+
+    -- Verify conflict decorations on both conflict blocks
+    check_eq_i64(gc_state.conflict_count(cbuf.id), 2, "detected 2 conflict blocks")
+    check_true(count_owner_signs(cbuf, OWNER_GIT_CONFLICT) >= 10, "conflict gutter ! signs added")
+    check_true(count_owner_inline_decors(cbuf, OWNER_GIT_CONFLICT) >= 10, "conflict inline spans added")
+    check_eq_i64(count_owner_virt_texts(cbuf, OWNER_GIT_CONFLICT), 2, "2 conflict hint virt_texts")
+    check_eq_str(
+        find_owner_virt_text_at_row(cbuf, OWNER_GIT_CONFLICT, 1),
+        CONFLICT_HINT_TEXT,
+        "conflict 1 EOL hint text",
+    )
+
+    -- Populate quickfix list via `:GitConflictListQf`
+    app_feed_keys(kernel, ":GitConflictListQf<Return>")# ! { e => panic(e) }
+    check_eq_i64(world.quickfix.len(), 2, "quickfix populated with 2 conflicts")
+
+    -- Jump forward/backward between conflicts with `]x` / `[x`, then resolve #1 with `<Space> c o` (ours)
+    app_feed_keys(kernel, "gg0]x]x")# ! { e => panic(e) }
+    check_eq_i64(cbuf.point.row, 7, "second ]x jumped to conflict #2 at row 7")
+    app_feed_keys(kernel, "[x")# ! { e => panic(e) }
+    check_eq_i64(cbuf.point.row, 1, "[x jumped back to conflict #1 at row 1")
+    app_feed_keys(kernel, "<Space>co")# ! { e => panic(e) }
+    check_eq_str(cbuf.line_at(1), "    let prefix = \"Hello\"", "conflict #1 resolved to OURS")
+    check_eq_i64(gc_state.conflict_count(cbuf.id), 1, "1 conflict remaining after resolving #1")
+
+    -- Jump to second conflict with `]x` and resolve with `<Space> c t` (theirs)
+    app_feed_keys(kernel, "]x")# ! { e => panic(e) }
+    check_eq_i64(cbuf.point.row, 3, "]x jumped to conflict #2 at shifted row 3")
+    app_feed_keys(kernel, "<Space>ct")# ! { e => panic(e) }
+    check_eq_str(cbuf.line_at(3), "    let target = \"Lava\"", "conflict #2 resolved to THEIRS")
+
+    -- Verify all conflict markers and conflict decorations are completely gone!
+    check_eq_i64(gc_state.conflict_count(cbuf.id), 0, "0 conflicts after resolving both")
+    check_eq_i64(count_owner_signs(cbuf, OWNER_GIT_CONFLICT), 0, "0 conflict signs remaining")
+    check_eq_i64(count_owner_inline_decors(cbuf, OWNER_GIT_CONFLICT), 0, "0 conflict inline decors remaining")
+    check_eq_i64(count_owner_virt_texts(cbuf, OWNER_GIT_CONFLICT), 0, "0 conflict virt_texts remaining")
+    check_true(not buffer_contains_line_substr(cbuf, "<<<<<<<"), "no <<<<<<< markers left")
+    check_true(not buffer_contains_line_substr(cbuf, "======="), "no ======= markers left")
+    check_true(not buffer_contains_line_substr(cbuf, ">>>>>>>"), "no >>>>>>> markers left")
+
+    -- Test `u` undo restores conflict markers AND conflict decorations, and `<C-r>` redoes!
+    app_feed_keys(kernel, "u")# ! { e => panic(e) }
+    check_eq_i64(gc_state.conflict_count(cbuf.id), 1, "undo restored conflict #2")
+    check_true(buffer_contains_line_substr(cbuf, "<<<<<<< HEAD"), "undo restored <<<<<<< marker")
+    check_eq_i64(count_owner_virt_texts(cbuf, OWNER_GIT_CONFLICT), 1, "undo restored conflict #2 virt_text")
+
+    app_feed_keys(kernel, "u")# ! { e => panic(e) }
+    check_eq_i64(gc_state.conflict_count(cbuf.id), 2, "second undo restored both conflicts")
+    check_eq_i64(count_owner_virt_texts(cbuf, OWNER_GIT_CONFLICT), 2, "second undo restored both virt_texts")
+
+    app_feed_keys(kernel, "<C-r><C-r>")# ! { e => panic(e) }
+    check_eq_i64(gc_state.conflict_count(cbuf.id), 0, "redo re-applied both conflict resolutions")
+    check_eq_str(cbuf.line_at(1), "    let prefix = \"Hello\"", "redo line 1")
+    check_eq_str(cbuf.line_at(3), "    let target = \"Lava\"", "redo line 3")
+
+    -- Also verify diff3 3-way conflict (`||||||| base`) + `<Space> c b` (both)!
+    let diff3_buf = world.create_buffer(
+        "diff3.ns",
+        BufferKind.File,
+        major_mode = "nessa",
+        initial_lines = [
+            "<<<<<<< HEAD",
+            "let x = 1",
+            "||||||| base",
+            "let x = 0",
+            "=======",
+            "let y = 2",
+            ">>>>>>> topic",
+        ],
+    )
+    let _ = world.switch_to_buffer(diff3_buf.id)
+    kernel.emit_hook("buffer-opened", diff3_buf.id)
+    kernel.emit_hook("buffer-switched", diff3_buf.id)
+    check_eq_i64(gc_state.conflict_count(diff3_buf.id), 1, "diff3 conflict detected")
+    app_feed_keys(kernel, "gg0<Space>cb")# ! { e => panic(e) }
+    check_eq_i64(gc_state.conflict_count(diff3_buf.id), 0, "diff3 conflict resolved via both")
+    check_eq_str(diff3_buf.line_at(0), "let x = 1", "diff3 both line 0 (ours)")
+    check_eq_str(diff3_buf.line_at(1), "let y = 2", "diff3 both line 1 (theirs)")
+
+    -- Verify `<Space> c 0` (`none`) AND ensure normal Vim `ct` / `cb` / `c0` motions still work!
+    app_feed_keys(kernel, "u<Space>c0")# ! { e => panic(e) }
+    check_eq_i64(gc_state.conflict_count(diff3_buf.id), 0, "conflict resolved via none")
+    check_eq_str(diff3_buf.line_at(0), "", "none emptied conflict block")
+    app_feed_keys(kernel, "ifoo<Space>bar<Space>=<Space>\"baz\"<Escape>0f=ct\"X<Escape>")# ! { e => panic(e) }
+    check_eq_str(diff3_buf.line_at(0), "foo bar X\"baz\"", "Vim ct\" motion remains intact")
+
+    -- Final frame commit & cleanup
+    let gen2 = app_commit_frame(kernel) ! { e => panic(e) }
+    check_true(gen2 > gen1, "final frame committed cleanly")
+
+    let _ = cap
+    let _ = fs.remove_dir_all(tmp_dir) ! { _ => () }
+}
+
+fn main() {
+    test_batch_04_git_plugins()
+    println("test_plugins_batch_04: ALL PASSED")
+}

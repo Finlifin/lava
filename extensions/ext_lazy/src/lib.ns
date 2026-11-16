@@ -1,0 +1,854 @@
+-- ext_lazy: Interactive Single-VM Extension Manager & Runtime Health Inspector (`lava.org/ext_lazy`).
+-- Inspired by `folke/lazy.nvim` and Emacs `package.el`: live introspection of `SystemKernel`
+-- extensions, services, commands, and keymaps in `*Lazy*` (`<Space>l`, `:Lazy`), detail inspector
+-- float (`<Return>`/`K`), live hot-enable/disable (`x`/`e`) with dependency & core guards,
+-- activate-all (`R`), and `:CheckHealth` (`c`) runtime verification.
+
+use std.collections.HashMap
+use std.runtime
+use @lava_sys.rgb
+use @lava_core.{
+    CommandSpec, ExtId, ExtState, ExtensionRecord, HookListener, InteractiveEffects,
+    KeyBindingEntry, KeyStroke, Keymap, ServiceEffects, ServiceEntry, SystemKernel, log_event,
+    status_emit
+}
+use @lava_accel.accel_fuzzy_rank
+use @ext_document.{
+    Buffer, BufferId, EditorWorld, FloatingWindow, Pos, ext_document_id, require_editor_world
+}
+use @ext_vim.{
+    KEYMAP_VIM_LEADER, ModalInterceptor, VimMode, VimState, ext_vim_id, require_vim_state,
+    sync_world_from_vim
+}
+
+pub const SERVICE_LAZY: String = "lava.lazy.manager"
+pub const OWNER_LAZY: String = "ext_lazy"
+pub const LAZY_BUF_NAME: String = "*Lazy*"
+pub const CHECKHEALTH_BUF_NAME: String = "*CheckHealth*"
+pub const MODE_LAZY: String = "lazy"
+pub const MODE_CHECKHEALTH: String = "checkhealth"
+pub const FLOAT_ID_LAZY_DETAIL: String = "lazy-detail"
+
+pub fn ext_lazy_id() -> ExtId = ExtId("lava.org/ext_lazy")
+
+pub struct LazyService {
+    pub prev_buf_id: ?BufferId,
+    pub health_prev_buf_id: ?BufferId,
+    pub row_ext_map: HashMap,
+    pub detail_open: bool,
+    pub last_health_ok: bool,
+}
+
+impl LazyService {
+    pub fn new() -> LazyService {
+        LazyService {
+            prev_buf_id: null,
+            health_prev_buf_id: null,
+            row_ext_map: HashMap.new(),
+            detail_open: false,
+            last_health_ok: true,
+        }
+    }
+}
+
+pub fn require_lazy_service(kernel: SystemKernel) -> !String LazyService {
+    let raw = kernel.require_service(SERVICE_LAZY)!
+    raw.as(LazyService)
+}
+
+-- ============================================================================
+-- 1. Live Single-VM Runtime Introspection Helpers
+-- ============================================================================
+
+fn format_ext_state(st: ExtState) -> String {
+    st match {
+        ExtState.Active => "Active",
+        ExtState.Disabled => "Disabled",
+        ExtState.Registered => "Registered",
+        ExtState.Failed(reason) => "Failed: " ++ reason,
+    }
+}
+
+fn services_owned_by(kernel: SystemKernel, id: ExtId) -> List {
+    let out = List()
+    let keys = kernel.services.keys()
+    keys.sort()
+    for i in 0..keys.len() {
+        let sk = keys.get(i.as(usize)).as(String)
+        let entry = kernel.services.get(sk).as(ServiceEntry)
+        if entry.owner == id {
+            out.push(entry.name)
+        }
+    }
+    out
+}
+
+fn commands_owned_by(kernel: SystemKernel, id: ExtId) -> List {
+    let out = List()
+    let keys = kernel.commands.keys()
+    keys.sort()
+    for i in 0..keys.len() {
+        let ck = keys.get(i.as(usize)).as(String)
+        let spec = kernel.commands.get(ck).as(CommandSpec)
+        if spec.owner == id {
+            out.push(spec)
+        }
+    }
+    out
+}
+
+fn keybindings_owned_by(kernel: SystemKernel, id: ExtId) -> List {
+    let out = List()
+    let km_names = kernel.keymaps.keys()
+    km_names.sort()
+    for i in 0..km_names.len() {
+        let km_name = km_names.get(i.as(usize)).as(String)
+        let km = kernel.keymaps.get(km_name).as(Keymap)
+        let chords = km.bindings.keys()
+        chords.sort()
+        for j in 0..chords.len() {
+            let ch = chords.get(j.as(usize)).as(String)
+            let entry = km.bindings.get(ch).as(KeyBindingEntry)
+            if entry.owner == id {
+                out.push("[" ++ km_name ++ "] " ++ entry.chord ++ " -> " ++ entry.command_name)
+            }
+        }
+    }
+    out
+}
+
+fn active_dependents_of(kernel: SystemKernel, target_id: ExtId) -> List {
+    let out = List()
+    let all = kernel.list_extensions()
+    for i in 0..all.len() {
+        let rec = all.get(i.as(usize)).as(ExtensionRecord)
+        if rec.id != target_id and rec.state == ExtState.Active {
+            for j in 0..rec.dependencies.len() {
+                if rec.dependencies.get(j.as(usize)).as(ExtId) == target_id {
+                    out.push(rec.id)
+                    break
+                }
+            }
+        }
+    }
+    out
+}
+
+fn is_foundational_core_extension(id: ExtId) -> bool {
+    let raw = id.raw()
+    raw == "lava.org/ext_document"
+        or raw == "lava.org/ext_window"
+        or raw == "lava.org/ext_render"
+        or raw == "lava.org/ext_vim"
+        or raw == "lava.org/ext_app"
+        or raw == "lava.org/ext_lazy"
+}
+
+pub fn render_lazy_buffer(kernel: SystemKernel, _world: EditorWorld) -> List {
+    let svc_opt = kernel.service(SERVICE_LAZY)
+    let row_map = HashMap.new()
+    let all = kernel.list_extensions()
+    let active_list = List()
+    let other_list = List()
+
+    for i in 0..all.len() {
+        let rec = all.get(i.as(usize)).as(ExtensionRecord)
+        if rec.state == ExtState.Active {
+            active_list.push(rec)
+        } else {
+            other_list.push(rec)
+        }
+    }
+
+    let total_n = all.len()
+    let active_a = active_list.len()
+    let other_d = other_list.len()
+    let svc_s = kernel.services.keys().len()
+    let cmd_c = kernel.commands.keys().len()
+
+    let out = List()
+    out.push(
+        "Lava Extension Manager (Lazy) — Total: " ++ total_n.to_string()
+        ++ " | Active: " ++ active_a.to_string()
+        ++ " | Disabled: " ++ other_d.to_string()
+        ++ " | Services: " ++ svc_s.to_string()
+        ++ " | Commands: " ++ cmd_c.to_string()
+    )
+    out.push("[RET/K] Details  [x] Toggle Enable/Disable  [R] Activate All  [c] Check Health  [q] Close")
+    out.push("==========================================================================================")
+    out.push("")
+
+    out.push("● Active Extensions (" ++ active_a.to_string() ++ ")")
+    if active_a == 0 {
+        out.push("  (none)")
+    } else {
+        for i in 0..active_a {
+            let rec = active_list.get(i.as(usize)).as(ExtensionRecord)
+            let cmd_cnt = commands_owned_by(kernel, rec.id).len()
+            let svc_cnt = services_owned_by(kernel, rec.id).len()
+            let row_idx = out.len()
+            row_map.insert(row_idx, rec.id)
+            out.push(
+                "  ● " ++ rec.name ++ " (" ++ rec.version ++ ") [" ++ rec.id.raw() ++ "] — "
+                ++ cmd_cnt.to_string() ++ " cmds, " ++ svc_cnt.to_string() ++ " svcs — "
+                ++ rec.description
+            )
+        }
+    }
+
+    out.push("")
+    out.push("○ Disabled / Other Extensions (" ++ other_d.to_string() ++ ")")
+    if other_d == 0 {
+        out.push("  (all registered extensions are active)")
+    } else {
+        for i in 0..other_d {
+            let rec = other_list.get(i.as(usize)).as(ExtensionRecord)
+            let st_str = format_ext_state(rec.state)
+            let row_idx = out.len()
+            row_map.insert(row_idx, rec.id)
+            out.push(
+                "  ○ " ++ rec.name ++ " (" ++ rec.version ++ ") [" ++ st_str ++ "] [" ++ rec.id.raw() ++ "]"
+            )
+        }
+    }
+
+    if svc_opt != null {
+        svc_opt.as(LazyService).row_ext_map = row_map
+    }
+    out
+}
+
+fn parse_ext_id_from_line(kernel: SystemKernel, line: String) -> ?ExtId {
+    let n = line.char_len()
+    var i: i64 = 0
+    while i < n {
+        if line.slice(i, i + 1) == "[" {
+            var j = i + 1
+            while j < n and line.slice(j, j + 1) != "]" {
+                j += 1
+            }
+            if j < n and j > i + 1 {
+                let candidate = ExtId(line.slice(i + 1, j))
+                if kernel.extensions.contains_key(candidate) {
+                    return candidate
+                }
+            }
+            i = j + 1
+            continue
+        }
+        i += 1
+    }
+    null
+}
+
+fn resolve_ext_id_at_row(kernel: SystemKernel, svc: LazyService, buf: Buffer, row: i64) -> ?ExtId {
+    let mapped_opt = svc.row_ext_map.get(row)
+    if mapped_opt != null {
+        let eid = mapped_opt.as(ExtId)
+        if kernel.extensions.contains_key(eid) {
+            return eid
+        }
+    }
+    parse_ext_id_from_line(kernel, buf.line_at(row))
+}
+
+fn find_row_for_ext_id(svc: LazyService, target_id: ExtId) -> i64 {
+    for k_any in svc.row_ext_map.keys() {
+        let r = k_any.as(i64)
+        let eid = svc.row_ext_map.get(r).as(ExtId)
+        if eid == target_id {
+            return r
+        }
+    }
+    -1
+}
+
+fn first_extension_row(svc: LazyService) -> i64 {
+    var best: i64 = -1
+    for k_any in svc.row_ext_map.keys() {
+        let r = k_any.as(i64)
+        if best < 0 or r < best {
+            best = r
+        }
+    }
+    if best >= 0 { best } else { 0 }
+}
+
+fn refresh_lazy_buffer(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    svc: LazyService,
+    .focus_ext: ?ExtId = null,
+) -> Buffer {
+    let existing = world.find_buffer_by_name(LAZY_BUF_NAME)
+    let prev_row = if existing != null { existing.as(Buffer).point.row } else { -1 }
+    let lines = render_lazy_buffer(kernel, world)
+    let lbuf = world.ensure_special_buffer(LAZY_BUF_NAME, MODE_LAZY, lines, read_only = true)
+
+    var next_row: i64 = -1
+    focus_ext match {
+        fext? => {
+            next_row = find_row_for_ext_id(svc, fext)
+        },
+        null => (),
+    }
+    if next_row < 0 {
+        if prev_row >= 0 {
+            next_row = prev_row
+        } else {
+            next_row = first_extension_row(svc)
+        }
+    }
+    lbuf.point = lbuf.clamp_pos(Pos.new(next_row, 0), insert_mode = false)
+    lbuf.preferred_col = 0
+    lbuf
+}
+
+-- ============================================================================
+-- 2. Detail Floating Window (`"lazy-detail"`) & Modal Close Interceptor
+-- ============================================================================
+
+fn close_lazy_detail_float(world: EditorWorld, vim: VimState, svc: LazyService) {
+    svc.detail_open = false
+    let _ = world.remove_floating_window(FLOAT_ID_LAZY_DETAIL)
+    if vim.modal_interceptor != null {
+        if vim.modal_interceptor.as(ModalInterceptor).owner == OWNER_LAZY {
+            vim.clear_interceptor()
+        }
+    }
+}
+
+fn lazy_detail_interceptor(
+    kernel: SystemKernel,
+    stroke: KeyStroke,
+) -> #ServiceEffects !String bool {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_lazy_service(kernel)!
+
+    if not svc.detail_open or world.get_floating_window(FLOAT_ID_LAZY_DETAIL) == null {
+        close_lazy_detail_float(world, vim, svc)
+        return false
+    }
+
+    let k = stroke.key
+    let plain = (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod)
+    let ctrl_only = stroke.ctrl and (not stroke.alt) and (not stroke.super_mod)
+
+    if k == "Escape" or (plain and k == "q") or k == "Return"
+        or (ctrl_only and (k == "[" or k == "c" or k == "g" or k == "m")) {
+        close_lazy_detail_float(world, vim, svc)
+        status_emit("Closed extension details")#
+        return true
+    }
+
+    -- Dismiss detail float and allow underlying `*Lazy*` navigation/action stroke (`j`, `k`, `x`, `c`, etc.) to run
+    close_lazy_detail_float(world, vim, svc)
+    false
+}
+
+fn build_extension_detail_lines(kernel: SystemKernel, rec: ExtensionRecord) -> List {
+    let lines = List()
+    lines.push("Extension:    " ++ rec.name ++ " (" ++ rec.version ++ ")")
+    lines.push("ExtId:        " ++ rec.id.raw())
+    lines.push("Domain:       " ++ rec.domain)
+    lines.push("State:        " ++ format_ext_state(rec.state))
+    lines.push("Description:  " ++ rec.description)
+
+    let dep_strs = List()
+    for i in 0..rec.dependencies.len() {
+        dep_strs.push(rec.dependencies.get(i.as(usize)).as(ExtId).raw())
+    }
+    let dep_text = if dep_strs.is_empty() { "(none)" } else { dep_strs.join(", ") }
+    lines.push("Dependencies: " ++ dep_text)
+    lines.push("──────────────────────────────────────────────────────────────────────────")
+
+    let svcs = services_owned_by(kernel, rec.id)
+    lines.push("Published Services (" ++ svcs.len().to_string() ++ "):")
+    if svcs.is_empty() {
+        lines.push("  (none)")
+    } else {
+        for i in 0..svcs.len() {
+            lines.push("  • " ++ svcs.get(i.as(usize)).as(String))
+        }
+    }
+
+    let cmds = commands_owned_by(kernel, rec.id)
+    lines.push("Registered Commands (" ++ cmds.len().to_string() ++ "):")
+    if cmds.is_empty() {
+        lines.push("  (none)")
+    } else {
+        let limit = if cmds.len() > 8 { 8 } else { cmds.len() }
+        for i in 0..limit {
+            let cs = cmds.get(i.as(usize)).as(CommandSpec)
+            lines.push("  • " ++ cs.name ++ " — " ++ cs.summary)
+        }
+        if cmds.len() > limit {
+            lines.push("  ... (+" ++ (cmds.len() - limit).to_string() ++ " more commands)")
+        }
+    }
+
+    let keys = keybindings_owned_by(kernel, rec.id)
+    lines.push("Bound Key Chords (" ++ keys.len().to_string() ++ "):")
+    if keys.is_empty() {
+        lines.push("  (none)")
+    } else {
+        let klimit = if keys.len() > 8 { 8 } else { keys.len() }
+        for i in 0..klimit {
+            lines.push("  • " ++ keys.get(i.as(usize)).as(String))
+        }
+        if keys.len() > klimit {
+            lines.push("  ... (+" ++ (keys.len() - klimit).to_string() ++ " more bindings)")
+        }
+    }
+
+    lines
+}
+
+-- ============================================================================
+-- 3. `:CheckHealth` Single-VM Health Report
+-- ============================================================================
+
+pub fn build_checkhealth_lines(kernel: SystemKernel, svc: LazyService) -> List {
+    let lines = List()
+    lines.push("Lava Single-VM Health Report (:CheckHealth)")
+    lines.push("==========================================================================")
+    lines.push("")
+
+    -- 1. Nessa VM & GC Runtime
+    let vm_ver = runtime.VERSION
+    let gc_cols = runtime.gc_collections()
+    lines.push("## Nessa Runtime & Garbage Collector")
+    lines.push("  [OK] Nessa VM Version: " ++ vm_ver)
+    lines.push("  [OK] GC Collections: " ++ gc_cols.to_string())
+    lines.push("")
+
+    -- 2. Native / Fallback Accelerator (`@lava_accel`)
+    let probe_hits = accel_fuzzy_rank("lv", ["lava", "nessa"])
+    let accel_ok = not probe_hits.is_empty()
+    let native_probe = runtime.host_call("accel_fuzzy_rank", ["lv", ["lava"], 1])
+    let accel_backend = native_probe match {
+        _! => "native Rust bridge (`lava-accel`)",
+        error _ => "deterministic Nessa fallback",
+    }
+    lines.push("## @lava_accel Accelerator")
+    if accel_ok {
+        lines.push("  [OK] @lava_accel available (" ++ accel_backend ++ ")")
+    } else {
+        lines.push("  [ERROR] @lava_accel fuzzy rank probe returned empty result")
+    }
+    lines.push("")
+
+    -- 3. Core Services (`world`, `window`, `render`, `vim`, `emacs`)
+    lines.push("## Core Kernel Services")
+    let core_checks = [
+        ("world", "lava.document.world"),
+        ("window", "lava.window.manager"),
+        ("render", "lava.render.compositor"),
+        ("vim", "lava.vim.state"),
+        ("emacs", "lava.emacs.state"),
+    ]
+    var all_core_svcs_ok = true
+    for i in 0..core_checks.len() {
+        let (short_name, svc_key) = core_checks.get(i.as(usize)).as((String, String))
+        if kernel.service(svc_key) != null {
+            lines.push("  [OK] " ++ short_name ++ " (`" ++ svc_key ++ "`) active")
+        } else {
+            all_core_svcs_ok = false
+            lines.push("  [WARN] " ++ short_name ++ " (`" ++ svc_key ++ "`) not published")
+        }
+    }
+    lines.push("")
+
+    -- 4. Extension Lifecycle States
+    let all_exts = kernel.list_extensions()
+    var active_cnt: i64 = 0
+    var disabled_cnt: i64 = 0
+    let failed_msgs = List()
+    for i in 0..all_exts.len() {
+        let rec = all_exts.get(i.as(usize)).as(ExtensionRecord)
+        rec.state match {
+            ExtState.Active => { active_cnt += 1 },
+            ExtState.Failed(reason) => {
+                failed_msgs.push(rec.id.raw() ++ ": " ++ reason)
+            },
+            _ => { disabled_cnt += 1 },
+        }
+    }
+
+    lines.push("## Extension Registry")
+    if failed_msgs.is_empty() {
+        lines.push(
+            "  [OK] Zero failed extensions (" ++ active_cnt.to_string() ++ " active, "
+            ++ disabled_cnt.to_string() ++ " disabled/registered, "
+            ++ all_exts.len().to_string() ++ " total)"
+        )
+    } else {
+        for i in 0..failed_msgs.len() {
+            lines.push("  [ERROR] Failed extension — " ++ failed_msgs.get(i.as(usize)).as(String))
+        }
+    }
+    lines.push("")
+
+    let healthy = accel_ok and all_core_svcs_ok and failed_msgs.is_empty()
+    svc.last_health_ok = healthy
+    if healthy {
+        lines.push("Summary: HEALTHY — All runtime, accelerator, service, and extension checks passed. [q] Close")
+    } else {
+        lines.push("Summary: ISSUES DETECTED — Inspect warnings/errors above. [q] Close")
+    }
+    lines
+}
+
+-- ============================================================================
+-- 4. Command Handlers & Registration (`lava.org/ext_lazy`)
+-- ============================================================================
+
+fn cmd_lazy_open(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_lazy_service(kernel)!
+
+    close_lazy_detail_float(world, vim, svc)
+    let cur = world.active_buffer()
+    if cur.name != LAZY_BUF_NAME and cur.name != CHECKHEALTH_BUF_NAME {
+        svc.prev_buf_id = cur.id
+    }
+
+    let lbuf = refresh_lazy_buffer(kernel, world, svc)
+    let _ = world.switch_to_buffer(lbuf.id)
+    vim.mode = VimMode.Normal
+    vim.clear_transient()
+    sync_world_from_vim(world, vim)
+    kernel.emit_hook("buffer-switched", lbuf.id)
+
+    let total = kernel.list_extensions().len()
+    status_emit("Lazy Extension Manager (" ++ total.to_string() ++ " extensions)")#
+    ()
+}
+
+fn cmd_lazy_inspect(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_lazy_service(kernel)!
+    let buf = world.active_buffer()
+
+    let target_id? = resolve_ext_id_at_row(kernel, svc, buf, buf.point.row) else {
+        status_emit("Lazy: move cursor onto an extension row to inspect")#
+        return ()
+    }
+    let rec_any? = kernel.extensions.get(target_id) else {
+        status_emit("Lazy: unknown extension " ++ target_id.raw())#
+        return ()
+    }
+    let rec = rec_any.as(ExtensionRecord)
+    let detail_lines = build_extension_detail_lines(kernel, rec)
+
+    world.set_floating_window(FloatingWindow {
+        id: FLOAT_ID_LAZY_DETAIL,
+        owner: OWNER_LAZY,
+        title: " Extension Details: " ++ rec.name ++ " [" ++ rec.id.raw() ++ "] (q/Esc to close) ",
+        anchor: "center",
+        width_cols: 78,
+        height_rows: 20,
+        lines: detail_lines,
+        selected_row: -1,
+        border_rgba: rgb(137, 180, 250),
+    })
+    svc.detail_open = true
+    vim.set_interceptor(OWNER_LAZY, lazy_detail_interceptor)
+    status_emit("Inspecting " ++ rec.id.raw())#
+    ()
+}
+
+fn emit_lazy_warning(world: EditorWorld, msg: String) -> #[log_event, status_emit] Unit {
+    let _ = world.push_notification("warn", "Lazy", msg)
+    world.status_message = msg
+    log_event("warn", OWNER_LAZY, msg)#
+    status_emit(msg)#
+}
+
+fn cmd_lazy_toggle_ext(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_lazy_service(kernel)!
+    close_lazy_detail_float(world, vim, svc)
+
+    let buf = world.active_buffer()
+    let target_id? = resolve_ext_id_at_row(kernel, svc, buf, buf.point.row) else {
+        status_emit("Lazy: move cursor onto an extension row to toggle")#
+        return false
+    }
+    let rec_any? = kernel.extensions.get(target_id) else {
+        status_emit("Lazy: unknown extension " ++ target_id.raw())#
+        return false
+    }
+    let rec = rec_any.as(ExtensionRecord)
+
+    if rec.state == ExtState.Active {
+        let deps = active_dependents_of(kernel, target_id)
+        if not deps.is_empty() {
+            let first_dep = deps.get(0).as(ExtId)
+            let warn_msg = "Cannot deactivate " ++ target_id.raw()
+                ++ ": active extension " ++ first_dep.raw() ++ " depends on it"
+            emit_lazy_warning(world, warn_msg)#
+            return false
+        }
+        if is_foundational_core_extension(target_id) {
+            let warn_msg = "Cannot deactivate core foundational extension: " ++ target_id.raw()
+            emit_lazy_warning(world, warn_msg)#
+            return false
+        }
+        let deact_res = kernel.deactivate_extension(target_id)
+        deact_res match {
+            _! => {
+                let _ = refresh_lazy_buffer(kernel, world, svc, focus_ext = target_id)
+                sync_world_from_vim(world, vim)
+                let msg = "Lazy: deactivated " ++ target_id.raw()
+                let _ = world.push_notification("info", "Lazy", msg)
+                world.status_message = msg
+                status_emit(msg)#
+                return true
+            },
+            error err => {
+                let warn_msg = "Cannot deactivate " ++ target_id.raw() ++ ": " ++ err
+                emit_lazy_warning(world, warn_msg)#
+                return false
+            },
+        }
+    }
+
+    -- Re-activate disabled / registered extension
+    let act_res = kernel.activate_extension(target_id)
+    act_res match {
+        _! => {
+            let _ = refresh_lazy_buffer(kernel, world, svc, focus_ext = target_id)
+            sync_world_from_vim(world, vim)
+            let msg = "Lazy: activated " ++ target_id.raw()
+            let _ = world.push_notification("info", "Lazy", msg)
+            world.status_message = msg
+            status_emit(msg)#
+            true
+        },
+        error err => {
+            let warn_msg = "Failed to activate " ++ target_id.raw() ++ ": " ++ err
+            emit_lazy_warning(world, warn_msg)#
+            let _ = refresh_lazy_buffer(kernel, world, svc, focus_ext = target_id)
+            false
+        },
+    }
+}
+
+fn cmd_lazy_activate_all(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_lazy_service(kernel)!
+    close_lazy_detail_float(world, vim, svc)
+
+    let cur_focus = resolve_ext_id_at_row(kernel, svc, world.active_buffer(), world.active_buffer().point.row)
+    let _ = kernel.activate_all() ! { err => {
+        emit_lazy_warning(world, "Lazy activate_all error: " ++ err)#
+    } }
+    let all = kernel.list_extensions()
+    var activated_cnt: i64 = 0
+    for i in 0..all.len() {
+        let rec = all.get(i.as(usize)).as(ExtensionRecord)
+        if rec.state != ExtState.Active {
+            let res = kernel.activate_extension(rec.id)
+            res match {
+                _! => { activated_cnt += 1 },
+                error err => {
+                    emit_lazy_warning(world, "Lazy activate error for " ++ rec.id.raw() ++ ": " ++ err)#
+                },
+            }
+        }
+    }
+
+    if world.find_buffer_by_name(LAZY_BUF_NAME) != null {
+        let _ = refresh_lazy_buffer(kernel, world, svc, focus_ext = cur_focus)
+    }
+    sync_world_from_vim(world, vim)
+    let msg = "Lazy: all extensions active (+" ++ activated_cnt.to_string() ++ " activated)"
+    world.status_message = msg
+    status_emit(msg)#
+    ()
+}
+
+fn cmd_lazy_check_health(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_lazy_service(kernel)!
+    close_lazy_detail_float(world, vim, svc)
+
+    let cur = world.active_buffer()
+    if cur.name != CHECKHEALTH_BUF_NAME {
+        svc.health_prev_buf_id = cur.id
+    }
+
+    let lines = build_checkhealth_lines(kernel, svc)
+    let hbuf = world.ensure_special_buffer(CHECKHEALTH_BUF_NAME, MODE_CHECKHEALTH, lines, read_only = true)
+    hbuf.point = Pos.zero()
+    let _ = world.switch_to_buffer(hbuf.id)
+    vim.mode = VimMode.Normal
+    vim.clear_transient()
+    sync_world_from_vim(world, vim)
+    kernel.emit_hook("buffer-switched", hbuf.id)
+
+    let verdict = if svc.last_health_ok { "HEALTHY" } else { "ISSUES DETECTED" }
+    let msg = "CheckHealth: " ++ verdict
+    world.status_message = msg
+    status_emit(msg)#
+    svc.last_health_ok
+}
+
+fn cmd_lazy_close(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_lazy_service(kernel)!
+
+    if svc.detail_open or world.get_floating_window(FLOAT_ID_LAZY_DETAIL) != null {
+        close_lazy_detail_float(world, vim, svc)
+        status_emit("Closed extension details")#
+        return ()
+    }
+
+    let cur = world.active_buffer()
+    if cur.name == CHECKHEALTH_BUF_NAME {
+        var switched_h = false
+        svc.health_prev_buf_id match {
+            pid? => {
+                if pid != cur.id and world.buffer(pid) != null {
+                    switched_h = world.switch_to_buffer(pid)
+                }
+            },
+            null => (),
+        }
+        if not switched_h {
+            let _ = world.switch_to_buffer(world.scratch_id)
+        }
+        vim.mode = VimMode.Normal
+        vim.clear_transient()
+        sync_world_from_vim(world, vim)
+        kernel.emit_hook("buffer-switched", world.active_buffer_id)
+        status_emit("Closed *CheckHealth*")#
+        return ()
+    }
+
+    if cur.name == LAZY_BUF_NAME {
+        var switched = false
+        svc.prev_buf_id match {
+            pid? => {
+                if pid != cur.id and world.buffer(pid) != null {
+                    switched = world.switch_to_buffer(pid)
+                }
+            },
+            null => (),
+        }
+        if not switched {
+            let _ = world.switch_to_buffer(world.scratch_id)
+        }
+        vim.mode = VimMode.Normal
+        vim.clear_transient()
+        sync_world_from_vim(world, vim)
+        kernel.emit_hook("buffer-switched", world.active_buffer_id)
+        status_emit("Closed *Lazy*")#
+    }
+    ()
+}
+
+fn cleanup_lazy_hooks_and_bindings(kernel: SystemKernel, ext_id: ExtId) {
+    for topic_any in kernel.hooks.keys() {
+        let topic = topic_any.as(String)
+        let list_opt = kernel.hooks.get(topic)
+        if list_opt != null {
+            let listeners = list_opt.as(List)
+            let kept = List()
+            for i in 0..listeners.len() {
+                let item = listeners.get(i.as(usize)).as(HookListener)
+                if item.owner != ext_id {
+                    kept.push(item)
+                }
+            }
+            kernel.hooks.insert(topic, kept)
+        }
+    }
+    for km_any in kernel.keymaps.keys() {
+        let km_name = km_any.as(String)
+        let km_opt = kernel.keymaps.get(km_name)
+        if km_opt != null {
+            let km = km_opt.as(Keymap)
+            for chord_any in km.bindings.keys() {
+                let chord = chord_any.as(String)
+                let entry_opt = km.bindings.get(chord)
+                if entry_opt != null and entry_opt.as(KeyBindingEntry).owner == ext_id {
+                    let _ = km.bindings.remove(chord)
+                }
+            }
+        }
+    }
+}
+
+pub fn register_lazy_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_lazy_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_lazy",
+        "0.1.0",
+        "Interactive Single-VM extension manager (`*Lazy*`, `<Space>l`, `:Lazy`) and `:CheckHealth` runtime inspector.",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let svc = LazyService.new()
+            k.publish_service(SERVICE_LAZY, ext_id, svc)
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> l", "lazy", ext_id, description = "Open Lazy extension manager")
+
+            let lazy_km = k.ensure_keymap("mode:" ++ MODE_LAZY)
+            lazy_km.bind("<Return>", "lazy-inspect", ext_id, description = "Inspect extension details")
+            lazy_km.bind("K", "lazy-inspect", ext_id, description = "Inspect extension details")
+            lazy_km.bind("x", "lazy-toggle-ext", ext_id, description = "Toggle enable/disable extension")
+            lazy_km.bind("e", "lazy-toggle-ext", ext_id, description = "Toggle enable/disable extension")
+            lazy_km.bind("R", "lazy-activate-all", ext_id, description = "Activate all extensions")
+            lazy_km.bind("c", "lazy-check-health", ext_id, description = "Run :CheckHealth report")
+            lazy_km.bind("q", "lazy-close", ext_id, description = "Close detail float or *Lazy*")
+            lazy_km.bind("<Escape>", "lazy-close", ext_id, description = "Close detail float or *Lazy*")
+
+            let health_km = k.ensure_keymap("mode:" ++ MODE_CHECKHEALTH)
+            health_km.bind("q", "lazy-close", ext_id, description = "Close *CheckHealth*")
+            health_km.bind("<Escape>", "lazy-close", ext_id, description = "Close *CheckHealth*")
+
+            k.register_command("lazy", ext_id, "Open interactive `*Lazy*` Single-VM extension manager (`<Space>l`).", cmd_lazy_open)
+            k.register_command("list-extensions", ext_id, "Open interactive `*Lazy*` Single-VM extension manager.", cmd_lazy_open)
+            k.register_command("ex:Lazy", ext_id, "Ex `:Lazy`.", cmd_lazy_open, interactive = false)
+
+            k.register_command("lazy-inspect", ext_id, "Inspect extension metadata, services, commands, and keymaps.", cmd_lazy_inspect)
+            k.register_command("lazy-toggle-ext", ext_id, "Toggle selected extension active/disabled state in `*Lazy*`.", cmd_lazy_toggle_ext)
+            k.register_command("lazy-activate-all", ext_id, "Activate all registered/disabled extensions.", cmd_lazy_activate_all)
+            k.register_command("ex:LazySync", ext_id, "Ex `:LazySync` (activate all).", cmd_lazy_activate_all, interactive = false)
+
+            k.register_command("lazy-check-health", ext_id, "Run Single-VM runtime & service health check (`:CheckHealth`).", cmd_lazy_check_health)
+            k.register_command("checkhealth", ext_id, "Run Single-VM runtime & service health check (`:CheckHealth`).", cmd_lazy_check_health)
+            k.register_command("ex:CheckHealth", ext_id, "Ex `:CheckHealth`.", cmd_lazy_check_health, interactive = false)
+            k.register_command("ex:Checkhealth", ext_id, "Ex `:Checkhealth`.", cmd_lazy_check_health, interactive = false)
+
+            k.register_command("lazy-close", ext_id, "Close `" ++ FLOAT_ID_LAZY_DETAIL ++ "` float or `*Lazy*` / `*CheckHealth*` buffer.", cmd_lazy_close)
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            let v_opt = k.service("lava.vim.state")
+            if v_opt != null {
+                let vs = v_opt.as(VimState)
+                if vs.modal_interceptor != null and vs.modal_interceptor.as(ModalInterceptor).owner == OWNER_LAZY {
+                    vs.clear_interceptor()
+                }
+            }
+            if w_opt != null {
+                w_opt.as(EditorWorld).clear_owner_ui(OWNER_LAZY)
+            }
+            cleanup_lazy_hooks_and_bindings(k, ext_id)
+            ()
+        },
+    )
+}

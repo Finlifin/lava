@@ -1,0 +1,429 @@
+-- srv_fs: Server-Side Filesystem Extension (`lava.server/srv_fs`).
+-- Implements `fs/stat`, `fs/read`, `fs/write` (atomic temp+rename), `fs/readdir`,
+-- `fs/mkdir`, `fs/remove`, `fs/rename`, `fs/copy`, `fs/realpath`, and `fs/find_root`.
+
+use std.fs
+use std.io.{File, IoError}
+use std.ordering.Ordering
+use std.path
+use std.process
+use @server_sys.{expand_tilde, find_project_root, resolve_server_path}
+use @server_core.{
+    JsonValue, ServerKernel, SrvExtId, expect_params_map, opt_bool_param, opt_str_list_param,
+    require_str_list_param, require_str_param
+}
+
+pub fn srv_fs_id() -> SrvExtId = SrvExtId("lava.server/srv_fs")
+
+private global _atomic_tmp_seq: i64 = 1
+
+private fn check_path_readonly(resolved_path: String, is_dir: bool) -> bool {
+    if is_dir {
+        let res = process.exec("test", args = ["-w", resolved_path])
+        return res match {
+            out! => not out.success(),
+            error _ => false,
+        }
+    }
+    File.open(resolved_path, mode = "r+") match {
+        f! => {
+            let _ = f.close()
+            false
+        },
+        error IoError.PermissionDenied(_) => true,
+        error _ => {
+            let res = process.exec("test", args = ["-w", resolved_path])
+            res match {
+                out! => not out.success(),
+                error _ => false,
+            }
+        },
+    }
+}
+
+private fn copy_dir_recursive(src_dir: String, dst_dir: String) -> !String i64 {
+    fs.create_dir_all(dst_dir) match {
+        _! => (),
+        error err => return error ("cannot create directory '" ++ dst_dir ++ "': " ++ err.to_string()),
+    }
+    let entries = fs.read_dir_entries(src_dir) match {
+        v! => v,
+        error err => return error ("cannot read directory '" ++ src_dir ++ "': " ++ err.to_string()),
+    }
+    var total_bytes: i64 = 0
+    for i in 0..entries.len() {
+        let ent = entries.get(i.as(usize)).as(fs.DirEntry)
+        let dst_child = path.join(dst_dir, ent.name)
+        if ent.is_dir {
+            total_bytes += copy_dir_recursive(ent.path, dst_child)!
+        } else {
+            let copied = fs.copy(ent.path, dst_child) match {
+                c! => c,
+                error err => return error ("cannot copy '" ++ ent.path ++ "' -> '" ++ dst_child ++ "': " ++ err.to_string()),
+            }
+            total_bytes += copied
+        }
+    }
+    total_bytes
+}
+
+private fn rpc_fs_stat(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_path = require_str_param(m, "path")!
+    let resolved = resolve_server_path(raw_path)
+    let out = Map()
+    out.set("path", resolved)
+    if not fs.exists(resolved) {
+        out.set("exists", false)
+        out.set("is_dir", false)
+        out.set("is_file", false)
+        out.set("size", 0)
+        out.set("readonly", false)
+        return out
+    }
+    let meta = fs.metadata(resolved) match {
+        v! => v,
+        error err => return error ("fs/stat failed on '" ++ resolved ++ "': " ++ err.to_string()),
+    }
+    out.set("exists", true)
+    out.set("is_dir", meta.is_dir)
+    out.set("is_file", meta.is_file)
+    out.set("size", meta.size)
+    out.set("readonly", check_path_readonly(resolved, meta.is_dir))
+    out
+}
+
+private fn rpc_fs_read(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_path = require_str_param(m, "path")!
+    let resolved = resolve_server_path(raw_path)
+    if not fs.exists(resolved) {
+        return error ("file does not exist: " ++ resolved)
+    }
+    if fs.is_dir(resolved) {
+        return error ("path is a directory, not a file: " ++ resolved)
+    }
+    let raw = fs.read_to_string(resolved) match {
+        v! => v,
+        error err => return error ("cannot read file '" ++ resolved ++ "': " ++ err.to_string()),
+    }
+    let has_crlf = raw.contains("\r\n")
+    let byte_size = raw.len()
+    let lines = if raw == "" {
+        [""]
+    } else {
+        let norm = raw.replace("\r\n", "\n").replace("\r", "\n")
+        let parts = norm.split("\n")
+        if parts.len() > 1 and norm.ends_with("\n") {
+            let _ = parts.pop()
+        }
+        if parts.is_empty() {
+            parts.push("")
+        }
+        parts
+    }
+    let out = Map()
+    out.set("lines", lines)
+    out.set("crlf", has_crlf)
+    out.set("size", byte_size)
+    out.set("path", resolved)
+    out
+}
+
+private fn rpc_fs_write(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_path = require_str_param(m, "path")!
+    let lines = require_str_list_param(m, "lines")!
+    let crlf = opt_bool_param(m, "crlf", false)!
+    let create_dirs = opt_bool_param(m, "create_dirs", false)!
+    let trailing_newline = opt_bool_param(m, "trailing_newline", true)!
+
+    let target_init = resolve_server_path(raw_path)
+    let par_opt = path.parent(target_init)
+    if par_opt != null {
+        let par_dir = par_opt.as(String)
+        if not fs.exists(par_dir) {
+            if create_dirs {
+                fs.create_dir_all(par_dir) match {
+                    _! => (),
+                    error err => return error ("cannot create parent directories '" ++ par_dir ++ "': " ++ err.to_string()),
+                }
+            } else {
+                return error ("parent directory does not exist: " ++ par_dir)
+            }
+        }
+    }
+
+    let target = resolve_server_path(raw_path)
+    let sep = if crlf { "\r\n" } else { "\n" }
+    let content = if lines.is_empty() {
+        ""
+    } else if trailing_newline {
+        lines.join(sep) ++ sep
+    } else {
+        lines.join(sep)
+    }
+
+    let parent_dir = path.parent(target) match {
+        p? => p,
+        null => ".",
+    }
+    let base_name = path.file_name(target) match {
+        n? => n,
+        null => "file",
+    }
+    let seq = _atomic_tmp_seq
+    _atomic_tmp_seq += 1
+    let tmp_name = ".lava_srv_tmp_" ++ base_name ++ "_" ++ process.pid().to_string() ++ "_" ++ seq.to_string()
+    let tmp_path = path.join(parent_dir, tmp_name)
+
+    var wrote_atomically = false
+    fs.write_string(tmp_path, content) match {
+        _! => {
+            fs.rename(tmp_path, target) match {
+                _! => {
+                    wrote_atomically = true
+                },
+                error _ => {
+                    if fs.exists(tmp_path) {
+                        let _ = fs.remove(tmp_path)
+                    }
+                },
+            }
+        },
+        error _ => {
+            if fs.exists(tmp_path) {
+                let _ = fs.remove(tmp_path)
+            }
+        },
+    }
+
+    if not wrote_atomically {
+        fs.write_string(target, content) match {
+            _! => (),
+            error err => return error ("cannot write file '" ++ target ++ "': " ++ err.to_string()),
+        }
+    }
+
+    let final_path = resolve_server_path(target)
+    let out = Map()
+    out.set("bytes", content.len())
+    out.set("lines", lines.len())
+    out.set("path", final_path)
+    out
+}
+
+private fn rpc_fs_readdir(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_path = require_str_param(m, "path")!
+    let show_hidden = opt_bool_param(m, "show_hidden", false)!
+    let dir_path = resolve_server_path(raw_path)
+
+    if not fs.exists(dir_path) {
+        return error ("directory does not exist: " ++ dir_path)
+    }
+    if not fs.is_dir(dir_path) {
+        return error ("path is not a directory: " ++ dir_path)
+    }
+
+    let raw_entries = fs.read_dir_entries(dir_path) match {
+        v! => v,
+        error err => return error ("cannot read directory '" ++ dir_path ++ "': " ++ err.to_string()),
+    }
+    let filtered = List()
+    for i in 0..raw_entries.len() {
+        let ent = raw_entries.get(i.as(usize)).as(fs.DirEntry)
+        if (not show_hidden) and ent.name.starts_with(".") {
+            continue
+        }
+        filtered.push(ent)
+    }
+
+    filtered.sort_by(|a: Any, b: Any| {
+        let ea = a.as(fs.DirEntry)
+        let eb = b.as(fs.DirEntry)
+        if ea.is_dir != eb.is_dir {
+            if ea.is_dir {
+                return Ordering.less
+            } else {
+                return Ordering.greater
+            }
+        }
+        let la = ea.name.to_lower()
+        let lb = eb.name.to_lower()
+        if la != lb {
+            return la.cmp(lb)
+        }
+        ea.name.cmp(eb.name)
+    })
+
+    let entries_json = List()
+    for i in 0..filtered.len() {
+        let ent = filtered.get(i.as(usize)).as(fs.DirEntry)
+        let item = Map()
+        item.set("name", ent.name)
+        item.set("path", ent.path)
+        item.set("is_dir", ent.is_dir)
+        item.set("size", ent.size)
+        entries_json.push(item)
+    }
+
+    let out = Map()
+    out.set("path", dir_path)
+    out.set("entries", entries_json)
+    out
+}
+
+private fn rpc_fs_mkdir(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_path = require_str_param(m, "path")!
+    let recursive = opt_bool_param(m, "recursive", true)!
+    let target = resolve_server_path(raw_path)
+    if recursive {
+        fs.create_dir_all(target) match {
+            _! => (),
+            error err => return error ("cannot create directory '" ++ target ++ "': " ++ err.to_string()),
+        }
+    } else {
+        fs.create_dir(target) match {
+            _! => (),
+            error err => return error ("cannot create directory '" ++ target ++ "': " ++ err.to_string()),
+        }
+    }
+    let out = Map()
+    out.set("ok", true)
+    out.set("path", resolve_server_path(target))
+    out
+}
+
+private fn rpc_fs_remove(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_path = require_str_param(m, "path")!
+    let recursive = opt_bool_param(m, "recursive", false)!
+    let target = resolve_server_path(raw_path)
+    if not fs.exists(target) {
+        return error ("path does not exist: " ++ target)
+    }
+    if fs.is_dir(target) {
+        if recursive {
+            fs.remove_dir_all(target) match {
+                _! => (),
+                error err => return error ("cannot remove directory '" ++ target ++ "': " ++ err.to_string()),
+            }
+        } else {
+            fs.remove_dir(target) match {
+                _! => (),
+                error err => return error ("cannot remove directory '" ++ target ++ "': " ++ err.to_string()),
+            }
+        }
+    } else {
+        fs.remove_file(target) match {
+            _! => (),
+            error err => return error ("cannot remove file '" ++ target ++ "': " ++ err.to_string()),
+        }
+    }
+    let out = Map()
+    out.set("ok", true)
+    out.set("path", target)
+    out
+}
+
+private fn rpc_fs_rename(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_src = require_str_param(m, "src")!
+    let raw_dst = require_str_param(m, "dst")!
+    let src = resolve_server_path(raw_src)
+    let dst = resolve_server_path(raw_dst)
+    if not fs.exists(src) {
+        return error ("source path does not exist: " ++ src)
+    }
+    fs.rename(src, dst) match {
+        _! => (),
+        error err => return error ("cannot rename '" ++ src ++ "' -> '" ++ dst ++ "': " ++ err.to_string()),
+    }
+    let out = Map()
+    out.set("ok", true)
+    out.set("src", src)
+    out.set("dst", resolve_server_path(dst))
+    out
+}
+
+private fn rpc_fs_copy(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_src = require_str_param(m, "src")!
+    let raw_dst = require_str_param(m, "dst")!
+    let src = resolve_server_path(raw_src)
+    let dst = resolve_server_path(raw_dst)
+    if not fs.exists(src) {
+        return error ("source path does not exist: " ++ src)
+    }
+    let copied_bytes = if fs.is_dir(src) {
+        copy_dir_recursive(src, dst)!
+    } else {
+        fs.copy(src, dst) match {
+            c! => c,
+            error err => return error ("cannot copy '" ++ src ++ "' -> '" ++ dst ++ "': " ++ err.to_string()),
+        }
+    }
+    let out = Map()
+    out.set("ok", true)
+    out.set("bytes", copied_bytes)
+    out.set("src", src)
+    out.set("dst", resolve_server_path(dst))
+    out
+}
+
+private fn rpc_fs_realpath(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_path = require_str_param(m, "path")!
+    let expanded = expand_tilde(raw_path.trim())
+    let canon = fs.canonicalize(expanded) match {
+        v! => v,
+        error err => return error ("cannot canonicalize '" ++ expanded ++ "': " ++ err.to_string()),
+    }
+    let out = Map()
+    out.set("path", canon)
+    out
+}
+
+private fn rpc_fs_find_root(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let start_path = require_str_param(m, "start_path")!
+    let markers = opt_str_list_param(m, "markers")!
+    let effective_markers = if markers.is_empty() {
+        ["compile_commands.json", "Cargo.toml", "package.toml", "pyproject.toml", "go.mod", "package.json", ".git"]
+    } else {
+        markers
+    }
+    let (root, matched_marker) = find_project_root(start_path, effective_markers)
+    let out = Map()
+    out.set("root", root)
+    out.set("matched_marker", matched_marker)
+    out
+}
+
+pub fn register_fs_extension(kernel: ServerKernel) -> !String Unit {
+    let ext_id = srv_fs_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.server",
+        "srv_fs",
+        "0.1.0",
+        "Server-side filesystem operations, atomic file writes, directory listing, and project root discovery.",
+        List(),
+        |k: ServerKernel| -> !String Unit {
+            k.register_rpc("fs/stat", ext_id, "Stat a server path.", rpc_fs_stat)
+            k.register_rpc("fs/read", ext_id, "Read file lines and CRLF status.", rpc_fs_read)
+            k.register_rpc("fs/write", ext_id, "Atomically write lines to a server file.", rpc_fs_write)
+            k.register_rpc("fs/readdir", ext_id, "List directory entries sorted directories-first.", rpc_fs_readdir)
+            k.register_rpc("fs/mkdir", ext_id, "Create directory on server.", rpc_fs_mkdir)
+            k.register_rpc("fs/remove", ext_id, "Remove file or directory on server.", rpc_fs_remove)
+            k.register_rpc("fs/rename", ext_id, "Rename or move path on server.", rpc_fs_rename)
+            k.register_rpc("fs/copy", ext_id, "Copy file or directory on server.", rpc_fs_copy)
+            k.register_rpc("fs/realpath", ext_id, "Canonicalize path on server.", rpc_fs_realpath)
+            k.register_rpc("fs/find_root", ext_id, "Walk upward for project root markers.", rpc_fs_find_root)
+            ()
+        },
+        |_k: ServerKernel| -> !String Unit { () },
+    )
+}

@@ -1,0 +1,546 @@
+-- End-to-end integration test suite for `lava.org/ext_help`:
+--   1. Emacs Info Hypertext Manual Reader (`*Info*`, `major_mode = "info"`)
+--   2. Emacs Global 5-Domain Documentation Search — Apropos Suite (`*Apropos*`, `major_mode = "apropos"`)
+--   3. Emacs `helpful` Deep Runtime & Source Introspection (`*Help*`, `major_mode = "help"`)
+
+use std.fs
+use std.path
+use std.time
+use @lava_sys.mock_enable
+use @lava_core.{
+    ExtId, InteractiveEffects, SystemKernel, clipboard_get, clipboard_set, log_event, status_emit
+}
+use @ext_document.{Buffer, EditorWorld, Pos, require_editor_world}
+use @ext_window.{WindowManager, require_window_manager}
+use @ext_vim.KEYMAP_VIM_LEADER
+use @ext_app.{AppHostCap, app_commit_frame, app_feed_keys, register_default_extensions}
+use @ext_help.{
+    APROPOS_BUF_NAME, AproposHit, HELP_BUF_NAME, HelpState, INFO_BUF_NAME, INFO_DIR_NODE,
+    SERVICE_HELP_STATE, all_option_metas, ext_help_id, register_help_extension, require_help_state
+}
+
+fn check_eq_str(actual: String, expected: String, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual='" ++ actual ++ "' expected='" ++ expected ++ "'")
+    }
+}
+
+fn check_eq_i64(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual=" ++ actual.to_string() ++ " expected=" ++ expected.to_string())
+    }
+}
+
+fn check_eq_bool(actual: bool, expected: bool, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual=" ++ actual.to_string() ++ " expected=" ++ expected.to_string())
+    }
+}
+
+fn check_true(cond: bool, label: String) {
+    if not cond {
+        panic("FAILED: " ++ label)
+    }
+}
+
+fn buffer_text(buf: Buffer) -> String {
+    buf.lines.join("\n")
+}
+
+fn find_line_containing(buf: Buffer, needle: String) -> i64 {
+    for r in 0..buf.line_count() {
+        if buf.line_at(r).contains(needle) {
+            return r
+        }
+    }
+    -1
+}
+
+fn feed(
+    kernel: SystemKernel,
+    keys: String,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] Unit {
+    app_feed_keys(kernel, keys)# ! {
+        e => panic("app_feed_keys('" ++ keys ++ "') failed: " ++ e)
+    }
+}
+
+fn setup_fixture_workspace() -> (String, String, String, String, String) {
+    let stamp = time.unix_millis().to_string()
+    let root = "/tmp/lava_test_help_info_" ++ stamp
+    let docs_dir = path.join(root, "docs")
+    let nessa_docs_dir = path.join(path.join(root, "nessa2"), "docs")
+    let code_dir = path.join(root, "src")
+
+    let _ = fs.create_dir_all(docs_dir) ! { e => panic("mkdir docs: " ++ e.to_string()) }
+    let _ = fs.create_dir_all(nessa_docs_dir) ! { e => panic("mkdir nessa2/docs: " ++ e.to_string()) }
+    let _ = fs.create_dir_all(code_dir) ! { e => panic("mkdir src: " ++ e.to_string()) }
+
+    let guide_md = path.join(docs_dir, "guide.md")
+    let guide_content = [
+        "# Lava Test Guide *lava-guide*",
+        "Welcome to the Lava hypertext manual with quantum-telemetry workflows.",
+        "See [Extra Reference](extra.md) for companion details.",
+        "",
+        "## Navigation Keys *nav-keys*",
+        "Use `h`, `j`, `k`, `l` or Emacs `C-n` / `C-p` to move smoothly.",
+        "Tag anchor inline: *motion-basics*.",
+        "",
+        "## Widget Configuration *widget-config*",
+        "Customize `tabstop` and quantum-telemetry widget scoring rules here.",
+    ].join("\n") ++ "\n"
+    let _ = fs.write_string(guide_md, guide_content) ! {
+        e => panic("write guide.md: " ++ e.to_string())
+    }
+
+    let extra_md = path.join(docs_dir, "extra.md")
+    let extra_content = [
+        "# Extra Companion Manual *extra-manual*",
+        "Detailed appendix for cross-manual Markdown links.",
+    ].join("\n") ++ "\n"
+    let _ = fs.write_string(extra_md, extra_content) ! {
+        e => panic("write extra.md: " ++ e.to_string())
+    }
+
+    let nessa_md = path.join(nessa_docs_dir, "effects.md")
+    let nessa_content = [
+        "# Nessa Algebraic Effects *nessa-effects*",
+        "Delimited continuations and `handles(...)` capability providers.",
+    ].join("\n") ++ "\n"
+    let _ = fs.write_string(nessa_md, nessa_content) ! {
+        e => panic("write effects.md: " ++ e.to_string())
+    }
+
+    let sample_ns = path.join(code_dir, "sample_widget.ns")
+    -- Line numbers (0-based):
+    -- 0: -- Sample fixture module for Helpful & Apropos source jump tests.
+    -- 1:
+    -- 2: -- Computes quantum-telemetry score for a widget buffer.
+    -- 3: pub fn compute_widget_score(seed: i64) -> i64 {
+    -- 4:     seed * 10 + 7
+    -- 5: }
+    -- 6:
+    -- 7: -- Registers sample-widget-boost interactive command.
+    -- 8: pub fn register_sample_fixture_commands(k: SystemKernel, owner: ExtId) {
+    -- 9:     k.register_command("sample-widget-boost", owner, "Boost quantum-telemetry widget score.", cmd_sample_boost)
+    -- 10: }
+    let sample_ns_content = [
+        "-- Sample fixture module for Helpful & Apropos source jump tests.",
+        "",
+        "-- Computes quantum-telemetry score for a widget buffer.",
+        "pub fn compute_widget_score(seed: i64) -> i64 {{",
+        "    seed * 10 + 7",
+        "}}",
+        "",
+        "-- Registers sample-widget-boost interactive command.",
+        "pub fn register_sample_fixture_commands(k: SystemKernel, owner: ExtId) {{",
+        "    k.register_command(\"sample-widget-boost\", owner, \"Boost quantum-telemetry widget score.\", cmd_sample_boost)",
+        "}}",
+    ].join("\n") ++ "\n"
+    let _ = fs.write_string(sample_ns, sample_ns_content) ! {
+        e => panic("write sample_widget.ns: " ++ e.to_string())
+    }
+
+    let scratch_src = path.join(root, "demo.ns")
+    let scratch_content = [
+        "fn demo() {{",
+        "    let x = compute_widget_score(4)",
+        "    -- sample-widget-boost",
+        "    -- relativenumber",
+        "}}",
+    ].join("\n") ++ "\n"
+    let _ = fs.write_string(scratch_src, scratch_content) ! {
+        e => panic("write demo.ns: " ++ e.to_string())
+    }
+
+    (root, docs_dir, nessa_docs_dir, code_dir, sample_ns)
+}
+
+fn boot_kernel_with_help() -> SystemKernel {
+    mock_enable(true)
+    let kernel = SystemKernel.new()
+    register_default_extensions(kernel) ! {
+        e => panic("register_default_extensions failed: " ++ e)
+    }
+    register_help_extension(kernel) ! {
+        e => panic("register_help_extension failed: " ++ e)
+    }
+    kernel.activate_all() ! {
+        e => panic("activate_all failed: " ++ e)
+    }
+    check_true(kernel.is_extension_active(ext_help_id()), "ext_help is active")
+    check_true(kernel.service(SERVICE_HELP_STATE) != null, "lava.help.state service published")
+
+    -- Register `sample-widget-boost` on the live kernel matching `sample_widget.ns` line 9!
+    kernel.register_command(
+        "sample-widget-boost",
+        ext_help_id(),
+        "Boost quantum-telemetry widget score.",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            w.status_message = "boosted!"
+            status_emit("boosted!")#
+            ()
+        },
+    )
+    let leader = kernel.ensure_keymap(KEYMAP_VIM_LEADER)
+    leader.bind("<Space> h z", "sample-widget-boost", ext_help_id(), description = "Sample boost")
+    kernel
+}
+
+fn find_apropos_hit_by_kind_and_target(state: HelpState, kind: String, target_sub: String) -> ?AproposHit {
+    for i in 0..state.apropos_entries.len() {
+        let h = state.apropos_entries.get(i.as(usize)).as(AproposHit)
+        if h.kind == kind and h.target_id.contains(target_sub) {
+            return h
+        }
+    }
+    null
+}
+
+fn run_help_info_apropos_suite(
+    root: String,
+    docs_dir: String,
+    nessa_docs_dir: String,
+    code_dir: String,
+    sample_ns: String,
+) {
+    let kernel = boot_kernel_with_help()
+    let world: EditorWorld = (require_editor_world(kernel) ! { e => panic(e) }).as(EditorWorld)
+    let wm: WindowManager = (require_window_manager(kernel) ! { e => panic(e) }).as(WindowManager)
+    let state: HelpState = (require_help_state(kernel) ! { e => panic(e) }).as(HelpState)
+
+    -- Configure deterministic doc & code roots
+    state.override_doc_roots = [docs_dir, nessa_docs_dir]
+    state.override_code_roots = [code_dir]
+    world.cwd = root
+
+    -- Verify all 29 EditorOptions are cataloged
+    check_eq_i64(all_option_metas().len(), 29, "all 29 EditorOptions documented in OptionMeta catalog")
+
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let _cap = AppHostCap.new(world)
+
+    let demo_path = path.join(root, "demo.ns")
+    let _ = world.open_file(demo_path)# ! { e => panic("open demo.ns: " ++ e) }
+    wm.sync_from_world(world)
+    check_eq_str(world.active_buffer().name, "demo.ns", "starts in demo.ns")
+
+    -- ========================================================================
+    -- 1. Emacs Info Hypertext Manual Reader (`C-h i`, `*Info*`, `major_mode == "info"`)
+    -- ========================================================================
+    println("  [1] Emacs Info reader: (dir)Top, links, n/p/u/t/d, history l/r, index i, search s, quit q")
+    feed(kernel, "<C-h> i")#
+    let gen0 = app_commit_frame(kernel) ! { e => panic(e) }
+    check_true(gen0 >= 1, "committed *Info* frame")
+    check_eq_str(world.active_buffer().name, INFO_BUF_NAME, "C-h i opens *Info*")
+    check_eq_str(world.active_buffer().major_mode, "info", "*Info* has major_mode = info")
+    check_eq_str(state.current_info_node, INFO_DIR_NODE, "opens at (dir)Top")
+
+    let dir_txt = buffer_text(world.active_buffer())
+    check_true(dir_txt.contains("File: dir,  Node: Top [(dir)Top]"), "(dir)Top has classic Emacs Info header")
+    check_true(dir_txt.contains("Lava System & Editor Manuals"), "(dir)Top groups Lava manuals")
+    check_true(dir_txt.contains("[guide#top]"), "(dir)Top lists guide#top")
+    check_true(dir_txt.contains("Nessa Language & Standard Library Manuals"), "(dir)Top groups Nessa manuals")
+    check_true(dir_txt.contains("[nessa:effects#top]"), "(dir)Top lists nessa:effects#top")
+
+    -- `<Tab>` jumps cursor to `[extra#top]`, second `<Tab>` jumps to `[guide#top]`, `<S-Tab>` & `<Tab>` verify bidirectional link nav!
+    feed(kernel, "<Tab>")#
+    check_true(world.active_buffer().line_at(world.active_buffer().point.row).contains("[extra#top]"), "TAB focuses first menu link [extra#top]")
+    feed(kernel, "<Tab>")#
+    check_true(world.active_buffer().line_at(world.active_buffer().point.row).contains("[guide#top]"), "second TAB focuses [guide#top]")
+    feed(kernel, "<S-Tab>")#
+    check_true(world.active_buffer().line_at(world.active_buffer().point.row).contains("[extra#top]"), "S-TAB returns to [extra#top]")
+    feed(kernel, "<Tab>")#
+    feed(kernel, "<Return>")#
+    check_eq_str(state.current_info_node, "guide#top", "RET follows [guide#top] link")
+    let guide_top_txt = buffer_text(world.active_buffer())
+    check_true(guide_top_txt.contains("File: guide,  Node: Lava Test Guide [guide#top]"), "guide#top Info header rendered")
+    check_true(guide_top_txt.contains("*lava-guide*"), "guide#top renders *tags* badge")
+    check_true(guide_top_txt.contains("* [guide#navigation-keys]"), "guide#top renders child * Menu: links")
+    check_true(guide_top_txt.contains("[Source: " ++ path.join(docs_dir, "guide.md") ++ ":1]"), "guide#top renders [Source: file:line]")
+
+    -- `n` -> `guide#navigation-keys`, `n` -> `guide#widget-configuration`, `p` -> `guide#navigation-keys`, `u` -> `guide#top`, `d` -> `(dir)Top`
+    feed(kernel, "n")#
+    check_eq_str(state.current_info_node, "guide#navigation-keys", "n advances to guide#navigation-keys")
+    feed(kernel, "n")#
+    check_eq_str(state.current_info_node, "guide#widget-configuration", "n advances to guide#widget-configuration")
+    feed(kernel, "p")#
+    check_eq_str(state.current_info_node, "guide#navigation-keys", "p returns to guide#navigation-keys")
+    feed(kernel, "u")#
+    check_eq_str(state.current_info_node, "guide#top", "u climbs Up to parent guide#top")
+
+    -- Move cursor to row 5 before navigating to `(dir)Top` so we can verify cursor-row restoration on `l`!
+    world.active_buffer().point = Pos.new(5, 0)
+    feed(kernel, "d")#
+    check_eq_str(state.current_info_node, INFO_DIR_NODE, "d jumps to (dir)Top")
+
+    -- `l` (`info-history-back`) restores `guide#top` AND cursor row 5; `r` (`info-history-forward`) goes back to `(dir)Top`!
+    feed(kernel, "l")#
+    check_eq_str(state.current_info_node, "guide#top", "l navigates Info history backward to guide#top")
+    check_eq_i64(world.active_buffer().point.row, 5, "l restores saved cursor_row = 5 in guide#top")
+    feed(kernel, "r")#
+    check_eq_str(state.current_info_node, INFO_DIR_NODE, "r navigates Info history forward to (dir)Top")
+
+    -- `g` (`info-goto-node`) jumps to `guide#widget-configuration`, then `t` (`info-top-node`) jumps to manual top `guide#top`
+    feed(kernel, "g")#
+    feed(kernel, "widget-configuration<Return>")#
+    check_eq_str(state.current_info_node, "guide#widget-configuration", "g prompts and jumps to guide#widget-configuration")
+    feed(kernel, "t")#
+    check_eq_str(state.current_info_node, "guide#top", "t jumps to manual top guide#top")
+
+    -- `m` (`info-menu`) picks child menu item `guide#navigation-keys`, then `u` goes back to `guide#top`
+    feed(kernel, "m")#
+    feed(kernel, "navigation<Return>")#
+    check_eq_str(state.current_info_node, "guide#navigation-keys", "m picks child menu item guide#navigation-keys")
+    feed(kernel, "u")#
+    check_eq_str(state.current_info_node, "guide#top", "u returns to guide#top")
+
+    -- Follow relative Markdown link `[Extra Reference](extra.md)` inside `guide#top`!
+    let md_link_row = find_line_containing(world.active_buffer(), "[Extra Reference](extra.md)")
+    check_true(md_link_row > 0, "found Markdown link line in guide#top")
+    world.active_buffer().point = Pos.new(md_link_row, 5)
+    feed(kernel, "<Return>")#
+    check_eq_str(state.current_info_node, "extra#top", "RET on [Extra Reference](extra.md) opens extra#top in *Info*")
+
+    -- `i` (`info-index`) looks up `*motion-basics*` inline tag and opens `guide#navigation-keys`!
+    feed(kernel, "i")#
+    feed(kernel, "motion-basics<Return>")#
+    check_eq_str(state.current_info_node, "guide#navigation-keys", "i index lookup jumps to node owning *motion-basics*")
+
+    -- `s` (`info-search`) full-text searches manuals for `quantum-telemetry` and `]` cycles hits!
+    feed(kernel, "s")#
+    feed(kernel, "quantum-telemetry<Return>")#
+    check_true(state.info_search_hits.len() >= 2, "s finds 2+ manual sections matching quantum-telemetry")
+    let first_hit_node = state.current_info_node
+    feed(kernel, "]")#
+    check_true(state.current_info_node != first_hit_node, "] advances to second Info search hit node")
+    feed(kernel, "[")#
+    check_eq_str(state.current_info_node, first_hit_node, "[ returns to first Info search hit node")
+
+    -- `q` (`info-quit`) switches back to `demo.ns`!
+    feed(kernel, "q")#
+    check_eq_str(world.active_buffer().name, "demo.ns", "q quits *Info* and restores demo.ns")
+
+    -- Also test `:Info nessa:effects` Ex command
+    feed(kernel, ":Info<Space>nessa:effects<Return>")#
+    check_eq_str(world.active_buffer().name, INFO_BUF_NAME, ":Info opens *Info*")
+    check_eq_str(state.current_info_node, "nessa:effects#top", ":Info nessa:effects opens nessa:effects#top")
+    feed(kernel, "q")#
+    check_eq_str(world.active_buffer().name, "demo.ns", "q returns to demo.ns")
+
+    -- ========================================================================
+    -- 2. Emacs Global Documentation Search — Apropos Suite (`C-h d`, `C-h a`, `C-h o`)
+    -- ========================================================================
+    println("  [2] Global 5-domain Apropos (`C-h d`): manuals, commands, variables, extensions, and .ns symbols")
+    -- Query `"quantum"` hits:
+    --   - Manual (`guide.md` sections mentioning `quantum-telemetry`)
+    --   - Command (`sample-widget-boost` summary `"Boost quantum-telemetry widget score."`)
+    --   - Symbol (`compute_widget_score` via `-- Computes quantum-telemetry score...` doc comment!)
+    feed(kernel, "<C-h> d")#
+    feed(kernel, "quantum<Return>")#
+    check_eq_str(world.active_buffer().name, APROPOS_BUF_NAME, "C-h d opens *Apropos*")
+    check_eq_str(world.active_buffer().major_mode, "apropos", "*Apropos* has major_mode = apropos")
+
+    let doc_hit_opt = find_apropos_hit_by_kind_and_target(state, "doc", "guide#")
+    let cmd_hit_opt = find_apropos_hit_by_kind_and_target(state, "command", "sample-widget-boost")
+    let sym_hit_opt = find_apropos_hit_by_kind_and_target(state, "symbol", "compute_widget_score")
+    check_true(doc_hit_opt != null, "Apropos found manual section hit for 'quantum'")
+    check_true(cmd_hit_opt != null, "Apropos found interactive command hit for 'quantum'")
+    check_true(sym_hit_opt != null, "Apropos found .ns symbol hit via -- doc comment for 'quantum'")
+
+    -- Also verify Variable & Extension domains in `C-h d`!
+    feed(kernel, "g")#
+    feed(kernel, "<BackSpace><BackSpace><BackSpace><BackSpace><BackSpace><BackSpace><BackSpace>relative<Return>")#
+    check_true(find_apropos_hit_by_kind_and_target(state, "variable", "relativenumber") != null, "Apropos g refresh finds EditorOptions variable relativenumber")
+
+    feed(kernel, ":AproposDocs<Space>ext_help<Return>")#
+    check_true(find_apropos_hit_by_kind_and_target(state, "extension", "lava.org/ext_help") != null, ":AproposDocs finds extension lava.org/ext_help")
+
+    -- Re-run `quantum` in `*Apropos*` to test `<Tab>`/`n`/`p`, `<Return>` -> `*Info*`, `<Return>` -> `*Help*`, and `s` -> `.ns` source!
+    feed(kernel, ":AproposDocs<Space>quantum<Return>")#
+    let r0 = world.active_buffer().point.row
+    feed(kernel, "<Tab>")#
+    check_true(world.active_buffer().point.row > r0, "TAB moves to next Apropos entry")
+    feed(kernel, "p")#
+    check_eq_i64(world.active_buffer().point.row, r0, "p moves back to previous Apropos entry")
+
+    -- `<Return>` on a `"doc"` hit opens `*Info*` at that exact node!
+    let doc_hit = find_apropos_hit_by_kind_and_target(state, "doc", "guide#").as(AproposHit)
+    world.active_buffer().point = Pos.new(doc_hit.row, 0)
+    feed(kernel, "<Return>")#
+    check_eq_str(world.active_buffer().name, INFO_BUF_NAME, "RET on doc Apropos hit opens *Info*")
+    check_eq_str(state.current_info_node, doc_hit.target_id, "opened exact doc node from *Apropos*")
+
+    -- Re-open `*Apropos*`, focus `"command"` hit (`sample-widget-boost`), press `<Return>` -> opens `*Help*`!
+    feed(kernel, ":AproposDocs<Space>quantum<Return>")#
+    let cmd_hit = find_apropos_hit_by_kind_and_target(state, "command", "sample-widget-boost").as(AproposHit)
+    world.active_buffer().point = Pos.new(cmd_hit.row, 0)
+    feed(kernel, "<Return>")#
+    check_eq_str(world.active_buffer().name, HELP_BUF_NAME, "RET on command Apropos hit opens *Help*")
+    check_true(buffer_text(world.active_buffer()).contains("sample-widget-boost is an interactive command"), "*Help* describes sample-widget-boost")
+
+    -- Re-open `*Apropos*`, focus `"symbol"` hit (`compute_widget_score`), press `s` -> jumps directly to `sample_widget.ns` row 3!
+    feed(kernel, ":AproposDocs<Space>quantum<Return>")#
+    let sym_hit = find_apropos_hit_by_kind_and_target(state, "symbol", "compute_widget_score").as(AproposHit)
+    world.active_buffer().point = Pos.new(sym_hit.row, 0)
+    feed(kernel, "s")#
+    check_eq_str(world.active_buffer().name, "sample_widget.ns", "s on symbol hit in *Apropos* opens sample_widget.ns")
+    check_eq_i64(world.active_buffer().point.row, 3, "s positions cursor on exact pub fn compute_widget_score line (row 3)")
+
+    -- Test `C-h a` (`apropos-command`) and `C-h o` (`apropos`) + `q` (`apropos-quit`)
+    feed(kernel, "<C-h> a")#
+    feed(kernel, "widget<Space>boost<Return>")#
+    check_eq_str(world.active_buffer().name, APROPOS_BUF_NAME, "C-h a opens *Apropos*")
+    check_true(find_apropos_hit_by_kind_and_target(state, "command", "sample-widget-boost") != null, "C-h a Orderless multi-token finds sample-widget-boost")
+    feed(kernel, "q")#
+    check_eq_str(world.active_buffer().name, "sample_widget.ns", "q in *Apropos* returns to sample_widget.ns")
+
+    feed(kernel, "<C-h> o")#
+    feed(kernel, "compute_widget_score<Return>")#
+    check_eq_str(world.active_buffer().name, APROPOS_BUF_NAME, "C-h o opens unified *Apropos*")
+    check_true(find_apropos_hit_by_kind_and_target(state, "symbol", "compute_widget_score") != null, "C-h o finds compute_widget_score")
+    feed(kernel, "q")#
+
+    -- ========================================================================
+    -- 3. `C-h f` (`describe-function`): Keybindings + Owner + `[Source: file:line]` + `s` Jump
+    -- ========================================================================
+    println("  [3] Helpful `C-h f` (`describe-function`): keybindings, source preview, and `s` source jump")
+    let _ = world.open_file(demo_path)# ! { e => panic(e) }
+    wm.sync_from_world(world)
+
+    feed(kernel, "<C-h> f")#
+    feed(kernel, "sample-widget-boost<Return>")#
+    check_eq_str(world.active_buffer().name, HELP_BUF_NAME, "C-h f opens *Help*")
+    check_eq_str(world.active_buffer().major_mode, "help", "*Help* has major_mode = help")
+    let fn_help_txt = buffer_text(world.active_buffer())
+    check_true(fn_help_txt.contains("Owner:          [Extension: lava.org/ext_help]"), "C-h f shows owner extension link")
+    check_true(fn_help_txt.contains("<Space> h z"), "C-h f shows bound leader chord <Space> h z")
+    check_true(fn_help_txt.contains("[Source: " ++ sample_ns ++ ":10]"), "C-h f locates k.register_command at sample_widget.ns:10")
+    check_true(fn_help_txt.contains("register_command(\"sample-widget-boost\""), "C-h f renders inline .ns source preview")
+
+    -- Press `s` (`help-goto-source`) in `*Help*` -> opens `sample_widget.ns` at row 9 (line 10)!
+    feed(kernel, "s")#
+    check_eq_str(world.active_buffer().name, "sample_widget.ns", "s in *Help* opens sample_widget.ns")
+    check_eq_i64(world.active_buffer().point.row, 9, "s jumps to exact k.register_command definition row (row 9)")
+
+    -- ========================================================================
+    -- 4. `C-h v` (`describe-variable`): Live `e` Toggle & Integer Option Edit
+    -- ========================================================================
+    println("  [4] Helpful `C-h v` (`describe-variable`): relativenumber & tabstop live `e` mutation")
+    let orig_rnu = world.options.relativenumber
+    feed(kernel, "<C-h> v")#
+    feed(kernel, "relativenumber<Return>")#
+    check_eq_str(world.active_buffer().name, HELP_BUF_NAME, "C-h v opens *Help* for relativenumber")
+    check_true(buffer_text(world.active_buffer()).contains("Current Value:  " ++ orig_rnu.to_string()), "shows initial relativenumber")
+
+    -- Press `e` to toggle boolean `relativenumber` live!
+    feed(kernel, "e")#
+    check_eq_bool(world.options.relativenumber, not orig_rnu, "e toggles world.options.relativenumber live")
+    check_true(buffer_text(world.active_buffer()).contains("Current Value:  " ++ (not orig_rnu).to_string()), "*Help* refreshes Current Value immediately")
+
+    -- Inspect `tabstop` (`i64`) and press `e` to change it to `8`!
+    feed(kernel, "<C-h> v")#
+    feed(kernel, "tabstop<Return>")#
+    check_eq_i64(world.options.tabstop, 4, "default tabstop is 4")
+    feed(kernel, "e")#
+    -- Prompt starts with initial `"4"`, so BackSpace + `"8"` + Return sets `tabstop = 8`!
+    feed(kernel, "<BackSpace>8<Return>")#
+    check_eq_i64(world.options.tabstop, 8, "e updates world.options.tabstop = 8 live")
+    check_true(buffer_text(world.active_buffer()).contains("Current Value:  8"), "*Help* shows Current Value: 8")
+
+    -- Verify `*Help*` history back (`l`) & forward (`r`) between `relativenumber` and `tabstop`!
+    feed(kernel, "l")#
+    check_true(buffer_text(world.active_buffer()).contains("Variable:       relativenumber"), "l goes back to relativenumber in *Help* history")
+    feed(kernel, "r")#
+    check_true(buffer_text(world.active_buffer()).contains("Variable:       tabstop"), "r goes forward to tabstop in *Help* history")
+    feed(kernel, "q")#
+
+    -- ========================================================================
+    -- 5. `C-h m`, `C-h w`, `C-h c`, `C-h ?` / `<F1>`, `:h <tag>`, and Normal `K` (`helpful-at-point`)
+    -- ========================================================================
+    println("  [5] `C-h m`, `C-h w`, `C-h c`, `C-h ?`, `:h <tag>`, and Normal `K` (`helpful-at-point`)")
+    let demo_buf: Buffer = (world.open_file(demo_path)# ! { e => panic(e) }).as(Buffer)
+    wm.sync_from_world(world)
+
+    -- `C-h m` (`describe-mode`) on `demo.ns`
+    feed(kernel, "<C-h> m")#
+    check_eq_str(world.active_buffer().name, HELP_BUF_NAME, "C-h m opens *Help*")
+    let mode_txt = buffer_text(world.active_buffer())
+    check_true(mode_txt.contains("Buffer Name:    demo.ns"), "C-h m shows buffer name demo.ns")
+    check_true(mode_txt.contains("Major Mode:     nessa"), "C-h m shows major_mode nessa")
+    check_true(mode_txt.contains("Loaded Extensions"), "C-h m lists loaded extensions")
+    feed(kernel, "q")#
+    check_eq_str(world.active_buffer().name, "demo.ns", "q returns to demo.ns")
+
+    -- `C-h w` (`where-is`) for `info`
+    feed(kernel, "<C-h> w")#
+    feed(kernel, "info<Return>")#
+    check_true(world.status_message.contains("`info` is on"), "C-h w reports keybindings in status bar")
+    check_true(world.status_message.contains("C-h i") or world.status_message.contains("<C-h> i"), "C-h w includes C-h i binding")
+
+    -- `C-h c` (`describe-key-briefly`) for `<C-h> d`
+    feed(kernel, "<C-h> c")#
+    feed(kernel, "<lt>C-h<gt><Space>d<Return>")#
+    check_true(world.status_message.contains("apropos-documentation"), "C-h c reports apropos-documentation in echo area")
+
+    -- `C-h ?` and `<F1>` (`help-for-help`)
+    feed(kernel, "<C-h> ?")#
+    check_eq_str(world.active_buffer().name, HELP_BUF_NAME, "C-h ? opens *Help* cheat-sheet")
+    check_true(buffer_text(world.active_buffer()).contains("Lava Self-Documenting Help System"), "C-h ? renders overview")
+    feed(kernel, "q")#
+
+    feed(kernel, "<F1>")#
+    check_eq_str(world.active_buffer().name, HELP_BUF_NAME, "<F1> opens *Help* cheat-sheet")
+    feed(kernel, "q")#
+
+    -- `:h nav-keys` (`ex:h` tag lookup -> opens `*Info*` at `guide#navigation-keys`!)
+    feed(kernel, ":h<Space>nav-keys<Return>")#
+    check_eq_str(world.active_buffer().name, INFO_BUF_NAME, ":h nav-keys opens *Info*")
+    check_eq_str(state.current_info_node, "guide#navigation-keys", ":h nav-keys resolves *nav-keys* tag to guide#navigation-keys")
+    feed(kernel, "q")#
+
+    -- `:help` with no args opens `*Info*` `(dir)Top`!
+    feed(kernel, ":help<Return>")#
+    check_eq_str(world.active_buffer().name, INFO_BUF_NAME, ":help with no args opens *Info*")
+    check_eq_str(state.current_info_node, INFO_DIR_NODE, ":help opens (dir)Top")
+    feed(kernel, "q")#
+
+    -- Normal-mode `K` (`helpful-at-point`) on `compute_widget_score` in `demo.ns` (row 1, col 14)
+    check_eq_str(world.active_buffer().name, "demo.ns", "back in demo.ns for K test")
+    demo_buf.point = Pos.new(1, 14)
+    feed(kernel, "K")#
+    check_eq_str(world.active_buffer().name, HELP_BUF_NAME, "Normal K on symbol opens *Help*")
+    let sym_card = buffer_text(world.active_buffer())
+    check_true(sym_card.contains("compute_widget_score is a Nessa `fn` definition."), "K renders symbol card header")
+    check_true(sym_card.contains("Computes quantum-telemetry score"), "K includes -- doc comment")
+    check_true(sym_card.contains("[Source: " ++ sample_ns ++ ":4]"), "K includes [Source: file:line]")
+    -- Press `g d` in `*Help*` to jump straight to `compute_widget_score` in `sample_widget.ns`!
+    feed(kernel, "g d")#
+    check_eq_str(world.active_buffer().name, "sample_widget.ns", "gd in *Help* opens sample_widget.ns")
+    check_eq_i64(world.active_buffer().point.row, 3, "gd lands on row 3 of sample_widget.ns")
+
+    -- Normal-mode `K` on command identifier `sample-widget-boost` in `demo.ns` (row 2, col 10)
+    let _ = world.open_file(demo_path)# ! { e => panic(e) }
+    wm.sync_from_world(world)
+    world.active_buffer().point = Pos.new(2, 10)
+    feed(kernel, "K")#
+    check_eq_str(world.active_buffer().name, HELP_BUF_NAME, "Normal K on command token opens *Help*")
+    check_true(buffer_text(world.active_buffer()).contains("sample-widget-boost is an interactive command"), "K resolves command under cursor")
+    feed(kernel, "q")#
+
+    -- `C-h .` (`helpful-at-point`) on option identifier `relativenumber` in `demo.ns` (row 3, col 10)
+    world.active_buffer().point = Pos.new(3, 10)
+    feed(kernel, "<C-h> .")#
+    check_eq_str(world.active_buffer().name, HELP_BUF_NAME, "C-h . on option token opens *Help*")
+    check_true(buffer_text(world.active_buffer()).contains("relativenumber is a customizable `EditorOptions` variable"), "C-h . resolves EditorOptions variable under cursor")
+    feed(kernel, "q")#
+    check_eq_str(world.active_buffer().name, "demo.ns", "final q returns cleanly to demo.ns")
+}
+
+fn main() {
+    println("=== test_emacs_help_info ===")
+    let (root, docs_dir, nessa_docs_dir, code_dir, sample_ns) = setup_fixture_workspace()
+    run_help_info_apropos_suite(root, docs_dir, nessa_docs_dir, code_dir, sample_ns)
+    let _ = fs.remove_dir_all(root) ! { _ => () }
+    println("test_emacs_help_info: ALL PASSED")
+}

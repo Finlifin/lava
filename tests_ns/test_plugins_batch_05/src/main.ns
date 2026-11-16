@@ -1,0 +1,533 @@
+-- End-to-end integration test suite for Lava Batch 05 Plugins (13–15):
+--   13. `ext_trouble` (`trouble.nvim` / `Flycheck`: live syntax/conflict/style/quickfix diagnostics,
+--       gutter signs, underlines, EOL virtual text, `]d`/`[d`, `*Trouble*` panel, filter, jump, live clear)
+--   14. `ext_aerial` (`aerial.nvim` / `nvim-navic`: live `world.winbar_text` breadcrumbs across
+--       Nessa/Rust/Markdown, `OUTLINE` right sidebar, `sidebar-clicked`, `g]`/`g[`, `aerial-jump` prompt)
+--   15. `ext_conform` (`conform.nvim` / `Apheleia`: deterministic Nessa/Rust/JSON/Python formatting,
+--       single-step undo, Visual range formatting, malformed JSON rejection, format-on-save on `:w`, `:ConformInfo`)
+
+use std.fs
+use std.path
+use std.time
+use @lava_sys.{RawUiEvent, mock_enable}
+use @lava_core.{ExtId, SystemKernel, clipboard_get, clipboard_set, log_event, status_emit}
+use @ext_document.{
+    Buffer, EditorWorld, GutterSign, InlineSpanDecor, Pos, QuickfixEntry, VirtualTextDecor,
+    require_editor_world
+}
+use @ext_app.{AppHostCap, app_commit_frame, app_feed_keys, app_step_event, boot_kernel}
+use @ext_trouble.{
+    COLOR_DIAG_ERROR, COLOR_DIAG_WARN, OWNER_TROUBLE, SIGN_PRIORITY_ERROR, SIGN_PRIORITY_WARN,
+    TROUBLE_BUF_NAME, TroubleService, register_trouble_extension, require_trouble_service
+}
+use @ext_aerial.{
+    AERIAL_SIDEBAR_TITLE, OWNER_AERIAL, AerialService, register_aerial_extension,
+    require_aerial_service
+}
+use @ext_conform.{
+    CONFORM_INFO_BUF_NAME, ConformService, register_conform_extension, require_conform_service
+}
+
+fn check_true(cond: bool, label: String) {
+    if not cond {
+        panic("FAILED: " ++ label)
+    }
+}
+
+fn check_eq_str(actual: String, expected: String, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual='" ++ actual ++ "' expected='" ++ expected ++ "'")
+    }
+}
+
+fn check_eq_i64(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual=" ++ actual.to_string() ++ " expected=" ++ expected.to_string())
+    }
+}
+
+fn boot_batch05_kernel() -> SystemKernel {
+    let kernel: SystemKernel = (boot_kernel() ! { e => panic(e) }).as(SystemKernel)
+    let _ = register_trouble_extension(kernel) ! { e => panic(e) }
+    let _ = register_aerial_extension(kernel) ! { e => panic(e) }
+    let _ = register_conform_extension(kernel) ! { e => panic(e) }
+    let _ = kernel.activate_all() ! { e => panic(e) }
+    kernel
+}
+
+fn count_owner_signs(buf: Buffer, owner: String) -> i64 {
+    var count: i64 = 0
+    for i in 0..buf.signs.len() {
+        let s = buf.signs.get(i.as(usize)).as(GutterSign)
+        if s.owner == owner {
+            count += 1
+        }
+    }
+    count
+}
+
+fn has_owner_sign_at(buf: Buffer, owner: String, row: i64, text: String, fg: i64, prio: i64) -> bool {
+    for i in 0..buf.signs.len() {
+        let s = buf.signs.get(i.as(usize)).as(GutterSign)
+        if s.owner == owner and s.row == row and s.text == text and s.fg_rgba == fg and s.priority == prio {
+            return true
+        }
+    }
+    false
+}
+
+fn count_owner_inline_decors(buf: Buffer, owner: String) -> i64 {
+    var count: i64 = 0
+    for i in 0..buf.inline_decors.len() {
+        let d = buf.inline_decors.get(i.as(usize)).as(InlineSpanDecor)
+        if d.owner == owner and d.underline {
+            count += 1
+        }
+    }
+    count
+}
+
+fn count_owner_virt_texts(buf: Buffer, owner: String) -> i64 {
+    var count: i64 = 0
+    for i in 0..buf.virt_texts.len() {
+        let vt = buf.virt_texts.get(i.as(usize)).as(VirtualTextDecor)
+        if vt.owner == owner {
+            count += 1
+        }
+    }
+    count
+}
+
+fn find_owner_virt_text_at_row(buf: Buffer, owner: String, row: i64) -> String {
+    for i in 0..buf.virt_texts.len() {
+        let vt = buf.virt_texts.get(i.as(usize)).as(VirtualTextDecor)
+        if vt.owner == owner and vt.row == row {
+            return vt.text
+        }
+    }
+    ""
+}
+
+fn find_row_containing(buf: Buffer, needle: String) -> i64 {
+    for i in 0..buf.line_count() {
+        if buf.line_at(i).contains(needle) {
+            return i
+        }
+    }
+    -1
+}
+
+fn test_batch_05_plugins() {
+    mock_enable(true)
+
+    let tmp_dir = "/tmp/lava_batch05_" ++ time.unix_millis().to_string()
+    let _ = fs.create_dir_all(tmp_dir) ! { e => panic(e.to_string()) }
+
+    let kernel = boot_batch05_kernel()
+    check_eq_i64(kernel.list_extensions().len(), 11, "11 active extensions (8 core + 3 batch05)")
+
+    let world: EditorWorld = (require_editor_world(kernel) ! { e => panic(e) }).as(EditorWorld)
+    world.cwd = tmp_dir
+
+    let trouble_svc: TroubleService = (require_trouble_service(kernel) ! { e => panic(e) }).as(TroubleService)
+    let aerial_svc: AerialService = (require_aerial_service(kernel) ! { e => panic(e) }).as(AerialService)
+    let conform_svc: ConformService = (require_conform_service(kernel) ! { e => panic(e) }).as(ConformService)
+
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
+    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+
+    -- ========================================================================
+    -- PART 1: Plugin 13 — `ext_trouble` (`trouble.nvim` / `Flycheck`)
+    -- ========================================================================
+    let broken_path = path.join(tmp_dir, "broken.ns")
+    let broken_src = [
+        "fn demo() -> i64 {{",
+        "    let x = (1 + 2]   ",
+        "<<<<<<< HEAD",
+        "    return 1",
+        "=======",
+        "    return 2",
+        ">>>>>>> topic",
+        "    let s = \"unterminated",
+        "}}",
+    ].join("\n") ++ "\n"
+    let _ = fs.write_string(broken_path, broken_src) ! { e => panic(e.to_string()) }
+
+    -- Also add a quickfix compiler diagnostic targeting `broken.ns`
+    world.quickfix = [
+        QuickfixEntry {
+            file_path: broken_path,
+            row: 0,
+            col: 3,
+            text: "unused function `demo`",
+        },
+    ]
+
+    app_feed_keys(kernel, ":e<Space>" ++ broken_path ++ "<Return>")# ! { e => panic(e) }
+    let b_trouble = world.active_buffer()
+    check_eq_str(b_trouble.name, "broken.ns", "opened broken.ns")
+
+    -- Verify diagnostics were detected across syntax (mismatched bracket + unterminated string),
+    -- git conflict (`<<<<<<<`, `=======`, `>>>>>>>`), style (trailing whitespace on row 1), and quickfix!
+    let diags = trouble_svc.diagnostics_for_buffer(b_trouble.id)
+    check_true(diags.len() >= 6, "trouble detected bracket, string, conflict, style, and quickfix diagnostics")
+
+    -- Verify GutterSign ("E" red priority 30, "W" yellow priority 25), InlineSpanDecor, and EOL VirtualTextDecor
+    check_true(
+        has_owner_sign_at(b_trouble, OWNER_TROUBLE, 1, "E", COLOR_DIAG_ERROR, SIGN_PRIORITY_ERROR),
+        "row 1 has red E gutter sign at priority 30",
+    )
+    check_true(
+        has_owner_sign_at(b_trouble, OWNER_TROUBLE, 2, "E", COLOR_DIAG_ERROR, SIGN_PRIORITY_ERROR),
+        "row 2 conflict marker has red E gutter sign",
+    )
+    check_true(
+        count_owner_inline_decors(b_trouble, OWNER_TROUBLE) >= 6,
+        "trouble underline inline_decors populated",
+    )
+    check_true(
+        count_owner_virt_texts(b_trouble, OWNER_TROUBLE) >= 5,
+        "trouble EOL virtual text decors populated",
+    )
+    let row1_vt = find_owner_virt_text_at_row(b_trouble, OWNER_TROUBLE, 1)
+    check_true(row1_vt.starts_with("■ "), "row 1 virtual text starts with '■ '")
+    check_true(row1_vt.contains("Mismatched bracket"), "row 1 virtual text reports mismatched ']'")
+
+    -- Navigate forward with `]d` and backward with `[d` (including wrap-around)
+    app_feed_keys(kernel, "gg0")# ! { e => panic(e) }
+    check_eq_i64(b_trouble.point.row, 0, "cursor starts at row 0 col 0")
+    app_feed_keys(kernel, "]d")# ! { e => panic(e) }
+    check_eq_i64(b_trouble.point.row, 0, "]d lands on row 0 col 3 quickfix diagnostic")
+    check_eq_i64(b_trouble.point.col, 3, "]d lands on exact quickfix col 3")
+
+    app_feed_keys(kernel, "]d")# ! { e => panic(e) }
+    check_eq_i64(b_trouble.point.row, 1, "second ]d jumps to row 1 mismatched bracket")
+    check_eq_i64(b_trouble.point.col, 18, "second ]d lands on exact bracket col 18")
+
+    app_feed_keys(kernel, "[d")# ! { e => panic(e) }
+    check_eq_i64(b_trouble.point.row, 0, "[d jumps back to row 0 diagnostic")
+    app_feed_keys(kernel, "[d")# ! { e => panic(e) }
+    check_eq_i64(b_trouble.point.row, 7, "[d from first diagnostic wraps around to last diagnostic on row 7")
+
+    -- Open interactive `*Trouble*` workspace panel via `:Trouble`
+    app_feed_keys(kernel, ":Trouble<Return>")# ! { e => panic(e) }
+    let t_panel = world.active_buffer()
+    check_eq_str(t_panel.name, TROUBLE_BUF_NAME, ":Trouble opened *Trouble* special buffer")
+    check_eq_str(t_panel.major_mode, "trouble", "*Trouble* major_mode is trouble")
+    check_true(find_row_containing(t_panel, "Errors:") >= 0, "*Trouble* header shows Errors/Warnings counts")
+
+    -- Cycle filter via `f`: `"all"` -> `"error"` -> `"warning"` -> `"all"`
+    check_eq_str(trouble_svc.filter_mode, "all", "initial filter is all")
+    app_feed_keys(kernel, "f")# ! { e => panic(e) }
+    check_eq_str(trouble_svc.filter_mode, "error", "f switched filter to error")
+    check_true(find_row_containing(t_panel, "[W]") < 0, "error filter hides WARN items")
+
+    app_feed_keys(kernel, "f")# ! { e => panic(e) }
+    check_eq_str(trouble_svc.filter_mode, "warning", "second f switched filter to warning")
+    check_true(find_row_containing(t_panel, "[W]") >= 0, "warning filter shows trailing whitespace WARN")
+    check_true(find_row_containing(t_panel, "[E]") < 0, "warning filter hides ERROR items")
+    -- Verify yellow W sign works on a warning-only line too (`0xF9E2AFFF`, priority 25)
+    app_feed_keys(kernel, "f")# ! { e => panic(e) }
+    check_eq_str(trouble_svc.filter_mode, "all", "third f returned filter to all")
+
+    -- Move cursor to the mismatched bracket diagnostic row in `*Trouble*` and press `<Return>` to jump!
+    let bracket_panel_row = find_row_containing(t_panel, "Mismatched bracket")
+    check_true(bracket_panel_row > 0, "found mismatched bracket row in *Trouble* panel")
+    app_feed_keys(kernel, (bracket_panel_row + 1).to_string() ++ "G<Return>")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, "broken.ns", "<Return> in *Trouble* jumped back to broken.ns")
+    check_eq_i64(world.active_buffer().point.row, 1, "<Return> jumped to exact error row 1")
+    check_eq_i64(world.active_buffer().point.col, 18, "<Return> jumped to exact error col 18")
+
+    -- Toggle `*Trouble*` via `<Space> x x` and close via `q`
+    app_feed_keys(kernel, "<Space>xx")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, TROUBLE_BUF_NAME, "<Space>xx opened *Trouble*")
+    app_feed_keys(kernel, "q")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, "broken.ns", "q closed *Trouble* back to broken.ns")
+
+    -- Check yellow warning GutterSign on a line with trailing whitespace only, then fix all errors and verify 0 diagnostics!
+    world.quickfix = List()
+    b_trouble.set_lines(
+        [
+            "fn demo() -> i64 {{",
+            "    let x = (1 + 2)   ",
+            "    x",
+            "}}",
+        ],
+        record_undo = true,
+    )
+    kernel.emit_hook("buffer-modified", b_trouble.id)
+    check_eq_i64(trouble_svc.diagnostics_for_buffer(b_trouble.id).len(), 1, "only 1 trailing-space warning left")
+    check_true(
+        has_owner_sign_at(b_trouble, OWNER_TROUBLE, 1, "W", COLOR_DIAG_WARN, SIGN_PRIORITY_WARN),
+        "trailing whitespace renders yellow W sign at priority 25",
+    )
+
+    -- Trim trailing spaces on line 2 (`2G$xxx` -> clean code) and confirm diagnostics & decors clear completely!
+    app_feed_keys(kernel, "2G$xxx")# ! { e => panic(e) }
+    check_eq_str(b_trouble.line_at(1), "    let x = (1 + 2)", "trimmed trailing spaces on row 1")
+    check_eq_i64(trouble_svc.diagnostics_for_buffer(b_trouble.id).len(), 0, "fixing code cleared all diagnostics")
+    check_eq_i64(count_owner_signs(b_trouble, OWNER_TROUBLE), 0, "all trouble signs cleared")
+    check_eq_i64(count_owner_inline_decors(b_trouble, OWNER_TROUBLE), 0, "all trouble underlines cleared")
+    check_eq_i64(count_owner_virt_texts(b_trouble, OWNER_TROUBLE), 0, "all trouble virtual texts cleared")
+
+    -- ========================================================================
+    -- PART 2: Plugin 14 — `ext_aerial` (`aerial.nvim` / `nvim-navic`)
+    -- ========================================================================
+    let calc_path = path.join(tmp_dir, "calc.ns")
+    let calc_src = [
+        "struct Calculator {{",
+        "    pub acc: i64,",
+        "}}",
+        "",
+        "impl Calculator {{",
+        "    pub fn compute(self, x: i64) -> i64 {{",
+        "        let next = self.acc + x",
+        "        next",
+        "    }}",
+        "",
+        "    pub fn reset(self) {{",
+        "        self.acc = 0",
+        "    }}",
+        "}}",
+        "",
+        "pub fn standalone_helper() -> i64 {{",
+        "    99",
+        "}}",
+    ].join("\n") ++ "\n"
+    let _ = fs.write_string(calc_path, calc_src) ! { e => panic(e.to_string()) }
+
+    app_feed_keys(kernel, ":e<Space>" ++ calc_path ++ "<Return>")# ! { e => panic(e) }
+    let b_calc = world.active_buffer()
+    check_eq_str(b_calc.name, "calc.ns", "opened calc.ns")
+    check_eq_str(world.winbar_text, "calc.ns > Calculator", "row 0 breadcrumb inside struct Calculator")
+
+    -- Move cursor to blank line 4 (0-indexed row 3) between `struct` and `impl`
+    app_feed_keys(kernel, "4G")# ! { e => panic(e) }
+    check_eq_str(world.winbar_text, "calc.ns", "blank line outside struct resets breadcrumb to calc.ns")
+
+    -- Move cursor inside `fn compute` body (line 7, 0-indexed row 6)
+    app_feed_keys(kernel, "7G")# ! { e => panic(e) }
+    check_eq_str(
+        world.winbar_text,
+        "calc.ns > Calculator > fn compute",
+        "nested breadcrumb inside Calculator::compute",
+    )
+
+    -- Toggle Aerial right sidebar via `<Space> c s` (`:AerialToggle`)
+    app_feed_keys(kernel, "<Space>cs")# ! { e => panic(e) }
+    check_true(world.right_sidebar.visible, "<Space>cs opened right_sidebar")
+    check_eq_str(world.right_sidebar.owner, OWNER_AERIAL, "right_sidebar owner is ext_aerial")
+    check_eq_str(world.right_sidebar.title, AERIAL_SIDEBAR_TITLE, "right_sidebar title is OUTLINE")
+    check_eq_i64(world.right_sidebar.lines.len(), 5, "5 symbols in calc.ns outline")
+    check_eq_str(world.right_sidebar.lines.get(0).as(String), "[S] Calculator", "outline row 0 is [S] Calculator")
+    check_eq_str(world.right_sidebar.lines.get(2).as(String), "  [F] compute", "outline row 2 is indented [F] compute")
+    check_eq_i64(world.right_sidebar.selected_row, 2, "selected_row highlights enclosing fn compute")
+
+    -- Navigate symbols via `g]` and `g[`
+    app_feed_keys(kernel, "g]")# ! { e => panic(e) }
+    check_eq_i64(b_calc.point.row, 10, "g] jumped to pub fn reset on row 10")
+    check_eq_str(world.winbar_text, "calc.ns > Calculator > fn reset", "breadcrumb updated to fn reset")
+    check_eq_i64(world.right_sidebar.selected_row, 3, "sidebar selected_row updated to reset (idx 3)")
+
+    app_feed_keys(kernel, "g[")# ! { e => panic(e) }
+    check_eq_i64(b_calc.point.row, 5, "g[ jumped back to pub fn compute on row 5")
+
+    -- Emit `"sidebar-clicked"` on row 4 (`[F] standalone_helper`) and verify cursor jumps directly!
+    kernel.emit_hook("sidebar-clicked", (OWNER_AERIAL, 4))
+    check_eq_i64(b_calc.point.row, 15, "clicking sidebar row 4 jumped cursor to standalone_helper row 15")
+    check_eq_str(world.winbar_text, "calc.ns > fn standalone_helper", "breadcrumb updated to fn standalone_helper")
+
+    -- Test interactive `aerial-jump` prompt picker via `<Space> c j` + typing `"compute<Return>"`!
+    app_feed_keys(kernel, "<Space>cjcompute<Return>")# ! { e => panic(e) }
+    check_eq_i64(b_calc.point.row, 5, "aerial-jump prompt jumped cursor to fn compute row 5")
+    check_eq_i64(b_calc.point.col, 4, "aerial-jump prompt placed cursor at fn compute indent col 4")
+
+    -- Test Rust (`engine.rs`) and Markdown (`README.md`) breadcrumbs dynamically!
+    let rs_path = path.join(tmp_dir, "engine.rs")
+    let rs_src = [
+        "pub enum State {{",
+        "    Idle,",
+        "    Running,",
+        "}}",
+        "",
+        "impl State {{",
+        "    pub fn is_running(&self) -> bool {{",
+        "        true",
+        "    }}",
+        "}}",
+    ].join("\n") ++ "\n"
+    let _ = fs.write_string(rs_path, rs_src) ! { e => panic(e.to_string()) }
+    app_feed_keys(kernel, ":e<Space>" ++ rs_path ++ "<Return>")# ! { e => panic(e) }
+    check_eq_str(world.winbar_text, "engine.rs > State", "Rust enum breadcrumb")
+    app_feed_keys(kernel, "8G")# ! { e => panic(e) }
+    check_eq_str(world.winbar_text, "engine.rs > State > fn is_running", "Rust impl method breadcrumb")
+
+    let md_path = path.join(tmp_dir, "README.md")
+    let md_src = [
+        "# Overview",
+        "Intro paragraph.",
+        "## Usage",
+        "Run lava from terminal.",
+        "### Keybindings",
+        "Press Space c s.",
+        "## Architecture",
+        "Pure Nessa plugins.",
+    ].join("\n") ++ "\n"
+    let _ = fs.write_string(md_path, md_src) ! { e => panic(e.to_string()) }
+    app_feed_keys(kernel, ":e<Space>" ++ md_path ++ "<Return>")# ! { e => panic(e) }
+    check_eq_str(world.winbar_text, "README.md > Overview", "Markdown H1 breadcrumb")
+    app_feed_keys(kernel, "4G")# ! { e => panic(e) }
+    check_eq_str(world.winbar_text, "README.md > Overview > Usage", "Markdown H1 > H2 breadcrumb")
+    app_feed_keys(kernel, "6G")# ! { e => panic(e) }
+    check_eq_str(
+        world.winbar_text,
+        "README.md > Overview > Usage > Keybindings",
+        "Markdown H1 > H2 > H3 breadcrumb",
+    )
+    app_feed_keys(kernel, "8G")# ! { e => panic(e) }
+    check_eq_str(
+        world.winbar_text,
+        "README.md > Overview > Architecture",
+        "Markdown sibling H2 pops previous H2/H3 cleanly",
+    )
+
+    -- Close Aerial sidebar via `:AerialToggle`
+    app_feed_keys(kernel, ":AerialToggle<Return>")# ! { e => panic(e) }
+    check_true(not world.right_sidebar.visible, ":AerialToggle closed right_sidebar")
+
+    -- ========================================================================
+    -- PART 3: Plugin 15 — `ext_conform` (`conform.nvim` / `Apheleia`)
+    -- ========================================================================
+    -- 3A. Format messy unindented Nessa code via `<Space> c f` in a SINGLE undo step (`u` restores exact original!)
+    let messy_ns_path = path.join(tmp_dir, "messy.ns")
+    let messy_ns_lines = [
+        "fn outer(x: i64) -> i64 {{   ",
+        "if x > 0 {{",
+        "\tlet msg = \"keep }} inside string\"  ",
+        "return x + 1",
+        "}} else {{",
+        "   return 0   ",
+        "  }}",
+        "",
+        "",
+        "",
+        "   }}",
+        "",
+        "",
+    ]
+    let _ = fs.write_string(messy_ns_path, messy_ns_lines.join("\n") ++ "\n") ! { e => panic(e.to_string()) }
+    app_feed_keys(kernel, ":e<Space>" ++ messy_ns_path ++ "<Return>")# ! { e => panic(e) }
+    let b_ns = world.active_buffer()
+    app_feed_keys(kernel, "4G0")# ! { e => panic(e) }
+
+    app_feed_keys(kernel, "<Space>cf")# ! { e => panic(e) }
+    check_eq_str(b_ns.line_at(0), "fn outer(x: i64) -> i64 {{", "formatted line 0 stripped trailing spaces")
+    check_eq_str(b_ns.line_at(1), "    if x > 0 {{", "formatted line 1 indented 4 spaces")
+    check_eq_str(
+        b_ns.line_at(2),
+        "        let msg = \"keep }} inside string\"",
+        "formatted line 2 ignored '}}' inside string literal and indented 8 spaces",
+    )
+    check_eq_str(b_ns.line_at(3), "        return x + 1", "formatted line 3 indented 8 spaces")
+    check_eq_str(b_ns.line_at(4), "    }} else {{", "formatted line 4 dedented closing '}}' then re-opened '{{'")
+    check_eq_str(b_ns.line_at(5), "        return 0", "formatted line 5 indented 8 spaces")
+    check_eq_str(b_ns.line_at(6), "    }}", "formatted line 6 dedented to 4 spaces")
+    check_eq_str(b_ns.line_at(7), "", "collapsed >=3 consecutive blank lines to 1 blank line")
+    check_eq_str(b_ns.line_at(8), "}}", "formatted closing outer brace at col 0")
+    check_eq_i64(b_ns.line_count(), 9, "trimmed excess trailing blank lines at EOF")
+
+    -- Single `u` MUST restore the exact original unformatted buffer!
+    app_feed_keys(kernel, "u")# ! { e => panic(e) }
+    check_eq_str(b_ns.line_at(1), "if x > 0 {{", "single undo `u` restored original unindented line 1")
+    check_eq_i64(b_ns.line_count(), messy_ns_lines.len(), "single undo `u` restored original line count")
+
+    -- Visual-line range formatting: select ONLY lines 2..4 (`2GV4G<Space>cf`) and verify lines outside stay untouched!
+    app_feed_keys(kernel, "2GV4G<Space>cf")# ! { e => panic(e) }
+    check_eq_str(b_ns.line_at(1), "    if x > 0 {{", "visual range formatted line 1")
+    check_eq_str(b_ns.line_at(3), "        return x + 1", "visual range formatted line 3")
+    check_eq_str(b_ns.line_at(5), "   return 0   ", "line 5 outside visual selection remained untouched")
+
+    -- 3B. Format compact JSON (`{"a":1,"b":[true,2]}`) via `:Format` and verify single-step undo + malformed JSON safety!
+    let json_path = path.join(tmp_dir, "config.json")
+    let compact_json = "{{\"a\":1,\"b\":[true,2],\"empty\":{{}},\"arr\":[]}}"
+    let _ = fs.write_string(json_path, compact_json ++ "\n") ! { e => panic(e.to_string()) }
+
+    app_feed_keys(kernel, ":e<Space>" ++ json_path ++ "<Return>")# ! { e => panic(e) }
+    let b_json = world.active_buffer()
+    check_eq_str(b_json.major_mode, "json", "config.json detected json major_mode")
+    let undo_before_json = b_json.undo_tree.current_id
+
+    app_feed_keys(kernel, ":Format<Return>")# ! { e => panic(e) }
+    check_eq_str(b_json.line_at(0), "{{", "JSON line 0 is '{{'")
+    check_eq_str(b_json.line_at(1), "    \"a\": 1,", "JSON line 1 pretty-printed key a")
+    check_eq_str(b_json.line_at(2), "    \"b\": [", "JSON line 2 opened array b")
+    check_eq_str(b_json.line_at(3), "        true,", "JSON line 3 array element true")
+    check_eq_str(b_json.line_at(4), "        2", "JSON line 4 array element 2")
+    check_eq_str(b_json.line_at(5), "    ],", "JSON line 5 closed array b")
+    check_eq_str(b_json.line_at(6), "    \"empty\": {{}},", "JSON empty object stays compact {{}}")
+    check_eq_str(b_json.line_at(7), "    \"arr\": []", "JSON empty array stays compact []")
+    check_eq_str(b_json.line_at(8), "}}", "JSON line 8 is '}}'")
+
+    -- Single `u` restores exact compact single-line JSON!
+    app_feed_keys(kernel, "u")# ! { e => panic(e) }
+    check_eq_i64(b_json.undo_tree.current_id, undo_before_json, "single u returned to initial JSON undo node")
+    check_eq_str(b_json.line_at(0), compact_json, "single u restored exact compact JSON string")
+
+    -- Malformed JSON MUST be rejected cleanly without corrupting buffer or recording undo node!
+    let bad_json_path = path.join(tmp_dir, "broken.json")
+    let bad_json_line = "{{\"a\": 1, \"b\": [true, 2}}"
+    let _ = fs.write_string(bad_json_path, bad_json_line ++ "\n") ! { e => panic(e.to_string()) }
+    app_feed_keys(kernel, ":e<Space>" ++ bad_json_path ++ "<Return>")# ! { e => panic(e) }
+    let b_bad_json = world.active_buffer()
+    let bad_undo_id = b_bad_json.undo_tree.current_id
+
+    app_feed_keys(kernel, ":Format<Return>")# ! { e => panic(e) }
+    check_eq_str(b_bad_json.line_at(0), bad_json_line, "malformed JSON buffer was NOT corrupted")
+    check_eq_i64(b_bad_json.undo_tree.current_id, bad_undo_id, "malformed JSON did not add spurious undo node")
+    check_true(conform_svc.last_status.starts_with("Error:"), "ConformService recorded JSON error status")
+
+    -- 3C. Format-on-save (`<Space> u f` toggles `world.options.format_on_save = true`, then `:w` formats messy Rust before disk write!)
+    check_true(not world.options.format_on_save, "format_on_save defaults to false")
+    app_feed_keys(kernel, "<Space>uf")# ! { e => panic(e) }
+    check_true(world.options.format_on_save, "<Space>uf enabled world.options.format_on_save")
+
+    let messy_rs_path = path.join(tmp_dir, "save_fmt.rs")
+    let messy_rs = [
+        "pub fn add(a: i32, b: i32) -> i32 {{   ",
+        "let sum = a + b;   ",
+        "   sum",
+        "  }}",
+    ].join("\n") ++ "\n"
+    let _ = fs.write_string(messy_rs_path, messy_rs) ! { e => panic(e.to_string()) }
+    app_feed_keys(kernel, ":e<Space>" ++ messy_rs_path ++ "<Return>")# ! { e => panic(e) }
+    app_feed_keys(kernel, ":w<Return>")# ! { e => panic(e) }
+
+    let saved_disk = (fs.read_to_string(messy_rs_path) ! { e => panic(e.to_string()) }).as(String)
+    let expected_rs = [
+        "pub fn add(a: i32, b: i32) -> i32 {{",
+        "    let sum = a + b;",
+        "    sum",
+        "}}",
+    ].join("\n") ++ "\n"
+    check_eq_str(saved_disk, expected_rs, ":w with format_on_save=true formatted Rust code on disk")
+
+    -- Inspect `:ConformInfo` and close with `q`
+    app_feed_keys(kernel, ":ConformInfo<Return>")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, CONFORM_INFO_BUF_NAME, ":ConformInfo opened *ConformInfo*")
+    check_true(
+        find_row_containing(world.active_buffer(), "Format on save  : ENABLED") >= 0,
+        "*ConformInfo* shows Format on save : ENABLED",
+    )
+    app_feed_keys(kernel, "q")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, "save_fmt.rs", "q closed *ConformInfo* back to save_fmt.rs")
+
+    -- Commit a render frame with all Batch 05 chrome active to verify end-to-end rendering compatibility
+    app_commit_frame(kernel)# ! { e => panic(e) }
+
+    let _ = fs.remove_dir_all(tmp_dir) ! { _ => () }
+}
+
+fn main() {
+    test_batch_05_plugins()
+    println("ALL BATCH 05 PLUGIN TESTS PASSED (ext_trouble, ext_aerial, ext_conform)!")
+}

@@ -1,0 +1,105 @@
+-- lava_term: POSIX PTY & VT100/ANSI/TrueColor Terminal Emulator Bridge for Lava.
+-- Bridges `lava-term` (`PtyManager` + `VtScreen`) via `std.runtime.host_call` when running
+-- inside the Lava host runtime, and reports `pty_available() == false` in standalone `nessa run`
+-- mock tests so terminal extensions can run deterministic command-line fallbacks seamlessly.
+
+use std.runtime
+
+pub const PTY_WAKE_TIMER_ID: i64 = 1347705088 -- `0x50545900`
+
+pub struct TermSpan {
+    pub row: i64,
+    pub start_col: i64,
+    pub end_col: i64,
+    pub fg_rgba: i64,
+    pub bg_rgba: i64,
+    pub bold: bool,
+}
+derive Eq, PartialEq, Display for TermSpan
+
+pub struct TermSnapshot {
+    pub lines: List,
+    pub spans: List,
+    pub cursor_row: i64,
+    pub cursor_col: i64,
+    pub cursor_visible: bool,
+    pub alt_screen: bool,
+    pub cwd: String,
+    pub title: String,
+    pub alive: bool,
+    pub exit_code: i64,
+}
+
+pub fn pty_available() -> bool {
+    let raw! = runtime.host_call("pty_available", List()) else {
+        return false
+    }
+    raw.as(bool)
+}
+
+pub fn pty_spawn(shell: String, cwd: String, rows: i64, cols: i64) -> !String i64 {
+    let raw = runtime.host_call("pty_spawn", [shell, cwd, rows, cols])!
+    raw.as(i64)
+}
+
+pub fn pty_write(term_id: i64, data: String) -> !String Unit {
+    let _ = runtime.host_call("pty_write", [term_id, data])!
+    ()
+}
+
+pub fn pty_send_key(
+    term_id: i64,
+    key: String,
+    text: String,
+    ctrl: bool,
+    alt: bool,
+    shift_mod: bool,
+) -> !String Unit {
+    let _ = runtime.host_call("pty_send_key", [term_id, key, text, ctrl, alt, shift_mod])!
+    ()
+}
+
+pub fn pty_resize(term_id: i64, rows: i64, cols: i64) -> !String Unit {
+    let _ = runtime.host_call("pty_resize", [term_id, rows, cols])!
+    ()
+}
+
+pub fn pty_snapshot(term_id: i64, .include_scrollback: bool = true) -> !String TermSnapshot {
+    let raw = runtime.host_call("pty_snapshot", [term_id, include_scrollback])!
+    let fields = raw.as(List)
+    let raw_lines = fields.get(0).as(List)
+    let raw_spans = fields.get(1).as(List)
+
+    let spans = List()
+    for i in 0..raw_spans.len() {
+        let sp = raw_spans.get(i.as(usize)).as(List)
+        spans.push(TermSpan {
+            row: sp.get(0).as(i64),
+            start_col: sp.get(1).as(i64),
+            end_col: sp.get(2).as(i64),
+            fg_rgba: sp.get(3).as(i64),
+            bg_rgba: sp.get(4).as(i64),
+            bold: sp.get(5).as(bool),
+        })
+    }
+
+    TermSnapshot {
+        lines: raw_lines,
+        spans: spans,
+        cursor_row: fields.get(2).as(i64),
+        cursor_col: fields.get(3).as(i64),
+        cursor_visible: fields.get(4).as(bool),
+        alt_screen: fields.get(5).as(bool),
+        cwd: fields.get(6).as(String),
+        title: fields.get(7).as(String),
+        alive: fields.get(8).as(bool),
+        exit_code: fields.get(9).as(i64),
+    }
+}
+
+pub fn pty_kill(term_id: i64) -> bool {
+    let raw! = runtime.host_call("pty_kill", [term_id]) else {
+        return false
+    }
+    raw.as(bool)
+}

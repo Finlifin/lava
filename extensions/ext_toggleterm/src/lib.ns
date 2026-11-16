@@ -1,0 +1,2603 @@
+-- ext_toggleterm: Persistent Numbered POSIX PTY + VT100/ANSI & Fallback Terminals (`lava.org/ext_toggleterm`).
+-- Combines Neovim `toggleterm.nvim` & Emacs `vterm`:
+--   - Dual-engine execution: real persistent interactive POSIX PTYs (`lava_term`) when running
+--     under the Lava host runtime (`pty_available() == true`), plus deterministic stateful
+--     `std.process.shell` fallback (`cd`, `pwd`, `clear`, compound commands, exit status, history)
+--     in standalone `nessa run` tests (`pty_available() == false`).
+--   - 4 layout views per numbered session (`1..9`):
+--       1. `"float"`      : `<C-\>`, `<Space>tf`, `:ToggleTerm [id_or_cmd]` (`FloatingWindow` + spans + cursor)
+--       2. `"horizontal"` : `<Space>th`, `:TermSplit` (`SplitAxis.Horizontal` bottom split)
+--       3. `"vertical"`   : `<Space>tv`, `:TermVSplit` (`SplitAxis.Vertical` right split)
+--       4. `"buffer"`     : `:term`, `:terminal`, `:vterm`, `<Space>tt`, `<Space>tb`, `terminal-here`
+--   - Authentic `TERM-INSERT` vs `TERM-NORMAL` modal key routing (`<C-\><C-n>`, `<F7>`, `<M-Escape>`
+--     to enter `TERM-NORMAL` for Vim scrollback navigation/search/yank; `i`/`a`/`I`/`A`/`<Return>`
+--     to re-enter `TERM-INSERT`) + live `"timer-tick"` PTY output streaming & dynamic resize.
+
+use std.env
+use std.fs
+use std.path
+use std.process
+use @lava_sys.{host_schedule_timer, rgb, rgba}
+use @lava_core.{
+    ExtId, InteractiveEffects, KeyStroke, PromptKind, PromptRequest, ServiceEffects, SystemKernel,
+    ask_prompt, log_event, status_emit
+}
+use @lava_term.{
+    PTY_WAKE_TIMER_ID, TermSnapshot, TermSpan, pty_available, pty_kill, pty_resize, pty_send_key,
+    pty_snapshot, pty_spawn, pty_write
+}
+use @ext_document.{
+    Buffer, BufferId, EditorWorld, FloatingWindow, InlineSpanDecor, Pos, Span, ext_document_id,
+    require_editor_world
+}
+use @ext_window.{
+    SERVICE_WINDOW_MANAGER, SplitAxis, WinId, WindowManager, WindowPane, ext_window_id,
+    require_window_manager
+}
+use @ext_vim.{
+    KEYMAP_VIM_INSERT, KEYMAP_VIM_LEADER, KEYMAP_VIM_NORMAL, KEYMAP_VIM_VISUAL, ModalInterceptor,
+    VimMode, VimState, ext_vim_id, require_vim_state, sync_world_from_vim
+}
+
+pub const SERVICE_TOGGLETERM: String = "lava.toggleterm.manager"
+pub const OWNER_TOGGLETERM: String = "ext_toggleterm"
+pub const FLOAT_ID_TOGGLETERM: String = "toggleterm"
+pub const MAX_SCROLLBACK_LINES: i64 = 1000
+pub const MAX_HISTORY_ENTRIES: i64 = 200
+pub const DEFAULT_FLOAT_COLS: i64 = 88
+pub const DEFAULT_FLOAT_ROWS: i64 = 22
+const CWD_SENTINEL: String = "__LAVA_TOGGLETERM_PWD__:"
+
+pub fn ext_toggleterm_id() -> ExtId = ExtId("lava.org/ext_toggleterm")
+
+-- ============================================================================
+-- 1. Persistent Terminal Session & Service Model
+-- ============================================================================
+
+fn resolve_default_shell() -> String {
+    let env_sh = env.get_or("SHELL", "").trim()
+    if env_sh != "" and fs.exists(env_sh) {
+        return env_sh
+    }
+    if fs.exists("/bin/bash") {
+        return "/bin/bash"
+    }
+    "/bin/sh"
+}
+
+fn short_shell_name(shell_path: String) -> String {
+    let base_opt = path.file_name(shell_path)
+    if base_opt != null {
+        let b = base_opt.as(String)
+        if b != "" {
+            return b
+        }
+    }
+    if shell_path != "" { shell_path } else { "sh" }
+}
+
+pub fn is_terminal_buffer_mode(major_mode: String) -> bool {
+    major_mode == "terminal" or major_mode == "toggleterm"
+}
+
+fn parse_terminal_buffer_id(buf_name: String) -> i64 {
+    if buf_name.starts_with("*terminal-") and buf_name.ends_with("*") {
+        let inner = buf_name.slice(10, buf_name.char_len() - 1)
+        let parsed = inner.parse_i64()
+        if parsed != null and parsed.as(i64) > 0 {
+            return parsed.as(i64)
+        }
+    }
+    -1
+}
+
+pub struct TerminalSession {
+    pub id: i64,
+    pub name: String,
+    pub cwd: String,
+    pub history: List,
+    pub scrollback: List,
+    pub last_exit_code: i64,
+    pub pty_id: i64,
+    pub shell: String,
+    pub title: String,
+    pub alive: bool,
+    pub alt_screen: bool,
+    pub cursor_row: i64,
+    pub cursor_col: i64,
+    pub cursor_visible: bool,
+    pub pty_rows: i64,
+    pub pty_cols: i64,
+    pub pty_lines: List,
+    pub pty_spans: List,
+    pub line_input: String,
+    pub preferred_major_mode: String,
+}
+
+impl TerminalSession {
+    pub fn new(id: i64, initial_cwd: String) -> TerminalSession {
+        let clean_cwd = if initial_cwd.trim() != "" { path.normalize(initial_cwd) } else { "." }
+        let sh = resolve_default_shell()
+        TerminalSession {
+            id: id,
+            name: "*terminal-" ++ id.to_string() ++ "*",
+            cwd: clean_cwd,
+            history: List(),
+            scrollback: List(),
+            last_exit_code: 0,
+            pty_id: 0,
+            shell: sh,
+            title: short_shell_name(sh),
+            alive: true,
+            alt_screen: false,
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: true,
+            pty_rows: 24,
+            pty_cols: 84,
+            pty_lines: List(),
+            pty_spans: List(),
+            line_input: "",
+            preferred_major_mode: "terminal",
+        }
+    }
+
+    pub fn append_line(self, line: String) {
+        self.scrollback.push(line)
+        while self.scrollback.len() > MAX_SCROLLBACK_LINES {
+            let _ = self.scrollback.remove(0)
+        }
+    }
+
+    pub fn record_history(self, cmd_line: String) {
+        let trimmed = cmd_line.trim()
+        if trimmed == "" {
+            return
+        }
+        if not self.history.is_empty() {
+            let prev = self.history.get((self.history.len() - 1).as(usize)).as(String)
+            if prev == trimmed {
+                return
+            }
+        }
+        self.history.push(trimmed)
+        while self.history.len() > MAX_HISTORY_ENTRIES {
+            let _ = self.history.remove(0)
+        }
+    }
+}
+
+pub struct ToggleTermService {
+    pub sessions: List,
+    pub current_id: i64,
+    pub visible_mode: String,
+    pub float_visible: bool,
+    pub term_insert_mode: bool,
+    pub pending_ctrl_backslash: bool,
+    pub input_line: String,
+    pub history_idx: i64,
+    pub draft_input: String,
+    pub previous_buf_id: ?BufferId,
+    pub split_win_id: ?WinId,
+    pub float_sel_anchor: ?Pos,
+    pub float_sel_cursor: ?Pos,
+    pub float_scroll_offset: i64,
+}
+
+pub typealias ToggleTermState = ToggleTermService
+
+impl ToggleTermService {
+    pub fn new() -> ToggleTermService {
+        ToggleTermService {
+            sessions: List(),
+            current_id: 1,
+            visible_mode: "hidden",
+            float_visible: false,
+            term_insert_mode: true,
+            pending_ctrl_backslash: false,
+            input_line: "",
+            history_idx: -1,
+            draft_input: "",
+            previous_buf_id: null,
+            split_win_id: null,
+            float_sel_anchor: null,
+            float_sel_cursor: null,
+            float_scroll_offset: 0,
+        }
+    }
+
+    pub fn find_session(self, id: i64) -> ?TerminalSession {
+        for i in 0..self.sessions.len() {
+            let s = self.sessions.get(i.as(usize)).as(TerminalSession)
+            if s.id == id {
+                return s
+            }
+        }
+        null
+    }
+
+    pub fn ensure_session(self, id: i64, default_cwd: String) -> TerminalSession {
+        let safe_id = if id > 0 { id } else { 1 }
+        let existing_opt = self.find_session(safe_id)
+        if existing_opt != null {
+            return existing_opt.as(TerminalSession)
+        }
+        let created = TerminalSession.new(safe_id, default_cwd)
+        var insert_pos = self.sessions.len()
+        for i in 0..self.sessions.len() {
+            let cur = self.sessions.get(i.as(usize)).as(TerminalSession)
+            if safe_id < cur.id {
+                insert_pos = i
+                break
+            }
+        }
+        self.sessions.insert(insert_pos.as(usize), created)
+        created
+    }
+
+    pub fn active_session(self, default_cwd: String) -> TerminalSession {
+        self.ensure_session(self.current_id, default_cwd)
+    }
+
+    pub fn switch_session(self, id: i64, default_cwd: String) -> TerminalSession {
+        let cur_opt = self.find_session(self.current_id)
+        if cur_opt != null {
+            cur_opt.as(TerminalSession).line_input = self.input_line
+        }
+        let safe_id = if id > 0 { id } else { 1 }
+        self.current_id = safe_id
+        self.history_idx = -1
+        self.draft_input = ""
+        self.pending_ctrl_backslash = false
+        self.float_sel_anchor = null
+        self.float_sel_cursor = null
+        self.float_scroll_offset = 0
+        let target = self.ensure_session(safe_id, default_cwd)
+        self.input_line = target.line_input
+        target
+    }
+
+    pub fn cycle_or_create_next(self, delta: i64, default_cwd: String) -> TerminalSession {
+        if self.sessions.len() <= 1 and delta > 0 {
+            let cur = self.active_session(default_cwd)
+            let next_id = if cur.id == 1 { 2 } else { 1 }
+            return self.switch_session(next_id, default_cwd)
+        }
+        let count = self.sessions.len()
+        if count == 0 {
+            return self.switch_session(1, default_cwd)
+        }
+        var cur_idx: i64 = 0
+        for i in 0..count {
+            if self.sessions.get(i.as(usize)).as(TerminalSession).id == self.current_id {
+                cur_idx = i
+                break
+            }
+        }
+        var next_idx = (cur_idx + delta) % count
+        if next_idx < 0 {
+            next_idx += count
+        }
+        let target = self.sessions.get(next_idx.as(usize)).as(TerminalSession)
+        self.switch_session(target.id, default_cwd)
+    }
+
+    pub fn set_input(self, session: TerminalSession, text: String) {
+        self.input_line = text
+        session.line_input = text
+    }
+}
+
+pub fn require_toggleterm_service(kernel: SystemKernel) -> !String ToggleTermService {
+    let raw = kernel.require_service(SERVICE_TOGGLETERM)!
+    raw.as(ToggleTermService)
+}
+
+pub fn require_toggleterm_state(kernel: SystemKernel) -> !String ToggleTermService {
+    require_toggleterm_service(kernel)!
+}
+
+-- ============================================================================
+-- 2. Dual-Engine Execution: Native POSIX PTY + Stateful Shell Fallback
+-- ============================================================================
+
+fn clamp_pty_rows(rows: i64) -> i64 {
+    if rows < 4 { 4 } else if rows > 200 { 200 } else { rows }
+}
+
+fn clamp_pty_cols(cols: i64) -> i64 {
+    if cols < 16 { 16 } else if cols > 400 { 400 } else { cols }
+}
+
+pub fn ensure_session_pty(session: TerminalSession, rows: i64, cols: i64) -> bool {
+    if not pty_available() {
+        return false
+    }
+    let r = clamp_pty_rows(rows)
+    let c = clamp_pty_cols(cols)
+    if session.pty_id > 0 {
+        if not session.alive {
+            return false
+        }
+        if session.pty_rows != r or session.pty_cols != c {
+            let _ = pty_resize(session.pty_id, r, c) ! { _ => () }
+            session.pty_rows = r
+            session.pty_cols = c
+        }
+        return true
+    }
+    let sh = if session.shell != "" { session.shell } else { resolve_default_shell() }
+    session.shell = sh
+    let spawned_res = pty_spawn(sh, session.cwd, r, c)
+    spawned_res match {
+        pid! => {
+            session.pty_id = pid
+            session.pty_rows = r
+            session.pty_cols = c
+            session.alive = true
+            let _ = sync_session_from_pty(session, true)
+            true
+        },
+        error _ => false,
+    }
+}
+
+pub fn sync_session_from_pty(session: TerminalSession, include_scrollback: bool) -> bool {
+    if (not pty_available()) or session.pty_id <= 0 {
+        return false
+    }
+    let snap_res = pty_snapshot(session.pty_id, include_scrollback = include_scrollback)
+    snap_res match {
+        snap! => {
+            session.pty_lines = snap.lines
+            session.pty_spans = snap.spans
+            session.cursor_row = snap.cursor_row
+            session.cursor_col = snap.cursor_col
+            session.cursor_visible = snap.cursor_visible
+            session.alt_screen = snap.alt_screen
+            session.alive = snap.alive
+            session.last_exit_code = snap.exit_code
+            if snap.cwd.trim() != "" {
+                session.cwd = snap.cwd.trim()
+            }
+            if snap.title.trim() != "" {
+                session.title = snap.title.trim()
+            }
+            -- Mirror non-empty screen lines into `session.scrollback` for programmatic callers
+            let mirrored = List()
+            for i in 0..snap.lines.len() {
+                mirrored.push(snap.lines.get(i.as(usize)).as(String))
+            }
+            while not mirrored.is_empty() {
+                let tail = mirrored.get((mirrored.len() - 1).as(usize)).as(String)
+                if tail.trim() == "" and mirrored.len() > 1 {
+                    let _ = mirrored.pop()
+                } else {
+                    break
+                }
+            }
+            session.scrollback = mirrored
+            true
+        },
+        error _ => false,
+    }
+}
+
+fn shell_quote_single(raw: String) -> String {
+    "'" ++ raw.replace("'", "'\\''") ++ "'"
+}
+
+fn strip_quotes(raw: String) -> String {
+    let s = raw.trim()
+    let n = s.char_len()
+    if n >= 2 {
+        let first = s.slice(0, 1)
+        let last = s.slice(n - 1, n)
+        if (first == "\"" and last == "\"") or (first == "'" and last == "'") {
+            return s.slice(1, n - 1)
+        }
+    }
+    s
+}
+
+fn resolve_cd_target(base_cwd: String, raw_arg: String) -> String {
+    let arg = strip_quotes(raw_arg)
+    let home = env.get_or("HOME", base_cwd)
+    if arg == "" or arg == "~" {
+        return path.normalize(home)
+    }
+    if arg.starts_with("~/") {
+        return path.normalize(path.join(home, arg.drop(2)))
+    }
+    if path.is_absolute(arg) {
+        return path.normalize(arg)
+    }
+    path.normalize(path.join(base_cwd, arg))
+}
+
+fn is_pure_cd_command(cmd_line: String) -> bool {
+    if cmd_line == "cd" {
+        return true
+    }
+    if not cmd_line.starts_with("cd ") {
+        return false
+    }
+    (not cmd_line.contains("&&"))
+        and (not cmd_line.contains("||"))
+        and (not cmd_line.contains(";"))
+        and (not cmd_line.contains("|"))
+}
+
+fn push_output_text_lines(session: TerminalSession, text: String) {
+    if text == "" {
+        return
+    }
+    let norm = text.replace("\r\n", "\n").replace("\r", "\n")
+    let parts = norm.split("\n")
+    var limit = parts.len()
+    if limit > 0 and norm.ends_with("\n") {
+        limit -= 1
+    }
+    for i in 0..limit {
+        session.append_line(parts.get(i.as(usize)).as(String))
+    }
+}
+
+pub fn run_in_session(session: TerminalSession, raw_cmd: String) -> i64 {
+    let cmd_line = raw_cmd.trim()
+    if cmd_line == "" {
+        return 0
+    }
+    session.record_history(cmd_line)
+
+    -- 1. Built-in `clear`
+    if cmd_line == "clear" {
+        session.scrollback = List()
+        session.last_exit_code = 0
+        return 0
+    }
+
+    session.append_line("$ " ++ cmd_line)
+
+    -- 2. Built-in `pwd`
+    if cmd_line == "pwd" {
+        session.append_line(session.cwd)
+        session.last_exit_code = 0
+        return 0
+    }
+
+    -- 3. Built-in standalone `cd` / `cd <dir>`
+    if is_pure_cd_command(cmd_line) {
+        let arg = if cmd_line == "cd" { "" } else { cmd_line.drop(3).trim() }
+        let target = resolve_cd_target(session.cwd, arg)
+        if fs.exists(target) and fs.is_dir(target) {
+            let canon = fs.canonicalize(target) ! { _ => target }
+            session.cwd = canon
+            session.last_exit_code = 0
+            return 0
+        }
+        session.append_line("cd: no such directory: " ++ (if arg != "" { arg } else { target }))
+        session.append_line("[exit 1]")
+        session.last_exit_code = 1
+        return 1
+    }
+
+    -- 4. External shell command (preserving compound `cd <dir> && <cmd>` directory transitions!)
+    let might_change_dir = cmd_line.contains("cd ")
+    let exec_cmd = if might_change_dir {
+        cmd_line ++ "\n__lava_ec=$?; printf '\\n" ++ CWD_SENTINEL ++ "%s\\n' \"$PWD\"; exit $__lava_ec"
+    } else {
+        cmd_line
+    }
+
+    let res = process.shell(exec_cmd, cwd = session.cwd)
+    res match {
+        out! => {
+            var clean_stdout = out.stdout
+            if might_change_dir and clean_stdout.contains(CWD_SENTINEL) {
+                let norm = clean_stdout.replace("\r\n", "\n")
+                let lines = norm.split("\n")
+                let kept = List()
+                for i in 0..lines.len() {
+                    let ln = lines.get(i.as(usize)).as(String)
+                    if ln.starts_with(CWD_SENTINEL) {
+                        let candidate_pwd = ln.drop(CWD_SENTINEL.char_len()).trim()
+                        if candidate_pwd != "" and fs.is_dir(candidate_pwd) {
+                            session.cwd = candidate_pwd
+                        }
+                    } else {
+                        kept.push(ln)
+                    }
+                }
+                if kept.len() >= 2
+                    and kept.get((kept.len() - 1).as(usize)).as(String) == ""
+                    and kept.get((kept.len() - 2).as(usize)).as(String) == "" {
+                    let _ = kept.pop()
+                }
+                clean_stdout = kept.join("\n")
+            }
+            push_output_text_lines(session, clean_stdout)
+            push_output_text_lines(session, out.stderr)
+            if out.status != 0 {
+                session.append_line("[exit " ++ out.status.to_string() ++ "]")
+            }
+            session.last_exit_code = out.status
+            out.status
+        },
+        error io_err => {
+            session.append_line("shell error: " ++ io_err.to_string())
+            session.append_line("[exit 127]")
+            session.last_exit_code = 127
+            127
+        },
+    }
+}
+
+pub fn toggleterm_exec(session: TerminalSession, raw_cmd: String) -> i64 {
+    let trimmed = raw_cmd.trim()
+    if trimmed == "" {
+        return 0
+    }
+    if pty_available() {
+        if ensure_session_pty(session, session.pty_rows, session.pty_cols) {
+            session.record_history(trimmed)
+            let _ = pty_write(session.pty_id, trimmed ++ "\n") ! { _ => () }
+            let _ = sync_session_from_pty(session, true)
+            return session.last_exit_code
+        }
+    }
+    run_in_session(session, raw_cmd)
+}
+
+-- ============================================================================
+-- 3. ANSI Span Conversion, Floating Window & Buffer Terminal Rendering
+-- ============================================================================
+
+fn term_spans_to_inline_decors(spans: List, row_offset: i64, col_offset: i64) -> List {
+    let out = List()
+    for i in 0..spans.len() {
+        let sp = spans.get(i.as(usize)).as(TermSpan)
+        if sp.end_col > sp.start_col and (sp.fg_rgba != 0 or sp.bg_rgba != 0) {
+            out.push(InlineSpanDecor {
+                owner: OWNER_TOGGLETERM,
+                row: sp.row + row_offset,
+                start_col: sp.start_col + col_offset,
+                end_col: sp.end_col + col_offset,
+                bg_rgba: sp.bg_rgba,
+                fg_rgba: sp.fg_rgba,
+                underline: false,
+                replace_label: "",
+            })
+        }
+    }
+    out
+}
+
+fn build_tabs_header(svc: ToggleTermService) -> String {
+    let tabs = List()
+    for i in 0..svc.sessions.len() {
+        let s = svc.sessions.get(i.as(usize)).as(TerminalSession)
+        if s.id == svc.current_id {
+            tabs.push("[#" ++ s.id.to_string() ++ "*]")
+        } else {
+            tabs.push("[#" ++ s.id.to_string() ++ "]")
+        }
+    }
+    " Sessions: " ++ tabs.join(" ") ++ "  (<Tab>:switch  <Up>/<Down>:hist  <C-l>:clear  <C-\\>:hide)"
+}
+
+fn format_terminal_title(svc: ToggleTermService, session: TerminalSession) -> String {
+    let sh_label = if session.title != "" { session.title } else { short_shell_name(session.shell) }
+    let mode_tag = if svc.term_insert_mode { "TERM-INSERT" } else { "TERM-NORMAL" }
+    "Terminal #" ++ session.id.to_string() ++ ": " ++ sh_label ++ " (" ++ session.cwd ++ ") [" ++ mode_tag ++ "]"
+}
+
+pub fn refresh_toggleterm_float(world: EditorWorld, svc: ToggleTermService) {
+    let session = svc.active_session(world.cwd)
+    let lines = List()
+    var span_decors = List()
+    var vis_cursor_row: i64 = 0
+    var vis_cursor_col: i64 = 0
+
+    if pty_available() and ensure_session_pty(session, DEFAULT_FLOAT_ROWS, DEFAULT_FLOAT_COLS - 4) {
+        let include_sb = (not svc.term_insert_mode)
+            or svc.float_scroll_offset > 0
+            or svc.float_sel_anchor != null
+        let _ = sync_session_from_pty(session, include_sb)
+        let total = session.pty_lines.len()
+        let max_scroll = if total > DEFAULT_FLOAT_ROWS { total - DEFAULT_FLOAT_ROWS } else { 0 }
+        if svc.float_scroll_offset < 0 {
+            svc.float_scroll_offset = 0
+        } else if svc.float_scroll_offset > max_scroll {
+            svc.float_scroll_offset = max_scroll
+        }
+        let start_row = if total > DEFAULT_FLOAT_ROWS {
+            total - DEFAULT_FLOAT_ROWS - svc.float_scroll_offset
+        } else {
+            0
+        }
+        let end_row = if start_row + DEFAULT_FLOAT_ROWS <= total {
+            start_row + DEFAULT_FLOAT_ROWS
+        } else {
+            total
+        }
+        for i in start_row..end_row {
+            lines.push(session.pty_lines.get(i.as(usize)).as(String))
+        }
+        while lines.len() < DEFAULT_FLOAT_ROWS {
+            lines.push("")
+        }
+        let raw_decors = term_spans_to_inline_decors(session.pty_spans, -start_row, 0)
+        for i in 0..raw_decors.len() {
+            let d = raw_decors.get(i.as(usize)).as(InlineSpanDecor)
+            if d.row >= 0 and d.row < DEFAULT_FLOAT_ROWS {
+                span_decors.push(d)
+            }
+        }
+        vis_cursor_row = session.cursor_row - start_row
+        if vis_cursor_row < 0 {
+            vis_cursor_row = 0
+        } else if vis_cursor_row >= lines.len() {
+            vis_cursor_row = lines.len() - 1
+        }
+        vis_cursor_col = if session.cursor_col >= 0 { session.cursor_col } else { 0 }
+    } else {
+        let header = build_tabs_header(svc)
+        lines.push(header)
+        lines.push("─".repeat(84))
+        span_decors.push(InlineSpanDecor {
+            owner: OWNER_TOGGLETERM,
+            row: 0,
+            start_col: 0,
+            end_col: header.char_len(),
+            bg_rgba: 0,
+            fg_rgba: rgb(137, 180, 250),
+            underline: false,
+            replace_label: "",
+        })
+
+        let max_body: i64 = 18
+        let total = session.scrollback.len()
+        let max_scroll = if total > max_body { total - max_body } else { 0 }
+        if svc.float_scroll_offset < 0 {
+            svc.float_scroll_offset = 0
+        } else if svc.float_scroll_offset > max_scroll {
+            svc.float_scroll_offset = max_scroll
+        }
+        let start_idx = if total > max_body { total - max_body - svc.float_scroll_offset } else { 0 }
+        let end_idx = if start_idx + max_body <= total { start_idx + max_body } else { total }
+        for i in start_idx..end_idx {
+            let sb_ln = session.scrollback.get(i.as(usize)).as(String)
+            let row_idx = lines.len()
+            lines.push(" " ++ sb_ln)
+            if sb_ln.starts_with("$ ") {
+                span_decors.push(InlineSpanDecor {
+                    owner: OWNER_TOGGLETERM,
+                    row: row_idx,
+                    start_col: 1,
+                    end_col: 3,
+                    bg_rgba: 0,
+                    fg_rgba: rgb(166, 227, 161),
+                    underline: false,
+                    replace_label: "",
+                })
+            }
+        }
+        while lines.len() < 21 {
+            lines.push("")
+        }
+        let prompt_row = lines.len()
+        let prompt_txt = " $ " ++ svc.input_line
+        lines.push(prompt_txt ++ "█")
+        span_decors.push(InlineSpanDecor {
+            owner: OWNER_TOGGLETERM,
+            row: prompt_row,
+            start_col: 1,
+            end_col: 3,
+            bg_rgba: 0,
+            fg_rgba: rgb(166, 227, 161),
+            underline: false,
+            replace_label: "",
+        })
+        vis_cursor_row = prompt_row
+        vis_cursor_col = prompt_txt.char_len()
+    }
+
+    -- Overlay mouse text selection highlight inside the floating terminal
+    if svc.float_sel_anchor != null and svc.float_sel_cursor != null {
+        let a = svc.float_sel_anchor.as(Pos)
+        let b = svc.float_sel_cursor.as(Pos)
+        let lo = if a <= b { a } else { b }
+        let hi = if a <= b { b } else { a }
+        let sel_bg = rgba(137, 180, 250, 95)
+        let r_start = if lo.row < 0 { 0 } else { lo.row }
+        let r_end = if hi.row >= lines.len() { lines.len() - 1 } else { hi.row }
+        if r_start <= r_end {
+            for r in r_start..(r_end + 1) {
+                let ln = lines.get(r.as(usize)).as(String)
+                let llen = ln.char_len()
+                var sc = if r == lo.row { lo.col } else { 0 }
+                var ec = if r == hi.row { hi.col + 1 } else { llen }
+                if sc < 0 {
+                    sc = 0
+                }
+                if sc > llen {
+                    sc = llen
+                }
+                if ec < sc {
+                    ec = sc
+                }
+                if ec > llen {
+                    ec = llen
+                }
+                if ec > sc {
+                    span_decors.push(InlineSpanDecor {
+                        owner: OWNER_TOGGLETERM,
+                        row: r,
+                        start_col: sc,
+                        end_col: ec,
+                        bg_rgba: sel_bg,
+                        fg_rgba: 0,
+                        underline: false,
+                        replace_label: "",
+                    })
+                }
+            }
+        }
+    }
+
+    let win = FloatingWindow {
+        id: FLOAT_ID_TOGGLETERM,
+        owner: OWNER_TOGGLETERM,
+        title: format_terminal_title(svc, session),
+        anchor: "center",
+        width_cols: DEFAULT_FLOAT_COLS,
+        height_rows: DEFAULT_FLOAT_ROWS,
+        lines: lines,
+        selected_row: vis_cursor_row,
+        border_rgba: rgb(166, 227, 161),
+    }
+    world.set_floating_window(win)
+    world.floating_window_spans.insert(FLOAT_ID_TOGGLETERM, span_decors)
+    world.floating_window_cursor.insert(FLOAT_ID_TOGGLETERM, Pos.new(vis_cursor_row, vis_cursor_col))
+}
+
+pub fn render_terminal_buffer_lines(svc: ToggleTermService, session: TerminalSession) -> List {
+    if pty_available() and session.pty_id > 0 and (not session.pty_lines.is_empty()) {
+        let out = List()
+        for i in 0..session.pty_lines.len() {
+            out.push(session.pty_lines.get(i.as(usize)).as(String))
+        }
+        return out
+    }
+
+    let out = List()
+    if session.preferred_major_mode == "toggleterm" {
+        out.push(
+            "=== ToggleTerm " ++ session.name ++ " | cwd: " ++ session.cwd
+            ++ " | last exit: " ++ session.last_exit_code.to_string() ++ " ==="
+        )
+        out.push("Keys: <Return>/i: run command  |  c: clear  |  <Tab>: switch terminal  |  q: hide")
+        out.push("─".repeat(78))
+        if session.scrollback.is_empty() and session.line_input == "" and (not svc.term_insert_mode) {
+            out.push("(empty scrollback — press <Return> or i to execute a command)")
+        } else {
+            for i in 0..session.scrollback.len() {
+                out.push(session.scrollback.get(i.as(usize)).as(String))
+            }
+            if svc.term_insert_mode and svc.current_id == session.id {
+                out.push("$ " ++ svc.input_line)
+            }
+        }
+        return out
+    }
+
+    -- Interactive `"terminal"` buffer (`:term` / `:vterm` / `<Space>tt` / `<Space>th` / `<Space>tv`)
+    for i in 0..session.scrollback.len() {
+        out.push(session.scrollback.get(i.as(usize)).as(String))
+    }
+    let cur_input = if svc.current_id == session.id { svc.input_line } else { session.line_input }
+    out.push("$ " ++ cur_input)
+    out
+}
+
+fn apply_terminal_buffer_spans_and_cursor(
+    world: EditorWorld,
+    wm_opt: ?WindowManager,
+    svc: ToggleTermService,
+    session: TerminalSession,
+    buf: Buffer,
+    update_cursor: bool,
+) {
+    buf.clear_owner_decors(OWNER_TOGGLETERM)
+    if pty_available() and session.pty_id > 0 {
+        let decors = term_spans_to_inline_decors(session.pty_spans, 0, 0)
+        for i in 0..decors.len() {
+            buf.inline_decors.push(decors.get(i.as(usize)).as(InlineSpanDecor))
+        }
+        if update_cursor {
+            let crow = if session.cursor_row < 0 {
+                0
+            } else if session.cursor_row >= buf.line_count() {
+                buf.line_count() - 1
+            } else {
+                session.cursor_row
+            }
+            let ccol = if session.cursor_col < 0 { 0 } else { session.cursor_col }
+            buf.point = buf.clamp_pos(Pos.new(crow, ccol), insert_mode = svc.term_insert_mode)
+            buf.preferred_col = buf.point.col
+        }
+    } else {
+        -- Decorate prompt prefixes (`$ `) with green terminal accent
+        for r in 0..buf.line_count() {
+            let ln = buf.line_at(r)
+            if ln.starts_with("$ ") {
+                buf.inline_decors.push(InlineSpanDecor {
+                    owner: OWNER_TOGGLETERM,
+                    row: r,
+                    start_col: 0,
+                    end_col: 2,
+                    bg_rgba: 0,
+                    fg_rgba: rgb(166, 227, 161),
+                    underline: false,
+                    replace_label: "",
+                })
+            }
+        }
+        if update_cursor {
+            let last_r = buf.line_count() - 1
+            let last_ln = buf.line_at(last_r)
+            let target_col = if svc.term_insert_mode { last_ln.char_len() } else { 0 }
+            buf.point = buf.clamp_pos(Pos.new(last_r, target_col), insert_mode = svc.term_insert_mode)
+            buf.preferred_col = buf.point.col
+        }
+    }
+
+    if wm_opt != null and update_cursor {
+        let wm = wm_opt.as(WindowManager)
+        let vis = wm.visible_panes()
+        for i in 0..vis.len() {
+            let pane = vis.get(i.as(usize)).as(WindowPane)
+            if pane.buffer_id == buf.id {
+                pane.cursor = buf.point
+                let p_rows = wm.pane_rows(pane)
+                if buf.point.row >= pane.top_row + p_rows {
+                    pane.top_row = buf.point.row - p_rows + 1
+                } else if buf.point.row < pane.top_row {
+                    pane.top_row = buf.point.row
+                }
+            }
+        }
+        let _ = world
+    }
+}
+
+pub fn sync_terminal_buffer_if_exists(world: EditorWorld, svc: ToggleTermService, session: TerminalSession) {
+    let existing_opt = world.find_buffer_by_name(session.name)
+    if existing_opt != null {
+        let existing = existing_opt.as(Buffer)
+        let mode = if is_terminal_buffer_mode(existing.major_mode) {
+            existing.major_mode
+        } else {
+            session.preferred_major_mode
+        }
+        if pty_available() and session.pty_id > 0 {
+            let _ = sync_session_from_pty(session, not svc.term_insert_mode)
+        }
+        let lines = render_terminal_buffer_lines(svc, session)
+        let b = world.ensure_special_buffer(session.name, mode, lines, read_only = true)
+        apply_terminal_buffer_spans_and_cursor(world, null, svc, session, b, svc.term_insert_mode)
+    }
+}
+
+fn sync_terminal_buffer_with_wm(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    svc: ToggleTermService,
+    session: TerminalSession,
+    major_mode: String,
+    update_cursor: bool,
+) -> Buffer {
+    let wm_raw = kernel.service(SERVICE_WINDOW_MANAGER)
+    let wm_opt: ?WindowManager = if wm_raw != null { wm_raw.as(WindowManager) } else { null }
+
+    -- Determine target PTY dimensions from any visible pane showing this terminal buffer
+    var target_rows: i64 = 24
+    var target_cols: i64 = 84
+    let existing_opt = world.find_buffer_by_name(session.name)
+    if wm_opt != null {
+        let wm = wm_opt.as(WindowManager)
+        wm.layout_all()
+        let active_p = wm.active_pane()
+        let sample_buf = if existing_opt != null { existing_opt.as(Buffer) } else { world.active_buffer() }
+        target_rows = wm.pane_rows(active_p)
+        target_cols = wm.pane_cols(active_p, sample_buf, world.options)
+        if existing_opt != null {
+            let ex_id = existing_opt.as(Buffer).id
+            let vis = wm.visible_panes()
+            for i in 0..vis.len() {
+                let p = vis.get(i.as(usize)).as(WindowPane)
+                if p.buffer_id == ex_id {
+                    target_rows = wm.pane_rows(p)
+                    target_cols = wm.pane_cols(p, existing_opt.as(Buffer), world.options)
+                    break
+                }
+            }
+        }
+    }
+
+    if pty_available() {
+        let _ = ensure_session_pty(session, target_rows, target_cols)
+        let _ = sync_session_from_pty(session, not svc.term_insert_mode)
+    }
+
+    session.preferred_major_mode = major_mode
+    let lines = render_terminal_buffer_lines(svc, session)
+    let tbuf = world.ensure_special_buffer(session.name, major_mode, lines, read_only = true)
+    apply_terminal_buffer_spans_and_cursor(world, wm_opt, svc, session, tbuf, update_cursor)
+    tbuf
+}
+
+fn sync_statusline_badge(world: EditorWorld, svc: ToggleTermService) {
+    let abuf = world.active_buffer()
+    if svc.float_visible or is_terminal_buffer_mode(abuf.major_mode) {
+        let tag = if svc.term_insert_mode { "TERM-INSERT" } else { "TERM-NORMAL" }
+        world.statusline_left_extra = "[" ++ tag ++ " #" ++ svc.current_id.to_string() ++ "]"
+    } else if world.statusline_left_extra.starts_with("[TERM-") {
+        world.statusline_left_extra = ""
+    }
+}
+
+fn sync_modal_interceptor_attachment(world: EditorWorld, vim: VimState, svc: ToggleTermService) {
+    svc.pending_ctrl_backslash = false
+    if svc.float_visible {
+        if vim.mode != VimMode.Normal {
+            vim.mode = VimMode.Normal
+        }
+        vim.set_interceptor(OWNER_TOGGLETERM, terminal_modal_interceptor)
+        sync_world_from_vim(world, vim)
+        sync_statusline_badge(world, svc)
+        return
+    }
+
+    let abuf = world.active_buffer()
+    if is_terminal_buffer_mode(abuf.major_mode) {
+        let parsed_id = parse_terminal_buffer_id(abuf.name)
+        if parsed_id > 0 and parsed_id != svc.current_id {
+            let _ = svc.switch_session(parsed_id, world.cwd)
+        }
+        if svc.term_insert_mode {
+            vim.mode = VimMode.Insert
+            vim.clear_transient()
+            vim.set_interceptor(OWNER_TOGGLETERM, terminal_modal_interceptor)
+            sync_world_from_vim(world, vim)
+            sync_statusline_badge(world, svc)
+            return
+        }
+        -- `TERM-NORMAL` mode: release modal interceptor so native Vim motions/search/yank work!
+        if vim.modal_interceptor != null {
+            if vim.modal_interceptor.as(ModalInterceptor).owner == OWNER_TOGGLETERM {
+                vim.clear_interceptor()
+            }
+        }
+        if vim.mode == VimMode.Insert {
+            vim.mode = VimMode.Normal
+        }
+        sync_world_from_vim(world, vim)
+        sync_statusline_badge(world, svc)
+        return
+    }
+
+    if vim.modal_interceptor != null {
+        if vim.modal_interceptor.as(ModalInterceptor).owner == OWNER_TOGGLETERM {
+            vim.clear_interceptor()
+        }
+    }
+    sync_statusline_badge(world, svc)
+}
+
+pub fn hide_toggleterm_float(world: EditorWorld, vim: VimState, svc: ToggleTermService) {
+    svc.float_visible = false
+    svc.pending_ctrl_backslash = false
+    svc.float_sel_anchor = null
+    svc.float_sel_cursor = null
+    svc.float_scroll_offset = 0
+    if svc.visible_mode == "float" {
+        svc.visible_mode = "hidden"
+    }
+    let _ = world.remove_floating_window(FLOAT_ID_TOGGLETERM)
+    let _ = world.floating_window_spans.remove(FLOAT_ID_TOGGLETERM)
+    let _ = world.floating_window_cursor.remove(FLOAT_ID_TOGGLETERM)
+    if vim.modal_interceptor != null {
+        if vim.modal_interceptor.as(ModalInterceptor).owner == OWNER_TOGGLETERM {
+            vim.clear_interceptor()
+        }
+    }
+    if vim.mode != VimMode.Normal and (not is_terminal_buffer_mode(world.active_buffer().major_mode)) {
+        vim.mode = VimMode.Normal
+    }
+    sync_modal_interceptor_attachment(world, vim, svc)
+    sync_world_from_vim(world, vim)
+}
+
+pub fn open_toggleterm_float(world: EditorWorld, vim: VimState, svc: ToggleTermService) {
+    let sess = svc.active_session(world.cwd)
+    svc.input_line = sess.line_input
+    svc.visible_mode = "float"
+    svc.float_visible = true
+    svc.term_insert_mode = true
+    svc.pending_ctrl_backslash = false
+    svc.float_sel_anchor = null
+    svc.float_sel_cursor = null
+    svc.float_scroll_offset = 0
+    if vim.mode != VimMode.Normal {
+        vim.mode = VimMode.Normal
+    }
+    vim.clear_transient()
+    refresh_toggleterm_float(world, svc)
+    vim.set_interceptor(OWNER_TOGGLETERM, terminal_modal_interceptor)
+    sync_world_from_vim(world, vim)
+    sync_statusline_badge(world, svc)
+}
+
+fn close_exited_terminal_session(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    vim: VimState,
+    svc: ToggleTermService,
+    session: TerminalSession,
+) {
+    let saved_cwd = session.cwd
+    let sid = session.id
+    let sname = session.name
+    if session.pty_id > 0 {
+        let _ = pty_kill(session.pty_id)
+        session.pty_id = 0
+    }
+    session.alive = true
+    session.alt_screen = false
+    session.cursor_row = 0
+    session.cursor_col = 0
+    session.cursor_visible = true
+    session.pty_lines = List()
+    session.pty_spans = List()
+    session.scrollback = List()
+    session.line_input = ""
+    session.cwd = saved_cwd
+    session.last_exit_code = 0
+
+    if svc.current_id == sid {
+        svc.input_line = ""
+        svc.history_idx = -1
+        svc.draft_input = ""
+        svc.pending_ctrl_backslash = false
+        svc.float_sel_anchor = null
+        svc.float_sel_cursor = null
+        svc.float_scroll_offset = 0
+    }
+
+    let msg = "Terminal #" ++ sid.to_string() ++ " exited (EOF)"
+
+    if svc.float_visible and svc.current_id == sid {
+        hide_toggleterm_float(world, vim, svc)
+        let b_opt = world.find_buffer_by_name(sname)
+        if b_opt != null and b_opt.as(Buffer).id != world.active_buffer_id {
+            let _ = world.kill_buffer(b_opt.as(Buffer).id, force = true) ! { _ => world.active_buffer_id }
+        }
+        world.status_message = msg
+        return
+    }
+
+    let wm_raw = kernel.service(SERVICE_WINDOW_MANAGER)
+    if wm_raw != null {
+        let wm = wm_raw.as(WindowManager)
+        let pane_opt = find_visible_terminal_pane(wm, world, sname)
+        if pane_opt != null and wm.visible_panes().len() > 1 {
+            wm.active_tab().active_win_id = pane_opt.as(WindowPane).id
+            let _ = wm.close_active(world)
+            svc.visible_mode = "hidden"
+            svc.term_insert_mode = false
+            svc.split_win_id = null
+            let b_opt = world.find_buffer_by_name(sname)
+            if b_opt != null and b_opt.as(Buffer).id != world.active_buffer_id {
+                let _ = world.kill_buffer(b_opt.as(Buffer).id, force = true) ! { _ => world.active_buffer_id }
+            }
+            if (not is_terminal_buffer_mode(world.active_buffer().major_mode)) and vim.mode == VimMode.Insert {
+                vim.mode = VimMode.Normal
+            }
+            sync_modal_interceptor_attachment(world, vim, svc)
+            sync_world_from_vim(world, vim)
+            kernel.emit_hook("buffer-switched", world.active_buffer_id)
+            kernel.emit_hook("window-focused", wm.active_tab().active_win_id)
+            world.status_message = msg
+            return
+        }
+    }
+
+    svc.visible_mode = "hidden"
+    svc.term_insert_mode = false
+    svc.split_win_id = null
+    let b_opt = world.find_buffer_by_name(sname)
+    var switched = false
+    svc.previous_buf_id match {
+        pid? => {
+            let is_same_term = b_opt != null and pid == b_opt.as(Buffer).id
+            if world.buffers.contains_key(pid) and (not is_same_term) {
+                switched = world.switch_to_buffer(pid)
+            }
+        },
+        _ => (),
+    }
+    if not switched {
+        let _ = world.cycle_buffer(-1)
+    }
+    if b_opt != null {
+        let tbid = b_opt.as(Buffer).id
+        if world.active_buffer_id == tbid {
+            let _ = world.switch_to_buffer(world.scratch_id)
+        }
+        if world.active_buffer_id != tbid {
+            let _ = world.kill_buffer(tbid, force = true) ! { _ => world.active_buffer_id }
+        }
+    }
+    if wm_raw != null {
+        wm_raw.as(WindowManager).sync_from_world(world)
+    }
+    if (not is_terminal_buffer_mode(world.active_buffer().major_mode)) and vim.mode == VimMode.Insert {
+        vim.mode = VimMode.Normal
+    }
+    sync_modal_interceptor_attachment(world, vim, svc)
+    sync_world_from_vim(world, vim)
+    kernel.emit_hook("buffer-switched", world.active_buffer_id)
+    world.status_message = msg
+}
+
+fn enter_term_normal_mode(kernel: SystemKernel, world: EditorWorld, vim: VimState, svc: ToggleTermService) {
+    svc.term_insert_mode = false
+    svc.pending_ctrl_backslash = false
+    let session = svc.active_session(world.cwd)
+    session.line_input = svc.input_line
+    if svc.float_visible {
+        refresh_toggleterm_float(world, svc)
+    } else {
+        let cur_mode = if is_terminal_buffer_mode(world.active_buffer().major_mode) {
+            world.active_buffer().major_mode
+        } else {
+            "terminal"
+        }
+        let _ = sync_terminal_buffer_with_wm(kernel, world, svc, session, cur_mode, false)
+        let abuf = world.active_buffer()
+        abuf.point = abuf.clamp_pos(abuf.point, insert_mode = false)
+        let wm_raw = kernel.service(SERVICE_WINDOW_MANAGER)
+        if wm_raw != null {
+            let wm = wm_raw.as(WindowManager)
+            wm.active_pane().cursor = abuf.point
+        }
+    }
+    vim.mode = VimMode.Normal
+    vim.clear_transient()
+    sync_modal_interceptor_attachment(world, vim, svc)
+}
+
+fn enter_term_insert_mode(kernel: SystemKernel, world: EditorWorld, vim: VimState, svc: ToggleTermService) {
+    svc.term_insert_mode = true
+    svc.pending_ctrl_backslash = false
+    let session = svc.active_session(world.cwd)
+    svc.input_line = session.line_input
+    if svc.float_visible {
+        refresh_toggleterm_float(world, svc)
+    } else {
+        let cur_mode = if is_terminal_buffer_mode(world.active_buffer().major_mode) {
+            world.active_buffer().major_mode
+        } else {
+            "terminal"
+        }
+        let _ = sync_terminal_buffer_with_wm(kernel, world, svc, session, cur_mode, true)
+    }
+    sync_modal_interceptor_attachment(world, vim, svc)
+}
+
+-- ============================================================================
+-- 4. Authentic `TERM-INSERT` / `TERM-NORMAL` Modal Key Interceptor
+-- ============================================================================
+
+fn printable_terminal_char(stroke: KeyStroke) -> ?String {
+    if stroke.ctrl or stroke.alt or stroke.super_mod {
+        return null
+    }
+    if stroke.key == "Space" {
+        return " "
+    }
+    if stroke.key.char_len() == 1 {
+        return stroke.key
+    }
+    if stroke.text.char_len() == 1 {
+        return stroke.text
+    }
+    null
+}
+
+fn handle_fallback_line_key(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    svc: ToggleTermService,
+    session: TerminalSession,
+    stroke: KeyStroke,
+    in_float: bool,
+) -> #ServiceEffects !String bool {
+    let k = stroke.key
+    let ctrl_only = stroke.ctrl and (not stroke.alt) and (not stroke.super_mod)
+
+    -- `<C-d>`: send EOF and close terminal when input line is empty
+    if ctrl_only and k == "d" {
+        if svc.input_line == "" {
+            let vim = require_vim_state(kernel)!
+            let sid = session.id
+            close_exited_terminal_session(kernel, world, vim, svc, session)
+            status_emit("Terminal #" ++ sid.to_string() ++ " exited (EOF)")#
+        }
+        return true
+    }
+
+    -- `<C-l>`: clear active terminal scrollback
+    if ctrl_only and k == "l" {
+        session.scrollback = List()
+        if in_float {
+            sync_terminal_buffer_if_exists(world, svc, session)
+            refresh_toggleterm_float(world, svc)
+        } else {
+            let cur_mode = world.active_buffer().major_mode
+            let _ = sync_terminal_buffer_with_wm(kernel, world, svc, session, cur_mode, true)
+        }
+        status_emit("Cleared Terminal #" ++ session.id.to_string())#
+        return true
+    }
+
+    -- `<C-c>`: interrupt & clear partial input line (recording `$ <partial>^C` in buffer terminal)
+    if ctrl_only and k == "c" {
+        if not in_float {
+            session.append_line("$ " ++ svc.input_line ++ "^C")
+        }
+        svc.set_input(session, "")
+        svc.history_idx = -1
+        if in_float {
+            refresh_toggleterm_float(world, svc)
+        } else {
+            let cur_mode = world.active_buffer().major_mode
+            let _ = sync_terminal_buffer_with_wm(kernel, world, svc, session, cur_mode, true)
+        }
+        status_emit("^C")#
+        return true
+    }
+
+    -- `<C-u>`: clear current input line
+    if ctrl_only and k == "u" {
+        svc.set_input(session, "")
+        svc.history_idx = -1
+        if in_float {
+            refresh_toggleterm_float(world, svc)
+        } else {
+            let cur_mode = world.active_buffer().major_mode
+            let _ = sync_terminal_buffer_with_wm(kernel, world, svc, session, cur_mode, true)
+        }
+        return true
+    }
+
+    -- `<C-w>`: delete previous word in input line
+    if ctrl_only and k == "w" {
+        let trimmed_r = svc.input_line.trim_end()
+        var cut_idx: i64 = 0
+        var idx = trimmed_r.char_len() - 1
+        while idx >= 0 {
+            if trimmed_r.slice(idx, idx + 1) == " " {
+                cut_idx = idx + 1
+                break
+            }
+            idx -= 1
+        }
+        svc.set_input(session, trimmed_r.slice(0, cut_idx))
+        svc.history_idx = -1
+        if in_float {
+            refresh_toggleterm_float(world, svc)
+        } else {
+            let cur_mode = world.active_buffer().major_mode
+            let _ = sync_terminal_buffer_with_wm(kernel, world, svc, session, cur_mode, true)
+        }
+        return true
+    }
+
+    -- `<BackSpace>`: delete last character of input line
+    if k == "BackSpace" or (ctrl_only and k == "h") {
+        let n = svc.input_line.char_len()
+        if n > 0 {
+            svc.set_input(session, svc.input_line.slice(0, n - 1))
+            if in_float {
+                refresh_toggleterm_float(world, svc)
+            } else {
+                let cur_mode = world.active_buffer().major_mode
+                let _ = sync_terminal_buffer_with_wm(kernel, world, svc, session, cur_mode, true)
+            }
+        }
+        return true
+    }
+
+    -- `<Up>` / `<Down>`: cycle `session.history`
+    if k == "Up" {
+        let hlen = session.history.len()
+        if hlen > 0 {
+            if svc.history_idx < 0 {
+                svc.draft_input = svc.input_line
+                svc.history_idx = hlen - 1
+            } else if svc.history_idx > 0 {
+                svc.history_idx -= 1
+            }
+            svc.set_input(session, session.history.get(svc.history_idx.as(usize)).as(String))
+            if in_float {
+                refresh_toggleterm_float(world, svc)
+            } else {
+                let cur_mode = world.active_buffer().major_mode
+                let _ = sync_terminal_buffer_with_wm(kernel, world, svc, session, cur_mode, true)
+            }
+        }
+        return true
+    }
+
+    if k == "Down" {
+        let hlen = session.history.len()
+        if svc.history_idx >= 0 {
+            if svc.history_idx + 1 < hlen {
+                svc.history_idx += 1
+                svc.set_input(session, session.history.get(svc.history_idx.as(usize)).as(String))
+            } else {
+                svc.history_idx = -1
+                svc.set_input(session, svc.draft_input)
+            }
+            if in_float {
+                refresh_toggleterm_float(world, svc)
+            } else {
+                let cur_mode = world.active_buffer().major_mode
+                let _ = sync_terminal_buffer_with_wm(kernel, world, svc, session, cur_mode, true)
+            }
+        }
+        return true
+    }
+
+    -- `<Return>`: execute `svc.input_line` in active `TerminalSession`
+    if k == "Return" or k == "KP_Enter" or (ctrl_only and k == "m") {
+        let to_run = svc.input_line
+        svc.set_input(session, "")
+        svc.history_idx = -1
+        svc.draft_input = ""
+        let trimmed_cmd = to_run.trim()
+        if trimmed_cmd == "exit" or trimmed_cmd == "logout" {
+            let vim = require_vim_state(kernel)!
+            let sid = session.id
+            close_exited_terminal_session(kernel, world, vim, svc, session)
+            status_emit("Terminal #" ++ sid.to_string() ++ " exited (EOF)")#
+            return true
+        }
+        if trimmed_cmd != "" {
+            let code = run_in_session(session, to_run)
+            status_emit(
+                "Terminal #" ++ session.id.to_string()
+                ++ " [exit " ++ code.to_string() ++ "]: " ++ trimmed_cmd
+            )#
+        } else if not in_float {
+            session.append_line("$ ")
+        }
+        if in_float {
+            sync_terminal_buffer_if_exists(world, svc, session)
+            refresh_toggleterm_float(world, svc)
+        } else {
+            let cur_mode = world.active_buffer().major_mode
+            let _ = sync_terminal_buffer_with_wm(kernel, world, svc, session, cur_mode, true)
+        }
+        return true
+    }
+
+    -- Printable character input
+    let ch_opt = printable_terminal_char(stroke)
+    if ch_opt != null {
+        svc.set_input(session, svc.input_line ++ ch_opt.as(String))
+        svc.history_idx = -1
+        if in_float {
+            refresh_toggleterm_float(world, svc)
+        } else {
+            let cur_mode = world.active_buffer().major_mode
+            let _ = sync_terminal_buffer_with_wm(kernel, world, svc, session, cur_mode, true)
+        }
+        return true
+    }
+
+    true
+}
+
+fn terminal_modal_interceptor(kernel: SystemKernel, stroke: KeyStroke) -> #ServiceEffects !String bool {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_toggleterm_service(kernel)!
+
+    if world.minibuffer_view.active {
+        return false
+    }
+
+    let k = stroke.key
+    let plain = (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod)
+    let ctrl_only = stroke.ctrl and (not stroke.alt) and (not stroke.super_mod)
+    let alt_only = stroke.alt and (not stroke.ctrl) and (not stroke.super_mod)
+
+    -- ========================================================================
+    -- Case A: Floating Terminal (`svc.float_visible`)
+    -- ========================================================================
+    if svc.float_visible and svc.visible_mode == "float" {
+        -- Single `<C-\>` (or `<M-\>`) always toggles float visibility; in fallback mode `<Escape>` also hides
+        if (ctrl_only and k == "\\")
+            or (alt_only and k == "\\")
+            or ((not pty_available()) and (k == "Escape" or (ctrl_only and k == "["))) {
+            hide_toggleterm_float(world, vim, svc)
+            status_emit("Terminal #" ++ svc.current_id.to_string() ++ " hidden")#
+            return true
+        }
+
+        if k == "F7" or (alt_only and k == "Escape") {
+            enter_term_normal_mode(kernel, world, vim, svc)
+            status_emit("-- TERM-NORMAL --")#
+            return true
+        }
+
+        -- `<M-1>`..`<M-9>` switches numbered session in both PTY and fallback float
+        if alt_only and k.char_len() == 1 and k.is_ascii_digit() {
+            let d_opt = k.parse_i64()
+            if d_opt != null and d_opt.as(i64) >= 1 {
+                let sess = svc.switch_session(d_opt.as(i64), world.cwd)
+                refresh_toggleterm_float(world, svc)
+                status_emit("Switched to Terminal #" ++ sess.id.to_string() ++ " (" ++ sess.cwd ++ ")")#
+                return true
+            }
+        }
+
+        if pty_available() {
+            let session = svc.active_session(world.cwd)
+            if ensure_session_pty(session, DEFAULT_FLOAT_ROWS, DEFAULT_FLOAT_COLS - 4) {
+                svc.float_sel_anchor = null
+                svc.float_sel_cursor = null
+                svc.float_scroll_offset = 0
+                let _ = pty_send_key(session.pty_id, stroke.key, stroke.text, stroke.ctrl, stroke.alt, stroke.shift_mod) ! { _ => () }
+                let _ = sync_session_from_pty(session, false)
+                if not session.alive {
+                    let sid = session.id
+                    close_exited_terminal_session(kernel, world, vim, svc, session)
+                    status_emit("Terminal #" ++ sid.to_string() ++ " exited (EOF)")#
+                    return true
+                }
+                if ctrl_only and k == "d" {
+                    let _ = host_schedule_timer(25)
+                    let _ = host_schedule_timer(80)
+                }
+                sync_terminal_buffer_if_exists(world, svc, session)
+                refresh_toggleterm_float(world, svc)
+                return true
+            }
+        }
+
+        -- Fallback float shortcuts (`1`..`9` when input empty, `<Tab>`/`<C-n>`/`<C-p>` cycle)
+        if plain and svc.input_line == "" and k.char_len() == 1 and k.is_ascii_digit() {
+            let d_opt = k.parse_i64()
+            if d_opt != null {
+                let d = d_opt.as(i64)
+                if d >= 1 and d <= 9 {
+                    let sess = svc.switch_session(d, world.cwd)
+                    refresh_toggleterm_float(world, svc)
+                    status_emit("Switched to Terminal #" ++ sess.id.to_string() ++ " (" ++ sess.cwd ++ ")")#
+                    return true
+                }
+            }
+        }
+
+        if k == "Tab" or (ctrl_only and k == "n") {
+            let delta: i64 = if stroke.shift_mod { -1 } else { 1 }
+            let sess = svc.cycle_or_create_next(delta, world.cwd)
+            refresh_toggleterm_float(world, svc)
+            status_emit("Switched to Terminal #" ++ sess.id.to_string() ++ " (" ++ sess.cwd ++ ")")#
+            return true
+        }
+
+        if ctrl_only and k == "p" {
+            let sess = svc.cycle_or_create_next(-1, world.cwd)
+            refresh_toggleterm_float(world, svc)
+            status_emit("Switched to Terminal #" ++ sess.id.to_string() ++ " (" ++ sess.cwd ++ ")")#
+            return true
+        }
+
+        let session = svc.active_session(world.cwd)
+        return handle_fallback_line_key(kernel, world, svc, session, stroke, true)#!
+    }
+
+    -- ========================================================================
+    -- Case B: Buffer / Split Terminal (`*terminal-N*`) in `TERM-INSERT` Mode
+    -- ========================================================================
+    let abuf = world.active_buffer()
+    if (not is_terminal_buffer_mode(abuf.major_mode)) or (not svc.term_insert_mode) {
+        sync_modal_interceptor_attachment(world, vim, svc)
+        return false
+    }
+
+    -- 1. Chord `<C-\><C-n>` -> exit `TERM-INSERT` to `TERM-NORMAL`!
+    if svc.pending_ctrl_backslash {
+        svc.pending_ctrl_backslash = false
+        if (ctrl_only and k == "n") or (plain and k == "n") {
+            enter_term_normal_mode(kernel, world, vim, svc)
+            status_emit("-- TERM-NORMAL --")#
+            return true
+        }
+        if ctrl_only and k == "\\" {
+            open_toggleterm_float(world, vim, svc)
+            status_emit("Terminal #" ++ svc.current_id.to_string() ++ " float opened")#
+            return true
+        }
+        -- Any other second key: cancel chord and fall through to forward keystroke
+    }
+
+    if ctrl_only and k == "\\" {
+        svc.pending_ctrl_backslash = true
+        status_emit("<C-\\>- (press <C-n> for TERM-NORMAL, <C-\\> for float)")#
+        return true
+    }
+
+    if k == "F7" or (alt_only and k == "Escape") {
+        enter_term_normal_mode(kernel, world, vim, svc)
+        status_emit("-- TERM-NORMAL --")#
+        return true
+    }
+
+    if alt_only and k == "\\" {
+        open_toggleterm_float(world, vim, svc)
+        status_emit("Terminal #" ++ svc.current_id.to_string() ++ " float opened")#
+        return true
+    }
+
+    -- `<M-1>`..`<M-9>` switches numbered terminal session in-place
+    if alt_only and k.char_len() == 1 and k.is_ascii_digit() {
+        let d_opt = k.parse_i64()
+        if d_opt != null and d_opt.as(i64) >= 1 {
+            let next_sess = svc.switch_session(d_opt.as(i64), world.cwd)
+            let tbuf = sync_terminal_buffer_with_wm(kernel, world, svc, next_sess, abuf.major_mode, true)
+            let _ = world.switch_to_buffer(tbuf.id)
+            kernel.emit_hook("buffer-switched", tbuf.id)
+            status_emit("Switched to Terminal #" ++ next_sess.id.to_string() ++ " (" ++ next_sess.cwd ++ ")")#
+            return true
+        }
+    }
+
+    let session = svc.active_session(world.cwd)
+    if pty_available() {
+        let cur_mode = abuf.major_mode
+        let _ = sync_terminal_buffer_with_wm(kernel, world, svc, session, cur_mode, false)
+        if session.pty_id > 0 {
+            let _ = pty_send_key(session.pty_id, stroke.key, stroke.text, stroke.ctrl, stroke.alt, stroke.shift_mod) ! { _ => () }
+            let _ = sync_session_from_pty(session, false)
+            if not session.alive {
+                let sid = session.id
+                close_exited_terminal_session(kernel, world, vim, svc, session)
+                status_emit("Terminal #" ++ sid.to_string() ++ " exited (EOF)")#
+                return true
+            }
+            if ctrl_only and k == "d" {
+                let _ = host_schedule_timer(25)
+                let _ = host_schedule_timer(80)
+            }
+            let _ = sync_terminal_buffer_with_wm(kernel, world, svc, session, cur_mode, true)
+            return true
+        }
+    }
+
+    handle_fallback_line_key(kernel, world, svc, session, stroke, false)#!
+}
+
+-- ============================================================================
+-- 5. Multi-Layout Window Helpers & Commands
+-- ============================================================================
+
+fn find_visible_terminal_pane(wm: WindowManager, world: EditorWorld, target_name: String) -> ?WindowPane {
+    let vis = wm.visible_panes()
+    for i in 0..vis.len() {
+        let p = vis.get(i.as(usize)).as(WindowPane)
+        let b_opt = world.buffer(p.buffer_id)
+        if b_opt != null {
+            let b = b_opt.as(Buffer)
+            if target_name != "" {
+                if b.name == target_name {
+                    return p
+                }
+            } else if is_terminal_buffer_mode(b.major_mode) {
+                return p
+            }
+        }
+    }
+    null
+}
+
+fn open_legacy_toggleterm_buffer_for(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    vim: VimState,
+    svc: ToggleTermService,
+    id: i64,
+) {
+    hide_toggleterm_float(world, vim, svc)
+    let cur_buf = world.active_buffer()
+    if not is_terminal_buffer_mode(cur_buf.major_mode) {
+        svc.previous_buf_id = cur_buf.id
+    }
+    let session = svc.switch_session(id, world.cwd)
+    session.preferred_major_mode = "toggleterm"
+    svc.visible_mode = "buffer"
+    svc.term_insert_mode = false
+    let tbuf = sync_terminal_buffer_with_wm(kernel, world, svc, session, "toggleterm", false)
+    tbuf.point = tbuf.clamp_pos(Pos.new(tbuf.line_count() - 1, 0), insert_mode = false)
+    let _ = world.switch_to_buffer(tbuf.id)
+    sync_modal_interceptor_attachment(world, vim, svc)
+    kernel.emit_hook("buffer-switched", tbuf.id)
+}
+
+fn open_interactive_terminal_in_current_window(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    vim: VimState,
+    svc: ToggleTermService,
+    id: i64,
+    override_dir: String,
+    initial_cmd: String,
+) -> TerminalSession {
+    hide_toggleterm_float(world, vim, svc)
+    let cur_buf = world.active_buffer()
+    if not is_terminal_buffer_mode(cur_buf.major_mode) {
+        svc.previous_buf_id = cur_buf.id
+    }
+
+    let base_dir = if override_dir.trim() != "" { override_dir.trim() } else { world.cwd }
+    let session = svc.switch_session(id, base_dir)
+    if override_dir.trim() != "" and fs.exists(base_dir) and fs.is_dir(base_dir) {
+        let canon = fs.canonicalize(base_dir) ! { _ => path.normalize(base_dir) }
+        if session.cwd != canon {
+            session.cwd = canon
+            if pty_available() and session.pty_id > 0 and session.alive {
+                let _ = pty_write(session.pty_id, "cd " ++ shell_quote_single(canon) ++ "\n") ! { _ => () }
+                let _ = sync_session_from_pty(session, true)
+            }
+        }
+    }
+
+    svc.visible_mode = "buffer"
+    svc.term_insert_mode = true
+    session.preferred_major_mode = "terminal"
+
+    let tbuf = sync_terminal_buffer_with_wm(kernel, world, svc, session, "terminal", true)
+    let _ = world.switch_to_buffer(tbuf.id)
+    kernel.emit_hook("buffer-switched", tbuf.id)
+
+    if initial_cmd.trim() != "" {
+        let _ = toggleterm_exec(session, initial_cmd.trim())
+        let _ = sync_terminal_buffer_with_wm(kernel, world, svc, session, "terminal", true)
+    }
+
+    sync_modal_interceptor_attachment(world, vim, svc)
+    session
+}
+
+fn open_or_toggle_split_terminal(
+    kernel: SystemKernel,
+    axis: SplitAxis,
+    mode_label: String,
+    args: List,
+) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let wm = require_window_manager(kernel)!
+    let svc = require_toggleterm_service(kernel)!
+
+    hide_toggleterm_float(world, vim, svc)
+
+    var target_id = svc.current_id
+    var initial_cmd = ""
+    if not args.is_empty() {
+        let raw_arg = args.get(0).as(String).trim()
+        let parsed_id = raw_arg.parse_i64()
+        if parsed_id != null and parsed_id.as(i64) > 0 {
+            target_id = parsed_id.as(i64)
+        } else {
+            initial_cmd = raw_arg
+        }
+    }
+
+    let session = svc.switch_session(target_id, world.cwd)
+    session.preferred_major_mode = "terminal"
+
+    -- Toggle behavior: if the active split pane is ALREADY showing this terminal and >1 panes exist, close it!
+    let existing_pane_opt = find_visible_terminal_pane(wm, world, session.name)
+    if existing_pane_opt != null and initial_cmd == "" {
+        let ep = existing_pane_opt.as(WindowPane)
+        if wm.active_tab().active_win_id == ep.id and wm.visible_panes().len() > 1 {
+            let _ = wm.close_active(world)
+            svc.visible_mode = "hidden"
+            svc.split_win_id = null
+            sync_modal_interceptor_attachment(world, vim, svc)
+            kernel.emit_hook("buffer-switched", world.active_buffer_id)
+            kernel.emit_hook("window-focused", wm.active_tab().active_win_id)
+            status_emit("Closed split terminal " ++ session.name)#
+            return ()
+        }
+        -- Focus the existing visible terminal pane and enter `TERM-INSERT`
+        wm.active_tab().active_win_id = ep.id
+        wm.sync_to_world(world)
+        svc.visible_mode = mode_label
+        svc.split_win_id = ep.id
+        svc.term_insert_mode = true
+        let _ = sync_terminal_buffer_with_wm(kernel, world, svc, session, "terminal", true)
+        sync_modal_interceptor_attachment(world, vim, svc)
+        kernel.emit_hook("window-focused", ep.id)
+        status_emit("Focused split terminal " ++ session.name)#
+        return ()
+    }
+
+    let cur_buf = world.active_buffer()
+    if not is_terminal_buffer_mode(cur_buf.major_mode) {
+        svc.previous_buf_id = cur_buf.id
+    }
+
+    let new_win_id = wm.split_active(axis, world)
+    if axis == SplitAxis.Horizontal {
+        wm.adjust_split_ratio(0.15)
+    }
+
+    svc.visible_mode = mode_label
+    svc.split_win_id = new_win_id
+    svc.term_insert_mode = true
+
+    let tbuf = sync_terminal_buffer_with_wm(kernel, world, svc, session, "terminal", true)
+    let _ = world.switch_to_buffer(tbuf.id)
+    kernel.emit_hook("buffer-switched", tbuf.id)
+    kernel.emit_hook("window-focused", new_win_id)
+
+    if initial_cmd != "" {
+        let _ = toggleterm_exec(session, initial_cmd)
+    }
+    let _ = sync_terminal_buffer_with_wm(kernel, world, svc, session, "terminal", true)
+    sync_modal_interceptor_attachment(world, vim, svc)
+
+    status_emit("Opened " ++ mode_label ++ " split " ++ session.name ++ " (" ++ session.cwd ++ ")")#
+    ()
+}
+
+fn cmd_toggleterm_toggle(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_toggleterm_service(kernel)!
+
+    let raw_arg = if not args.is_empty() { args.get(0).as(String).trim() } else { "" }
+    if raw_arg != "" {
+        let parsed_id = raw_arg.parse_i64()
+        if parsed_id != null and parsed_id.as(i64) > 0 {
+            let target_id = parsed_id.as(i64)
+            if svc.visible_mode == "float" and svc.float_visible and svc.current_id == target_id {
+                hide_toggleterm_float(world, vim, svc)
+                status_emit("Terminal #" ++ target_id.to_string() ++ " hidden")#
+                return ()
+            }
+            let _ = svc.switch_session(target_id, world.cwd)
+            open_toggleterm_float(world, vim, svc)
+            status_emit("Terminal #" ++ target_id.to_string() ++ " opened")#
+            return ()
+        }
+        let session = svc.active_session(world.cwd)
+        let _ = toggleterm_exec(session, raw_arg)
+        sync_terminal_buffer_if_exists(world, svc, session)
+        open_toggleterm_float(world, vim, svc)
+        status_emit("Terminal #" ++ session.id.to_string() ++ ": " ++ raw_arg)#
+        return ()
+    }
+
+    if svc.visible_mode == "float" and svc.float_visible {
+        hide_toggleterm_float(world, vim, svc)
+        status_emit("Terminal #" ++ svc.current_id.to_string() ++ " hidden")#
+        return ()
+    }
+
+    open_toggleterm_float(world, vim, svc)
+    let session = svc.active_session(world.cwd)
+    log_event("info", OWNER_TOGGLETERM, "Opened floating terminal #" ++ session.id.to_string())#
+    status_emit("Terminal #" ++ session.id.to_string() ++ " (" ++ session.cwd ++ ")")#
+    ()
+}
+
+fn cmd_toggleterm_buffer(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_toggleterm_service(kernel)!
+
+    var target_id = svc.current_id
+    if not args.is_empty() {
+        let parsed_opt = args.get(0).as(String).trim().parse_i64()
+        if parsed_opt != null and parsed_opt.as(i64) > 0 {
+            target_id = parsed_opt.as(i64)
+        }
+    }
+
+    open_legacy_toggleterm_buffer_for(kernel, world, vim, svc, target_id)
+    let session = svc.active_session(world.cwd)
+    status_emit("Opened buffer " ++ session.name ++ " (" ++ session.cwd ++ ")")#
+    ()
+}
+
+fn cmd_terminal_buffer(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_toggleterm_service(kernel)!
+
+    var target_id = svc.current_id
+    var override_dir = ""
+    var initial_cmd = ""
+
+    if not args.is_empty() {
+        let raw_arg = args.join(" ").trim()
+        if raw_arg != "" {
+            let parsed_id = raw_arg.parse_i64()
+            if parsed_id != null and parsed_id.as(i64) > 0 and parsed_id.as(i64) <= 9 {
+                target_id = parsed_id.as(i64)
+            } else {
+                let candidate_path = world.resolve_path(raw_arg)
+                if fs.exists(candidate_path) and fs.is_dir(candidate_path) {
+                    override_dir = candidate_path
+                } else {
+                    initial_cmd = raw_arg
+                }
+            }
+        }
+    }
+
+    let session = open_interactive_terminal_in_current_window(
+        kernel,
+        world,
+        vim,
+        svc,
+        target_id,
+        override_dir,
+        initial_cmd,
+    )
+    status_emit("-- TERM-INSERT -- " ++ session.name ++ " (" ++ session.cwd ++ ")")#
+    ()
+}
+
+fn cmd_terminal_here(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_toggleterm_service(kernel)!
+
+    var target_dir = world.cwd
+    if not args.is_empty() {
+        let raw_dir = args.get(0).as(String).trim()
+        if raw_dir != "" {
+            let resolved = world.resolve_path(raw_dir)
+            if fs.exists(resolved) and fs.is_dir(resolved) {
+                target_dir = resolved
+            } else {
+                let parent_opt = path.parent(resolved)
+                if parent_opt != null and fs.is_dir(parent_opt.as(String)) {
+                    target_dir = parent_opt.as(String)
+                }
+            }
+        }
+    } else {
+        let fp = world.active_buffer().file_path
+        if fp != "" {
+            let p_opt = path.parent(fp)
+            if p_opt != null and fs.is_dir(p_opt.as(String)) {
+                target_dir = p_opt.as(String)
+            }
+        }
+    }
+
+    let session = open_interactive_terminal_in_current_window(
+        kernel,
+        world,
+        vim,
+        svc,
+        svc.current_id,
+        target_dir,
+        "",
+    )
+    status_emit("Terminal #" ++ session.id.to_string() ++ " in " ++ session.cwd)#
+    ()
+}
+
+fn cmd_terminal_split(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    open_or_toggle_split_terminal(kernel, SplitAxis.Horizontal, "horizontal", args)#!
+}
+
+fn cmd_terminal_vsplit(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    open_or_toggle_split_terminal(kernel, SplitAxis.Vertical, "vertical", args)#!
+}
+
+fn cmd_terminal_normal_mode(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_toggleterm_service(kernel)!
+    enter_term_normal_mode(kernel, world, vim, svc)
+    status_emit("-- TERM-NORMAL --")#
+    ()
+}
+
+fn cmd_terminal_insert_mode(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_toggleterm_service(kernel)!
+    enter_term_insert_mode(kernel, world, vim, svc)
+    status_emit("-- TERM-INSERT --")#
+    ()
+}
+
+fn cmd_toggleterm_buffer_input(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_toggleterm_service(kernel)!
+    let session = svc.active_session(world.cwd)
+
+    let ans? = ask_prompt(PromptRequest {
+        label: "Terminal #" ++ session.id.to_string() ++ " (" ++ session.cwd ++ ") $ ",
+        initial: "",
+        kind: PromptKind.FreeText,
+        candidates: session.history,
+    })# else {
+        status_emit("Cancelled")#
+        return ()
+    }
+
+    let trimmed = ans.trim()
+    if trimmed != "" {
+        let code = toggleterm_exec(session, trimmed)
+        sync_terminal_buffer_if_exists(world, svc, session)
+        if svc.float_visible {
+            refresh_toggleterm_float(world, svc)
+        }
+        status_emit("Terminal #" ++ session.id.to_string() ++ " [exit " ++ code.to_string() ++ "]")#
+    }
+    ()
+}
+
+fn cmd_toggleterm_buffer_clear(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_toggleterm_service(kernel)!
+    let session = svc.active_session(world.cwd)
+    session.scrollback = List()
+    if pty_available() and session.pty_id > 0 {
+        let _ = pty_send_key(session.pty_id, "l", "", true, false, false) ! { _ => () }
+        let _ = sync_session_from_pty(session, false)
+    }
+    sync_terminal_buffer_if_exists(world, svc, session)
+    if svc.float_visible {
+        refresh_toggleterm_float(world, svc)
+    }
+    status_emit("Cleared " ++ session.name)#
+    ()
+}
+
+fn cmd_toggleterm_buffer_hide(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_toggleterm_service(kernel)!
+
+    let wm_raw = kernel.service(SERVICE_WINDOW_MANAGER)
+    if wm_raw != null and (svc.visible_mode == "horizontal" or svc.visible_mode == "vertical") {
+        let wm = wm_raw.as(WindowManager)
+        if wm.visible_panes().len() > 1 and wm.close_active(world) {
+            svc.visible_mode = "hidden"
+            svc.split_win_id = null
+            sync_modal_interceptor_attachment(world, vim, svc)
+            kernel.emit_hook("buffer-switched", world.active_buffer_id)
+            kernel.emit_hook("window-focused", wm.active_tab().active_win_id)
+            status_emit("Closed split terminal")#
+            return ()
+        }
+    }
+
+    svc.visible_mode = "hidden"
+    var switched = false
+    svc.previous_buf_id match {
+        pid? => {
+            if world.buffers.contains_key(pid) {
+                switched = world.switch_to_buffer(pid)
+            }
+        },
+        _ => (),
+    }
+    if not switched {
+        let _ = world.cycle_buffer(-1)
+    }
+    sync_modal_interceptor_attachment(world, vim, svc)
+    kernel.emit_hook("buffer-switched", world.active_buffer_id)
+    status_emit("Hid terminal buffer")#
+    ()
+}
+
+fn cycle_terminal_command(kernel: SystemKernel, delta: i64) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_toggleterm_service(kernel)!
+    let next_sess = svc.cycle_or_create_next(delta, world.cwd)
+    let abuf = world.active_buffer()
+    if svc.float_visible {
+        refresh_toggleterm_float(world, svc)
+    } else if abuf.major_mode == "toggleterm" {
+        open_legacy_toggleterm_buffer_for(kernel, world, vim, svc, next_sess.id)
+    } else if abuf.major_mode == "terminal" {
+        let tbuf = sync_terminal_buffer_with_wm(kernel, world, svc, next_sess, "terminal", svc.term_insert_mode)
+        let _ = world.switch_to_buffer(tbuf.id)
+        sync_modal_interceptor_attachment(world, vim, svc)
+        kernel.emit_hook("buffer-switched", tbuf.id)
+    }
+    status_emit("Switched to Terminal #" ++ next_sess.id.to_string())#
+    ()
+}
+
+fn cmd_toggleterm_next(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    cycle_terminal_command(kernel, 1)#!
+}
+
+fn cmd_toggleterm_prev(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    cycle_terminal_command(kernel, -1)#!
+}
+
+fn cmd_term_exec(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_toggleterm_service(kernel)!
+    var cmd_str = if not args.is_empty() { args.join(" ").trim() } else { "" }
+    if cmd_str == "" {
+        let ans? = ask_prompt(PromptRequest.text("TermExec $ ", ""))# else {
+            status_emit("Cancelled")#
+            return ()
+        }
+        cmd_str = ans.trim()
+    }
+    if cmd_str == "" {
+        return ()
+    }
+    let session = svc.active_session(world.cwd)
+    let code = toggleterm_exec(session, cmd_str)
+    sync_terminal_buffer_if_exists(world, svc, session)
+    if svc.float_visible {
+        refresh_toggleterm_float(world, svc)
+    }
+    let level = if code == 0 { "info" } else { "error" }
+    let _ = world.push_notification(
+        level,
+        "Terminal #" ++ session.id.to_string(),
+        "$ " ++ cmd_str ++ " (exit " ++ code.to_string() ++ ")",
+    )
+    status_emit("TermExec #" ++ session.id.to_string() ++ " [exit " ++ code.to_string() ++ "]: " ++ cmd_str)#
+    code
+}
+
+fn extract_lines_to_send(buf: Buffer, vim: VimState) -> List {
+    let lines = List()
+    let is_vis = vim.mode == VimMode.VisualChar
+        or vim.mode == VimMode.VisualLine
+        or vim.mode == VimMode.VisualBlock
+    if is_vis {
+        let a = vim.visual_anchor
+        let b = buf.point
+        if vim.mode == VimMode.VisualChar {
+            let lo = if a <= b { a } else { b }
+            let hi = if a <= b { b } else { a }
+            let hlen = buf.line_char_len(hi.row)
+            let end_c = if hi.col < hlen { hi.col + 1 } else { hlen }
+            let raw = buf.extract_span(Span.normalized(lo, Pos.new(hi.row, end_c)))
+            let parts = raw.split("\n")
+            for i in 0..parts.len() {
+                let ln = parts.get(i.as(usize)).as(String).trim()
+                if ln != "" {
+                    lines.push(ln)
+                }
+            }
+        } else {
+            let r1 = if a.row <= b.row { a.row } else { b.row }
+            let r2 = if a.row <= b.row { b.row } else { a.row }
+            for r in r1..(r2 + 1) {
+                let ln = buf.line_at(r).trim()
+                if ln != "" {
+                    lines.push(ln)
+                }
+            }
+        }
+        return lines
+    }
+    let cur = buf.line_at(buf.point.row).trim()
+    if cur != "" {
+        lines.push(cur)
+    }
+    lines
+}
+
+fn cmd_term_send(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_toggleterm_service(kernel)!
+    let buf = world.active_buffer()
+
+    let cmds = extract_lines_to_send(buf, vim)
+    if vim.mode != VimMode.Normal {
+        vim.mode = VimMode.Normal
+        vim.visual_dollar = false
+        vim.clear_transient()
+        sync_world_from_vim(world, vim)
+    }
+
+    if cmds.is_empty() {
+        status_emit("ToggleTerm: current line/selection is empty")#
+        return ()
+    }
+
+    let session = svc.active_session(world.cwd)
+    var last_code: i64 = 0
+    for i in 0..cmds.len() {
+        last_code = toggleterm_exec(session, cmds.get(i.as(usize)).as(String))
+    }
+    sync_terminal_buffer_if_exists(world, svc, session)
+    if svc.float_visible {
+        refresh_toggleterm_float(world, svc)
+    }
+
+    let summary = "Sent " ++ cmds.len().to_string() ++ " line(s) to Terminal #" ++ session.id.to_string()
+    let _ = world.push_notification("info", "ToggleTerm", summary)
+    status_emit(summary)#
+    last_code
+}
+
+-- ============================================================================
+-- 6. Live Streaming `"timer-tick"` Hook & Focus Hooks
+-- ============================================================================
+
+fn is_term_word_char(ch: String) -> bool {
+    ch == "_" or ch == "-" or ch == "." or ch == "/" or ch.is_alphanumeric()
+}
+
+fn find_float_window(world: EditorWorld) -> ?FloatingWindow {
+    for i in 0..world.floating_windows.len() {
+        let fw = world.floating_windows.get(i.as(usize)).as(FloatingWindow)
+        if fw.id == FLOAT_ID_TOGGLETERM {
+            return fw
+        }
+    }
+    null
+}
+
+fn select_float_word_at(line: String, col: i64) -> (i64, i64) {
+    let llen = line.char_len()
+    if llen <= 0 {
+        return (0, 0)
+    }
+    let c = if col < 0 { 0 } else if col >= llen { llen - 1 } else { col }
+    if not is_term_word_char(line.slice(c, c + 1)) {
+        return (c, c)
+    }
+    var sc = c
+    while sc > 0 and is_term_word_char(line.slice(sc - 1, sc)) {
+        sc -= 1
+    }
+    var ec = c
+    while ec + 1 < llen and is_term_word_char(line.slice(ec + 1, ec + 2)) {
+        ec += 1
+    }
+    (sc, ec)
+}
+
+pub fn extract_float_selected_text(world: EditorWorld, svc: ToggleTermService) -> String {
+    if svc.float_sel_anchor == null or svc.float_sel_cursor == null {
+        return ""
+    }
+    let fw_opt = find_float_window(world)
+    if fw_opt == null {
+        return ""
+    }
+    let fw = fw_opt.as(FloatingWindow)
+    if fw.lines.is_empty() {
+        return ""
+    }
+    let a = svc.float_sel_anchor.as(Pos)
+    let b = svc.float_sel_cursor.as(Pos)
+    let lo = if a <= b { a } else { b }
+    let hi = if a <= b { b } else { a }
+    let r_start = if lo.row < 0 { 0 } else { lo.row }
+    let r_end = if hi.row >= fw.lines.len() { fw.lines.len() - 1 } else { hi.row }
+    if r_start > r_end {
+        return ""
+    }
+    let parts = List()
+    for r in r_start..(r_end + 1) {
+        let ln = fw.lines.get(r.as(usize)).as(String)
+        let llen = ln.char_len()
+        var sc = if r == lo.row { lo.col } else { 0 }
+        var ec = if r == hi.row { hi.col + 1 } else { llen }
+        if sc < 0 {
+            sc = 0
+        }
+        if sc > llen {
+            sc = llen
+        }
+        if ec < sc {
+            ec = sc
+        }
+        if ec > llen {
+            ec = llen
+        }
+        let seg = ln.slice(sc, ec)
+        parts.push(if r < r_end { seg.trim_end() } else { seg })
+    }
+    parts.join("\n")
+}
+
+fn on_floating_window_mouse(kernel: SystemKernel, payload: Any) {
+    let w_opt = kernel.service("lava.document.world")
+    let svc_opt = kernel.service(SERVICE_TOGGLETERM)
+    if w_opt == null or svc_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let svc = svc_opt.as(ToggleTermService)
+    if not svc.float_visible {
+        return
+    }
+    let (kind, fw_id, raw_row, raw_col, click_count) = payload.as((String, String, i64, i64, i64))
+    if fw_id != FLOAT_ID_TOGGLETERM {
+        return
+    }
+    let fw_opt = find_float_window(world)
+    if fw_opt == null {
+        return
+    }
+    let fw = fw_opt.as(FloatingWindow)
+    if fw.lines.is_empty() {
+        return
+    }
+    let row = if raw_row < 0 {
+        0
+    } else if raw_row >= fw.lines.len() {
+        fw.lines.len() - 1
+    } else {
+        raw_row
+    }
+    let ln = fw.lines.get(row.as(usize)).as(String)
+    let llen = ln.char_len()
+    let col = if raw_col < 0 {
+        0
+    } else if raw_col > llen {
+        llen
+    } else {
+        raw_col
+    }
+
+    if kind == "press" {
+        if click_count >= 3 {
+            let end_c = if llen > 0 { llen - 1 } else { 0 }
+            svc.float_sel_anchor = Pos.new(row, 0)
+            svc.float_sel_cursor = Pos.new(row, end_c)
+            refresh_toggleterm_float(world, svc)
+            let yanked = extract_float_selected_text(world, svc)
+            if yanked != "" {
+                kernel.publish_service("lava.app.pending_yank", ext_toggleterm_id(), yanked)
+            }
+            return
+        }
+        if click_count == 2 {
+            let (sc, ec) = select_float_word_at(ln, col)
+            svc.float_sel_anchor = Pos.new(row, sc)
+            svc.float_sel_cursor = Pos.new(row, ec)
+            refresh_toggleterm_float(world, svc)
+            let yanked = extract_float_selected_text(world, svc)
+            if yanked != "" {
+                kernel.publish_service("lava.app.pending_yank", ext_toggleterm_id(), yanked)
+            }
+            return
+        }
+        svc.float_sel_anchor = Pos.new(row, col)
+        svc.float_sel_cursor = null
+        refresh_toggleterm_float(world, svc)
+        return
+    }
+
+    if kind == "drag" {
+        if svc.float_sel_anchor == null {
+            svc.float_sel_anchor = Pos.new(row, col)
+        }
+        let target = Pos.new(row, col)
+        svc.float_sel_cursor = target
+        refresh_toggleterm_float(world, svc)
+        return
+    }
+
+    if kind == "release" {
+        if svc.float_sel_anchor != null and svc.float_sel_cursor != null {
+            let yanked = extract_float_selected_text(world, svc)
+            if yanked != "" {
+                kernel.publish_service("lava.app.pending_yank", ext_toggleterm_id(), yanked)
+            }
+        }
+    }
+}
+
+fn on_floating_window_scroll(kernel: SystemKernel, payload: Any) {
+    let w_opt = kernel.service("lava.document.world")
+    let svc_opt = kernel.service(SERVICE_TOGGLETERM)
+    if w_opt == null or svc_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let svc = svc_opt.as(ToggleTermService)
+    if not svc.float_visible {
+        return
+    }
+    let (fw_id, dy) = payload.as((String, f64))
+    if fw_id != FLOAT_ID_TOGGLETERM {
+        return
+    }
+    let delta: i64 = if dy < 0.0 {
+        3
+    } else if dy > 0.0 {
+        -3
+    } else {
+        0
+    }
+    if delta == 0 {
+        return
+    }
+    var next_off = svc.float_scroll_offset + delta
+    if next_off < 0 {
+        next_off = 0
+    }
+    svc.float_scroll_offset = next_off
+    refresh_toggleterm_float(world, svc)
+}
+
+fn on_terminal_enter_normal_for_selection(kernel: SystemKernel, _payload: Any) {
+    let w_opt = kernel.service("lava.document.world")
+    let v_opt = kernel.service("lava.vim.state")
+    let svc_opt = kernel.service(SERVICE_TOGGLETERM)
+    if w_opt == null or v_opt == null or svc_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let vim = v_opt.as(VimState)
+    let svc = svc_opt.as(ToggleTermService)
+    if is_terminal_buffer_mode(world.active_buffer().major_mode) and svc.term_insert_mode {
+        svc.term_insert_mode = false
+        svc.pending_ctrl_backslash = false
+        if vim.modal_interceptor != null {
+            if vim.modal_interceptor.as(ModalInterceptor).owner == OWNER_TOGGLETERM {
+                vim.clear_interceptor()
+            }
+        }
+        sync_statusline_badge(world, svc)
+    }
+}
+
+fn on_terminal_timer_tick(kernel: SystemKernel, payload: Any) {
+    if not pty_available() {
+        return
+    }
+    let w_opt = kernel.service("lava.document.world")
+    let svc_opt = kernel.service(SERVICE_TOGGLETERM)
+    if w_opt == null or svc_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let svc = svc_opt.as(ToggleTermService)
+    let v_opt = kernel.service("lava.vim.state")
+    let _ = if payload matches _: i64 { payload.as(i64) == PTY_WAKE_TIMER_ID } else { false }
+
+    if svc.float_visible {
+        let active_sess = svc.active_session(world.cwd)
+        if active_sess.pty_id > 0 {
+            let _ = sync_session_from_pty(active_sess, false)
+            if (not active_sess.alive) and v_opt != null {
+                close_exited_terminal_session(kernel, world, v_opt.as(VimState), svc, active_sess)
+                return
+            }
+        }
+        refresh_toggleterm_float(world, svc)
+    }
+
+    let wm_raw = kernel.service(SERVICE_WINDOW_MANAGER)
+    if wm_raw != null {
+        let wm = wm_raw.as(WindowManager)
+        let vis = wm.visible_panes()
+        for i in 0..vis.len() {
+            let pane = vis.get(i.as(usize)).as(WindowPane)
+            let b_opt = world.buffer(pane.buffer_id)
+            if b_opt != null {
+                let b = b_opt.as(Buffer)
+                if is_terminal_buffer_mode(b.major_mode) {
+                    let sid = parse_terminal_buffer_id(b.name)
+                    if sid > 0 {
+                        let sess_opt = svc.find_session(sid)
+                        if sess_opt != null {
+                            let sess = sess_opt.as(TerminalSession)
+                            let p_rows = clamp_pty_rows(wm.pane_rows(pane))
+                            let p_cols = clamp_pty_cols(wm.pane_cols(pane, b, world.options))
+                            if sess.pty_id > 0 {
+                                if sess.pty_rows != p_rows or sess.pty_cols != p_cols {
+                                    let _ = pty_resize(sess.pty_id, p_rows, p_cols) ! { _ => () }
+                                    sess.pty_rows = p_rows
+                                    sess.pty_cols = p_cols
+                                }
+                                let is_active_term = (pane.id == wm.active_tab().active_win_id)
+                                let _ = sync_session_from_pty(sess, not (is_active_term and svc.term_insert_mode))
+                                if (not sess.alive) and v_opt != null {
+                                    close_exited_terminal_session(kernel, world, v_opt.as(VimState), svc, sess)
+                                    return
+                                }
+                                let lines = render_terminal_buffer_lines(svc, sess)
+                                let updated = world.ensure_special_buffer(sess.name, b.major_mode, lines, read_only = true)
+                                apply_terminal_buffer_spans_and_cursor(
+                                    world,
+                                    wm,
+                                    svc,
+                                    sess,
+                                    updated,
+                                    is_active_term and svc.term_insert_mode,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn on_focus_or_buffer_changed(kernel: SystemKernel, _payload: Any) {
+    let w_opt = kernel.service("lava.document.world")
+    let v_opt = kernel.service("lava.vim.state")
+    let svc_opt = kernel.service(SERVICE_TOGGLETERM)
+    if w_opt != null and v_opt != null and svc_opt != null {
+        sync_modal_interceptor_attachment(
+            w_opt.as(EditorWorld),
+            v_opt.as(VimState),
+            svc_opt.as(ToggleTermService),
+        )
+    }
+}
+
+-- ============================================================================
+-- 7. Extension Registration (`composer.rs` single-line signature contract)
+-- ============================================================================
+
+pub fn register_toggleterm_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_toggleterm_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_toggleterm",
+        "0.1.0",
+        "Persistent numbered POSIX PTY & VT100/ANSI terminals (`<C-\\>`, `:term`, `:vterm`, `<Space>tt/tf/th/tv/tb/ts/tr`).",
+        [ext_document_id(), ext_window_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let _ = require_editor_world(k)!
+            let svc = ToggleTermService.new()
+            k.publish_service(SERVICE_TOGGLETERM, ext_id, svc)
+
+            k.add_hook("timer-tick", ext_id, on_terminal_timer_tick)
+            k.add_hook("buffer-switched", ext_id, on_focus_or_buffer_changed)
+            k.add_hook("window-focused", ext_id, on_focus_or_buffer_changed)
+            k.add_hook("floating-window-mouse", ext_id, on_floating_window_mouse)
+            k.add_hook("floating-window-scroll", ext_id, on_floating_window_scroll)
+            k.add_hook("terminal-enter-normal-for-selection", ext_id, on_terminal_enter_normal_for_selection)
+
+            let norm_km = k.ensure_keymap(KEYMAP_VIM_NORMAL)
+            norm_km.bind("<C-\\>", "toggleterm-toggle", ext_id, description = "Toggle floating terminal")
+            norm_km.bind("] t", "toggleterm-next", ext_id, description = "Next terminal session")
+            norm_km.bind("[ t", "toggleterm-prev", ext_id, description = "Previous terminal session")
+
+            let ins_km = k.ensure_keymap(KEYMAP_VIM_INSERT)
+            ins_km.bind("<C-\\>", "toggleterm-toggle", ext_id, description = "Toggle floating terminal")
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> t t", "terminal", ext_id, description = "Open interactive terminal")
+            leader_km.bind("<Space> t f", "terminal-float", ext_id, description = "Toggle floating terminal")
+            leader_km.bind("<Space> t h", "terminal-split", ext_id, description = "Horizontal split terminal")
+            leader_km.bind("<Space> t v", "terminal-vsplit", ext_id, description = "Vertical split terminal")
+            leader_km.bind("<Space> t b", "toggleterm-buffer", ext_id, description = "Open terminal buffer")
+            leader_km.bind("<Space> t r", "toggleterm-run", ext_id, description = "Run command in terminal")
+            leader_km.bind("<Space> t s", "terminal-send-line", ext_id, description = "Send line to active terminal")
+
+            let vis_km = k.ensure_keymap(KEYMAP_VIM_VISUAL)
+            vis_km.bind("<Space> t s", "terminal-send-line", ext_id, description = "Send selection to active terminal")
+
+            -- Legacy `"mode:toggleterm"` (`<Space>tb`) normal-mode bindings
+            let legacy_km = k.ensure_keymap("mode:toggleterm")
+            legacy_km.bind("<Return>", "toggleterm-buffer-input", ext_id, description = "Run command in terminal")
+            legacy_km.bind("i", "terminal-insert-mode", ext_id, description = "Enter TERM-INSERT mode")
+            legacy_km.bind("a", "terminal-insert-mode", ext_id, description = "Enter TERM-INSERT mode")
+            legacy_km.bind("I", "terminal-insert-mode", ext_id, description = "Enter TERM-INSERT mode")
+            legacy_km.bind("A", "terminal-insert-mode", ext_id, description = "Enter TERM-INSERT mode")
+            legacy_km.bind("c", "toggleterm-buffer-clear", ext_id, description = "Clear terminal scrollback")
+            legacy_km.bind("<Tab>", "toggleterm-next", ext_id, description = "Switch to next terminal")
+            legacy_km.bind("q", "toggleterm-buffer-hide", ext_id, description = "Hide terminal buffer")
+
+            -- Interactive `"mode:terminal"` (`TERM-NORMAL`) bindings: re-enter `TERM-INSERT` cleanly!
+            let term_km = k.ensure_keymap("mode:terminal")
+            term_km.bind("i", "terminal-insert-mode", ext_id, description = "Enter TERM-INSERT mode")
+            term_km.bind("a", "terminal-insert-mode", ext_id, description = "Enter TERM-INSERT mode")
+            term_km.bind("I", "terminal-insert-mode", ext_id, description = "Enter TERM-INSERT mode")
+            term_km.bind("A", "terminal-insert-mode", ext_id, description = "Enter TERM-INSERT mode")
+            term_km.bind("<Return>", "terminal-insert-mode", ext_id, description = "Enter TERM-INSERT mode")
+            term_km.bind("<Tab>", "toggleterm-next", ext_id, description = "Switch to next terminal")
+            term_km.bind("q", "toggleterm-buffer-hide", ext_id, description = "Hide or close terminal window")
+
+            k.register_command("toggleterm", ext_id, "Toggle persistent floating terminal (`<C-\\>`).", cmd_toggleterm_toggle)
+            k.register_command("toggleterm-toggle", ext_id, "Toggle persistent floating terminal (`<C-\\>`).", cmd_toggleterm_toggle)
+            k.register_command("terminal-float", ext_id, "Toggle floating terminal (`<Space>tf`).", cmd_toggleterm_toggle)
+            k.register_command("ex:ToggleTerm", ext_id, "Ex `:ToggleTerm [id_or_cmd]`.", cmd_toggleterm_toggle, interactive = false)
+
+            k.register_command("terminal", ext_id, "Open interactive full-buffer terminal (`:term` / `:vterm`).", cmd_terminal_buffer)
+            k.register_command("ex:term", ext_id, "Ex `:term [cmd_or_dir]`.", cmd_terminal_buffer, interactive = false)
+            k.register_command("ex:terminal", ext_id, "Ex `:terminal [cmd_or_dir]`.", cmd_terminal_buffer, interactive = false)
+            k.register_command("ex:vterm", ext_id, "Ex `:vterm [cmd_or_dir]`.", cmd_terminal_buffer, interactive = false)
+            k.register_command("terminal-here", ext_id, "Open interactive terminal rooted at directory.", cmd_terminal_here)
+
+            k.register_command("terminal-split", ext_id, "Open/toggle horizontal bottom split terminal (`<Space>th`).", cmd_terminal_split)
+            k.register_command("ex:TermSplit", ext_id, "Ex `:TermSplit [id_or_cmd]`.", cmd_terminal_split, interactive = false)
+            k.register_command("terminal-vsplit", ext_id, "Open/toggle vertical right split terminal (`<Space>tv`).", cmd_terminal_vsplit)
+            k.register_command("ex:TermVSplit", ext_id, "Ex `:TermVSplit [id_or_cmd]`.", cmd_terminal_vsplit, interactive = false)
+
+            k.register_command("terminal-normal-mode", ext_id, "Switch terminal to TERM-NORMAL mode (`<C-\\><C-n>`).", cmd_terminal_normal_mode)
+            k.register_command("ex:TermNormal", ext_id, "Ex `:TermNormal`.", cmd_terminal_normal_mode, interactive = false)
+            k.register_command("terminal-insert-mode", ext_id, "Switch terminal to TERM-INSERT mode.", cmd_terminal_insert_mode)
+
+            k.register_command("toggleterm-buffer", ext_id, "Open persistent terminal buffer (`*terminal-N*`).", cmd_toggleterm_buffer)
+            k.register_command("ex:ToggleTermBuffer", ext_id, "Ex `:ToggleTermBuffer [id]`.", cmd_toggleterm_buffer, interactive = false)
+
+            k.register_command("toggleterm-buffer-input", ext_id, "Prompt and execute command in terminal buffer.", cmd_toggleterm_buffer_input)
+            k.register_command("toggleterm-buffer-clear", ext_id, "Clear active terminal scrollback.", cmd_toggleterm_buffer_clear)
+            k.register_command("toggleterm-buffer-hide", ext_id, "Hide active terminal buffer.", cmd_toggleterm_buffer_hide)
+            k.register_command("toggleterm-next", ext_id, "Switch to next numbered terminal session.", cmd_toggleterm_next)
+            k.register_command("toggleterm-prev", ext_id, "Switch to previous numbered terminal session.", cmd_toggleterm_prev)
+
+            k.register_command("toggleterm-run", ext_id, "Execute shell command in active terminal session (`<Space>tr`).", cmd_term_exec)
+            k.register_command("term-exec", ext_id, "Execute shell command in active terminal session.", cmd_term_exec)
+            k.register_command("ex:TermExec", ext_id, "Ex `:TermExec <cmd>`.", cmd_term_exec, interactive = false)
+
+            k.register_command("terminal-send-line", ext_id, "Send current buffer line or Visual selection to active terminal (`<Space>ts`).", cmd_term_send)
+            k.register_command("term-send", ext_id, "Send current buffer line or Visual selection to active terminal.", cmd_term_send)
+            k.register_command("ex:TermSend", ext_id, "Ex `:TermSend`.", cmd_term_send, interactive = false)
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let svc_opt = k.service(SERVICE_TOGGLETERM)
+            if svc_opt != null and pty_available() {
+                let svc = svc_opt.as(ToggleTermService)
+                for i in 0..svc.sessions.len() {
+                    let s = svc.sessions.get(i.as(usize)).as(TerminalSession)
+                    if s.pty_id > 0 {
+                        let _ = pty_kill(s.pty_id)
+                        s.pty_id = 0
+                    }
+                }
+            }
+            let w_opt = k.service("lava.document.world")
+            let v_opt = k.service("lava.vim.state")
+            if w_opt != null {
+                let w = w_opt.as(EditorWorld)
+                w.clear_owner_ui(OWNER_TOGGLETERM)
+                let _ = w.floating_window_spans.remove(FLOAT_ID_TOGGLETERM)
+                let _ = w.floating_window_cursor.remove(FLOAT_ID_TOGGLETERM)
+            }
+            if v_opt != null {
+                let vs = v_opt.as(VimState)
+                if vs.modal_interceptor != null {
+                    if vs.modal_interceptor.as(ModalInterceptor).owner == OWNER_TOGGLETERM {
+                        vs.clear_interceptor()
+                    }
+                }
+            }
+            ()
+        },
+    )
+}

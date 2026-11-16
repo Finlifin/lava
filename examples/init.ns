@@ -1,0 +1,108 @@
+-- examples/init.ns: Sample User Configuration & Live Extension Script for Lava.
+-- Demonstrates Principles 1, 3, 4, 5 & 6:
+-- User scripts run in the exact same Nessa VM, share the exact same TypePool/Heap/SystemKernel,
+-- and can register full Extensions, Services, Continuation-driven Commands, Hooks, and Keybindings.
+
+use @lava_core.{
+    ExtId, InteractiveEffects, PromptRequest, SystemKernel, ask_prompt, log_event, status_emit
+}
+use @ext_document.{BufferKind, Pos, require_editor_world}
+
+pub struct NotesCounter {
+    pub created: i64,
+}
+
+pub fn user_notes_ext_id() -> ExtId = ExtId("user.local/ext_notes")
+
+pub fn configure(kernel: SystemKernel) -> !String Unit {
+    let world = require_editor_world(kernel)!
+    world.options.relativenumber = false
+    world.options.tabstop = 4
+    world.options.shiftwidth = 4
+
+    let ext_id = user_notes_ext_id()
+    kernel.register_extension(
+        ext_id,
+        "user.local",
+        "ext_notes",
+        "0.1.0",
+        "User-defined quick-notes extension loaded from init.ns in the shared Nessa VM.",
+        [ExtId("lava.org/ext_document")],
+        |k: SystemKernel| -> !String Unit {
+            let counter = NotesCounter { created: 0 }
+            k.publish_service("user.notes.counter", ext_id, counter)
+
+            k.register_command(
+                "insert-lava-banner",
+                ext_id,
+                "Insert a decorative header comment at cursor in the active buffer.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let buf = w.active_buffer()
+                    let next_p = buf.insert_text(
+                        buf.point,
+                        "-- [Lava Programmable Environment | Single Nessa VM]\n",
+                    )!
+                    buf.checkpoint(next_p, "insert-lava-banner")
+                    log_event("info", "user.local/ext_notes", "Inserted banner") #
+                    status_emit("Banner inserted by user init.ns") #
+                    ()
+                },
+            )
+
+            k.register_command(
+                "quick-note",
+                ext_id,
+                "Prompt for a note title via delimited continuation and open a *note* buffer.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let title = if not args.is_empty() {
+                        args.get(0).as(String)
+                    } else {
+                        let ans? = ask_prompt(PromptRequest.text("Quick note title: ", ""))# else {
+                            status_emit("Cancelled quick-note")#
+                            return ()
+                        }
+                        ans
+                    }
+                    let c = kern.require_service("user.notes.counter")!.as(NotesCounter)
+                    c.created += 1
+                    let note_buf = w.create_buffer(
+                        "*note:" ++ title ++ "*",
+                        BufferKind.Scratch,
+                        major_mode = "org",
+                        initial_lines = [
+                            "* TODO " ++ title,
+                            "  Note #" ++ c.created.to_string() ++ " created inside Lava.",
+                            ""
+                        ],
+                    )
+                    note_buf.point = Pos.new(2, 0)
+                    let _ = w.switch_to_buffer(note_buf.id)
+                    kern.emit_hook("buffer-switched", note_buf.id)
+                    status_emit("Opened note: " ++ note_buf.name)#
+                    note_buf.name
+                },
+            )
+
+            let leader = k.ensure_keymap("vim-leader")
+            leader.bind(
+                "<Space> n n",
+                "quick-note",
+                ext_id,
+                description = "Create Org quick-note buffer",
+            )
+            leader.bind(
+                "<Space> n b",
+                "insert-lava-banner",
+                ext_id,
+                description = "Insert Lava banner comment",
+            )
+            ()
+        },
+        |_k: SystemKernel| -> !String Unit { () },
+    )!
+    kernel.activate_extension(ext_id)!
+    world.append_message("[init.ns] Activated user extension user.local/ext_notes")
+    ()
+}

@@ -1,0 +1,522 @@
+-- Deterministic End-to-End Integration Test Suite for Lava Batch 07 Plugins (19–21 of 30):
+--   19. `ext_lualine` (`lava.org/ext_lualine` — cached Git, diagnostics, macro, selection/MC, encoding, progress, active plugins)
+--   20. `ext_noice`   (`lava.org/ext_noice`   — `:Notify`, save/theme auto-toasts, TTL aging, `*Notifications*`, detail float, dismiss/last)
+--   21. `ext_zen`     (`lava.org/ext_zen`     — `:ZenMode [width]` chrome snapshot/restore & centered viewport, `:Twilight`, `:ZenNarrow`)
+
+use std.fs
+use std.io
+use std.path
+use std.process
+use std.time
+use @lava_sys.{DrawCmd, RawUiEvent, mock_enable, mock_last_frame_cmds, rgb}
+use @lava_core.{SystemKernel, clipboard_get, clipboard_set, log_event, status_emit}
+use @lava_accel.accel_git_status
+use @ext_document.{
+    Buffer, EditorWorld, FloatingWindow, GutterSign, Pos, SidebarPanel, ToastNotification,
+    require_editor_world
+}
+use @ext_window.{WindowManager, require_window_manager}
+use @ext_render.compose_frame
+use @ext_app.{AppHostCap, app_commit_frame, app_feed_keys, app_step_event, boot_kernel}
+use @ext_lualine.{
+    LualineService, ext_lualine_id, register_lualine_extension, require_lualine_service,
+    sync_lualine_segments
+}
+use @ext_noice.{
+    FLOAT_ID_NOICE_DETAIL, NOTIFICATIONS_BUF_NAME, NoiceService, ext_noice_id,
+    register_noice_extension, require_noice_service
+}
+use @ext_zen.{ZenService, ext_zen_id, register_zen_extension, require_zen_service}
+
+fn check_true(cond: bool, label: String) {
+    if not cond {
+        panic("FAILED: " ++ label)
+    }
+}
+
+fn check_eq_str(actual: String, expected: String, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual='" ++ actual ++ "' expected='" ++ expected ++ "'")
+    }
+}
+
+fn check_eq_i64(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual=" ++ actual.to_string() ++ " expected=" ++ expected.to_string())
+    }
+}
+
+fn run_git_checked(cwd: String, args: List) -> String {
+    let out_res = process.exec("git", args = args, cwd = cwd)
+    out_res match {
+        out! => {
+            if out.status != 0 {
+                panic(
+                    "git " ++ args.join(" ") ++ " failed (code "
+                    ++ out.status.to_string() ++ "): " ++ out.stderr,
+                )
+            }
+            out.stdout
+        },
+        error err => panic("git exec error: " ++ err.to_string()),
+    }
+}
+
+fn frame_has_text_substr(cmds: List, needle: String) -> bool {
+    for i in 0..cmds.len() {
+        let cmd = cmds.get(i.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.TextRun(_, _, txt, _, _, _, _, _, _) => {
+                if txt.contains(needle) {
+                    return true
+                }
+            },
+            _ => (),
+        }
+    }
+    false
+}
+
+fn find_text_color_for_substr(cmds: List, needle: String) -> i64 {
+    for i in 0..cmds.len() {
+        let cmd = cmds.get(i.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.TextRun(_, _, txt, _, _, color, _, _, _) => {
+                if txt.contains(needle) {
+                    return color
+                }
+            },
+            _ => (),
+        }
+    }
+    -1
+}
+
+fn buffer_contains_line_substr(buf: Buffer, needle: String) -> bool {
+    for i in 0..buf.line_count() {
+        if buf.line_at(i).contains(needle) {
+            return true
+        }
+    }
+    false
+}
+
+fn boot_batch07_kernel() -> SystemKernel {
+    let kernel: SystemKernel = (boot_kernel() ! { e => panic(e) }).as(SystemKernel)
+    let _ = register_lualine_extension(kernel) ! { e => panic(e) }
+    let _ = register_noice_extension(kernel) ! { e => panic(e) }
+    let _ = register_zen_extension(kernel) ! { e => panic(e) }
+    let _ = kernel.activate_all() ! { e => panic(e) }
+    kernel
+}
+
+fn run_batch07_suite() {
+    mock_enable(true)
+
+    -- 1. Create a deterministic temporary Git repository with initial commit + staged + modified + untracked files.
+    let tmp_dir = "/tmp/lava_batch07_" ++ time.unix_millis().to_string()
+    let _ = fs.create_dir_all(tmp_dir) ! { e => panic(e.to_string()) }
+
+    let _ = run_git_checked(tmp_dir, ["init"])
+    let _ = run_git_checked(tmp_dir, ["config", "user.email", "batch07@lava.org"])
+    let _ = run_git_checked(tmp_dir, ["config", "user.name", "Batch07"])
+
+    let main_file = path.join(tmp_dir, "focus.ns")
+    let sample_lines = List()
+    sample_lines.push("fn first_block() -> i64 {{")
+    sample_lines.push("    let x = 10")
+    sample_lines.push("    let y = 20")
+    sample_lines.push("    x + y")
+    sample_lines.push("}}")
+    sample_lines.push("")
+    sample_lines.push("fn middle_focus() -> i64 {{")
+    sample_lines.push("    let focus_a = 100")
+    sample_lines.push("    let focus_b = 200")
+    sample_lines.push("    focus_a + focus_b")
+    sample_lines.push("}}")
+    sample_lines.push("")
+    for extra_i in 0..16 {
+        sample_lines.push("let distant_code_" ++ extra_i.to_string() ++ " = " ++ extra_i.to_string())
+    }
+    let initial_content = sample_lines.join("\n") ++ "\n"
+    let _ = fs.write_string(main_file, initial_content) ! { e => panic(e.to_string()) }
+    let _ = run_git_checked(tmp_dir, ["add", "focus.ns"])
+    let _ = run_git_checked(tmp_dir, ["commit", "-m", "feat: initial focus module"])
+
+    -- Stage a new file (+1 staged), modify `focus.ns` (~1 modified), and add an untracked file (?1 untracked).
+    let staged_file = path.join(tmp_dir, "staged.ns")
+    let _ = fs.write_string(staged_file, "pub const STAGED_VAL: i64 = 1\n") ! { e => panic(e.to_string()) }
+    let _ = run_git_checked(tmp_dir, ["add", "staged.ns"])
+
+    let modified_content = initial_content.replace("let x = 10", "let x = 15")
+    let _ = fs.write_string(main_file, modified_content) ! { e => panic(e.to_string()) }
+
+    let untracked_file = path.join(tmp_dir, "notes.tmp")
+    let _ = fs.write_string(untracked_file, "scratch\n") ! { e => panic(e.to_string()) }
+
+    let git_summary = accel_git_status(tmp_dir)
+    check_true(git_summary.is_repo, "tmp_dir is a valid git repo")
+    check_true(git_summary.branch != "", "git branch detected")
+    check_eq_i64(git_summary.staged_count, 1, "git staged_count == 1")
+    check_eq_i64(git_summary.modified_count, 1, "git modified_count == 1")
+    check_eq_i64(git_summary.untracked_count, 1, "git untracked_count == 1")
+
+    -- 2. Boot kernel with all 8 core extensions + 3 Batch 07 extensions (11 active total).
+    let kernel = boot_batch07_kernel()
+    check_eq_i64(kernel.list_extensions().len(), 11, "11 registered extensions (8 core + 3 batch07)")
+    check_true(kernel.is_extension_active(ext_lualine_id()), "ext_lualine is active")
+    check_true(kernel.is_extension_active(ext_noice_id()), "ext_noice is active")
+    check_true(kernel.is_extension_active(ext_zen_id()), "ext_zen is active")
+
+    let world: EditorWorld = (require_editor_world(kernel) ! { e => panic(e) }).as(EditorWorld)
+    let wm: WindowManager = (require_window_manager(kernel) ! { e => panic(e) }).as(WindowManager)
+    let lualine_svc: LualineService = (require_lualine_service(kernel) ! { e => panic(e) }).as(LualineService)
+    let noice_svc: NoiceService = (require_noice_service(kernel) ! { e => panic(e) }).as(NoiceService)
+    let _zen_svc: ZenService = (require_zen_service(kernel) ! { e => panic(e) }).as(ZenService)
+
+    world.cwd = tmp_dir
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
+    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+
+    -- ========================================================================
+    -- PART 1: `ext_lualine` (`lava.org/ext_lualine`)
+    -- ========================================================================
+    app_feed_keys(kernel, ":e<Space>" ++ main_file ++ "<Return>")# ! { e => panic(e) }
+    let buf = world.active_buffer()
+    check_eq_str(buf.name, "focus.ns", "opened focus.ns")
+    check_eq_str(buf.major_mode, "nessa", "detected nessa filetype")
+
+    -- Verify Git segment (`git:<branch> +1 ~1 ?1`) in `statusline_left_extra`
+    let expected_git_seg = "git:" ++ git_summary.branch ++ " +1 ~1 ?1"
+    check_true(
+        world.statusline_left_extra.contains(expected_git_seg),
+        "left statusline has git segment: '" ++ world.statusline_left_extra ++ "'",
+    )
+
+    -- Verify O(1) cursor-move behavior: moving cursor does NOT spawn git / increment `git_refresh_count`!
+    let refreshes_before_move = lualine_svc.git_refresh_count
+    app_feed_keys(kernel, "jjkk")# ! { e => panic(e) }
+    check_eq_i64(
+        lualine_svc.git_refresh_count,
+        refreshes_before_move,
+        "cursor-moved uses O(1) cached git status without spawning git",
+    )
+
+    -- Add an `"E"` diagnostic GutterSign (and then a `"W"` sign) and verify `E:1` / `E:1 W:1`!
+    buf.signs.push(GutterSign {
+        row: 1,
+        text: "E",
+        fg_rgba: rgb(243, 139, 168),
+        priority: 50,
+        owner: "test_diag",
+    })
+    sync_lualine_segments(kernel, false)
+    check_true(
+        world.statusline_left_extra.contains("E:1"),
+        "left statusline shows E:1 diagnostic badge: '" ++ world.statusline_left_extra ++ "'",
+    )
+    buf.signs.push(GutterSign {
+        row: 2,
+        text: "W",
+        fg_rgba: rgb(249, 226, 175),
+        priority: 40,
+        owner: "test_diag",
+    })
+    sync_lualine_segments(kernel, false)
+    check_true(
+        world.statusline_left_extra.contains("E:1 W:1"),
+        "left statusline shows E:1 W:1 diagnostic badge: '" ++ world.statusline_left_extra ++ "'",
+    )
+
+    -- Start macro recording (`qa` + `j`) and verify `REC @a` badge appears, then `q` removes it!
+    app_feed_keys(kernel, "qaj")# ! { e => panic(e) }
+    check_true(
+        world.statusline_left_extra.contains("REC @a"),
+        "left statusline shows REC @a during macro recording: '" ++ world.statusline_left_extra ++ "'",
+    )
+    app_feed_keys(kernel, "qk")# ! { e => panic(e) }
+    check_true(
+        not world.statusline_left_extra.contains("REC @a"),
+        "REC @a cleared after stopping macro recording",
+    )
+
+    -- Verify `statusline_right_extra`: `UTF-8 | LF`, filetype `nessa`, progress `top`/`bot`, and active plugin count `⚡11`!
+    app_feed_keys(kernel, "gg0")# ! { e => panic(e) }
+    check_true(world.statusline_right_extra.contains("UTF-8 | LF"), "right statusline shows UTF-8 | LF")
+    check_true(world.statusline_right_extra.contains("nessa"), "right statusline shows filetype nessa")
+    check_true(world.statusline_right_extra.contains("top"), "right statusline shows top at first line")
+    check_true(world.statusline_right_extra.contains("⚡11"), "right statusline shows ⚡11 active extensions")
+
+    app_feed_keys(kernel, "G")# ! { e => panic(e) }
+    check_true(world.statusline_right_extra.contains("bot"), "right statusline shows bot at last line")
+
+    -- Verify Visual selection badge (`SEL:4C` in charwise Visual, `SEL:3L` in linewise Visual) & Multi-Cursor (`MC:3`)!
+    app_feed_keys(kernel, "gg0vlll")# ! { e => panic(e) }
+    check_true(
+        world.statusline_right_extra.contains("SEL:4C"),
+        "charwise visual shows SEL:4C: '" ++ world.statusline_right_extra ++ "'",
+    )
+    app_feed_keys(kernel, "<Escape>ggVjj")# ! { e => panic(e) }
+    check_true(
+        world.statusline_right_extra.contains("SEL:3L"),
+        "linewise visual shows SEL:3L: '" ++ world.statusline_right_extra ++ "'",
+    )
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    world.secondary_cursors.push(Pos.new(1, 4))
+    world.secondary_cursors.push(Pos.new(2, 4))
+    sync_lualine_segments(kernel, false)
+    check_true(
+        world.statusline_right_extra.contains("MC:3"),
+        "multi-cursor badge shows MC:3: '" ++ world.statusline_right_extra ++ "'",
+    )
+
+    -- Verify `compose_frame` renders both `statusline_left_extra` and `statusline_right_extra` in DrawCmds!
+    let (_spec1, cmds1) = compose_frame(kernel, world, wm)
+    check_true(frame_has_text_substr(cmds1, expected_git_seg), "compose_frame renders git segment")
+    check_true(frame_has_text_substr(cmds1, "E:1 W:1"), "compose_frame renders E:1 W:1 segment")
+    check_true(frame_has_text_substr(cmds1, "MC:3"), "compose_frame renders MC:3 segment")
+    check_true(frame_has_text_substr(cmds1, "UTF-8 | LF"), "compose_frame renders UTF-8 | LF")
+    check_true(frame_has_text_substr(cmds1, "⚡11"), "compose_frame renders ⚡11")
+    world.secondary_cursors = List()
+
+    -- Verify `:LualineToggle` and `<Space> u l` clear & restore segments!
+    app_feed_keys(kernel, ":LualineToggle<Return>")# ! { e => panic(e) }
+    check_true(not lualine_svc.enabled, ":LualineToggle disabled lualine")
+    check_eq_str(world.statusline_left_extra, "", "left extra cleared when lualine disabled")
+    check_eq_str(world.statusline_right_extra, "", "right extra cleared when lualine disabled")
+
+    app_feed_keys(kernel, "<Space>ul")# ! { e => panic(e) }
+    check_true(lualine_svc.enabled, "<Space> u l re-enabled lualine")
+    check_true(world.statusline_left_extra.contains(expected_git_seg), "left extra restored after <Space> u l")
+    check_true(world.statusline_right_extra.contains("UTF-8 | LF"), "right extra restored after <Space> u l")
+
+    -- Verify `:LualineRefresh` forces a fresh git status query
+    let refreshes_before_cmd = lualine_svc.git_refresh_count
+    app_feed_keys(kernel, ":LualineRefresh<Return>")# ! { e => panic(e) }
+    check_true(lualine_svc.git_refresh_count > refreshes_before_cmd, ":LualineRefresh refreshed git cache")
+
+    -- ========================================================================
+    -- PART 2: `ext_noice` (`lava.org/ext_noice`)
+    -- ========================================================================
+    world.notifications = List()
+    world.notification_history = List()
+
+    -- 2a. `:Notify warn Disk space low` pushes toast onto `world.notifications` & `world.notification_history`
+    app_feed_keys(kernel, ":Notify<Space>warn<Space>Disk<Space>space<Space>low<Return>")# ! { e => panic(e) }
+    check_eq_i64(world.notifications.len(), 1, ":Notify pushed 1 active toast")
+    check_eq_i64(world.notification_history.len(), 1, ":Notify recorded 1 history entry")
+    let warn_toast = world.notifications.get(0).as(ToastNotification)
+    check_eq_str(warn_toast.level, "warn", "toast level == warn")
+    check_eq_str(warn_toast.message, "Disk space low", "toast message == Disk space low")
+
+    let (_spec_toast, cmds_toast) = compose_frame(kernel, world, wm)
+    check_true(frame_has_text_substr(cmds_toast, "Disk space low"), "compose_frame renders Noice toast card")
+
+    -- 2b. Saving buffer triggers `"Saved"` auto-toast (`focus.ns (<N>L)`) & updates lualine git modified count!
+    app_feed_keys(kernel, ":w<Return>")# ! { e => panic(e) }
+    check_eq_i64(world.notifications.len(), 2, "saving buffer pushed Saved auto-toast")
+    check_eq_i64(world.notification_history.len(), 2, "history has 2 entries after save")
+    let saved_toast = world.notifications.get(1).as(ToastNotification)
+    check_eq_str(saved_toast.level, "info", "Saved toast level == info")
+    check_eq_str(saved_toast.title, "Saved", "Saved toast title == Saved")
+    check_true(
+        saved_toast.message.contains("focus.ns (") and saved_toast.message.ends_with("L)"),
+        "Saved toast message format: '" ++ saved_toast.message ++ "'",
+    )
+
+    -- 2c. `:theme gruvbox-dark` triggers `"theme-changed"` lifecycle hook & `"Colorscheme"` auto-toast
+    app_feed_keys(kernel, ":theme<Space>gruvbox-dark<Return>")# ! { e => panic(e) }
+    check_eq_i64(world.notifications.len(), 3, "theme-changed pushed Colorscheme toast")
+    let theme_toast = world.notifications.get(2).as(ToastNotification)
+    check_eq_str(theme_toast.title, "Colorscheme", "Colorscheme toast title")
+    check_eq_str(theme_toast.message, "Switched to gruvbox-dark", "Colorscheme toast message")
+
+    -- 2d. `RawUiEvent.Tick` ages out `ttl_ticks` until active toasts expire while history persists!
+    let ttl_initial = world.notifications.get(0).as(ToastNotification).ttl_ticks
+    let _ = app_step_event(kernel, RawUiEvent.Tick(1, 100))# ! { e => panic(e) }
+    let ttl_after_one = world.notifications.get(0).as(ToastNotification).ttl_ticks
+    check_eq_i64(ttl_after_one, ttl_initial - 1, "Tick decremented ttl_ticks by 1")
+    for tick_i in 0..10 {
+        let _ = app_step_event(kernel, RawUiEvent.Tick(1, 200 + tick_i * 100))# ! { e => panic(e) }
+    }
+    check_eq_i64(world.notifications.len(), 0, "all toasts aged out after TTL ticks")
+    check_eq_i64(world.notification_history.len(), 3, "notification_history preserved after TTL expiry")
+
+    -- 2e. `<Space> n l` (`:NoiceLast`) re-displays most recent notification, and `<Space> n d` (`:NoiceDismiss`) clears active toasts!
+    app_feed_keys(kernel, "<Space>nl")# ! { e => panic(e) }
+    check_eq_i64(world.notifications.len(), 1, "<Space> n l re-displayed last notification")
+    check_eq_str(
+        world.notifications.get(0).as(ToastNotification).message,
+        "Switched to gruvbox-dark",
+        "<Space> n l re-displayed latest history entry",
+    )
+
+    app_feed_keys(kernel, "<Space>nd")# ! { e => panic(e) }
+    check_eq_i64(world.notifications.len(), 0, "<Space> n d dismissed active toasts")
+    check_eq_i64(world.notification_history.len(), 3, "<Space> n d preserved notification_history")
+
+    -- 2f. `<Space> s n` (`:Notifications`) opens `*Notifications*`, `<Return>` opens `"noice-detail"` float, `c` clears history, `q` closes!
+    app_feed_keys(kernel, "<Space>sn")# ! { e => panic(e) }
+    let nbuf = world.active_buffer()
+    check_eq_str(nbuf.name, NOTIFICATIONS_BUF_NAME, "<Space> s n opened *Notifications*")
+    check_eq_str(nbuf.major_mode, "notifications", "*Notifications* major_mode == notifications")
+    check_true(buffer_contains_line_substr(nbuf, "[WARN] Warning — Disk space low"), "history shows warn entry")
+    check_true(buffer_contains_line_substr(nbuf, "[INFO] Saved — focus.ns"), "history shows Saved entry")
+    check_true(buffer_contains_line_substr(nbuf, "[INFO] Colorscheme — Switched to gruvbox-dark"), "history shows Colorscheme entry")
+
+    -- Move to row 0 (`Disk space low`) and press `<Return>` to open centered `"noice-detail"` float
+    app_feed_keys(kernel, "gg<Return>")# ! { e => panic(e) }
+    let detail_opt = world.get_floating_window(FLOAT_ID_NOICE_DETAIL)
+    check_true(detail_opt != null, "<Return> opened noice-detail floating window")
+    let detail_win = detail_opt.as(FloatingWindow)
+    check_eq_str(detail_win.anchor, "center", "noice-detail float is centered")
+    check_true(detail_win.lines.join("\n").contains("Disk space low"), "noice-detail displays full message")
+
+    let gen_detail = app_commit_frame(kernel) ! { e => panic(e) }
+    check_true(gen_detail >= 1 and frame_has_text_substr(mock_last_frame_cmds(), "Disk space low"), "rendered noice-detail float")
+
+    -- Press `c` to clear notification history & refresh `*Notifications*`
+    app_feed_keys(kernel, "c")# ! { e => panic(e) }
+    check_eq_i64(world.notification_history.len(), 0, "c cleared notification_history")
+    check_true(world.get_floating_window(FLOAT_ID_NOICE_DETAIL) == null, "c dismissed detail float")
+    check_true(buffer_contains_line_substr(nbuf, "(No notifications recorded)"), "*Notifications* refreshed to empty state")
+
+    -- Press `q` to close `*Notifications*` and return to `focus.ns`!
+    app_feed_keys(kernel, "q")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, "focus.ns", "q closed *Notifications* and returned to focus.ns")
+    check_true(noice_svc.enabled, "NoiceService remains enabled")
+
+    -- ========================================================================
+    -- PART 3: `ext_zen` (`lava.org/ext_zen`)
+    -- ========================================================================
+    world.options.theme_name = "catppuccin-mocha"
+    world.left_sidebar = SidebarPanel {
+        visible: true,
+        side: "left",
+        title: "EXPLORER",
+        width_cols: 30,
+        lines: ["focus.ns", "staged.ns"],
+        selected_row: 0,
+        owner: "test_sidebar",
+    }
+    world.right_sidebar = SidebarPanel {
+        visible: true,
+        side: "right",
+        title: "OUTLINE",
+        width_cols: 24,
+        lines: ["first_block", "middle_focus"],
+        selected_row: 0,
+        owner: "test_sidebar",
+    }
+    world.options.number = true
+    world.options.relativenumber = true
+    world.options.signcolumn = true
+    world.options.indent_guides = true
+    sync_lualine_segments(kernel, false)
+    let saved_left_extra = world.statusline_left_extra
+    let saved_right_extra = world.statusline_right_extra
+    check_true(saved_left_extra != "" and saved_right_extra != "", "pre-Zen statusline extras populated")
+    wm.sync_from_world(world)
+
+    -- 3a. Invoke `:ZenMode 84` -> centers viewport at 84 cols, hides sidebars & gutter clutter!
+    app_feed_keys(kernel, ":ZenMode<Space>84<Return>")# ! { e => panic(e) }
+    check_true(world.options.zen_mode, ":ZenMode 84 enabled zen_mode")
+    check_eq_i64(world.options.zen_width, 84, ":ZenMode 84 set zen_width == 84")
+    check_true(not world.left_sidebar.visible, "Zen Mode hid left_sidebar")
+    check_true(not world.right_sidebar.visible, "Zen Mode hid right_sidebar")
+    check_true(not world.options.number, "Zen Mode disabled number")
+    check_true(not world.options.relativenumber, "Zen Mode disabled relativenumber")
+    check_true(not world.options.signcolumn, "Zen Mode disabled signcolumn")
+    check_true(not world.options.indent_guides, "Zen Mode disabled indent_guides")
+
+    let zen_rect = wm.workspace_rect_for_world(world)
+    let expected_zen_w = (84.0 * wm.metrics.cell_width).floor()
+    let expected_zen_x = ((1280.0 - expected_zen_w) * 0.5).floor()
+    check_true(zen_rect.w == expected_zen_w, "workspace_rect_for_world width matches 84 cols")
+    check_true(zen_rect.x == expected_zen_x and zen_rect.x > 200.0, "workspace_rect_for_world horizontally centered")
+
+    let (_spec_zen, cmds_zen) = compose_frame(kernel, world, wm)
+    check_eq_str( wm.active_pane().rect.x.to_string(), expected_zen_x.to_string(), "compose_frame centered active pane x")
+    check_true(not frame_has_text_substr(cmds_zen, "EXPLORER"), "compose_frame hid left sidebar in Zen Mode")
+
+    -- 3b. Invoke `<Space> z` to exit Zen Mode -> restores sidebars, line numbers, signcolumn, indent_guides & statusline!
+    app_feed_keys(kernel, "<Space>z")# ! { e => panic(e) }
+    check_true(not world.options.zen_mode, "<Space> z exited Zen Mode")
+    check_true(world.left_sidebar.visible, "left_sidebar.visible restored after Zen exit")
+    check_true(world.right_sidebar.visible, "right_sidebar.visible restored after Zen exit")
+    check_true(world.options.number, "number restored after Zen exit")
+    check_true(world.options.relativenumber, "relativenumber restored after Zen exit")
+    check_true(world.options.signcolumn, "signcolumn restored after Zen exit")
+    check_true(world.options.indent_guides, "indent_guides restored after Zen exit")
+    check_true(world.statusline_left_extra.contains("git:"), "statusline_left_extra restored after Zen exit")
+
+    -- Also verify `<Space> z` enters Zen Mode (preserving width 84) and a second `<Space> z` exits cleanly!
+    app_feed_keys(kernel, "<Space>z")# ! { e => panic(e) }
+    check_true(world.options.zen_mode and (not world.left_sidebar.visible) and (not world.options.number), "<Space> z entered Zen Mode")
+    app_feed_keys(kernel, "<Space>z")# ! { e => panic(e) }
+    check_true((not world.options.zen_mode) and world.left_sidebar.visible and world.options.number, "second <Space> z restored chrome")
+
+    -- 3c. Test `:Twilight` & `<Space> u t` dimming lines far from cursor in `compose_frame`!
+    app_feed_keys(kernel, "gg0")# ! { e => panic(e) }
+    let (_spec_no_tw, cmds_no_tw) = compose_frame(kernel, world, wm)
+    let color_before_twilight = find_text_color_for_substr(cmds_no_tw, "distant_code_10")
+
+    app_feed_keys(kernel, "<Space>ut")# ! { e => panic(e) }
+    check_true(world.options.twilight_mode, "<Space> u t enabled twilight_mode")
+    let (_spec_tw, cmds_tw) = compose_frame(kernel, world, wm)
+    let color_during_twilight = find_text_color_for_substr(cmds_tw, "distant_code_10")
+    check_true(
+        color_before_twilight != -1 and color_during_twilight != -1 and color_before_twilight != color_during_twilight,
+        "distant_code_10 color dimmed during twilight",
+    )
+
+    app_feed_keys(kernel, ":Twilight<Return>")# ! { e => panic(e) }
+    check_true(not world.options.twilight_mode, ":Twilight toggled twilight_mode off")
+
+    -- 3d. Test `:ZenNarrow` (`<Space> z n`) on `middle_focus()` block AND on a Visual selection!
+    -- Move cursor inside `fn middle_focus()` (line 8, 0-based row 7 -> `8G`) and press `<Space> z n`
+    app_feed_keys(kernel, "8G<Space>zn")# ! { e => panic(e) }
+    check_true(world.options.zen_mode, "<Space> z n enabled zen_mode")
+    check_true(buf.is_narrowed(), "<Space> z n narrowed buffer around middle_focus")
+    check_eq_i64(buf.min_row(), 6, "narrowed start_row == 6 (fn middle_focus)")
+    check_eq_i64(buf.max_row(), 10, "narrowed end_row == 10 (closing brace of middle_focus)")
+    check_true((not world.left_sidebar.visible) and (not world.options.number), "<Space> z n hid chrome")
+
+    -- Toggle `<Space> z n` off -> restores widening (`buf.narrow == null`) AND chrome!
+    app_feed_keys(kernel, "<Space>zn")# ! { e => panic(e) }
+    check_true(not world.options.zen_mode, "<Space> z n toggled zen_mode off")
+    check_true(not buf.is_narrowed(), "<Space> z n widened buffer back to full range")
+    check_true(world.left_sidebar.visible and world.options.number, "<Space> z n restored sidebar & number")
+
+    -- Visual selection narrowing via `ggVjj<Space>zn` (rows 0..2) and `:ZenNarrow` toggle off!
+    app_feed_keys(kernel, "ggVjj<Space>zn")# ! { e => panic(e) }
+    check_true(world.options.zen_mode and buf.is_narrowed(), "Visual <Space> z n entered narrowed Zen Mode")
+    check_eq_i64(buf.min_row(), 0, "Visual ZenNarrow min_row == 0")
+    check_eq_i64(buf.max_row(), 2, "Visual ZenNarrow max_row == 2")
+
+    -- Deactivation safety check: deactivating `ext_zen` while active in ZenNarrow cleanly restores buffer & chrome!
+    let _ = kernel.deactivate_extension(ext_zen_id()) ! { e => panic(e) }
+    check_true(not world.options.zen_mode, "deactivating ext_zen cleared zen_mode")
+    check_true(not buf.is_narrowed(), "deactivating ext_zen widened narrowed buffer")
+    check_true(world.left_sidebar.visible and world.options.number, "deactivating ext_zen restored snapshotted chrome")
+
+    -- Deactivate & re-activate `ext_lualine` and `ext_noice` to verify clean lifecycle teardown
+    let _ = kernel.deactivate_extension(ext_lualine_id()) ! { e => panic(e) }
+    check_eq_str(world.statusline_left_extra, "", "deactivating ext_lualine cleared statusline_left_extra")
+    check_eq_str(world.statusline_right_extra, "", "deactivating ext_lualine cleared statusline_right_extra")
+    let _ = kernel.deactivate_extension(ext_noice_id()) ! { e => panic(e) }
+
+    let _ = kernel.activate_extension(ext_lualine_id()) ! { e => panic(e) }
+    let _ = kernel.activate_extension(ext_noice_id()) ! { e => panic(e) }
+    let _ = kernel.activate_extension(ext_zen_id()) ! { e => panic(e) }
+    check_true(world.statusline_left_extra.contains("git:"), "re-activating ext_lualine restored statusline")
+
+    -- Clean up temporary git repository
+    let _ = process.exec("rm", args = ["-rf", tmp_dir])
+    io.println("[PASS] Batch 07 plugins (ext_lualine, ext_noice, ext_zen) passed all E2E assertions.")
+}
+
+fn main() {
+    run_batch07_suite()
+}

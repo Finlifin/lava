@@ -1,0 +1,944 @@
+-- ext_neotree: Docked File Explorer Tree & Filesystem Navigator (`lava.org/ext_neotree`).
+-- Renders interactive expandable directory trees with Git porcelain badges in `world.left_sidebar`,
+-- handles mouse clicks via `"sidebar-clicked"`, and supports full modal keyboard operations
+-- (`j`/`k`, `h`/`l`/`<Return>`, `a` create, `r` rename, `d` delete, `H` dotfiles, `R` refresh, `q`/`<Escape>`).
+
+use std.collections.{HashMap, Set}
+use std.fs
+use std.fs.DirEntry
+use std.path
+use @lava_core.{
+    ExtId, InteractiveEffects, KeyStroke, LogCollectorCap, PromptKind, PromptRequest,
+    ServiceEffects, StatusCollectorCap, SystemKernel, ask_prompt, clipboard_get, clipboard_set,
+    log_event, status_emit
+}
+use @lava_accel.{GitFileEntry, GitStatusSummary, accel_git_status}
+use @ext_document.{
+    Buffer, EditorWorld, SidebarPanel, ext_document_id, require_editor_world
+}
+use @ext_vim.{
+    KEYMAP_VIM_LEADER, ModalInterceptor, VimMode, VimState, ext_vim_id, require_vim_state,
+    sync_world_from_vim
+}
+use @ext_render.ext_render_id
+
+pub const SERVICE_NEOTREE: String = "lava.neotree.state"
+pub const NEOTREE_OWNER: String = "ext_neotree"
+
+pub fn ext_neotree_id() -> ExtId = ExtId("lava.org/ext_neotree")
+
+pub struct NeotreeNode {
+    pub name: String,
+    pub full_path: String,
+    pub parent_path: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub depth: i64,
+    pub expanded: bool,
+    pub git_badge: String,
+}
+
+pub struct NeotreeState {
+    pub root_dir: String,
+    pub expanded_dirs: Set,
+    pub show_hidden: bool,
+    pub focused: bool,
+    pub nodes: List,
+}
+
+impl NeotreeState {
+    pub fn new(cwd: String) -> NeotreeState {
+        let norm = path.normalize(cwd)
+        let exp = Set.new()
+        exp.insert(norm)
+        NeotreeState {
+            root_dir: norm,
+            expanded_dirs: exp,
+            show_hidden: false,
+            focused: false,
+            nodes: List(),
+        }
+    }
+
+    pub fn selected_node(self, selected_row: i64) -> ?NeotreeNode {
+        if self.nodes.is_empty() {
+            return null
+        }
+        let idx = if selected_row < 0 {
+            0
+        } else if selected_row >= self.nodes.len() {
+            self.nodes.len() - 1
+        } else {
+            selected_row
+        }
+        self.nodes.get(idx.as(usize)).as(NeotreeNode)
+    }
+}
+
+pub fn require_neotree_state(kernel: SystemKernel) -> !String NeotreeState {
+    let raw = kernel.require_service(SERVICE_NEOTREE)!
+    raw.as(NeotreeState)
+}
+
+fn file_icon_prefix(name: String, is_symlink: bool) -> String {
+    if is_symlink {
+        return "→"
+    }
+    let low = name.to_lower()
+    when {
+        low.ends_with(".ns") => "λ",
+        low.ends_with(".rs") => "⚙",
+        low.ends_with(".toml") or low.ends_with(".json") or low.ends_with(".yaml") or low.ends_with(".yml") => "≡",
+        low.ends_with(".md") or low.ends_with(".org") or low.ends_with(".txt") => "¶",
+        low.starts_with(".") => "·",
+        else => "•",
+    }
+}
+
+fn git_entry_badge(entry: GitFileEntry) -> String {
+    let x = entry.index_status
+    let y = entry.worktree_status
+    if x == "?" or y == "?" {
+        return "[?]"
+    }
+    if x == "A" {
+        return "[A]"
+    }
+    if x == "D" or y == "D" {
+        return "[D]"
+    }
+    if x == "R" {
+        return "[R]"
+    }
+    if x == "M" or y == "M" {
+        return "[M]"
+    }
+    if x != " " or y != " " {
+        return "[M]"
+    }
+    ""
+}
+
+fn collect_git_badges(root_dir: String) -> (HashMap, HashMap) {
+    let file_map = HashMap.new()
+    let dir_map = HashMap.new()
+    let gs: GitStatusSummary = accel_git_status(root_dir)
+    if not gs.is_repo {
+        return (file_map, dir_map)
+    }
+    for i in 0..gs.entries.len() {
+        let ge = gs.entries.get(i.as(usize)).as(GitFileEntry)
+        let badge = git_entry_badge(ge)
+        if badge == "" {
+            continue
+        }
+        let full = path.normalize(path.join(gs.root, ge.rel_path))
+        file_map.insert(full, badge)
+
+        -- Propagate status up to ancestor directories for collapsed folder visibility
+        var cur_parent = path.parent(full)
+        while cur_parent != null {
+            let p_str = cur_parent.as(String)
+            if not dir_map.contains_key(p_str) {
+                dir_map.insert(p_str, badge)
+            } else if badge == "[M]" {
+                dir_map.insert(p_str, "[M]")
+            }
+            if p_str == root_dir or p_str == gs.root {
+                break
+            }
+            let next_p = path.parent(p_str)
+            if next_p != null and next_p.as(String) == p_str {
+                break
+            }
+            cur_parent = next_p
+        }
+    }
+    (file_map, dir_map)
+}
+
+fn walk_tree_nodes(
+    dir_path: String,
+    depth: i64,
+    state: NeotreeState,
+    file_badges: HashMap,
+    dir_badges: HashMap,
+    out_nodes: List,
+) {
+    if depth > 24 {
+        return
+    }
+    let entries! = fs.read_dir_entries(dir_path) else {
+        return
+    }
+
+    let dirs = List()
+    let files = List()
+    for i in 0..entries.len() {
+        let e = entries.get(i.as(usize)).as(DirEntry)
+        if e.name == "" or e.name == "." or e.name == ".." {
+            continue
+        }
+        if (not state.show_hidden) and e.name.starts_with(".") {
+            continue
+        }
+        if e.is_dir {
+            dirs.push(e)
+        } else {
+            files.push(e)
+        }
+    }
+
+    dirs.sort_by(|a: Any, b: Any| {
+        let na = a.as(DirEntry).name
+        let nb = b.as(DirEntry).name
+        let la = na.to_lower()
+        let lb = nb.to_lower()
+        if la != lb { la.cmp(lb) } else { na.cmp(nb) }
+    })
+    files.sort_by(|a: Any, b: Any| {
+        let na = a.as(DirEntry).name
+        let nb = b.as(DirEntry).name
+        let la = na.to_lower()
+        let lb = nb.to_lower()
+        if la != lb { la.cmp(lb) } else { na.cmp(nb) }
+    })
+
+    for i in 0..dirs.len() {
+        let d = dirs.get(i.as(usize)).as(DirEntry)
+        let norm_full = path.normalize(d.path)
+        let is_exp = state.expanded_dirs.contains(norm_full)
+        let db_opt = dir_badges.get(norm_full)
+        let badge = if db_opt != null { db_opt.as(String) } else { "" }
+        out_nodes.push(NeotreeNode {
+            name: d.name,
+            full_path: norm_full,
+            parent_path: dir_path,
+            is_dir: true,
+            is_symlink: d.is_symlink,
+            depth: depth,
+            expanded: is_exp,
+            git_badge: badge,
+        })
+        if is_exp {
+            walk_tree_nodes(norm_full, depth + 1, state, file_badges, dir_badges, out_nodes)
+        }
+    }
+
+    for i in 0..files.len() {
+        let f = files.get(i.as(usize)).as(DirEntry)
+        let norm_full = path.normalize(f.path)
+        let fb_opt = file_badges.get(norm_full)
+        let badge = if fb_opt != null { fb_opt.as(String) } else { "" }
+        out_nodes.push(NeotreeNode {
+            name: f.name,
+            full_path: norm_full,
+            parent_path: dir_path,
+            is_dir: false,
+            is_symlink: f.is_symlink,
+            depth: depth,
+            expanded: false,
+            git_badge: badge,
+        })
+    }
+}
+
+fn format_node_line(node: NeotreeNode) -> String {
+    let indent = if node.depth > 0 { "  ".repeat(node.depth) } else { "" }
+    let badge_suffix = if node.git_badge != "" { " " ++ node.git_badge } else { "" }
+    if node.is_dir {
+        let chevron = if node.expanded { "▾ " } else { "▸ " }
+        indent ++ chevron ++ node.name ++ "/" ++ badge_suffix
+    } else {
+        let icon = file_icon_prefix(node.name, node.is_symlink)
+        indent ++ "  " ++ icon ++ " " ++ node.name ++ badge_suffix
+    }
+}
+
+pub fn refresh_neotree(
+    world: EditorWorld,
+    state: NeotreeState,
+    .focus_path: String = "",
+) {
+    if state.root_dir == "" or (not fs.exists(state.root_dir)) {
+        state.root_dir = path.normalize(world.cwd)
+        state.expanded_dirs.insert(state.root_dir)
+    }
+
+    let (file_badges, dir_badges) = collect_git_badges(state.root_dir)
+    let nodes = List()
+    walk_tree_nodes(state.root_dir, 0, state, file_badges, dir_badges, nodes)
+    state.nodes = nodes
+
+    let lines = List()
+    var target_sel = world.left_sidebar.selected_row
+    let norm_focus = if focus_path != "" { path.normalize(focus_path) } else { "" }
+
+    for i in 0..nodes.len() {
+        let n = nodes.get(i.as(usize)).as(NeotreeNode)
+        lines.push(format_node_line(n))
+        if norm_focus != "" and n.full_path == norm_focus {
+            target_sel = i
+        }
+    }
+    if lines.is_empty() {
+        lines.push("  (empty workspace)")
+        target_sel = 0
+    } else {
+        if target_sel < 0 {
+            target_sel = 0
+        }
+        if target_sel >= lines.len() {
+            target_sel = lines.len() - 1
+        }
+    }
+
+    let prev_vis = if world.left_sidebar.owner == NEOTREE_OWNER {
+        world.left_sidebar.visible
+    } else {
+        true
+    }
+    let width = if world.left_sidebar.owner == NEOTREE_OWNER and world.left_sidebar.width_cols >= 16 {
+        world.left_sidebar.width_cols
+    } else {
+        30
+    }
+
+    world.left_sidebar = SidebarPanel {
+        visible: prev_vis,
+        side: "left",
+        title: "EXPLORER",
+        width_cols: width,
+        lines: lines,
+        selected_row: target_sel,
+        owner: NEOTREE_OWNER,
+    }
+}
+
+fn focus_neotree(kernel: SystemKernel, world: EditorWorld, vim: VimState, state: NeotreeState) {
+    state.focused = true
+    vim.mode = VimMode.Normal
+    vim.clear_transient()
+    vim.set_interceptor(NEOTREE_OWNER, neotree_intercept_key)
+    sync_world_from_vim(world, vim)
+}
+
+fn unfocus_neotree(world: EditorWorld, vim: VimState, state: NeotreeState) {
+    state.focused = false
+    if vim.modal_interceptor != null and vim.modal_interceptor.as(ModalInterceptor).owner == NEOTREE_OWNER {
+        vim.clear_interceptor()
+    }
+    sync_world_from_vim(world, vim)
+}
+
+fn open_or_toggle_node(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    vim: VimState,
+    state: NeotreeState,
+    row_idx: i64,
+) -> #[log_event, status_emit] !String Unit {
+    let node? = state.selected_node(row_idx) else {
+        return ()
+    }
+    world.left_sidebar.selected_row = row_idx
+    if node.is_dir {
+        if state.expanded_dirs.contains(node.full_path) {
+            let _ = state.expanded_dirs.remove(node.full_path)
+        } else {
+            state.expanded_dirs.insert(node.full_path)
+        }
+        refresh_neotree(world, state, focus_path = node.full_path)
+        world.left_sidebar.visible = true
+        return ()
+    }
+
+    unfocus_neotree(world, vim, state)
+    let opened = world.open_file(node.full_path)#!
+    kernel.emit_hook("buffer-switched", opened.id)
+    ()
+}
+
+fn collapse_current_or_parent(world: EditorWorld, state: NeotreeState) {
+    let node? = state.selected_node(world.left_sidebar.selected_row) else {
+        return
+    }
+    if node.is_dir and node.expanded {
+        let _ = state.expanded_dirs.remove(node.full_path)
+        refresh_neotree(world, state, focus_path = node.full_path)
+        world.left_sidebar.visible = true
+        return
+    }
+    if node.parent_path != "" and node.parent_path != state.root_dir {
+        let _ = state.expanded_dirs.remove(node.parent_path)
+        refresh_neotree(world, state, focus_path = node.parent_path)
+        world.left_sidebar.visible = true
+    }
+}
+
+fn expand_ancestors_to_root(state: NeotreeState, target_full: String) {
+    var cur = path.parent(target_full)
+    while cur != null {
+        let p = path.normalize(cur.as(String))
+        state.expanded_dirs.insert(p)
+        if p == state.root_dir {
+            break
+        }
+        let nxt = path.parent(p)
+        if nxt != null and nxt.as(String) == p {
+            break
+        }
+        cur = nxt
+    }
+}
+
+fn neotree_intercept_key(
+    kernel: SystemKernel,
+    stroke: KeyStroke,
+) -> #ServiceEffects !String bool {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let state = require_neotree_state(kernel)!
+
+    if (not state.focused) or (not world.left_sidebar.visible) or world.left_sidebar.owner != NEOTREE_OWNER {
+        unfocus_neotree(world, vim, state)
+        return false
+    }
+
+    if stroke.key == "Escape" or (stroke.ctrl and (stroke.key == "[" or stroke.key == "g")) {
+        unfocus_neotree(world, vim, state)
+        status_emit("Neo-tree unfocused")#
+        return true
+    }
+
+    if stroke.ctrl or stroke.alt or stroke.super_mod {
+        -- Allow `<C-w>` window focus navigation to unfocus Neo-tree and jump back to editor pane
+        if stroke.ctrl and stroke.key == "w" {
+            unfocus_neotree(world, vim, state)
+            status_emit("Focus returned to editor")#
+            return true
+        }
+        return true
+    }
+
+    let k = stroke.key
+    let total = state.nodes.len()
+
+    if k == "q" {
+        world.left_sidebar.visible = false
+        unfocus_neotree(world, vim, state)
+        status_emit("Neo-tree closed")#
+        return true
+    }
+
+    if k == "j" or k == "Down" {
+        if total > 0 {
+            let next_r = if world.left_sidebar.selected_row + 1 < total {
+                world.left_sidebar.selected_row + 1
+            } else {
+                total - 1
+            }
+            world.left_sidebar.selected_row = next_r
+        }
+        return true
+    }
+
+    if k == "k" or k == "Up" {
+        if total > 0 {
+            let prev_r = if world.left_sidebar.selected_row - 1 >= 0 {
+                world.left_sidebar.selected_row - 1
+            } else {
+                0
+            }
+            world.left_sidebar.selected_row = prev_r
+        }
+        return true
+    }
+
+    if k == "Return" or k == "l" or k == "Right" or k == "o" {
+        open_or_toggle_node(kernel, world, vim, state, world.left_sidebar.selected_row)#!
+        return true
+    }
+
+    if k == "h" or k == "Left" or k == "BackSpace" {
+        collapse_current_or_parent(world, state)
+        return true
+    }
+
+    if k == "H" or k == "." {
+        state.show_hidden = not state.show_hidden
+        let cur_opt = state.selected_node(world.left_sidebar.selected_row)
+        let keep_p = if cur_opt != null { cur_opt.as(NeotreeNode).full_path } else { "" }
+        refresh_neotree(world, state, focus_path = keep_p)
+        world.left_sidebar.visible = true
+        status_emit("Neo-tree hidden files: " ++ (if state.show_hidden { "shown" } else { "hidden" }))#
+        return true
+    }
+
+    if k == "R" {
+        let cur_opt = state.selected_node(world.left_sidebar.selected_row)
+        let keep_p = if cur_opt != null { cur_opt.as(NeotreeNode).full_path } else { "" }
+        refresh_neotree(world, state, focus_path = keep_p)
+        world.left_sidebar.visible = true
+        status_emit("Neo-tree refreshed")#
+        return true
+    }
+
+    if k == "a" {
+        let _ = kernel.dispatch_command("neotree-add", List())#!
+        return true
+    }
+
+    if k == "r" {
+        let _ = kernel.dispatch_command("neotree-rename", List())#!
+        return true
+    }
+
+    if k == "d" {
+        let _ = kernel.dispatch_command("neotree-delete", List())#!
+        return true
+    }
+
+    true
+}
+
+fn cmd_neotree_add(kern: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let state = require_neotree_state(kern)!
+
+    let sel_opt = state.selected_node(world.left_sidebar.selected_row)
+    let base_dir = if sel_opt != null {
+        let n = sel_opt.as(NeotreeNode)
+        if n.is_dir { n.full_path } else { n.parent_path }
+    } else {
+        state.root_dir
+    }
+
+    let raw_input = if (not args.is_empty()) and args.get(0).as(String).trim() != "" {
+        args.get(0).as(String).trim()
+    } else {
+        let base_label_opt = path.file_name(base_dir)
+        let base_label = if base_label_opt != null { base_label_opt.as(String) } else { base_dir }
+        let ans? = ask_prompt(PromptRequest.text(
+            "Neo-tree add in " ++ base_label ++ "/ (trailing / for dir): ",
+            "",
+        ))# else {
+            status_emit("Neo-tree add cancelled")#
+            return ()
+        }
+        ans.trim()
+    }
+
+    if raw_input == "" {
+        status_emit("Neo-tree: empty name")#
+        return ()
+    }
+
+    let make_dir = raw_input.ends_with("/")
+    let clean_rel = raw_input.trim_end_matches("/")
+    if clean_rel == "" {
+        return ()
+    }
+    let target_full = if path.is_absolute(clean_rel) {
+        path.normalize(clean_rel)
+    } else {
+        path.normalize(path.join(base_dir, clean_rel))
+    }
+
+    if make_dir {
+        let res = fs.create_dir_all(target_full)
+        res match {
+            _! => (),
+            error err => return error ("Neo-tree mkdir failed: " ++ err.to_string()),
+        }
+        expand_ancestors_to_root(state, target_full)
+        state.expanded_dirs.insert(target_full)
+        refresh_neotree(world, state, focus_path = target_full)
+        world.left_sidebar.visible = true
+        status_emit("Neo-tree created dir: " ++ clean_rel ++ "/")#
+        return target_full
+    }
+
+    let pdir_opt = path.parent(target_full)
+    if pdir_opt != null {
+        let pdir = pdir_opt.as(String)
+        if pdir != "" and (not fs.exists(pdir)) {
+            let mk_res = fs.create_dir_all(pdir)
+            mk_res match {
+                _! => (),
+                error err => return error ("Neo-tree mkdir parent failed: " ++ err.to_string()),
+            }
+        }
+    }
+    if not fs.exists(target_full) {
+        let w_res = fs.write_string(target_full, "")
+        w_res match {
+            _! => (),
+            error err => return error ("Neo-tree create file failed: " ++ err.to_string()),
+        }
+    }
+    expand_ancestors_to_root(state, target_full)
+    refresh_neotree(world, state, focus_path = target_full)
+    world.left_sidebar.visible = true
+    status_emit("Neo-tree created: " ++ clean_rel)#
+    target_full
+}
+
+fn cmd_neotree_rename(kern: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let state = require_neotree_state(kern)!
+
+    let node? = state.selected_node(world.left_sidebar.selected_row) else {
+        status_emit("Neo-tree: no entry selected")#
+        return ()
+    }
+
+    let new_raw = if (not args.is_empty()) and args.get(0).as(String).trim() != "" {
+        args.get(0).as(String).trim()
+    } else {
+        let ans? = ask_prompt(PromptRequest.text(
+            "Neo-tree rename " ++ node.name ++ " to: ",
+            "",
+        ))# else {
+            status_emit("Neo-tree rename cancelled")#
+            return ()
+        }
+        ans.trim()
+    }
+
+    let clean_dest = new_raw.trim_end_matches("/")
+    if clean_dest == "" or clean_dest == node.name {
+        status_emit("Neo-tree rename unchanged")#
+        return ()
+    }
+
+    let dest_full = if path.is_absolute(clean_dest) {
+        path.normalize(clean_dest)
+    } else {
+        path.normalize(path.join(node.parent_path, clean_dest))
+    }
+
+    let pdir_opt = path.parent(dest_full)
+    if pdir_opt != null {
+        let pdir = pdir_opt.as(String)
+        if pdir != "" and (not fs.exists(pdir)) {
+            let _ = fs.create_dir_all(pdir) ! { _ => () }
+        }
+    }
+
+    let ren_res = fs.rename(node.full_path, dest_full)
+    ren_res match {
+        _! => (),
+        error err => return error ("Neo-tree rename failed: " ++ err.to_string()),
+    }
+
+    if node.is_dir and state.expanded_dirs.contains(node.full_path) {
+        let _ = state.expanded_dirs.remove(node.full_path)
+        state.expanded_dirs.insert(dest_full)
+    }
+
+    let open_opt = world.find_buffer_by_path(node.full_path)
+    if open_opt != null {
+        let ob = open_opt.as(Buffer)
+        ob.file_path = dest_full
+        let bn_opt = path.file_name(dest_full)
+        if bn_opt != null {
+            ob.name = bn_opt.as(String)
+        }
+    }
+
+    expand_ancestors_to_root(state, dest_full)
+    refresh_neotree(world, state, focus_path = dest_full)
+    world.left_sidebar.visible = true
+    status_emit("Neo-tree renamed " ++ node.name ++ " -> " ++ clean_dest)#
+    dest_full
+}
+
+fn cmd_neotree_delete(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let state = require_neotree_state(kern)!
+
+    let node? = state.selected_node(world.left_sidebar.selected_row) else {
+        status_emit("Neo-tree: no entry selected")#
+        return ()
+    }
+
+    let ans? = ask_prompt(PromptRequest {
+        label: "Neo-tree delete " ++ node.name ++ "? (y/n) ",
+        initial: "",
+        kind: PromptKind.Confirm,
+        candidates: ["y", "n"],
+    })# else {
+        status_emit("Neo-tree delete cancelled")#
+        return ()
+    }
+
+    let norm = ans.trim().to_lower()
+    if norm != "y" and norm != "yes" {
+        status_emit("Neo-tree delete cancelled")#
+        return ()
+    }
+
+    if node.is_dir {
+        let rm_res = fs.remove_dir_all(node.full_path)
+        rm_res match {
+            _! => (),
+            error err => return error ("Neo-tree remove dir failed: " ++ err.to_string()),
+        }
+        let _ = state.expanded_dirs.remove(node.full_path)
+    } else {
+        let rm_res = fs.remove_file(node.full_path)
+        rm_res match {
+            _! => (),
+            error err => return error ("Neo-tree remove file failed: " ++ err.to_string()),
+        }
+    }
+
+    refresh_neotree(world, state)
+    world.left_sidebar.visible = true
+    status_emit("Neo-tree deleted: " ++ node.name)#
+    ()
+}
+
+fn cmd_neotree_toggle(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let vim = require_vim_state(kern)!
+    let state = require_neotree_state(kern)!
+
+    if world.left_sidebar.visible and world.left_sidebar.owner == NEOTREE_OWNER {
+        world.left_sidebar.visible = false
+        unfocus_neotree(world, vim, state)
+        status_emit("Neo-tree hidden")#
+    } else {
+        state.root_dir = path.normalize(world.cwd)
+        state.expanded_dirs.insert(state.root_dir)
+        refresh_neotree(world, state)
+        world.left_sidebar.visible = true
+        focus_neotree(kern, world, vim, state)
+        status_emit("Neo-tree Explorer")#
+    }
+    ()
+}
+
+fn cmd_neotree_focus(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let vim = require_vim_state(kern)!
+    let state = require_neotree_state(kern)!
+
+    if (not world.left_sidebar.visible) or world.left_sidebar.owner != NEOTREE_OWNER {
+        state.root_dir = path.normalize(world.cwd)
+        state.expanded_dirs.insert(state.root_dir)
+        refresh_neotree(world, state)
+        world.left_sidebar.visible = true
+    }
+    focus_neotree(kern, world, vim, state)
+    status_emit("Neo-tree focused")#
+    ()
+}
+
+fn cmd_neotree_reveal(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let vim = require_vim_state(kern)!
+    let state = require_neotree_state(kern)!
+
+    state.root_dir = path.normalize(world.cwd)
+    state.expanded_dirs.insert(state.root_dir)
+    let fpath = world.active_buffer().file_path
+    if fpath != "" {
+        expand_ancestors_to_root(state, fpath)
+    }
+    refresh_neotree(world, state, focus_path = fpath)
+    world.left_sidebar.visible = true
+    focus_neotree(kern, world, vim, state)
+    status_emit("Neo-tree revealed current file")#
+    ()
+}
+
+fn cmd_neotree_entry(kern: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let vim = require_vim_state(kern)!
+    let state = require_neotree_state(kern)!
+
+    let arg = if not args.is_empty() { args.get(0).as(String).trim() } else { "" }
+    if arg == "" {
+        state.root_dir = path.normalize(world.cwd)
+        state.expanded_dirs.insert(state.root_dir)
+        refresh_neotree(world, state)
+        world.left_sidebar.visible = true
+        focus_neotree(kern, world, vim, state)
+        status_emit("Neo-tree Explorer")#
+        return ()
+    }
+    if arg == "toggle" {
+        return cmd_neotree_toggle(kern, List())#
+    }
+    if arg == "focus" {
+        return cmd_neotree_focus(kern, List())#
+    }
+    if arg == "reveal" {
+        return cmd_neotree_reveal(kern, List())#
+    }
+    if arg == "close" {
+        world.left_sidebar.visible = false
+        unfocus_neotree(world, vim, state)
+        status_emit("Neo-tree closed")#
+        return ()
+    }
+    if arg == "show" {
+        state.root_dir = path.normalize(world.cwd)
+        state.expanded_dirs.insert(state.root_dir)
+        refresh_neotree(world, state)
+        world.left_sidebar.visible = true
+        status_emit("Neo-tree shown")#
+        return ()
+    }
+
+    let custom_dir = world.resolve_path(arg)
+    if fs.exists(custom_dir) and fs.is_dir(custom_dir) {
+        state.root_dir = custom_dir
+        state.expanded_dirs.insert(custom_dir)
+        refresh_neotree(world, state)
+        world.left_sidebar.visible = true
+        focus_neotree(kern, world, vim, state)
+        status_emit("Neo-tree: " ++ custom_dir)#
+        return ()
+    }
+
+    status_emit("Neo-tree: unknown subcommand or directory '" ++ arg ++ "'")#
+    ()
+}
+
+fn on_sidebar_clicked_hook(kern: SystemKernel, payload: Any) {
+    let (owner, row_idx) = payload.as((String, i64))
+    if owner != NEOTREE_OWNER {
+        return
+    }
+    let w_opt = kern.service("lava.document.world")
+    let v_opt = kern.service("lava.vim.state")
+    let n_opt = kern.service(SERVICE_NEOTREE)
+    if w_opt == null or v_opt == null or n_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let vim = v_opt.as(VimState)
+    let state = n_opt.as(NeotreeState)
+
+    handles(log_event) let _log_cap = LogCollectorCap.new()
+    handles(status_emit) let status_cap = StatusCollectorCap.new()
+    let res = open_or_toggle_node(kern, world, vim, state, row_idx)#
+    res match {
+        _! => {
+            if status_cap.latest != "" {
+                world.status_message = status_cap.latest
+            }
+        },
+        error err => {
+            world.append_message("Neo-tree click error: " ++ err)
+        },
+    }
+}
+
+pub fn register_neotree_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_neotree_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_neotree",
+        "0.1.0",
+        "Docked left-sidebar file explorer tree with folder expand/collapse chevrons, Git porcelain badges, mouse click handling, and filesystem CRUD.",
+        [ext_document_id(), ext_vim_id(), ext_render_id()],
+        |k: SystemKernel| -> !String Unit {
+            let world = require_editor_world(k)!
+            let state = NeotreeState.new(world.cwd)
+            k.publish_service(SERVICE_NEOTREE, ext_id, state)
+
+            k.register_command(
+                "neotree",
+                ext_id,
+                "Open or control Neo-tree docked file explorer (`:Neotree [toggle|focus|reveal|show|close]`).",
+                cmd_neotree_entry,
+            )
+
+            k.register_command(
+                "neotree-toggle",
+                ext_id,
+                "Toggle Neo-tree file explorer sidebar (`<Space> n t`).",
+                cmd_neotree_toggle,
+            )
+
+            k.register_command(
+                "neotree-focus",
+                ext_id,
+                "Show and focus Neo-tree file explorer (`<Space> n f`).",
+                cmd_neotree_focus,
+            )
+
+            k.register_command(
+                "neotree-reveal",
+                ext_id,
+                "Reveal active buffer's file in Neo-tree (`<Space> n r`).",
+                cmd_neotree_reveal,
+            )
+
+            k.register_command(
+                "neotree-add",
+                ext_id,
+                "Create a new file or directory in Neo-tree (`a`).",
+                cmd_neotree_add,
+            )
+
+            k.register_command(
+                "neotree-rename",
+                ext_id,
+                "Rename the selected entry in Neo-tree (`r`).",
+                cmd_neotree_rename,
+            )
+
+            k.register_command(
+                "neotree-delete",
+                ext_id,
+                "Delete the selected entry in Neo-tree (`d`).",
+                cmd_neotree_delete,
+            )
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> n t", "neotree-toggle", ext_id, description = "Toggle Neo-tree explorer")
+            leader_km.bind("<Space> n f", "neotree-focus", ext_id, description = "Focus Neo-tree explorer")
+            leader_km.bind("<Space> n r", "neotree-reveal", ext_id, description = "Reveal file in Neo-tree")
+
+            k.add_hook("sidebar-clicked", ext_id, on_sidebar_clicked_hook)
+
+            k.add_hook(
+                "buffer-saved",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| -> Unit {
+                    let w_opt = kern.service("lava.document.world")
+                    let n_opt = kern.service(SERVICE_NEOTREE)
+                    if w_opt != null and n_opt != null {
+                        let w = w_opt.as(EditorWorld)
+                        let st = n_opt.as(NeotreeState)
+                        if w.left_sidebar.visible and w.left_sidebar.owner == NEOTREE_OWNER {
+                            refresh_neotree(w, st)
+                        }
+                    }
+                },
+            )
+
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                w_opt.as(EditorWorld).clear_owner_ui(NEOTREE_OWNER)
+            }
+            let v_opt = k.service("lava.vim.state")
+            if v_opt != null {
+                let vs = v_opt.as(VimState)
+                if vs.modal_interceptor != null and vs.modal_interceptor.as(ModalInterceptor).owner == NEOTREE_OWNER {
+                    vs.clear_interceptor()
+                }
+            }
+            ()
+        },
+    )
+}

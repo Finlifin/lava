@@ -1,0 +1,968 @@
+-- lava_remote: SSH Remote Transport, `lava-server --stdio` JSON-RPC 2.0 Bridge,
+-- `ssh://` & Emacs TRAMP `/ssh:` URI Parser, `~/.ssh/config` Scanner & Port-Forwarding Client.
+
+use std.collections.HashMap
+use std.env
+use std.fs
+use std.path
+use std.process
+use std.runtime
+
+pub struct RemoteTarget {
+    pub authority: String,
+    pub prefix: String,
+    pub user: String,
+    pub host: String,
+    pub port: i64,
+    pub remote_path: String,
+}
+
+impl RemoteTarget {
+    pub fn canonical_uri(self) -> String = self.prefix ++ self.remote_path
+
+    pub fn ssh_destination(self) -> String {
+        if self.user == "" {
+            self.host
+        } else {
+            self.user ++ "@" ++ self.host
+        }
+    }
+}
+
+pub struct SshHostConfigEntry {
+    pub alias_name: String,
+    pub hostname: String,
+    pub user: String,
+    pub port: i64,
+    pub identity_file: String,
+    pub proxy_jump: String,
+}
+
+pub struct RemoteConnectionInfo {
+    pub authority: String,
+    pub prefix: String,
+    pub mode: String,
+    pub alive: bool,
+    pub hostname: String,
+    pub os: String,
+    pub arch: String,
+    pub remote_home: String,
+    pub remote_cwd: String,
+    pub server_version: String,
+    pub latency_us: i64,
+}
+
+pub struct RemoteFileStat {
+    pub exists: bool,
+    pub is_dir: bool,
+    pub is_file: bool,
+    pub size: i64,
+    pub readonly: bool,
+    pub remote_path: String,
+}
+
+pub struct RemoteDirItem {
+    pub name: String,
+    pub full_uri: String,
+    pub remote_path: String,
+    pub is_dir: bool,
+    pub size: i64,
+}
+
+pub struct RemoteGrepMatch {
+    pub full_uri: String,
+    pub row: i64,
+    pub col: i64,
+    pub line_text: String,
+}
+
+pub struct RemoteTunnelInfo {
+    pub id: i64,
+    pub authority: String,
+    pub direction: String,
+    pub local_port: i64,
+    pub remote_host: String,
+    pub remote_port: i64,
+    pub alive: bool,
+}
+
+-- ============================================================================
+-- 1. Pure-Nessa `ssh://` & Emacs TRAMP `/ssh:` URI Parser & Normalizer
+-- ============================================================================
+
+pub fn is_ssh_uri(raw: String) -> bool {
+    let t = raw.trim()
+    t.starts_with("ssh://") or t.starts_with("/ssh:")
+}
+
+pub fn normalize_posix_remote_path(raw_path: String) -> String {
+    if raw_path == "" {
+        return "/"
+    }
+    let parts = raw_path.split("/")
+    let stack = List()
+    for i in 0..parts.len() {
+        let seg = parts.get(i.as(usize)).as(String)
+        if seg == "" or seg == "." {
+            continue
+        }
+        if seg == ".." {
+            if not stack.is_empty() {
+                let _ = stack.pop()
+            }
+        } else {
+            stack.push(seg)
+        }
+    }
+    if stack.is_empty() {
+        "/"
+    } else {
+        "/" ++ stack.join("/")
+    }
+}
+
+private fn parse_authority_str(raw_auth: String, port_sep: String) -> !String (String, String, i64, String) {
+    let t = raw_auth.trim()
+    if t == "" {
+        return error "empty SSH host authority"
+    }
+    var user = ""
+    var host_port = t
+    let at_idx = t.find_indices("@")
+    if not at_idx.is_empty() {
+        let last_at = at_idx.get((at_idx.len() - 1).as(usize)).as(i64)
+        user = t.slice(0, last_at).trim()
+        host_port = t.slice(last_at + 1, t.char_len()).trim()
+    }
+    var host = host_port
+    var port: i64 = 0
+    let sep_idx = host_port.find_indices(port_sep)
+    if not sep_idx.is_empty() {
+        let last_sep = sep_idx.get((sep_idx.len() - 1).as(usize)).as(i64)
+        let cand_host = host_port.slice(0, last_sep).trim()
+        let cand_port = host_port.slice(last_sep + 1, host_port.char_len()).trim()
+        if cand_port != "" and (not cand_host.contains(":")) {
+            let parsed_p? = cand_port.parse_i64() else {
+                return error ("invalid SSH port '" ++ cand_port ++ "'")
+            }
+            if parsed_p <= 0 or parsed_p > 65535 {
+                return error ("out-of-range SSH port '" ++ cand_port ++ "'")
+            }
+            host = cand_host
+            port = parsed_p
+        }
+    }
+    if host == "" {
+        return error ("missing hostname in SSH target '" ++ raw_auth ++ "'")
+    }
+    var authority = ""
+    if user != "" {
+        authority = user ++ "@"
+    }
+    authority = authority ++ host
+    if port > 0 and port != 22 {
+        authority = authority ++ ":" ++ port.to_string()
+    }
+    (user, host, port, authority)
+}
+
+pub fn parse_ssh_uri(raw: String) -> !String RemoteTarget {
+    let t = raw.trim()
+    if t.starts_with("ssh://") {
+        let after = t.drop(6)
+        let slash_hits = after.find_indices("/")
+        var auth_part = after
+        var path_part = "/"
+        if not slash_hits.is_empty() {
+            let idx = slash_hits.get(0).as(i64)
+            auth_part = after.slice(0, idx)
+            path_part = after.slice(idx, after.char_len())
+        }
+        let (user, host, port, authority) = parse_authority_str(auth_part, ":")!
+        let res = RemoteTarget {
+            authority: authority,
+            prefix: "ssh://" ++ authority,
+            user: user,
+            host: host,
+            port: port,
+            remote_path: normalize_posix_remote_path(path_part),
+        }
+        return res
+    }
+    if t.starts_with("/ssh:") {
+        let after = t.drop(5)
+        let sp? = after.split_once(":") else {
+            return error ("invalid TRAMP SSH URI: " ++ t)
+        }
+        let (auth_part, path_part) = sp
+        let (user, host, port, authority) = parse_authority_str(auth_part, "#")!
+        let res = RemoteTarget {
+            authority: authority,
+            prefix: "ssh://" ++ authority,
+            user: user,
+            host: host,
+            port: port,
+            remote_path: normalize_posix_remote_path(path_part),
+        }
+        return res
+    }
+    let (user, host, port, authority) = parse_authority_str(t, ":")!
+    RemoteTarget {
+        authority: authority,
+        prefix: "ssh://" ++ authority,
+        user: user,
+        host: host,
+        port: port,
+        remote_path: "/",
+    }
+}
+
+pub fn normalize_ssh_uri(raw: String) -> String {
+    let parsed! = parse_ssh_uri(raw) else {
+        return raw.trim()
+    }
+    parsed.canonical_uri()
+}
+
+pub fn join_ssh_uri(base_uri: String, rel_or_abs: String) -> String {
+    if is_ssh_uri(rel_or_abs) {
+        return normalize_ssh_uri(rel_or_abs)
+    }
+    let parsed! = parse_ssh_uri(base_uri) else {
+        return rel_or_abs
+    }
+    let next_path = if rel_or_abs.starts_with("/") {
+        normalize_posix_remote_path(rel_or_abs)
+    } else {
+        normalize_posix_remote_path(parsed.remote_path ++ "/" ++ rel_or_abs)
+    }
+    parsed.prefix ++ next_path
+}
+
+pub fn parent_ssh_uri(uri: String) -> String {
+    let parsed! = parse_ssh_uri(uri) else {
+        return uri
+    }
+    if parsed.remote_path == "/" {
+        return parsed.prefix ++ "/"
+    }
+    let p_opt = path.parent(parsed.remote_path)
+    let par = if p_opt != null and p_opt.as(String) != "" {
+        normalize_posix_remote_path(p_opt.as(String))
+    } else {
+        "/"
+    }
+    parsed.prefix ++ par
+}
+
+pub fn ssh_uri_basename(uri: String) -> String {
+    let parsed! = parse_ssh_uri(uri) else {
+        let f_opt = path.file_name(uri)
+        return if f_opt != null { f_opt.as(String) } else { uri }
+    }
+    if parsed.remote_path == "/" {
+        return parsed.authority ++ ":/"
+    }
+    let f_opt = path.file_name(parsed.remote_path)
+    if f_opt != null {
+        f_opt.as(String)
+    } else {
+        parsed.remote_path
+    }
+}
+
+-- ============================================================================
+-- 2. Standalone Mock Mount Fallback (for pure `nessa run` unit tests)
+-- ============================================================================
+
+var g_mock_mounts: ?HashMap = null
+var g_mock_connected: ?HashMap = null
+var g_mock_tunnels: ?List = null
+var g_next_mock_tunnel: i64 = 1
+
+fn ensure_mock_maps() -> (HashMap, HashMap) {
+    if g_mock_mounts == null {
+        g_mock_mounts = HashMap.new()
+    }
+    if g_mock_connected == null {
+        g_mock_connected = HashMap.new()
+    }
+    (g_mock_mounts.as(HashMap), g_mock_connected.as(HashMap))
+}
+
+-- Register a local directory backing `authority` when running outside `LavaHostHandler`
+-- (under standalone `nessa run`), while also registering a `lava-server` profile if inside Lava!
+pub fn remote_register_mock_mount(authority: String, local_root_dir: String) -> !String Unit {
+    let parsed = parse_ssh_uri(authority)!
+    let (mounts, _) = ensure_mock_maps()
+    mounts.insert(parsed.authority, path.normalize(local_root_dir))
+    ()
+}
+
+fn resolve_mock_local_path(uri: RemoteTarget) -> ?String {
+    let (mounts, _) = ensure_mock_maps()
+    let root_any? = mounts.get(uri.authority) else {
+        return null
+    }
+    let root = root_any.as(String)
+    let rel = if uri.remote_path.starts_with("/") {
+        uri.remote_path.drop(1)
+    } else {
+        uri.remote_path
+    }
+    if rel == "" {
+        root
+    } else {
+        path.normalize(path.join(root, rel))
+    }
+}
+
+-- ============================================================================
+-- 3. Host-Bridged Remote Operations (`remote_*` + Mock Mount Fallback)
+-- ============================================================================
+
+pub fn remote_host_available() -> bool {
+    let raw! = runtime.host_call("remote_available", List()) else {
+        return false
+    }
+    raw.as(bool)
+}
+
+pub fn remote_register_profile(
+    authority: String,
+    transport_bin: String,
+    transport_args: List,
+    .lsp_proxy_bin: String = "",
+) -> !String Unit {
+    if remote_host_available() {
+        let _ = runtime.host_call(
+            "remote_register_profile",
+            [authority, transport_bin, transport_args, lsp_proxy_bin],
+        )!
+    }
+    ()
+}
+
+fn decode_conn_info(f: List) -> RemoteConnectionInfo {
+    RemoteConnectionInfo {
+        authority: f.get(0).as(String),
+        prefix: f.get(1).as(String),
+        mode: f.get(2).as(String),
+        alive: f.get(3).as(bool),
+        hostname: f.get(4).as(String),
+        os: f.get(5).as(String),
+        arch: f.get(6).as(String),
+        remote_home: f.get(7).as(String),
+        remote_cwd: f.get(8).as(String),
+        server_version: f.get(9).as(String),
+        latency_us: f.get(10).as(i64),
+    }
+}
+
+pub fn remote_discover_ssh_hosts() -> List {
+    if remote_host_available() {
+        let raw_res = runtime.host_call("remote_ssh_hosts", List())
+        raw_res match {
+            v! => {
+                let arr = v.as(List)
+                let out = List()
+                for i in 0..arr.len() {
+                    let row = arr.get(i.as(usize)).as(List)
+                    out.push(SshHostConfigEntry {
+                        alias_name: row.get(0).as(String),
+                        hostname: row.get(1).as(String),
+                        user: row.get(2).as(String),
+                        port: row.get(3).as(i64),
+                        identity_file: row.get(4).as(String),
+                        proxy_jump: row.get(5).as(String),
+                    })
+                }
+                return out
+            },
+            error _ => (),
+        }
+    }
+    let home = env.get_or("HOME", "")
+    if home == "" {
+        return List()
+    }
+    let cfg_path = path.join(path.join(home, ".ssh"), "config")
+    if not fs.exists(cfg_path) {
+        return List()
+    }
+    let content = fs.read_to_string(cfg_path) ! { _ => "" }
+    let lines = content.split("\n")
+    let out = List()
+    for i in 0..lines.len() {
+        let ln = lines.get(i.as(usize)).as(String).trim()
+        if ln.starts_with("Host ") or ln.starts_with("host ") {
+            let rest = ln.drop(5).trim()
+            if rest != "" and (not rest.contains("*")) and (not rest.contains("?")) {
+                let alias_tok = rest.split(" ").get(0).as(String).trim()
+                if alias_tok != "" {
+                    out.push(SshHostConfigEntry {
+                        alias_name: alias_tok,
+                        hostname: alias_tok,
+                        user: "",
+                        port: 0,
+                        identity_file: "",
+                        proxy_jump: "",
+                    })
+                }
+            }
+        }
+    }
+    out
+}
+
+pub fn remote_connect(raw_target: String) -> !String RemoteConnectionInfo {
+    let parsed = parse_ssh_uri(raw_target)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let (_, connected) = ensure_mock_maps()
+        let info = RemoteConnectionInfo {
+            authority: parsed.authority,
+            prefix: parsed.prefix,
+            mode: "lava-server",
+            alive: true,
+            hostname: parsed.host,
+            os: "linux",
+            arch: "x86_64",
+            remote_home: "/",
+            remote_cwd: "/",
+            server_version: "0.1.0-mock",
+            latency_us: 45,
+        }
+        connected.insert(parsed.authority, info)
+        return info
+    }
+    let raw = runtime.host_call("remote_connect", [raw_target])!
+    decode_conn_info(raw.as(List))
+}
+
+pub fn remote_disconnect(raw_target: String) -> bool {
+    let parsed_res = parse_ssh_uri(raw_target)
+    parsed_res match {
+        p! => {
+            let (_, connected) = ensure_mock_maps()
+            if connected.contains_key(p.authority) {
+                let _ = connected.remove(p.authority)
+                return true
+            }
+        },
+        error _ => (),
+    }
+    let raw! = runtime.host_call("remote_disconnect", [raw_target]) else {
+        return false
+    }
+    raw.as(bool)
+}
+
+pub fn remote_list_connections() -> List {
+    let out = List()
+    let (_, connected) = ensure_mock_maps()
+    for k in connected.keys() {
+        out.push(connected.get(k).as(RemoteConnectionInfo))
+    }
+    if remote_host_available() {
+        let raw_res = runtime.host_call("remote_list_connections", List())
+        raw_res match {
+            v! => {
+                let arr = v.as(List)
+                for i in 0..arr.len() {
+                    out.push(decode_conn_info(arr.get(i.as(usize)).as(List)))
+                }
+            },
+            error _ => (),
+        }
+    }
+    out
+}
+
+pub fn remote_stat(uri: String) -> !String RemoteFileStat {
+    let parsed = parse_ssh_uri(uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let lp = local_opt.as(String)
+        let ex = fs.exists(lp)
+        let is_d = ex and fs.is_dir(lp)
+        let is_f = ex and (not is_d)
+        let sz = if is_f {
+            let txt = fs.read_to_string(lp) ! { _ => "" }
+            txt.len()
+        } else {
+            0
+        }
+        let st = RemoteFileStat {
+            exists: ex,
+            is_dir: is_d,
+            is_file: is_f,
+            size: sz,
+            readonly: false,
+            remote_path: parsed.remote_path,
+        }
+        return st
+    }
+    let raw = runtime.host_call("remote_stat", [uri])!
+    let f = raw.as(List)
+    RemoteFileStat {
+        exists: f.get(0).as(bool),
+        is_dir: f.get(1).as(bool),
+        is_file: f.get(2).as(bool),
+        size: f.get(3).as(i64),
+        readonly: f.get(4).as(bool),
+        remote_path: f.get(5).as(String),
+    }
+}
+
+pub fn remote_read_lines(uri: String) -> !String (List, bool) {
+    let parsed = parse_ssh_uri(uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let _ = remote_connect(uri)!
+        let lp = local_opt.as(String)
+        if not fs.exists(lp) {
+            return error ("remote file not found: " ++ parsed.canonical_uri())
+        }
+        let content! = fs.read_to_string(lp) else {
+            return error ("cannot read remote file: " ++ parsed.canonical_uri())
+        }
+        let crlf = content.contains("\r\n")
+        let norm = content.replace("\r\n", "\n")
+        if norm == "" {
+            return ([""], false)
+        }
+        let parts = norm.split("\n")
+        if parts.len() > 1 and norm.ends_with("\n") {
+            let _ = parts.pop()
+        }
+        if parts.is_empty() {
+            parts.push("")
+        }
+        return (parts, crlf)
+    }
+    let raw = runtime.host_call("remote_read_lines", [uri])!
+    let pair = raw.as(List)
+    (pair.get(0).as(List), pair.get(1).as(bool))
+}
+
+pub fn remote_write_lines(uri: String, lines: List, crlf: bool) -> !String i64 {
+    let parsed = parse_ssh_uri(uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let _ = remote_connect(uri)!
+        let lp = local_opt.as(String)
+        let p_opt = path.parent(lp)
+        if p_opt != null {
+            let pd = p_opt.as(String)
+            if pd != "" and (not fs.exists(pd)) {
+                let _ = fs.create_dir_all(pd) ! { _ => () }
+            }
+        }
+        let sep = if crlf { "\r\n" } else { "\n" }
+        var body = lines.join(sep)
+        if not (lines.len() == 1 and lines.get(0).as(String) == "") {
+            body = body ++ sep
+        }
+        let _! = fs.write_string(lp, body) else {
+            return error ("cannot write remote file: " ++ parsed.canonical_uri())
+        }
+        return body.len()
+    }
+    let raw = runtime.host_call("remote_write_lines", [uri, lines, crlf])!
+    raw.as(i64)
+}
+
+pub fn remote_readdir(uri: String, .show_hidden: bool = false) -> !String List {
+    let parsed = parse_ssh_uri(uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let _ = remote_connect(uri)!
+        let lp = local_opt.as(String)
+        let names! = fs.read_dir(lp) else {
+            return error ("cannot list remote dir: " ++ parsed.canonical_uri())
+        }
+        let out = List()
+        for i in 0..names.len() {
+            let name = names.get(i.as(usize)).as(String)
+            if (not show_hidden) and name.starts_with(".") {
+                continue
+            }
+            let full_lp = path.join(lp, name)
+            let is_d = fs.exists(full_lp) and fs.is_dir(full_lp)
+            let rpath = normalize_posix_remote_path(parsed.remote_path ++ "/" ++ name)
+            out.push(RemoteDirItem {
+                name: name,
+                full_uri: parsed.prefix ++ rpath,
+                remote_path: rpath,
+                is_dir: is_d,
+                size: 0,
+            })
+        }
+        out.sort_by(|a: Any, b: Any| {
+            let da = a.as(RemoteDirItem)
+            let db = b.as(RemoteDirItem)
+            if da.is_dir != db.is_dir {
+                db.is_dir.cmp(da.is_dir)
+            } else {
+                da.name.to_lower().cmp(db.name.to_lower())
+            }
+        })
+        return out
+    }
+    let raw = runtime.host_call("remote_readdir", [uri, show_hidden])!
+    let arr = raw.as(List)
+    let out = List()
+    for i in 0..arr.len() {
+        let r = arr.get(i.as(usize)).as(List)
+        out.push(RemoteDirItem {
+            name: r.get(0).as(String),
+            full_uri: r.get(1).as(String),
+            remote_path: r.get(2).as(String),
+            is_dir: r.get(3).as(bool),
+            size: r.get(4).as(i64),
+        })
+    }
+    out
+}
+
+pub fn remote_mkdir(uri: String) -> !String Unit {
+    let parsed = parse_ssh_uri(uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let _! = fs.create_dir_all(local_opt.as(String)) else {
+            return error ("cannot mkdir: " ++ parsed.canonical_uri())
+        }
+        return ()
+    }
+    let _ = runtime.host_call("remote_mkdir", [uri])!
+    ()
+}
+
+pub fn remote_remove(uri: String, .recursive: bool = false) -> !String Unit {
+    let parsed = parse_ssh_uri(uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let lp = local_opt.as(String)
+        if fs.is_dir(lp) {
+            if recursive {
+                let _! = fs.remove_dir_all(lp) else {
+                    return error ("cannot remove dir: " ++ parsed.canonical_uri())
+                }
+            } else {
+                let _! = fs.remove_dir(lp) else {
+                    return error ("cannot remove dir: " ++ parsed.canonical_uri())
+                }
+            }
+        } else {
+            let _! = fs.remove_file(lp) else {
+                return error ("cannot remove file: " ++ parsed.canonical_uri())
+            }
+        }
+        return ()
+    }
+    let _ = runtime.host_call("remote_remove", [uri, recursive])!
+    ()
+}
+
+pub fn remote_rename(src_uri: String, dst_uri: String) -> !String Unit {
+    let ps = parse_ssh_uri(src_uri)!
+    let pd = parse_ssh_uri(dst_uri)!
+    let ls_opt = resolve_mock_local_path(ps)
+    let ld_opt = resolve_mock_local_path(pd)
+    if ls_opt != null and ld_opt != null {
+        let _! = fs.rename(ls_opt.as(String), ld_opt.as(String)) else {
+            return error ("cannot rename: " ++ ps.canonical_uri())
+        }
+        return ()
+    }
+    let _ = runtime.host_call("remote_rename", [src_uri, dst_uri])!
+    ()
+}
+
+pub fn remote_copy(src_uri: String, dst_uri: String) -> !String Unit {
+    let ps = parse_ssh_uri(src_uri)!
+    let pd = parse_ssh_uri(dst_uri)!
+    let ls_opt = resolve_mock_local_path(ps)
+    let ld_opt = resolve_mock_local_path(pd)
+    if ls_opt != null and ld_opt != null {
+        let content! = fs.read_to_string(ls_opt.as(String)) else {
+            return error ("cannot read source for copy: " ++ ps.canonical_uri())
+        }
+        let _! = fs.write_string(ld_opt.as(String), content) else {
+            return error ("cannot write destination for copy: " ++ pd.canonical_uri())
+        }
+        return ()
+    }
+    let _ = runtime.host_call("remote_copy", [src_uri, dst_uri])!
+    ()
+}
+
+pub fn remote_which(target: String, bin: String) -> !String String {
+    let parsed = parse_ssh_uri(target)!
+    if resolve_mock_local_path(parsed) != null {
+        let path_env = env.get_or("PATH", "/usr/local/bin:/usr/bin:/bin")
+        let dirs = path_env.split(":")
+        for i in 0..dirs.len() {
+            let d = dirs.get(i.as(usize)).as(String).trim()
+            if d != "" {
+                let full = path.join(d, bin.trim())
+                if fs.exists(full) and (not fs.is_dir(full)) {
+                    return full
+                }
+            }
+        }
+        return ""
+    }
+    let raw = runtime.host_call("remote_which", [target, bin])!
+    raw.as(String)
+}
+
+pub fn remote_find_root(uri: String, markers: List) -> !String String {
+    let parsed = parse_ssh_uri(uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let (mounts, _) = ensure_mock_maps()
+        let mount_root = mounts.get(parsed.authority).as(String)
+        var cur = local_opt.as(String)
+        if fs.exists(cur) and (not fs.is_dir(cur)) {
+            let p_opt = path.parent(cur)
+            if p_opt != null {
+                cur = p_opt.as(String)
+            }
+        }
+        var guard: i64 = 0
+        while guard < 32 and cur.starts_with(mount_root) {
+            for mi in 0..markers.len() {
+                let m = markers.get(mi.as(usize)).as(String)
+                if m != "" and fs.exists(path.join(cur, m)) {
+                    let rel = cur.drop(mount_root.char_len())
+                    return parsed.prefix ++ normalize_posix_remote_path(rel)
+                }
+            }
+            if cur == mount_root {
+                break
+            }
+            let par_opt = path.parent(cur)
+            if par_opt == null {
+                break
+            }
+            cur = par_opt.as(String)
+            guard += 1
+        }
+        return parsed.prefix ++ "/"
+    }
+    let raw = runtime.host_call("remote_find_root", [uri, markers])!
+    raw.as(String)
+}
+
+pub fn remote_search_files(uri: String, query: String, .limit: i64 = 300) -> !String List {
+    let parsed = parse_ssh_uri(uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let lp = local_opt.as(String)
+        let walked = fs.walk_dir(lp) ! { _ => List() }
+        let q_low = query.trim().to_lower()
+        let out = List()
+        for i in 0..walked.len() {
+            let entry = walked.get(i.as(usize)).as(String)
+            let (full, rel) = if entry.starts_with(lp) {
+                (entry, entry.drop(lp.char_len()))
+            } else {
+                (path.join(lp, entry), entry)
+            }
+            if fs.is_dir(full) {
+                continue
+            }
+            if q_low == "" or rel.to_lower().contains(q_low) {
+                let rpath = normalize_posix_remote_path(parsed.remote_path ++ "/" ++ rel)
+                out.push(parsed.prefix ++ rpath)
+                if out.len() >= limit {
+                    break
+                }
+            }
+        }
+        return out
+    }
+    let raw = runtime.host_call("remote_search_files", [uri, query, limit])!
+    raw.as(List)
+}
+
+pub fn remote_search_grep(uri: String, pattern: String, .limit: i64 = 200) -> !String List {
+    let parsed = parse_ssh_uri(uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let lp = local_opt.as(String)
+        let walked = fs.walk_dir(lp) ! { _ => List() }
+        let pat_low = pattern.to_lower()
+        let out = List()
+        for i in 0..walked.len() {
+            let entry = walked.get(i.as(usize)).as(String)
+            let (full, rel) = if entry.starts_with(lp) {
+                (entry, entry.drop(lp.char_len()))
+            } else {
+                (path.join(lp, entry), entry)
+            }
+            if fs.is_dir(full) {
+                continue
+            }
+            let txt = fs.read_to_string(full) ! { _ => "" }
+            let lines = txt.split("\n")
+            let rpath = normalize_posix_remote_path(parsed.remote_path ++ "/" ++ rel)
+            for r in 0..lines.len() {
+                let ln = lines.get(r.as(usize)).as(String)
+                let hits = ln.to_lower().find_indices(pat_low)
+                if not hits.is_empty() {
+                    out.push(RemoteGrepMatch {
+                        full_uri: parsed.prefix ++ rpath,
+                        row: r,
+                        col: hits.get(0).as(i64),
+                        line_text: ln,
+                    })
+                    if out.len() >= limit {
+                        return out
+                    }
+                }
+            }
+        }
+        return out
+    }
+    let raw = runtime.host_call("remote_search_grep", [uri, pattern, limit])!
+    let arr = raw.as(List)
+    let out = List()
+    for i in 0..arr.len() {
+        let rec = arr.get(i.as(usize)).as(List)
+        out.push(RemoteGrepMatch {
+            full_uri: rec.get(0).as(String),
+            row: rec.get(1).as(i64),
+            col: rec.get(2).as(i64),
+            line_text: rec.get(3).as(String),
+        })
+    }
+    out
+}
+
+pub fn remote_exec(
+    target: String,
+    cmd: String,
+    .cwd: String = "",
+    .stdin_data: String = "",
+) -> !String (i64, String, String) {
+    let parsed = parse_ssh_uri(target)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let out! = process.shell(cmd, stdin_data = stdin_data, cwd = local_opt.as(String)) else {
+            return error ("remote shell failed: " ++ cmd)
+        }
+        return (out.status, out.stdout, out.stderr)
+    }
+    let raw = runtime.host_call("remote_exec", [target, cmd, cwd, stdin_data])!
+    let tup = raw.as(List)
+    (tup.get(0).as(i64), tup.get(1).as(String), tup.get(2).as(String))
+}
+
+pub fn remote_deploy_server(target: String, local_server_bin: String) -> !String RemoteConnectionInfo {
+    let raw = runtime.host_call("remote_deploy_server", [target, local_server_bin])!
+    decode_conn_info(raw.as(List))
+}
+
+-- Returns `(transport_bin, transport_args, remote_prefix, clean_remote_root)` ready for `lsp_spawn_remote`!
+pub fn remote_lsp_launch_command(
+    target: String,
+    remote_root: String,
+    server_cmd: String,
+    server_args: List,
+) -> !String (String, List, String, String) {
+    let raw = runtime.host_call(
+        "remote_lsp_launch_command",
+        [target, remote_root, server_cmd, server_args],
+    )!
+    let f = raw.as(List)
+    (
+        f.get(0).as(String),
+        f.get(1).as(List),
+        f.get(2).as(String),
+        f.get(3).as(String),
+    )
+}
+
+pub fn remote_port_forward_start(
+    target: String,
+    direction: String,
+    local_port: i64,
+    remote_host: String,
+    remote_port: i64,
+) -> !String i64 {
+    let parsed = parse_ssh_uri(target)!
+    if resolve_mock_local_path(parsed) != null {
+        if g_mock_tunnels == null {
+            g_mock_tunnels = List()
+        }
+        let id = g_next_mock_tunnel
+        g_next_mock_tunnel += 1
+        g_mock_tunnels.as(List).push(RemoteTunnelInfo {
+            id: id,
+            authority: parsed.authority,
+            direction: direction,
+            local_port: local_port,
+            remote_host: if remote_host == "" { "127.0.0.1" } else { remote_host },
+            remote_port: remote_port,
+            alive: true,
+        })
+        return id
+    }
+    let raw = runtime.host_call(
+        "remote_port_forward_start",
+        [target, direction, local_port, remote_host, remote_port],
+    )!
+    raw.as(i64)
+}
+
+pub fn remote_port_forward_stop(tunnel_id: i64) -> bool {
+    if g_mock_tunnels != null {
+        let ts = g_mock_tunnels.as(List)
+        for i in 0..ts.len() {
+            let t = ts.get(i.as(usize)).as(RemoteTunnelInfo)
+            if t.id == tunnel_id {
+                let _ = ts.remove(i.as(usize))
+                return true
+            }
+        }
+    }
+    let raw! = runtime.host_call("remote_port_forward_stop", [tunnel_id]) else {
+        return false
+    }
+    raw.as(bool)
+}
+
+pub fn remote_port_forward_list() -> List {
+    let out = List()
+    if g_mock_tunnels != null {
+        let ts = g_mock_tunnels.as(List)
+        for i in 0..ts.len() {
+            out.push(ts.get(i.as(usize)).as(RemoteTunnelInfo))
+        }
+    }
+    if remote_host_available() {
+        let raw_res = runtime.host_call("remote_port_forward_list", List())
+        raw_res match {
+            v! => {
+                let arr = v.as(List)
+                for i in 0..arr.len() {
+                    let r = arr.get(i.as(usize)).as(List)
+                    out.push(RemoteTunnelInfo {
+                        id: r.get(0).as(i64),
+                        authority: r.get(1).as(String),
+                        direction: r.get(2).as(String),
+                        local_port: r.get(3).as(i64),
+                        remote_host: r.get(4).as(String),
+                        remote_port: r.get(5).as(i64),
+                        alive: r.get(6).as(bool),
+                    })
+                }
+            },
+            error _ => (),
+        }
+    }
+    out
+}

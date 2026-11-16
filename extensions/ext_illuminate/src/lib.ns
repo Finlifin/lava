@@ -1,0 +1,526 @@
+-- ext_illuminate: Live Cursor Symbol Occurrence Highlighter & Reference Navigator.
+-- Inspired by `vim-illuminate` and Emacs `symbol-overlay`.
+-- Publishes service `"lava.illuminate.state"` (`IlluminateService`) and provides whole-word
+-- occurrence highlighting plus `]r` / `[r` buffer reference navigation and `:IlluminateToggle`.
+
+use @lava_sys.rgba
+use @lava_core.{
+    ExtId, InteractiveEffects, KeyBindingEntry, Keymap, SystemKernel, status_emit
+}
+use @lava_accel.accel_doc_find_word_occurrences
+use @ext_document.{
+    Buffer, BufferId, BufferKind, EditorWorld, Pos, Span, ext_document_id, require_editor_world
+}
+use @ext_vim.{
+    KEYMAP_VIM_LEADER, KEYMAP_VIM_NORMAL, VimMode, VimState, ext_vim_id, require_vim_state,
+    sync_world_from_vim
+}
+
+pub const SERVICE_ILLUMINATE: String = "lava.illuminate.state"
+pub const OWNER_ILLUMINATE: String = "ext_illuminate"
+
+pub fn ext_illuminate_id() -> ExtId = ExtId("lava.org/ext_illuminate")
+
+-- ============================================================================
+-- 1. Service State
+-- ============================================================================
+
+pub struct IlluminateService {
+    pub enabled: bool,
+    pub min_word_len: i64,
+    pub current_word: String,
+    pub occurrences: List,
+    pub last_buf_id: BufferId,
+    pub last_edit_ver: i64,
+    pub last_word: String,
+    pub last_win_start: i64,
+    pub last_win_end: i64,
+}
+
+impl IlluminateService {
+    pub fn new() -> IlluminateService {
+        IlluminateService {
+            enabled: true,
+            min_word_len: 2,
+            current_word: "",
+            occurrences: List(),
+            last_buf_id: BufferId(0),
+            last_edit_ver: -1,
+            last_word: "",
+            last_win_start: 0,
+            last_win_end: -1,
+        }
+    }
+
+    pub fn clear_occurrences(self) {
+        self.current_word = ""
+        self.occurrences = List()
+        self.last_buf_id = BufferId(0)
+        self.last_edit_ver = -1
+        self.last_word = ""
+        self.last_win_start = 0
+        self.last_win_end = -1
+    }
+}
+
+pub fn require_illuminate_service(kernel: SystemKernel) -> !String IlluminateService {
+    let raw = kernel.require_service(SERVICE_ILLUMINATE)!
+    raw.as(IlluminateService)
+}
+
+-- ============================================================================
+-- 2. Whole-Word Identifier Extraction & Occurrence Scanner
+-- ============================================================================
+
+fn is_ident_char(ch: String) -> bool {
+    if ch == "" {
+        return false
+    }
+    ch == "_" or ch.is_alphanumeric()
+}
+
+fn is_ascii_digit_char(ch: String) -> bool {
+    ch == "0"
+        or ch == "1"
+        or ch == "2"
+        or ch == "3"
+        or ch == "4"
+        or ch == "5"
+        or ch == "6"
+        or ch == "7"
+        or ch == "8"
+        or ch == "9"
+}
+
+fn is_pure_digits(word: String) -> bool {
+    let n = word.char_len()
+    if n == 0 {
+        return false
+    }
+    for i in 0..n {
+        if not is_ascii_digit_char(word.slice(i, i + 1)) {
+            return false
+        }
+    }
+    true
+}
+
+fn is_illuminatable_buffer(buf: Buffer) -> bool {
+    buf.kind != BufferKind.Special and buf.kind != BufferKind.Directory
+}
+
+pub fn extract_symbol_at_point(buf: Buffer, min_len: i64) -> String {
+    if not is_illuminatable_buffer(buf) {
+        return ""
+    }
+    let row = buf.point.row
+    let col = buf.point.col
+    let line = buf.line_at(row)
+    let llen = line.char_len()
+    if col < 0 or col >= llen {
+        return ""
+    }
+    let ch = line.slice(col, col + 1)
+    if not is_ident_char(ch) {
+        return ""
+    }
+    var ws = col
+    while ws > 0 and is_ident_char(line.slice(ws - 1, ws)) {
+        ws -= 1
+    }
+    var we = col + 1
+    while we < llen and is_ident_char(line.slice(we, we + 1)) {
+        we += 1
+    }
+    let word = line.slice(ws, we)
+    let req_len = if min_len > 1 { min_len } else { 1 }
+    if word.char_len() < req_len or is_pure_digits(word) {
+        return ""
+    }
+    word
+}
+
+fn occ_item_to_span(item: Any) -> Span {
+    if item matches _: Span {
+        return item.as(Span)
+    }
+    if item matches _: (i64, i64, i64) {
+        let (r, sc, ec) = item.as((i64, i64, i64))
+        return Span.normalized(Pos.new(r, sc), Pos.new(r, ec))
+    }
+    let lst = item.as(List)
+    let r = lst.get(0).as(i64)
+    let sc = lst.get(1).as(i64)
+    let ec = lst.get(2).as(i64)
+    Span.normalized(Pos.new(r, sc), Pos.new(r, ec))
+}
+
+fn convert_raw_occurrences(raw: List) -> List {
+    let out = List()
+    for i in 0..raw.len() {
+        out.push(occ_item_to_span(raw.get(i.as(usize))))
+    }
+    out
+}
+
+pub fn find_whole_word_occurrences(buf: Buffer, word: String) -> List {
+    if word.char_len() == 0 {
+        return List()
+    }
+    buf.sync_external_lines()
+    let lo_r = buf.min_row()
+    let hi_r = buf.max_row()
+    let raw = accel_doc_find_word_occurrences(buf.doc_id, word, lo_r, hi_r, 10000)
+    convert_raw_occurrences(raw)
+}
+
+pub fn refresh_buffer_illuminate(world: EditorWorld, service: IlluminateService, buf: Buffer) {
+    if (not service.enabled) or (not is_illuminatable_buffer(buf)) {
+        buf.clear_owner_decors(OWNER_ILLUMINATE)
+        service.clear_occurrences()
+        return
+    }
+
+    buf.sync_external_lines()
+    let lcount = buf.line_count()
+    let top_r = if world.viewport_top_row > 0 { world.viewport_top_row } else { 0 }
+    let vrows = if world.viewport_rows > 0 { world.viewport_rows } else { 36 }
+    let end_r = top_r + vrows + 5
+    let word = extract_symbol_at_point(buf, service.min_word_len)
+
+    if buf.id == service.last_buf_id
+        and buf.edit_version == service.last_edit_ver
+        and word == service.last_word {
+        if word == "" or lcount <= 400 {
+            return
+        }
+        let win_escaped = (service.last_win_start > 0 and top_r < service.last_win_start + 5)
+            or (service.last_win_end < lcount - 1 and end_r > service.last_win_end - 5)
+        if not win_escaped {
+            return
+        }
+    }
+
+    buf.clear_owner_decors(OWNER_ILLUMINATE)
+
+    if word == "" {
+        service.current_word = ""
+        service.occurrences = List()
+        service.last_buf_id = buf.id
+        service.last_edit_ver = buf.edit_version
+        service.last_word = ""
+        service.last_win_start = 0
+        service.last_win_end = lcount - 1
+        return
+    }
+
+    var occs = List()
+    var win_lo: i64 = 0
+    var win_hi: i64 = lcount - 1
+    var should_highlight = false
+
+    if lcount <= 400 {
+        let lo_r = buf.min_row()
+        let hi_r = buf.max_row()
+        win_lo = lo_r
+        win_hi = hi_r
+        occs = convert_raw_occurrences(
+            accel_doc_find_word_occurrences(buf.doc_id, word, lo_r, hi_r, 500),
+        )
+        should_highlight = occs.len() >= 2
+    } else {
+        let min_r = buf.min_row()
+        let max_r = buf.max_row()
+        win_lo = if top_r - 20 > min_r { top_r - 20 } else { min_r }
+        win_hi = if end_r + 20 < max_r { end_r + 20 } else { max_r }
+        occs = convert_raw_occurrences(
+            accel_doc_find_word_occurrences(buf.doc_id, word, win_lo, win_hi, 300),
+        )
+        if occs.len() >= 2 {
+            should_highlight = true
+        } else if occs.len() == 1 {
+            let probe_hi = if min_r + 500 < max_r { min_r + 500 } else { max_r }
+            let probe = accel_doc_find_word_occurrences(buf.doc_id, word, min_r, probe_hi, 2)
+            should_highlight = probe.len() >= 2
+        }
+    }
+
+    service.current_word = word
+    service.occurrences = occs
+    service.last_buf_id = buf.id
+    service.last_edit_ver = buf.edit_version
+    service.last_word = word
+    service.last_win_start = win_lo
+    service.last_win_end = win_hi
+
+    if not should_highlight {
+        return
+    }
+
+    let hl_bg = rgba(137, 180, 250, 55)
+    for i in 0..occs.len() {
+        let sp = occs.get(i.as(usize)).as(Span)
+        if sp.start.row >= win_lo and sp.start.row <= win_hi {
+            buf.add_inline_decor(
+                OWNER_ILLUMINATE,
+                sp.start.row,
+                sp.start.col,
+                sp.end.col,
+                bg_rgba = hl_bg,
+                fg_rgba = 0,
+                underline = true,
+            )
+        }
+    }
+}
+
+-- ============================================================================
+-- 3. Reference Navigation (`]r` / `[r`) & Toggle Command
+-- ============================================================================
+
+fn find_enclosing_occurrence_idx(occs: List, pos: Pos) -> i64 {
+    for i in 0..occs.len() {
+        let sp = occs.get(i.as(usize)).as(Span)
+        if sp.start.row == pos.row and pos.col >= sp.start.col and pos.col < sp.end.col {
+            return i
+        }
+    }
+    -1
+}
+
+fn jump_symbol_reference(kernel: SystemKernel, forward: bool) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let service = require_illuminate_service(kernel)!
+    let buf = world.active_buffer()
+
+    let word = extract_symbol_at_point(buf, service.min_word_len)
+    if word == "" {
+        status_emit("No symbol under cursor")#
+        return ()
+    }
+
+    let occs = find_whole_word_occurrences(buf, word)
+    let total = occs.len()
+    if total == 0 {
+        status_emit("No references for " ++ word)#
+        return ()
+    }
+
+    let step = vim.effective_count()
+    let cur_idx = find_enclosing_occurrence_idx(occs, buf.point)
+    var chosen_idx: i64 = 0
+
+    if cur_idx >= 0 {
+        if forward {
+            chosen_idx = (cur_idx + step) % total
+        } else {
+            let rem = step % total
+            chosen_idx = (cur_idx - rem + total) % total
+        }
+    } else {
+        var cur = buf.point
+        for _ in 0..step {
+            if forward {
+                var found: i64 = -1
+                for i in 0..total {
+                    let sp = occs.get(i.as(usize)).as(Span)
+                    if sp.start > cur {
+                        found = i
+                        break
+                    }
+                }
+                chosen_idx = if found >= 0 { found } else { 0 }
+            } else {
+                var found: i64 = -1
+                var i = total - 1
+                while i >= 0 {
+                    let sp = occs.get(i.as(usize)).as(Span)
+                    if sp.start < cur {
+                        found = i
+                        break
+                    }
+                    i -= 1
+                }
+                chosen_idx = if found >= 0 { found } else { total - 1 }
+            }
+            cur = occs.get(chosen_idx.as(usize)).as(Span).start
+        }
+    }
+
+    let target = occs.get(chosen_idx.as(usize)).as(Span)
+    world.jumps.record(buf.id, buf.file_path, buf.point)
+    buf.point = buf.clamp_pos(target.start, insert_mode = false)
+    buf.preferred_col = buf.point.col
+    vim.mode = VimMode.Normal
+    vim.clear_transient()
+    sync_world_from_vim(world, vim)
+    refresh_buffer_illuminate(world, service, buf)
+    kernel.emit_hook("cursor-moved", buf.id)
+    status_emit(
+        "[" ++ (chosen_idx + 1).to_string() ++ "/" ++ total.to_string() ++ "] " ++ word
+    )#
+    ()
+}
+
+-- ============================================================================
+-- 4. Hooks & Extension Registration (`lava.org/ext_illuminate`)
+-- ============================================================================
+
+fn on_illuminate_sync_hook(kern: SystemKernel, _payload: Any) {
+    let w_opt = kern.service("lava.document.world")
+    let s_opt = kern.service(SERVICE_ILLUMINATE)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let service = s_opt.as(IlluminateService)
+    refresh_buffer_illuminate(world, service, world.active_buffer())
+}
+
+fn on_illuminate_insert_hook(kern: SystemKernel, _payload: Any) {
+    let w_opt = kern.service("lava.document.world")
+    let s_opt = kern.service(SERVICE_ILLUMINATE)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let buf = world.active_buffer()
+    if buf.line_count() > 2000 {
+        return
+    }
+    let service = s_opt.as(IlluminateService)
+    refresh_buffer_illuminate(world, service, buf)
+}
+
+fn on_illuminate_switch_hook(kern: SystemKernel, _payload: Any) {
+    let w_opt = kern.service("lava.document.world")
+    let s_opt = kern.service(SERVICE_ILLUMINATE)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let service = s_opt.as(IlluminateService)
+    let active = world.active_buffer()
+    if service.last_buf_id != BufferId(0) and service.last_buf_id != active.id {
+        let prev_opt = world.buffer(service.last_buf_id)
+        if prev_opt != null {
+            prev_opt.as(Buffer).clear_owner_decors(OWNER_ILLUMINATE)
+        }
+    }
+    service.clear_occurrences()
+    refresh_buffer_illuminate(world, service, active)
+}
+
+fn unbind_owner_from_keymaps(kernel: SystemKernel, owner: ExtId) {
+    for km_key in kernel.keymaps.keys() {
+        let km_name = km_key.as(String)
+        let km = kernel.keymaps.get(km_name).as(Keymap)
+        let to_remove = List()
+        for chord_key in km.bindings.keys() {
+            let chord = chord_key.as(String)
+            let entry = km.bindings.get(chord).as(KeyBindingEntry)
+            if entry.owner == owner {
+                to_remove.push(chord)
+            }
+        }
+        for i in 0..to_remove.len() {
+            let _ = km.bindings.remove(to_remove.get(i.as(usize)).as(String))
+        }
+    }
+}
+
+fn migrate_leader_u_prefix(leader_km: Keymap) {
+    let prev_opt = leader_km.bindings.get("<Space> u")
+    if prev_opt != null {
+        let prev = prev_opt.as(KeyBindingEntry)
+        if prev.command_name == "undo-tree-visualize" {
+            let _ = leader_km.unbind("<Space> u")
+            leader_km.bind("<Space> u u", prev.command_name, prev.owner, description = prev.description)
+        }
+    }
+}
+
+pub fn register_illuminate_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_illuminate_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_illuminate",
+        "0.1.0",
+        "Live whole-word symbol occurrence highlighting under cursor with ]r/[r reference navigation.",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let service = IlluminateService.new()
+            k.publish_service(SERVICE_ILLUMINATE, ext_id, service)
+
+            let norm_km = k.ensure_keymap(KEYMAP_VIM_NORMAL)
+            norm_km.bind("] r", "illuminate-next-ref", ext_id, description = "Next symbol reference")
+            norm_km.bind("[ r", "illuminate-prev-ref", ext_id, description = "Previous symbol reference")
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            migrate_leader_u_prefix(leader_km)
+            leader_km.bind("<Space> u i", "illuminate-toggle", ext_id, description = "Toggle symbol illuminate")
+
+            k.register_command(
+                "illuminate-next-ref",
+                ext_id,
+                "Jump to next whole-word occurrence of symbol under cursor (`]r`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    jump_symbol_reference(kern, true)#
+                },
+            )
+
+            k.register_command(
+                "illuminate-prev-ref",
+                ext_id,
+                "Jump to previous whole-word occurrence of symbol under cursor (`[r`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    jump_symbol_reference(kern, false)#
+                },
+            )
+
+            k.register_command(
+                "illuminate-toggle",
+                ext_id,
+                "Toggle live symbol occurrence highlighting (`:IlluminateToggle`, `<Space> u i`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let svc = require_illuminate_service(kern)!
+                    svc.enabled = not svc.enabled
+                    if not svc.enabled {
+                        svc.clear_occurrences()
+                        world.clear_owner_ui(OWNER_ILLUMINATE)
+                        status_emit("Illuminate: OFF")#
+                    } else {
+                        refresh_buffer_illuminate(world, svc, world.active_buffer())
+                        status_emit("Illuminate: ON")#
+                    }
+                    ()
+                },
+            )
+
+            k.add_hook("cursor-moved", ext_id, on_illuminate_sync_hook)
+            k.add_hook("mode-changed", ext_id, on_illuminate_sync_hook)
+            k.add_hook("buffer-switched", ext_id, on_illuminate_switch_hook)
+            k.add_hook("buffer-opened", ext_id, on_illuminate_switch_hook)
+            k.add_hook("buffer-modified", ext_id, on_illuminate_sync_hook)
+            k.add_hook("after-insert-stroke", ext_id, on_illuminate_insert_hook)
+
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                let w = w_opt.as(EditorWorld)
+                refresh_buffer_illuminate(w, service, w.active_buffer())
+            }
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                w_opt.as(EditorWorld).clear_owner_ui(OWNER_ILLUMINATE)
+            }
+            unbind_owner_from_keymaps(k, ext_id)
+            ()
+        },
+    )
+}

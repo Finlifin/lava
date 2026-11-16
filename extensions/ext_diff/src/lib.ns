@@ -1,0 +1,2859 @@
+-- ext_diff: Feature-Rich Diff & Patch Extension (`lava.org/ext_diff`) for Lava.
+-- Provides Side-by-Side synchronized split & Unified patch views, intra-line word diff spans,
+-- interactive hunk patching (`do`/`dp`) with UndoTree checkpoints, multi-file Git `*DiffView*`,
+-- recursive directory `*DiffDirs*`, visual selection diffing, and a first-class stdio `Filter`
+-- & `Mapper` pipeline (`sed`, `awk`, `rg`) preserving original 0-based source line numbers.
+
+pub mod pipeline
+pub mod align
+pub mod explorers
+
+use std.fs
+use std.path
+use @lava_sys.host_read_file_lines
+use @lava_core.{
+    ExtId, InteractiveEffects, PromptKind, PromptRequest, ServiceEffects, SystemKernel, ask_prompt,
+    clipboard_get, clipboard_set, log_event, status_emit
+}
+use @ext_document.{
+    Buffer, BufferId, BufferKind, EditorWorld, FloatingWindow, Pos, RegisterValue, Span,
+    ext_document_id, require_editor_world
+}
+use @ext_window.{
+    SERVICE_WINDOW_MANAGER, SplitAxis, WinId, WindowManager, WindowPane, ext_window_id
+}
+use @ext_vim.{
+    KEYMAP_VIM_LEADER, KEYMAP_VIM_VISUAL, VimMode, VimState, ext_vim_id, require_vim_state,
+    sync_world_from_vim
+}
+
+pub use pipeline.{
+    DiffPipelineStage, DiffPreset, DiffStageKind, TrackedDiffLine, active_stage_count,
+    align_filtered_lines, align_mapped_lines, clone_tracked_lines, default_diff_presets,
+    format_pipeline_badge, has_any_active_mapper, make_initial_tracked_lines,
+    parse_stage_command_spec, run_diff_pipeline_on_lines, run_single_stage,
+    split_stdio_output_lines, summarize_stage_label
+}
+pub use align.{
+    DIFF_HEADER_ROWS, OWNER_DIFF, SbsRowMeta, SessionHunk, UnifiedRowMeta, build_session_hunks,
+    compute_intraline_spans, compute_tracked_diff_hunks, format_standard_unified_patch, max_i64,
+    min_i64, normalize_ws_for_cmp, render_side_by_side_buffers, render_unified_buffer, rgba_hex
+}
+pub use explorers.{
+    BUF_DIFF_DIRS, BUF_DIFF_VIEW, DiffDirEntry, DiffViewEntry, effective_git_cwd,
+    fetch_git_revision_lines, render_diffdirs_buffer, render_diffview_buffer,
+    scan_directory_diff_entries, scan_git_diffview_entries, split_file_text_lines
+}
+
+pub const SERVICE_DIFF: String = "lava.diff.service"
+pub const BUF_DIFF_LEFT: String = "*Diff Left*"
+pub const BUF_DIFF_RIGHT: String = "*Diff Right*"
+pub const BUF_DIFF_UNIFIED: String = "*Diff*"
+pub const BUF_DIFF_PATCH: String = "*Diff Patch*"
+pub const FLOAT_DIFF_PIPELINE: String = "diff-pipeline-float"
+
+pub fn ext_diff_id() -> ExtId = ExtId("lava.org/ext_diff")
+
+-- ============================================================================
+-- 1. Diff Sources, Session State & Public `DiffService`
+-- ============================================================================
+
+pub struct DiffSource {
+    pub kind: String,
+    pub title: String,
+    pub buf_id: ?BufferId,
+    pub file_path: String,
+    pub git_root: String,
+    pub git_rev: String,
+    pub snapshot_lines: List,
+    pub editable: bool,
+}
+
+impl DiffSource {
+    pub fn empty() -> DiffSource {
+        DiffSource {
+            kind: "snapshot",
+            title: "(empty)",
+            buf_id: null,
+            file_path: "",
+            git_root: "",
+            git_rev: "",
+            snapshot_lines: List(),
+            editable: false,
+        }
+    }
+
+    pub fn from_buffer(buf: Buffer) -> DiffSource {
+        let label = if buf.file_path != "" { buf.name } else { buf.name }
+        let cap = min_i64(buf.line_count(), 50000)
+        DiffSource {
+            kind: "buffer",
+            title: label,
+            buf_id: buf.id,
+            file_path: buf.file_path,
+            git_root: "",
+            git_rev: "",
+            snapshot_lines: buf.slice_lines(0, cap),
+            editable: not buf.read_only,
+        }
+    }
+
+    pub fn from_saved_disk(file_path: String, lines: List) -> DiffSource {
+        let base_opt = path.file_name(file_path)
+        let base = if base_opt != null { base_opt.as(String) } else { file_path }
+        DiffSource {
+            kind: "saved",
+            title: "Saved: " ++ base,
+            buf_id: null,
+            file_path: file_path,
+            git_root: "",
+            git_rev: "",
+            snapshot_lines: clone_str_list(lines),
+            editable: false,
+        }
+    }
+
+    pub fn from_git_rev(repo_root: String, rel_path: String, full_path: String, rev: String, lines: List) -> DiffSource {
+        DiffSource {
+            kind: "git_rev",
+            title: rev ++ ":" ++ rel_path,
+            buf_id: null,
+            file_path: full_path,
+            git_root: repo_root,
+            git_rev: rev,
+            snapshot_lines: clone_str_list(lines),
+            editable: false,
+        }
+    }
+
+    pub fn from_snapshot(title: String, lines: List) -> DiffSource {
+        DiffSource {
+            kind: "snapshot",
+            title: title,
+            buf_id: null,
+            file_path: "",
+            git_root: "",
+            git_rev: "",
+            snapshot_lines: clone_str_list(lines),
+            editable: false,
+        }
+    }
+}
+
+pub struct DiffSession {
+    pub active: bool,
+    pub layout: String,
+    pub stages: List,
+    pub next_stage_id: i64,
+    pub show_mapped_text: bool,
+    pub ignore_whitespace: bool,
+    pub context_lines: i64,
+    pub left_source: DiffSource,
+    pub right_source: DiffSource,
+    pub left_raw_lines: List,
+    pub right_raw_lines: List,
+    pub left_tracked: List,
+    pub right_tracked: List,
+    pub hunks: List,
+    pub added_count: i64,
+    pub deleted_count: i64,
+    pub changed_count: i64,
+    pub sbs_rows: List,
+    pub unified_rows: List,
+    pub left_diff_buf_id: ?BufferId,
+    pub right_diff_buf_id: ?BufferId,
+    pub unified_diff_buf_id: ?BufferId,
+    pub left_win_id: ?WinId,
+    pub right_win_id: ?WinId,
+    pub prev_buffer_id: ?BufferId,
+    pub prev_single_window: bool,
+    pub syncing_panes: bool,
+    pub last_error: String,
+}
+
+impl DiffSession {
+    pub fn new() -> DiffSession {
+        DiffSession {
+            active: false,
+            layout: "side-by-side",
+            stages: List(),
+            next_stage_id: 1,
+            show_mapped_text: true,
+            ignore_whitespace: false,
+            context_lines: 3,
+            left_source: DiffSource.empty(),
+            right_source: DiffSource.empty(),
+            left_raw_lines: List(),
+            right_raw_lines: List(),
+            left_tracked: List(),
+            right_tracked: List(),
+            hunks: List(),
+            added_count: 0,
+            deleted_count: 0,
+            changed_count: 0,
+            sbs_rows: List(),
+            unified_rows: List(),
+            left_diff_buf_id: null,
+            right_diff_buf_id: null,
+            unified_diff_buf_id: null,
+            left_win_id: null,
+            right_win_id: null,
+            prev_buffer_id: null,
+            prev_single_window: true,
+            syncing_panes: false,
+            last_error: "",
+        }
+    }
+
+    pub fn hunk_count(self) -> i64 = self.hunks.len()
+}
+
+pub struct DiffService {
+    pub session: DiffSession,
+    pub presets: List,
+    pub diffview_repo_root: String,
+    pub diffview_rev: String,
+    pub diffview_rev_label: String,
+    pub diffview_entries: List,
+    pub diffview_active_idx: i64,
+    pub diffview_prev_buf_id: ?BufferId,
+    pub diffdirs_left: String,
+    pub diffdirs_right: String,
+    pub diffdirs_entries: List,
+    pub diffdirs_identical_count: i64,
+    pub diffdirs_prev_buf_id: ?BufferId,
+    pub captured_selection_lines: ?List,
+    pub captured_selection_title: String,
+}
+
+impl DiffService {
+    pub fn new() -> DiffService {
+        DiffService {
+            session: DiffSession.new(),
+            presets: default_diff_presets(),
+            diffview_repo_root: "",
+            diffview_rev: "HEAD",
+            diffview_rev_label: "HEAD",
+            diffview_entries: List(),
+            diffview_active_idx: 0,
+            diffview_prev_buf_id: null,
+            diffdirs_left: "",
+            diffdirs_right: "",
+            diffdirs_entries: List(),
+            diffdirs_identical_count: 0,
+            diffdirs_prev_buf_id: null,
+            captured_selection_lines: null,
+            captured_selection_title: "",
+        }
+    }
+
+    pub fn find_preset(self, name: String) -> ?DiffPreset {
+        let needle = name.trim().to_lower()
+        for i in 0..self.presets.len() {
+            let p = self.presets.get(i.as(usize)).as(DiffPreset)
+            if p.name.to_lower() == needle {
+                return p
+            }
+        }
+        null
+    }
+
+    pub fn register_preset(
+        self,
+        name: String,
+        kind: DiffStageKind,
+        command: String,
+        .description: String = "",
+    ) {
+        let clean_name = name.trim()
+        if clean_name == "" {
+            return
+        }
+        let preset = DiffPreset {
+            name: clean_name,
+            kind: kind,
+            command: command,
+            description: if description != "" { description } else { command },
+        }
+        for i in 0..self.presets.len() {
+            let existing = self.presets.get(i.as(usize)).as(DiffPreset)
+            if existing.name.to_lower() == clean_name.to_lower() {
+                self.presets.set(i.as(usize), preset)
+                return
+            }
+        }
+        self.presets.push(preset)
+    }
+
+    pub fn export_unified_patch(self) -> String {
+        let s = self.session
+        let lines = format_standard_unified_patch(
+            s.left_source.title,
+            s.right_source.title,
+            s.left_tracked,
+            s.right_tracked,
+            s.hunks,
+            s.stages,
+            s.show_mapped_text,
+            s.context_lines,
+        )
+        lines.join("\n") ++ "\n"
+    }
+}
+
+pub fn require_diff_service(kernel: SystemKernel) -> !String DiffService {
+    let raw = kernel.require_service(SERVICE_DIFF)!
+    raw.as(DiffService)
+}
+
+pub fn register_diff_preset(
+    service: DiffService,
+    name: String,
+    kind: DiffStageKind,
+    command: String,
+    .description: String = "",
+) {
+    service.register_preset(name, kind, command, description = description)
+}
+
+-- ============================================================================
+-- 2. Helpers: Argument Parsing, Source Loading & Window Split Synchronization
+-- ============================================================================
+
+fn clone_str_list(src: List) -> List {
+    let out = List()
+    for i in 0..src.len() {
+        out.push(src.get(i.as(usize)).as(String))
+    }
+    out
+}
+
+fn clone_stage_list(src: List) -> List {
+    let out = List()
+    for i in 0..src.len() {
+        let st = src.get(i.as(usize)).as(DiffPipelineStage)
+        out.push(DiffPipelineStage {
+            stage_id: st.stage_id,
+            kind: st.kind,
+            command: st.command,
+            side: st.side,
+            enabled: st.enabled,
+            label: st.label,
+        })
+    }
+    out
+}
+
+fn join_raw_arg_string(args: List) -> String {
+    if args.is_empty() {
+        return ""
+    }
+    if args.len() == 1 {
+        return args.get(0).as(String).trim()
+    }
+    let parts = List()
+    for i in 0..args.len() {
+        parts.push(args.get(i.as(usize)).as(String))
+    }
+    parts.join(" ").trim()
+}
+
+-- Parse up to 2 shell-quoted or whitespace-separated arguments from Ex `args`.
+fn parse_two_args(args: List) -> (String, String) {
+    if args.is_empty() {
+        return ("", "")
+    }
+    if args.len() >= 2 {
+        return (args.get(0).as(String).trim(), args.get(1).as(String).trim())
+    }
+    let raw = args.get(0).as(String).trim()
+    if raw == "" {
+        return ("", "")
+    }
+    let toks = List()
+    let n = raw.char_len()
+    var i: i64 = 0
+    while i < n and toks.len() < 2 {
+        while i < n and raw.slice(i, i + 1) == " " {
+            i += 1
+        }
+        if i >= n {
+            break
+        }
+        let ch0 = raw.slice(i, i + 1)
+        if ch0 == "\"" or ch0 == "'" {
+            let quote = ch0
+            i += 1
+            var acc = ""
+            while i < n {
+                let c = raw.slice(i, i + 1)
+                if c == "\\" and i + 1 < n and quote == "\"" {
+                    acc = acc ++ raw.slice(i + 1, i + 2)
+                    i += 2
+                } else if c == quote {
+                    i += 1
+                    break
+                } else {
+                    acc = acc ++ c
+                    i += 1
+                }
+            }
+            toks.push(acc)
+        } else {
+            var acc = ""
+            while i < n {
+                let c = raw.slice(i, i + 1)
+                if c == "\\" and i + 1 < n {
+                    acc = acc ++ raw.slice(i + 1, i + 2)
+                    i += 2
+                } else if c == " " {
+                    break
+                } else {
+                    acc = acc ++ c
+                    i += 1
+                }
+            }
+            toks.push(acc)
+        }
+    }
+    let a0 = if toks.len() >= 1 { toks.get(0).as(String) } else { "" }
+    let a1 = if toks.len() >= 2 { toks.get(1).as(String) } else { "" }
+    (a0, a1)
+}
+
+fn is_internal_diff_buffer_name(name: String) -> bool {
+    name == BUF_DIFF_LEFT
+        or name == BUF_DIFF_RIGHT
+        or name == BUF_DIFF_UNIFIED
+        or name == BUF_DIFF_VIEW
+        or name == BUF_DIFF_DIRS
+        or name == BUF_DIFF_PATCH
+}
+
+fn optional_wm(kernel: SystemKernel) -> ?WindowManager {
+    let svc_opt = kernel.service(SERVICE_WINDOW_MANAGER)
+    if svc_opt == null {
+        return null
+    }
+    svc_opt.as(WindowManager)
+}
+
+-- Open a local path or `ssh://` remote URI into a real `Buffer`, preserving existing open buffers.
+fn open_or_load_file_buffer(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    raw_path: String,
+) -> #ServiceEffects !String Buffer {
+    let trimmed = raw_path.trim()
+    if trimmed == "" {
+        return error "File path cannot be empty"
+    }
+    let saved_active = world.active_buffer_id
+
+    if trimmed.starts_with("ssh://") {
+        let existing_ssh = world.find_buffer_by_path(trimmed)
+        if existing_ssh != null {
+            return existing_ssh.as(Buffer)
+        }
+        -- Support dedicated `ext_ssh` opener command if present, otherwise `world.open_file`
+        if kernel.get_command("ssh-open-uri") != null {
+            let _ = kernel.dispatch_command("ssh-open-uri", [trimmed])#!
+            let after_ssh = world.find_buffer_by_path(trimmed)
+            if after_ssh != null {
+                world.active_buffer_id = saved_active
+                return after_ssh.as(Buffer)
+            }
+        }
+        let opened_ssh = world.open_file(trimmed)#!
+        world.active_buffer_id = saved_active
+        return opened_ssh
+    }
+
+    let full = world.resolve_path(trimmed)
+    let existing = world.find_buffer_by_path(full)
+    if existing != null {
+        return existing.as(Buffer)
+    }
+    if not fs.exists(full) {
+        return error ("File does not exist: " ++ full)
+    }
+    if fs.is_dir(full) {
+        return error ("Path is a directory (use :DiffDirs): " ++ full)
+    }
+    let opened = world.open_file(full)#!
+    world.active_buffer_id = saved_active
+    opened
+}
+
+fn load_source_raw_lines(world: EditorWorld, src: DiffSource) -> !String List {
+    if src.kind == "buffer" {
+        if src.buf_id != null {
+            let sbid? = src.buf_id else { return clone_str_list(src.snapshot_lines) }
+            let b_opt = world.buffer(sbid)
+            if b_opt != null {
+                let b = b_opt.as(Buffer)
+                src.editable = not b.read_only
+                let cap = min_i64(b.line_count(), 50000)
+                let snap = b.slice_lines(0, cap)
+                src.snapshot_lines = snap
+                return clone_str_list(snap)
+            }
+        }
+        if src.file_path != "" and fs.is_file(src.file_path) {
+            let (flines, _) = host_read_file_lines(src.file_path)!
+            return flines
+        }
+        return clone_str_list(src.snapshot_lines)
+    }
+    if src.kind == "saved" {
+        if src.file_path != "" {
+            if src.file_path.starts_with("ssh://") {
+                return clone_str_list(src.snapshot_lines)
+            }
+            if fs.is_file(src.file_path) {
+                let (flines, _) = host_read_file_lines(src.file_path)!
+                src.snapshot_lines = clone_str_list(flines)
+                return flines
+            }
+        }
+        return clone_str_list(src.snapshot_lines)
+    }
+    if src.kind == "git_rev" {
+        let cwd = effective_git_cwd(world, src.file_path)
+        let (_, _, glines) = fetch_git_revision_lines(cwd, src.file_path, src.git_rev)!
+        src.snapshot_lines = clone_str_list(glines)
+        return glines
+    }
+    clone_str_list(src.snapshot_lines)
+}
+
+-- Keep `*Diff Left*` and `*Diff Right*` split panes locked in cursor row and scroll offset!
+fn sync_diff_split_panes(world: EditorWorld, wm_opt: ?WindowManager, session: DiffSession) {
+    if (not session.active) or session.layout != "side-by-side" or session.syncing_panes {
+        return
+    }
+    let wm? = wm_opt else {
+        return
+    }
+    let lwid? = session.left_win_id else { return }
+    let rwid? = session.right_win_id else { return }
+    let lbid? = session.left_diff_buf_id else { return }
+    let rbid? = session.right_diff_buf_id else { return }
+    let lp_opt = wm.panes.get(lwid)
+    let rp_opt = wm.panes.get(rwid)
+    let lb_opt = world.buffer(lbid)
+    let rb_opt = world.buffer(rbid)
+    if lp_opt == null or rp_opt == null or lb_opt == null or rb_opt == null {
+        return
+    }
+
+    session.syncing_panes = true
+    let lp = lp_opt.as(WindowPane)
+    let rp = rp_opt.as(WindowPane)
+    let lb = lb_opt.as(Buffer)
+    let rb = rb_opt.as(Buffer)
+
+    if world.active_buffer_id == lbid and lp.buffer_id == lbid and rp.buffer_id == rbid {
+        wm.sync_from_world(world)
+        let r = lp.cursor.row
+        rb.point = rb.clamp_pos(Pos.new(r, lp.cursor.col), insert_mode = false)
+        rp.cursor = rb.point
+        rp.prev_cursor = rp.cursor
+        rp.top_row = lp.top_row
+        rp.left_col = lp.left_col
+    } else if world.active_buffer_id == rbid and lp.buffer_id == lbid and rp.buffer_id == rbid {
+        wm.sync_from_world(world)
+        let r = rp.cursor.row
+        lb.point = lb.clamp_pos(Pos.new(r, rp.cursor.col), insert_mode = false)
+        lp.cursor = lb.point
+        lp.prev_cursor = lp.cursor
+        lp.top_row = rp.top_row
+        lp.left_col = rp.left_col
+    }
+    session.syncing_panes = false
+}
+
+-- ============================================================================
+-- 3. Core Session Recomputation, Layout Arrangement & Rendering
+-- ============================================================================
+
+fn compute_pipeline_and_hunks(
+    cwd: String,
+    left_raw: List,
+    right_raw: List,
+    stages: List,
+    ignore_whitespace: bool,
+) -> !String (List, List, List, i64, i64, i64) {
+    let l_tracked = run_diff_pipeline_on_lines(left_raw, stages, "left", cwd)!
+    let r_tracked = run_diff_pipeline_on_lines(right_raw, stages, "right", cwd)!
+    let raw_hunks = compute_tracked_diff_hunks(l_tracked, r_tracked, ignore_whitespace)
+    let (session_hunks, added, deleted, changed) = build_session_hunks(
+        raw_hunks,
+        l_tracked,
+        r_tracked,
+        left_raw.len(),
+        right_raw.len(),
+    )
+    (l_tracked, r_tracked, session_hunks, added, deleted, changed)
+}
+
+fn render_active_diff_buffers(world: EditorWorld, wm_opt: ?WindowManager, session: DiffSession) {
+    let max_orig = max_i64(session.left_raw_lines.len(), session.right_raw_lines.len())
+    if session.layout == "unified" {
+        let ubuf = world.ensure_special_buffer(BUF_DIFF_UNIFIED, "diff", [""], read_only = true)
+        session.unified_diff_buf_id = ubuf.id
+        session.unified_rows = render_unified_buffer(
+            ubuf,
+            session.left_source.title,
+            session.right_source.title,
+            session.left_tracked,
+            session.right_tracked,
+            session.hunks,
+            session.stages,
+            session.show_mapped_text,
+            session.ignore_whitespace,
+            session.context_lines,
+            session.added_count,
+            session.deleted_count,
+            session.changed_count,
+            max_orig,
+        )
+        if wm_opt != null {
+            let wm = wm_opt.as(WindowManager)
+            let ap = wm.active_pane()
+            ap.buffer_id = ubuf.id
+            world.active_buffer_id = ubuf.id
+            wm.sync_from_world(world)
+        } else {
+            let _ = world.switch_to_buffer(ubuf.id)
+        }
+        return
+    }
+
+    -- Default `"side-by-side"` synchronized split layout
+    let lbuf = world.ensure_special_buffer(BUF_DIFF_LEFT, "diff", [""], read_only = true)
+    let rbuf = world.ensure_special_buffer(BUF_DIFF_RIGHT, "diff", [""], read_only = true)
+    session.left_diff_buf_id = lbuf.id
+    session.right_diff_buf_id = rbuf.id
+    session.sbs_rows = render_side_by_side_buffers(
+        lbuf,
+        rbuf,
+        session.left_source.title,
+        session.right_source.title,
+        session.left_tracked,
+        session.right_tracked,
+        session.hunks,
+        session.stages,
+        session.show_mapped_text,
+        session.ignore_whitespace,
+        session.added_count,
+        session.deleted_count,
+        session.changed_count,
+        max_orig,
+    )
+
+    if wm_opt != null {
+        let wm = wm_opt.as(WindowManager)
+        var reuse_split = false
+        var reuse_lwid = WinId(0)
+        var reuse_rwid = WinId(0)
+        if session.left_win_id != null and session.right_win_id != null {
+            let lwid? = session.left_win_id else { return }
+            let rwid? = session.right_win_id else { return }
+            if wm.panes.contains_key(lwid) and wm.panes.contains_key(rwid) and lwid != rwid {
+                reuse_split = true
+                reuse_lwid = lwid
+                reuse_rwid = rwid
+            }
+        }
+        if reuse_split {
+            let lp = wm.panes.get(reuse_lwid).as(WindowPane)
+            let rp = wm.panes.get(reuse_rwid).as(WindowPane)
+            lp.buffer_id = lbuf.id
+            rp.buffer_id = rbuf.id
+            if world.active_buffer_id != lbuf.id and world.active_buffer_id != rbuf.id {
+                wm.active_tab().active_win_id = rp.id
+                world.active_buffer_id = rbuf.id
+            }
+            wm.sync_from_world(world)
+        } else {
+            wm.close_others(world)
+            let left_pane = wm.active_pane()
+            let left_wid = left_pane.id
+            left_pane.buffer_id = lbuf.id
+            left_pane.cursor = lbuf.point
+            left_pane.top_row = 0
+            world.active_buffer_id = lbuf.id
+
+            let right_wid = wm.split_active(SplitAxis.Vertical, world)
+            let right_pane = wm.panes.get(right_wid).as(WindowPane)
+            right_pane.buffer_id = rbuf.id
+            right_pane.cursor = rbuf.point
+            right_pane.top_row = 0
+            wm.active_tab().active_win_id = right_wid
+            world.active_buffer_id = rbuf.id
+            session.left_win_id = left_wid
+            session.right_win_id = right_wid
+            wm.balance_splits()
+            wm.sync_to_world(world)
+        }
+        sync_diff_split_panes(world, wm_opt, session)
+    } else {
+        let _ = world.switch_to_buffer(rbuf.id)
+    }
+}
+
+fn start_diff_session(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    service: DiffService,
+    left_src: DiffSource,
+    right_src: DiffSource,
+    .layout: String = "",
+    .preserve_stages: bool = false,
+) -> #ServiceEffects !String Unit {
+    let session = service.session
+    let wm_opt = optional_wm(kernel)
+
+    -- Record pre-diff window & buffer context if entering diff from normal editing
+    let cur_buf = world.active_buffer()
+    if not is_internal_diff_buffer_name(cur_buf.name) {
+        session.prev_buffer_id = cur_buf.id
+        if wm_opt != null {
+            session.prev_single_window = wm_opt.as(WindowManager).visible_panes().len() <= 1
+        }
+    }
+
+    let chosen_layout = if layout == "unified" or layout == "side-by-side" {
+        layout
+    } else if session.active and (session.layout == "unified" or session.layout == "side-by-side") {
+        session.layout
+    } else {
+        "side-by-side"
+    }
+
+    let stages_to_use = if preserve_stages { clone_stage_list(session.stages) } else { List() }
+    let l_raw = load_source_raw_lines(world, left_src)!
+    let r_raw = load_source_raw_lines(world, right_src)!
+
+    let (l_trk, r_trk, shunks, add_n, del_n, chg_n) = compute_pipeline_and_hunks(
+        world.cwd,
+        l_raw,
+        r_raw,
+        stages_to_use,
+        session.ignore_whitespace,
+    )!
+
+    session.active = true
+    session.layout = chosen_layout
+    if not preserve_stages {
+        session.stages = List()
+        session.next_stage_id = 1
+        session.show_mapped_text = true
+    } else {
+        session.stages = stages_to_use
+    }
+    session.left_source = left_src
+    session.right_source = right_src
+    session.left_raw_lines = l_raw
+    session.right_raw_lines = r_raw
+    session.left_tracked = l_trk
+    session.right_tracked = r_trk
+    session.hunks = shunks
+    session.added_count = add_n
+    session.deleted_count = del_n
+    session.changed_count = chg_n
+    session.last_error = ""
+
+    render_active_diff_buffers(world, wm_opt, session)
+
+    -- Position cursor at first hunk (or first body row if identical)
+    let first_row = if not session.hunks.is_empty() {
+        let h0 = session.hunks.get(0).as(SessionHunk)
+        if session.layout == "unified" { h0.unified_row } else { h0.sbs_row }
+    } else {
+        DIFF_HEADER_ROWS
+    }
+    position_diff_cursor_at_row(world, wm_opt, session, first_row)
+
+    let v_opt = kernel.service("lava.vim.state")
+    if v_opt != null {
+        sync_world_from_vim(world, v_opt.as(VimState))
+    }
+    kernel.emit_hook("buffer-switched", world.active_buffer_id)
+
+    status_emit(
+        "Diff: " ++ left_src.title ++ " ↔ " ++ right_src.title
+        ++ " (" ++ session.hunks.len().to_string() ++ " hunks: +"
+        ++ add_n.to_string() ++ " -" ++ del_n.to_string() ++ " ~" ++ chg_n.to_string() ++ ")"
+    )#
+    ()
+}
+
+fn position_diff_cursor_at_row(
+    world: EditorWorld,
+    wm_opt: ?WindowManager,
+    session: DiffSession,
+    row: i64,
+) {
+    if session.layout == "unified" {
+        if session.unified_diff_buf_id != null {
+            let ubid? = session.unified_diff_buf_id else { return }
+            let ubuf_opt = world.buffer(ubid)
+            if ubuf_opt != null {
+                let ubuf = ubuf_opt.as(Buffer)
+                let clamped = ubuf.clamp_pos(Pos.new(row, 0), insert_mode = false)
+                ubuf.point = clamped
+                if wm_opt != null {
+                    wm_opt.as(WindowManager).sync_from_world(world)
+                }
+            }
+        }
+        return
+    }
+    if session.left_diff_buf_id != null {
+        let lbid? = session.left_diff_buf_id else { return }
+        let lb_opt = world.buffer(lbid)
+        if lb_opt != null {
+            let lb = lb_opt.as(Buffer)
+            lb.point = lb.clamp_pos(Pos.new(row, 0), insert_mode = false)
+        }
+    }
+    if session.right_diff_buf_id != null {
+        let rbid? = session.right_diff_buf_id else { return }
+        let rb_opt = world.buffer(rbid)
+        if rb_opt != null {
+            let rb = rb_opt.as(Buffer)
+            rb.point = rb.clamp_pos(Pos.new(row, 0), insert_mode = false)
+        }
+    }
+    sync_diff_split_panes(world, wm_opt, session)
+}
+
+fn refresh_diff_session(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    service: DiffService,
+    .preserve_cursor: bool = true,
+) -> #ServiceEffects !String Unit {
+    let session = service.session
+    if not session.active {
+        return error "No active diff session"
+    }
+    let saved_row = world.active_buffer().point.row
+    let l_raw = load_source_raw_lines(world, session.left_source)!
+    let r_raw = load_source_raw_lines(world, session.right_source)!
+
+    let (l_trk, r_trk, shunks, add_n, del_n, chg_n) = compute_pipeline_and_hunks(
+        world.cwd,
+        l_raw,
+        r_raw,
+        session.stages,
+        session.ignore_whitespace,
+    )!
+
+    session.left_raw_lines = l_raw
+    session.right_raw_lines = r_raw
+    session.left_tracked = l_trk
+    session.right_tracked = r_trk
+    session.hunks = shunks
+    session.added_count = add_n
+    session.deleted_count = del_n
+    session.changed_count = chg_n
+    session.last_error = ""
+
+    let wm_opt = optional_wm(kernel)
+    render_active_diff_buffers(world, wm_opt, session)
+
+    let target_r = if preserve_cursor { saved_row } else { DIFF_HEADER_ROWS }
+    position_diff_cursor_at_row(world, wm_opt, session, target_r)
+    ()
+}
+
+-- Public API: Open diff between any two open `BufferId`s.
+pub fn open_diff_between_buffers(
+    kernel: SystemKernel,
+    left_buf_id: BufferId,
+    right_buf_id: BufferId,
+    .layout: String = "",
+) -> #ServiceEffects !String Unit {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let lbuf? = world.buffer(left_buf_id) else {
+        return error ("Unknown left buffer id: " ++ left_buf_id.to_string())
+    }
+    let rbuf? = world.buffer(right_buf_id) else {
+        return error ("Unknown right buffer id: " ++ right_buf_id.to_string())
+    }
+    start_diff_session(
+        kernel,
+        world,
+        service,
+        DiffSource.from_buffer(lbuf),
+        DiffSource.from_buffer(rbuf),
+        layout = layout,
+    )#
+}
+
+-- Public API: Open diff between any two local paths or `ssh://` remote URIs.
+pub fn open_diff_between_files(
+    kernel: SystemKernel,
+    left_path: String,
+    right_path: String,
+    .layout: String = "",
+) -> #ServiceEffects !String Unit {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let lbuf = open_or_load_file_buffer(kernel, world, left_path)#!
+    let rbuf = open_or_load_file_buffer(kernel, world, right_path)#!
+    start_diff_session(
+        kernel,
+        world,
+        service,
+        DiffSource.from_buffer(lbuf),
+        DiffSource.from_buffer(rbuf),
+        layout = layout,
+    )#
+}
+
+-- ============================================================================
+-- 4. Seven Comparison Entry Commands (`:DiffBuffers`, `:DiffFiles`, `:DiffSaved`,
+--    `:DiffHead`, `:DiffView`, `:DiffDirs`, `:DiffSelection`)
+-- ============================================================================
+
+fn resolve_buffer_by_name_or_path(world: EditorWorld, spec: String) -> ?Buffer {
+    let trimmed = spec.trim()
+    if trimmed == "" {
+        return null
+    }
+    let by_name = world.find_buffer_by_name(trimmed)
+    if by_name != null {
+        return by_name
+    }
+    let full = world.resolve_path(trimmed)
+    world.find_buffer_by_path(full)
+}
+
+fn candidate_user_buffer_names(world: EditorWorld) -> List {
+    let out = List()
+    for i in 0..world.buffer_order.len() {
+        let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+        let b = world.buffers.get(bid).as(Buffer)
+        if b.id != world.messages_id and (not is_internal_diff_buffer_name(b.name)) {
+            out.push(b.name)
+        }
+    }
+    out
+}
+
+fn cmd_diff_buffers(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let wm_opt = optional_wm(kernel)
+    let (arg_a, arg_b) = parse_two_args(args)
+
+    if arg_a != "" and arg_b != "" {
+        let ba? = resolve_buffer_by_name_or_path(world, arg_a) else {
+            return error ("Buffer not found: " ++ arg_a)
+        }
+        let bb? = resolve_buffer_by_name_or_path(world, arg_b) else {
+            return error ("Buffer not found: " ++ arg_b)
+        }
+        open_diff_between_buffers(kernel, ba.id, bb.id)#!
+        return ()
+    }
+
+    -- Auto-pick Left pane vs Right pane if 2 visible split panes show distinct user buffers
+    if arg_a == "" and wm_opt != null {
+        let vis = wm_opt.as(WindowManager).visible_panes()
+        let distinct_ids = List()
+        for i in 0..vis.len() {
+            let p = vis.get(i.as(usize)).as(WindowPane)
+            let b_opt = world.buffer(p.buffer_id)
+            if b_opt != null {
+                let b = b_opt.as(Buffer)
+                if (not is_internal_diff_buffer_name(b.name)) and b.id != world.messages_id {
+                    var dup = false
+                    for j in 0..distinct_ids.len() {
+                        if distinct_ids.get(j.as(usize)).as(BufferId) == b.id {
+                            dup = true
+                        }
+                    }
+                    if not dup {
+                        distinct_ids.push(b.id)
+                    }
+                }
+            }
+        }
+        if distinct_ids.len() >= 2 {
+            let id0 = distinct_ids.get(0).as(BufferId)
+            let id1 = distinct_ids.get(1).as(BufferId)
+            open_diff_between_buffers(kernel, id0, id1)#!
+            return ()
+        }
+    }
+
+    let cands = candidate_user_buffer_names(world)
+    let cur_name = world.active_buffer().name
+    let left_name = if arg_a != "" {
+        arg_a
+    } else {
+        let ans_a? = ask_prompt(PromptRequest.with_candidates(
+            "Diff Left buffer: ",
+            cur_name,
+            PromptKind.BufferName,
+            cands,
+        ))# else {
+            status_emit("DiffBuffers cancelled")#
+            return ()
+        }
+        ans_a.trim()
+    }
+
+    var default_right = ""
+    for i in 0..cands.len() {
+        let cn = cands.get(i.as(usize)).as(String)
+        if cn != left_name {
+            default_right = cn
+            break
+        }
+    }
+    let ans_b? = ask_prompt(PromptRequest.with_candidates(
+        "Diff Right buffer: ",
+        default_right,
+        PromptKind.BufferName,
+        cands,
+    ))# else {
+        status_emit("DiffBuffers cancelled")#
+        return ()
+    }
+    let right_name = ans_b.trim()
+
+    let ba? = resolve_buffer_by_name_or_path(world, left_name) else {
+        return error ("Buffer not found: " ++ left_name)
+    }
+    let bb? = resolve_buffer_by_name_or_path(world, right_name) else {
+        return error ("Buffer not found: " ++ right_name)
+    }
+    open_diff_between_buffers(kernel, ba.id, bb.id)#!
+    ()
+}
+
+fn cmd_diff_files(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let (arg_a, arg_b) = parse_two_args(args)
+
+    let init_a = if world.active_buffer().file_path != "" {
+        world.active_buffer().file_path
+    } else {
+        world.cwd ++ "/"
+    }
+    let path_a = if arg_a != "" {
+        arg_a
+    } else {
+        let ans_a? = ask_prompt(PromptRequest {
+            label: "Diff Left file (local or ssh://): ",
+            initial: init_a,
+            kind: PromptKind.FilePath,
+            candidates: List(),
+        })# else {
+            status_emit("DiffFiles cancelled")#
+            return ()
+        }
+        ans_a.trim()
+    }
+
+    let path_b = if arg_b != "" {
+        arg_b
+    } else {
+        let ans_b? = ask_prompt(PromptRequest {
+            label: "Diff Right file (local or ssh://): ",
+            initial: world.cwd ++ "/",
+            kind: PromptKind.FilePath,
+            candidates: List(),
+        })# else {
+            status_emit("DiffFiles cancelled")#
+            return ()
+        }
+        ans_b.trim()
+    }
+
+    open_diff_between_files(kernel, path_a, path_b)#!
+    ()
+}
+
+fn cmd_diff_saved(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let buf = world.active_buffer()
+    if buf.file_path == "" {
+        return error ("Buffer '" ++ buf.name ++ "' has no saved file path")
+    }
+    var saved_lines = List()
+    if buf.file_path.starts_with("ssh://") {
+        let snap_opt = buf.vars.get("ssh_saved_lines")
+        if snap_opt != null {
+            saved_lines = clone_str_list(snap_opt.as(List))
+        } else {
+            return error ("No saved remote baseline cached for " ++ buf.file_path)
+        }
+    } else {
+        if not fs.is_file(buf.file_path) {
+            return error ("File is not yet saved on disk: " ++ buf.file_path)
+        }
+        let (disk_lines, _) = host_read_file_lines(buf.file_path)!
+        saved_lines = disk_lines
+    }
+
+    start_diff_session(
+        kernel,
+        world,
+        service,
+        DiffSource.from_saved_disk(buf.file_path, saved_lines),
+        DiffSource.from_buffer(buf),
+    )#!
+    ()
+}
+
+fn cmd_diff_head(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let rev_raw = join_raw_arg_string(args)
+    let rev = if rev_raw == "" { "HEAD" } else { rev_raw }
+
+    -- Allow running `:DiffHead` even while already viewing a diff (re-targets the right buffer's file!)
+    var target_buf = world.active_buffer()
+    if service.session.active
+        and is_internal_diff_buffer_name(target_buf.name)
+        and service.session.right_source.buf_id != null {
+        let rbid? = service.session.right_source.buf_id else { return () }
+        let rb_opt = world.buffer(rbid)
+        if rb_opt != null {
+            target_buf = rb_opt.as(Buffer)
+        }
+    }
+
+    if target_buf.file_path == "" {
+        return error ("Buffer '" ++ target_buf.name ++ "' has no file path")
+    }
+    let cwd = effective_git_cwd(world, target_buf.file_path)
+    let (repo_root, rel_path, rev_lines) = fetch_git_revision_lines(cwd, target_buf.file_path, rev)!
+
+    start_diff_session(
+        kernel,
+        world,
+        service,
+        DiffSource.from_git_rev(repo_root, rel_path, target_buf.file_path, rev, rev_lines),
+        DiffSource.from_buffer(target_buf),
+    )#!
+    ()
+}
+
+fn cmd_diff_view(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let rev_raw = join_raw_arg_string(args)
+    let rev = if rev_raw == "" { "HEAD" } else { rev_raw }
+
+    let cur = world.active_buffer()
+    if cur.name != BUF_DIFF_VIEW and (not is_internal_diff_buffer_name(cur.name)) {
+        service.diffview_prev_buf_id = cur.id
+    }
+
+    let cwd = effective_git_cwd(world, cur.file_path)
+    let (repo_root, rev_label, entries) = scan_git_diffview_entries(world, cwd, rev)!
+    service.diffview_repo_root = repo_root
+    service.diffview_rev = rev
+    service.diffview_rev_label = rev_label
+    service.diffview_entries = entries
+    service.diffview_active_idx = 0
+
+    let vbuf = world.ensure_special_buffer(BUF_DIFF_VIEW, "diffview", [""], read_only = true)
+    render_diffview_buffer(vbuf, repo_root, rev_label, entries)
+    vbuf.point = vbuf.clamp_pos(Pos.new(DIFF_HEADER_ROWS, 0), insert_mode = false)
+
+    let wm_opt = optional_wm(kernel)
+    if wm_opt != null {
+        let wm = wm_opt.as(WindowManager)
+        wm.close_others(world)
+        wm.active_pane().buffer_id = vbuf.id
+        world.active_buffer_id = vbuf.id
+        wm.sync_from_world(world)
+    } else {
+        let _ = world.switch_to_buffer(vbuf.id)
+    }
+    kernel.emit_hook("buffer-switched", vbuf.id)
+    status_emit("DiffView: " ++ entries.len().to_string() ++ " changed file(s) against " ++ rev)#
+    ()
+}
+
+fn open_diffview_entry_by_index(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    service: DiffService,
+    idx: i64,
+) -> #ServiceEffects !String Unit {
+    if service.diffview_entries.is_empty() {
+        status_emit("No changed files in DiffView")#
+        return ()
+    }
+    let clamped = min_i64(max_i64(0, idx), service.diffview_entries.len() - 1)
+    service.diffview_active_idx = clamped
+    let entry = service.diffview_entries.get(clamped.as(usize)).as(DiffViewEntry)
+
+    let (_, _, base_lines) = if entry.status == "?" {
+        (service.diffview_repo_root, entry.rel_path, List())
+    } else {
+        fetch_git_revision_lines(service.diffview_repo_root, entry.full_path, service.diffview_rev) ! {
+            _ => (service.diffview_repo_root, entry.rel_path, List()),
+        }
+    }
+
+    let left_src = DiffSource.from_git_rev(
+        service.diffview_repo_root,
+        entry.rel_path,
+        entry.full_path,
+        service.diffview_rev,
+        base_lines,
+    )
+    let right_src = if fs.is_file(entry.full_path) or world.find_buffer_by_path(entry.full_path) != null {
+        let rbuf = open_or_load_file_buffer(kernel, world, entry.full_path)#!
+        DiffSource.from_buffer(rbuf)
+    } else {
+        DiffSource.from_snapshot("(deleted: " ++ entry.rel_path ++ ")", List())
+    }
+
+    start_diff_session(
+        kernel,
+        world,
+        service,
+        left_src,
+        right_src,
+        layout = "side-by-side",
+        preserve_stages = service.session.active,
+    )#
+}
+
+fn cmd_diff_dirs(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let (arg_a, arg_b) = parse_two_args(args)
+
+    let dir_a_raw = if arg_a != "" {
+        arg_a
+    } else {
+        let ans_a? = ask_prompt(PromptRequest {
+            label: "Diff Left directory: ",
+            initial: world.cwd,
+            kind: PromptKind.FilePath,
+            candidates: List(),
+        })# else {
+            status_emit("DiffDirs cancelled")#
+            return ()
+        }
+        ans_a.trim()
+    }
+
+    let dir_b_raw = if arg_b != "" {
+        arg_b
+    } else {
+        let ans_b? = ask_prompt(PromptRequest {
+            label: "Diff Right directory: ",
+            initial: world.cwd,
+            kind: PromptKind.FilePath,
+            candidates: List(),
+        })# else {
+            status_emit("DiffDirs cancelled")#
+            return ()
+        }
+        ans_b.trim()
+    }
+
+    let left_dir = world.resolve_path(dir_a_raw)
+    let right_dir = world.resolve_path(dir_b_raw)
+    let cur = world.active_buffer()
+    if cur.name != BUF_DIFF_DIRS and (not is_internal_diff_buffer_name(cur.name)) {
+        service.diffdirs_prev_buf_id = cur.id
+    }
+
+    let (entries, ident_cnt) = scan_directory_diff_entries(left_dir, right_dir)!
+    service.diffdirs_left = left_dir
+    service.diffdirs_right = right_dir
+    service.diffdirs_entries = entries
+    service.diffdirs_identical_count = ident_cnt
+
+    let dbuf = world.ensure_special_buffer(BUF_DIFF_DIRS, "diffdirs", [""], read_only = true)
+    render_diffdirs_buffer(dbuf, left_dir, right_dir, entries, ident_cnt)
+    dbuf.point = dbuf.clamp_pos(Pos.new(DIFF_HEADER_ROWS, 0), insert_mode = false)
+
+    let wm_opt = optional_wm(kernel)
+    if wm_opt != null {
+        let wm = wm_opt.as(WindowManager)
+        wm.close_others(world)
+        wm.active_pane().buffer_id = dbuf.id
+        world.active_buffer_id = dbuf.id
+        wm.sync_from_world(world)
+    } else {
+        let _ = world.switch_to_buffer(dbuf.id)
+    }
+    kernel.emit_hook("buffer-switched", dbuf.id)
+    status_emit("DiffDirs: " ++ entries.len().to_string() ++ " differing file(s)")#
+    ()
+}
+
+fn open_diffdirs_entry_by_index(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    service: DiffService,
+    idx: i64,
+) -> #ServiceEffects !String Unit {
+    if service.diffdirs_entries.is_empty() {
+        status_emit("Directories are identical — no file entry to open")#
+        return ()
+    }
+    let clamped = min_i64(max_i64(0, idx), service.diffdirs_entries.len() - 1)
+    let entry = service.diffdirs_entries.get(clamped.as(usize)).as(DiffDirEntry)
+
+    if entry.status == "MODIFIED" {
+        open_diff_between_files(kernel, entry.left_path, entry.right_path, layout = "side-by-side")#!
+        return ()
+    }
+    if entry.status == "ONLY LEFT" {
+        let lbuf = open_or_load_file_buffer(kernel, world, entry.left_path)#!
+        let r_snap = DiffSource.from_snapshot("(missing on right: " ++ entry.rel_path ++ ")", List())
+        start_diff_session(kernel, world, service, DiffSource.from_buffer(lbuf), r_snap, layout = "side-by-side")#!
+        return ()
+    }
+    let l_snap = DiffSource.from_snapshot("(missing on left: " ++ entry.rel_path ++ ")", List())
+    let rbuf = open_or_load_file_buffer(kernel, world, entry.right_path)#!
+    start_diff_session(kernel, world, service, l_snap, DiffSource.from_buffer(rbuf), layout = "side-by-side")#!
+    ()
+}
+
+fn extract_current_or_last_selection(
+    world: EditorWorld,
+    vim_opt: ?Any,
+    buf: Buffer,
+) -> ?(List, String) {
+    if vim_opt != null {
+        let vim = vim_opt.as(VimState)
+        if vim.mode == VimMode.VisualLine or vim.mode == VimMode.VisualChar or vim.mode == VimMode.VisualBlock {
+            let a = vim.visual_anchor
+            let b = buf.point
+            let r1 = min_i64(a.row, b.row)
+            let r2 = max_i64(a.row, b.row)
+            let lines = List()
+            if vim.mode == VimMode.VisualChar {
+                let lo = if a <= b { a } else { b }
+                let hi = if a <= b { b } else { a }
+                let hi_excl = Pos.new(hi.row, min_i64(buf.line_char_len(hi.row), hi.col + 1))
+                let text = buf.extract_span(Span.normalized(lo, hi_excl))
+                let split_l = split_file_text_lines(text)
+                for i in 0..split_l.len() {
+                    lines.push(split_l.get(i.as(usize)).as(String))
+                }
+            } else if vim.mode == VimMode.VisualBlock {
+                let c1 = min_i64(a.col, b.col)
+                let c2 = max_i64(a.col, b.col) + 1
+                for r in r1..(r2 + 1) {
+                    let ln = buf.line_at(r)
+                    let llen = ln.char_len()
+                    let sc = min_i64(c1, llen)
+                    let ec = min_i64(c2, llen)
+                    lines.push(ln.slice(sc, ec))
+                }
+            } else {
+                for r in r1..(r2 + 1) {
+                    lines.push(buf.line_at(r))
+                }
+            }
+            buf.named_marks.insert("<", Pos.new(r1, a.col))
+            buf.named_marks.insert(">", Pos.new(r2, b.col))
+            vim.has_last_visual = true
+            vim.last_visual_mode = vim.mode
+            vim.last_visual_anchor = a
+            vim.last_visual_point = b
+            vim.mode = VimMode.Normal
+            vim.clear_transient()
+            sync_world_from_vim(world, vim)
+            let label = buf.name ++ ":" ++ (r1 + 1).to_string() ++ "-" ++ (r2 + 1).to_string()
+            return (lines, label)
+        }
+    }
+
+    -- Emacs active region
+    if buf.mark_active and buf.mark != null {
+        let m = buf.mark.as(Pos)
+        let r1 = min_i64(m.row, buf.point.row)
+        let r2 = max_i64(m.row, buf.point.row)
+        let lines = List()
+        for r in r1..(r2 + 1) {
+            lines.push(buf.line_at(r))
+        }
+        buf.mark_active = false
+        let label = buf.name ++ ":" ++ (r1 + 1).to_string() ++ "-" ++ (r2 + 1).to_string()
+        return (lines, label)
+    }
+
+    -- Vim `:'<,'>DiffSelection` marks set right before Ex command entry
+    if buf.named_marks.contains_key("<") and buf.named_marks.contains_key(">") {
+        let p1 = buf.named_marks.get("<").as(Pos)
+        let p2 = buf.named_marks.get(">").as(Pos)
+        let r1 = min_i64(p1.row, p2.row)
+        let r2 = max_i64(p1.row, p2.row)
+        let lines = List()
+        for r in r1..(r2 + 1) {
+            lines.push(buf.line_at(r))
+        }
+        let label = buf.name ++ ":" ++ (r1 + 1).to_string() ++ "-" ++ (r2 + 1).to_string()
+        return (lines, label)
+    }
+
+    null
+}
+
+fn cmd_diff_selection(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let sub = join_raw_arg_string(args).to_lower()
+
+    if sub == "clear" or sub == "cancel" {
+        service.captured_selection_lines = null
+        service.captured_selection_title = ""
+        status_emit("Cleared captured diff selection")#
+        return ()
+    }
+
+    let buf = world.active_buffer()
+    let vim_opt = kernel.service("lava.vim.state")
+    let sel? = extract_current_or_last_selection(world, vim_opt, buf) else {
+        return error "Select a visual region first (or use V / v + <Space>dr)"
+    }
+    let (sel_lines, sel_title) = sel
+
+    if sub == "clip" or sub == "clipboard" or sub == "reg" {
+        var clip_text = ""
+        let reg_opt = world.registers.get_reg("\"")#
+        if reg_opt != null {
+            let r? = reg_opt else { return () }
+            clip_text = r.text
+        } else {
+            clip_text = clipboard_get()#
+        }
+        let clip_lines = split_file_text_lines(clip_text)
+        start_diff_session(
+            kernel,
+            world,
+            service,
+            DiffSource.from_snapshot("Clipboard", clip_lines),
+            DiffSource.from_snapshot("Selection (" ++ sel_title ++ ")", sel_lines),
+        )#!
+        return ()
+    }
+
+    if service.captured_selection_lines == null {
+        service.captured_selection_lines = sel_lines
+        service.captured_selection_title = sel_title
+        status_emit(
+            "Captured Left selection (" ++ sel_lines.len().to_string()
+            ++ " lines from " ++ sel_title ++ ") — select Right region and press <Space>dr"
+        )#
+        return ()
+    }
+
+    let left_lines = service.captured_selection_lines.as(List)
+    let left_title = service.captured_selection_title
+    service.captured_selection_lines = null
+    service.captured_selection_title = ""
+
+    start_diff_session(
+        kernel,
+        world,
+        service,
+        DiffSource.from_snapshot("Selection A (" ++ left_title ++ ")", left_lines),
+        DiffSource.from_snapshot("Selection B (" ++ sel_title ++ ")", sel_lines),
+    )#!
+    ()
+}
+
+-- ============================================================================
+-- 5. Interactive Hunk Operations (`]c`/`[c`, `do`, `dp`, `<Return>`/`gf`)
+-- ============================================================================
+
+fn cmd_jump_hunk(kernel: SystemKernel, forward: bool) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let session = service.session
+    if not session.active {
+        status_emit("No active diff session")#
+        return ()
+    }
+    if session.hunks.is_empty() {
+        status_emit("No diff hunks (0 differences)")#
+        return ()
+    }
+
+    let cur_row = world.active_buffer().point.row
+    let total = session.hunks.len()
+    var target_idx: i64 = -1
+
+    if forward {
+        for i in 0..total {
+            let sh = session.hunks.get(i.as(usize)).as(SessionHunk)
+            let h_row = if session.layout == "unified" { sh.unified_row } else { sh.sbs_row }
+            if h_row > cur_row {
+                target_idx = i
+                break
+            }
+        }
+        if target_idx < 0 {
+            target_idx = 0
+        }
+    } else {
+        var i = total - 1
+        while i >= 0 {
+            let sh = session.hunks.get(i.as(usize)).as(SessionHunk)
+            let h_row = if session.layout == "unified" { sh.unified_row } else { sh.sbs_row }
+            if h_row < cur_row {
+                target_idx = i
+                break
+            }
+            i -= 1
+        }
+        if target_idx < 0 {
+            target_idx = total - 1
+        }
+    }
+
+    let chosen = session.hunks.get(target_idx.as(usize)).as(SessionHunk)
+    let dest_row = if session.layout == "unified" { chosen.unified_row } else { chosen.sbs_row }
+    let wm_opt = optional_wm(kernel)
+    position_diff_cursor_at_row(world, wm_opt, session, dest_row)
+    status_emit(
+        "Diff hunk " ++ (target_idx + 1).to_string() ++ "/" ++ total.to_string()
+        ++ " (" ++ chosen.hunk.kind ++ ")"
+    )#
+    ()
+}
+
+fn find_session_hunk_at_cursor(session: DiffSession, cur_row: i64) -> ?SessionHunk {
+    if session.hunks.is_empty() {
+        return null
+    }
+    if session.layout == "unified" {
+        if cur_row >= 0 and cur_row < session.unified_rows.len() {
+            let meta = session.unified_rows.get(cur_row.as(usize)).as(UnifiedRowMeta)
+            if meta.hunk_idx >= 0 and meta.hunk_idx < session.hunks.len() {
+                return session.hunks.get(meta.hunk_idx.as(usize)).as(SessionHunk)
+            }
+        }
+        for i in 0..session.hunks.len() {
+            let sh = session.hunks.get(i.as(usize)).as(SessionHunk)
+            if sh.unified_row - cur_row >= -1 and sh.unified_row - cur_row <= 1 {
+                return sh
+            }
+        }
+        return null
+    }
+
+    if cur_row >= 0 and cur_row < session.sbs_rows.len() {
+        let meta = session.sbs_rows.get(cur_row.as(usize)).as(SbsRowMeta)
+        if meta.hunk_idx >= 0 and meta.hunk_idx < session.hunks.len() {
+            return session.hunks.get(meta.hunk_idx.as(usize)).as(SessionHunk)
+        }
+    }
+    for i in 0..session.hunks.len() {
+        let sh = session.hunks.get(i.as(usize)).as(SessionHunk)
+        if sh.sbs_row - cur_row >= -1 and sh.sbs_row - cur_row <= 1 {
+            return sh
+        }
+    }
+    null
+}
+
+fn apply_hunk_patch_transfer(
+    kernel: SystemKernel,
+    is_obtain: bool,
+) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let session = service.session
+    if not session.active {
+        return error "No active diff session"
+    }
+
+    let active_buf = world.active_buffer()
+    let sh? = find_session_hunk_at_cursor(session, active_buf.point.row) else {
+        status_emit("No diff hunk under cursor")#
+        return ()
+    }
+
+    -- Determine transfer direction (`from_left_to_right: bool`)
+    var left_to_right = true
+    if session.layout == "side-by-side" {
+        var in_left = false
+        if session.left_diff_buf_id != null {
+            let lbid? = session.left_diff_buf_id else { return () }
+            in_left = active_buf.id == lbid
+        }
+        if in_left {
+            -- In Left pane: `do` obtains Right -> Left (`false`); `dp` puts Left -> Right (`true`)
+            left_to_right = not is_obtain
+        } else {
+            -- In Right pane: `do` obtains Left -> Right (`true`); `dp` puts Right -> Left (`false`)
+            left_to_right = is_obtain
+        }
+    } else {
+        -- In Unified view: if only one side is editable, target the editable side on `do`!
+        if is_obtain {
+            if session.right_source.editable {
+                left_to_right = true
+            } else if session.left_source.editable {
+                left_to_right = false
+            } else {
+                left_to_right = true
+            }
+        } else {
+            if session.left_source.editable {
+                left_to_right = false
+            } else {
+                left_to_right = true
+            }
+        }
+    }
+
+    let dst_src = if left_to_right { session.right_source } else { session.left_source }
+    if not dst_src.editable {
+        return error ("Target side '" ++ dst_src.title ++ "' is read-only")
+    }
+    let dst_bid? = dst_src.buf_id else {
+        return error ("Target side '" ++ dst_src.title ++ "' is read-only")
+    }
+    let dst_buf? = world.buffer(dst_bid) else {
+        return error ("Target buffer no longer exists: " ++ dst_src.title)
+    }
+    dst_buf.ensure_writable()!
+
+    let src_raw = if left_to_right { session.left_raw_lines } else { session.right_raw_lines }
+    let dst_raw = dst_buf.slice_lines(0, min_i64(dst_buf.line_count(), 50000))
+    let src_s = if left_to_right { sh.raw_left_start } else { sh.raw_right_start }
+    let src_e = if left_to_right { sh.raw_left_end } else { sh.raw_right_end }
+    let dst_s = if left_to_right { sh.raw_right_start } else { sh.raw_left_start }
+    let dst_e = if left_to_right { sh.raw_right_end } else { sh.raw_left_end }
+
+    let rebuilt = List()
+    for i in 0..min_i64(dst_s, dst_raw.len()) {
+        rebuilt.push(dst_raw.get(i.as(usize)).as(String))
+    }
+    for j in max_i64(0, src_s)..min_i64(src_e, src_raw.len()) {
+        rebuilt.push(src_raw.get(j.as(usize)).as(String))
+    }
+    for k in max_i64(dst_s, dst_e)..dst_raw.len() {
+        rebuilt.push(dst_raw.get(k.as(usize)).as(String))
+    }
+    if rebuilt.is_empty() {
+        rebuilt.push("")
+    }
+
+    let action_name = if is_obtain { "diff-obtain" } else { "diff-put" }
+    dst_buf.set_lines(rebuilt, record_undo = true, label = action_name)
+    let dest_pt_row = min_i64(max_i64(0, dst_s), dst_buf.max_row())
+    dst_buf.point = dst_buf.clamp_pos(Pos.new(dest_pt_row, dst_buf.first_non_blank_col(dest_pt_row)), insert_mode = false)
+    dst_buf.preferred_col = dst_buf.point.col
+    dst_buf.checkpoint(dst_buf.point, action_name)
+
+    kernel.emit_hook("buffer-modified", dst_buf.id)
+    refresh_diff_session(kernel, world, service, preserve_cursor = true)#!
+    status_emit(
+        "Applied " ++ action_name ++ " -> " ++ dst_buf.name
+        ++ " (" ++ session.hunks.len().to_string() ++ " hunks remaining)"
+    )#
+    ()
+}
+
+fn find_nearest_sbs_orig_row(sbs_rows: List, cur_row: i64, want_left: bool) -> i64 {
+    if cur_row < 0 or cur_row >= sbs_rows.len() {
+        return 0
+    }
+    let cur_meta = sbs_rows.get(cur_row.as(usize)).as(SbsRowMeta)
+    let direct = if want_left { cur_meta.left_orig_row } else { cur_meta.right_orig_row }
+    if direct >= 0 {
+        return direct
+    }
+    -- Scan outward for nearest real source line on that side
+    var dist: i64 = 1
+    while dist < sbs_rows.len() {
+        if cur_row - dist >= DIFF_HEADER_ROWS {
+            let m_up = sbs_rows.get((cur_row - dist).as(usize)).as(SbsRowMeta)
+            let v_up = if want_left { m_up.left_orig_row } else { m_up.right_orig_row }
+            if v_up >= 0 {
+                return v_up
+            }
+        }
+        if cur_row + dist < sbs_rows.len() {
+            let m_dn = sbs_rows.get((cur_row + dist).as(usize)).as(SbsRowMeta)
+            let v_dn = if want_left { m_dn.left_orig_row } else { m_dn.right_orig_row }
+            if v_dn >= 0 {
+                return v_dn
+            }
+        }
+        dist += 1
+    }
+    0
+}
+
+fn source_has_navigable_buffer(src: DiffSource) -> bool {
+    src.buf_id != null or (src.kind == "buffer" and src.file_path != "")
+}
+
+fn cmd_goto_source(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let session = service.session
+    let active_buf = world.active_buffer()
+
+    -- Also handle `<Return>` in `*DiffView*` and `*DiffDirs*` seamlessly!
+    if active_buf.major_mode == "diffview" {
+        let idx = active_buf.point.row - DIFF_HEADER_ROWS
+        if idx >= 0 and idx < service.diffview_entries.len() {
+            open_diffview_entry_by_index(kernel, world, service, idx)#!
+        }
+        return ()
+    }
+    if active_buf.major_mode == "diffdirs" {
+        let idx = active_buf.point.row - DIFF_HEADER_ROWS
+        if idx >= 0 and idx < service.diffdirs_entries.len() {
+            open_diffdirs_entry_by_index(kernel, world, service, idx)#!
+        }
+        return ()
+    }
+
+    if not session.active {
+        return error "No active diff session"
+    }
+
+    let cur_row = active_buf.point.row
+    var choose_left = false
+    var target_orig_row: i64 = 0
+
+    if session.layout == "unified" {
+        if cur_row >= 0 and cur_row < session.unified_rows.len() {
+            let umeta = session.unified_rows.get(cur_row.as(usize)).as(UnifiedRowMeta)
+            if umeta.kind == "delete" and source_has_navigable_buffer(session.left_source) {
+                choose_left = true
+                target_orig_row = max_i64(0, umeta.left_orig_row)
+            } else if umeta.right_orig_row >= 0 and source_has_navigable_buffer(session.right_source) {
+                choose_left = false
+                target_orig_row = umeta.right_orig_row
+            } else if umeta.left_orig_row >= 0 and source_has_navigable_buffer(session.left_source) {
+                choose_left = true
+                target_orig_row = umeta.left_orig_row
+            } else if source_has_navigable_buffer(session.right_source) {
+                choose_left = false
+                target_orig_row = max_i64(0, umeta.left_orig_row)
+            }
+        }
+    } else {
+        var in_left = false
+        if session.left_diff_buf_id != null {
+            let lbid? = session.left_diff_buf_id else { return () }
+            in_left = active_buf.id == lbid
+        }
+        if in_left and source_has_navigable_buffer(session.left_source) {
+            choose_left = true
+            target_orig_row = find_nearest_sbs_orig_row(session.sbs_rows, cur_row, true)
+        } else if source_has_navigable_buffer(session.right_source) {
+            choose_left = false
+            target_orig_row = find_nearest_sbs_orig_row(session.sbs_rows, cur_row, false)
+        } else if source_has_navigable_buffer(session.left_source) {
+            choose_left = true
+            target_orig_row = find_nearest_sbs_orig_row(session.sbs_rows, cur_row, true)
+        } else {
+            return error "Neither diff side is backed by a navigable buffer or file"
+        }
+    }
+
+    let tgt_src = if choose_left { session.left_source } else { session.right_source }
+    var tgt_buf_opt: ?Buffer = null
+    if tgt_src.buf_id != null {
+        let tbid? = tgt_src.buf_id else { return () }
+        let b_opt = world.buffer(tbid)
+        if b_opt != null {
+            tgt_buf_opt = b_opt.as(Buffer)
+        }
+    }
+    if tgt_buf_opt == null {
+        if tgt_src.file_path != "" {
+            tgt_buf_opt = open_or_load_file_buffer(kernel, world, tgt_src.file_path)#!
+        } else {
+            return error ("Cannot navigate to snapshot source: " ++ tgt_src.title)
+        }
+    }
+    let tgt_buf? = tgt_buf_opt else {
+        return error ("Cannot navigate to snapshot source: " ++ tgt_src.title)
+    }
+
+    session.active = false
+    let wm_opt = optional_wm(kernel)
+    if wm_opt != null {
+        let wm = wm_opt.as(WindowManager)
+        if session.prev_single_window {
+            wm.close_others(world)
+        }
+        let ap = wm.active_pane()
+        ap.buffer_id = tgt_buf.id
+        world.active_buffer_id = tgt_buf.id
+        tgt_buf.point = tgt_buf.clamp_pos(
+            Pos.new(target_orig_row, tgt_buf.first_non_blank_col(target_orig_row)),
+            insert_mode = false,
+        )
+        tgt_buf.preferred_col = tgt_buf.point.col
+        ap.cursor = tgt_buf.point
+        wm.sync_from_world(world)
+    } else {
+        let _ = world.switch_to_buffer(tgt_buf.id)
+        tgt_buf.point = tgt_buf.clamp_pos(
+            Pos.new(target_orig_row, tgt_buf.first_non_blank_col(target_orig_row)),
+            insert_mode = false,
+        )
+        tgt_buf.preferred_col = tgt_buf.point.col
+    }
+
+    world.jumps.record(tgt_buf.id, tgt_buf.file_path, tgt_buf.point)
+    let v_opt = kernel.service("lava.vim.state")
+    if v_opt != null {
+        sync_world_from_vim(world, v_opt.as(VimState))
+    }
+    kernel.emit_hook("buffer-switched", tgt_buf.id)
+    status_emit("Jumped to " ++ tgt_buf.name ++ " line " ++ (tgt_buf.point.row + 1).to_string())#
+    ()
+}
+
+-- ============================================================================
+-- 6. Stdio `Filter` & `Mapper` Pipeline Commands, Presets & Toggles
+-- ============================================================================
+
+fn apply_candidate_stages(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    service: DiffService,
+    candidate_stages: List,
+    success_msg: String,
+) -> #ServiceEffects !String Unit {
+    let session = service.session
+    if not session.active {
+        return error "No active diff session"
+    }
+
+    let comp_res = compute_pipeline_and_hunks(
+        world.cwd,
+        session.left_raw_lines,
+        session.right_raw_lines,
+        candidate_stages,
+        session.ignore_whitespace,
+    )
+
+    var failed_err = ""
+    let comp_ok = comp_res ! {
+        err_msg => {
+            failed_err = err_msg
+            (List(), List(), List(), 0, 0, 0)
+        },
+    }
+    if failed_err != "" {
+        -- Abort cleanly: preserve previous valid `session.stages` and diff buffers!
+        session.last_error = failed_err
+        let _ = world.push_notification("error", "Diff Pipeline", failed_err)
+        log_event("error", "ext_diff", failed_err)#
+        status_emit(failed_err)#
+        return error failed_err
+    }
+    let (l_trk, r_trk, shunks, add_n, del_n, chg_n) = comp_ok
+
+    session.stages = candidate_stages
+    session.left_tracked = l_trk
+    session.right_tracked = r_trk
+    session.hunks = shunks
+    session.added_count = add_n
+    session.deleted_count = del_n
+    session.changed_count = chg_n
+    session.last_error = ""
+
+    let wm_opt = optional_wm(kernel)
+    render_active_diff_buffers(world, wm_opt, session)
+
+    let first_r = if not session.hunks.is_empty() {
+        let h0 = session.hunks.get(0).as(SessionHunk)
+        if session.layout == "unified" { h0.unified_row } else { h0.sbs_row }
+    } else {
+        DIFF_HEADER_ROWS
+    }
+    position_diff_cursor_at_row(world, wm_opt, session, first_r)
+    status_emit(success_msg ++ " -> " ++ session.hunks.len().to_string() ++ " hunk(s)")#
+    ()
+}
+
+fn cmd_add_pipeline_stage(
+    kernel: SystemKernel,
+    kind: DiffStageKind,
+    args: List,
+) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let session = service.session
+    if not session.active {
+        return error "No active diff session"
+    }
+
+    let arg_cmd = join_raw_arg_string(args)
+    let raw_spec = if arg_cmd != "" {
+        arg_cmd
+    } else {
+        let prompt_lbl = kind match {
+            DiffStageKind.Filter => "Diff Filter command (stdin -> stdout, e.g. rg -v '^DEBUG'): ",
+            DiffStageKind.Mapper => "Diff Mapper command (stdin -> stdout, e.g. sed -E 's/0x[0-9a-fA-F]+/0xADDR/g'): ",
+        }
+        let ans? = ask_prompt(PromptRequest.text(prompt_lbl, ""))# else {
+            status_emit(kind.name() ++ " cancelled")#
+            return ()
+        }
+        ans.trim()
+    }
+
+    if raw_spec == "" {
+        status_emit("Empty " ++ kind.name() ++ " command ignored")#
+        return ()
+    }
+
+    let (side, actual_cmd) = parse_stage_command_spec(raw_spec)
+    if actual_cmd == "" {
+        return error "Pipeline command cannot be empty"
+    }
+
+    let st_id = session.next_stage_id
+    let new_stage = DiffPipelineStage {
+        stage_id: st_id,
+        kind: kind,
+        command: actual_cmd,
+        side: side,
+        enabled: true,
+        label: summarize_stage_label(actual_cmd),
+    }
+
+    let next_stages = clone_stage_list(session.stages)
+    next_stages.push(new_stage)
+    apply_candidate_stages(
+        kernel,
+        world,
+        service,
+        next_stages,
+        "Added " ++ kind.name() ++ " #" ++ st_id.to_string() ++ " (`" ++ summarize_stage_label(actual_cmd) ++ "`)",
+    )#!
+    session.next_stage_id = st_id + 1
+    ()
+}
+
+fn preset_prompt_candidates(service: DiffService) -> List {
+    let out = List()
+    for i in 0..service.presets.len() {
+        let p = service.presets.get(i.as(usize)).as(DiffPreset)
+        out.push(p.name ++ "  [" ++ p.kind.name() ++ "] " ++ p.description)
+    }
+    out
+}
+
+fn cmd_apply_preset(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let session = service.session
+    if not session.active {
+        return error "No active diff session"
+    }
+
+    let arg_name = join_raw_arg_string(args)
+    let chosen_raw = if arg_name != "" {
+        arg_name
+    } else {
+        let cands = preset_prompt_candidates(service)
+        let ans? = ask_prompt(PromptRequest.with_candidates(
+            "Apply Diff Preset: ",
+            "",
+            PromptKind.Choice,
+            cands,
+        ))# else {
+            status_emit("DiffPreset cancelled")#
+            return ()
+        }
+        ans.trim()
+    }
+    if chosen_raw == "" {
+        return ()
+    }
+
+    -- Extract preset key before whitespace description if chosen from `PromptKind.Choice`
+    let preset_key = chosen_raw.split(" ").get(0).as(String).trim()
+    let preset? = service.find_preset(preset_key) else {
+        return error ("Unknown diff preset: " ++ preset_key)
+    }
+
+    let st_id = session.next_stage_id
+    let new_stage = DiffPipelineStage {
+        stage_id: st_id,
+        kind: preset.kind,
+        command: preset.command,
+        side: "both",
+        enabled: true,
+        label: preset.name,
+    }
+    let next_stages = clone_stage_list(session.stages)
+    next_stages.push(new_stage)
+    apply_candidate_stages(
+        kernel,
+        world,
+        service,
+        next_stages,
+        "Applied preset '" ++ preset.name ++ "' [" ++ preset.kind.name() ++ "]",
+    )#!
+    session.next_stage_id = st_id + 1
+    ()
+}
+
+fn cmd_clear_filters(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    if not service.session.active {
+        return error "No active diff session"
+    }
+    let _ = world.remove_floating_window(FLOAT_DIFF_PIPELINE)
+    apply_candidate_stages(kernel, world, service, List(), "Cleared all Mapper & Filter stages")#!
+    ()
+}
+
+fn show_pipeline_float(world: EditorWorld, session: DiffSession) {
+    let lines = List()
+    if session.stages.is_empty() {
+        lines.push(" (No active Mapper or Filter stages — comparing raw source text)")
+    } else {
+        for i in 0..session.stages.len() {
+            let st = session.stages.get(i.as(usize)).as(DiffPipelineStage)
+            let on_tag = if st.enabled { "[ON] " } else { "[OFF]" }
+            lines.push(
+                " #" ++ (i + 1).to_string() ++ " " ++ on_tag ++ " "
+                ++ st.kind.name() ++ " (" ++ st.side ++ "): " ++ st.command
+            )
+        }
+    }
+    var w: i64 = 58
+    for i in 0..lines.len() {
+        let lw = lines.get(i.as(usize)).as(String).char_len() + 4
+        if lw > w {
+            w = lw
+        }
+    }
+    if w > 100 {
+        w = 100
+    }
+    let h = min_i64(16, max_i64(3, lines.len()))
+    world.set_floating_window(FloatingWindow {
+        id: FLOAT_DIFF_PIPELINE,
+        owner: OWNER_DIFF,
+        title: " Diff Stdio Pipeline (" ++ session.stages.len().to_string() ++ " stages) ",
+        anchor: "center",
+        width_cols: w,
+        height_rows: h,
+        lines: lines,
+        selected_row: 0,
+        border_rgba: rgba_hex(0x89B4FA, 255),
+    })
+}
+
+fn cmd_pipeline_manage(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let session = service.session
+    if not session.active {
+        return error "No active diff session"
+    }
+
+    let raw_arg = join_raw_arg_string(args)
+    let action_str = if raw_arg != "" {
+        raw_arg
+    } else {
+        let cands = List()
+        if not session.stages.is_empty() {
+            cands.push("pop — Remove last pipeline stage (#" ++ session.stages.len().to_string() ++ ")")
+            for i in 0..session.stages.len() {
+                let st = session.stages.get(i.as(usize)).as(DiffPipelineStage)
+                let flag = if st.enabled { "ON" } else { "OFF" }
+                cands.push(
+                    "toggle " ++ (i + 1).to_string() ++ " — [" ++ flag ++ "] "
+                    ++ st.kind.name() ++ ": " ++ summarize_stage_label(st.command)
+                )
+                cands.push(
+                    "drop " ++ (i + 1).to_string() ++ " — Delete stage #" ++ (i + 1).to_string()
+                )
+            }
+            cands.push("clear — Clear all pipeline stages")
+        }
+        cands.push("show — Show pipeline stages floating window")
+        cands.push("close — Hide pipeline floating window")
+
+        show_pipeline_float(world, session)
+        let ans? = ask_prompt(PromptRequest.with_candidates(
+            "Manage Diff Pipeline: ",
+            "",
+            PromptKind.Choice,
+            cands,
+        ))# else {
+            let _ = world.remove_floating_window(FLOAT_DIFF_PIPELINE)
+            return ()
+        }
+        let _ = world.remove_floating_window(FLOAT_DIFF_PIPELINE)
+        let strip_opt = ans.split_once("—")
+        if strip_opt != null {
+            let (head, _) = strip_opt.as((String, String))
+            head.trim()
+        } else {
+            ans.trim()
+        }
+    }
+
+    let low = action_str.to_lower()
+    if low == "show" or low == "list" {
+        show_pipeline_float(world, session)
+        status_emit("Showing Diff Pipeline (" ++ session.stages.len().to_string() ++ " stages)")#
+        return ()
+    }
+    if low == "close" or low == "hide" {
+        let _ = world.remove_floating_window(FLOAT_DIFF_PIPELINE)
+        return ()
+    }
+    if low == "clear" {
+        return cmd_clear_filters(kernel)#
+    }
+    if low == "pop" or low == "u" or low == "d" {
+        if session.stages.is_empty() {
+            status_emit("Pipeline is already empty")#
+            return ()
+        }
+        let next = clone_stage_list(session.stages)
+        let _ = next.pop()
+        apply_candidate_stages(kernel, world, service, next, "Popped last pipeline stage")#!
+        return ()
+    }
+    if low.starts_with("toggle ") {
+        let idx_str = low.drop(7).trim()
+        let idx_1? = idx_str.parse_i64() else {
+            return error ("Invalid stage index: " ++ idx_str)
+        }
+        let idx0 = idx_1 - 1
+        if idx0 < 0 or idx0 >= session.stages.len() {
+            return error ("Stage index out of range: " ++ idx_1.to_string())
+        }
+        let next = clone_stage_list(session.stages)
+        let st = next.get(idx0.as(usize)).as(DiffPipelineStage)
+        st.enabled = not st.enabled
+        apply_candidate_stages(
+            kernel,
+            world,
+            service,
+            next,
+            "Toggled stage #" ++ idx_1.to_string() ++ " -> " ++ (if st.enabled { "ON" } else { "OFF" }),
+        )#!
+        return ()
+    }
+    if low.starts_with("drop ") or low.starts_with("del ") {
+        let rest = if low.starts_with("drop ") { low.drop(5).trim() } else { low.drop(4).trim() }
+        let idx_1? = rest.parse_i64() else {
+            return error ("Invalid stage index: " ++ rest)
+        }
+        let idx0 = idx_1 - 1
+        if idx0 < 0 or idx0 >= session.stages.len() {
+            return error ("Stage index out of range: " ++ idx_1.to_string())
+        }
+        let next = clone_stage_list(session.stages)
+        let _ = next.remove(idx0.as(usize))
+        apply_candidate_stages(kernel, world, service, next, "Removed stage #" ++ idx_1.to_string())#!
+        return ()
+    }
+    status_emit("Unknown DiffPipeline action: " ++ action_str)#
+    ()
+}
+
+fn cmd_toggle_view_mapped(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let session = service.session
+    if not session.active {
+        return error "No active diff session"
+    }
+    session.show_mapped_text = not session.show_mapped_text
+    let saved_row = world.active_buffer().point.row
+    let wm_opt = optional_wm(kernel)
+    render_active_diff_buffers(world, wm_opt, session)
+    position_diff_cursor_at_row(world, wm_opt, session, saved_row)
+    let mode_lbl = if session.show_mapped_text and has_any_active_mapper(session.stages) {
+        "MAPPED"
+    } else {
+        "ORIGINAL"
+    }
+    status_emit("Diff display text: [" ++ mode_lbl ++ "] (" ++ session.hunks.len().to_string() ++ " hunks)")#
+    ()
+}
+
+fn cmd_toggle_layout(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let session = service.session
+    if not session.active {
+        return error "No active diff session"
+    }
+
+    let cur_hunk_opt = find_session_hunk_at_cursor(session, world.active_buffer().point.row)
+    let cur_hunk_idx = if cur_hunk_opt != null { cur_hunk_opt.as(SessionHunk).index } else { -1 }
+
+    let wm_opt = optional_wm(kernel)
+    if session.layout == "side-by-side" {
+        session.layout = "unified"
+        if wm_opt != null {
+            wm_opt.as(WindowManager).close_others(world)
+        }
+    } else {
+        session.layout = "side-by-side"
+        session.left_win_id = null
+        session.right_win_id = null
+    }
+
+    render_active_diff_buffers(world, wm_opt, session)
+    let dest_row = if cur_hunk_idx >= 0 and cur_hunk_idx < session.hunks.len() {
+        let sh = session.hunks.get(cur_hunk_idx.as(usize)).as(SessionHunk)
+        if session.layout == "unified" { sh.unified_row } else { sh.sbs_row }
+    } else {
+        DIFF_HEADER_ROWS
+    }
+    position_diff_cursor_at_row(world, wm_opt, session, dest_row)
+    kernel.emit_hook("buffer-switched", world.active_buffer_id)
+    status_emit("Diff layout: " ++ session.layout)#
+    ()
+}
+
+fn cmd_toggle_whitespace(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let session = service.session
+    if not session.active {
+        return error "No active diff session"
+    }
+    session.ignore_whitespace = not session.ignore_whitespace
+    refresh_diff_session(kernel, world, service, preserve_cursor = true)#!
+    status_emit(
+        "Diff ignore-whitespace: "
+        ++ (if session.ignore_whitespace { "ON" } else { "OFF" })
+        ++ " (" ++ session.hunks.len().to_string() ++ " hunks)"
+    )#
+    ()
+}
+
+fn step_context_lines(cur: i64, increase: bool) -> i64 {
+    let steps = [0, 1, 3, 6, 12, 9999]
+    var cur_i: i64 = 2
+    for i in 0..steps.len() {
+        if steps.get(i.as(usize)).as(i64) >= cur {
+            cur_i = i
+            break
+        }
+    }
+    let next_i = if increase {
+        min_i64(steps.len() - 1, cur_i + 1)
+    } else {
+        max_i64(0, cur_i - 1)
+    }
+    steps.get(next_i.as(usize)).as(i64)
+}
+
+fn cmd_adjust_context(kernel: SystemKernel, increase: bool) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let session = service.session
+    if not session.active {
+        return error "No active diff session"
+    }
+    session.context_lines = step_context_lines(session.context_lines, increase)
+    let wm_opt = optional_wm(kernel)
+    render_active_diff_buffers(world, wm_opt, session)
+    status_emit("Unified diff context lines: " ++ session.context_lines.to_string())#
+    ()
+}
+
+fn cmd_export_patch(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let session = service.session
+    if not session.active {
+        return error "No active diff session"
+    }
+
+    let patch_lines = format_standard_unified_patch(
+        session.left_source.title,
+        session.right_source.title,
+        session.left_tracked,
+        session.right_tracked,
+        session.hunks,
+        session.stages,
+        session.show_mapped_text,
+        session.context_lines,
+    )
+    let raw_out = join_raw_arg_string(args)
+    if raw_out != "" {
+        let full = world.resolve_path(raw_out)
+        let p_opt = path.parent(full)
+        if p_opt != null {
+            let pdir = p_opt.as(String)
+            if pdir != "" and (not fs.exists(pdir)) {
+                let _ = fs.create_dir_all(pdir) ! { _ => () }
+            }
+        }
+        let patch_text = patch_lines.join("\n") ++ "\n"
+        var write_err = ""
+        let _ = fs.write_string(full, patch_text) ! {
+            e => {
+                write_err = "Failed to export patch to " ++ full ++ ": " ++ e.to_string()
+                ()
+            },
+        }
+        if write_err != "" {
+            return error write_err
+        }
+        status_emit("Exported unified patch (" ++ patch_lines.len().to_string() ++ " lines) -> " ++ full)#
+        return full
+    }
+
+    let pbuf = world.ensure_special_buffer(BUF_DIFF_PATCH, "diff", patch_lines, read_only = false)
+    pbuf.kind = BufferKind.Scratch
+    let wm_opt = optional_wm(kernel)
+    if wm_opt != null {
+        let wm = wm_opt.as(WindowManager)
+        wm.close_others(world)
+        wm.active_pane().buffer_id = pbuf.id
+        world.active_buffer_id = pbuf.id
+        wm.sync_from_world(world)
+    } else {
+        let _ = world.switch_to_buffer(pbuf.id)
+    }
+    kernel.emit_hook("buffer-switched", pbuf.id)
+    status_emit("Exported patch to buffer " ++ BUF_DIFF_PATCH)#
+    ()
+}
+
+fn cmd_switch_diff_pane(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let active_buf = world.active_buffer()
+    if active_buf.major_mode == "diffview" or active_buf.major_mode == "diffdirs" {
+        return cmd_cycle_explorer_entry(kernel, 1)#
+    }
+    let session = service.session
+    if (not session.active) or session.layout != "side-by-side" {
+        return ()
+    }
+    let wm_opt = optional_wm(kernel)
+    if wm_opt != null {
+        let wm = wm_opt.as(WindowManager)
+        let _ = wm.cycle_window(1, world)
+        sync_diff_split_panes(world, wm_opt, session)
+        kernel.emit_hook("buffer-switched", world.active_buffer_id)
+    }
+    ()
+}
+
+fn cmd_cycle_explorer_entry(kernel: SystemKernel, delta: i64) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let active_buf = world.active_buffer()
+
+    if active_buf.major_mode == "diffview" {
+        let n = service.diffview_entries.len()
+        if n == 0 {
+            return ()
+        }
+        var cur = active_buf.point.row - DIFF_HEADER_ROWS
+        if cur < 0 or cur >= n {
+            cur = 0
+        }
+        var nxt = (cur + delta) % n
+        if nxt < 0 {
+            nxt += n
+        }
+        active_buf.point = active_buf.clamp_pos(Pos.new(DIFF_HEADER_ROWS + nxt, 0), insert_mode = false)
+        service.diffview_active_idx = nxt
+        let wm_opt = optional_wm(kernel)
+        if wm_opt != null {
+            wm_opt.as(WindowManager).sync_from_world(world)
+        }
+        return ()
+    }
+
+    if active_buf.major_mode == "diffdirs" {
+        let n = service.diffdirs_entries.len()
+        if n == 0 {
+            return ()
+        }
+        var cur = active_buf.point.row - DIFF_HEADER_ROWS
+        if cur < 0 or cur >= n {
+            cur = 0
+        }
+        var nxt = (cur + delta) % n
+        if nxt < 0 {
+            nxt += n
+        }
+        active_buf.point = active_buf.clamp_pos(Pos.new(DIFF_HEADER_ROWS + nxt, 0), insert_mode = false)
+        let wm_opt = optional_wm(kernel)
+        if wm_opt != null {
+            wm_opt.as(WindowManager).sync_from_world(world)
+        }
+        return ()
+    }
+
+    -- Inside an open file diff launched from DiffView: `]f` / `[f` cycles directly to next/prev repo file!
+    if service.session.active and (not service.diffview_entries.is_empty()) {
+        let n = service.diffview_entries.len()
+        var nxt = (service.diffview_active_idx + delta) % n
+        if nxt < 0 {
+            nxt += n
+        }
+        open_diffview_entry_by_index(kernel, world, service, nxt)#!
+    }
+    ()
+}
+
+fn find_fallback_restore_buffer(world: EditorWorld, preferred: ?BufferId) -> BufferId {
+    if preferred != null {
+        let pid? = preferred else { return world.scratch_id }
+        let b_opt = world.buffer(pid)
+        if b_opt != null and (not is_internal_diff_buffer_name(b_opt.as(Buffer).name)) {
+            return pid
+        }
+    }
+    for i in 0..world.buffer_order.len() {
+        let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+        let b = world.buffers.get(bid).as(Buffer)
+        if bid != world.messages_id and (not is_internal_diff_buffer_name(b.name)) {
+            return bid
+        }
+    }
+    world.scratch_id
+}
+
+fn cmd_quit_diff(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let active_buf = world.active_buffer()
+    let wm_opt = optional_wm(kernel)
+    let _ = world.remove_floating_window(FLOAT_DIFF_PIPELINE)
+
+    if active_buf.major_mode == "diffview" {
+        let restore_id = find_fallback_restore_buffer(world, service.diffview_prev_buf_id)
+        if wm_opt != null {
+            let wm = wm_opt.as(WindowManager)
+            wm.active_pane().buffer_id = restore_id
+            world.active_buffer_id = restore_id
+            wm.sync_from_world(world)
+        } else {
+            let _ = world.switch_to_buffer(restore_id)
+        }
+        let _ = world.kill_buffer(active_buf.id, force = true) ! { _ => restore_id }
+        kernel.emit_hook("buffer-switched", restore_id)
+        status_emit("Closed DiffView")#
+        return ()
+    }
+
+    if active_buf.major_mode == "diffdirs" {
+        let restore_id = find_fallback_restore_buffer(world, service.diffdirs_prev_buf_id)
+        if wm_opt != null {
+            let wm = wm_opt.as(WindowManager)
+            wm.active_pane().buffer_id = restore_id
+            world.active_buffer_id = restore_id
+            wm.sync_from_world(world)
+        } else {
+            let _ = world.switch_to_buffer(restore_id)
+        }
+        let _ = world.kill_buffer(active_buf.id, force = true) ! { _ => restore_id }
+        kernel.emit_hook("buffer-switched", restore_id)
+        status_emit("Closed DiffDirs")#
+        return ()
+    }
+
+    let session = service.session
+    session.active = false
+    let restore_id = find_fallback_restore_buffer(world, session.prev_buffer_id)
+
+    if wm_opt != null {
+        let wm = wm_opt.as(WindowManager)
+        wm.close_others(world)
+        let ap = wm.active_pane()
+        ap.buffer_id = restore_id
+        world.active_buffer_id = restore_id
+        ap.cursor = world.active_buffer().point
+        wm.sync_from_world(world)
+    } else {
+        let _ = world.switch_to_buffer(restore_id)
+    }
+
+    if session.left_diff_buf_id != null {
+        let lbid? = session.left_diff_buf_id else { return () }
+        let _ = world.kill_buffer(lbid, force = true) ! { _ => restore_id }
+        session.left_diff_buf_id = null
+    }
+    if session.right_diff_buf_id != null {
+        let rbid? = session.right_diff_buf_id else { return () }
+        let _ = world.kill_buffer(rbid, force = true) ! { _ => restore_id }
+        session.right_diff_buf_id = null
+    }
+    if session.unified_diff_buf_id != null {
+        let ubid? = session.unified_diff_buf_id else { return () }
+        let _ = world.kill_buffer(ubid, force = true) ! { _ => restore_id }
+        session.unified_diff_buf_id = null
+    }
+    session.left_win_id = null
+    session.right_win_id = null
+
+    let v_opt = kernel.service("lava.vim.state")
+    if v_opt != null {
+        sync_world_from_vim(world, v_opt.as(VimState))
+    }
+    kernel.emit_hook("buffer-switched", restore_id)
+    status_emit("Closed diff session")#
+    ()
+}
+
+fn cmd_refresh_any_diff(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let service = require_diff_service(kernel)!
+    let mode = world.active_buffer().major_mode
+    if mode == "diffview" {
+        return cmd_diff_view(kernel, [service.diffview_rev])#
+    }
+    if mode == "diffdirs" {
+        return cmd_diff_dirs(kernel, [service.diffdirs_left, service.diffdirs_right])#
+    }
+    refresh_diff_session(kernel, world, service, preserve_cursor = true)#!
+    status_emit("Refreshed diff (" ++ service.session.hunks.len().to_string() ++ " hunks)")#
+    ()
+}
+
+fn on_cursor_or_window_sync_hook(kernel: SystemKernel, _payload: Any) {
+    let w_opt = kernel.service("lava.document.world")
+    let s_opt = kernel.service(SERVICE_DIFF)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let service = s_opt.as(DiffService)
+    if service.session.active and service.session.layout == "side-by-side" {
+        sync_diff_split_panes(world, optional_wm(kernel), service.session)
+    }
+}
+
+-- ============================================================================
+-- 7. Extension Registration (`lava.org/ext_diff`)
+-- ============================================================================
+
+fn register_cmd_with_ex(
+    k: SystemKernel,
+    ext_id: ExtId,
+    kebab_name: String,
+    ex_name: String,
+    summary: String,
+    action: fn(SystemKernel, List) -> #InteractiveEffects !String Any,
+) {
+    k.register_command(kebab_name, ext_id, summary, action)
+    if ex_name != "" {
+        k.register_command("ex:" ++ ex_name, ext_id, "Ex command `:" ++ ex_name ++ "`.", action, interactive = false)
+    }
+}
+
+pub fn register_diff_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_diff_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_diff",
+        "0.1.0",
+        "Side-by-Side & Unified Diff/Patch engine with stdio Mapper & Filter pipelines (sed, awk, rg), intra-line highlights, Git DiffView, and directory comparison.",
+        [ext_document_id(), ext_window_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let service = DiffService.new()
+            k.publish_service(SERVICE_DIFF, ext_id, service)
+
+            -- 7 Comparison Entry Commands
+            register_cmd_with_ex(
+                k, ext_id, "diff-buffers", "DiffBuffers",
+                "Compare two open buffers side-by-side (`:DiffBuffers [bufA bufB]`, `<Space> d b`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any { cmd_diff_buffers(kern, args)# },
+            )
+            register_cmd_with_ex(
+                k, ext_id, "diff-files", "DiffFiles",
+                "Compare any two local or ssh:// files (`:DiffFiles [pathA pathB]`, `<Space> d f`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any { cmd_diff_files(kern, args)# },
+            )
+            register_cmd_with_ex(
+                k, ext_id, "diff-saved", "DiffSaved",
+                "Compare active unsaved buffer against its saved version (`:DiffSaved`, `<Space> d s`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any { cmd_diff_saved(kern)# },
+            )
+            register_cmd_with_ex(
+                k, ext_id, "diff-head", "DiffHead",
+                "Compare active buffer against Git revision (`:DiffHead [rev]`, `<Space> d h`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any { cmd_diff_head(kern, args)# },
+            )
+            register_cmd_with_ex(
+                k, ext_id, "diff-view", "DiffView",
+                "Open multi-file Git working-tree / revision diff explorer (`:DiffView [rev]`, `<Space> d v`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any { cmd_diff_view(kern, args)# },
+            )
+            register_cmd_with_ex(
+                k, ext_id, "diff-dirs", "DiffDirs",
+                "Compare two directories recursively (`:DiffDirs [dirA dirB]`, `<Space> d D`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any { cmd_diff_dirs(kern, args)# },
+            )
+            register_cmd_with_ex(
+                k, ext_id, "diff-selection", "DiffSelection",
+                "Capture & compare visual text selections (`:DiffSelection`, `<Space> d r`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any { cmd_diff_selection(kern, args)# },
+            )
+
+            -- Hunk Navigation, Patching & Source Jump
+            register_cmd_with_ex(
+                k, ext_id, "diff-next-hunk", "DiffNextHunk",
+                "Jump to next diff hunk (`]c` / `n`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any { cmd_jump_hunk(kern, true)# },
+            )
+            register_cmd_with_ex(
+                k, ext_id, "diff-prev-hunk", "DiffPrevHunk",
+                "Jump to previous diff hunk (`[c` / `p`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any { cmd_jump_hunk(kern, false)# },
+            )
+            register_cmd_with_ex(
+                k, ext_id, "diff-obtain", "DiffObtain",
+                "Pull hunk under cursor from the other diff side (`do`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any { apply_hunk_patch_transfer(kern, true)# },
+            )
+            register_cmd_with_ex(
+                k, ext_id, "diff-put", "DiffPut",
+                "Push hunk under cursor to the other diff side (`dp`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any { apply_hunk_patch_transfer(kern, false)# },
+            )
+            register_cmd_with_ex(
+                k, ext_id, "diff-goto-source", "DiffGotoSource",
+                "Jump to the exact unfiltered original line in the source buffer (`<Return>` / `gf`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any { cmd_goto_source(kern)# },
+            )
+
+            -- Stdio `Filter` & `Mapper` Pipeline Commands
+            register_cmd_with_ex(
+                k, ext_id, "diff-filter", "DiffFilter",
+                "Add a stdio Filter stage (`:DiffFilter [cmd]`, `f`, `<Space> d |`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    cmd_add_pipeline_stage(kern, DiffStageKind.Filter, args)#
+                },
+            )
+            register_cmd_with_ex(
+                k, ext_id, "diff-map", "DiffMap",
+                "Add a stdio Mapper stage (`:DiffMap [cmd]`, `m`, `<Space> d m`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    cmd_add_pipeline_stage(kern, DiffStageKind.Mapper, args)#
+                },
+            )
+            register_cmd_with_ex(
+                k, ext_id, "diff-preset", "DiffPreset",
+                "Apply a built-in or custom sed/awk/rg diff preset (`:DiffPreset [name]`, `P`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any { cmd_apply_preset(kern, args)# },
+            )
+            register_cmd_with_ex(
+                k, ext_id, "diff-pipeline-manage", "DiffPipeline",
+                "Manage, toggle, pop, or inspect active stdio pipeline stages (`:DiffPipeline`, `F`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any { cmd_pipeline_manage(kern, args)# },
+            )
+            k.register_command(
+                "diff-pipeline", ext_id, "Alias for `diff-pipeline-manage`.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any { cmd_pipeline_manage(kern, args)# },
+                interactive = false,
+            )
+            register_cmd_with_ex(
+                k, ext_id, "diff-clear-filters", "DiffClearFilters",
+                "Clear all Mapper and Filter pipeline stages (`:DiffClearFilters`, `X`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any { cmd_clear_filters(kern)# },
+            )
+
+            -- View, Layout, Whitespace, Context, Refresh, Patch Export & Close
+            register_cmd_with_ex(
+                k, ext_id, "diff-toggle-view-mapped", "DiffToggleViewMapped",
+                "Toggle displaying mapped text vs original unmasked text (`v`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any { cmd_toggle_view_mapped(kern)# },
+            )
+            k.register_command(
+                "diff-toggle-display-mapped", ext_id, "Alias for `diff-toggle-view-mapped`.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any { cmd_toggle_view_mapped(kern)# },
+                interactive = false,
+            )
+            register_cmd_with_ex(
+                k, ext_id, "diff-toggle-layout", "DiffToggleLayout",
+                "Toggle between Side-by-Side split and Unified patch view (`:DiffToggleLayout`, `t`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any { cmd_toggle_layout(kern)# },
+            )
+            register_cmd_with_ex(
+                k, ext_id, "diff-toggle-whitespace", "DiffToggleWhitespace",
+                "Toggle ignore-whitespace diff comparison (`:DiffToggleWhitespace`, `w`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any { cmd_toggle_whitespace(kern)# },
+            )
+            k.register_command(
+                "diff-context-less", ext_id, "Decrease unified diff context lines (`c` / `-`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any { cmd_adjust_context(kern, false)# },
+            )
+            k.register_command(
+                "diff-context-more", ext_id, "Increase unified diff context lines (`C` / `+`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any { cmd_adjust_context(kern, true)# },
+            )
+            register_cmd_with_ex(
+                k, ext_id, "diff-refresh", "DiffRefresh",
+                "Re-read diff sources and re-run stdio pipeline (`:DiffRefresh`, `R` / `gr`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any { cmd_refresh_any_diff(kern)# },
+            )
+            register_cmd_with_ex(
+                k, ext_id, "diff-export-patch", "DiffExportPatch",
+                "Export standard unified .patch to a buffer or file (`:DiffExportPatch [path]`, `W`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any { cmd_export_patch(kern, args)# },
+            )
+            register_cmd_with_ex(
+                k, ext_id, "diff-quit", "DiffClose",
+                "Close active diff view and restore previous window/buffer (`:DiffClose`, `q`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any { cmd_quit_diff(kern)# },
+            )
+            k.register_command(
+                "diff-close", ext_id, "Alias for `diff-quit`.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any { cmd_quit_diff(kern)# },
+                interactive = false,
+            )
+            k.register_command(
+                "diff-switch-pane", ext_id, "Switch focus between Left and Right diff panes (`<Tab>`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any { cmd_switch_diff_pane(kern)# },
+            )
+            k.register_command(
+                "diffview-next-file", ext_id, "Cycle to next changed file (`]f`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any { cmd_cycle_explorer_entry(kern, 1)# },
+            )
+            k.register_command(
+                "diffview-prev-file", ext_id, "Cycle to previous changed file (`[f`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any { cmd_cycle_explorer_entry(kern, -1)# },
+            )
+
+            -- `mode:diff` Keymap
+            let diff_km = k.ensure_keymap("mode:diff")
+            diff_km.bind("] c", "diff-next-hunk", ext_id, description = "Next diff hunk")
+            diff_km.bind("n", "diff-next-hunk", ext_id, description = "Next diff hunk")
+            diff_km.bind("[ c", "diff-prev-hunk", ext_id, description = "Previous diff hunk")
+            diff_km.bind("p", "diff-prev-hunk", ext_id, description = "Previous diff hunk")
+            diff_km.bind("d o", "diff-obtain", ext_id, description = "Obtain hunk from other side")
+            diff_km.bind("d p", "diff-put", ext_id, description = "Put hunk to other side")
+            diff_km.bind("<Return>", "diff-goto-source", ext_id, description = "Jump to unfiltered source line")
+            diff_km.bind("g f", "diff-goto-source", ext_id, description = "Jump to unfiltered source line")
+            diff_km.bind("f", "diff-filter", ext_id, description = "Add stdio Filter stage")
+            diff_km.bind("m", "diff-map", ext_id, description = "Add stdio Mapper stage")
+            diff_km.bind("P", "diff-preset", ext_id, description = "Apply sed/awk/rg preset")
+            diff_km.bind("F", "diff-pipeline-manage", ext_id, description = "Manage pipeline stages")
+            diff_km.bind("X", "diff-clear-filters", ext_id, description = "Clear all pipeline stages")
+            diff_km.bind("v", "diff-toggle-view-mapped", ext_id, description = "Toggle MAPPED vs ORIGINAL view")
+            diff_km.bind("t", "diff-toggle-layout", ext_id, description = "Toggle Side-by-Side vs Unified")
+            diff_km.bind("w", "diff-toggle-whitespace", ext_id, description = "Toggle ignore whitespace")
+            diff_km.bind("c", "diff-context-less", ext_id, description = "Decrease unified context")
+            diff_km.bind("-", "diff-context-less", ext_id, description = "Decrease unified context")
+            diff_km.bind("C", "diff-context-more", ext_id, description = "Increase unified context")
+            diff_km.bind("+", "diff-context-more", ext_id, description = "Increase unified context")
+            diff_km.bind("=", "diff-context-more", ext_id, description = "Increase unified context")
+            diff_km.bind("R", "diff-refresh", ext_id, description = "Refresh diff & re-run pipeline")
+            diff_km.bind("g r", "diff-refresh", ext_id, description = "Refresh diff & re-run pipeline")
+            diff_km.bind("W", "diff-export-patch", ext_id, description = "Export unified .patch")
+            diff_km.bind("q", "diff-quit", ext_id, description = "Close diff view")
+            diff_km.bind("<Tab>", "diff-switch-pane", ext_id, description = "Switch Left/Right diff pane")
+            diff_km.bind("] f", "diffview-next-file", ext_id, description = "Next file in DiffView")
+            diff_km.bind("[ f", "diffview-prev-file", ext_id, description = "Previous file in DiffView")
+
+            -- `mode:diffview` & `mode:diffdirs` Explorer Keymaps
+            let dv_km = k.ensure_keymap("mode:diffview")
+            dv_km.bind("<Return>", "diff-goto-source", ext_id, description = "Open file diff")
+            dv_km.bind("] f", "diffview-next-file", ext_id, description = "Next changed file")
+            dv_km.bind("[ f", "diffview-prev-file", ext_id, description = "Previous changed file")
+            dv_km.bind("<Tab>", "diffview-next-file", ext_id, description = "Next changed file")
+            dv_km.bind("R", "diff-refresh", ext_id, description = "Refresh DiffView")
+            dv_km.bind("g r", "diff-refresh", ext_id, description = "Refresh DiffView")
+            dv_km.bind("q", "diff-quit", ext_id, description = "Close DiffView")
+
+            let dd_km = k.ensure_keymap("mode:diffdirs")
+            dd_km.bind("<Return>", "diff-goto-source", ext_id, description = "Open file pair diff")
+            dd_km.bind("] f", "diffview-next-file", ext_id, description = "Next differing file")
+            dd_km.bind("[ f", "diffview-prev-file", ext_id, description = "Previous differing file")
+            dd_km.bind("<Tab>", "diffview-next-file", ext_id, description = "Next differing file")
+            dd_km.bind("R", "diff-refresh", ext_id, description = "Rescan directories")
+            dd_km.bind("g r", "diff-refresh", ext_id, description = "Rescan directories")
+            dd_km.bind("q", "diff-quit", ext_id, description = "Close DiffDirs")
+
+            -- `<Space> d ...` Leader & Visual Keybindings
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> d b", "diff-buffers", ext_id, description = "Diff buffers")
+            leader_km.bind("<Space> d f", "diff-files", ext_id, description = "Diff files (local/ssh)")
+            leader_km.bind("<Space> d s", "diff-saved", ext_id, description = "Diff against saved file")
+            leader_km.bind("<Space> d h", "diff-head", ext_id, description = "Diff against Git HEAD/rev")
+            leader_km.bind("<Space> d v", "diff-view", ext_id, description = "Git DiffView explorer")
+            leader_km.bind("<Space> d D", "diff-dirs", ext_id, description = "Diff two directories")
+            leader_km.bind("<Space> d r", "diff-selection", ext_id, description = "Diff visual selection")
+            leader_km.bind("<Space> d ]", "diff-next-hunk", ext_id, description = "Next diff hunk")
+            leader_km.bind("<Space> d [", "diff-prev-hunk", ext_id, description = "Previous diff hunk")
+            leader_km.bind("<Space> d |", "diff-filter", ext_id, description = "Add stdio Filter stage")
+            leader_km.bind("<Space> d m", "diff-map", ext_id, description = "Add stdio Mapper stage")
+            leader_km.bind("<Space> d p", "diff-preset", ext_id, description = "Apply diff preset")
+            leader_km.bind("<Space> d F", "diff-pipeline-manage", ext_id, description = "Manage diff pipeline")
+            leader_km.bind("<Space> d x", "diff-clear-filters", ext_id, description = "Clear diff filters/mappers")
+            leader_km.bind("<Space> d t", "diff-toggle-layout", ext_id, description = "Toggle diff layout")
+            leader_km.bind("<Space> d w", "diff-toggle-whitespace", ext_id, description = "Toggle diff whitespace")
+            leader_km.bind("<Space> d W", "diff-export-patch", ext_id, description = "Export unified patch")
+            leader_km.bind("<Space> d q", "diff-quit", ext_id, description = "Close diff session")
+
+            let visual_km = k.ensure_keymap(KEYMAP_VIM_VISUAL)
+            visual_km.bind("<Space> d r", "diff-selection", ext_id, description = "Capture/diff visual selection")
+
+            -- Synchronize Side-by-Side split panes on cursor movement and window focus
+            k.add_hook("cursor-moved", ext_id, on_cursor_or_window_sync_hook)
+            k.add_hook("window-focused", ext_id, on_cursor_or_window_sync_hook)
+
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                let w = w_opt.as(EditorWorld)
+                w.clear_owner_ui(OWNER_DIFF)
+                let _ = w.remove_floating_window(FLOAT_DIFF_PIPELINE)
+            }
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            let _ = leader_km.unbind("<Space> d b")
+            let _ = leader_km.unbind("<Space> d f")
+            let _ = leader_km.unbind("<Space> d s")
+            let _ = leader_km.unbind("<Space> d h")
+            let _ = leader_km.unbind("<Space> d v")
+            let _ = leader_km.unbind("<Space> d D")
+            let _ = leader_km.unbind("<Space> d r")
+            let _ = leader_km.unbind("<Space> d ]")
+            let _ = leader_km.unbind("<Space> d [")
+            let _ = leader_km.unbind("<Space> d |")
+            let _ = leader_km.unbind("<Space> d m")
+            let _ = leader_km.unbind("<Space> d p")
+            let _ = leader_km.unbind("<Space> d F")
+            let _ = leader_km.unbind("<Space> d x")
+            let _ = leader_km.unbind("<Space> d t")
+            let _ = leader_km.unbind("<Space> d w")
+            let _ = leader_km.unbind("<Space> d W")
+            let _ = leader_km.unbind("<Space> d q")
+            let _ = k.ensure_keymap(KEYMAP_VIM_VISUAL).unbind("<Space> d r")
+            ()
+        },
+    )
+}

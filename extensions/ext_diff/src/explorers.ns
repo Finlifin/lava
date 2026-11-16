@@ -1,0 +1,543 @@
+-- explorers.ns: Git Revision Loader, Multi-File `*DiffView*` Explorer, and Recursive `*DiffDirs*`
+-- Directory Comparison Engine for `ext_diff`.
+
+use std.collections.{HashMap, Set}
+use std.fs
+use std.path
+use std.process
+use @lava_accel.{DiffHunk, GitFileEntry, accel_diff_lines, accel_git_head_lines, accel_git_status}
+use @ext_document.{Buffer, EditorWorld}
+use align.{DIFF_HEADER_ROWS, OWNER_DIFF, max_i64, rgba_hex}
+use pipeline.split_stdio_output_lines
+
+pub const BUF_DIFF_VIEW: String = "*DiffView*"
+pub const BUF_DIFF_DIRS: String = "*DiffDirs*"
+
+pub struct DiffViewEntry {
+    pub status: String,
+    pub rel_path: String,
+    pub full_path: String,
+    pub added: i64,
+    pub deleted: i64,
+}
+
+pub struct DiffDirEntry {
+    pub status: String,
+    pub rel_path: String,
+    pub left_path: String,
+    pub right_path: String,
+    pub added: i64,
+    pub deleted: i64,
+}
+
+pub fn effective_git_cwd(world: EditorWorld, file_path: String) -> String {
+    if file_path != "" and (not file_path.starts_with("ssh://")) {
+        let p_opt = path.parent(file_path)
+        if p_opt != null {
+            let pdir = p_opt.as(String)
+            if pdir != "" and fs.is_dir(pdir) {
+                return pdir
+            }
+        }
+    }
+    world.cwd
+}
+
+pub fn split_file_text_lines(raw: String) -> List {
+    if raw == "" {
+        return List()
+    }
+    let norm = raw.replace("\r\n", "\n").replace("\r", "\n")
+    let parts = norm.split("\n")
+    if (not parts.is_empty()) and norm.ends_with("\n") {
+        let _ = parts.pop()
+    }
+    parts
+}
+
+fn verify_git_rev(repo_root: String, rev: String) -> bool {
+    let out! = process.exec("git", args = ["rev-parse", "--verify", rev], cwd = repo_root) else {
+        return false
+    }
+    out.success()
+}
+
+pub fn fetch_git_revision_lines(
+    cwd: String,
+    file_path: String,
+    rev: String,
+) -> !String (String, String, List) {
+    if file_path == "" {
+        return error "Buffer has no file path to compare against Git"
+    }
+    let st = accel_git_status(cwd)
+    if not st.is_repo {
+        return error ("Not inside a Git repository: " ++ cwd)
+    }
+    let full = if path.is_absolute(file_path) {
+        path.normalize(file_path)
+    } else {
+        path.normalize(path.join(cwd, file_path))
+    }
+    let root_pfx = st.root ++ "/"
+    if not full.starts_with(root_pfx) {
+        return error ("File is outside Git repository root (" ++ st.root ++ "): " ++ full)
+    }
+    let rel = full.drop(root_pfx.char_len())
+    let target_rev = if rev.trim() == "" { "HEAD" } else { rev.trim() }
+
+    if target_rev == "HEAD" {
+        let head_opt = accel_git_head_lines(cwd, full)
+        if head_opt != null {
+            return (st.root, rel, head_opt.as(List))
+        }
+        if not verify_git_rev(st.root, "HEAD") {
+            return error "Git repository has no commits at HEAD yet"
+        }
+        -- File is untracked / newly added relative to HEAD
+        return (st.root, rel, List())
+    }
+
+    if not verify_git_rev(st.root, target_rev) {
+        return error ("Unknown Git revision: " ++ target_rev)
+    }
+
+    let out! = process.exec("git", args = ["show", target_rev ++ ":" ++ rel], cwd = st.root) else {
+        return (st.root, rel, List())
+    }
+    if out.success() {
+        return (st.root, rel, split_stdio_output_lines(out.stdout))
+    }
+    (st.root, rel, List())
+}
+
+fn count_lines_added_deleted(old_lines: List, new_lines: List) -> (i64, i64) {
+    let hunks = accel_diff_lines(old_lines, new_lines)
+    var add_n: i64 = 0
+    var del_n: i64 = 0
+    for i in 0..hunks.len() {
+        let h = hunks.get(i.as(usize)).as(DiffHunk)
+        add_n += h.new_count
+        del_n += h.old_count
+    }
+    (add_n, del_n)
+}
+
+fn read_disk_lines_or_empty(full_path: String) -> List {
+    if not fs.is_file(full_path) {
+        return List()
+    }
+    let raw! = fs.read_to_string(full_path) else {
+        return List()
+    }
+    split_file_text_lines(raw)
+}
+
+pub fn scan_git_diffview_entries(
+    world: EditorWorld,
+    cwd: String,
+    rev: String,
+) -> !String (String, String, List) {
+    let st = accel_git_status(cwd)
+    if not st.is_repo {
+        return error ("Not inside a Git repository: " ++ cwd)
+    }
+    let target_rev = if rev.trim() == "" { "HEAD" } else { rev.trim() }
+    let has_rev = verify_git_rev(st.root, target_rev)
+    if rev.trim() != "" and rev.trim() != "HEAD" and (not has_rev) {
+        return error ("Unknown Git revision: " ++ target_rev)
+    }
+
+    let status_by_rel = HashMap.new()
+    let rel_list = List()
+    let seen = Set.new()
+
+    if rev.trim() != "" and rev.trim() != "HEAD" {
+        let out = process.exec(
+            "git",
+            args = ["diff", "--name-status", target_rev],
+            cwd = st.root,
+        ) ! {
+            _ => process.CommandOutput { status: -1, stdout: "", stderr: "" },
+        }
+        if out.success() {
+            let lines = split_stdio_output_lines(out.stdout)
+            for i in 0..lines.len() {
+                let ln = lines.get(i.as(usize)).as(String)
+                let sp_opt = ln.split_once("\t")
+                if sp_opt != null {
+                    let (code_raw, rest_path) = sp_opt.as((String, String))
+                    let code = code_raw.trim().take(1)
+                    let final_rel = if rest_path.contains("\t") {
+                        let (_, r2) = rest_path.split_once("\t").as((String, String))
+                        r2.trim()
+                    } else {
+                        rest_path.trim()
+                    }
+                    if final_rel != "" and (not seen.contains(final_rel)) {
+                        seen.insert(final_rel)
+                        rel_list.push(final_rel)
+                        status_by_rel.insert(final_rel, if code != "" { code } else { "M" })
+                    }
+                }
+            }
+        }
+    }
+
+    -- Always include working-tree / index entries from `accel_git_status` when comparing working tree
+    for i in 0..st.entries.len() {
+        let ge = st.entries.get(i.as(usize)).as(GitFileEntry)
+        let rel = ge.rel_path
+        if rel != "" and (not seen.contains(rel)) {
+            seen.insert(rel)
+            rel_list.push(rel)
+            let badge = if ge.index_status == "?" {
+                "?"
+            } else if ge.index_status == "A" {
+                "A"
+            } else if ge.index_status == "D" or ge.worktree_status == "D" {
+                "D"
+            } else {
+                "M"
+            }
+            status_by_rel.insert(rel, badge)
+        }
+    }
+
+    rel_list.sort()
+    let entries = List()
+    for i in 0..rel_list.len() {
+        let rel = rel_list.get(i.as(usize)).as(String)
+        let badge = status_by_rel.get(rel).as(String)
+        let full = path.normalize(path.join(st.root, rel))
+
+        let open_opt = world.find_buffer_by_path(full)
+        let cur_lines = if open_opt != null {
+            let ob = open_opt.as(Buffer)
+            let cap = if ob.line_count() < 50000 { ob.line_count() } else { 50000 }
+            ob.slice_lines(0, cap)
+        } else {
+            read_disk_lines_or_empty(full)
+        }
+
+        let base_lines = if has_rev and badge != "?" {
+            let rev_tup = fetch_git_revision_lines(st.root, full, target_rev) ! {
+                _ => ("", "", List()),
+            }
+            let (_, _, bl) = rev_tup
+            bl
+        } else {
+            List()
+        }
+
+        let (add_n, del_n) = count_lines_added_deleted(base_lines, cur_lines)
+        entries.push(DiffViewEntry {
+            status: badge,
+            rel_path: rel,
+            full_path: full,
+            added: add_n,
+            deleted: del_n,
+        })
+    }
+
+    let label_rev = if st.branch != "" and target_rev == "HEAD" {
+        st.branch ++ " (HEAD)"
+    } else {
+        target_rev
+    }
+    (st.root, label_rev, entries)
+}
+
+fn pad_right(s: String, width: i64) -> String {
+    let n = s.char_len()
+    if n >= width {
+        s
+    } else {
+        s ++ " ".repeat(width - n)
+    }
+}
+
+pub fn render_diffview_buffer(
+    buf: Buffer,
+    repo_root: String,
+    rev_label: String,
+    entries: List,
+) {
+    var total_add: i64 = 0
+    var total_del: i64 = 0
+    var max_path_w: i64 = 24
+    for i in 0..entries.len() {
+        let e = entries.get(i.as(usize)).as(DiffViewEntry)
+        total_add += e.added
+        total_del += e.deleted
+        if e.rel_path.char_len() + 4 > max_path_w {
+            max_path_w = e.rel_path.char_len() + 4
+        }
+    }
+    if max_path_w > 64 {
+        max_path_w = 64
+    }
+
+    let lines = List()
+    lines.push(
+        "  DIFFVIEW: " ++ repo_root ++ " @ " ++ rev_label
+        ++ "  │  " ++ entries.len().to_string() ++ " changed files (+"
+        ++ total_add.to_string() ++ " -" ++ total_del.to_string() ++ ")"
+    )
+    lines.push("   RET open file diff   ]f/[f/Tab cycle files   R/gr refresh   q close")
+
+    if entries.is_empty() {
+        lines.push("   (Working tree clean — no changed files)")
+    } else {
+        for i in 0..entries.len() {
+            let e = entries.get(i.as(usize)).as(DiffViewEntry)
+            let row_str = " [" ++ e.status ++ "]  "
+                ++ pad_right(e.rel_path, max_path_w)
+                ++ "+" ++ e.added.to_string()
+                ++ "  -" ++ e.deleted.to_string()
+            lines.push(row_str)
+        }
+    }
+
+    buf.read_only = false
+    buf.major_mode = "diffview"
+    buf.set_lines(lines, record_undo = false)
+    buf.modified = false
+    buf.read_only = true
+    buf.clear_owner_decors(OWNER_DIFF)
+
+    buf.add_inline_decor(
+        OWNER_DIFF,
+        0,
+        0,
+        max_i64(1, buf.line_char_len(0)),
+        bg_rgba = rgba_hex(0x282C42, 235),
+        fg_rgba = rgba_hex(0xCDD6F4, 255),
+    )
+    buf.add_inline_decor(
+        OWNER_DIFF,
+        1,
+        0,
+        max_i64(1, buf.line_char_len(1)),
+        bg_rgba = rgba_hex(0x212437, 225),
+        fg_rgba = rgba_hex(0x89B4FA, 255),
+    )
+
+    for i in 0..entries.len() {
+        let e = entries.get(i.as(usize)).as(DiffViewEntry)
+        let row = DIFF_HEADER_ROWS + i
+        let badge_fg = if e.status == "A" or e.status == "?" {
+            rgba_hex(0xA6E3A1, 255)
+        } else if e.status == "D" {
+            rgba_hex(0xF38BA8, 255)
+        } else {
+            rgba_hex(0xE0AF68, 255)
+        }
+        buf.add_sign(OWNER_DIFF, row, "▍", badge_fg, priority = 15)
+        buf.add_inline_decor(OWNER_DIFF, row, 1, 4, fg_rgba = badge_fg)
+    }
+}
+
+fn is_skipped_dir_rel(rel: String) -> bool {
+    rel.starts_with(".git/") or rel.contains("/.git/") or rel == ".git"
+}
+
+pub fn scan_directory_diff_entries(left_dir: String, right_dir: String) -> !String (List, i64) {
+    if not fs.is_dir(left_dir) {
+        return error ("Left path is not a directory: " ++ left_dir)
+    }
+    if not fs.is_dir(right_dir) {
+        return error ("Right path is not a directory: " ++ right_dir)
+    }
+
+    var walk_err = ""
+    let l_walk = fs.walk_dir(left_dir, max_depth = 16, include_hidden = false) ! {
+        e => {
+            walk_err = "Failed to scan left directory: " ++ e.to_string()
+            List()
+        },
+    }
+    if walk_err != "" {
+        return error walk_err
+    }
+    let r_walk = fs.walk_dir(right_dir, max_depth = 16, include_hidden = false) ! {
+        e => {
+            walk_err = "Failed to scan right directory: " ++ e.to_string()
+            List()
+        },
+    }
+    if walk_err != "" {
+        return error walk_err
+    }
+
+    let l_set = Set.new()
+    let r_set = Set.new()
+    let all_set = Set.new()
+    let all_rels = List()
+
+    for i in 0..l_walk.len() {
+        let rel = l_walk.get(i.as(usize)).as(String)
+        if not is_skipped_dir_rel(rel) {
+            l_set.insert(rel)
+            if not all_set.contains(rel) {
+                all_set.insert(rel)
+                all_rels.push(rel)
+            }
+        }
+    }
+    for j in 0..r_walk.len() {
+        let rel = r_walk.get(j.as(usize)).as(String)
+        if not is_skipped_dir_rel(rel) {
+            r_set.insert(rel)
+            if not all_set.contains(rel) {
+                all_set.insert(rel)
+                all_rels.push(rel)
+            }
+        }
+    }
+
+    all_rels.sort()
+    let entries = List()
+    var identical_count: i64 = 0
+
+    for i in 0..all_rels.len() {
+        let rel = all_rels.get(i.as(usize)).as(String)
+        let in_l = l_set.contains(rel)
+        let in_r = r_set.contains(rel)
+        let lp = path.normalize(path.join(left_dir, rel))
+        let rp = path.normalize(path.join(right_dir, rel))
+
+        if in_l and (not in_r) {
+            let l_lines = read_disk_lines_or_empty(lp)
+            entries.push(DiffDirEntry {
+                status: "ONLY LEFT",
+                rel_path: rel,
+                left_path: lp,
+                right_path: rp,
+                added: 0,
+                deleted: l_lines.len(),
+            })
+        } else if (not in_l) and in_r {
+            let r_lines = read_disk_lines_or_empty(rp)
+            entries.push(DiffDirEntry {
+                status: "ONLY RIGHT",
+                rel_path: rel,
+                left_path: lp,
+                right_path: rp,
+                added: r_lines.len(),
+                deleted: 0,
+            })
+        } else {
+            let l_raw = fs.read_to_string(lp) ! { _ => "" }
+            let r_raw = fs.read_to_string(rp) ! { _ => "" }
+            if l_raw == r_raw {
+                identical_count += 1
+            } else {
+                let l_lines = split_file_text_lines(l_raw)
+                let r_lines = split_file_text_lines(r_raw)
+                let (add_n, del_n) = count_lines_added_deleted(l_lines, r_lines)
+                entries.push(DiffDirEntry {
+                    status: "MODIFIED",
+                    rel_path: rel,
+                    left_path: lp,
+                    right_path: rp,
+                    added: add_n,
+                    deleted: del_n,
+                })
+            }
+        }
+    }
+
+    (entries, identical_count)
+}
+
+pub fn render_diffdirs_buffer(
+    buf: Buffer,
+    left_dir: String,
+    right_dir: String,
+    entries: List,
+    identical_count: i64,
+) {
+    var mod_cnt: i64 = 0
+    var only_l_cnt: i64 = 0
+    var only_r_cnt: i64 = 0
+    var max_path_w: i64 = 24
+    for i in 0..entries.len() {
+        let e = entries.get(i.as(usize)).as(DiffDirEntry)
+        if e.status == "MODIFIED" {
+            mod_cnt += 1
+        } else if e.status == "ONLY LEFT" {
+            only_l_cnt += 1
+        } else {
+            only_r_cnt += 1
+        }
+        if e.rel_path.char_len() + 4 > max_path_w {
+            max_path_w = e.rel_path.char_len() + 4
+        }
+    }
+    if max_path_w > 60 {
+        max_path_w = 60
+    }
+
+    let lines = List()
+    lines.push(
+        " ⇄ DIFFDIRS: " ++ left_dir ++ " ↔ " ++ right_dir
+        ++ "  │  " ++ mod_cnt.to_string() ++ " modified, "
+        ++ only_l_cnt.to_string() ++ " only-left, "
+        ++ only_r_cnt.to_string() ++ " only-right ("
+        ++ identical_count.to_string() ++ " identical)"
+    )
+    lines.push("   RET open file diff   ]f/[f/Tab cycle entries   R/gr rescan   q close")
+
+    if entries.is_empty() {
+        lines.push("   (Directories are identical — 0 differing files)")
+    } else {
+        for i in 0..entries.len() {
+            let e = entries.get(i.as(usize)).as(DiffDirEntry)
+            let badge = pad_right("[" ++ e.status ++ "]", 14)
+            let row_str = " " ++ badge
+                ++ pad_right(e.rel_path, max_path_w)
+                ++ "+" ++ e.added.to_string()
+                ++ "  -" ++ e.deleted.to_string()
+            lines.push(row_str)
+        }
+    }
+
+    buf.read_only = false
+    buf.major_mode = "diffdirs"
+    buf.set_lines(lines, record_undo = false)
+    buf.modified = false
+    buf.read_only = true
+    buf.clear_owner_decors(OWNER_DIFF)
+
+    buf.add_inline_decor(
+        OWNER_DIFF,
+        0,
+        0,
+        max_i64(1, buf.line_char_len(0)),
+        bg_rgba = rgba_hex(0x282C42, 235),
+        fg_rgba = rgba_hex(0xCDD6F4, 255),
+    )
+    buf.add_inline_decor(
+        OWNER_DIFF,
+        1,
+        0,
+        max_i64(1, buf.line_char_len(1)),
+        bg_rgba = rgba_hex(0x212437, 225),
+        fg_rgba = rgba_hex(0x89B4FA, 255),
+    )
+
+    for i in 0..entries.len() {
+        let e = entries.get(i.as(usize)).as(DiffDirEntry)
+        let row = DIFF_HEADER_ROWS + i
+        let badge_fg = if e.status == "ONLY RIGHT" {
+            rgba_hex(0xA6E3A1, 255)
+        } else if e.status == "ONLY LEFT" {
+            rgba_hex(0xF38BA8, 255)
+        } else {
+            rgba_hex(0x89B4FA, 255)
+        }
+        buf.add_sign(OWNER_DIFF, row, "▍", badge_fg, priority = 15)
+        buf.add_inline_decor(OWNER_DIFF, row, 1, 13, fg_rgba = badge_fg)
+    }
+}

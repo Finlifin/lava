@@ -1,0 +1,1282 @@
+-- ext_magit: Interactive Git Porcelain Buffer (`Magit` / `Neogit`) for Lava.
+-- Renders `*magit*` status buffer with inline `<Tab>` diff expansion, file/all staging (`s`/`S`),
+-- unstaging (`u`/`U`), confirmed discard (`x`), continuation-prompted commit (`c`) & branch (`b`),
+-- commit log (`l`), `<Return>` jump-to-file, refresh (`g`), and bury (`q`).
+
+use std.collections.{HashMap, Set}
+use std.fs
+use std.path
+use std.process
+use @lava_sys.rgba
+use @lava_core.{
+    ExtId, InteractiveEffects, PromptKind, PromptRequest, SystemKernel, ask_prompt,
+    clipboard_get, clipboard_set, log_event, status_emit
+}
+use @lava_accel.{GitFileEntry, GitStatusSummary, accel_git_status}
+use @ext_document.{
+    Buffer, BufferId, BufferKind, EditorWorld, Pos, ext_document_id, require_editor_world
+}
+use @ext_vim.{KEYMAP_VIM_LEADER, ext_vim_id}
+
+pub const SERVICE_MAGIT: String = "lava.magit.state"
+pub const OWNER_MAGIT: String = "ext_magit"
+pub const MAGIT_BUF_NAME: String = "*magit*"
+pub const MAGIT_LOG_BUF_NAME: String = "*magit-log*"
+
+pub fn ext_magit_id() -> ExtId = ExtId("lava.org/ext_magit")
+
+fn rgba_hex(hex_rgb: i64, alpha: i64) -> i64 {
+    let r = (hex_rgb / 65536) % 256
+    let g = (hex_rgb / 256) % 256
+    let b = hex_rgb % 256
+    rgba(r, g, b, alpha)
+}
+
+pub struct MagitRowMeta {
+    pub kind: String,
+    pub section: String,
+    pub rel_path: String,
+    pub commit_hash: String,
+    pub target_line: i64,
+}
+
+pub struct MagitState {
+    pub repo_root: String,
+    pub previous_buf_id: ?BufferId,
+    pub expanded_keys: Set,
+    pub row_meta: HashMap,
+    pub untracked_paths: List,
+    pub unstaged_paths: List,
+    pub staged_paths: List,
+}
+
+impl MagitState {
+    pub fn new() -> MagitState {
+        MagitState {
+            repo_root: "",
+            previous_buf_id: null,
+            expanded_keys: Set.new(),
+            row_meta: HashMap.new(),
+            untracked_paths: List(),
+            unstaged_paths: List(),
+            staged_paths: List(),
+        }
+    }
+
+    pub fn meta_at(self, row: i64) -> ?MagitRowMeta {
+        let m? = self.row_meta.get(row) else {
+            return null
+        }
+        m.as(MagitRowMeta)
+    }
+}
+
+pub fn require_magit_state(kernel: SystemKernel) -> !String MagitState {
+    let raw = kernel.require_service(SERVICE_MAGIT)!
+    raw.as(MagitState)
+}
+
+fn clean_rel_path(raw_rel: String) -> String {
+    let arrow_opt = raw_rel.split_once(" -> ")
+    if arrow_opt != null {
+        let (_, dst) = arrow_opt.as((String, String))
+        return dst.trim()
+    }
+    raw_rel.trim()
+}
+
+fn status_code_label(code: String) -> String {
+    when {
+        code == "M" => "modified   ",
+        code == "A" => "new file   ",
+        code == "D" => "deleted    ",
+        code == "R" => "renamed    ",
+        code == "C" => "copied     ",
+        code == "U" => "unmerged   ",
+        code == "?" => "untracked  ",
+        else => "changed    ",
+    }
+}
+
+fn resolve_git_status(world: EditorWorld, state: MagitState) -> GitStatusSummary {
+    let buf = world.active_buffer()
+    if buf.file_path != "" {
+        let p_opt = path.parent(buf.file_path)
+        if p_opt != null {
+            let pdir = p_opt.as(String)
+            if pdir != "" and fs.is_dir(pdir) {
+                let st_buf = accel_git_status(pdir)
+                if st_buf.is_repo {
+                    return st_buf
+                }
+            }
+        }
+    }
+    let st_cwd = accel_git_status(world.cwd)
+    if st_cwd.is_repo {
+        return st_cwd
+    }
+    if state.repo_root != "" and fs.is_dir(state.repo_root) {
+        let st_prev = accel_git_status(state.repo_root)
+        if st_prev.is_repo {
+            return st_prev
+        }
+    }
+    st_cwd
+}
+
+fn git_head_exists(root: String) -> bool {
+    let res = process.exec("git", args = ["rev-parse", "--verify", "HEAD"], cwd = root)
+    res match {
+        out! => out.success(),
+        error _ => false,
+    }
+}
+
+fn git_latest_subject(root: String) -> String {
+    let res = process.exec(
+        "git",
+        args = ["log", "-1", "--pretty=format:%h %s"],
+        cwd = root,
+    )
+    res match {
+        out! => {
+            if out.success() and out.stdout.trim() != "" {
+                return out.stdout.trim()
+            }
+            "(no commits yet)"
+        },
+        error _ => "(no commits yet)",
+    }
+}
+
+fn git_recent_commits(root: String, limit: i64) -> List {
+    let out_list = List()
+    let res = process.exec(
+        "git",
+        args = ["log", "--oneline", "-n", limit.to_string()],
+        cwd = root,
+    )
+    res match {
+        out! => {
+            if out.success() and out.stdout.trim() != "" {
+                let raw_lines = out.stdout.replace("\r\n", "\n").split("\n")
+                for i in 0..raw_lines.len() {
+                    let ln = raw_lines.get(i.as(usize)).as(String).trim_end()
+                    if ln.trim() != "" {
+                        out_list.push(ln)
+                    }
+                }
+            }
+        },
+        error _ => (),
+    }
+    out_list
+}
+
+fn git_inline_diff_lines(root: String, section: String, rel_path: String) -> List {
+    let out_list = List()
+    if section == "untracked" {
+        let full = path.join(root, rel_path)
+        let content! = fs.read_to_string(full) else {
+            out_list.push("    (binary or unreadable file)")
+            return out_list
+        }
+        let norm = content.replace("\r\n", "\n")
+        let parts = norm.split("\n")
+        if parts.len() > 1 and norm.ends_with("\n") {
+            let _ = parts.pop()
+        }
+        out_list.push("    @@ -0,0 +1," ++ parts.len().to_string() ++ " @@")
+        let cap = if parts.len() > 80 { 80 } else { parts.len() }
+        for i in 0..cap {
+            out_list.push("    +" ++ parts.get(i.as(usize)).as(String))
+        }
+        return out_list
+    }
+
+    let args = if section == "staged" {
+        ["diff", "--cached", "--no-color", "-U2", "--", rel_path]
+    } else {
+        ["diff", "--no-color", "-U2", "--", rel_path]
+    }
+    let res = process.exec("git", args = args, cwd = root)
+    res match {
+        out! => {
+            if out.success() and out.stdout.trim() != "" {
+                let raw_lines = out.stdout.replace("\r\n", "\n").split("\n")
+                for i in 0..raw_lines.len() {
+                    let ln = raw_lines.get(i.as(usize)).as(String)
+                    if ln.starts_with("diff --git ")
+                        or ln.starts_with("index ")
+                        or ln.starts_with("--- ")
+                        or ln.starts_with("+++ ") {
+                        continue
+                    }
+                    if ln == "" and i == raw_lines.len() - 1 {
+                        continue
+                    }
+                    out_list.push("    " ++ ln)
+                }
+            }
+        },
+        error _ => (),
+    }
+    if out_list.is_empty() {
+        out_list.push("    (no textual diff)")
+    }
+    out_list
+}
+
+fn parse_hunk_new_start(hunk_line: String) -> i64 {
+    let plus_opt = hunk_line.split_once("+")
+    if plus_opt == null {
+        return 0
+    }
+    let (_, after_plus) = plus_opt.as((String, String))
+    var i: i64 = 0
+    let n = after_plus.char_len()
+    while i < n and after_plus.slice(i, i + 1).is_ascii_digit() {
+        i += 1
+    }
+    if i == 0 {
+        return 0
+    }
+    let parsed_opt = after_plus.slice(0, i).parse_i64()
+    if parsed_opt == null {
+        return 0
+    }
+    let v = parsed_opt.as(i64)
+    if v > 0 { v - 1 } else { 0 }
+}
+
+fn decorate_magit_buffer(buf: Buffer, state: MagitState) {
+    buf.clear_owner_decors(OWNER_MAGIT)
+    let hdr_fg = rgba_hex(0x7AA2F7, 255)
+    let sec_fg = rgba_hex(0xBB9AF7, 255)
+    let add_fg = rgba_hex(0x9ECE6A, 255)
+    let add_bg = rgba_hex(0x1E3A2B, 95)
+    let del_fg = rgba_hex(0xF7768E, 255)
+    let del_bg = rgba_hex(0x3F222B, 95)
+    let hunk_fg = rgba_hex(0x7DCFFF, 255)
+    let hash_fg = rgba_hex(0xE0AF68, 255)
+
+    for r in 0..buf.line_count() {
+        let ln = buf.line_at(r)
+        let llen = ln.char_len()
+        if llen == 0 {
+            continue
+        }
+        let meta_opt = state.meta_at(r)
+        if meta_opt == null {
+            if ln.starts_with("Head:") or ln.starts_with("Help:") {
+                buf.add_inline_decor(OWNER_MAGIT, r, 0, 5, fg_rgba = hdr_fg)
+            }
+            continue
+        }
+        let meta = meta_opt.as(MagitRowMeta)
+        if meta.kind == "section" {
+            buf.add_inline_decor(OWNER_MAGIT, r, 0, llen, fg_rgba = sec_fg)
+        } else if meta.kind == "diff" {
+            let trimmed = ln.trim_start()
+            if trimmed.starts_with("@@") {
+                buf.add_inline_decor(OWNER_MAGIT, r, 0, llen, fg_rgba = hunk_fg)
+            } else if trimmed.starts_with("+") {
+                buf.add_inline_decor(OWNER_MAGIT, r, 0, llen, bg_rgba = add_bg, fg_rgba = add_fg)
+            } else if trimmed.starts_with("-") {
+                buf.add_inline_decor(OWNER_MAGIT, r, 0, llen, bg_rgba = del_bg, fg_rgba = del_fg)
+            }
+        } else if meta.kind == "commit" and meta.commit_hash != "" {
+            let hlen = meta.commit_hash.char_len() + 2
+            if hlen <= llen {
+                buf.add_inline_decor(OWNER_MAGIT, r, 2, hlen, fg_rgba = hash_fg)
+            }
+        }
+    }
+}
+
+pub fn render_magit_status(
+    world: EditorWorld,
+    state: MagitState,
+    .focus_rel_path: String = "",
+    .prefer_section: String = "",
+    .initial_open: bool = false,
+) -> !String Buffer {
+    let st = resolve_git_status(world, state)
+    if not st.is_repo {
+        return error ("Not inside a Git repository: " ++ world.cwd)
+    }
+    state.repo_root = st.root
+    state.row_meta = HashMap.new()
+    state.untracked_paths = List()
+    state.unstaged_paths = List()
+    state.staged_paths = List()
+
+    let untracked_items = List()
+    let unstaged_items = List()
+    let staged_items = List()
+
+    for i in 0..st.entries.len() {
+        let e = st.entries.get(i.as(usize)).as(GitFileEntry)
+        let rel = clean_rel_path(e.rel_path)
+        if e.index_status == "?" and e.worktree_status == "?" {
+            untracked_items.push(("?", rel))
+            state.untracked_paths.push(rel)
+        } else {
+            if e.worktree_status != " " and e.worktree_status != "?" {
+                unstaged_items.push((e.worktree_status, rel))
+                state.unstaged_paths.push(rel)
+            }
+            if e.index_status != " " and e.index_status != "?" {
+                staged_items.push((e.index_status, rel))
+                state.staged_paths.push(rel)
+            }
+        }
+    }
+
+    let lines = List()
+    let subject = git_latest_subject(st.root)
+    lines.push("Head:     " ++ st.branch ++ " " ++ subject)
+    lines.push("Help:     [s]tage [u]nstage [S]tage-all [U]nstage-all [Tab]diff [c]ommit [b]ranch [x]discard [l]og [g]refresh [q]uit")
+    lines.push("")
+
+    var first_file_row: i64 = -1
+    var focus_row: i64 = -1
+
+    -- 1. Untracked files
+    if not untracked_items.is_empty() {
+        let hdr_row = lines.len()
+        lines.push("Untracked files (" ++ untracked_items.len().to_string() ++ ")")
+        state.row_meta.insert(hdr_row, MagitRowMeta {
+            kind: "section",
+            section: "untracked",
+            rel_path: "",
+            commit_hash: "",
+            target_line: 0,
+        })
+        for i in 0..untracked_items.len() {
+            let (code, rel) = untracked_items.get(i.as(usize)).as((String, String))
+            let frow = lines.len()
+            let exp_key = "untracked:" ++ rel
+            let chevron = if state.expanded_keys.contains(exp_key) { "▾ " } else { "▸ " }
+            lines.push("  " ++ chevron ++ status_code_label(code) ++ rel)
+            state.row_meta.insert(frow, MagitRowMeta {
+                kind: "file",
+                section: "untracked",
+                rel_path: rel,
+                commit_hash: "",
+                target_line: 0,
+            })
+            if first_file_row < 0 {
+                first_file_row = frow
+            }
+            if focus_rel_path != "" and rel == focus_rel_path and (prefer_section == "" or prefer_section == "untracked") {
+                focus_row = frow
+            }
+            if state.expanded_keys.contains(exp_key) {
+                let dlines = git_inline_diff_lines(st.root, "untracked", rel)
+                for di in 0..dlines.len() {
+                    let dr = lines.len()
+                    lines.push(dlines.get(di.as(usize)).as(String))
+                    state.row_meta.insert(dr, MagitRowMeta {
+                        kind: "diff",
+                        section: "untracked",
+                        rel_path: rel,
+                        commit_hash: "",
+                        target_line: di,
+                    })
+                }
+            }
+        }
+        lines.push("")
+    }
+
+    -- 2. Unstaged changes
+    if not unstaged_items.is_empty() {
+        let hdr_row = lines.len()
+        lines.push("Unstaged changes (" ++ unstaged_items.len().to_string() ++ ")")
+        state.row_meta.insert(hdr_row, MagitRowMeta {
+            kind: "section",
+            section: "unstaged",
+            rel_path: "",
+            commit_hash: "",
+            target_line: 0,
+        })
+        for i in 0..unstaged_items.len() {
+            let (code, rel) = unstaged_items.get(i.as(usize)).as((String, String))
+            let frow = lines.len()
+            let exp_key = "unstaged:" ++ rel
+            let chevron = if state.expanded_keys.contains(exp_key) { "▾ " } else { "▸ " }
+            lines.push("  " ++ chevron ++ status_code_label(code) ++ rel)
+            state.row_meta.insert(frow, MagitRowMeta {
+                kind: "file",
+                section: "unstaged",
+                rel_path: rel,
+                commit_hash: "",
+                target_line: 0,
+            })
+            if first_file_row < 0 {
+                first_file_row = frow
+            }
+            if focus_rel_path != "" and rel == focus_rel_path and (prefer_section == "" or prefer_section == "unstaged") {
+                focus_row = frow
+            }
+            if state.expanded_keys.contains(exp_key) {
+                let dlines = git_inline_diff_lines(st.root, "unstaged", rel)
+                var cur_target_ln: i64 = 0
+                for di in 0..dlines.len() {
+                    let dtxt = dlines.get(di.as(usize)).as(String)
+                    let trimmed = dtxt.trim_start()
+                    if trimmed.starts_with("@@") {
+                        cur_target_ln = parse_hunk_new_start(trimmed)
+                    } else if not trimmed.starts_with("-") {
+                        cur_target_ln += 1
+                    }
+                    let dr = lines.len()
+                    lines.push(dtxt)
+                    state.row_meta.insert(dr, MagitRowMeta {
+                        kind: "diff",
+                        section: "unstaged",
+                        rel_path: rel,
+                        commit_hash: "",
+                        target_line: if cur_target_ln > 0 { cur_target_ln - 1 } else { 0 },
+                    })
+                }
+            }
+        }
+        lines.push("")
+    }
+
+    -- 3. Staged changes
+    if not staged_items.is_empty() {
+        let hdr_row = lines.len()
+        lines.push("Staged changes (" ++ staged_items.len().to_string() ++ ")")
+        state.row_meta.insert(hdr_row, MagitRowMeta {
+            kind: "section",
+            section: "staged",
+            rel_path: "",
+            commit_hash: "",
+            target_line: 0,
+        })
+        for i in 0..staged_items.len() {
+            let (code, rel) = staged_items.get(i.as(usize)).as((String, String))
+            let frow = lines.len()
+            let exp_key = "staged:" ++ rel
+            let chevron = if state.expanded_keys.contains(exp_key) { "▾ " } else { "▸ " }
+            lines.push("  " ++ chevron ++ status_code_label(code) ++ rel)
+            state.row_meta.insert(frow, MagitRowMeta {
+                kind: "file",
+                section: "staged",
+                rel_path: rel,
+                commit_hash: "",
+                target_line: 0,
+            })
+            if first_file_row < 0 {
+                first_file_row = frow
+            }
+            if focus_rel_path != "" and rel == focus_rel_path and (prefer_section == "" or prefer_section == "staged") {
+                focus_row = frow
+            }
+            if state.expanded_keys.contains(exp_key) {
+                let dlines = git_inline_diff_lines(st.root, "staged", rel)
+                var cur_target_ln: i64 = 0
+                for di in 0..dlines.len() {
+                    let dtxt = dlines.get(di.as(usize)).as(String)
+                    let trimmed = dtxt.trim_start()
+                    if trimmed.starts_with("@@") {
+                        cur_target_ln = parse_hunk_new_start(trimmed)
+                    } else if not trimmed.starts_with("-") {
+                        cur_target_ln += 1
+                    }
+                    let dr = lines.len()
+                    lines.push(dtxt)
+                    state.row_meta.insert(dr, MagitRowMeta {
+                        kind: "diff",
+                        section: "staged",
+                        rel_path: rel,
+                        commit_hash: "",
+                        target_line: if cur_target_ln > 0 { cur_target_ln - 1 } else { 0 },
+                    })
+                }
+            }
+        }
+        lines.push("")
+    }
+
+    if untracked_items.is_empty() and unstaged_items.is_empty() and staged_items.is_empty() {
+        lines.push("Working tree clean")
+        lines.push("")
+    }
+
+    -- 4. Recent commits
+    let commits = git_recent_commits(st.root, 10)
+    let commits_hdr_row = lines.len()
+    lines.push("Recent commits")
+    state.row_meta.insert(commits_hdr_row, MagitRowMeta {
+        kind: "section",
+        section: "commits",
+        rel_path: "",
+        commit_hash: "",
+        target_line: 0,
+    })
+    if commits.is_empty() {
+        lines.push("  (no commits yet)")
+    } else {
+        for i in 0..commits.len() {
+            let cl = commits.get(i.as(usize)).as(String)
+            let sp_opt = cl.split_once(" ")
+            let chash = if sp_opt != null {
+                let (h, _) = sp_opt.as((String, String))
+                h
+            } else {
+                cl
+            }
+            let crow = lines.len()
+            lines.push("  " ++ cl)
+            state.row_meta.insert(crow, MagitRowMeta {
+                kind: "commit",
+                section: "commits",
+                rel_path: "",
+                commit_hash: chash,
+                target_line: 0,
+            })
+        }
+    }
+
+    let existing_opt = world.find_buffer_by_name(MAGIT_BUF_NAME)
+    let prev_row = if existing_opt != null { existing_opt.as(Buffer).point.row } else { 0 }
+    let magit_buf = world.ensure_special_buffer(MAGIT_BUF_NAME, "magit", lines, read_only = true)
+    decorate_magit_buffer(magit_buf, state)
+
+    var target_r = prev_row
+    if focus_row >= 0 {
+        target_r = focus_row
+    } else if initial_open and first_file_row >= 0 {
+        target_r = first_file_row
+    } else {
+        let meta_at_prev = state.meta_at(prev_row)
+        let is_file_or_diff = if meta_at_prev != null {
+            let mk = meta_at_prev.as(MagitRowMeta).kind
+            mk == "file" or mk == "diff" or mk == "section"
+        } else {
+            false
+        }
+        if (not is_file_or_diff) and first_file_row >= 0 {
+            target_r = first_file_row
+        }
+    }
+    magit_buf.point = magit_buf.clamp_pos(Pos.new(target_r, 0), insert_mode = false)
+    magit_buf.preferred_col = 0
+    magit_buf
+}
+
+fn cmd_magit_status(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_magit_state(kernel)!
+    let cur = world.active_buffer()
+    if cur.name != MAGIT_BUF_NAME and cur.name != MAGIT_LOG_BUF_NAME {
+        state.previous_buf_id = cur.id
+    }
+    let mbuf = render_magit_status(world, state, initial_open = cur.name != MAGIT_BUF_NAME)!
+    let _ = world.switch_to_buffer(mbuf.id)
+    kernel.emit_hook("buffer-switched", mbuf.id)
+    status_emit("Magit: " ++ state.repo_root)#
+    ()
+}
+
+fn section_paths(state: MagitState, section: String) -> List {
+    when {
+        section == "untracked" => state.untracked_paths,
+        section == "unstaged" => state.unstaged_paths,
+        section == "staged" => state.staged_paths,
+        else => List(),
+    }
+}
+
+fn cmd_magit_toggle_diff(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_magit_state(kernel)!
+    let buf = world.active_buffer()
+    if buf.major_mode != "magit" {
+        return ()
+    }
+    let meta? = state.meta_at(buf.point.row) else {
+        return ()
+    }
+    if meta.kind == "file" or meta.kind == "diff" {
+        let key = meta.section ++ ":" ++ meta.rel_path
+        if state.expanded_keys.contains(key) {
+            let _ = state.expanded_keys.remove(key)
+        } else {
+            state.expanded_keys.insert(key)
+        }
+        let _ = render_magit_status(
+            world,
+            state,
+            focus_rel_path = meta.rel_path,
+            prefer_section = meta.section,
+        )!
+        return ()
+    }
+    if meta.kind == "section" {
+        let paths = section_paths(state, meta.section)
+        if paths.is_empty() {
+            return ()
+        }
+        var all_open = true
+        for i in 0..paths.len() {
+            let p = paths.get(i.as(usize)).as(String)
+            if not state.expanded_keys.contains(meta.section ++ ":" ++ p) {
+                all_open = false
+                break
+            }
+        }
+        for i in 0..paths.len() {
+            let p = paths.get(i.as(usize)).as(String)
+            let k = meta.section ++ ":" ++ p
+            if all_open {
+                let _ = state.expanded_keys.remove(k)
+            } else {
+                state.expanded_keys.insert(k)
+            }
+        }
+        let prev_r = buf.point.row
+        let mb = render_magit_status(world, state)!
+        mb.point = mb.clamp_pos(Pos.new(prev_r, 0), insert_mode = false)
+    }
+    ()
+}
+
+fn run_git_checked(root: String, args: List) -> !String String {
+    let raw_res = process.exec("git", args = args, cwd = root)
+    var ok_out = ""
+    var ok_err = ""
+    var exited_zero = false
+    var io_err_msg = ""
+    raw_res match {
+        out! => {
+            exited_zero = out.success()
+            ok_out = out.stdout
+            ok_err = out.stderr
+        },
+        error e => {
+            io_err_msg = "git execution error: " ++ e.to_string()
+        },
+    }
+    if io_err_msg != "" {
+        return error io_err_msg
+    }
+    if not exited_zero {
+        let msg = if ok_err.trim() != "" { ok_err.trim() } else { ok_out.trim() }
+        return error ("git failed: " ++ msg)
+    }
+    ok_out
+}
+
+fn cmd_magit_stage(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_magit_state(kernel)!
+    let buf = world.active_buffer()
+    if buf.major_mode != "magit" or state.repo_root == "" {
+        return ()
+    }
+    let meta? = state.meta_at(buf.point.row) else {
+        status_emit("Nothing to stage at cursor")#
+        return ()
+    }
+    if (meta.kind == "file" or meta.kind == "diff")
+        and (meta.section == "unstaged" or meta.section == "untracked") {
+        let _ = run_git_checked(state.repo_root, ["add", "--", meta.rel_path])!
+        let old_row = buf.point.row
+        let mb = render_magit_status(world, state)!
+        let after_meta = state.meta_at(old_row)
+        let still_on_file = if after_meta != null {
+            after_meta.as(MagitRowMeta).kind == "file"
+        } else {
+            false
+        }
+        if not still_on_file {
+            let _ = render_magit_status(
+                world,
+                state,
+                focus_rel_path = meta.rel_path,
+                prefer_section = "staged",
+            )!
+        } else {
+            mb.point = mb.clamp_pos(Pos.new(old_row, 0), insert_mode = false)
+        }
+        status_emit("Staged " ++ meta.rel_path)#
+        return ()
+    }
+    if meta.kind == "section" and (meta.section == "unstaged" or meta.section == "untracked") {
+        let paths = section_paths(state, meta.section)
+        for i in 0..paths.len() {
+            let rel = paths.get(i.as(usize)).as(String)
+            let _ = run_git_checked(state.repo_root, ["add", "--", rel])!
+        }
+        let _ = render_magit_status(world, state)!
+        status_emit("Staged " ++ paths.len().to_string() ++ " file(s)")#
+        return ()
+    }
+    status_emit("Already staged or nothing to stage at cursor")#
+    ()
+}
+
+fn cmd_magit_stage_all(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_magit_state(kernel)!
+    if state.repo_root == "" {
+        return ()
+    }
+    let _ = run_git_checked(state.repo_root, ["add", "-A"])!
+    let _ = render_magit_status(world, state)!
+    status_emit("Staged all changes")#
+    ()
+}
+
+fn unstage_single_path(root: String, rel_path: String) -> !String Unit {
+    if git_head_exists(root) {
+        let _ = run_git_checked(root, ["reset", "HEAD", "--", rel_path])!
+    } else {
+        let _ = run_git_checked(root, ["rm", "--cached", "-f", "--", rel_path])!
+    }
+    ()
+}
+
+fn cmd_magit_unstage(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_magit_state(kernel)!
+    let buf = world.active_buffer()
+    if buf.major_mode != "magit" or state.repo_root == "" {
+        return ()
+    }
+    let meta? = state.meta_at(buf.point.row) else {
+        status_emit("Nothing to unstage at cursor")#
+        return ()
+    }
+    if (meta.kind == "file" or meta.kind == "diff") and meta.section == "staged" {
+        unstage_single_path(state.repo_root, meta.rel_path)!
+        let _ = render_magit_status(world, state, focus_rel_path = meta.rel_path)!
+        status_emit("Unstaged " ++ meta.rel_path)#
+        return ()
+    }
+    if meta.kind == "section" and meta.section == "staged" {
+        let paths = state.staged_paths
+        for i in 0..paths.len() {
+            unstage_single_path(state.repo_root, paths.get(i.as(usize)).as(String))!
+        }
+        let _ = render_magit_status(world, state)!
+        status_emit("Unstaged all staged changes")#
+        return ()
+    }
+    status_emit("Nothing staged at cursor")#
+    ()
+}
+
+fn cmd_magit_unstage_all(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_magit_state(kernel)!
+    if state.repo_root == "" {
+        return ()
+    }
+    if git_head_exists(state.repo_root) {
+        let _ = run_git_checked(state.repo_root, ["reset", "HEAD"])!
+    } else {
+        let _ = run_git_checked(state.repo_root, ["rm", "-r", "--cached", "-f", "."])!
+    }
+    let _ = render_magit_status(world, state)!
+    status_emit("Unstaged all changes")#
+    ()
+}
+
+fn reload_open_buffer_from_disk(kernel: SystemKernel, world: EditorWorld, full_path: String) {
+    let norm = path.normalize(full_path)
+    let open_opt = world.find_buffer_by_path(norm)
+    if open_opt == null {
+        return
+    }
+    let b = open_opt.as(Buffer)
+    if not fs.exists(norm) {
+        return
+    }
+    let content! = fs.read_to_string(norm) else {
+        return
+    }
+    b.set_text(content, record_undo = true, label = "magit-discard")
+    b.modified = false
+    kernel.emit_hook("buffer-saved", b.id)
+}
+
+fn cmd_magit_discard(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_magit_state(kernel)!
+    let buf = world.active_buffer()
+    if buf.major_mode != "magit" or state.repo_root == "" {
+        return ()
+    }
+    let meta? = state.meta_at(buf.point.row) else {
+        status_emit("Nothing to discard at cursor")#
+        return ()
+    }
+    if (meta.kind != "file" and meta.kind != "diff")
+        or (meta.section != "unstaged" and meta.section != "untracked") {
+        status_emit("Select an unstaged or untracked file to discard")#
+        return ()
+    }
+    let rel = meta.rel_path
+    let ans? = ask_prompt(PromptRequest {
+        label: "Discard changes in " ++ rel ++ "? (y/n): ",
+        initial: "",
+        kind: PromptKind.Confirm,
+        candidates: ["y", "n"],
+    })# else {
+        status_emit("Discard cancelled")#
+        return ()
+    }
+    let low = ans.trim().to_lower()
+    if low != "y" and low != "yes" {
+        status_emit("Discard cancelled")#
+        return ()
+    }
+    let full = path.join(state.repo_root, rel)
+    if meta.section == "untracked" {
+        var rm_err = ""
+        if fs.is_dir(full) {
+            let rm_res = fs.remove_dir_all(full)
+            rm_res match {
+                _! => (),
+                error e => { rm_err = e.to_string() },
+            }
+        } else if fs.exists(full) {
+            let rm_res = fs.remove_file(full)
+            rm_res match {
+                _! => (),
+                error e => { rm_err = e.to_string() },
+            }
+        }
+        if rm_err != "" {
+            return error rm_err
+        }
+    } else {
+        let _ = run_git_checked(state.repo_root, ["checkout", "--", rel])!
+        reload_open_buffer_from_disk(kernel, world, full)
+    }
+    let _ = render_magit_status(world, state)!
+    status_emit("Discarded " ++ rel)#
+    ()
+}
+
+fn notify_repo_buffers_saved(kernel: SystemKernel, world: EditorWorld, root: String) {
+    let pfx = root ++ "/"
+    for i in 0..world.buffer_order.len() {
+        let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+        let b = world.buffers.get(bid).as(Buffer)
+        if b.kind == BufferKind.File and b.file_path.starts_with(pfx) {
+            kernel.emit_hook("buffer-saved", b.id)
+        }
+    }
+}
+
+fn cmd_magit_commit(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_magit_state(kernel)!
+    if state.repo_root == "" {
+        let st = resolve_git_status(world, state)
+        if not st.is_repo {
+            return error "Not inside a Git repository"
+        }
+        state.repo_root = st.root
+    }
+    let msg_opt = ask_prompt(PromptRequest.text("Commit message: ", ""))#
+    let raw_msg? = msg_opt else {
+        status_emit("Commit cancelled")#
+        return ()
+    }
+    let msg = raw_msg.trim()
+    if msg == "" {
+        status_emit("Aborting commit due to empty commit message")#
+        return ()
+    }
+    let _ = run_git_checked(state.repo_root, ["commit", "-m", msg])!
+    state.expanded_keys = Set.new()
+    let mb = render_magit_status(world, state)!
+    let _ = world.switch_to_buffer(mb.id)
+    notify_repo_buffers_saved(kernel, world, state.repo_root)
+    status_emit("Committed: " ++ msg)#
+    ()
+}
+
+fn list_git_branches(root: String) -> List {
+    let out_list = List()
+    let res = process.exec(
+        "git",
+        args = ["branch", "--format=%(refname:short)"],
+        cwd = root,
+    )
+    res match {
+        out! => {
+            if out.success() {
+                let raw_lines = out.stdout.replace("\r\n", "\n").split("\n")
+                for i in 0..raw_lines.len() {
+                    let b = raw_lines.get(i.as(usize)).as(String).trim()
+                    if b != "" {
+                        out_list.push(b)
+                    }
+                }
+            }
+        },
+        error _ => (),
+    }
+    out_list
+}
+
+fn cmd_magit_branch(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_magit_state(kernel)!
+    if state.repo_root == "" {
+        return ()
+    }
+    let branches = list_git_branches(state.repo_root)
+    let ans? = ask_prompt(PromptRequest.with_candidates(
+        "Checkout or create branch: ",
+        "",
+        PromptKind.Choice,
+        branches,
+    ))# else {
+        status_emit("Branch switch cancelled")#
+        return ()
+    }
+    let target = ans.trim()
+    if target == "" {
+        return ()
+    }
+    var exists = false
+    for i in 0..branches.len() {
+        if branches.get(i.as(usize)).as(String) == target {
+            exists = true
+            break
+        }
+    }
+    if exists {
+        let _ = run_git_checked(state.repo_root, ["checkout", target])!
+    } else {
+        let _ = run_git_checked(state.repo_root, ["checkout", "-b", target])!
+    }
+    let _ = render_magit_status(world, state)!
+    notify_repo_buffers_saved(kernel, world, state.repo_root)
+    status_emit("Switched to branch '" ++ target ++ "'")#
+    ()
+}
+
+fn cmd_magit_log(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_magit_state(kernel)!
+    if state.repo_root == "" {
+        let st = resolve_git_status(world, state)
+        if not st.is_repo {
+            return error "Not inside a Git repository"
+        }
+        state.repo_root = st.root
+    }
+    let lines = List()
+    lines.push("Commits in " ++ state.repo_root ++ "  ([g] refresh, [q] back)")
+    lines.push("========================================================================")
+    let res = process.exec(
+        "git",
+        args = ["log", "--graph", "--decorate", "--date=short", "--pretty=format:%h  %ad  %an  %s", "-n", "50"],
+        cwd = state.repo_root,
+    )
+    res match {
+        out! => {
+            if out.success() and out.stdout.trim() != "" {
+                let raw_lines = out.stdout.replace("\r\n", "\n").split("\n")
+                for i in 0..raw_lines.len() {
+                    lines.push(raw_lines.get(i.as(usize)).as(String))
+                }
+            } else {
+                lines.push("(no commits yet)")
+            }
+        },
+        error _ => {
+            lines.push("(failed to read git log)")
+        },
+    }
+    let lbuf = world.ensure_special_buffer(MAGIT_LOG_BUF_NAME, "magit-log", lines, read_only = true)
+    let _ = world.switch_to_buffer(lbuf.id)
+    kernel.emit_hook("buffer-switched", lbuf.id)
+    status_emit("Showing *magit-log*")#
+    ()
+}
+
+fn cmd_magit_visit(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_magit_state(kernel)!
+    let buf = world.active_buffer()
+    if buf.major_mode != "magit" or state.repo_root == "" {
+        return ()
+    }
+    let meta? = state.meta_at(buf.point.row) else {
+        return ()
+    }
+    if (meta.kind == "file" or meta.kind == "diff") and meta.rel_path != "" {
+        let full = path.join(state.repo_root, meta.rel_path)
+        if not fs.exists(full) {
+            status_emit("File does not exist on disk: " ++ meta.rel_path)#
+            return ()
+        }
+        let opened = world.open_file(full)#!
+        if meta.kind == "diff" and meta.target_line > 0 {
+            opened.point = opened.clamp_pos(
+                Pos.new(meta.target_line, opened.first_non_blank_col(meta.target_line)),
+                insert_mode = false,
+            )
+            opened.preferred_col = opened.point.col
+        }
+        kernel.emit_hook("buffer-opened", opened.id)
+        kernel.emit_hook("buffer-switched", opened.id)
+        return ()
+    }
+    if meta.kind == "commit" and meta.commit_hash != "" {
+        let res = process.exec(
+            "git",
+            args = ["show", "--stat", "--no-color", meta.commit_hash],
+            cwd = state.repo_root,
+        )
+        res match {
+            out! => {
+                if out.success() {
+                    let show_lines = out.stdout.replace("\r\n", "\n").split("\n")
+                    let cbuf = world.ensure_special_buffer(MAGIT_LOG_BUF_NAME, "magit-log", show_lines, read_only = true)
+                    let _ = world.switch_to_buffer(cbuf.id)
+                    kernel.emit_hook("buffer-switched", cbuf.id)
+                    status_emit("Commit " ++ meta.commit_hash)#
+                }
+            },
+            error _ => (),
+        }
+    }
+    ()
+}
+
+fn cmd_magit_refresh(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_magit_state(kernel)!
+    let buf = world.active_buffer()
+    if buf.major_mode == "magit-log" {
+        return cmd_magit_log(kernel)#
+    }
+    let _ = render_magit_status(world, state)!
+    status_emit("Magit refreshed")#
+    ()
+}
+
+fn cmd_magit_quit(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_magit_state(kernel)!
+    let cur = world.active_buffer()
+    if cur.major_mode == "magit-log" {
+        let m_opt = world.find_buffer_by_name(MAGIT_BUF_NAME)
+        if m_opt != null {
+            let mb = m_opt.as(Buffer)
+            let _ = world.switch_to_buffer(mb.id)
+            kernel.emit_hook("buffer-switched", mb.id)
+            status_emit("Buffer: *magit*")#
+            return ()
+        }
+    }
+    state.previous_buf_id match {
+        pid? => {
+            let pb_opt = world.buffer(pid)
+            if pb_opt != null and pb_opt.as(Buffer).name != MAGIT_BUF_NAME {
+                let _ = world.switch_to_buffer(pid)
+                kernel.emit_hook("buffer-switched", pid)
+                status_emit("Buffer: " ++ world.active_buffer().name)#
+                return ()
+            }
+        },
+        _ => (),
+    }
+    let next_id = world.cycle_buffer(-1)
+    kernel.emit_hook("buffer-switched", next_id)
+    status_emit("Buffer: " ++ world.active_buffer().name)#
+    ()
+}
+
+pub fn register_magit_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_magit_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_magit",
+        "0.1.0",
+        "Interactive Magit Git status porcelain buffer with inline diffs, staging, commits, branches, and logs.",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let state = MagitState.new()
+            k.publish_service(SERVICE_MAGIT, ext_id, state)
+
+            k.register_command(
+                "magit-status",
+                ext_id,
+                "Open interactive *magit* Git porcelain buffer (`<Space> g g`, `C-x g`, `:Magit`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    cmd_magit_status(kern)#
+                },
+            )
+
+            k.register_command(
+                "magit",
+                ext_id,
+                "Alias for `magit-status` (`:Magit`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    cmd_magit_status(kern)#
+                },
+            )
+
+            k.register_command(
+                "magit-toggle-section",
+                ext_id,
+                "Toggle inline diff expansion on current file or section (`<Tab>`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    cmd_magit_toggle_diff(kern)#
+                },
+            )
+
+            k.register_command(
+                "magit-stage",
+                ext_id,
+                "Stage file or section under cursor (`s`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    cmd_magit_stage(kern)#
+                },
+            )
+
+            k.register_command(
+                "magit-stage-all",
+                ext_id,
+                "Stage all modified and untracked files (`S`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    cmd_magit_stage_all(kern)#
+                },
+            )
+
+            k.register_command(
+                "magit-unstage",
+                ext_id,
+                "Unstage file or section under cursor (`u`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    cmd_magit_unstage(kern)#
+                },
+            )
+
+            k.register_command(
+                "magit-unstage-all",
+                ext_id,
+                "Unstage all staged changes (`U`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    cmd_magit_unstage_all(kern)#
+                },
+            )
+
+            k.register_command(
+                "magit-discard",
+                ext_id,
+                "Discard unstaged changes or remove untracked file under cursor (`x`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    cmd_magit_discard(kern)#
+                },
+            )
+
+            k.register_command(
+                "magit-commit",
+                ext_id,
+                "Prompt for commit message and commit staged changes (`c`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    cmd_magit_commit(kern)#
+                },
+            )
+
+            k.register_command(
+                "magit-branch",
+                ext_id,
+                "Switch to an existing branch or create a new branch (`b`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    cmd_magit_branch(kern)#
+                },
+            )
+
+            k.register_command(
+                "magit-log",
+                ext_id,
+                "Open *magit-log* commit graph buffer (`l`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    cmd_magit_log(kern)#
+                },
+            )
+
+            k.register_command(
+                "magit-visit",
+                ext_id,
+                "Open file or inspect commit under cursor (`<Return>`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    cmd_magit_visit(kern)#
+                },
+            )
+
+            k.register_command(
+                "magit-refresh",
+                ext_id,
+                "Refresh *magit* status buffer (`g`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    cmd_magit_refresh(kern)#
+                },
+            )
+
+            k.register_command(
+                "magit-quit",
+                ext_id,
+                "Bury *magit* buffer and return to previous buffer (`q`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    cmd_magit_quit(kern)#
+                },
+            )
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> g g", "magit-status", ext_id, description = "Magit status")
+
+            let emacs_glob_km = k.ensure_keymap("emacs-global")
+            emacs_glob_km.bind("<C-x> g", "magit-status", ext_id, description = "Magit status")
+            let glob_km = k.ensure_keymap("global")
+            glob_km.bind("<C-x> g", "magit-status", ext_id, description = "Magit status")
+
+            let mode_km = k.ensure_keymap("mode:magit")
+            mode_km.bind("<Tab>", "magit-toggle-section", ext_id, description = "Toggle inline diff")
+            mode_km.bind("s", "magit-stage", ext_id, description = "Stage file/section")
+            mode_km.bind("S", "magit-stage-all", ext_id, description = "Stage all")
+            mode_km.bind("u", "magit-unstage", ext_id, description = "Unstage file/section")
+            mode_km.bind("U", "magit-unstage-all", ext_id, description = "Unstage all")
+            mode_km.bind("x", "magit-discard", ext_id, description = "Discard file changes")
+            mode_km.bind("c", "magit-commit", ext_id, description = "Commit staged changes")
+            mode_km.bind("b", "magit-branch", ext_id, description = "Switch/create branch")
+            mode_km.bind("l", "magit-log", ext_id, description = "Open commit log")
+            mode_km.bind("<Return>", "magit-visit", ext_id, description = "Visit file or commit")
+            mode_km.bind("g", "magit-refresh", ext_id, description = "Refresh Magit")
+            mode_km.bind("q", "magit-quit", ext_id, description = "Quit Magit")
+
+            let log_km = k.ensure_keymap("mode:magit-log")
+            log_km.bind("g", "magit-refresh", ext_id, description = "Refresh Magit log")
+            log_km.bind("q", "magit-quit", ext_id, description = "Close Magit log")
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                w_opt.as(EditorWorld).clear_owner_ui(OWNER_MAGIT)
+            }
+            let _ = k.ensure_keymap(KEYMAP_VIM_LEADER).unbind("<Space> g g")
+            let _ = k.ensure_keymap("emacs-global").unbind("<C-x> g")
+            let _ = k.ensure_keymap("global").unbind("<C-x> g")
+            ()
+        },
+    )
+}

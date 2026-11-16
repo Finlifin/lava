@@ -1,0 +1,189 @@
+-- srv_search: Server-Side Workspace Search, Live Grep & Multi-Language Symbol Outline (`lava.server/srv_search`).
+-- Implements `search/files`, `search/grep`, and `search/symbols`.
+
+use std.fs
+use std.path
+use @server_sys.{
+    SrvFuzzyHit, SrvGrepHit, SrvSymbolItem, accel_fuzzy_rank, accel_scan_symbols,
+    accel_workspace_files, accel_workspace_grep, resolve_server_path
+}
+use @server_core.{
+    JsonValue, ServerKernel, SrvExtId, expect_params_map, invalid_params, opt_bool_param,
+    opt_i64_param, opt_nullable_str_list_param, opt_str_param, require_str_param
+}
+
+pub fn srv_search_id() -> SrvExtId = SrvExtId("lava.server/srv_search")
+
+private fn infer_major_mode_from_path(file_path: String) -> String {
+    let ext_opt = path.extension(file_path)
+    let ext = ext_opt match {
+        e? => e.to_lower(),
+        null => "",
+    }
+    when {
+        ext == "rs" => "rust",
+        ext == "ns" => "nessa",
+        ext == "c" or ext == "h" => "c",
+        ext == "cc" or ext == "cpp" or ext == "cxx" or ext == "hpp" or ext == "hh" or ext == "hxx" => "cpp",
+        ext == "py" or ext == "pyi" => "python",
+        ext == "go" => "go",
+        ext == "ts" or ext == "tsx" => "typescript",
+        ext == "js" or ext == "jsx" or ext == "mjs" => "javascript",
+        ext == "md" or ext == "markdown" => "markdown",
+        ext == "org" => "org",
+        ext == "lua" => "lua",
+        ext == "zig" => "zig",
+        ext == "toml" => "toml",
+        ext == "json" => "json",
+        else => "text",
+    }
+}
+
+private fn rpc_search_files(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_root = require_str_param(m, "root")!
+    let query = opt_str_param(m, "query", "")!
+    let limit = opt_i64_param(m, "limit", 200)!
+    let include_hidden = opt_bool_param(m, "include_hidden", false)!
+
+    let root = resolve_server_path(raw_root)
+    if not fs.exists(root) or (not fs.is_dir(root)) {
+        return error ("workspace root directory does not exist: " ++ root)
+    }
+
+    let all_files = accel_workspace_files(root, max_files = 10000, include_hidden = include_hidden)
+    let effective_limit = if limit > 0 { limit } else { all_files.len() }
+
+    let matched = List()
+    if query.trim() == "" {
+        let take_n = if effective_limit < all_files.len() { effective_limit } else { all_files.len() }
+        for i in 0..take_n {
+            matched.push(all_files.get(i.as(usize)).as(String))
+        }
+    } else {
+        let ranked = accel_fuzzy_rank(query, all_files, limit = effective_limit)
+        for i in 0..ranked.len() {
+            let hit = ranked.get(i.as(usize)).as(SrvFuzzyHit)
+            if hit.index >= 0 and hit.index < all_files.len() {
+                matched.push(all_files.get(hit.index.as(usize)).as(String))
+            }
+        }
+    }
+
+    let out = Map()
+    out.set("files", matched)
+    out
+}
+
+private fn rpc_search_grep(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_root = require_str_param(m, "root")!
+    if (not m.contains("pattern")) and (not m.contains("query")) {
+        return error invalid_params("missing required string parameter 'pattern'")
+    }
+    let pattern = if m.contains("pattern") {
+        require_str_param(m, "pattern")!
+    } else {
+        require_str_param(m, "query")!
+    }
+    let limit = opt_i64_param(m, "limit", 300)!
+    let case_sensitive = opt_bool_param(m, "case_sensitive", false)!
+    let file_filter = opt_str_param(m, "file_filter", "")!
+
+    let root = resolve_server_path(raw_root)
+    if not fs.exists(root) or (not fs.is_dir(root)) {
+        return error ("workspace root directory does not exist: " ++ root)
+    }
+
+    let hits_json = List()
+    if pattern != "" {
+        let hits = accel_workspace_grep(
+            root,
+            pattern,
+            case_sensitive = case_sensitive,
+            max_results = limit,
+            file_filter = file_filter,
+        )
+        for i in 0..hits.len() {
+            let h = hits.get(i.as(usize)).as(SrvGrepHit)
+            let item = Map()
+            item.set("file_path", h.file_path)
+            item.set("row", h.row)
+            item.set("col", h.col)
+            item.set("line_text", h.line_text)
+            hits_json.push(item)
+        }
+    }
+
+    let out = Map()
+    out.set("hits", hits_json)
+    out
+}
+
+private fn rpc_search_symbols(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_path = require_str_param(m, "path")!
+    let explicit_lines_opt = opt_nullable_str_list_param(m, "lines")!
+    let explicit_mode = opt_str_param(m, "major_mode", "")!
+
+    let lines = if explicit_lines_opt != null {
+        explicit_lines_opt.as(List)
+    } else {
+        let resolved = resolve_server_path(raw_path)
+        if not fs.exists(resolved) or fs.is_dir(resolved) {
+            return error ("cannot scan symbols: file does not exist: " ++ resolved)
+        }
+        let content = fs.read_to_string(resolved) match {
+            txt! => txt,
+            error err => return error ("cannot read '" ++ resolved ++ "': " ++ err.to_string()),
+        }
+        let norm = content.replace("\r\n", "\n").replace("\r", "\n")
+        let parts = norm.split("\n")
+        if parts.len() > 1 and norm.ends_with("\n") {
+            let _ = parts.pop()
+        }
+        parts
+    }
+
+    let mode = if explicit_mode != "" {
+        explicit_mode
+    } else {
+        infer_major_mode_from_path(raw_path)
+    }
+
+    let syms = accel_scan_symbols(lines, mode)
+    let syms_json = List()
+    for i in 0..syms.len() {
+        let s = syms.get(i.as(usize)).as(SrvSymbolItem)
+        let item = Map()
+        item.set("name", s.name)
+        item.set("kind", s.kind)
+        item.set("row", s.row)
+        item.set("col", s.col)
+        item.set("level", s.level)
+        syms_json.push(item)
+    }
+
+    let out = Map()
+    out.set("symbols", syms_json)
+    out
+}
+
+pub fn register_search_extension(kernel: ServerKernel) -> !String Unit {
+    let ext_id = srv_search_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.server",
+        "srv_search",
+        "0.1.0",
+        "Server-side workspace file finder, ripgrep live search, and multi-language symbol scanner.",
+        List(),
+        |k: ServerKernel| -> !String Unit {
+            k.register_rpc("search/files", ext_id, "Fuzzy-find workspace files on server.", rpc_search_files)
+            k.register_rpc("search/grep", ext_id, "Live grep across workspace files on server.", rpc_search_grep)
+            k.register_rpc("search/symbols", ext_id, "Extract symbol outline for a file or lines.", rpc_search_symbols)
+            ()
+        },
+        |_k: ServerKernel| -> !String Unit { () },
+    )
+}

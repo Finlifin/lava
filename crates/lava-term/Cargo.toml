@@ -1,0 +1,7 @@
+[package]
+name = "lava-term"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+libc.workspace = true

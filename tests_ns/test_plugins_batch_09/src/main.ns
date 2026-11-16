@@ -1,0 +1,474 @@
+-- End-to-end integration test suite for Lava Batch 09 Plugins (25–27 of 30):
+--   25. `ext_toggleterm` (`toggleterm.nvim` / `vterm`: `<C-\>` floating terminal, stateful `cd`/`pwd`,
+--       multi-session `<Tab>` switching, hide/restore, `<Space>ts` send line, `<Space>tb` `*terminal-1*`)
+--   26. `ext_overseer` (`overseer.nvim` / VSCode Tasks: `Makefile` / `Cargo.toml` / `package.toml` /
+--       `package.json` discovery, failing task -> `world.quickfix` + error toast, `*Overseer*` `<Space>ro`,
+--       `<Space>rl` rerun)
+--   27. `ext_persistence` (`persistence.nvim` + `alpha-nvim`: `"session-empty-startup"` `*Dashboard*`,
+--       `:SessionSave` `<Space>qs`, `:SessionRestore` `<Space>ql` cursors + active buf + theme,
+--       `1` recent file jump on `*Dashboard*`, `:SessionDelete` `<Space>qd`)
+
+use std.fs
+use std.path
+use std.time
+use @lava_sys.{RawUiEvent, mock_enable}
+use @lava_core.{ExtId, SystemKernel, clipboard_get, clipboard_set, log_event, status_emit}
+use @ext_document.{
+    Buffer, EditorWorld, FloatingWindow, Pos, QuickfixEntry, ToastNotification,
+    require_editor_world
+}
+use @ext_render.{RenderCompositor, SERVICE_RENDERER}
+use @ext_app.{AppHostCap, app_commit_frame, app_feed_keys, app_step_event, boot_kernel}
+use @ext_toggleterm.{
+    FLOAT_ID_TOGGLETERM, ToggleTermService, ext_toggleterm_id, register_toggleterm_extension,
+    require_toggleterm_service
+}
+use @ext_overseer.{
+    OVERSEER_BUF_NAME, OverseerService, TaskRun, TaskTemplate, discover_tasks, ext_overseer_id,
+    register_overseer_extension, require_overseer_service
+}
+use @ext_persistence.{
+    DASHBOARD_BUF_NAME, DEFAULT_SESSION_FILE, PersistenceService, ext_persistence_id,
+    register_persistence_extension, require_persistence_service
+}
+
+fn check_true(cond: bool, label: String) {
+    if not cond {
+        panic("FAILED: " ++ label)
+    }
+}
+
+fn check_eq_str(actual: String, expected: String, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual='" ++ actual ++ "' expected='" ++ expected ++ "'")
+    }
+}
+
+fn check_eq_i64(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual=" ++ actual.to_string() ++ " expected=" ++ expected.to_string())
+    }
+}
+
+fn list_contains_substr(lines: List, needle: String) -> bool {
+    for i in 0..lines.len() {
+        if lines.get(i.as(usize)).as(String).contains(needle) {
+            return true
+        }
+    }
+    false
+}
+
+fn find_row_containing(buf: Buffer, needle: String) -> i64 {
+    for i in 0..buf.line_count() {
+        if buf.line_at(i).contains(needle) {
+            return i
+        }
+    }
+    -1
+}
+
+fn has_template_named(templates: List, target_name: String) -> bool {
+    for i in 0..templates.len() {
+        let t = templates.get(i.as(usize)).as(TaskTemplate)
+        if t.name == target_name {
+            return true
+        }
+    }
+    false
+}
+
+fn has_toast_with(world: EditorWorld, level: String, needle: String) -> bool {
+    for i in 0..world.notification_history.len() {
+        let t = world.notification_history.get(i.as(usize)).as(ToastNotification)
+        if t.level == level and (t.title.contains(needle) or t.message.contains(needle)) {
+            return true
+        }
+    }
+    false
+}
+
+fn boot_batch09_kernel() -> SystemKernel {
+    let kernel: SystemKernel = (boot_kernel() ! { e => panic(e) }).as(SystemKernel)
+    let _ = register_toggleterm_extension(kernel) ! { e => panic(e) }
+    let _ = register_overseer_extension(kernel) ! { e => panic(e) }
+    let _ = register_persistence_extension(kernel) ! { e => panic(e) }
+    let _ = kernel.activate_extension(ext_toggleterm_id()) ! { e => panic(e) }
+    let _ = kernel.activate_extension(ext_overseer_id()) ! { e => panic(e) }
+    let _ = kernel.activate_extension(ext_persistence_id()) ! { e => panic(e) }
+    let _ = kernel.activate_all() ! { e => panic(e) }
+    kernel
+}
+
+fn test_batch_09_plugins() {
+    mock_enable(true)
+
+    let raw_tmp = "/tmp/lava_batch09_" ++ time.unix_millis().to_string()
+    let _ = fs.create_dir_all(raw_tmp) ! { e => panic(e.to_string()) }
+    let tmp_dir = fs.canonicalize(raw_tmp) ! { _ => raw_tmp }
+    let subdir = path.join(tmp_dir, "subdir")
+    let _ = fs.create_dir_all(subdir) ! { e => panic(e.to_string()) }
+
+    let kernel = boot_batch09_kernel()
+    check_eq_i64(kernel.list_extensions().len(), 11, "11 active extensions (8 core + 3 batch09)")
+
+    let world: EditorWorld = (require_editor_world(kernel) ! { e => panic(e) }).as(EditorWorld)
+    world.cwd = tmp_dir
+
+    let term_svc: ToggleTermService = (require_toggleterm_service(kernel) ! { e => panic(e) }).as(ToggleTermService)
+    let overseer_svc: OverseerService = (require_overseer_service(kernel) ! { e => panic(e) }).as(OverseerService)
+    let persist_svc: PersistenceService = (require_persistence_service(kernel) ! { e => panic(e) }).as(PersistenceService)
+
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
+    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+
+    -- ========================================================================
+    -- PART 1: Plugin 25 — `ext_toggleterm` (`toggleterm.nvim` / `vterm`)
+    -- ========================================================================
+    println("STEP 1: testing ext_toggleterm")
+
+    -- 1a. `<C-\>` opens `"toggleterm-float"`
+    app_feed_keys(kernel, "<C-\\>")# ! { e => panic(e) }
+    check_eq_str(term_svc.visible_mode, "float", "<C-\\> enters float mode")
+    let fw1_opt = world.get_floating_window(FLOAT_ID_TOGGLETERM)
+    check_true(fw1_opt != null, "toggleterm-float floating window created")
+    let fw1 = fw1_opt.as(FloatingWindow)
+    check_eq_i64(fw1.width_cols, 88, "toggleterm-float width is 88")
+    check_eq_i64(fw1.height_rows, 22, "toggleterm-float height is 22")
+    check_true(fw1.title.contains("Terminal #1"), "float title shows Terminal #1")
+    check_true(fw1.title.contains(tmp_dir), "float title shows initial cwd")
+
+    -- 1b. Typing `echo hello_lava<Return>` outputs `hello_lava`
+    app_feed_keys(kernel, "echo<Space>hello_lava<Return>")# ! { e => panic(e) }
+    let sess1 = term_svc.active_session(world.cwd)
+    check_eq_i64(sess1.id, 1, "active session is #1")
+    check_true(list_contains_substr(sess1.scrollback, "$ echo hello_lava"), "scrollback has prompt header")
+    check_true(list_contains_substr(sess1.scrollback, "hello_lava"), "scrollback has hello_lava stdout")
+    let fw_after_echo = world.get_floating_window(FLOAT_ID_TOGGLETERM).as(FloatingWindow)
+    check_true(list_contains_substr(fw_after_echo.lines, "hello_lava"), "floating window renders hello_lava")
+
+    -- 1c. `cd subdir<Return>` followed by `pwd<Return>` persists working directory across commands!
+    app_feed_keys(kernel, "cd<Space>subdir<Return>")# ! { e => panic(e) }
+    check_eq_str(sess1.cwd, subdir, "cd subdir updated session #1 cwd persistently")
+    app_feed_keys(kernel, "pwd<Return>")# ! { e => panic(e) }
+    check_true(list_contains_substr(sess1.scrollback, subdir), "pwd output reflects persisted subdir")
+    let fw_after_cd = world.get_floating_window(FLOAT_ID_TOGGLETERM).as(FloatingWindow)
+    check_true(fw_after_cd.title.contains(subdir), "floating window title updated to subdir")
+
+    -- Verify shell command in persisted `subdir` runs inside `subdir`
+    let marker_in_sub = path.join(subdir, "inside_sub.txt")
+    let _ = fs.write_string(marker_in_sub, "sub_ok\n") ! { e => panic(e.to_string()) }
+    app_feed_keys(kernel, "cat<Space>inside_sub.txt<Return>")# ! { e => panic(e) }
+    check_true(list_contains_substr(sess1.scrollback, "sub_ok"), "subsequent shell command ran in subdir")
+
+    -- 1d. `<Tab>` switches to Terminal #2 with independent `cwd` & `scrollback`
+    app_feed_keys(kernel, "<Tab>")# ! { e => panic(e) }
+    check_eq_i64(term_svc.current_id, 2, "<Tab> switched to terminal #2")
+    let sess2 = term_svc.active_session(world.cwd)
+    check_eq_i64(sess2.id, 2, "session #2 active")
+    check_eq_str(sess2.cwd, tmp_dir, "terminal #2 has independent root cwd")
+    check_true(sess2.scrollback.is_empty(), "terminal #2 starts with clean independent scrollback")
+    app_feed_keys(kernel, "echo<Space>from_term_two<Return>")# ! { e => panic(e) }
+    check_true(list_contains_substr(sess2.scrollback, "from_term_two"), "terminal #2 recorded its own output")
+    check_true(not list_contains_substr(sess1.scrollback, "from_term_two"), "terminal #1 scrollback isolated")
+
+    -- 1e. `<C-\>` hides and `<C-\>` restores intact state; switch back to #1 via `1`
+    app_feed_keys(kernel, "<C-\\>")# ! { e => panic(e) }
+    check_eq_str(term_svc.visible_mode, "hidden", "<C-\\> hid floating terminal")
+    check_true(world.get_floating_window(FLOAT_ID_TOGGLETERM) == null, "floating window removed when hidden")
+
+    app_feed_keys(kernel, "<C-\\>")# ! { e => panic(e) }
+    check_eq_str(term_svc.visible_mode, "float", "second <C-\\> restored floating terminal")
+    check_eq_i64(term_svc.current_id, 2, "restored onto terminal #2")
+    check_true(list_contains_substr(sess2.scrollback, "from_term_two"), "terminal #2 scrollback intact")
+
+    -- Press `1` (with empty input line) to switch back to Terminal #1, verify `subdir` & `hello_lava` intact
+    app_feed_keys(kernel, "1")# ! { e => panic(e) }
+    check_eq_i64(term_svc.current_id, 1, "key 1 switched back to terminal #1")
+    check_eq_str(term_svc.active_session(world.cwd).cwd, subdir, "terminal #1 cwd still subdir")
+    check_true(list_contains_substr(sess1.scrollback, "hello_lava"), "terminal #1 scrollback still has hello_lava")
+
+    -- Verify `<Up>` recalls command history inside floating terminal, then `<C-u>` clears input and `<C-\>` hides
+    app_feed_keys(kernel, "<Up>")# ! { e => panic(e) }
+    check_eq_str(term_svc.input_line, "cat inside_sub.txt", "<Up> recalled previous command in session #1")
+    app_feed_keys(kernel, "<C-u><C-\\>")# ! { e => panic(e) }
+    check_eq_str(term_svc.visible_mode, "hidden", "hid float before buffer send test")
+
+    -- Verify `<C-\>` also works from Vim Insert mode and `:TermExec` runs directly
+    app_feed_keys(kernel, "i<C-\\>")# ! { e => panic(e) }
+    check_eq_str(term_svc.visible_mode, "float", "<C-\\> from Insert mode opened float")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+    check_eq_str(term_svc.visible_mode, "hidden", "<Escape> hid floating terminal")
+    app_feed_keys(kernel, ":TermExec<Space>echo<Space>via_termexec<Return>")# ! { e => panic(e) }
+    check_true(list_contains_substr(sess1.scrollback, "via_termexec"), ":TermExec executed in active terminal")
+
+    -- 1f. `<Space> t s` sends current buffer line to active terminal #1
+    let script_buf_path = path.join(tmp_dir, "send_cmd.sh")
+    let _ = fs.write_string(script_buf_path, "echo sent_via_leader_ts\n") ! { e => panic(e.to_string()) }
+    app_feed_keys(kernel, ":e<Space>" ++ script_buf_path ++ "<Return>")# ! { e => panic(e) }
+    app_feed_keys(kernel, "gg0<Space>ts")# ! { e => panic(e) }
+    check_true(
+        list_contains_substr(sess1.scrollback, "sent_via_leader_ts"),
+        "<Space>ts executed buffer line in active terminal #1",
+    )
+
+    -- 1g. `<Space> t b` opens `*terminal-1*` buffer (`major_mode == "toggleterm"`)
+    app_feed_keys(kernel, "<Space>tb")# ! { e => panic(e) }
+    let tbuf1 = world.active_buffer()
+    check_eq_str(tbuf1.name, "*terminal-1*", "<Space>tb opened *terminal-1*")
+    check_eq_str(tbuf1.major_mode, "toggleterm", "*terminal-1* major_mode is toggleterm")
+    check_true(find_row_containing(tbuf1, "hello_lava") >= 0, "*terminal-1* displays hello_lava")
+    check_true(find_row_containing(tbuf1, "sent_via_leader_ts") >= 0, "*terminal-1* displays sent_via_leader_ts")
+    app_feed_keys(kernel, "q")# ! { e => panic(e) }
+    check_true(world.active_buffer().name != "*terminal-1*", "q hid *terminal-1*")
+
+    -- ========================================================================
+    -- PART 2: Plugin 26 — `ext_overseer` (`overseer.nvim` / VSCode Tasks)
+    -- ========================================================================
+    println("STEP 2: testing ext_overseer")
+
+    let proj_dir = path.join(tmp_dir, "overseer_proj")
+    let proj_src_dir = path.join(proj_dir, "src")
+    let _ = fs.create_dir_all(proj_src_dir) ! { e => panic(e.to_string()) }
+    let app_ns_path = path.join(proj_src_dir, "app.ns")
+    let _ = fs.write_string(
+        app_ns_path,
+        [
+            "fn alpha() -> i64 = 1",
+            "fn beta() -> i64 = 2",
+            "fn gamma() -> i64 = broken_expr",
+            "fn delta() -> i64 = 4",
+        ].join("\n") ++ "\n",
+    ) ! { e => panic(e.to_string()) }
+
+    let makefile_content = [
+        ".PHONY: build lint",
+        "CC := gcc",
+        "%.o: %.c",
+        "\t$(CC) -c $<",
+        "build:",
+        "\t@echo building_ok",
+        "lint:",
+        "\t@echo 'src/app.ns:3:5: broken expr' && exit 2",
+    ].join("\n") ++ "\n"
+    let _ = fs.write_string(path.join(proj_dir, "Makefile"), makefile_content) ! { e => panic(e.to_string()) }
+    let _ = fs.write_string(
+        path.join(proj_dir, "Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+    ) ! { e => panic(e.to_string()) }
+    let _ = fs.write_string(
+        path.join(proj_dir, "package.toml"),
+        "[package]\nname = \"demo_ns\"\ndomain = \"lava.org\"\nversion = \"0.1.0\"\n",
+    ) ! { e => panic(e.to_string()) }
+    let _ = fs.write_string(
+        path.join(proj_dir, "package.json"),
+        "{{\"name\": \"demo-web\", \"scripts\": {{\"bundle\": \"echo bundled\"}}}}\n",
+    ) ! { e => panic(e.to_string()) }
+
+    -- 2a. Verify `discover_tasks` finds Makefile, Cargo.toml, package.toml, and package.json tasks
+    let discovered = discover_tasks(proj_dir)
+    check_true(has_template_named(discovered, "make: build"), "discovered 'make: build'")
+    check_true(has_template_named(discovered, "make: lint"), "discovered 'make: lint'")
+    check_true(not has_template_named(discovered, "make: .PHONY"), "excluded .PHONY target")
+    check_true(not has_template_named(discovered, "make: %.o"), "excluded % pattern rule")
+    check_true(has_template_named(discovered, "cargo: check"), "discovered 'cargo: check'")
+    check_true(has_template_named(discovered, "cargo: clippy"), "discovered 'cargo: clippy'")
+    check_true(has_template_named(discovered, "nessa: check"), "discovered 'nessa: check'")
+    check_true(has_template_named(discovered, "npm: bundle"), "discovered 'npm: bundle'")
+
+    world.cwd = proj_dir
+    world.quickfix = List()
+
+    -- 2b. Run failing task `make: lint` outputting `src/app.ns:3:5: broken expr`
+    app_feed_keys(kernel, ":OverseerRun<Space>make:<Space>lint<Return>")# ! { e => panic(e) }
+    check_eq_i64(overseer_svc.runs.len(), 1, "1 Overseer TaskRun recorded")
+    let fail_run = overseer_svc.latest_run().as(TaskRun)
+    check_eq_str(fail_run.name, "make: lint", "recorded task name 'make: lint'")
+    check_eq_str(fail_run.status, "FAILED", "failing task recorded FAILED status")
+    check_true(fail_run.exit_code != 0, "failing task recorded non-zero exit code")
+    check_eq_i64(fail_run.error_count, 1, "failing task parsed 1 diagnostic")
+
+    -- Verify `world.quickfix` populated with `row == 2, col == 4` and error ToastNotification pushed
+    check_eq_i64(world.quickfix.len(), 1, "world.quickfix has 1 diagnostic entry")
+    let qf0 = world.quickfix.get(0).as(QuickfixEntry)
+    check_eq_i64(qf0.row, 2, "quickfix 0-based row is 2 (from line 3)")
+    check_eq_i64(qf0.col, 4, "quickfix 0-based col is 4 (from col 5)")
+    check_true(qf0.text.contains("broken expr"), "quickfix text contains 'broken expr'")
+    check_eq_str(world.quickfix_title, "Overseer: make: lint", "quickfix title set by Overseer")
+    check_true(has_toast_with(world, "error", "make: lint"), "error ToastNotification pushed for failed task")
+
+    -- 2c. Open `*Overseer*` dashboard via `<Space> r o`, verify status & diagnostic jump via `<Return>`
+    app_feed_keys(kernel, "<Space>ro")# ! { e => panic(e) }
+    let obuf = world.active_buffer()
+    check_eq_str(obuf.name, OVERSEER_BUF_NAME, "<Space>ro opened *Overseer*")
+    check_eq_str(obuf.major_mode, "overseer", "*Overseer* major_mode is overseer")
+    check_true(find_row_containing(obuf, "[FAILED]") >= 0, "*Overseer* renders [FAILED] status")
+    let diag_row_in_overseer = find_row_containing(obuf, "src/app.ns:3:5: broken expr")
+    check_true(diag_row_in_overseer >= 0, "*Overseer* renders diagnostic output line")
+
+    -- Move cursor to diagnostic line in `*Overseer*` and press `<Return>` to jump to `src/app.ns:3:5`
+    obuf.point = Pos.new(diag_row_in_overseer, 0)
+    app_feed_keys(kernel, "<Return>")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, "app.ns", "<Return> on Overseer diagnostic jumped to app.ns")
+    check_eq_i64(world.active_buffer().point.row, 2, "jumped to exact row 2 in app.ns")
+    check_eq_i64(world.active_buffer().point.col, 4, "jumped to exact col 4 in app.ns")
+
+    -- 2d. Run passing task `make: build` and re-run it via `<Space> r l`
+    app_feed_keys(kernel, ":OverseerRun<Space>make:<Space>build<Return>")# ! { e => panic(e) }
+    check_eq_i64(overseer_svc.runs.len(), 2, "2 Overseer runs after make: build")
+    let pass_run1 = overseer_svc.latest_run().as(TaskRun)
+    check_eq_str(pass_run1.status, "SUCCESS", "make: build succeeded")
+    check_eq_i64(pass_run1.exit_code, 0, "make: build exit code 0")
+
+    app_feed_keys(kernel, "<Space>rl")# ! { e => panic(e) }
+    check_eq_i64(overseer_svc.runs.len(), 3, "<Space>rl re-ran last task immediately")
+    let pass_run2 = overseer_svc.latest_run().as(TaskRun)
+    check_eq_str(pass_run2.name, "make: build", "<Space>rl re-ran make: build")
+    check_eq_str(pass_run2.status, "SUCCESS", "re-run succeeded")
+    check_true(has_toast_with(world, "info", "make: build"), "info ToastNotification pushed for passing task")
+
+    -- 2e. Register custom template outputting Rust `--> src/app.ns:4:8` diagnostic and run via `<Space> r t` picker
+    overseer_svc.register_template(
+        "custom: rustc-diag",
+        "printf 'error[E0425]: cannot find value\\n  --> src/app.ns:4:8\\n' && exit 1",
+        proj_dir,
+    )
+    app_feed_keys(kernel, "<Space>rtcustom:<Space>rustc-diag<Return>")# ! { e => panic(e) }
+    check_eq_i64(overseer_svc.runs.len(), 4, "<Space>rt interactive picker ran custom template")
+    let rust_run = overseer_svc.latest_run().as(TaskRun)
+    check_eq_str(rust_run.name, "custom: rustc-diag", "custom template executed")
+    check_eq_str(rust_run.status, "FAILED", "custom rustc-diag recorded FAILED")
+    check_eq_i64(world.quickfix.len(), 1, "Rust --> header parsed into world.quickfix")
+    let rqf = world.quickfix.get(0).as(QuickfixEntry)
+    check_eq_i64(rqf.row, 3, "Rust --> row 3 (from line 4)")
+    check_eq_i64(rqf.col, 7, "Rust --> col 7 (from col 8)")
+
+    -- ========================================================================
+    -- PART 3: Plugin 27 — `ext_persistence` (`persistence.nvim` + `alpha-nvim`)
+    -- ========================================================================
+    println("STEP 3: testing ext_persistence")
+    world.cwd = tmp_dir
+
+    -- 3a. Emit `"session-empty-startup"` -> `*Dashboard*` opens with ASCII banner & shortcuts
+    kernel.emit_hook("session-empty-startup", true)
+    let dash_buf = world.active_buffer()
+    check_eq_str(dash_buf.name, DASHBOARD_BUF_NAME, "session-empty-startup opened *Dashboard*")
+    check_eq_str(dash_buf.major_mode, "dashboard", "*Dashboard* major_mode is dashboard")
+    check_true(find_row_containing(dash_buf, "Loaded 11 extensions") >= 0, "Dashboard shows active extension count")
+    check_true(find_row_containing(dash_buf, "[f]") >= 0, "Dashboard shows [f] Find File shortcut")
+    check_true(find_row_containing(dash_buf, "[s]") >= 0, "Dashboard shows [s] Restore Session shortcut")
+    check_true(find_row_containing(dash_buf, "[q]") >= 0, "Dashboard shows [q] Quit shortcut")
+
+    -- 3b. Open 2 temp files at distinct `(row, col)` cursor positions & switch theme to `"tokyo-night"`
+    let file_one = path.join(tmp_dir, "first_mod.ns")
+    let file_two = path.join(tmp_dir, "second_mod.ns")
+    let _ = fs.write_string(
+        file_one,
+        [
+            "let a = 100",
+            "let b = 200",
+            "let c = 300_target",
+            "let d = 400",
+        ].join("\n") ++ "\n",
+    ) ! { e => panic(e.to_string()) }
+    let _ = fs.write_string(
+        file_two,
+        [
+            "pub struct Point {{ x: i64, y: i64 }}",
+            "pub fn origin() -> i64 = 0",
+            "pub fn unit() -> i64 = 1",
+        ].join("\n") ++ "\n",
+    ) ! { e => panic(e.to_string()) }
+
+    -- Close earlier `send_cmd.sh` & `app.ns` so session captures a clean two-file workspace
+    let old_send = world.find_buffer_by_path(script_buf_path)
+    if old_send != null {
+        let _ = world.kill_buffer(old_send.as(Buffer).id, force = true) ! { e => panic(e) }
+    }
+    let old_app = world.find_buffer_by_path(app_ns_path)
+    if old_app != null {
+        let _ = world.kill_buffer(old_app.as(Buffer).id, force = true) ! { e => panic(e) }
+    }
+
+    app_feed_keys(kernel, ":e<Space>" ++ file_one ++ "<Return>")# ! { e => panic(e) }
+    let b_one = world.active_buffer()
+    b_one.point = Pos.new(2, 8)
+    b_one.preferred_col = 8
+
+    app_feed_keys(kernel, ":e<Space>" ++ file_two ++ "<Return>")# ! { e => panic(e) }
+    let b_two = world.active_buffer()
+    b_two.point = Pos.new(1, 7)
+    b_two.preferred_col = 7
+
+    -- Switch back to `first_mod.ns` as the active buffer, keeping `b_one.point == (2, 8)`
+    let _ = world.switch_to_buffer(b_one.id)
+    b_one.point = Pos.new(2, 8)
+    kernel.emit_hook("buffer-switched", b_one.id)
+
+    -- Switch theme to `"tokyo-night"`
+    app_feed_keys(kernel, ":theme<Space>tokyo-night<Return>")# ! { e => panic(e) }
+    check_eq_str(world.options.theme_name, "tokyo-night", "theme set to tokyo-night before save")
+
+    -- Save session via `<Space> q s`
+    app_feed_keys(kernel, "<Space>qs")# ! { e => panic(e) }
+    let session_path = path.join(tmp_dir, DEFAULT_SESSION_FILE)
+    check_true(fs.exists(session_path), "<Space>qs wrote .lava_session.txt to disk")
+
+    -- 3c. Kill both file buffers & reset theme to `"nord"`
+    let _ = world.kill_buffer(b_one.id, force = true) ! { e => panic(e) }
+    let _ = world.kill_buffer(b_two.id, force = true) ! { e => panic(e) }
+    check_true(world.find_buffer_by_path(file_one) == null, "first_mod.ns closed")
+    check_true(world.find_buffer_by_path(file_two) == null, "second_mod.ns closed")
+    app_feed_keys(kernel, ":theme<Space>nord<Return>")# ! { e => panic(e) }
+    check_eq_str(world.options.theme_name, "nord", "theme reset to nord")
+
+    -- 3d. Restore session via `<Space> q l` and verify files, cursors, active buffer, and theme!
+    app_feed_keys(kernel, "<Space>ql")# ! { e => panic(e) }
+    let restored_one_opt = world.find_buffer_by_path(file_one)
+    let restored_two_opt = world.find_buffer_by_path(file_two)
+    check_true(restored_one_opt != null, "first_mod.ns reopened by SessionRestore")
+    check_true(restored_two_opt != null, "second_mod.ns reopened by SessionRestore")
+
+    let r_one = restored_one_opt.as(Buffer)
+    let r_two = restored_two_opt.as(Buffer)
+    check_eq_i64(r_one.point.row, 2, "first_mod.ns cursor row 2 restored")
+    check_eq_i64(r_one.point.col, 8, "first_mod.ns cursor col 8 restored")
+    check_eq_i64(r_two.point.row, 1, "second_mod.ns cursor row 1 restored")
+    check_eq_i64(r_two.point.col, 7, "second_mod.ns cursor col 7 restored")
+    check_eq_str(world.active_buffer().file_path, file_one, "active buffer restored to first_mod.ns")
+    check_eq_str(world.options.theme_name, "tokyo-night", "theme restored to tokyo-night in world.options")
+
+    let comp_opt = kernel.service(SERVICE_RENDERER)
+    check_true(comp_opt != null, "RenderCompositor service available")
+    check_eq_str(
+        comp_opt.as(RenderCompositor).active_theme_name,
+        "tokyo-night",
+        "RenderCompositor synced to tokyo-night",
+    )
+
+    -- 3e. Open `*Dashboard*` via `<Space> s d` and press `1` to open recent file #1
+    check_true(not persist_svc.recent_files.is_empty(), "recent_files populated")
+    let top_recent = persist_svc.recent_files.get(0).as(String)
+    app_feed_keys(kernel, "<Space>sd")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, DASHBOARD_BUF_NAME, "<Space>sd opened *Dashboard*")
+    check_true(find_row_containing(world.active_buffer(), "[1]") >= 0, "Dashboard lists recent file [1]")
+
+    app_feed_keys(kernel, "1")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().file_path, top_recent, "pressing 1 on *Dashboard* opened recent file #1")
+
+    -- 3f. Delete session via `<Space> q d` (`:SessionDelete`) and verify removal
+    app_feed_keys(kernel, "<Space>qd")# ! { e => panic(e) }
+    check_true(not fs.exists(session_path), "<Space>qd deleted session file from disk")
+
+    -- Final 2D scene compositor sanity check
+    let frame_gen = app_commit_frame(kernel) ! { e => panic(e) }
+    check_true(frame_gen >= 1, "app_commit_frame succeeded after Batch 09 workflows")
+
+    let _ = cap
+    let _ = fs.remove_dir_all(tmp_dir) ! { _ => () }
+    println("ALL BATCH 09 PLUGIN TESTS PASSED!")
+}
+
+fn main() {
+    test_batch_09_plugins()
+}

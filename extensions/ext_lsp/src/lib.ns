@@ -1,0 +1,3875 @@
+-- ext_lsp: Native JSON-RPC 2.0 Language Server Protocol Client & Dual-Backend Code Intelligence.
+-- Publishes `SERVICE_LSP` (`"lava.lsp.service"` -> `LspService`), manages live `@lava_lsp`
+-- language server sessions, synchronizes buffer edits/diagnostics/statusline, registers `"lsp"`
+-- completions on `ext_cmp`, and provides instant `@lava_accel` + multi-language AST/symbol
+-- workspace fallback when external language server binaries are not installed.
+
+use std.collections.{HashMap, Set}
+use std.env
+use std.fs
+use std.path
+use std.time
+use @lava_sys.{host_read_file_lines, host_write_file_lines, rgb}
+use @lava_core.{
+    ExtId, InteractiveEffects, KeyStroke, Keymap, PromptKind, PromptRequest,
+    SystemKernel, ask_prompt, clipboard_get, clipboard_set, log_event, status_emit
+}
+use @lava_accel.{
+    GrepHit, SymbolDefHit, SymbolItem, SymbolOutlineSpan, accel_doc_save_file,
+    accel_doc_scan_symbol_spans, accel_find_symbol_defs, accel_lsp_did_change_doc,
+    accel_lsp_did_open_doc, accel_lsp_did_save_doc, accel_scan_symbols, accel_workspace_files,
+    accel_workspace_grep
+}
+use @lava_lsp.{
+    LSP_WAKE_TIMER_ID, LspCodeAct, LspCompItem, LspDiag, LspLoc, LspSym,
+    LspTextEdit, LspWireEvent, lsp_available, lsp_did_change, lsp_did_close,
+    lsp_did_open, lsp_did_save, lsp_find_root, lsp_poll_events, lsp_request,
+    lsp_spawn, lsp_spawn_remote, lsp_status, lsp_stop, lsp_which
+}
+use @lava_remote.{
+    RemoteDirItem, RemoteGrepMatch, is_ssh_uri, join_ssh_uri, parent_ssh_uri,
+    parse_ssh_uri, remote_find_root, remote_host_available,
+    remote_lsp_launch_command, remote_read_lines, remote_readdir,
+    remote_search_files, remote_search_grep, remote_stat, remote_which,
+    remote_write_lines, ssh_uri_basename
+}
+use @ext_document.{
+    Buffer, BufferId, BufferKind, CompletionItem, EditorWorld, FloatingWindow,
+    Pos, QuickfixEntry, Span, detect_major_mode, ext_document_id, require_editor_world
+}
+use @ext_window.{SERVICE_WINDOW_MANAGER, WindowManager}
+use @ext_vim.{
+    KEYMAP_VIM_LEADER, KEYMAP_VIM_NORMAL, ModalInterceptor, SERVICE_VIM, VimState, ext_vim_id
+}
+use @ext_cmp.{CmpService, SERVICE_CMP}
+
+pub const SERVICE_LSP: String = "lava.lsp.service"
+pub const OWNER_LSP: String = "ext_lsp"
+pub const LSP_HOVER_FLOAT_ID: String = "*lsp-hover*"
+pub const LSP_INFO_BUF_NAME: String = "*LspInfo*"
+pub const LSP_LOG_BUF_NAME: String = "*LspLog*"
+pub const LSP_REFS_BUF_NAME: String = "*LSP References*"
+pub const MODE_LSP_INFO: String = "lspinfo"
+pub const MODE_LSP_LOG: String = "lsplog"
+pub const MODE_LSP_REFS: String = "lsprefs"
+
+pub fn ext_lsp_id() -> ExtId = ExtId("lava.org/ext_lsp")
+
+-- ============================================================================
+-- 1. Public Server Spec, Client Session & LspService State
+-- ============================================================================
+
+pub struct LspServerSpec {
+    pub name: String,
+    pub server_id: String,
+    pub cmd: String,
+    pub args: List,
+    pub filetypes: List,
+    pub root_markers: List,
+    pub install_hint: String,
+    pub settings_json: String,
+    pub description: String,
+}
+
+pub struct LspClientInfo {
+    pub client_id: i64,
+    pub server_id: String,
+    pub server_name: String,
+    pub cmd: String,
+    pub exe_path: String,
+    pub args: List,
+    pub root_dir: String,
+    pub settings_json: String,
+    pub live_rpc: bool,
+    pub binary_found: bool,
+    pub alive: bool,
+    pub initialized: bool,
+    pub server_version: String,
+    pub capabilities: String,
+    pub attached_buffers: List,
+}
+
+pub struct BufferLspAttachment {
+    pub buf_id: BufferId,
+    pub server_id: String,
+    pub server_name: String,
+    pub root_dir: String,
+    pub exe_path: String,
+    pub client_id: i64,
+    pub live_rpc: bool,
+    pub binary_found: bool,
+    pub version: i64,
+    pub last_edit_version: i64,
+}
+
+pub struct FallbackCodeAction {
+    pub title: String,
+    pub action_tag: String,
+    pub row: i64,
+    pub col: i64,
+    pub ident: String,
+    pub live_edits: List,
+}
+
+pub struct LspService {
+    pub specs: HashMap,
+    pub spec_order: List,
+    pub clients: HashMap,
+    pub client_order: List,
+    pub next_synthetic_id: i64,
+    pub buf_attachments: HashMap,
+    pub diagnostics_by_buf: HashMap,
+    pub diagnostics_by_path: HashMap,
+    pub hover_cache: HashMap,
+    pub completion_cache: HashMap,
+    pub locations_cache: HashMap,
+    pub symbols_cache: HashMap,
+    pub code_actions_cache: HashMap,
+    pub workspace_edit_cache: HashMap,
+    pub logs: List,
+    pub extra_search_dirs: List,
+    pub prev_buf_before_panel: BufferId,
+    pub last_refs_entries: List,
+    pub cmp_registered: bool,
+}
+
+private global _active_lsp_service: ?LspService = null
+
+-- ============================================================================
+-- 2. Executable & Project Root Resolution Helpers
+-- ============================================================================
+
+pub fn resolve_executable_in_path_with_dirs(bin: String, extra_dirs: List) -> ?String {
+    let trimmed = bin.trim()
+    if trimmed == "" {
+        return null
+    }
+    if trimmed.contains("/") {
+        let resolved = lsp_which(trimmed)
+        if resolved != "" {
+            return resolved
+        }
+        if fs.exists(trimmed) and (not fs.is_dir(trimmed)) {
+            return trimmed
+        }
+        return null
+    }
+    for i in 0..extra_dirs.len() {
+        let d = extra_dirs.get(i.as(usize)).as(String).trim()
+        if d != "" {
+            let full = path.join(d, trimmed)
+            if fs.exists(full) and (not fs.is_dir(full)) {
+                return full
+            }
+        }
+    }
+    let via_host = lsp_which(trimmed)
+    if via_host != "" {
+        return via_host
+    }
+    let path_env = env.get_or("PATH", "")
+    let parts = path_env.split(":")
+    for i in 0..parts.len() {
+        let d = parts.get(i.as(usize)).as(String).trim()
+        if d != "" {
+            let full = path.join(d, trimmed)
+            if fs.exists(full) and (not fs.is_dir(full)) {
+                return full
+            }
+        }
+    }
+    null
+}
+
+pub fn resolve_executable_in_path(bin: String) -> ?String {
+    if _active_lsp_service != null {
+        let svc = _active_lsp_service.as(LspService)
+        return resolve_executable_in_path_with_dirs(bin, svc.extra_search_dirs)
+    }
+    resolve_executable_in_path_with_dirs(bin, List())
+}
+
+pub fn detect_project_root(file_path: String, fallback_cwd: String, root_markers: List) -> String {
+    let start_raw = if file_path.trim() != "" { file_path.trim() } else { fallback_cwd.trim() }
+    if start_raw == "" {
+        return "."
+    }
+    if is_ssh_uri(start_raw) {
+        let rf_res = remote_find_root(start_raw, root_markers)
+        var rroot = ""
+        rf_res match {
+            found! => {
+                rroot = found.trim()
+            },
+            error _ => {
+                rroot = parent_ssh_uri(start_raw)
+            },
+        }
+        while rroot.ends_with("/") and rroot.char_len() > 6 {
+            rroot = rroot.slice(0, rroot.char_len() - 1)
+        }
+        return rroot
+    }
+    let start_dir = if fs.exists(start_raw) and fs.is_dir(start_raw) {
+        path.normalize(start_raw)
+    } else {
+        let p_opt = path.parent(start_raw)
+        if p_opt != null and p_opt.as(String) != "" {
+            path.normalize(p_opt.as(String))
+        } else if fallback_cwd.trim() != "" {
+            path.normalize(fallback_cwd)
+        } else {
+            "."
+        }
+    }
+    if root_markers.is_empty() {
+        return start_dir
+    }
+    var cur = start_dir
+    var depth_guard: i64 = 0
+    while depth_guard < 40 and cur != "" {
+        for mi in 0..root_markers.len() {
+            let marker = root_markers.get(mi.as(usize)).as(String).trim()
+            if marker != "" and fs.exists(path.join(cur, marker)) {
+                return cur
+            }
+        }
+        let parent_opt = path.parent(cur)
+        if parent_opt == null {
+            break
+        }
+        let next_dir = parent_opt.as(String)
+        if next_dir == "" or next_dir == cur {
+            break
+        }
+        cur = next_dir
+        depth_guard += 1
+    }
+    let via_bridge = lsp_find_root(start_dir, root_markers)
+    if via_bridge != "" {
+        return via_bridge
+    }
+    start_dir
+}
+
+pub fn infer_language_id(buf: Buffer) -> String {
+    let mode = buf.major_mode.to_lower()
+    if mode != "" and mode != "text" and mode != "fundamental" {
+        if mode == "shell" {
+            return "shellscript"
+        }
+        return mode
+    }
+    let fp = if buf.file_path != "" { buf.file_path.to_lower() } else { buf.name.to_lower() }
+    when {
+        fp.ends_with(".ns") => "nessa",
+        fp.ends_with(".rs") => "rust",
+        fp.ends_with(".py") or fp.ends_with(".pyi") => "python",
+        fp.ends_with(".ts") or fp.ends_with(".tsx") => "typescript",
+        fp.ends_with(".js") or fp.ends_with(".jsx") or fp.ends_with(".mjs") => "javascript",
+        fp.ends_with(".cpp") or fp.ends_with(".hpp") or fp.ends_with(".cc") => "cpp",
+        fp.ends_with(".c") or fp.ends_with(".h") => "c",
+        fp.ends_with(".go") => "go",
+        fp.ends_with(".lua") => "lua",
+        fp.ends_with(".zig") => "zig",
+        fp.ends_with(".sh") or fp.ends_with(".bash") or fp.ends_with(".zsh") => "shellscript",
+        fp.ends_with(".json") or fp.ends_with(".jsonc") => "json",
+        fp.ends_with(".toml") => "toml",
+        fp.ends_with(".yaml") or fp.ends_with(".yml") => "yaml",
+        fp.ends_with(".md") or fp.ends_with(".markdown") => "markdown",
+        fp.ends_with(".html") or fp.ends_with(".htm") => "html",
+        fp.ends_with(".css") or fp.ends_with(".scss") => "css",
+        fp.ends_with(".java") => "java",
+        fp.ends_with(".rb") => "ruby",
+        fp.ends_with(".nix") => "nix",
+        else => "plaintext",
+    }
+}
+
+private fn sync_wm(kernel: SystemKernel, world: EditorWorld) {
+    let wm_opt = kernel.service(SERVICE_WINDOW_MANAGER)
+    if wm_opt != null {
+        wm_opt.as(WindowManager).sync_from_world(world)
+    }
+}
+
+-- ============================================================================
+-- 3. Identifier, Symbol & Multi-Language Workspace Analyzer
+-- ============================================================================
+
+private fn is_ident_char_str(ch: String) -> bool {
+    if ch == "" {
+        return false
+    }
+    ch == "_" or ch.is_ascii_alphanumeric()
+}
+
+pub fn word_span_at(line: String, col: i64) -> ?(i64, i64, String) {
+    let n = line.char_len()
+    if n == 0 {
+        return null
+    }
+    var probe = if col < 0 {
+        0
+    } else if col >= n {
+        n - 1
+    } else {
+        col
+    }
+    if not is_ident_char_str(line.slice(probe, probe + 1)) {
+        if probe > 0 and is_ident_char_str(line.slice(probe - 1, probe)) {
+            probe -= 1
+        } else {
+            return null
+        }
+    }
+    var sc = probe
+    while sc > 0 and is_ident_char_str(line.slice(sc - 1, sc)) {
+        sc -= 1
+    }
+    var ec = probe + 1
+    while ec < n and is_ident_char_str(line.slice(ec, ec + 1)) {
+        ec += 1
+    }
+    let word = line.slice(sc, ec)
+    if word == "" {
+        return null
+    }
+    (sc, ec, word)
+}
+
+private fn extract_leading_ident(s: String) -> String {
+    let trimmed = s.trim_start()
+    let n = trimmed.char_len()
+    var end_idx: i64 = 0
+    while end_idx < n and is_ident_char_str(trimmed.slice(end_idx, end_idx + 1)) {
+        end_idx += 1
+    }
+    if end_idx == 0 {
+        ""
+    } else {
+        trimmed.slice(0, end_idx)
+    }
+}
+
+private fn strip_visibility_modifiers(trimmed: String) -> String {
+    var cur = trimmed.trim_start()
+    var changed = true
+    while changed {
+        changed = false
+        if cur.starts_with("pub(crate) ") {
+            cur = cur.drop(11).trim_start()
+            changed = true
+        } else if cur.starts_with("pub(super) ") {
+            cur = cur.drop(11).trim_start()
+            changed = true
+        } else if cur.starts_with("pub ") {
+            cur = cur.drop(4).trim_start()
+            changed = true
+        } else if cur.starts_with("private ") {
+            cur = cur.drop(8).trim_start()
+            changed = true
+        } else if cur.starts_with("export ") {
+            cur = cur.drop(7).trim_start()
+            changed = true
+        } else if cur.starts_with("default ") {
+            cur = cur.drop(8).trim_start()
+            changed = true
+        } else if cur.starts_with("async ") {
+            cur = cur.drop(6).trim_start()
+            changed = true
+        } else if cur.starts_with("unsafe ") {
+            cur = cur.drop(7).trim_start()
+            changed = true
+        } else if cur.starts_with("static ") {
+            cur = cur.drop(7).trim_start()
+            changed = true
+        } else if cur.starts_with("local ") {
+            cur = cur.drop(6).trim_start()
+            changed = true
+        }
+    }
+    cur
+}
+
+private fn parse_decl_on_line(line: String, row: i64) -> ?LspSym {
+    let raw_trim = line.trim()
+    if raw_trim == "" or raw_trim.starts_with("//") or raw_trim.starts_with("--") or raw_trim.starts_with("#") or raw_trim.starts_with("/*") or raw_trim.starts_with("*") {
+        return null
+    }
+    let stripped = strip_visibility_modifiers(raw_trim)
+    let kw_pairs = [
+        ("fn ", "Function"),
+        ("def ", "Function"),
+        ("func ", "Function"),
+        ("function ", "Function"),
+        ("struct ", "Struct"),
+        ("class ", "Class"),
+        ("enum ", "Enum"),
+        ("trait ", "Interface"),
+        ("interface ", "Interface"),
+        ("newtype ", "Struct"),
+        ("type ", "Type"),
+        ("const ", "Constant"),
+        ("global ", "Variable"),
+        ("mod ", "Module")
+    ]
+    for i in 0..kw_pairs.len() {
+        let (kw, kind_label) = kw_pairs.get(i.as(usize)).as((String, String))
+        if stripped.starts_with(kw) {
+            var rest = stripped.drop(kw.char_len()).trim_start()
+            -- Go receiver syntax: `func (r *Recv) MyMethod(...)`
+            if kw == "func " and rest.starts_with("(") {
+                let close_opt = rest.split_once(")")
+                if close_opt != null {
+                    let (_, after_recv) = close_opt.as((String, String))
+                    rest = after_recv.trim_start()
+                }
+            }
+            let sym_name = extract_leading_ident(rest)
+            if sym_name != "" {
+                let col_hits = line.find_indices(sym_name)
+                let col = if not col_hits.is_empty() { col_hits.get(0).as(i64) } else { 0 }
+                return (LspSym {
+                    name: sym_name,
+                    kind: kind_label,
+                    detail: raw_trim,
+                    row: row,
+                    col: col,
+                    end_row: row,
+                })
+            }
+        }
+    }
+    if stripped.starts_with("impl ") or stripped.starts_with("impl<") {
+        var rest = stripped.drop(4).trim_start()
+        if rest.starts_with("<") {
+            let gt_opt = rest.split_once(">")
+            if gt_opt != null {
+                let (_, after_gt) = gt_opt.as((String, String))
+                rest = after_gt.trim_start()
+            }
+        }
+        var target = rest
+        let for_opt = rest.split_once(" for ")
+        if for_opt != null {
+            let (_, rhs) = for_opt.as((String, String))
+            target = rhs.trim_start()
+        }
+        let impl_name = extract_leading_ident(target)
+        if impl_name != "" {
+            let col_hits = line.find_indices(impl_name)
+            let col = if not col_hits.is_empty() { col_hits.get(0).as(i64) } else { 0 }
+            return (LspSym {
+                name: impl_name,
+                kind: "Impl",
+                detail: raw_trim,
+                row: row,
+                col: col,
+                end_row: row,
+            })
+        }
+    }
+    -- C / C++ / Java typed function prototype or definition: e.g. `int calc_add(int a, int b)`
+    if stripped.contains("(") {
+        let paren_sp = stripped.split_once("(")
+        if paren_sp != null {
+            let (before_p, _) = paren_sp.as((String, String))
+            let head = before_p.trim()
+            let blocked_kw = head.starts_with("if ") or head == "if"
+                or head.starts_with("for ") or head == "for"
+                or head.starts_with("while ") or head == "while"
+                or head.starts_with("switch ") or head == "switch"
+                or head.starts_with("return ") or head == "return"
+                or head.starts_with("catch ") or head == "catch"
+                or head.starts_with("else ") or head.starts_with("let ")
+                or head.starts_with("var ") or head.contains("=")
+                or head.contains(".") or head.contains("->")
+            if (not blocked_kw) and head.contains(" ") {
+                let hlen = head.char_len()
+                var ec = hlen
+                while ec > 0 and (head.slice(ec - 1, ec) == " " or head.slice(ec - 1, ec) == "\t") {
+                    ec -= 1
+                }
+                var sc = ec
+                while sc > 0 and is_ident_char_str(head.slice(sc - 1, sc)) {
+                    sc -= 1
+                }
+                if sc > 0 and ec > sc {
+                    let prefix_part = head.slice(0, sc).trim()
+                    let sym_cand = head.slice(sc, ec)
+                    if prefix_part != "" and sym_cand != "" and (not sym_cand.slice(0, 1).is_ascii_digit()) {
+                        let col_hits = line.find_indices(sym_cand)
+                        let col = if not col_hits.is_empty() { col_hits.get(0).as(i64) } else { 0 }
+                        return (LspSym {
+                            name: sym_cand,
+                            kind: "Function",
+                            detail: raw_trim,
+                            row: row,
+                            col: col,
+                            end_row: row,
+                        })
+                    }
+                }
+            }
+        }
+    }
+    null
+}
+
+private struct BufSymbolsCacheEntry {
+    doc_id: i64,
+    edit_version: i64,
+    total_lines: i64,
+    buf_name: String,
+    line0: String,
+    major_mode: String,
+    syms: List,
+}
+
+private global _buf_symbols_cache: ?HashMap = null
+
+private fn ensure_buf_symbols_cache() -> HashMap {
+    let existing? = _buf_symbols_cache else {
+        let m = HashMap.new()
+        _buf_symbols_cache = m
+        return m
+    }
+    existing
+}
+
+pub fn extract_buffer_symbols(buf: Buffer) -> List {
+    let n = buf.line_count()
+    let line0 = buf.line_at(0)
+    let cache = ensure_buf_symbols_cache()
+    let cached_opt = cache.get(buf.id)
+    if cached_opt != null {
+        let entry = cached_opt.as(BufSymbolsCacheEntry)
+        if entry.doc_id == buf.doc_id
+            and entry.edit_version == buf.edit_version
+            and entry.total_lines == n
+            and entry.buf_name == buf.name
+            and entry.line0 == line0
+            and entry.major_mode == buf.major_mode {
+            return entry.syms
+        }
+    }
+
+    buf.sync_external_lines()
+    let out = List()
+    let seen = Set.new()
+
+    if n <= 800 {
+        for r in 0..n {
+            let parsed_opt = parse_decl_on_line(buf.line_at(r), r)
+            if parsed_opt != null {
+                let sym = parsed_opt.as(LspSym)
+                let key = sym.row.to_string() ++ ":" ++ sym.name ++ ":" ++ sym.kind
+                if not seen.contains(key) {
+                    seen.insert(key)
+                    out.push(sym)
+                }
+            }
+        }
+    }
+
+    let spans = accel_doc_scan_symbol_spans(buf.doc_id, buf.major_mode, 4000)
+    if not spans.is_empty() {
+        for i in 0..spans.len() {
+            let sp = spans.get(i.as(usize)).as(SymbolOutlineSpan)
+            let key = sp.row.to_string() ++ ":" ++ sp.name ++ ":" ++ sp.kind
+            if not seen.contains(key) and sp.name.trim() != "" {
+                seen.insert(key)
+                out.push(LspSym {
+                    name: sp.name,
+                    kind: sp.kind,
+                    detail: buf.line_at(sp.row).trim(),
+                    row: sp.row,
+                    col: sp.col,
+                    end_row: sp.end_row,
+                })
+            }
+        }
+    } else if n <= 800 and (not buf.native_large) {
+        let accel_items = accel_scan_symbols(buf.slice_lines(0, n), buf.major_mode)
+        for i in 0..accel_items.len() {
+            let it = accel_items.get(i.as(usize)).as(SymbolItem)
+            let key = it.row.to_string() ++ ":" ++ it.name ++ ":" ++ it.kind
+            if not seen.contains(key) and it.name.trim() != "" {
+                seen.insert(key)
+                out.push(LspSym {
+                    name: it.name,
+                    kind: it.kind,
+                    detail: buf.line_at(it.row).trim(),
+                    row: it.row,
+                    col: it.col,
+                    end_row: it.row,
+                })
+            }
+        }
+    }
+
+    out.sort_by(|a: Any, b: Any| {
+        let sa = a.as(LspSym)
+        let sb = b.as(LspSym)
+        sa.row.cmp(sb.row)
+    })
+
+    if cache.len() > 64 {
+        cache.clear()
+    }
+    cache.insert(
+        buf.id,
+        BufSymbolsCacheEntry {
+            doc_id: buf.doc_id,
+            edit_version: buf.edit_version,
+            total_lines: n,
+            buf_name: buf.name,
+            line0: line0,
+            major_mode: buf.major_mode,
+            syms: out,
+        },
+    )
+    out
+}
+
+private fn extract_doc_comments_above(lines: List, row: i64) -> String {
+    let collected = List()
+    var r = row - 1
+    while r >= 0 and row - r <= 12 {
+        let trimmed = lines.get(r.as(usize)).as(String).trim()
+        if trimmed.starts_with("///") {
+            collected.push(trimmed.drop(3).trim())
+        } else if trimmed.starts_with("//!") {
+            collected.push(trimmed.drop(3).trim())
+        } else if trimmed.starts_with("//") {
+            collected.push(trimmed.drop(2).trim())
+        } else if trimmed.starts_with("--") {
+            collected.push(trimmed.drop(2).trim())
+        } else if trimmed.starts_with("#") and (not trimmed.starts_with("#[")) and (not trimmed.starts_with("#!")) {
+            collected.push(trimmed.drop(1).trim())
+        } else if trimmed.starts_with("#[") or trimmed.starts_with("@") {
+            -- Skip Rust/Python attributes right above item
+            ()
+        } else {
+            break
+        }
+        r -= 1
+    }
+    if collected.is_empty() {
+        return ""
+    }
+    let rev = List()
+    var i = collected.len() - 1
+    while i >= 0 {
+        rev.push(collected.get(i.as(usize)).as(String))
+        i -= 1
+    }
+    rev.join("\n")
+}
+
+private fn whole_word_cols_in_line(line: String, ident: String) -> List {
+    let cols = List()
+    let ilen = ident.char_len()
+    if ilen == 0 {
+        return cols
+    }
+    let n = line.char_len()
+    let raw_hits = line.find_indices(ident)
+    for i in 0..raw_hits.len() {
+        let c = raw_hits.get(i.as(usize)).as(i64)
+        let left_ok = if c <= 0 {
+            true
+        } else {
+            not is_ident_char_str(line.slice(c - 1, c))
+        }
+        let right_ok = if c + ilen >= n {
+            true
+        } else {
+            not is_ident_char_str(line.slice(c + ilen, c + ilen + 1))
+        }
+        if left_ok and right_ok {
+            cols.push(c)
+        }
+    }
+    cols
+}
+
+private fn replace_whole_word_in_line(line: String, old_ident: String, new_ident: String) -> (String, i64) {
+    let cols = whole_word_cols_in_line(line, old_ident)
+    if cols.is_empty() {
+        return (line, 0)
+    }
+    let ilen = old_ident.char_len()
+    var updated = line
+    var idx = cols.len() - 1
+    while idx >= 0 {
+        let sc = cols.get(idx.as(usize)).as(i64)
+        let ec = sc + ilen
+        updated = updated.slice(0, sc) ++ new_ident ++ updated.slice(ec, updated.char_len())
+        idx -= 1
+    }
+    (updated, cols.len())
+}
+
+private fn is_code_file_path(fp: String) -> bool {
+    let low = fp.to_lower()
+    low.ends_with(".ns") or low.ends_with(".rs") or low.ends_with(".py") or low.ends_with(".pyi")
+        or low.ends_with(".ts") or low.ends_with(".tsx") or low.ends_with(".js") or low.ends_with(".jsx")
+        or low.ends_with(".c") or low.ends_with(".h") or low.ends_with(".cpp") or low.ends_with(".hpp")
+        or low.ends_with(".cc") or low.ends_with(".go") or low.ends_with(".lua") or low.ends_with(".zig")
+        or low.ends_with(".sh") or low.ends_with(".java") or low.ends_with(".rb") or low.ends_with(".nix")
+}
+
+private fn find_local_binding_in_buffer(buf: Buffer, ident: String, upto_row: i64) -> ?LspLoc {
+    var r = if upto_row < buf.line_count() { upto_row } else { buf.line_count() - 1 }
+    while r >= 0 {
+        let line = buf.line_at(r)
+        let trimmed = line.trim_start()
+        if trimmed.starts_with("let ") or trimmed.starts_with("var ") or trimmed.starts_with("const ") or trimmed.starts_with("for ") {
+            let cols = whole_word_cols_in_line(line, ident)
+            if not cols.is_empty() {
+                let c0 = cols.get(0).as(i64)
+                let eq_hits = line.find_indices("=")
+                let colon_hits = line.find_indices(":")
+                let in_hits = line.find_indices(" in ")
+                let before_rhs = if not eq_hits.is_empty() {
+                    c0 < eq_hits.get(0).as(i64)
+                } else if not in_hits.is_empty() {
+                    c0 < in_hits.get(0).as(i64)
+                } else {
+                    not colon_hits.is_empty()
+                }
+                if before_rhs {
+                    return (LspLoc {
+                        file_path: buf.file_path,
+                        row: r,
+                        col: c0,
+                        end_row: r,
+                        end_col: c0 + ident.char_len(),
+                    })
+                }
+            }
+        }
+        -- Parameter on enclosing `fn` / `def` / `func` header
+        let decl_opt = parse_decl_on_line(line, r)
+        if decl_opt != null {
+            let d = decl_opt.as(LspSym)
+            if d.kind == "Function" {
+                let cols = whole_word_cols_in_line(line, ident)
+                if not cols.is_empty() {
+                    let c0 = cols.get(0).as(i64)
+                    return (LspLoc {
+                        file_path: buf.file_path,
+                        row: r,
+                        col: c0,
+                        end_row: r,
+                        end_col: c0 + ident.char_len(),
+                    })
+                }
+            }
+        }
+        r -= 1
+    }
+    null
+}
+
+private fn walk_mock_remote_files(
+    dir_uri: String,
+    q_low: String,
+    limit: i64,
+    depth: i64,
+    out: List,
+) {
+    if depth > 12 or out.len() >= limit {
+        return
+    }
+    let items = remote_readdir(dir_uri, show_hidden = false) ! { _ => List() }
+    for i in 0..items.len() {
+        if out.len() >= limit {
+            return
+        }
+        let item = items.get(i.as(usize)).as(RemoteDirItem)
+        if item.is_dir {
+            if item.name != ".git" and item.name != "target" and item.name != "node_modules" {
+                walk_mock_remote_files(item.full_uri, q_low, limit, depth + 1, out)
+            }
+        } else if q_low == "" or item.full_uri.to_lower().contains(q_low) {
+            out.push(item.full_uri)
+        }
+    }
+}
+
+private fn query_remote_files(root_uri: String, query: String, limit: i64) -> !String List {
+    if remote_host_available() {
+        return remote_search_files(root_uri, query, limit = limit)!
+    }
+    let out = List()
+    walk_mock_remote_files(root_uri, query.trim().to_lower(), limit, 0, out)
+    out
+}
+
+private fn query_remote_grep(root_uri: String, pattern: String, limit: i64) -> !String List {
+    if remote_host_available() {
+        return remote_search_grep(root_uri, pattern, limit = limit)!
+    }
+    let files = List()
+    walk_mock_remote_files(root_uri, "", 400, 0, files)
+    let pat_low = pattern.to_lower()
+    let out = List()
+    for fi in 0..files.len() {
+        let furi = files.get(fi.as(usize)).as(String)
+        let rl_res = remote_read_lines(furi)
+        rl_res match {
+            pair! => {
+                let (flines, _) = pair
+                for r in 0..flines.len() {
+                    let ln = flines.get(r.as(usize)).as(String)
+                    let hits = ln.to_lower().find_indices(pat_low)
+                    if not hits.is_empty() {
+                        out.push(RemoteGrepMatch {
+                            full_uri: furi,
+                            row: r,
+                            col: hits.get(0).as(i64),
+                            line_text: ln,
+                        })
+                        if out.len() >= limit {
+                            return out
+                        }
+                    }
+                }
+            },
+            error _ => (),
+        }
+    }
+    out
+}
+
+private fn fallback_find_definitions(
+    world: EditorWorld,
+    active_buf: Buffer,
+    ident: String,
+    root_dir: String,
+    kind_filter: String,
+) -> List {
+    let locs = List()
+    let seen = Set.new()
+    -- 1. Active buffer declarations first
+    let active_syms = extract_buffer_symbols(active_buf)
+    for i in 0..active_syms.len() {
+        let s = active_syms.get(i.as(usize)).as(LspSym)
+        let matches_kind = if kind_filter == "impl" {
+            s.kind == "Impl"
+        } else if kind_filter == "type" {
+            s.kind == "Struct" or s.kind == "Enum" or s.kind == "Interface" or s.kind == "Type" or s.kind == "Class"
+        } else {
+            s.kind != "Impl"
+        }
+        if s.name == ident and matches_kind {
+            let key = active_buf.file_path ++ ":" ++ s.row.to_string() ++ ":" ++ s.col.to_string()
+            if not seen.contains(key) {
+                seen.insert(key)
+                locs.push(LspLoc {
+                    file_path: active_buf.file_path,
+                    row: s.row,
+                    col: s.col,
+                    end_row: s.end_row,
+                    end_col: s.col + ident.char_len(),
+                })
+            }
+        }
+    }
+    -- 2. Other open buffers in EditorWorld
+    for bi in 0..world.buffer_order.len() {
+        let bid = world.buffer_order.get(bi.as(usize)).as(BufferId)
+        if bid != active_buf.id {
+            let ob = world.buffers.get(bid).as(Buffer)
+            if ob.kind == BufferKind.File or ob.kind == BufferKind.Scratch {
+                let osyms = extract_buffer_symbols(ob)
+                for i in 0..osyms.len() {
+                    let s = osyms.get(i.as(usize)).as(LspSym)
+                    let matches_kind = if kind_filter == "impl" {
+                        s.kind == "Impl"
+                    } else if kind_filter == "type" {
+                        s.kind == "Struct" or s.kind == "Enum" or s.kind == "Interface" or s.kind == "Type" or s.kind == "Class"
+                    } else {
+                        s.kind != "Impl"
+                    }
+                    if s.name == ident and matches_kind {
+                        let key = ob.file_path ++ ":" ++ s.row.to_string() ++ ":" ++ s.col.to_string()
+                        if not seen.contains(key) {
+                            seen.insert(key)
+                            locs.push(LspLoc {
+                                file_path: ob.file_path,
+                                row: s.row,
+                                col: s.col,
+                                end_row: s.end_row,
+                                end_col: s.col + ident.char_len(),
+                            })
+                        }
+                    }
+                }
+            }
+        }
+    }
+    -- 3. Remote `ssh://` workspace grep OR local `@lava_accel` symbol search
+    let remote_search_root = if is_ssh_uri(root_dir) {
+        root_dir
+    } else if is_ssh_uri(active_buf.file_path) {
+        parent_ssh_uri(active_buf.file_path)
+    } else {
+        ""
+    }
+    if remote_search_root != "" {
+        let rg_res = query_remote_grep(remote_search_root, ident, 120)
+        rg_res match {
+            rg_hits! => {
+                for i in 0..rg_hits.len() {
+                    let rh = rg_hits.get(i.as(usize)).as(RemoteGrepMatch)
+                    if world.find_buffer_by_path(rh.full_uri) == null {
+                        let decl_opt = parse_decl_on_line(rh.line_text, rh.row)
+                        if decl_opt != null {
+                            let ds = decl_opt.as(LspSym)
+                            let matches_kind = if kind_filter == "impl" {
+                                ds.kind == "Impl"
+                            } else if kind_filter == "type" {
+                                ds.kind == "Struct" or ds.kind == "Enum" or ds.kind == "Interface" or ds.kind == "Type" or ds.kind == "Class"
+                            } else {
+                                ds.kind != "Impl"
+                            }
+                            if ds.name == ident and matches_kind {
+                                let key = rh.full_uri ++ ":" ++ rh.row.to_string() ++ ":" ++ ds.col.to_string()
+                                if not seen.contains(key) {
+                                    seen.insert(key)
+                                    locs.push(LspLoc {
+                                        file_path: rh.full_uri,
+                                        row: rh.row,
+                                        col: ds.col,
+                                        end_row: rh.row,
+                                        end_col: ds.col + ident.char_len(),
+                                    })
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            error _ => (),
+        }
+    }
+    let search_root = if remote_search_root != "" {
+        ""
+    } else if root_dir.trim() != "" and fs.exists(root_dir) {
+        root_dir
+    } else if world.cwd.trim() != "" and fs.exists(world.cwd) {
+        world.cwd
+    } else {
+        ""
+    }
+    if search_root != "" {
+        if kind_filter != "impl" {
+            let defs = accel_find_symbol_defs([search_root], ident, limit = 25)
+            for i in 0..defs.len() {
+                let d = defs.get(i.as(usize)).as(SymbolDefHit)
+                if d.symbol == ident {
+                    let matches_type = if kind_filter == "type" {
+                        d.kind == "struct" or d.kind == "enum" or d.kind == "trait" or d.kind == "type" or d.kind == "newtype"
+                    } else {
+                        true
+                    }
+                    if matches_type {
+                        let key = d.file_path ++ ":" ++ d.row.to_string() ++ ":0"
+                        if not seen.contains(key) {
+                            seen.insert(key)
+                            locs.push(LspLoc {
+                                file_path: d.file_path,
+                                row: d.row,
+                                col: 0,
+                                end_row: d.row,
+                                end_col: ident.char_len(),
+                            })
+                        }
+                    }
+                }
+            }
+        }
+        let grep_hits = accel_workspace_grep(search_root, ident, case_sensitive = true, max_results = 120)
+        for i in 0..grep_hits.len() {
+            let gh = grep_hits.get(i.as(usize)).as(GrepHit)
+            let full_fp = if path.is_absolute(gh.file_path) {
+                path.normalize(gh.file_path)
+            } else {
+                path.normalize(path.join(search_root, gh.file_path))
+            }
+            if world.find_buffer_by_path(full_fp) == null {
+                let decl_opt = parse_decl_on_line(gh.line_text, gh.row)
+                if decl_opt != null {
+                    let ds = decl_opt.as(LspSym)
+                    let matches_kind = if kind_filter == "impl" {
+                        ds.kind == "Impl"
+                    } else if kind_filter == "type" {
+                        ds.kind == "Struct" or ds.kind == "Enum" or ds.kind == "Interface" or ds.kind == "Type" or ds.kind == "Class"
+                    } else {
+                        ds.kind != "Impl"
+                    }
+                    if ds.name == ident and matches_kind {
+                        let key = full_fp ++ ":" ++ gh.row.to_string() ++ ":" ++ ds.col.to_string()
+                        if not seen.contains(key) {
+                            seen.insert(key)
+                            locs.push(LspLoc {
+                                file_path: full_fp,
+                                row: gh.row,
+                                col: ds.col,
+                                end_row: gh.row,
+                                end_col: ds.col + ident.char_len(),
+                            })
+                        }
+                    }
+                }
+            }
+        }
+    }
+    -- 4. Local let/var/parameter fallback in active buffer
+    if locs.is_empty() and kind_filter == "def" {
+        let local_opt = find_local_binding_in_buffer(active_buf, ident, active_buf.point.row)
+        if local_opt != null {
+            locs.push(local_opt.as(LspLoc))
+        }
+    }
+    locs
+}
+
+private fn infer_type_ident_near_cursor(buf: Buffer, ident: String) -> String {
+    -- If `ident` starts with an uppercase letter, it is likely already a type name
+    if ident.char_len() > 0 and ident.slice(0, 1).is_ascii_uppercase() {
+        return ident
+    }
+    -- Check active line and local binding line for `ident: TypeName` or `-> TypeName`
+    var check_line = buf.line_at(buf.point.row)
+    let bind_opt = find_local_binding_in_buffer(buf, ident, buf.point.row)
+    if bind_opt != null {
+        let bl = bind_opt.as(LspLoc)
+        check_line = buf.line_at(bl.row)
+    }
+    let pat_colon = ident ++ ":"
+    let colon_hits = check_line.find_indices(pat_colon)
+    if not colon_hits.is_empty() {
+        let after = check_line.drop(colon_hits.get(0).as(i64) + pat_colon.char_len()).trim_start()
+        let cleaned = if after.starts_with("&mut ") {
+            after.drop(5).trim_start()
+        } else if after.starts_with("&") or after.starts_with("?") or after.starts_with("*") {
+            after.drop(1).trim_start()
+        } else {
+            after
+        }
+        let ty = extract_leading_ident(cleaned)
+        if ty != "" {
+            return ty
+        }
+    }
+    let arrow_hits = check_line.find_indices("->")
+    if not arrow_hits.is_empty() {
+        let after = check_line.drop(arrow_hits.get(0).as(i64) + 2).trim_start()
+        let ty = extract_leading_ident(after)
+        if ty != "" {
+            return ty
+        }
+    }
+    -- Also check constructor assignment `let ident = TypeName`
+    let eq_hits = check_line.find_indices("=")
+    if not eq_hits.is_empty() {
+        let rhs = check_line.drop(eq_hits.get(0).as(i64) + 1).trim_start()
+        let cand = extract_leading_ident(rhs)
+        if cand.char_len() > 0 and cand.slice(0, 1).is_ascii_uppercase() {
+            return cand
+        }
+    }
+    ident
+}
+
+private fn fallback_hover_lines(
+    world: EditorWorld,
+    buf: Buffer,
+    ident: String,
+    root_dir: String,
+) -> List {
+    let lines = List()
+    let lang = infer_language_id(buf)
+    let defs = fallback_find_definitions(world, buf, ident, root_dir, "def")
+    if not defs.is_empty() {
+        let loc = defs.get(0).as(LspLoc)
+        var src_buf_opt: ?Buffer = buf
+        var target_lines = List()
+        var target_row = loc.row
+        var disp_path = buf.name
+        if loc.file_path != "" and loc.file_path != buf.file_path {
+            src_buf_opt = null
+            let ob_opt = world.find_buffer_by_path(loc.file_path)
+            if ob_opt != null {
+                let ob = ob_opt.as(Buffer)
+                src_buf_opt = ob
+                disp_path = ob.name
+            } else if is_ssh_uri(loc.file_path) {
+                let rl_res = remote_read_lines(loc.file_path)
+                rl_res match {
+                    pair! => {
+                        let (rlines, _) = pair
+                        target_lines = rlines
+                    },
+                    error _ => (),
+                }
+                disp_path = ssh_uri_basename(loc.file_path)
+            } else if fs.exists(loc.file_path) {
+                let raw = fs.read_to_string(loc.file_path) ! { _ => "" }
+                if raw != "" {
+                    target_lines = raw.replace("\r\n", "\n").split("\n")
+                }
+                let fn_opt = path.file_name(loc.file_path)
+                disp_path = if fn_opt != null { fn_opt.as(String) } else { loc.file_path }
+            }
+        }
+        if src_buf_opt != null {
+            let sb = src_buf_opt.as(Buffer)
+            let sb_cnt = sb.line_count()
+            if loc.row >= 0 and loc.row < sb_cnt {
+                let win_lo = if loc.row > 12 { loc.row - 12 } else { 0 }
+                target_lines = sb.slice_lines(win_lo, loc.row + 1)
+                target_row = loc.row - win_lo
+            } else {
+                target_row = -1
+            }
+        }
+        let sig_line = if target_row >= 0 and target_row < target_lines.len() {
+            target_lines.get(target_row.as(usize)).as(String).trim()
+        } else {
+            ident
+        }
+        lines.push("```" ++ lang)
+        lines.push(sig_line)
+        lines.push("```")
+        let docs = if target_row >= 0 and target_row < target_lines.len() {
+            extract_doc_comments_above(target_lines, target_row)
+        } else {
+            ""
+        }
+        if docs != "" {
+            lines.push("────────────────────────────────────────")
+            let doc_parts = docs.split("\n")
+            for di in 0..doc_parts.len() {
+                lines.push(doc_parts.get(di.as(usize)).as(String))
+            }
+        }
+        lines.push("Defined at " ++ disp_path ++ ":" ++ (loc.row + 1).to_string() ++ ":" ++ (loc.col + 1).to_string())
+        return lines
+    }
+    -- Fallback context line summary
+    lines.push("Symbol: `" ++ ident ++ "` (" ++ lang ++ ")")
+    lines.push("Line " ++ (buf.point.row + 1).to_string() ++ ": " ++ buf.line_at(buf.point.row).trim())
+    lines
+}
+
+private fn fallback_find_references(
+    world: EditorWorld,
+    active_buf: Buffer,
+    ident: String,
+    root_dir: String,
+) -> List {
+    let entries = List()
+    let seen = Set.new()
+    let open_paths = Set.new()
+    if active_buf.file_path != "" {
+        let norm_active = if is_ssh_uri(active_buf.file_path) {
+            active_buf.file_path
+        } else {
+            path.normalize(active_buf.file_path)
+        }
+        open_paths.insert(norm_active)
+    }
+    -- 1. Active buffer whole-word occurrences
+    for r in 0..active_buf.line_count() {
+        let ln = active_buf.line_at(r)
+        let cols = whole_word_cols_in_line(ln, ident)
+        for ci in 0..cols.len() {
+            let c = cols.get(ci.as(usize)).as(i64)
+            let fp = if active_buf.file_path != "" {
+                if is_ssh_uri(active_buf.file_path) { active_buf.file_path } else { path.normalize(active_buf.file_path) }
+            } else {
+                active_buf.name
+            }
+            let key = fp ++ ":" ++ r.to_string() ++ ":" ++ c.to_string()
+            if not seen.contains(key) {
+                seen.insert(key)
+                entries.push(QuickfixEntry {
+                    file_path: fp,
+                    row: r,
+                    col: c,
+                    text: ln.trim(),
+                })
+            }
+        }
+    }
+    -- 2. Other open file buffers
+    for bi in 0..world.buffer_order.len() {
+        let bid = world.buffer_order.get(bi.as(usize)).as(BufferId)
+        if bid != active_buf.id {
+            let ob = world.buffers.get(bid).as(Buffer)
+            if ob.kind == BufferKind.File {
+                let norm_ob = if ob.file_path != "" {
+                    if is_ssh_uri(ob.file_path) { ob.file_path } else { path.normalize(ob.file_path) }
+                } else {
+                    ob.name
+                }
+                if ob.file_path != "" {
+                    open_paths.insert(norm_ob)
+                }
+                for r in 0..ob.line_count() {
+                    let ln = ob.line_at(r)
+                    let cols = whole_word_cols_in_line(ln, ident)
+                    for ci in 0..cols.len() {
+                        let c = cols.get(ci.as(usize)).as(i64)
+                        let key = norm_ob ++ ":" ++ r.to_string() ++ ":" ++ c.to_string()
+                        if not seen.contains(key) {
+                            seen.insert(key)
+                            entries.push(QuickfixEntry {
+                                file_path: norm_ob,
+                                row: r,
+                                col: c,
+                                text: ln.trim(),
+                            })
+                        }
+                    }
+                }
+            }
+        }
+    }
+    -- 3. Unopened workspace files via remote SSH grep OR local `@lava_accel`
+    let remote_ref_root = if is_ssh_uri(root_dir) {
+        root_dir
+    } else if is_ssh_uri(active_buf.file_path) {
+        parent_ssh_uri(active_buf.file_path)
+    } else {
+        ""
+    }
+    if remote_ref_root != "" {
+        let rg_res = query_remote_grep(remote_ref_root, ident, 200)
+        rg_res match {
+            rg_hits! => {
+                for i in 0..rg_hits.len() {
+                    let rh = rg_hits.get(i.as(usize)).as(RemoteGrepMatch)
+                    if not open_paths.contains(rh.full_uri) {
+                        let cols = whole_word_cols_in_line(rh.line_text, ident)
+                        for ci in 0..cols.len() {
+                            let c = cols.get(ci.as(usize)).as(i64)
+                            let key = rh.full_uri ++ ":" ++ rh.row.to_string() ++ ":" ++ c.to_string()
+                            if not seen.contains(key) {
+                                seen.insert(key)
+                                entries.push(QuickfixEntry {
+                                    file_path: rh.full_uri,
+                                    row: rh.row,
+                                    col: c,
+                                    text: rh.line_text.trim(),
+                                })
+                            }
+                        }
+                    }
+                }
+            },
+            error _ => (),
+        }
+        return entries
+    }
+    let search_root = if root_dir.trim() != "" and fs.exists(root_dir) {
+        root_dir
+    } else if world.cwd.trim() != "" and fs.exists(world.cwd) {
+        world.cwd
+    } else {
+        ""
+    }
+    if search_root != "" {
+        let hits = accel_workspace_grep(search_root, ident, case_sensitive = true, max_results = 200)
+        for i in 0..hits.len() {
+            let gh = hits.get(i.as(usize)).as(GrepHit)
+            let full_fp = if path.is_absolute(gh.file_path) {
+                path.normalize(gh.file_path)
+            } else {
+                path.normalize(path.join(search_root, gh.file_path))
+            }
+            if not open_paths.contains(full_fp) {
+                let cols = whole_word_cols_in_line(gh.line_text, ident)
+                for ci in 0..cols.len() {
+                    let c = cols.get(ci.as(usize)).as(i64)
+                    let key = full_fp ++ ":" ++ gh.row.to_string() ++ ":" ++ c.to_string()
+                    if not seen.contains(key) {
+                        seen.insert(key)
+                        entries.push(QuickfixEntry {
+                            file_path: full_fp,
+                            row: gh.row,
+                            col: c,
+                            text: gh.line_text.trim(),
+                        })
+                    }
+                }
+            }
+        }
+    }
+    entries
+}
+
+-- ============================================================================
+-- 4. LspService Methods: Lifecycle, Polling, Diagnostics & Decorations
+-- ============================================================================
+
+impl LspService {
+    pub fn new() -> LspService {
+        LspService {
+            specs: HashMap.new(),
+            spec_order: List(),
+            clients: HashMap.new(),
+            client_order: List(),
+            next_synthetic_id: 1000,
+            buf_attachments: HashMap.new(),
+            diagnostics_by_buf: HashMap.new(),
+            diagnostics_by_path: HashMap.new(),
+            hover_cache: HashMap.new(),
+            completion_cache: HashMap.new(),
+            locations_cache: HashMap.new(),
+            symbols_cache: HashMap.new(),
+            code_actions_cache: HashMap.new(),
+            workspace_edit_cache: HashMap.new(),
+            logs: List(),
+            extra_search_dirs: List(),
+            prev_buf_before_panel: BufferId(1),
+            last_refs_entries: List(),
+            cmp_registered: false,
+        }
+    }
+
+    pub fn append_log(self, level: String, msg: String) {
+        let stamp = time.unix_millis().to_string()
+        self.logs.push("[" ++ stamp ++ "] [" ++ level.to_upper() ++ "] " ++ msg)
+        while self.logs.len() > 400 {
+            let _ = self.logs.remove(0)
+        }
+    }
+
+    pub fn prepend_search_path(self, dir: String) {
+        let trimmed = dir.trim()
+        if trimmed == "" {
+            return
+        }
+        let updated = List()
+        updated.push(trimmed)
+        for i in 0..self.extra_search_dirs.len() {
+            let existing = self.extra_search_dirs.get(i.as(usize)).as(String)
+            if existing != trimmed {
+                updated.push(existing)
+            }
+        }
+        self.extra_search_dirs = updated
+    }
+
+    pub fn register_server_spec(self, spec: LspServerSpec) {
+        if not self.specs.contains_key(spec.server_id) {
+            self.spec_order.push(spec.server_id)
+        }
+        self.specs.insert(spec.server_id, spec)
+    }
+
+    pub fn get_server_spec(self, server_id: String) -> ?LspServerSpec {
+        let raw? = self.specs.get(server_id) else {
+            return null
+        }
+        raw.as(LspServerSpec)
+    }
+
+    pub fn find_spec_for_buffer(self, buf: Buffer) -> ?LspServerSpec {
+        let mode = buf.major_mode.to_lower()
+        let fp = if buf.file_path != "" { buf.file_path.to_lower() } else { buf.name.to_lower() }
+        for i in 0..self.spec_order.len() {
+            let sid = self.spec_order.get(i.as(usize)).as(String)
+            let spec = self.specs.get(sid).as(LspServerSpec)
+            for fi in 0..spec.filetypes.len() {
+                let ft = spec.filetypes.get(fi.as(usize)).as(String).to_lower()
+                if ft == mode {
+                    return spec
+                }
+                if ft.starts_with(".") and fp.ends_with(ft) {
+                    return spec
+                }
+            }
+        }
+        null
+    }
+
+    pub fn active_clients_for_buffer(self, buf_id: BufferId) -> List {
+        let out = List()
+        let att_opt = self.buf_attachments.get(buf_id)
+        if att_opt == null {
+            return out
+        }
+        let att = att_opt.as(BufferLspAttachment)
+        if att.client_id > 0 {
+            let c_opt = self.clients.get(att.client_id)
+            if c_opt != null {
+                out.push(c_opt.as(LspClientInfo))
+            }
+        }
+        out
+    }
+
+    pub fn has_live_external_client(self, buf_id: BufferId) -> bool {
+        let clients = self.active_clients_for_buffer(buf_id)
+        for i in 0..clients.len() {
+            let c = clients.get(i.as(usize)).as(LspClientInfo)
+            if c.live_rpc and c.alive {
+                return true
+            }
+        }
+        false
+    }
+
+    private fn find_reusable_client(self, server_id: String, root_dir: String) -> ?LspClientInfo {
+        for i in 0..self.client_order.len() {
+            let cid = self.client_order.get(i.as(usize)).as(i64)
+            let c_opt = self.clients.get(cid)
+            if c_opt != null {
+                let c = c_opt.as(LspClientInfo)
+                if c.server_id == server_id and c.root_dir == root_dir and c.alive {
+                    return c
+                }
+            }
+        }
+        null
+    }
+
+    pub fn attach_buffer(
+        self,
+        _kernel: SystemKernel,
+        world: EditorWorld,
+        buf: Buffer,
+        spec: LspServerSpec,
+    ) -> bool {
+        if buf.kind == BufferKind.Special {
+            return false
+        }
+        self.register_server_spec(spec)
+        let is_remote = is_ssh_uri(buf.file_path)
+        let root_dir = detect_project_root(buf.file_path, world.cwd, spec.root_markers)
+
+        if is_remote {
+            var authority = "remote"
+            var rprefix = "ssh://remote"
+            let pt_res = parse_ssh_uri(buf.file_path)
+            pt_res match {
+                pt! => {
+                    authority = pt.authority
+                    rprefix = pt.prefix
+                },
+                error _ => (),
+            }
+            var remote_exe = ""
+            let rw_res = remote_which(buf.file_path, spec.cmd)
+            rw_res match {
+                rw! => {
+                    remote_exe = rw.trim()
+                },
+                error _ => (),
+            }
+            if remote_exe == "" and (not remote_host_available()) {
+                let fallback_exe_opt = resolve_executable_in_path_with_dirs(spec.cmd, self.extra_search_dirs)
+                if fallback_exe_opt != null {
+                    remote_exe = fallback_exe_opt.as(String)
+                }
+            }
+            let binary_found = remote_exe != ""
+            let disp_name = if binary_found {
+                spec.cmd ++ "@" ++ authority
+            } else {
+                "builtin-index@" ++ authority
+            }
+            let exe_display = if binary_found {
+                rprefix ++ ":" ++ remote_exe
+            } else {
+                ""
+            }
+
+            var client_id: i64 = 0
+            var live_rpc = false
+
+            let reuse_opt = self.find_reusable_client(spec.server_id, root_dir)
+            if reuse_opt != null {
+                let existing = reuse_opt.as(LspClientInfo)
+                client_id = existing.client_id
+                live_rpc = existing.live_rpc
+                var already = false
+                for bi in 0..existing.attached_buffers.len() {
+                    if existing.attached_buffers.get(bi.as(usize)).as(BufferId) == buf.id {
+                        already = true
+                    }
+                }
+                if not already {
+                    existing.attached_buffers.push(buf.id)
+                }
+            } else if binary_found and lsp_available() and remote_host_available() {
+                let launch_res = remote_lsp_launch_command(buf.file_path, root_dir, remote_exe, spec.args)
+                launch_res match {
+                    tup! => {
+                        let (tbin, targs, launch_prefix, clean_rroot) = tup
+                        let spawn_res = lsp_spawn_remote(
+                            tbin,
+                            targs,
+                            launch_prefix,
+                            clean_rroot,
+                            disp_name,
+                            init_options_json = spec.settings_json,
+                        )
+                        spawn_res match {
+                            sid! => {
+                                client_id = sid
+                                live_rpc = true
+                                let info = LspClientInfo {
+                                    client_id: sid,
+                                    server_id: spec.server_id,
+                                    server_name: disp_name,
+                                    cmd: spec.cmd,
+                                    exe_path: launch_prefix ++ ":" ++ remote_exe,
+                                    args: spec.args,
+                                    root_dir: root_dir,
+                                    settings_json: spec.settings_json,
+                                    live_rpc: true,
+                                    binary_found: true,
+                                    alive: true,
+                                    initialized: false,
+                                    server_version: "",
+                                    capabilities: "",
+                                    attached_buffers: [buf.id],
+                                }
+                                self.clients.insert(sid, info)
+                                self.client_order.push(sid)
+                                self.append_log(
+                                    "info",
+                                    "Spawned remote LSP server " ++ disp_name ++ " (" ++ remote_exe ++ ") at " ++ root_dir,
+                                )
+                            },
+                            error err_msg => {
+                                self.append_log(
+                                    "warn",
+                                    "Failed spawning remote " ++ disp_name ++ ": " ++ err_msg ++ " (falling back to remote index)",
+                                )
+                            },
+                        }
+                    },
+                    error lerr => {
+                        self.append_log("warn", "Failed building remote LSP launch command: " ++ lerr)
+                    },
+                }
+            } else if binary_found {
+                let sid = self.next_synthetic_id
+                self.next_synthetic_id += 1
+                client_id = sid
+                let info = LspClientInfo {
+                    client_id: sid,
+                    server_id: spec.server_id,
+                    server_name: disp_name,
+                    cmd: spec.cmd,
+                    exe_path: exe_display,
+                    args: spec.args,
+                    root_dir: root_dir,
+                    settings_json: spec.settings_json,
+                    live_rpc: false,
+                    binary_found: true,
+                    alive: true,
+                    initialized: true,
+                    server_version: "remote-standalone",
+                    capabilities: "definition,references,hover,rename,codeAction,documentSymbol,completion",
+                    attached_buffers: [buf.id],
+                }
+                self.clients.insert(sid, info)
+                self.client_order.push(sid)
+                self.append_log(
+                    "info",
+                    "Attached remote binary " ++ disp_name ++ " (" ++ exe_display ++ ") at " ++ root_dir,
+                )
+            } else {
+                self.append_log(
+                    "info",
+                    "Attached remote builtin-index fallback for " ++ buf.name ++ " (" ++ spec.server_id ++ ") at " ++ root_dir,
+                )
+            }
+
+            let prev_att_opt = self.buf_attachments.get(buf.id)
+            let next_ver = if prev_att_opt != null {
+                prev_att_opt.as(BufferLspAttachment).version + 1
+            } else {
+                1
+            }
+            let att = BufferLspAttachment {
+                buf_id: buf.id,
+                server_id: spec.server_id,
+                server_name: disp_name,
+                root_dir: root_dir,
+                exe_path: exe_display,
+                client_id: client_id,
+                live_rpc: live_rpc,
+                binary_found: binary_found,
+                version: next_ver,
+                last_edit_version: buf.edit_version,
+            }
+            self.buf_attachments.insert(buf.id, att)
+            buf.vars.insert("lsp_root_dir", root_dir)
+            buf.vars.insert("lsp_server", disp_name)
+
+            if live_rpc and client_id > 0 and buf.file_path != "" {
+                let lang_id = infer_language_id(buf)
+                buf.sync_external_lines()
+                if not accel_lsp_did_open_doc(client_id, buf.doc_id, buf.file_path, lang_id, next_ver, buf.crlf) {
+                    let _ = lsp_did_open(client_id, buf.file_path, lang_id, next_ver, buf.to_text()) ! {
+                        err => self.append_log("warn", "remote didOpen error: " ++ err),
+                    }
+                }
+            }
+            if world.active_buffer_id == buf.id {
+                self.sync_statusline(world, buf)
+            }
+            return binary_found
+        }
+
+        let exe_opt = resolve_executable_in_path_with_dirs(spec.cmd, self.extra_search_dirs)
+        let exe_path = if exe_opt != null { exe_opt.as(String) } else { "" }
+        let binary_found = exe_path != ""
+        let host_rpc_ready = binary_found and lsp_available()
+
+        var client_id: i64 = 0
+        var live_rpc = false
+
+        let reuse_opt = self.find_reusable_client(spec.server_id, root_dir)
+        if reuse_opt != null {
+            let existing = reuse_opt.as(LspClientInfo)
+            client_id = existing.client_id
+            live_rpc = existing.live_rpc
+            var already = false
+            for bi in 0..existing.attached_buffers.len() {
+                if existing.attached_buffers.get(bi.as(usize)).as(BufferId) == buf.id {
+                    already = true
+                }
+            }
+            if not already {
+                existing.attached_buffers.push(buf.id)
+            }
+        } else if host_rpc_ready {
+            let spawn_res = lsp_spawn(
+                exe_path,
+                spec.args,
+                root_dir,
+                root_dir,
+                init_options_json = spec.settings_json,
+            )
+            spawn_res match {
+                sid! => {
+                    client_id = sid
+                    live_rpc = true
+                    let info = LspClientInfo {
+                        client_id: sid,
+                        server_id: spec.server_id,
+                        server_name: spec.cmd,
+                        cmd: spec.cmd,
+                        exe_path: exe_path,
+                        args: spec.args,
+                        root_dir: root_dir,
+                        settings_json: spec.settings_json,
+                        live_rpc: true,
+                        binary_found: true,
+                        alive: true,
+                        initialized: false,
+                        server_version: "",
+                        capabilities: "",
+                        attached_buffers: [buf.id],
+                    }
+                    self.clients.insert(sid, info)
+                    self.client_order.push(sid)
+                    self.append_log("info", "Spawned LSP server " ++ spec.cmd ++ " (" ++ exe_path ++ ") at " ++ root_dir)
+                },
+                error err_msg => {
+                    self.append_log("warn", "Failed spawning " ++ spec.cmd ++ ": " ++ err_msg ++ " (falling back to builtin-index)")
+                },
+            }
+        } else if binary_found {
+            -- Executable exists in `$PATH`, running in standalone VM without `LspManager` host bridge
+            let sid = self.next_synthetic_id
+            self.next_synthetic_id += 1
+            client_id = sid
+            let info = LspClientInfo {
+                client_id: sid,
+                server_id: spec.server_id,
+                server_name: spec.cmd,
+                cmd: spec.cmd,
+                exe_path: exe_path,
+                args: spec.args,
+                root_dir: root_dir,
+                settings_json: spec.settings_json,
+                live_rpc: false,
+                binary_found: true,
+                alive: true,
+                initialized: true,
+                server_version: "standalone",
+                capabilities: "definition,references,hover,rename,codeAction,documentSymbol,completion",
+                attached_buffers: [buf.id],
+            }
+            self.clients.insert(sid, info)
+            self.client_order.push(sid)
+            self.append_log("info", "Attached resolved binary " ++ spec.cmd ++ " (" ++ exe_path ++ ") at " ++ root_dir)
+        } else {
+            self.append_log("info", "Attached builtin-index fallback for " ++ buf.name ++ " (" ++ spec.server_id ++ ") at " ++ root_dir)
+        }
+
+        let prev_att_opt = self.buf_attachments.get(buf.id)
+        let next_ver = if prev_att_opt != null {
+            prev_att_opt.as(BufferLspAttachment).version + 1
+        } else {
+            1
+        }
+        let disp_server_name = if binary_found { spec.cmd } else { "builtin-index" }
+        let att = BufferLspAttachment {
+            buf_id: buf.id,
+            server_id: spec.server_id,
+            server_name: disp_server_name,
+            root_dir: root_dir,
+            exe_path: exe_path,
+            client_id: client_id,
+            live_rpc: live_rpc,
+            binary_found: binary_found,
+            version: next_ver,
+            last_edit_version: buf.edit_version,
+        }
+        self.buf_attachments.insert(buf.id, att)
+        buf.vars.insert("lsp_root_dir", root_dir)
+        buf.vars.insert("lsp_server", disp_server_name)
+
+        if live_rpc and client_id > 0 and buf.file_path != "" {
+            let lang_id = infer_language_id(buf)
+            buf.sync_external_lines()
+            if not accel_lsp_did_open_doc(client_id, buf.doc_id, buf.file_path, lang_id, next_ver, buf.crlf) {
+                let _ = lsp_did_open(client_id, buf.file_path, lang_id, next_ver, buf.to_text()) ! {
+                    err => self.append_log("warn", "didOpen error: " ++ err),
+                }
+            }
+        }
+        if world.active_buffer_id == buf.id {
+            self.sync_statusline(world, buf)
+        }
+        binary_found
+    }
+
+    pub fn diagnostics_for_buffer(self, buf: Buffer) -> List {
+        let by_id = self.diagnostics_by_buf.get(buf.id)
+        if by_id != null {
+            return by_id.as(List)
+        }
+        if buf.file_path != "" {
+            let by_p = self.diagnostics_by_path.get(buf.file_path)
+            if by_p != null {
+                return by_p.as(List)
+            }
+        }
+        List()
+    }
+
+    pub fn apply_buffer_diagnostics(self, world: EditorWorld, buf: Buffer, items: List) {
+        self.diagnostics_by_buf.insert(buf.id, items)
+        if buf.file_path != "" {
+            self.diagnostics_by_path.insert(buf.file_path, items)
+        }
+        buf.vars.insert("lsp_diagnostics", items)
+        buf.clear_owner_decors(OWNER_LSP)
+
+        var err_cnt: i64 = 0
+        var warn_cnt: i64 = 0
+        var decors_pushed: i64 = 0
+        let total_lines = buf.line_count()
+        let row_best_sev = HashMap.new()
+        let row_first_msg = HashMap.new()
+
+        for i in 0..items.len() {
+            let d = items.get(i.as(usize)).as(LspDiag)
+            let sev_up = d.severity.to_upper()
+            let rank = when {
+                sev_up == "ERROR" => 4,
+                sev_up == "WARN" or sev_up == "WARNING" => 3,
+                sev_up == "INFO" => 2,
+                else => 1,
+            }
+            if rank == 4 {
+                err_cnt += 1
+            } else if rank == 3 {
+                warn_cnt += 1
+            }
+            if d.row >= 0 and d.row < total_lines {
+                if decors_pushed < 334 {
+                    let fg_col = when {
+                        rank == 4 => rgb(243, 139, 168),
+                        rank == 3 => rgb(249, 226, 175),
+                        rank == 2 => rgb(137, 180, 250),
+                        else => rgb(148, 226, 213),
+                    }
+                    let line_len = buf.line_char_len(d.row)
+                    let sc = if d.col < 0 { 0 } else if d.col > line_len { line_len } else { d.col }
+                    let raw_ec = if d.end_row > d.row { line_len } else { d.end_col }
+                    let ec = if raw_ec <= sc {
+                        if sc < line_len { sc + 1 } else { line_len }
+                    } else if raw_ec > line_len {
+                        line_len
+                    } else {
+                        raw_ec
+                    }
+                    if ec > sc {
+                        buf.add_inline_decor(
+                            OWNER_LSP,
+                            d.row,
+                            sc,
+                            ec,
+                            bg_rgba = 0,
+                            fg_rgba = fg_col,
+                            underline = true,
+                            replace_label = "",
+                        )
+                        decors_pushed += 1
+                    }
+                }
+                let prev_rank_opt = row_best_sev.get(d.row)
+                let prev_rank = if prev_rank_opt != null { prev_rank_opt.as(i64) } else { 0 }
+                if rank > prev_rank and (prev_rank > 0 or row_best_sev.len() < 333) {
+                    row_best_sev.insert(d.row, rank)
+                    row_first_msg.insert(d.row, d.message)
+                }
+            }
+        }
+
+        buf.vars.insert("lsp_err_count", err_cnt)
+        buf.vars.insert("lsp_warn_count", warn_cnt)
+
+        let diag_rows = row_best_sev.keys()
+        for i in 0..diag_rows.len() {
+            if decors_pushed >= 1000 {
+                break
+            }
+            let r = diag_rows.get(i.as(usize)).as(i64)
+            let rank = row_best_sev.get(r).as(i64)
+            let msg = row_first_msg.get(r).as(String)
+            let (sign_txt, fg_col, prio) = when {
+                rank == 4 => ("E", rgb(243, 139, 168), 90),
+                rank == 3 => ("W", rgb(249, 226, 175), 80),
+                rank == 2 => ("I", rgb(137, 180, 250), 70),
+                else => ("H", rgb(148, 226, 213), 60),
+            }
+            buf.add_sign(OWNER_LSP, r, sign_txt, fg_col, priority = prio)
+            decors_pushed += 1
+            if decors_pushed < 1000 {
+                let clipped = if msg.char_len() > 64 { msg.slice(0, 64) ++ "…" } else { msg }
+                buf.add_virt_text(OWNER_LSP, r, "● " ++ clipped, fg_col, italic = true)
+                decors_pushed += 1
+            }
+        }
+
+        if world.active_buffer_id == buf.id {
+            self.sync_statusline(world, buf)
+        }
+    }
+
+    pub fn sync_statusline(self, world: EditorWorld, buf: Buffer) {
+        if buf.kind == BufferKind.Special {
+            return
+        }
+        let att_opt = self.buf_attachments.get(buf.id)
+        if att_opt == null {
+            return
+        }
+        let att = att_opt.as(BufferLspAttachment)
+        let diags = self.diagnostics_for_buffer(buf)
+        var err_cnt: i64 = 0
+        var warn_cnt: i64 = 0
+        for i in 0..diags.len() {
+            let d = diags.get(i.as(usize)).as(LspDiag)
+            let s = d.severity.to_upper()
+            if s == "ERROR" {
+                err_cnt += 1
+            } else if s == "WARN" or s == "WARNING" {
+                warn_cnt += 1
+            }
+        }
+        var badge = "[LSP: " ++ att.server_name ++ "]"
+        if is_ssh_uri(buf.file_path) or is_ssh_uri(att.root_dir) {
+            let src_uri = if is_ssh_uri(buf.file_path) { buf.file_path } else { att.root_dir }
+            let pt_res = parse_ssh_uri(src_uri)
+            pt_res match {
+                pt! => {
+                    badge = badge ++ " [REMOTE " ++ pt.authority ++ "]"
+                },
+                error _ => (),
+            }
+        }
+        if err_cnt > 0 or warn_cnt > 0 {
+            badge = badge ++ " E:" ++ err_cnt.to_string() ++ " W:" ++ warn_cnt.to_string()
+        }
+        world.statusline_right_extra = badge
+    }
+
+    pub fn poll_all_clients(self, world: EditorWorld) {
+        for i in 0..self.client_order.len() {
+            let cid = self.client_order.get(i.as(usize)).as(i64)
+            let c_opt = self.clients.get(cid)
+            if c_opt != null {
+                let c = c_opt.as(LspClientInfo)
+                if c.live_rpc and c.alive {
+                    let evs = lsp_poll_events(cid) ! { _ => List() }
+                    for ei in 0..evs.len() {
+                        let ev = evs.get(ei.as(usize)).as(LspWireEvent)
+                        ev match {
+                            LspWireEvent.Initialized(sname, sver, caps) => {
+                                c.initialized = true
+                                if sname != "" {
+                                    c.server_name = sname
+                                }
+                                c.server_version = sver
+                                c.capabilities = caps
+                                self.append_log("info", "Initialized " ++ c.server_name ++ " " ++ sver)
+                            },
+                            LspWireEvent.Diagnostics(fp, items) => {
+                                self.diagnostics_by_path.insert(fp, items)
+                                let b_opt = world.find_buffer_by_path(fp)
+                                if b_opt != null {
+                                    self.apply_buffer_diagnostics(world, b_opt.as(Buffer), items)
+                                }
+                            },
+                            LspWireEvent.Hover(req_id, md) => {
+                                self.hover_cache.insert(req_id, md)
+                                self.hover_cache.insert(cid, md)
+                            },
+                            LspWireEvent.Locations(req_id, _lkind, items) => {
+                                self.locations_cache.insert(req_id, items)
+                            },
+                            LspWireEvent.Symbols(req_id, items) => {
+                                self.symbols_cache.insert(req_id, items)
+                            },
+                            LspWireEvent.Completions(_req_id, items) => {
+                                self.completion_cache.insert(cid, items)
+                            },
+                            LspWireEvent.WorkspaceEdit(req_id, _lbl, edits) => {
+                                self.workspace_edit_cache.insert(req_id, edits)
+                            },
+                            LspWireEvent.CodeActions(req_id, items) => {
+                                self.code_actions_cache.insert(req_id, items)
+                            },
+                            LspWireEvent.Log(lvl, msg) => {
+                                self.append_log(lvl, "[" ++ c.server_name ++ "] " ++ msg)
+                            },
+                            LspWireEvent.RequestError(_req_id, method, msg) => {
+                                self.append_log("error", "[" ++ c.server_name ++ "] " ++ method ++ ": " ++ msg)
+                            },
+                            LspWireEvent.Exited(code) => {
+                                c.alive = false
+                                self.append_log("warn", "LSP server " ++ c.server_name ++ " exited (" ++ code.to_string() ++ ")")
+                            },
+                        }
+                    }
+                    let st_res = lsp_status(cid)
+                    st_res match {
+                        st! => {
+                            c.alive = st.alive
+                            c.initialized = st.initialized
+                            if st.server_name != "" {
+                                c.server_name = st.server_name
+                            }
+                            if st.server_version != "" {
+                                c.server_version = st.server_version
+                            }
+                            if st.capabilities != "" {
+                                c.capabilities = st.capabilities
+                            }
+                        },
+                        error _ => (),
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn wait_live_response(
+        self,
+        world: EditorWorld,
+        _client_id: i64,
+        req_id: i64,
+        cache: HashMap,
+    ) -> ?Any {
+        var tries: i64 = 0
+        while tries < 25 {
+            self.poll_all_clients(world)
+            let hit = cache.get(req_id)
+            if hit != null {
+                return hit
+            }
+            time.sleep_ms(6)
+            tries += 1
+        }
+        self.poll_all_clients(world)
+        cache.get(req_id)
+    }
+
+    pub fn notify_buffer_changed(self, _world: EditorWorld, buf: Buffer) {
+        let att_opt = self.buf_attachments.get(buf.id)
+        if att_opt == null {
+            return
+        }
+        let att = att_opt.as(BufferLspAttachment)
+        if att.last_edit_version == buf.edit_version {
+            return
+        }
+        att.last_edit_version = buf.edit_version
+        att.version += 1
+        if att.live_rpc and att.client_id > 0 and buf.file_path != "" {
+            buf.sync_external_lines()
+            if not accel_lsp_did_change_doc(att.client_id, buf.doc_id, buf.file_path, att.version, buf.crlf) {
+                let _ = lsp_did_change(att.client_id, buf.file_path, att.version, buf.to_text()) ! {
+                    _ => (),
+                }
+            }
+            let _ = lsp_request(
+                att.client_id,
+                "completion",
+                buf.file_path,
+                buf.point.row,
+                buf.point.col,
+            ) ! { _ => 0 }
+        }
+    }
+
+    pub fn notify_buffer_saved(self, buf: Buffer) {
+        let att_opt = self.buf_attachments.get(buf.id)
+        if att_opt == null {
+            return
+        }
+        let att = att_opt.as(BufferLspAttachment)
+        if att.live_rpc and att.client_id > 0 and buf.file_path != "" {
+            buf.sync_external_lines()
+            if not accel_lsp_did_save_doc(att.client_id, buf.doc_id, buf.file_path, buf.crlf) {
+                let _ = lsp_did_save(att.client_id, buf.file_path, buf.to_text()) ! {
+                    _ => (),
+                }
+            }
+        }
+    }
+
+    pub fn notify_buffer_closed(self, buf_id: BufferId, file_path: String) {
+        let att_opt = self.buf_attachments.remove(buf_id)
+        if att_opt == null {
+            return
+        }
+        let att = att_opt.as(BufferLspAttachment)
+        if att.live_rpc and att.client_id > 0 and file_path != "" {
+            let _ = lsp_did_close(att.client_id, file_path) ! {
+                _ => (),
+            }
+        }
+    }
+
+    pub fn stop_clients_for_buffer(self, world: EditorWorld, buf: Buffer) -> i64 {
+        var stopped: i64 = 0
+        let att_opt = self.buf_attachments.remove(buf.id)
+        if att_opt != null {
+            let att = att_opt.as(BufferLspAttachment)
+            if att.client_id > 0 {
+                let c_opt = self.clients.get(att.client_id)
+                if c_opt != null {
+                    let c = c_opt.as(LspClientInfo)
+                    if c.live_rpc and c.alive {
+                        let _ = lsp_stop(c.client_id)
+                    }
+                    c.alive = false
+                    stopped += 1
+                    self.append_log("info", "Stopped LSP client " ++ c.server_name)
+                }
+            }
+        }
+        buf.clear_owner_decors(OWNER_LSP)
+        if world.active_buffer_id == buf.id {
+            world.statusline_right_extra = ""
+        }
+        stopped
+    }
+}
+
+pub fn require_lsp_service(kernel: SystemKernel) -> !String LspService {
+    let raw = kernel.require_service(SERVICE_LSP)!
+    raw.as(LspService)
+}
+
+-- ============================================================================
+-- 5. Navigation, Edits, Completion Provider & UI Panels
+-- ============================================================================
+
+private fn jump_to_location(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    from_buf: Buffer,
+    target_path: String,
+    row: i64,
+    col: i64,
+) -> #InteractiveEffects !String Buffer {
+    world.jumps.record(from_buf.id, from_buf.file_path, from_buf.point)
+    from_buf.named_marks.insert("'", from_buf.point)
+
+    var dest_buf = from_buf
+    if target_path != "" and target_path != from_buf.file_path and target_path != from_buf.name {
+        let open_opt = world.find_buffer_by_path(target_path)
+        if open_opt != null {
+            dest_buf = open_opt.as(Buffer)
+            world.active_buffer_id = dest_buf.id
+        } else {
+            let by_name_opt = world.find_buffer_by_name(target_path)
+            if by_name_opt != null {
+                dest_buf = by_name_opt.as(Buffer)
+                world.active_buffer_id = dest_buf.id
+            } else if is_ssh_uri(target_path) {
+                let st_res = remote_stat(target_path)
+                var can_open_remote = false
+                st_res match {
+                    st! => {
+                        can_open_remote = st.exists and st.is_file
+                    },
+                    error _ => (),
+                }
+                if can_open_remote {
+                    dest_buf = world.open_file(target_path)#!
+                    kernel.emit_hook("buffer-opened", dest_buf.id)
+                }
+            } else if fs.exists(target_path) {
+                dest_buf = world.open_file(target_path)#!
+                kernel.emit_hook("buffer-opened", dest_buf.id)
+            }
+        }
+    }
+    dest_buf.point = dest_buf.clamp_pos(Pos.new(row, col), insert_mode = false)
+    dest_buf.preferred_col = dest_buf.point.col
+    sync_wm(kernel, world)
+    kernel.emit_hook("buffer-switched", dest_buf.id)
+    dest_buf
+}
+
+private fn apply_lsp_text_edits(world: EditorWorld, edits: List) -> !String i64 {
+    if edits.is_empty() {
+        return 0
+    }
+    -- Group edits by file_path and apply bottom-up so earlier spans stay valid
+    let by_file = HashMap.new()
+    let files = List()
+    for i in 0..edits.len() {
+        let e = edits.get(i.as(usize)).as(LspTextEdit)
+        let fp = e.file_path
+        if not by_file.contains_key(fp) {
+            by_file.insert(fp, List())
+            files.push(fp)
+        }
+        by_file.get(fp).as(List).push(e)
+    }
+    var count: i64 = 0
+    for fi in 0..files.len() {
+        let fp = files.get(fi.as(usize)).as(String)
+        let file_edits = by_file.get(fp).as(List)
+        file_edits.sort_by(|a: Any, b: Any| {
+            let ea = a.as(LspTextEdit)
+            let eb = b.as(LspTextEdit)
+            if ea.start_row != eb.start_row {
+                eb.start_row.cmp(ea.start_row)
+            } else {
+                eb.start_col.cmp(ea.start_col)
+            }
+        })
+        var target_buf_opt = if fp == "" {
+            world.active_buffer()
+        } else {
+            world.find_buffer_by_path(fp)
+        }
+        if target_buf_opt == null and fp != "" and is_ssh_uri(fp) {
+            let (flines, crlf) = remote_read_lines(fp)!
+            let b = Buffer.new(BufferId(999999), fp, BufferKind.File, file_path = fp, initial_lines = flines)
+            b.crlf = crlf
+            for ei in 0..file_edits.len() {
+                let ed = file_edits.get(ei.as(usize)).as(LspTextEdit)
+                let sp = Span.normalized(Pos.new(ed.start_row, ed.start_col), Pos.new(ed.end_row, ed.end_col))
+                let _ = b.replace_span(sp, ed.new_text)!
+                count += 1
+            }
+            b.sync_external_lines()
+            let _ = remote_write_lines(fp, b.slice_lines(0, b.line_count()), b.crlf)!
+        } else if target_buf_opt == null and fp != "" and fs.exists(fp) {
+            let (flines, crlf) = host_read_file_lines(fp)!
+            let b = Buffer.new(BufferId(999999), fp, BufferKind.File, file_path = fp, initial_lines = flines)
+            b.crlf = crlf
+            for ei in 0..file_edits.len() {
+                let ed = file_edits.get(ei.as(usize)).as(LspTextEdit)
+                let sp = Span.normalized(Pos.new(ed.start_row, ed.start_col), Pos.new(ed.end_row, ed.end_col))
+                let _ = b.replace_span(sp, ed.new_text)!
+                count += 1
+            }
+            b.sync_external_lines()
+            if b.doc_id > 0 {
+                let _ = accel_doc_save_file(b.doc_id, fp, b.crlf)!
+            } else {
+                let _ = host_write_file_lines(fp, b.slice_lines(0, b.line_count()), true)!
+            }
+        } else if target_buf_opt != null {
+            let b = target_buf_opt.as(Buffer)
+            let was_ro = b.read_only
+            if was_ro {
+                return error ("buffer is read-only: " ++ b.name)
+            }
+            for ei in 0..file_edits.len() {
+                let ed = file_edits.get(ei.as(usize)).as(LspTextEdit)
+                let sp = Span.normalized(Pos.new(ed.start_row, ed.start_col), Pos.new(ed.end_row, ed.end_col))
+                let _ = b.replace_span(sp, ed.new_text)!
+                count += 1
+            }
+            b.checkpoint(b.point, "lsp-edit")
+        }
+    }
+    count
+}
+
+private fn try_register_cmp_source(kernel: SystemKernel, svc: LspService) {
+    if svc.cmp_registered {
+        return
+    }
+    let cmp_opt = kernel.service(SERVICE_CMP)
+    if cmp_opt == null {
+        return
+    }
+    let cmp = cmp_opt.as(CmpService)
+    cmp.register_source(
+        "lsp",
+        |buf: Buffer, prefix: String| -> List {
+            let out = List()
+            let seen = Set.new()
+            let p_low = prefix.to_lower()
+            if _active_lsp_service != null {
+                let lsvc = _active_lsp_service.as(LspService)
+                let att_opt = lsvc.buf_attachments.get(buf.id)
+                if att_opt != null {
+                    let att = att_opt.as(BufferLspAttachment)
+                    let cached_opt = lsvc.completion_cache.get(att.client_id)
+                    if cached_opt != null {
+                        let citems = cached_opt.as(List)
+                        for i in 0..citems.len() {
+                            let ci = citems.get(i.as(usize)).as(LspCompItem)
+                            if p_low == "" or ci.label.to_lower().contains(p_low) {
+                                if not seen.contains(ci.label) {
+                                    seen.insert(ci.label)
+                                    out.push(CompletionItem {
+                                        label: ci.label,
+                                        insert_text: if ci.insert_text != "" { ci.insert_text } else { ci.label },
+                                        kind: if ci.kind != "" { ci.kind } else { "LSP" },
+                                        detail: if ci.detail != "" { ci.detail } else { "[LSP]" },
+                                    })
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let syms = extract_buffer_symbols(buf)
+            for i in 0..syms.len() {
+                let s = syms.get(i.as(usize)).as(LspSym)
+                if p_low == "" or s.name.to_lower().contains(p_low) {
+                    if not seen.contains(s.name) {
+                        seen.insert(s.name)
+                        out.push(CompletionItem {
+                            label: s.name,
+                            insert_text: s.name,
+                            kind: s.kind,
+                            detail: "[LSP] " ++ s.detail,
+                        })
+                    }
+                }
+            }
+            out
+        },
+    )
+    svc.cmp_registered = true
+}
+
+private fn show_hover_float(kernel: SystemKernel, world: EditorWorld, title_sym: String, raw_lines: List) {
+    let formatted = List()
+    var max_w: i64 = 38
+    for i in 0..raw_lines.len() {
+        let part_lines = raw_lines.get(i.as(usize)).as(String).split("\n")
+        for pi in 0..part_lines.len() {
+            let ln = part_lines.get(pi.as(usize)).as(String)
+            let clipped = if ln.char_len() > 86 { ln.slice(0, 86) ++ "…" } else { ln }
+            if clipped.char_len() + 4 > max_w {
+                max_w = clipped.char_len() + 4
+            }
+            formatted.push(" " ++ clipped)
+        }
+    }
+    if formatted.is_empty() {
+        formatted.push(" No hover information available.")
+    }
+    let w_cols = if max_w > 92 { 92 } else { max_w }
+    let h_rows = if formatted.len() + 2 > 18 { 18 } else if formatted.len() + 2 < 4 { 4 } else { formatted.len() + 2 }
+    world.set_floating_window(FloatingWindow {
+        id: LSP_HOVER_FLOAT_ID,
+        owner: OWNER_LSP,
+        title: " *lsp-hover* · " ++ title_sym ++ " ",
+        anchor: "cursor",
+        width_cols: w_cols,
+        height_rows: h_rows,
+        lines: formatted,
+        selected_row: 0,
+        border_rgba: rgb(137, 180, 250),
+    })
+    let vim_opt = kernel.service(SERVICE_VIM)
+    if vim_opt != null {
+        let vim = vim_opt.as(VimState)
+        if vim.modal_interceptor == null {
+            vim.modal_interceptor = ModalInterceptor {
+                owner: OWNER_LSP,
+                handler: |kern: SystemKernel, stroke: KeyStroke| -> #[log_event, status_emit, clipboard_get, clipboard_set] !String bool {
+                    let v_opt = kern.service(SERVICE_VIM)
+                    if v_opt != null {
+                        let vs = v_opt.as(VimState)
+                        if vs.modal_interceptor != null and vs.modal_interceptor.as(ModalInterceptor).owner == OWNER_LSP {
+                            vs.modal_interceptor = null
+                        }
+                    }
+                    let w_opt = kern.service("lava.document.world")
+                    if w_opt != null {
+                        let _ = w_opt.as(EditorWorld).remove_floating_window(LSP_HOVER_FLOAT_ID)
+                    }
+                    stroke.key == "Escape"
+                },
+            }
+        }
+    }
+}
+
+private fn render_lsp_info_lines(svc: LspService, world: EditorWorld, target_buf: Buffer) -> List {
+    let lines = List()
+    lines.push("========================================================================")
+    lines.push(" Lava LSP Client Status (*LspInfo*)                  Press `q` to close ")
+    lines.push("========================================================================")
+    let fp_disp = if target_buf.file_path != "" { target_buf.file_path } else { "(unsaved buffer)" }
+    lines.push(" Active Buffer : " ++ target_buf.name ++ " (" ++ target_buf.id.to_string() ++ ")")
+    lines.push(" File Path     : " ++ fp_disp)
+    lines.push(" Filetype/Mode : " ++ target_buf.major_mode ++ " (languageId=" ++ infer_language_id(target_buf) ++ ")")
+
+    let att_opt = svc.buf_attachments.get(target_buf.id)
+    if att_opt != null {
+        let att = att_opt.as(BufferLspAttachment)
+        lines.push(" Root Directory: " ++ att.root_dir)
+        if is_ssh_uri(target_buf.file_path) or is_ssh_uri(att.root_dir) {
+            let src_uri = if is_ssh_uri(target_buf.file_path) { target_buf.file_path } else { att.root_dir }
+            let pt_res = parse_ssh_uri(src_uri)
+            pt_res match {
+                pt! => {
+                    lines.push(" Transport     : [REMOTE " ++ pt.authority ++ "] (" ++ pt.prefix ++ ")")
+                },
+                error _ => (),
+            }
+        }
+        let backend_mode = if att.live_rpc {
+            if is_ssh_uri(att.root_dir) {
+                "LIVE REMOTE JSON-RPC 2.0 (@lava_lsp over SSH)"
+            } else {
+                "LIVE JSON-RPC 2.0 (@lava_lsp)"
+            }
+        } else if att.binary_found {
+            "RESOLVED BINARY (" ++ att.exe_path ++ ") + Workspace Index"
+        } else {
+            "BUILTIN WORKSPACE INDEX (@lava_accel fallback)"
+        }
+        lines.push(" Active Server : " ++ att.server_name)
+        lines.push(" Backend Engine: " ++ backend_mode)
+        if att.exe_path != "" {
+            lines.push(" Executable    : " ++ att.exe_path)
+        }
+        let diags = svc.diagnostics_for_buffer(target_buf)
+        lines.push(" Diagnostics   : " ++ diags.len().to_string() ++ " item(s)")
+    } else {
+        let fallback_root = detect_project_root(target_buf.file_path, world.cwd, [".git", "package.toml", "Cargo.toml"])
+        lines.push(" Root Directory: " ++ fallback_root)
+        lines.push(" Active Server : builtin-index (no explicit server spec attached)")
+    }
+
+    lines.push("")
+    lines.push(" Active Client Sessions (" ++ svc.client_order.len().to_string() ++ "):")
+    lines.push(" ----------------------------------------------------------------------")
+    if svc.client_order.len() == 0 {
+        lines.push("   (No external language server processes spawned; using @lava_accel index)")
+    } else {
+        for i in 0..svc.client_order.len() {
+            let cid = svc.client_order.get(i.as(usize)).as(i64)
+            let c = svc.clients.get(cid).as(LspClientInfo)
+            let st_badge = if c.alive { "RUNNING" } else { "STOPPED" }
+            var remote_tag = ""
+            if is_ssh_uri(c.root_dir) {
+                let pt_res = parse_ssh_uri(c.root_dir)
+                pt_res match {
+                    pt! => {
+                        remote_tag = " [REMOTE " ++ pt.authority ++ "]"
+                    },
+                    error _ => (),
+                }
+            }
+            lines.push(
+                "   [#" ++ c.client_id.to_string() ++ "] " ++ c.server_name
+                ++ remote_tag ++ " [" ++ st_badge ++ "] root=" ++ c.root_dir
+                ++ " buffers=" ++ c.attached_buffers.len().to_string()
+            )
+            if c.exe_path != "" {
+                lines.push("         cmd: " ++ c.exe_path ++ " " ++ c.args.join(" "))
+            }
+        }
+    }
+
+    lines.push("")
+    lines.push(" Registered Server Specs (" ++ svc.spec_order.len().to_string() ++ "):")
+    lines.push(" ----------------------------------------------------------------------")
+    for i in 0..svc.spec_order.len() {
+        let sid = svc.spec_order.get(i.as(usize)).as(String)
+        let sp = svc.specs.get(sid).as(LspServerSpec)
+        let resolved_opt = resolve_executable_in_path_with_dirs(sp.cmd, svc.extra_search_dirs)
+        let bin_tag = if resolved_opt != null {
+            "[READY: " ++ resolved_opt.as(String) ++ "]"
+        } else {
+            "[FALLBACK: builtin-index]"
+        }
+        lines.push("   • " ++ sp.server_id ++ " -> " ++ sp.cmd ++ " " ++ bin_tag)
+    }
+    lines
+}
+
+private fn collect_code_actions(
+    svc: LspService,
+    world: EditorWorld,
+    buf: Buffer,
+) -> List {
+    let actions = List()
+    let row = buf.point.row
+    let line = buf.line_at(row)
+
+    -- 1. Live LSP code actions if running
+    let att_opt = svc.buf_attachments.get(buf.id)
+    if att_opt != null {
+        let att = att_opt.as(BufferLspAttachment)
+        if att.live_rpc and att.client_id > 0 and buf.file_path != "" {
+            let req_res = lsp_request(att.client_id, "codeAction", buf.file_path, row, buf.point.col)
+            req_res match {
+                req_id! => {
+                    let resp_opt = svc.wait_live_response(world, att.client_id, req_id, svc.code_actions_cache)
+                    if resp_opt != null {
+                        let live_acts = resp_opt.as(List)
+                        for i in 0..live_acts.len() {
+                            let la = live_acts.get(i.as(usize)).as(LspCodeAct)
+                            actions.push(FallbackCodeAction {
+                                title: "[LSP] " ++ la.title,
+                                action_tag: "live_edits",
+                                row: row,
+                                col: buf.point.col,
+                                ident: "",
+                                live_edits: la.edits,
+                            })
+                        }
+                    }
+                },
+                error _ => (),
+            }
+        }
+    }
+
+    -- 2. Smart built-in quick-fixes
+    if line != line.trim_end() {
+        actions.push(FallbackCodeAction {
+            title: "Quick Fix: Trim trailing whitespace on current line",
+            action_tag: "trim_line_ws",
+            row: row,
+            col: buf.point.col,
+            ident: "",
+            live_edits: List(),
+        })
+    }
+
+    let ws_opt = word_span_at(line, buf.point.col)
+    if ws_opt != null {
+        let (sc, _ec, word) = ws_opt.as((i64, i64, String))
+        if not word.starts_with("_") {
+            actions.push(FallbackCodeAction {
+                title: "Quick Fix: Prefix identifier `" ++ word ++ "` with `_`",
+                action_tag: "prefix_underscore",
+                row: row,
+                col: sc,
+                ident: word,
+                live_edits: List(),
+            })
+        }
+    }
+
+    -- Contiguous `use ` / `import ` block check (top 300 lines)
+    var import_count: i64 = 0
+    let import_scan_limit = if buf.line_count() < 300 { buf.line_count() } else { 300 }
+    for r in 0..import_scan_limit {
+        let tr = buf.line_at(r).trim_start()
+        if tr.starts_with("use ") or tr.starts_with("import ") {
+            import_count += 1
+        }
+    }
+    if import_count >= 2 {
+        actions.push(FallbackCodeAction {
+            title: "Source Action: Organize & sort contiguous imports/uses",
+            action_tag: "sort_imports",
+            row: row,
+            col: 0,
+            ident: "",
+            live_edits: List(),
+        })
+    }
+
+    if line.contains("TODO:") and (not line.contains("TODO(tracked):")) {
+        actions.push(FallbackCodeAction {
+            title: "Quick Fix: Normalize TODO marker to `TODO(tracked):`",
+            action_tag: "normalize_todo",
+            row: row,
+            col: 0,
+            ident: "",
+            live_edits: List(),
+        })
+    }
+
+    -- Always ensure at least one universal action (trim buffer trailing whitespace / add doc stub)
+    actions.push(FallbackCodeAction {
+        title: "Source Action: Trim trailing whitespace across buffer",
+        action_tag: "trim_buffer_ws",
+        row: row,
+        col: 0,
+        ident: "",
+        live_edits: List(),
+    })
+    actions
+}
+
+private fn execute_code_action(world: EditorWorld, buf: Buffer, act: FallbackCodeAction) -> !String String {
+    buf.ensure_writable()!
+    when {
+        act.action_tag == "live_edits" => {
+            let n = apply_lsp_text_edits(world, act.live_edits)!
+            return ("Applied LSP code action (" ++ n.to_string() ++ " edit(s)): " ++ act.title)
+        },
+        act.action_tag == "trim_line_ws" => {
+            let cur = buf.line_at(act.row)
+            buf.set_line_at(act.row, cur.trim_end())
+            buf.modified = true
+            buf.point = buf.clamp_pos(buf.point, insert_mode = false)
+            buf.checkpoint(buf.point, "lsp-code-action")
+            return "Trimmed trailing whitespace on line " ++ (act.row + 1).to_string()
+        },
+        act.action_tag == "prefix_underscore" => {
+            let ln = buf.line_at(act.row)
+            let updated = ln.slice(0, act.col) ++ "_" ++ ln.slice(act.col, ln.char_len())
+            buf.set_line_at(act.row, updated)
+            buf.modified = true
+            buf.checkpoint(buf.point, "lsp-code-action")
+            return "Prefixed `" ++ act.ident ++ "` -> `_" ++ act.ident ++ "`"
+        },
+        act.action_tag == "sort_imports" => {
+            var r: i64 = 0
+            var sorted_blocks: i64 = 0
+            while r < buf.line_count() {
+                let tr = buf.line_at(r).trim_start()
+                if tr.starts_with("use ") or tr.starts_with("import ") {
+                    let block = List()
+                    let start_r = r
+                    while r < buf.line_count() {
+                        let cur_ln = buf.line_at(r)
+                        let ctr = cur_ln.trim_start()
+                        if ctr.starts_with("use ") or ctr.starts_with("import ") {
+                            block.push(cur_ln)
+                            r += 1
+                        } else {
+                            break
+                        }
+                    }
+                    if block.len() >= 2 {
+                        block.sort_by(|a: Any, b: Any| a.as(String).cmp(b.as(String)))
+                        for bi in 0..block.len() {
+                            buf.set_line_at(start_r + bi, block.get(bi.as(usize)).as(String))
+                        }
+                        sorted_blocks += 1
+                    }
+                } else {
+                    r += 1
+                }
+            }
+            buf.modified = true
+            buf.checkpoint(buf.point, "lsp-code-action")
+            return ("Organized " ++ sorted_blocks.to_string() ++ " import block(s)")
+        },
+        act.action_tag == "normalize_todo" => {
+            let ln = buf.line_at(act.row)
+            buf.set_line_at(act.row, ln.replace("TODO:", "TODO(tracked):"))
+            buf.modified = true
+            buf.checkpoint(buf.point, "lsp-code-action")
+            return "Normalized TODO marker"
+        },
+        else => {
+            var trimmed_rows: i64 = 0
+            for r in 0..buf.line_count() {
+                let ln = buf.line_at(r)
+                let tr = ln.trim_end()
+                if ln != tr {
+                    buf.set_line_at(r, tr)
+                    trimmed_rows += 1
+                }
+            }
+            if trimmed_rows > 0 {
+                buf.modified = true
+                buf.point = buf.clamp_pos(buf.point, insert_mode = false)
+                buf.checkpoint(buf.point, "lsp-code-action")
+            }
+            return ("Trimmed trailing whitespace on " ++ trimmed_rows.to_string() ++ " line(s)")
+        },
+    }
+}
+
+-- ============================================================================
+-- 6. Extension Registration & Interactive Commands
+-- ============================================================================
+
+pub fn register_lsp_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_lsp_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_lsp",
+        "0.1.0",
+        "JSON-RPC 2.0 LSP client with @lava_lsp live sessions and @lava_accel multi-language workspace fallback.",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let svc = LspService.new()
+            _active_lsp_service = svc
+            k.publish_service(SERVICE_LSP, ext_id, svc)
+            try_register_cmp_source(k, svc)
+
+            -- Lifecycle & live sync hooks
+            k.add_hook(
+                "extension-activated",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| -> Unit {
+                    try_register_cmp_source(kern, svc)
+                    -- Ensure Normal-mode `K` stays routed through `lsp-hover` (which delegates to `helpful-at-point` when no external LSP hover is active!)
+                    let norm_opt = kern.keymaps.get(KEYMAP_VIM_NORMAL)
+                    if norm_opt != null {
+                        norm_opt.as(Keymap).bind("K", "lsp-hover", ext_id, description = "LSP Hover / Helpful at Point")
+                    }
+                },
+                priority = 50,
+            )
+
+            let on_buf_edit = |kern: SystemKernel, _payload: Any| -> Unit {
+                let w_opt = kern.service("lava.document.world")
+                if w_opt != null {
+                    let w = w_opt.as(EditorWorld)
+                    svc.notify_buffer_changed(w, w.active_buffer())
+                }
+            }
+            let on_insert_stroke = |kern: SystemKernel, _payload: Any| -> Unit {
+                let w_opt = kern.service("lava.document.world")
+                if w_opt != null {
+                    let w = w_opt.as(EditorWorld)
+                    let b = w.active_buffer()
+                    if b.line_count() <= 2000 {
+                        svc.notify_buffer_changed(w, b)
+                    }
+                }
+            }
+            k.add_hook("buffer-changed", ext_id, on_buf_edit, priority = 40)
+            k.add_hook("buffer-modified", ext_id, on_buf_edit, priority = 40)
+            k.add_hook("after-insert-stroke", ext_id, on_insert_stroke, priority = 40)
+
+            k.add_hook(
+                "buffer-saved",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| -> Unit {
+                    let w_opt = kern.service("lava.document.world")
+                    if w_opt != null {
+                        let w = w_opt.as(EditorWorld)
+                        svc.notify_buffer_saved(w.active_buffer())
+                    }
+                },
+                priority = 40,
+            )
+
+            k.add_hook(
+                "buffer-closed",
+                ext_id,
+                |kern: SystemKernel, payload: Any| -> Unit {
+                    if payload matches _: BufferId {
+                        let bid = payload.as(BufferId)
+                        let w_opt = kern.service("lava.document.world")
+                        var fp = ""
+                        if w_opt != null {
+                            let b_opt = w_opt.as(EditorWorld).buffer(bid)
+                            if b_opt != null {
+                                fp = b_opt.as(Buffer).file_path
+                            }
+                        }
+                        svc.notify_buffer_closed(bid, fp)
+                    }
+                },
+                priority = 40,
+            )
+
+            k.add_hook(
+                "cursor-moved",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| -> Unit {
+                    let w_opt = kern.service("lava.document.world")
+                    if w_opt != null {
+                        let _ = w_opt.as(EditorWorld).remove_floating_window(LSP_HOVER_FLOAT_ID)
+                    }
+                },
+                priority = 40,
+            )
+
+            k.add_hook(
+                "buffer-switched",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| -> Unit {
+                    let w_opt = kern.service("lava.document.world")
+                    if w_opt != null {
+                        let w = w_opt.as(EditorWorld)
+                        let _ = w.remove_floating_window(LSP_HOVER_FLOAT_ID)
+                        svc.sync_statusline(w, w.active_buffer())
+                    }
+                },
+                priority = 45,
+            )
+
+            k.add_hook(
+                "timer-tick",
+                ext_id,
+                |kern: SystemKernel, payload: Any| -> Unit {
+                    let w_opt = kern.service("lava.document.world")
+                    if w_opt == null {
+                        return ()
+                    }
+                    let w = w_opt.as(EditorWorld)
+                    if payload matches _: i64 {
+                        let tid = payload.as(i64)
+                        if tid == LSP_WAKE_TIMER_ID or svc.client_order.len() > 0 {
+                            svc.poll_all_clients(w)
+                        }
+                    } else {
+                        svc.poll_all_clients(w)
+                    }
+                    ()
+                },
+                priority = 30,
+            )
+
+            -- ----------------------------------------------------------------
+            -- Navigation: Definition, Implementation, Type Definition, Refs
+            -- ----------------------------------------------------------------
+            let run_nav_kind = |kern: SystemKernel, nav_kind: String, label: String| -> #InteractiveEffects !String Any {
+                let w = require_editor_world(kern)!
+                let buf = w.active_buffer()
+                let cur_line = buf.line_at(buf.point.row)
+                let att_opt = svc.buf_attachments.get(buf.id)
+                let root_dir = if att_opt != null {
+                    att_opt.as(BufferLspAttachment).root_dir
+                } else {
+                    detect_project_root(buf.file_path, w.cwd, [".git", "package.toml", "Cargo.toml", "compile_commands.json"])
+                }
+
+                -- 0. C/C++ `#include "..."` / `#include <...>` header jump when live LSP hasn't intercepted
+                if nav_kind == "def" and cur_line.trim_start().starts_with("#include") and (not svc.has_live_external_client(buf.id)) {
+                    var inc_rel = ""
+                    let q1 = cur_line.find_indices("\"")
+                    if q1.len() >= 2 {
+                        let s0 = q1.get(0).as(i64) + 1
+                        let s1 = q1.get(1).as(i64)
+                        if s1 > s0 {
+                            inc_rel = cur_line.slice(s0, s1).trim()
+                        }
+                    } else if cur_line.contains("<") and cur_line.contains(">") {
+                        let l0 = cur_line.find_indices("<").get(0).as(i64) + 1
+                        let r0 = cur_line.find_indices(">").get(0).as(i64)
+                        if r0 > l0 {
+                            inc_rel = cur_line.slice(l0, r0).trim()
+                        }
+                    }
+                    if inc_rel != "" {
+                        if is_ssh_uri(buf.file_path) {
+                            let cands = [
+                                join_ssh_uri(parent_ssh_uri(buf.file_path), inc_rel),
+                                join_ssh_uri(root_dir, inc_rel),
+                                join_ssh_uri(root_dir, "include/" ++ inc_rel),
+                            ]
+                            for ci in 0..cands.len() {
+                                let cu = cands.get(ci.as(usize)).as(String)
+                                let st_res = remote_stat(cu)
+                                var ok_inc = false
+                                st_res match {
+                                    st! => {
+                                        ok_inc = st.exists and st.is_file
+                                    },
+                                    error _ => (),
+                                }
+                                if ok_inc {
+                                    let dest = jump_to_location(kern, w, buf, cu, 0, 0)#!
+                                    status_emit("LSP " ++ label ++ ": `" ++ inc_rel ++ "` -> " ++ dest.name ++ ":1")#
+                                    return ()
+                                }
+                            }
+                        } else if buf.file_path != "" {
+                            let p_opt = path.parent(buf.file_path)
+                            let pdir = if p_opt != null { p_opt.as(String) } else { root_dir }
+                            let lcands = [
+                                path.join(pdir, inc_rel),
+                                path.join(root_dir, inc_rel),
+                                path.join(path.join(root_dir, "include"), inc_rel),
+                            ]
+                            for ci in 0..lcands.len() {
+                                let lp = lcands.get(ci.as(usize)).as(String)
+                                if fs.exists(lp) and (not fs.is_dir(lp)) {
+                                    let dest = jump_to_location(kern, w, buf, path.normalize(lp), 0, 0)#!
+                                    status_emit("LSP " ++ label ++ ": `" ++ inc_rel ++ "` -> " ++ dest.name ++ ":1")#
+                                    return ()
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let ws_opt = word_span_at(cur_line, buf.point.col)
+                if ws_opt == null {
+                    status_emit("LSP " ++ label ++ ": no symbol under cursor")#
+                    return ()
+                }
+                let (_sc, _ec, raw_ident) = ws_opt.as((i64, i64, String))
+
+                -- 1. Try live `@lava_lsp` request first
+                if att_opt != null {
+                    let att = att_opt.as(BufferLspAttachment)
+                    if att.live_rpc and att.client_id > 0 and buf.file_path != "" {
+                        let rpc_kind = when {
+                            nav_kind == "impl" => "implementation",
+                            nav_kind == "type" => "typeDefinition",
+                            else => "definition",
+                        }
+                        let req_res = lsp_request(att.client_id, rpc_kind, buf.file_path, buf.point.row, buf.point.col)
+                        req_res match {
+                            req_id! => {
+                                let resp_opt = svc.wait_live_response(w, att.client_id, req_id, svc.locations_cache)
+                                if resp_opt != null {
+                                    let live_locs = resp_opt.as(List)
+                                    if not live_locs.is_empty() {
+                                        let loc0 = live_locs.get(0).as(LspLoc)
+                                        let dest = jump_to_location(kern, w, buf, loc0.file_path, loc0.row, loc0.col)#!
+                                        status_emit("LSP " ++ label ++ ": " ++ dest.name ++ ":" ++ (loc0.row + 1).to_string())#
+                                        return ()
+                                    }
+                                }
+                            },
+                            error _ => (),
+                        }
+                    }
+                }
+
+                -- 2. Instant `@lava_accel` + multi-language workspace fallback
+                let target_ident = if nav_kind == "type" {
+                    infer_type_ident_near_cursor(buf, raw_ident)
+                } else if nav_kind == "impl" {
+                    infer_type_ident_near_cursor(buf, raw_ident)
+                } else {
+                    raw_ident
+                }
+                let fallback_locs = fallback_find_definitions(w, buf, target_ident, root_dir, nav_kind)
+                if fallback_locs.is_empty() {
+                    status_emit("LSP " ++ label ++ ": not found for `" ++ target_ident ++ "`")#
+                    return ()
+                }
+                let loc = fallback_locs.get(0).as(LspLoc)
+                let dest = jump_to_location(kern, w, buf, loc.file_path, loc.row, loc.col)#!
+                status_emit("LSP " ++ label ++ ": `" ++ target_ident ++ "` -> " ++ dest.name ++ ":" ++ (loc.row + 1).to_string())#
+                ()
+            }
+
+            k.register_command(
+                "lsp-definition",
+                ext_id,
+                "Jump to symbol definition via LSP or workspace symbol index.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    run_nav_kind(kern, "def", "Definition")#
+                },
+            )
+            k.register_command(
+                "ex:LspDefinition",
+                ext_id,
+                ":LspDefinition — jump to definition.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    kern.dispatch_command("lsp-definition", args)#!
+                },
+            )
+
+            k.register_command(
+                "lsp-implementation",
+                ext_id,
+                "Jump to trait/type implementation (`gI` / `:LspImplementation`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    run_nav_kind(kern, "impl", "Implementation")#
+                },
+            )
+            k.register_command(
+                "ex:LspImplementation",
+                ext_id,
+                ":LspImplementation — jump to implementation.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    kern.dispatch_command("lsp-implementation", args)#!
+                },
+            )
+
+            k.register_command(
+                "lsp-type-definition",
+                ext_id,
+                "Jump to type definition (`gy` / `:LspTypeDefinition`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    run_nav_kind(kern, "type", "Type Definition")#
+                },
+            )
+            k.register_command(
+                "ex:LspTypeDefinition",
+                ext_id,
+                ":LspTypeDefinition — jump to type definition.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    kern.dispatch_command("lsp-type-definition", args)#!
+                },
+            )
+
+            -- ----------------------------------------------------------------
+            -- References (`gr` / `:LspReferences` -> `world.quickfix` + `*LSP References*`)
+            -- ----------------------------------------------------------------
+            k.register_command(
+                "lsp-references",
+                ext_id,
+                "Find symbol references across workspace and populate quickfix + *LSP References*.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let buf = w.active_buffer()
+                    let ws_opt = word_span_at(buf.line_at(buf.point.row), buf.point.col)
+                    if ws_opt == null {
+                        status_emit("LSP References: no symbol under cursor")#
+                        return ()
+                    }
+                    let (_sc, _ec, ident) = ws_opt.as((i64, i64, String))
+                    let att_opt = svc.buf_attachments.get(buf.id)
+                    let root_dir = if att_opt != null {
+                        att_opt.as(BufferLspAttachment).root_dir
+                    } else {
+                        detect_project_root(buf.file_path, w.cwd, [".git", "package.toml", "Cargo.toml"])
+                    }
+
+                    var qf_entries = List()
+                    if att_opt != null {
+                        let att = att_opt.as(BufferLspAttachment)
+                        if att.live_rpc and att.client_id > 0 and buf.file_path != "" {
+                            let req_res = lsp_request(att.client_id, "references", buf.file_path, buf.point.row, buf.point.col)
+                            req_res match {
+                                req_id! => {
+                                    let resp_opt = svc.wait_live_response(w, att.client_id, req_id, svc.locations_cache)
+                                    if resp_opt != null {
+                                        let live_locs = resp_opt.as(List)
+                                        for i in 0..live_locs.len() {
+                                            let lc = live_locs.get(i.as(usize)).as(LspLoc)
+                                            var preview = ""
+                                            let ob_opt = w.find_buffer_by_path(lc.file_path)
+                                            if ob_opt != null {
+                                                preview = ob_opt.as(Buffer).line_at(lc.row).trim()
+                                            }
+                                            qf_entries.push(QuickfixEntry {
+                                                file_path: lc.file_path,
+                                                row: lc.row,
+                                                col: lc.col,
+                                                text: preview,
+                                            })
+                                        }
+                                    }
+                                },
+                                error _ => (),
+                            }
+                        }
+                    }
+                    if qf_entries.is_empty() {
+                        qf_entries = fallback_find_references(w, buf, ident, root_dir)
+                    }
+                    w.quickfix = qf_entries
+                    w.quickfix_idx = 0
+                    w.quickfix_title = "LSP References: " ++ ident
+                    svc.last_refs_entries = qf_entries
+
+                    let lines = List()
+                    lines.push("LSP References for `" ++ ident ++ "` (" ++ qf_entries.len().to_string() ++ " match(es))  [RET: jump | q: close]")
+                    lines.push("────────────────────────────────────────────────────────────────────────")
+                    for i in 0..qf_entries.len() {
+                        let e = qf_entries.get(i.as(usize)).as(QuickfixEntry)
+                        let fn_opt = path.file_name(e.file_path)
+                        let short_p = if fn_opt != null { fn_opt.as(String) } else { e.file_path }
+                        lines.push(
+                            short_p ++ ":" ++ (e.row + 1).to_string() ++ ":" ++ (e.col + 1).to_string()
+                            ++ "  " ++ e.text
+                        )
+                    }
+                    svc.prev_buf_before_panel = buf.id
+                    let rbuf = w.ensure_special_buffer(LSP_REFS_BUF_NAME, MODE_LSP_REFS, lines, read_only = true)
+                    rbuf.point = Pos.new(if qf_entries.is_empty() { 0 } else { 2 }, 0)
+                    w.active_buffer_id = rbuf.id
+                    sync_wm(kern, w)
+                    status_emit("LSP References: " ++ qf_entries.len().to_string() ++ " occurrence(s) of `" ++ ident ++ "`")#
+                    ()
+                },
+            )
+            k.register_command(
+                "ex:LspReferences",
+                ext_id,
+                ":LspReferences — find workspace references.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    kern.dispatch_command("lsp-references", args)#!
+                },
+            )
+
+            -- ----------------------------------------------------------------
+            -- Hover (`K` with `helpful-at-point` Harmony + `:LspHover` float)
+            -- ----------------------------------------------------------------
+            let run_hover = |kern: SystemKernel, force_float: bool| -> #InteractiveEffects !String Any {
+                let w = require_editor_world(kern)!
+                let buf = w.active_buffer()
+                let ws_opt = word_span_at(buf.line_at(buf.point.row), buf.point.col)
+                let ident = if ws_opt != null {
+                    let (_s, _e, wd) = ws_opt.as((i64, i64, String))
+                    wd
+                } else {
+                    ""
+                }
+
+                -- 1. Check live external `@lava_lsp` client hover first
+                var live_hover_md = ""
+                let att_opt = svc.buf_attachments.get(buf.id)
+                let root_dir = if att_opt != null {
+                    att_opt.as(BufferLspAttachment).root_dir
+                } else {
+                    detect_project_root(buf.file_path, w.cwd, [".git", "package.toml", "Cargo.toml"])
+                }
+                if att_opt != null {
+                    let att = att_opt.as(BufferLspAttachment)
+                    if att.live_rpc and att.client_id > 0 and buf.file_path != "" {
+                        let req_res = lsp_request(att.client_id, "hover", buf.file_path, buf.point.row, buf.point.col)
+                        req_res match {
+                            req_id! => {
+                                let resp_opt = svc.wait_live_response(w, att.client_id, req_id, svc.hover_cache)
+                                if resp_opt != null {
+                                    live_hover_md = resp_opt.as(String).trim()
+                                }
+                            },
+                            error _ => (),
+                        }
+                    }
+                }
+                if live_hover_md != "" {
+                    show_hover_float(kern, w, if ident != "" { ident } else { buf.name }, [live_hover_md])
+                    status_emit("LSP Hover: " ++ ident)#
+                    return ()
+                }
+
+                -- 2. Harmony rule: when invoked via `K` (not `force_float`) and no live external LSP hover is available,
+                --    delegate seamlessly to `helpful-at-point` if `ext_help` is registered!
+                if (not force_float) and kern.get_command("helpful-at-point") != null {
+                    let _ = kern.dispatch_command("helpful-at-point", List())#!
+                    return ()
+                }
+
+                -- 3. Standalone `ext_lsp` OR explicit `:LspHover` (`force_float`): render `*lsp-hover*` FloatingWindow!
+                if ident == "" {
+                    show_hover_float(kern, w, buf.name, ["No identifier under cursor."])
+                    return ()
+                }
+                let hlines = fallback_hover_lines(w, buf, ident, root_dir)
+                show_hover_float(kern, w, ident, hlines)
+                status_emit("LSP Hover: `" ++ ident ++ "`")#
+                ()
+            }
+
+            k.register_command(
+                "lsp-hover",
+                ext_id,
+                "Show symbol hover card (`*lsp-hover*` float, or `*Help*` on `K` when no external LSP server is running).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    var force_fl = false
+                    for i in 0..args.len() {
+                        if args.get(i.as(usize)).as(String) == "force_float" {
+                            force_fl = true
+                        }
+                    }
+                    run_hover(kern, force_fl)#
+                },
+            )
+            k.register_command(
+                "ex:LspHover",
+                ext_id,
+                ":LspHover — display floating `*lsp-hover*` documentation card.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    run_hover(kern, true)#
+                },
+            )
+
+            -- ----------------------------------------------------------------
+            -- Rename (`<Space> r n` / `:LspRename [new_name]`)
+            -- ----------------------------------------------------------------
+            k.register_command(
+                "lsp-rename",
+                ext_id,
+                "Rename symbol across buffer and workspace (`<Space>rn` / `:LspRename [new_name]`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let buf = w.active_buffer()
+                    buf.ensure_writable()!
+                    let ws_opt = word_span_at(buf.line_at(buf.point.row), buf.point.col)
+                    if ws_opt == null {
+                        status_emit("LSP Rename: no identifier under cursor")#
+                        return ()
+                    }
+                    let (_sc, _ec, old_name) = ws_opt.as((i64, i64, String))
+                    var new_name = if not args.is_empty() {
+                        args.get(0).as(String).trim()
+                    } else {
+                        ""
+                    }
+                    if new_name == "" {
+                        let ans? = ask_prompt(PromptRequest.text("LSP Rename `" ++ old_name ++ "` -> ", old_name))# else {
+                            status_emit("LSP Rename cancelled")#
+                            return ()
+                        }
+                        new_name = ans.trim()
+                    }
+                    if new_name == "" or new_name == old_name {
+                        status_emit("LSP Rename unchanged")#
+                        return ()
+                    }
+
+                    -- 1. Try live `@lava_lsp` rename first
+                    let att_opt = svc.buf_attachments.get(buf.id)
+                    let root_dir = if att_opt != null {
+                        att_opt.as(BufferLspAttachment).root_dir
+                    } else {
+                        detect_project_root(buf.file_path, w.cwd, [".git", "package.toml", "Cargo.toml"])
+                    }
+                    if att_opt != null {
+                        let att = att_opt.as(BufferLspAttachment)
+                        if att.live_rpc and att.client_id > 0 and buf.file_path != "" {
+                            let req_res = lsp_request(
+                                att.client_id,
+                                "rename",
+                                buf.file_path,
+                                buf.point.row,
+                                buf.point.col,
+                                extra = new_name,
+                            )
+                            req_res match {
+                                req_id! => {
+                                    let resp_opt = svc.wait_live_response(w, att.client_id, req_id, svc.workspace_edit_cache)
+                                    if resp_opt != null {
+                                        let edits = resp_opt.as(List)
+                                        if not edits.is_empty() {
+                                            let applied = apply_lsp_text_edits(w, edits)!
+                                            svc.notify_buffer_changed(w, buf)
+                                            status_emit("LSP Rename: `" ++ old_name ++ "` -> `" ++ new_name ++ "` (" ++ applied.to_string() ++ " occurrence(s))")#
+                                            return ()
+                                        }
+                                    }
+                                },
+                                error _ => (),
+                            }
+                        }
+                    }
+
+                    -- 2. Whole-word symbol rename across active buffer, open buffers & project root files
+                    var total_replaced: i64 = 0
+                    var files_touched: i64 = 0
+                    let touched_paths = Set.new()
+
+                    -- Active buffer + open writable file buffers
+                    for bi in 0..w.buffer_order.len() {
+                        let bid = w.buffer_order.get(bi.as(usize)).as(BufferId)
+                        let ob = w.buffers.get(bid).as(Buffer)
+                        if (bid == buf.id or ob.kind == BufferKind.File) and (not ob.read_only) {
+                            var buf_hits: i64 = 0
+                            for r in 0..ob.line_count() {
+                                let (upd, cnt) = replace_whole_word_in_line(ob.line_at(r), old_name, new_name)
+                                if cnt > 0 {
+                                    ob.set_line_at(r, upd)
+                                    buf_hits += cnt
+                                }
+                            }
+                            if buf_hits > 0 {
+                                ob.modified = true
+                                ob.point = ob.clamp_pos(ob.point, insert_mode = false)
+                                ob.checkpoint(ob.point, "lsp-rename")
+                                total_replaced += buf_hits
+                                files_touched += 1
+                                if ob.file_path != "" {
+                                    touched_paths.insert(ob.file_path)
+                                }
+                            }
+                        }
+                    }
+
+                    -- Also update unopened project files inside `root_dir` when active buffer belongs to `root_dir`
+                    if buf.file_path != "" and root_dir != "" and is_ssh_uri(root_dir) {
+                        let rf_res = query_remote_files(root_dir, "", 300)
+                        rf_res match {
+                            rfiles! => {
+                                for fi in 0..rfiles.len() {
+                                    let ruri = rfiles.get(fi.as(usize)).as(String)
+                                    if (not touched_paths.contains(ruri)) and w.find_buffer_by_path(ruri) == null and is_code_file_path(ruri) {
+                                        let rl_res = remote_read_lines(ruri)
+                                        rl_res match {
+                                            pair! => {
+                                                let (flines, fcrlf) = pair
+                                                var f_hits: i64 = 0
+                                                for r in 0..flines.len() {
+                                                    let (upd, cnt) = replace_whole_word_in_line(flines.get(r.as(usize)).as(String), old_name, new_name)
+                                                    if cnt > 0 {
+                                                        flines.set(r.as(usize), upd)
+                                                        f_hits += cnt
+                                                    }
+                                                }
+                                                if f_hits > 0 {
+                                                    let _ = remote_write_lines(ruri, flines, fcrlf) ! { _ => 0 }
+                                                    total_replaced += f_hits
+                                                    files_touched += 1
+                                                }
+                                            },
+                                            error _ => (),
+                                        }
+                                    }
+                                }
+                            },
+                            error _ => (),
+                        }
+                    } else if buf.file_path != "" and root_dir != "" and fs.exists(root_dir) {
+                        let ws_files = accel_workspace_files(root_dir, max_files = 300)
+                        for fi in 0..ws_files.len() {
+                            let rel_or_abs = ws_files.get(fi.as(usize)).as(String)
+                            let full_p = if path.is_absolute(rel_or_abs) {
+                                path.normalize(rel_or_abs)
+                            } else {
+                                path.normalize(path.join(root_dir, rel_or_abs))
+                            }
+                            if (not touched_paths.contains(full_p)) and w.find_buffer_by_path(full_p) == null and is_code_file_path(full_p) {
+                                let raw = fs.read_to_string(full_p) ! { _ => "" }
+                                if raw.contains(old_name) {
+                                    let flines = raw.replace("\r\n", "\n").split("\n")
+                                    var f_hits: i64 = 0
+                                    for r in 0..flines.len() {
+                                        let (upd, cnt) = replace_whole_word_in_line(flines.get(r.as(usize)).as(String), old_name, new_name)
+                                        if cnt > 0 {
+                                            flines.set(r.as(usize), upd)
+                                            f_hits += cnt
+                                        }
+                                    }
+                                    if f_hits > 0 {
+                                        let _ = fs.write_string(full_p, flines.join("\n")) ! { _ => () }
+                                        total_replaced += f_hits
+                                        files_touched += 1
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    svc.notify_buffer_changed(w, buf)
+                    status_emit(
+                        "Renamed `" ++ old_name ++ "` -> `" ++ new_name ++ "` ("
+                        ++ total_replaced.to_string() ++ " occurrence(s) in "
+                        ++ files_touched.to_string() ++ " file(s))"
+                    )#
+                    ()
+                },
+            )
+            k.register_command(
+                "ex:LspRename",
+                ext_id,
+                ":LspRename [new_name] — rename symbol at cursor.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    kern.dispatch_command("lsp-rename", args)#!
+                },
+            )
+
+            -- ----------------------------------------------------------------
+            -- Code Actions (`<Space> c a` / `:LspCodeAction [index_or_query]`)
+            -- ----------------------------------------------------------------
+            k.register_command(
+                "lsp-code-action",
+                ext_id,
+                "Query and apply LSP / quick-fix code actions (`<Space>ca` / `:LspCodeAction`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let buf = w.active_buffer()
+                    let actions = collect_code_actions(svc, w, buf)
+                    if actions.is_empty() {
+                        status_emit("No code actions available")#
+                        return ()
+                    }
+
+                    var chosen_idx: i64 = -1
+                    if not args.is_empty() {
+                        let arg0 = args.get(0).as(String).trim()
+                        if arg0 != "" {
+                            let parsed_opt = arg0.parse_i64()
+                            if parsed_opt != null {
+                                let idx1 = parsed_opt.as(i64) - 1
+                                if idx1 >= 0 and idx1 < actions.len() {
+                                    chosen_idx = idx1
+                                }
+                            } else {
+                                let low_q = arg0.to_lower()
+                                for i in 0..actions.len() {
+                                    let a = actions.get(i.as(usize)).as(FallbackCodeAction)
+                                    if a.title.to_lower().contains(low_q) or a.action_tag.to_lower().contains(low_q) {
+                                        chosen_idx = i
+                                        break
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if chosen_idx < 0 {
+                        let labels = List()
+                        for i in 0..actions.len() {
+                            let a = actions.get(i.as(usize)).as(FallbackCodeAction)
+                            labels.push((i + 1).to_string() ++ ". " ++ a.title)
+                        }
+                        let ans? = ask_prompt(PromptRequest.with_candidates(
+                            "Code Action: ",
+                            "",
+                            PromptKind.Choice,
+                            labels,
+                        ))# else {
+                            status_emit("Code action cancelled")#
+                            return ()
+                        }
+                        let trimmed_ans = ans.trim()
+                        for i in 0..labels.len() {
+                            if labels.get(i.as(usize)).as(String) == trimmed_ans {
+                                chosen_idx = i
+                                break
+                            }
+                        }
+                        if chosen_idx < 0 {
+                            let num_opt = trimmed_ans.parse_i64()
+                            if num_opt != null {
+                                let idx1 = num_opt.as(i64) - 1
+                                if idx1 >= 0 and idx1 < actions.len() {
+                                    chosen_idx = idx1
+                                }
+                            }
+                        }
+                        if chosen_idx < 0 {
+                            let low_ans = trimmed_ans.to_lower()
+                            for i in 0..actions.len() {
+                                if actions.get(i.as(usize)).as(FallbackCodeAction).title.to_lower().contains(low_ans) {
+                                    chosen_idx = i
+                                    break
+                                }
+                            }
+                        }
+                    }
+
+                    if chosen_idx < 0 or chosen_idx >= actions.len() {
+                        chosen_idx = 0
+                    }
+                    let selected = actions.get(chosen_idx.as(usize)).as(FallbackCodeAction)
+                    let summary = execute_code_action(w, buf, selected)!
+                    svc.notify_buffer_changed(w, buf)
+                    status_emit(summary)#
+                    ()
+                },
+            )
+            k.register_command(
+                "ex:LspCodeAction",
+                ext_id,
+                ":LspCodeAction [index] — apply code action at cursor.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    kern.dispatch_command("lsp-code-action", args)#!
+                },
+            )
+
+            -- ----------------------------------------------------------------
+            -- Document Symbols (`<Space> c S` / `:LspSymbols [filter]`)
+            -- ----------------------------------------------------------------
+            k.register_command(
+                "lsp-document-symbols",
+                ext_id,
+                "Pick and jump to a document symbol (`<Space>cS` / `:LspSymbols`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let buf = w.active_buffer()
+
+                    var syms = List()
+                    let att_opt = svc.buf_attachments.get(buf.id)
+                    if att_opt != null {
+                        let att = att_opt.as(BufferLspAttachment)
+                        if att.live_rpc and att.client_id > 0 and buf.file_path != "" {
+                            let req_res = lsp_request(att.client_id, "documentSymbol", buf.file_path, 0, 0)
+                            req_res match {
+                                req_id! => {
+                                    let resp_opt = svc.wait_live_response(w, att.client_id, req_id, svc.symbols_cache)
+                                    if resp_opt != null {
+                                        syms = resp_opt.as(List)
+                                    }
+                                },
+                                error _ => (),
+                            }
+                        }
+                    }
+                    if syms.is_empty() {
+                        syms = extract_buffer_symbols(buf)
+                    }
+                    if syms.is_empty() {
+                        status_emit("LSP Symbols: no symbols in " ++ buf.name)#
+                        return ()
+                    }
+
+                    var chosen_sym_opt: ?LspSym = null
+                    if not args.is_empty() {
+                        let q = args.get(0).as(String).trim().to_lower()
+                        if q != "" {
+                            for i in 0..syms.len() {
+                                let s = syms.get(i.as(usize)).as(LspSym)
+                                if s.name.to_lower() == q or s.name.to_lower().contains(q) {
+                                    chosen_sym_opt = s
+                                    break
+                                }
+                            }
+                        }
+                    }
+
+                    if chosen_sym_opt == null {
+                        let candidates = List()
+                        for i in 0..syms.len() {
+                            let s = syms.get(i.as(usize)).as(LspSym)
+                            candidates.push("[" ++ s.kind ++ "] " ++ s.name ++ "  :" ++ (s.row + 1).to_string())
+                        }
+                        let ans? = ask_prompt(PromptRequest.with_candidates(
+                            "Document Symbols: ",
+                            "",
+                            PromptKind.Choice,
+                            candidates,
+                        ))# else {
+                            return ()
+                        }
+                        let trimmed_ans = ans.trim()
+                        for i in 0..candidates.len() {
+                            if candidates.get(i.as(usize)).as(String) == trimmed_ans {
+                                chosen_sym_opt = syms.get(i.as(usize)).as(LspSym)
+                                break
+                            }
+                        }
+                        if chosen_sym_opt == null {
+                            let q_low = trimmed_ans.to_lower()
+                            for i in 0..syms.len() {
+                                let s = syms.get(i.as(usize)).as(LspSym)
+                                if s.name.to_lower().contains(q_low) {
+                                    chosen_sym_opt = s
+                                    break
+                                }
+                            }
+                        }
+                    }
+
+                    if chosen_sym_opt != null {
+                        let sym = chosen_sym_opt.as(LspSym)
+                        let _ = jump_to_location(kern, w, buf, buf.file_path, sym.row, sym.col)#!
+                        status_emit("Symbol: " ++ sym.name ++ " (line " ++ (sym.row + 1).to_string() ++ ")")#
+                    }
+                    ()
+                },
+            )
+            k.register_command(
+                "ex:LspSymbols",
+                ext_id,
+                ":LspSymbols [query] — jump to document symbol.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    kern.dispatch_command("lsp-document-symbols", args)#!
+                },
+            )
+
+            -- ----------------------------------------------------------------
+            -- Diagnostics Navigation (`<Space> c d`, `]e`, `[e`)
+            -- ----------------------------------------------------------------
+            k.register_command(
+                "lsp-line-diagnostics",
+                ext_id,
+                "Show diagnostics for the current line (`<Space>cd`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let buf = w.active_buffer()
+                    let diags = svc.diagnostics_for_buffer(buf)
+                    let row_msgs = List()
+                    for i in 0..diags.len() {
+                        let d = diags.get(i.as(usize)).as(LspDiag)
+                        if d.row == buf.point.row {
+                            row_msgs.push("[" ++ d.severity ++ "] " ++ d.message)
+                        }
+                    }
+                    if row_msgs.is_empty() {
+                        status_emit("No diagnostics on line " ++ (buf.point.row + 1).to_string())#
+                    } else {
+                        show_hover_float(kern, w, "Line " ++ (buf.point.row + 1).to_string() ++ " Diagnostics", row_msgs)
+                        status_emit(row_msgs.get(0).as(String))#
+                    }
+                    ()
+                },
+            )
+            k.register_command(
+                "ex:LspLineDiagnostics",
+                ext_id,
+                ":LspLineDiagnostics — show diagnostics on current line.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    kern.dispatch_command("lsp-line-diagnostics", args)#!
+                },
+            )
+
+            k.register_command(
+                "lsp-next-error",
+                ext_id,
+                "Jump to next LSP diagnostic (`]e`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let buf = w.active_buffer()
+                    let diags = svc.diagnostics_for_buffer(buf)
+                    if diags.is_empty() {
+                        status_emit("No LSP diagnostics in " ++ buf.name)#
+                        return ()
+                    }
+                    var chosen = diags.get(0).as(LspDiag)
+                    for i in 0..diags.len() {
+                        let d = diags.get(i.as(usize)).as(LspDiag)
+                        if d.row > buf.point.row or (d.row == buf.point.row and d.col > buf.point.col) {
+                            chosen = d
+                            break
+                        }
+                    }
+                    buf.point = buf.clamp_pos(Pos.new(chosen.row, chosen.col), insert_mode = false)
+                    sync_wm(kern, w)
+                    status_emit("[" ++ chosen.severity ++ "] " ++ chosen.message)#
+                    ()
+                },
+            )
+            k.register_command(
+                "ex:LspNextError",
+                ext_id,
+                ":LspNextError — jump to next diagnostic.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    kern.dispatch_command("lsp-next-error", args)#!
+                },
+            )
+
+            k.register_command(
+                "lsp-prev-error",
+                ext_id,
+                "Jump to previous LSP diagnostic (`[e`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let buf = w.active_buffer()
+                    let diags = svc.diagnostics_for_buffer(buf)
+                    if diags.is_empty() {
+                        status_emit("No LSP diagnostics in " ++ buf.name)#
+                        return ()
+                    }
+                    var chosen = diags.get((diags.len() - 1).as(usize)).as(LspDiag)
+                    var idx = diags.len() - 1
+                    while idx >= 0 {
+                        let d = diags.get(idx.as(usize)).as(LspDiag)
+                        if d.row < buf.point.row or (d.row == buf.point.row and d.col < buf.point.col) {
+                            chosen = d
+                            break
+                        }
+                        idx -= 1
+                    }
+                    buf.point = buf.clamp_pos(Pos.new(chosen.row, chosen.col), insert_mode = false)
+                    sync_wm(kern, w)
+                    status_emit("[" ++ chosen.severity ++ "] " ++ chosen.message)#
+                    ()
+                },
+            )
+            k.register_command(
+                "ex:LspPrevError",
+                ext_id,
+                ":LspPrevError — jump to previous diagnostic.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    kern.dispatch_command("lsp-prev-error", args)#!
+                },
+            )
+
+            -- ----------------------------------------------------------------
+            -- Management Commands: `*LspInfo*`, `LspStart`, `LspStop`, `LspRestart`, `*LspLog*`
+            -- ----------------------------------------------------------------
+            k.register_command(
+                "lsp-info",
+                ext_id,
+                "Open *LspInfo* buffer showing attached LSP clients, roots, and server specs.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let cur = w.active_buffer()
+                    let target = if cur.name == LSP_INFO_BUF_NAME or cur.name == LSP_LOG_BUF_NAME {
+                        let prev_opt = w.buffer(svc.prev_buf_before_panel)
+                        if prev_opt != null { prev_opt.as(Buffer) } else { cur }
+                    } else {
+                        svc.prev_buf_before_panel = cur.id
+                        cur
+                    }
+                    let lines = render_lsp_info_lines(svc, w, target)
+                    let ibuf = w.ensure_special_buffer(LSP_INFO_BUF_NAME, MODE_LSP_INFO, lines, read_only = true)
+                    ibuf.point = Pos.zero()
+                    w.active_buffer_id = ibuf.id
+                    sync_wm(kern, w)
+                    status_emit("*LspInfo* (" ++ svc.client_order.len().to_string() ++ " client(s), `q` to close)")#
+                    ()
+                },
+            )
+            k.register_command(
+                "ex:LspInfo",
+                ext_id,
+                ":LspInfo — inspect LSP client status for active buffer.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    kern.dispatch_command("lsp-info", args)#!
+                },
+            )
+
+            k.register_command(
+                "lsp-start",
+                ext_id,
+                "Start or attach an LSP server for the active buffer (`:LspStart [server_id]`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let buf = w.active_buffer()
+                    var spec_opt: ?LspServerSpec = null
+                    if not args.is_empty() {
+                        let req_id = args.get(0).as(String).trim()
+                        if req_id != "" {
+                            spec_opt = svc.get_server_spec(req_id)
+                        }
+                    }
+                    if spec_opt == null {
+                        spec_opt = svc.find_spec_for_buffer(buf)
+                    }
+                    if spec_opt == null {
+                        status_emit("LSP Start: no matching server spec for `" ++ buf.major_mode ++ "`")#
+                        return ()
+                    }
+                    let spec = spec_opt.as(LspServerSpec)
+                    let found = svc.attach_buffer(kern, w, buf, spec)
+                    if found {
+                        status_emit("LSP attached: " ++ spec.cmd)#
+                    } else {
+                        status_emit("LSP attached fallback index (" ++ spec.cmd ++ " not in $PATH)")#
+                    }
+                    ()
+                },
+            )
+            k.register_command(
+                "ex:LspStart",
+                ext_id,
+                ":LspStart [server] — attach LSP server to active buffer.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    kern.dispatch_command("lsp-start", args)#!
+                },
+            )
+
+            k.register_command(
+                "lsp-stop",
+                ext_id,
+                "Stop LSP client(s) attached to the active buffer (`:LspStop`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let buf = w.active_buffer()
+                    let n = svc.stop_clients_for_buffer(w, buf)
+                    status_emit("Stopped " ++ n.to_string() ++ " LSP client(s) for " ++ buf.name)#
+                    ()
+                },
+            )
+            k.register_command(
+                "ex:LspStop",
+                ext_id,
+                ":LspStop — stop active buffer LSP client.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    kern.dispatch_command("lsp-stop", args)#!
+                },
+            )
+
+            k.register_command(
+                "lsp-restart",
+                ext_id,
+                "Restart LSP client for the active buffer (`:LspRestart`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let buf = w.active_buffer()
+                    let prev_att_opt = svc.buf_attachments.get(buf.id)
+                    var sid = ""
+                    if prev_att_opt != null {
+                        sid = prev_att_opt.as(BufferLspAttachment).server_id
+                    }
+                    let _ = svc.stop_clients_for_buffer(w, buf)
+                    let restart_args = if sid != "" { [sid] } else { List() }
+                    let _ = kern.dispatch_command("lsp-start", restart_args)#!
+                    ()
+                },
+            )
+            k.register_command(
+                "ex:LspRestart",
+                ext_id,
+                ":LspRestart — restart active buffer LSP client.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    kern.dispatch_command("lsp-restart", args)#!
+                },
+            )
+
+            k.register_command(
+                "lsp-log",
+                ext_id,
+                "Open *LspLog* buffer displaying LSP lifecycle and RPC log entries.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let cur = w.active_buffer()
+                    if cur.name != LSP_LOG_BUF_NAME and cur.name != LSP_INFO_BUF_NAME {
+                        svc.prev_buf_before_panel = cur.id
+                    }
+                    let lines = List()
+                    lines.push("========================================================================")
+                    lines.push(" Lava LSP Event Log (*LspLog*)                       Press `q` to close ")
+                    lines.push("========================================================================")
+                    if svc.logs.is_empty() {
+                        lines.push(" (No LSP log entries recorded yet.)")
+                    } else {
+                        for i in 0..svc.logs.len() {
+                            lines.push(" " ++ svc.logs.get(i.as(usize)).as(String))
+                        }
+                    }
+                    let lbuf = w.ensure_special_buffer(LSP_LOG_BUF_NAME, MODE_LSP_LOG, lines, read_only = true)
+                    lbuf.point = Pos.new(lines.len() - 1, 0)
+                    w.active_buffer_id = lbuf.id
+                    sync_wm(kern, w)
+                    status_emit("*LspLog* (" ++ svc.logs.len().to_string() ++ " line(s))")#
+                    ()
+                },
+            )
+            k.register_command(
+                "ex:LspLog",
+                ext_id,
+                ":LspLog — view LSP client log buffer.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    kern.dispatch_command("lsp-log", args)#!
+                },
+            )
+
+            -- Panel close & jump commands for `*LspInfo*`, `*LspLog*`, and `*LSP References*`
+            k.register_command(
+                "lsp-panel-close",
+                ext_id,
+                "Close *LspInfo* / *LspLog* / *LSP References* buffer and restore previous buffer.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    if w.buffers.contains_key(svc.prev_buf_before_panel) {
+                        w.active_buffer_id = svc.prev_buf_before_panel
+                    } else {
+                        let _ = w.cycle_buffer(-1)
+                    }
+                    sync_wm(kern, w)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "lsp-refs-jump",
+                ext_id,
+                "Jump to the reference entry on the current line in *LSP References*.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let rbuf = w.active_buffer()
+                    let idx = rbuf.point.row - 2
+                    if idx < 0 or idx >= svc.last_refs_entries.len() {
+                        return ()
+                    }
+                    let entry = svc.last_refs_entries.get(idx.as(usize)).as(QuickfixEntry)
+                    let origin_opt = w.buffer(svc.prev_buf_before_panel)
+                    let from_b = if origin_opt != null { origin_opt.as(Buffer) } else { rbuf }
+                    let dest = jump_to_location(kern, w, from_b, entry.file_path, entry.row, entry.col)#!
+                    status_emit("Reference -> " ++ dest.name ++ ":" ++ (entry.row + 1).to_string())#
+                    ()
+                },
+            )
+
+            -- ----------------------------------------------------------------
+            -- Mode & Vim Keymap Registrations (Collision-Free!)
+            -- ----------------------------------------------------------------
+            let info_km = k.ensure_keymap("mode:" ++ MODE_LSP_INFO)
+            info_km.bind("q", "lsp-panel-close", ext_id, description = "Close *LspInfo*")
+            info_km.bind("<Escape>", "lsp-panel-close", ext_id, description = "Close *LspInfo*")
+
+            let log_km = k.ensure_keymap("mode:" ++ MODE_LSP_LOG)
+            log_km.bind("q", "lsp-panel-close", ext_id, description = "Close *LspLog*")
+            log_km.bind("<Escape>", "lsp-panel-close", ext_id, description = "Close *LspLog*")
+
+            let refs_km = k.ensure_keymap("mode:" ++ MODE_LSP_REFS)
+            refs_km.bind("<Return>", "lsp-refs-jump", ext_id, description = "Jump to reference")
+            refs_km.bind("q", "lsp-panel-close", ext_id, description = "Close *LSP References*")
+            refs_km.bind("<Escape>", "lsp-panel-close", ext_id, description = "Close *LSP References*")
+
+            let norm_km = k.ensure_keymap(KEYMAP_VIM_NORMAL)
+            norm_km.bind("g d", "lsp-definition", ext_id, description = "LSP Go to Definition")
+            norm_km.bind("g r", "lsp-references", ext_id, description = "LSP Find References")
+            norm_km.bind("g I", "lsp-implementation", ext_id, description = "LSP Go to Implementation")
+            norm_km.bind("g y", "lsp-type-definition", ext_id, description = "LSP Go to Type Definition")
+            norm_km.bind("[ e", "lsp-prev-error", ext_id, description = "LSP Previous Diagnostic")
+            norm_km.bind("] e", "lsp-next-error", ext_id, description = "LSP Next Diagnostic")
+            norm_km.bind("K", "lsp-hover", ext_id, description = "LSP Hover / Helpful at Point")
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> c a", "lsp-code-action", ext_id, description = "LSP Code Action")
+            leader_km.bind("<Space> r n", "lsp-rename", ext_id, description = "LSP Rename Symbol")
+            leader_km.bind("<Space> c l", "lsp-info", ext_id, description = "LSP Info")
+            leader_km.bind("<Space> c d", "lsp-line-diagnostics", ext_id, description = "LSP Line Diagnostics")
+            leader_km.bind("<Space> c S", "lsp-document-symbols", ext_id, description = "LSP Document Symbols")
+
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            if _active_lsp_service != null {
+                let s = _active_lsp_service.as(LspService)
+                for i in 0..s.client_order.len() {
+                    let cid = s.client_order.get(i.as(usize)).as(i64)
+                    let c_opt = s.clients.get(cid)
+                    if c_opt != null {
+                        let c = c_opt.as(LspClientInfo)
+                        if c.live_rpc and c.alive {
+                            let _ = lsp_stop(c.client_id)
+                        }
+                        c.alive = false
+                    }
+                }
+            }
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                w_opt.as(EditorWorld).clear_owner_ui(OWNER_LSP)
+            }
+            ()
+        },
+    )
+}

@@ -1,0 +1,610 @@
+-- End-to-end integration tests for Subagent 2:
+--   Part A (`ext_telescope`):
+--     - `help_tags` (`:Telescope help_tags`, `<Space> f h`)
+--     - `docs`      (`:Telescope docs`, `<Space> s H`, `<Space> h s`) + `<C-q>` Quickfix
+--     - `commands`  (`:Telescope commands`, `<Space> f C`)
+--   Part B (`ext_minibuffer`):
+--     - Stage-1 Ex verb catalog (`h`, `help`, `Info`, `Apropos`, `AproposDocs` `[help]` Marginalia)
+--     - Stage-2 `:Telescope ` (`help_tags`, `docs`, `commands`)
+--     - Stage-2 `:h ` / `:help ` (`[tag]`, `[info]`, `[cmd]`, `[opt]` Marginalia + Orderless + cache)
+--     - Stage-2 `:Info ` (`(dir)Top` + `manual#slug` `[info]` Marginalia)
+--     - Stage-2 `:Apropos ` / `:AproposDocs ` (Orderless suggestions + literal `<Return>` preservation)
+--     - `info-node` / `help-tag` prompt `[info]` / `[tag]` Marginalia
+
+use std.fs
+use std.path
+use std.time
+use @lava_sys.{RawUiEvent, mock_enable}
+use @lava_core.{
+    ExtId, InteractiveEffects, PromptKind, PromptRequest, SystemKernel, ask_prompt,
+    clipboard_get, clipboard_set, log_event, status_emit
+}
+use @ext_document.{
+    EditorWorld, FloatingWindow, MinibufferRichItem, QuickfixEntry, require_editor_world
+}
+use @ext_window.{WindowManager, require_window_manager}
+use @ext_minibuffer.{
+    MinibufferController, open_prompt_view, require_minibuffer_controller
+}
+use @ext_app.{
+    AppHostCap, app_commit_frame, app_feed_keys, app_step_event, register_default_extensions
+}
+use @ext_telescope.{
+    collect_help_doc_roots, ext_telescope_id, register_telescope_extension
+}
+
+pub struct MockDispatchRecorder {
+    pub last_info_node: String,
+    pub last_desc_fn: String,
+    pub demo_runs: i64,
+    pub last_prompt_result: ?String,
+}
+
+impl MockDispatchRecorder {
+    pub fn new() -> MockDispatchRecorder {
+        MockDispatchRecorder {
+            last_info_node: "",
+            last_desc_fn: "",
+            demo_runs: 0,
+            last_prompt_result: null,
+        }
+    }
+}
+
+fn check_eq_str(actual: String, expected: String, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual='" ++ actual ++ "' expected='" ++ expected ++ "'")
+    }
+}
+
+fn check_eq_i64(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual=" ++ actual.to_string() ++ " expected=" ++ expected.to_string())
+    }
+}
+
+fn check_true(cond: bool, label: String) {
+    if not cond {
+        panic("FAILED: " ++ label)
+    }
+}
+
+fn join_lines(lines: List) -> String {
+    var out = ""
+    for i in 0..lines.len() {
+        if i > 0 {
+            out = out ++ "\n"
+        }
+        out = out ++ lines.get(i.as(usize)).as(String)
+    }
+    out
+}
+
+fn find_item_annotation(items: List, cand: String) -> ?String {
+    for i in 0..items.len() {
+        let (label, ann) = items.get(i.as(usize)).as((String, String))
+        if label == cand {
+            return ann
+        }
+    }
+    null
+}
+
+fn find_rich_item(rich_items: List, label: String) -> ?MinibufferRichItem {
+    for i in 0..rich_items.len() {
+        let it = rich_items.get(i.as(usize)).as(MinibufferRichItem)
+        if it.label == label {
+            return it
+        }
+    }
+    null
+}
+
+fn setup_isolated_fixture(tmp_dir: String) {
+    let docs_dir = path.join(tmp_dir, "docs")
+    let _ = fs.create_dir_all(docs_dir) ! { e => panic(e.to_string()) }
+
+    -- `.lava_isolated_doc_test` ensures deterministic isolated doc root discovery
+    let _ = fs.write_string(
+        path.join(tmp_dir, ".lava_isolated_doc_test"),
+        "isolated\n",
+    ) ! { e => panic(e.to_string()) }
+
+    let manual_body =
+        "# Overview *test-overview*\n" ++
+        "Lava unifies modal editing and self-documenting introspection.\n" ++
+        "\n" ++
+        "## Keybindings *test-keys*\n" ++
+        "Press leader f h for help tags or use ranger paste yanks.\n" ++
+        "Every keymap binding is discoverable live.\n" ++
+        "\n" ++
+        "## Architecture *test-arch*\n" ++
+        "Effect handlers power continuation prompts cleanly without hacky globals.\n"
+    let _ = fs.write_string(
+        path.join(docs_dir, "manual.md"),
+        manual_body,
+    ) ! { e => panic(e.to_string()) }
+
+    let plugin_body =
+        "# Dirvish File Manager *dirvish*\n" ++
+        "Navigate parent directories with ranger paste and instant preview panes.\n"
+    let _ = fs.write_string(
+        path.join(docs_dir, "plugin_guide.md"),
+        plugin_body,
+    ) ! { e => panic(e.to_string()) }
+}
+
+fn boot_test_kernel(rec: MockDispatchRecorder) -> SystemKernel {
+    let kernel = SystemKernel.new()
+    register_default_extensions(kernel) ! { e => panic(e) }
+    register_telescope_extension(kernel) ! { e => panic(e) }
+
+    let demo_ext = ExtId("lava.org/test_demo_cmds")
+    kernel.register_extension(
+        demo_ext,
+        "lava.org",
+        "test_demo_cmds",
+        "0.1.0",
+        "Test commands for Telescope & Minibuffer verification.",
+        [],
+        |k: SystemKernel| -> !String Unit {
+            k.register_command(
+                "demo-custom-action",
+                demo_ext,
+                "Execute demo custom action for Telescope command picker verification.",
+                |_kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    rec.demo_runs += 1
+                    status_emit("demo-custom-action executed")#
+                    ()
+                },
+            )
+            k.ensure_keymap("vim:leader").bind(
+                "<Space> z z",
+                "demo-custom-action",
+                demo_ext,
+                description = "Run demo custom action",
+            )
+            -- Register mock Ex handlers for `:AproposDocs` so literal submission is captured cleanly
+            k.register_command(
+                "ex:AproposDocs",
+                demo_ext,
+                "Global full-text documentation search",
+                |_kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let parts = List()
+                    for i in 0..args.len() {
+                        parts.push(args.get(i.as(usize)).as(String))
+                    }
+                    rec.last_prompt_result = parts.join(" ")
+                    ()
+                },
+                interactive = false,
+            )
+            ()
+        },
+        |_k: SystemKernel| -> !String Unit { () },
+    )
+
+    kernel.activate_all() ! { e => panic(e) }
+    kernel
+}
+
+fn register_mock_help_commands(kernel: SystemKernel, rec: MockDispatchRecorder) {
+    let help_mock_ext = ExtId("lava.org/mock_help_dispatch")
+    kernel.register_command(
+        "info",
+        help_mock_ext,
+        "Open Emacs *Info* hypertext reader at node.",
+        |_kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            if not args.is_empty() {
+                rec.last_info_node = args.get(0).as(String)
+            } else {
+                rec.last_info_node = "(dir)Top"
+            }
+            ()
+        },
+    )
+    kernel.register_command(
+        "describe-function",
+        help_mock_ext,
+        "Open Helpful buffer for command.",
+        |_kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            if not args.is_empty() {
+                rec.last_desc_fn = args.get(0).as(String)
+            }
+            ()
+        },
+    )
+}
+
+fn test_telescope_help_tags_and_commands(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    rec: MockDispatchRecorder,
+    tmp_dir: String,
+) {
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
+
+    -- Isolated doc roots check
+    let roots = collect_help_doc_roots(world)
+    check_eq_i64(roots.len(), 1, "isolated marker restricts doc_roots to tmp_dir/docs")
+    check_eq_str(
+        roots.get(0).as(String),
+        path.join(world.cwd, "docs"),
+        "isolated doc root path",
+    )
+
+    -- 1. `:Telescope` with empty arg and unknown arg lists `help_tags`, `docs`, `commands`
+    app_feed_keys(kernel, ":Telescope<Return>")# ! { e => panic(e) }
+    check_true(world.status_message.contains("help_tags"), "empty :Telescope lists help_tags")
+    check_true(world.status_message.contains("docs"), "empty :Telescope lists docs")
+    check_true(world.status_message.contains("commands"), "empty :Telescope lists commands")
+    let builtin_picker = join_lines(world.get_floating_window("telescope-picker").as(FloatingWindow).lines)
+    check_true(builtin_picker.contains("help_tags") and builtin_picker.contains("docs") and builtin_picker.contains("commands"), "builtin picker lists help_tags, docs, commands")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    app_feed_keys(kernel, ":Telescope<Space>nonexistent_mode<Return>")# ! { e => panic(e) }
+    check_true(world.status_message.contains("help_tags"), "unknown :Telescope lists help_tags")
+    check_true(world.status_message.contains("docs"), "unknown :Telescope lists docs")
+    check_true(world.status_message.contains("commands"), "unknown :Telescope lists commands")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    -- 2. `<Space> f h` opens `help_tags` picker with tags, sections, and commands
+    app_feed_keys(kernel, "<Space> f h")# ! { e => panic(e) }
+    check_true(world.get_floating_window("telescope-picker") != null, "help_tags picker opened")
+    check_true(world.get_floating_window("telescope-preview") != null, "help_tags preview opened")
+
+    -- Filter for `*test-keys*` -> preview shows Markdown section lines (`start_row..=end_row`)
+    app_feed_keys(kernel, "test-keys")# ! { e => panic(e) }
+    let picker_win = world.get_floating_window("telescope-picker").as(FloatingWindow)
+    let preview_win = world.get_floating_window("telescope-preview").as(FloatingWindow)
+    let picker_text = join_lines(picker_win.lines)
+    let preview_text = join_lines(preview_win.lines)
+    check_true(
+        picker_text.contains("*test-keys*"),
+        "help_tags lists *test-keys*: " ++ picker_text,
+    )
+    check_true(
+        preview_text.contains("## Keybindings *test-keys*") and
+            preview_text.contains("Press leader f h for help tags"),
+        "help_tags preview renders Markdown section body: " ++ preview_text,
+    )
+    check_true(
+        not preview_text.contains("## Architecture"),
+        "help_tags preview respects end_row boundary: " ++ preview_text,
+    )
+
+    -- Render frame verification
+    let gen = app_commit_frame(kernel) ! { e => panic(e) }
+    check_true(gen >= 1, "help_tags frame committed")
+
+    -- `<Return>` on `*test-keys*` when `"info"` is NOT registered yet -> opens `docs/manual.md` at row 3!
+    app_feed_keys(kernel, "<Return>")# ! { e => panic(e) }
+    check_true(world.get_floating_window("telescope-picker") == null, "help_tags closed on Return")
+    check_eq_str(
+        world.active_buffer().file_path,
+        path.normalize(path.join(tmp_dir, "docs/manual.md")),
+        "fallback opened docs/manual.md when info command not registered",
+    )
+    check_eq_i64(world.active_buffer().point.row, 3, "jumped to ## Keybindings start_row (row 3)")
+
+    -- Open `:Telescope help_tags` and select a command (`demo-custom-action`) before `describe-function` exists
+    app_feed_keys(kernel, ":Telescope<Space>help_tags<Return>")# ! { e => panic(e) }
+    app_feed_keys(kernel, "demo-custom-action")# ! { e => panic(e) }
+    let cmd_prev = join_lines(world.get_floating_window("telescope-preview").as(FloatingWindow).lines)
+    check_true(
+        cmd_prev.contains("demo-custom-action") and cmd_prev.contains("<Space> z z"),
+        "help_tags command preview displays docstring & keybinding: " ++ cmd_prev,
+    )
+    app_feed_keys(kernel, "<Return>")# ! { e => panic(e) }
+    check_eq_str(
+        world.active_buffer().name,
+        "*Help*",
+        "command accept fell back to describe-command opening *Help*",
+    )
+
+    -- 3. `:Telescope commands` (`<Space> f C`) filters and executes selected command on `<Return>`
+    check_eq_i64(rec.demo_runs, 0, "demo-custom-action not run yet")
+    app_feed_keys(kernel, "<Space> f C")# ! { e => panic(e) }
+    check_true(world.get_floating_window("telescope-picker") != null, "commands picker opened")
+    app_feed_keys(kernel, "custom<Space>demo")# ! { e => panic(e) }
+    let cmds_picker_txt = join_lines(world.get_floating_window("telescope-picker").as(FloatingWindow).lines)
+    let cmds_prev_txt = join_lines(world.get_floating_window("telescope-preview").as(FloatingWindow).lines)
+    check_true(
+        cmds_picker_txt.contains("demo-custom-action"),
+        "Orderless 'custom demo' matched demo-custom-action: " ++ cmds_picker_txt,
+    )
+    check_true(
+        cmds_prev_txt.contains("lava.org/test_demo_cmds") and cmds_prev_txt.contains("<Space> z z"),
+        "commands preview shows owner extension + bound keychord: " ++ cmds_prev_txt,
+    )
+    app_feed_keys(kernel, "<Return>")# ! { e => panic(e) }
+    check_eq_i64(rec.demo_runs, 1, "Telescope commands <Return> executed demo-custom-action")
+
+    let _ = cap
+    println("  [PASS] test_telescope_help_tags_and_commands")
+}
+
+fn test_telescope_docs_and_dynamic_info_dispatch(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    rec: MockDispatchRecorder,
+    tmp_dir: String,
+) {
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
+
+    -- 1. `<Space> s H` opens `docs` mode and runs live Orderless full-text search on every keystroke!
+    app_feed_keys(kernel, "<Space> s H")# ! { e => panic(e) }
+    check_true(world.get_floating_window("telescope-picker") != null, "docs picker opened via <Space> s H")
+
+    -- Type `"ranger paste"` -> matches both `manual.md` and `plugin_guide.md`
+    app_feed_keys(kernel, "ranger<Space>paste")# ! { e => panic(e) }
+    let docs_both = join_lines(world.get_floating_window("telescope-picker").as(FloatingWindow).lines)
+    check_true(
+        docs_both.contains("manual") and docs_both.contains("plugin_guide"),
+        "Orderless 'ranger paste' matched both docs: " ++ docs_both,
+    )
+
+    -- Type `" !leader"` -> Orderless negation narrows live to `plugin_guide`!
+    app_feed_keys(kernel, "<Space>!leader")# ! { e => panic(e) }
+    let docs_narrow = join_lines(world.get_floating_window("telescope-picker").as(FloatingWindow).lines)
+    let docs_prev = join_lines(world.get_floating_window("telescope-preview").as(FloatingWindow).lines)
+    check_true(
+        docs_narrow.contains("plugin_guide") and (not docs_narrow.contains("manual#keybindings")),
+        "Orderless negation narrowed live to plugin_guide: " ++ docs_narrow,
+    )
+    check_true(
+        docs_prev.contains(">>") and docs_prev.contains("Navigate parent directories with ranger paste"),
+        "docs preview centers around matching row with >> marker: " ++ docs_prev,
+    )
+
+    -- Export matching documentation hits to `*Quickfix*` on `<C-q>`!
+    app_feed_keys(kernel, "<C-q>")# ! { e => panic(e) }
+    check_true(world.get_floating_window("telescope-picker") == null, "docs picker closed after <C-q>")
+    check_eq_str(world.active_buffer().name, "*Quickfix*", "<C-q> opened *Quickfix*")
+    check_true(world.quickfix.len() >= 1, "Quickfix populated with doc search hits")
+    let qf0 = world.quickfix.get(0).as(QuickfixEntry)
+    check_eq_str(
+        path.normalize(qf0.file_path),
+        path.normalize(path.join(tmp_dir, "docs/plugin_guide.md")),
+        "Quickfix entry points to plugin_guide.md",
+    )
+
+    -- Verify `<Return>` file fallback in `docs` mode before `"info"` is registered
+    app_feed_keys(kernel, "<Space> h s")# ! { e => panic(e) }
+    app_feed_keys(kernel, "continuation<Space>prompts")# ! { e => panic(e) }
+    app_feed_keys(kernel, "<Return>")# ! { e => panic(e) }
+    check_eq_str(
+        world.active_buffer().file_path,
+        path.normalize(path.join(tmp_dir, "docs/manual.md")),
+        "docs <Return> fallback opened manual.md",
+    )
+    check_eq_i64(world.active_buffer().point.row, 8, "docs <Return> jumped to matching line row 8")
+
+    -- 2. Register dynamic `"info"` and `"describe-function"` commands and verify dispatch!
+    register_mock_help_commands(kernel, rec)
+
+    -- `help_tags` `<Return>` on `*dirvish*` -> dispatches `"info"` with `["plugin_guide#top"]`
+    app_feed_keys(kernel, "<Space> f h")# ! { e => panic(e) }
+    app_feed_keys(kernel, "*dirvish*")# ! { e => panic(e) }
+    app_feed_keys(kernel, "<Return>")# ! { e => panic(e) }
+    check_eq_str(
+        rec.last_info_node,
+        "plugin_guide#top",
+        "help_tags <Return> dispatched info [node_id]",
+    )
+
+    -- `help_tags` `<Return>` on command -> dispatches `"describe-function"` with `[cmd_name]`
+    app_feed_keys(kernel, "<Space> f h")# ! { e => panic(e) }
+    app_feed_keys(kernel, "demo-custom-action")# ! { e => panic(e) }
+    app_feed_keys(kernel, "<Return>")# ! { e => panic(e) }
+    check_eq_str(
+        rec.last_desc_fn,
+        "demo-custom-action",
+        "help_tags command <Return> dispatched describe-function",
+    )
+
+    -- `docs` `<Return>` -> dispatches `"info"` with `[hit.node_id]`
+    app_feed_keys(kernel, ":Telescope<Space>docs<Return>")# ! { e => panic(e) }
+    app_feed_keys(kernel, "continuation<Space>prompts")# ! { e => panic(e) }
+    app_feed_keys(kernel, "<Return>")# ! { e => panic(e) }
+    check_eq_str(
+        rec.last_info_node,
+        "manual#architecture",
+        "docs <Return> dispatched info [hit.node_id]",
+    )
+
+    let _ = cap
+    println("  [PASS] test_telescope_docs_and_dynamic_info_dispatch")
+}
+
+fn test_minibuffer_help_and_info_completion(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    mb: MinibufferController,
+    rec: MockDispatchRecorder,
+) {
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
+
+    -- 1. Stage-1 Ex verb catalog includes `h`, `help`, `Info`, `Apropos`, `AproposDocs` with `[help]` Marginalia
+    app_feed_keys(kernel, ":")# ! { e => panic(e) }
+    check_true(world.minibuffer_view.active, "minibuffer active on `:`")
+
+    let ann_h = find_item_annotation(mb.items, "h")
+    let ann_help = find_item_annotation(mb.items, "help")
+    let ann_info = find_item_annotation(mb.items, "Info")
+    let ann_ap = find_item_annotation(mb.items, "Apropos")
+    let ann_apd = find_item_annotation(mb.items, "AproposDocs")
+    check_true(ann_h != null and ann_h.as(String).starts_with("[help]"), "Stage-1 `h` has [help] Marginalia")
+    check_true(ann_help != null and ann_help.as(String).starts_with("[help]"), "Stage-1 `help` has [help] Marginalia")
+    check_true(ann_info != null and ann_info.as(String).starts_with("[help]"), "Stage-1 `Info` has [help] Marginalia")
+    check_true(ann_ap != null and ann_ap.as(String).starts_with("[help]"), "Stage-1 `Apropos` has [help] Marginalia")
+    check_true(ann_apd != null and ann_apd.as(String).starts_with("[help]"), "Stage-1 `AproposDocs` has [help] Marginalia")
+
+    -- 2. Stage-2 `:Telescope ` includes `help_tags`, `docs`, and `commands`
+    app_feed_keys(kernel, "Telescope<Space>")# ! { e => panic(e) }
+    check_true(find_item_annotation(mb.items, "Telescope help_tags") != null, ":Telescope completes help_tags")
+    check_true(find_item_annotation(mb.items, "Telescope docs") != null, ":Telescope completes docs")
+    check_true(find_item_annotation(mb.items, "Telescope commands") != null, ":Telescope completes commands")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    -- 3. Stage-2 `:h ` / `:help ` populates `[tag]`, `[info]`, `[cmd]`, `[opt]` Marginalia + Orderless filtering
+    app_feed_keys(kernel, ":h<Space>")# ! { e => panic(e) }
+    check_true(mb.cached_help_catalog != null, "per-session help doc cache populated on :h ")
+    let tag_ann = find_item_annotation(mb.items, "h test-keys")
+    let info_ann = find_item_annotation(mb.items, "h manual#keybindings")
+    let cmd_ann = find_item_annotation(mb.items, "h demo-custom-action")
+    let opt_ann = find_item_annotation(mb.items, "h relativenumber")
+    check_true(
+        tag_ann != null and tag_ann.as(String).starts_with("[tag]"),
+        ":h includes test-keys with [tag] Marginalia: " ++ (if tag_ann != null { tag_ann.as(String) } else { "null" }),
+    )
+    check_true(
+        info_ann != null and info_ann.as(String).starts_with("[info]"),
+        ":h includes manual#keybindings with [info] Marginalia",
+    )
+    check_true(
+        cmd_ann != null and cmd_ann.as(String).starts_with("[cmd]") and cmd_ann.as(String).contains("SPC z z"),
+        ":h includes demo-custom-action with [cmd] + keychord Marginalia",
+    )
+    check_true(
+        opt_ann != null and opt_ann.as(String) == "[opt]  editor option",
+        ":h includes relativenumber with [opt] Marginalia",
+    )
+
+    -- Orderless filtering in `:h `: `"keys manual"` matches `h test-keys` via combined haystack!
+    app_feed_keys(kernel, "keys<Space>manual")# ! { e => panic(e) }
+    check_true(
+        find_item_annotation(mb.items, "h test-keys") != null,
+        "Orderless ':h keys manual' matched h test-keys",
+    )
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    -- Also verify `:help *dirvish*` (with stars!) matches `help dirvish` cleanly
+    app_feed_keys(kernel, ":help<Space>*dirvish*")# ! { e => panic(e) }
+    let dirv_ann = find_item_annotation(mb.items, "help dirvish")
+    check_true(
+        dirv_ann != null and dirv_ann.as(String).starts_with("[tag]"),
+        ":help *dirvish* matched with [tag] Marginalia",
+    )
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    -- 4. Stage-2 `:Info ` completes `(dir)Top` + manual names + `node_id`s with `[info]` Marginalia
+    app_feed_keys(kernel, ":Info<Space>")# ! { e => panic(e) }
+    let top_ann = find_item_annotation(mb.items, "Info (dir)Top")
+    let node_ann = find_item_annotation(mb.items, "Info manual#architecture")
+    check_true(
+        top_ann != null and top_ann.as(String).starts_with("[info]"),
+        ":Info completes (dir)Top with [info] Marginalia",
+    )
+    check_true(
+        node_ann != null and node_ann.as(String).starts_with("[info] Architecture"),
+        ":Info completes manual#architecture with [info] title — summary Marginalia",
+    )
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    -- 5. Stage-2 `:AproposDocs ` offers Orderless suggestions AND preserves literal free-form input on `<Return>`!
+    app_feed_keys(kernel, ":AproposDocs<Space>dirvish")# ! { e => panic(e) }
+    check_true(
+        find_item_annotation(mb.items, "AproposDocs dirvish") != null,
+        ":AproposDocs dirvish suggests dirvish",
+    )
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    rec.last_prompt_result = null
+    app_feed_keys(kernel, ":AproposDocs<Space>ranger<Space>custom<Space>phrase<Return>")# ! { e => panic(e) }
+    check_true(rec.last_prompt_result != null, ":AproposDocs executed on Return")
+    check_eq_str(
+        rec.last_prompt_result.as(String),
+        "ranger custom phrase",
+        ":AproposDocs <Return> submitted literal free-form query without clobbering",
+    )
+
+    -- 6. Custom `info-node` and `help-tag` prompts render clean `[info]` and `[tag]` Marginalia!
+    let custom_ext = ExtId("lava.org/test_demo_cmds")
+    kernel.register_command(
+        "test-ask-info-node",
+        custom_ext,
+        "Ask for an info-node with Marginalia.",
+        |_kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let res = ask_prompt(PromptRequest {
+                kind: PromptKind.Choice,
+                label: "Info node: ",
+                initial: "",
+                candidates: ["(dir)Top", "manual#keybindings", "plugin_guide#top"],
+            })#
+            rec.last_prompt_result = res
+            ()
+        },
+    )
+    kernel.register_command(
+        "test-ask-help-tag",
+        custom_ext,
+        "Ask for a help-tag with Marginalia.",
+        |_kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let res = ask_prompt(PromptRequest {
+                kind: PromptKind.Choice,
+                label: "Help tag: ",
+                initial: "",
+                candidates: ["*test-keys*", "*dirvish*"],
+            })#
+            rec.last_prompt_result = res
+            ()
+        },
+    )
+
+    let _ = kernel.dispatch_command("test-ask-info-node", [])# ! { e => panic(e) }
+    let (req_info, _) = kernel.active_prompt.as((PromptRequest, Any))
+    open_prompt_view(kernel, req_info)
+    let rich_info = find_rich_item(world.minibuffer_rich_items, "manual#keybindings")
+    check_true(
+        rich_info != null and
+            rich_info.as(MinibufferRichItem).kind_badge == "[info]" and
+            rich_info.as(MinibufferRichItem).marginalia.starts_with("[info]"),
+        "info-node prompt renders [info] Marginalia: " ++ (if rich_info != null { rich_info.as(MinibufferRichItem).marginalia } else { "null" }),
+    )
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    let _ = kernel.dispatch_command("test-ask-help-tag", [])# ! { e => panic(e) }
+    let (req_tag, _) = kernel.active_prompt.as((PromptRequest, Any))
+    open_prompt_view(kernel, req_tag)
+    let rich_tag = find_rich_item(world.minibuffer_rich_items, "*test-keys*")
+    check_true(
+        rich_tag != null and
+            rich_tag.as(MinibufferRichItem).kind_badge == "[tag]" and
+            rich_tag.as(MinibufferRichItem).marginalia.starts_with("[tag]"),
+        "help-tag prompt renders [tag] Marginalia: " ++ (if rich_tag != null { rich_tag.as(MinibufferRichItem).marginalia } else { "null" }),
+    )
+    app_feed_keys(kernel, "<Return>")# ! { e => panic(e) }
+    check_eq_str(rec.last_prompt_result.as(String), "*test-keys*", "help-tag prompt accepted *test-keys*")
+
+    let _ = cap
+    println("  [PASS] test_minibuffer_help_and_info_completion")
+}
+
+fn main() {
+    mock_enable(true)
+
+    let tmp_dir = "/tmp/lava_telescope_help_" ++ time.unix_millis().to_string()
+    setup_isolated_fixture(tmp_dir)
+
+    let rec = MockDispatchRecorder.new()
+    let kernel = boot_test_kernel(rec)
+    check_true(kernel.is_extension_active(ext_telescope_id()), "ext_telescope active")
+
+    let world = (require_editor_world(kernel) ! { e => panic(e) }).as(EditorWorld)
+    let wm = (require_window_manager(kernel) ! { e => panic(e) }).as(WindowManager)
+    let mb = (require_minibuffer_controller(kernel) ! { e => panic(e) }).as(MinibufferController)
+    world.cwd = path.normalize(tmp_dir)
+
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let boot_cap = AppHostCap.new(world)
+    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+    check_eq_i64(wm.pixel_width, 1280, "viewport width")
+    let _ = boot_cap
+
+    test_telescope_help_tags_and_commands(kernel, world, rec, tmp_dir)
+    test_telescope_docs_and_dynamic_info_dispatch(kernel, world, rec, tmp_dir)
+    test_minibuffer_help_and_info_completion(kernel, world, mb, rec)
+
+    let _ = fs.remove_dir_all(tmp_dir) ! { _ => () }
+    println("ALL TELESCOPE HELP/DOCS & MINIBUFFER :HELP COMPLETION TESTS PASSED!")
+}

@@ -1,0 +1,621 @@
+-- Deterministic End-to-End Integration Test Suite for Lava Batch 10 Plugins (28–30 of 30):
+--   28. `ext_yanky`  (`lava.org/ext_yanky`  — post-yank temporary highlight, `[y`/`]y` yank-ring cycling across charwise & linewise yanks, `"yanky-picker"` floating window)
+--   29. `ext_treesj` (`lava.org/ext_treesj` — structural bracket split/join `<Space>j`/`:TSJToggle`, `dial.nvim` `<C-a>`/`g<C-x>` smart token cycling, `mini.move` `<M-j>`/`<M-k>` Normal & VisualLine block mover)
+--   30. `ext_lazy`   (`lava.org/ext_lazy`   — `*Lazy*` live Single-VM extension manager, `"lazy-detail"` 78x20 float inspector, `x` hot enable/disable & core dependency guard, `:CheckHealth`)
+
+use std.fs
+use std.io
+use std.path
+use std.time
+use @lava_sys.{DrawCmd, RawUiEvent, mock_enable, mock_last_frame_cmds}
+use @lava_core.{
+    ExtState, ExtensionRecord, Keymap, SystemKernel, clipboard_get, clipboard_set, log_event,
+    status_emit
+}
+use @ext_document.{
+    Buffer, EditorWorld, FloatingWindow, InlineSpanDecor, Pos, ext_document_id, require_editor_world
+}
+use @ext_vim.{KEYMAP_VIM_NORMAL, VimMode, VimState, require_vim_state}
+use @ext_app.{AppHostCap, app_commit_frame, app_feed_keys, app_step_event, boot_kernel}
+use @ext_yanky.{
+    FLOAT_ID_YANKY_PICKER, OWNER_YANKY, SERVICE_YANKY, YankyService, ext_yanky_id,
+    register_yanky_extension, require_yanky_service
+}
+use @ext_treesj.{
+    SERVICE_TREESJ, TreesjService, ext_treesj_id, register_treesj_extension, require_treesj_service
+}
+use @ext_lazy.{
+    CHECKHEALTH_BUF_NAME, FLOAT_ID_LAZY_DETAIL, LAZY_BUF_NAME, LazyService, MODE_LAZY,
+    SERVICE_LAZY, ext_lazy_id, register_lazy_extension, require_lazy_service
+}
+
+fn check_true(cond: bool, label: String) {
+    if not cond {
+        panic("FAILED: " ++ label)
+    }
+}
+
+fn check_eq_str(actual: String, expected: String, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual='" ++ actual ++ "' expected='" ++ expected ++ "'")
+    }
+}
+
+fn check_eq_i64(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual=" ++ actual.to_string() ++ " expected=" ++ expected.to_string())
+    }
+}
+
+fn count_owner_decors(buf: Buffer, owner: String) -> i64 {
+    var cnt: i64 = 0
+    for i in 0..buf.inline_decors.len() {
+        let dec = buf.inline_decors.get(i.as(usize)).as(InlineSpanDecor)
+        if dec.owner == owner {
+            cnt += 1
+        }
+    }
+    cnt
+}
+
+fn buffer_contains_line_substr(buf: Buffer, needle: String) -> bool {
+    for i in 0..buf.line_count() {
+        if buf.line_at(i).contains(needle) {
+            return true
+        }
+    }
+    false
+}
+
+fn find_row_with_substr(buf: Buffer, needle: String) -> i64 {
+    for i in 0..buf.line_count() {
+        if buf.line_at(i).contains(needle) {
+            return i
+        }
+    }
+    -1
+}
+
+fn float_contains_line_substr(fl: FloatingWindow, needle: String) -> bool {
+    for i in 0..fl.lines.len() {
+        let ln = fl.lines.get(i.as(usize)).as(String)
+        if ln.contains(needle) {
+            return true
+        }
+    }
+    false
+}
+
+fn frame_has_text_substr(cmds: List, needle: String) -> bool {
+    for i in 0..cmds.len() {
+        let cmd = cmds.get(i.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.TextRun(_, _, txt, _, _, _, _, _, _) => {
+                if txt.contains(needle) {
+                    return true
+                }
+            },
+            _ => (),
+        }
+    }
+    false
+}
+
+fn is_ext_in_state_active(kernel: SystemKernel, target_name: String) -> bool {
+    let exts = kernel.list_extensions()
+    for i in 0..exts.len() {
+        let rec = exts.get(i.as(usize)).as(ExtensionRecord)
+        if rec.name == target_name {
+            return rec.state match {
+                ExtState.Active => true,
+                _ => false,
+            }
+        }
+    }
+    false
+}
+
+fn is_ext_in_state_disabled(kernel: SystemKernel, target_name: String) -> bool {
+    let exts = kernel.list_extensions()
+    for i in 0..exts.len() {
+        let rec = exts.get(i.as(usize)).as(ExtensionRecord)
+        if rec.name == target_name {
+            return rec.state match {
+                ExtState.Disabled => true,
+                _ => false,
+            }
+        }
+    }
+    false
+}
+
+fn boot_batch10_kernel() -> SystemKernel {
+    let kernel: SystemKernel = (boot_kernel() ! { e => panic(e) }).as(SystemKernel)
+    let _ = register_yanky_extension(kernel) ! { e => panic(e) }
+    let _ = register_treesj_extension(kernel) ! { e => panic(e) }
+    let _ = register_lazy_extension(kernel) ! { e => panic(e) }
+    let _ = kernel.activate_all() ! { e => panic(e) }
+    kernel
+}
+
+fn run_batch10_suite() {
+    mock_enable(true)
+
+    let tmp_dir = "/tmp/lava_batch10_" ++ time.unix_millis().to_string()
+    let _ = fs.create_dir_all(tmp_dir) ! { e => panic(e.to_string()) }
+
+    let kernel = boot_batch10_kernel()
+    check_eq_i64(kernel.list_extensions().len(), 11, "11 registered extensions (8 core + 3 batch10)")
+    check_true(kernel.is_extension_active(ext_yanky_id()), "ext_yanky is active")
+    check_true(kernel.is_extension_active(ext_treesj_id()), "ext_treesj is active")
+    check_true(kernel.is_extension_active(ext_lazy_id()), "ext_lazy is active")
+
+    let world: EditorWorld = (require_editor_world(kernel) ! { e => panic(e) }).as(EditorWorld)
+    let vim: VimState = (require_vim_state(kernel) ! { e => panic(e) }).as(VimState)
+    let yanky_svc: YankyService = (require_yanky_service(kernel) ! { e => panic(e) }).as(YankyService)
+    let treesj_svc: TreesjService = (require_treesj_service(kernel) ! { e => panic(e) }).as(TreesjService)
+    let lazy_svc: LazyService = (require_lazy_service(kernel) ! { e => panic(e) }).as(LazyService)
+
+    world.cwd = tmp_dir
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
+    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+
+    -- ========================================================================
+    -- PART 1: `ext_yanky` (`lava.org/ext_yanky`)
+    -- ========================================================================
+    let yanky_file = path.join(tmp_dir, "yanky_demo.ns")
+    let yanky_lines = [
+        "first second third",
+        "slot=[]",
+        "alpha line",
+        "beta line",
+        "gamma line",
+    ]
+    let _ = fs.write_string(yanky_file, yanky_lines.join("\n") ++ "\n") ! { e => panic(e.to_string()) }
+
+    app_feed_keys(kernel, ":e<Space>" ++ yanky_file ++ "<Return>")# ! { e => panic(e) }
+    let ybuf = world.active_buffer()
+    check_eq_str(ybuf.name, "yanky_demo.ns", "opened yanky_demo.ns")
+    world.registers.yank_history.clear()
+
+    -- 1A. Yank "first", verify temporary warm highlight InlineSpanDecor appears on `"vim-yank"`
+    -- and clears automatically on next `"cursor-moved"`.
+    app_feed_keys(kernel, "gg0yiw")# ! { e => panic(e) }
+    check_eq_i64(world.registers.yank_history.len(), 1, "yanked 1st item ('first')")
+    check_true(
+        count_owner_decors(ybuf, OWNER_YANKY) >= 1,
+        "ext_yanky temporary InlineSpanDecor applied after yiw",
+    )
+
+    app_feed_keys(kernel, "w")# ! { e => panic(e) }
+    check_eq_i64(
+        count_owner_decors(ybuf, OWNER_YANKY),
+        0,
+        "ext_yanky temporary InlineSpanDecor cleared on cursor-moved",
+    )
+
+    -- Yank "second" and "third"
+    app_feed_keys(kernel, "yiwwyiw")# ! { e => panic(e) }
+    check_eq_i64(world.registers.yank_history.len(), 3, "yank_history has 3 items ('first', 'second', 'third')")
+
+    -- 1B. Move to `slot=[` on row 1 (col 5 = `[`) and paste `"third"` with `p` (inserts after `[` -> `slot=[third]`).
+    app_feed_keys(kernel, "j0f[p")# ! { e => panic(e) }
+    check_eq_str(ybuf.line_at(1), "slot=[third]", "initial paste p inserts 'third'")
+
+    -- Press `[y` -> replaces `"third"` with `"second"`!
+    app_feed_keys(kernel, "[y")# ! { e => panic(e) }
+    check_eq_str(ybuf.line_at(1), "slot=[second]", "[y cycles older yank 'second'")
+
+    -- Press `[y` again -> replaces `"second"` with `"first"`!
+    app_feed_keys(kernel, "[y")# ! { e => panic(e) }
+    check_eq_str(ybuf.line_at(1), "slot=[first]", "second [y cycles older yank 'first'")
+
+    -- Press `]y` -> replaces `"first"` with `"second"`!
+    app_feed_keys(kernel, "]y")# ! { e => panic(e) }
+    check_eq_str(ybuf.line_at(1), "slot=[second]", "]y cycles newer yank 'second'")
+
+    -- 1C. Test linewise yank cycling (`yy` on alpha, beta, gamma -> `p` -> `[y` / `]y`).
+    world.registers.yank_history.clear()
+    ybuf.point = Pos.new(2, 0)
+    app_feed_keys(kernel, "yyjyyjyy")# ! { e => panic(e) }
+    check_eq_i64(world.registers.yank_history.len(), 3, "3 linewise yanks in ring")
+
+    -- Paste below `gamma line` (row 4) with `p` -> row 5 becomes `"gamma line"`
+    ybuf.point = Pos.new(4, 0)
+    app_feed_keys(kernel, "p")# ! { e => panic(e) }
+    check_eq_str(ybuf.line_at(5), "gamma line", "linewise p pastes 'gamma line'")
+
+    app_feed_keys(kernel, "[y")# ! { e => panic(e) }
+    check_eq_str(ybuf.line_at(5), "beta line", "linewise [y replaces with 'beta line'")
+
+    app_feed_keys(kernel, "[y")# ! { e => panic(e) }
+    check_eq_str(ybuf.line_at(5), "alpha line", "linewise [y replaces with 'alpha line'")
+
+    app_feed_keys(kernel, "]y")# ! { e => panic(e) }
+    check_eq_str(ybuf.line_at(5), "beta line", "linewise ]y replaces with 'beta line'")
+
+    -- 1D. Interactive Yank History Picker (`<Space> p` / `:YankyRingHistory` -> `"yanky-picker"` float):
+    -- Put charwise yanks `"pick_old"` and `"pick_new"` in ring, open `<Space> p`, select `"pick_old"` with `j` + `<Return>`!
+    ybuf.set_lines([
+        "pick_old pick_new",
+        "dest=<>",
+    ])
+    ybuf.point = Pos.new(0, 0)
+    world.registers.yank_history.clear()
+    app_feed_keys(kernel, "yiwwyiw")# ! { e => panic(e) }
+    check_eq_i64(world.registers.yank_history.len(), 2, "2 items in yank ring for picker test")
+
+    -- Move cursor to `<` in `dest=<>` (row 1, col 5) and press `<Space>p`
+    ybuf.point = Pos.new(1, 5)
+    app_feed_keys(kernel, "<Space>p")# ! { e => panic(e) }
+    check_true(yanky_svc.picker_open, "yanky_svc.picker_open == true after <Space>p")
+    let picker_float_opt = world.get_floating_window(FLOAT_ID_YANKY_PICKER)
+    check_true(picker_float_opt != null, "FloatingWindow 'yanky-picker' exists")
+    let picker_float = picker_float_opt.as(FloatingWindow)
+    check_eq_str(picker_float.title, "Yank Ring History", "yanky-picker title")
+    check_true(float_contains_line_substr(picker_float, "[#1] [C]"), "picker shows [#1] [C] entry")
+    check_true(float_contains_line_substr(picker_float, "pick_new"), "picker shows pick_new")
+    check_true(float_contains_line_substr(picker_float, "pick_old"), "picker shows pick_old")
+
+    -- Verify frame composition renders `"Yank Ring History"` cleanly
+    let _ = app_commit_frame(kernel)# ! { e => panic(e) }
+    check_true(
+        frame_has_text_substr(mock_last_frame_cmds(), "Yank Ring History"),
+        "rendered frame contains Yank Ring History float",
+    )
+
+    -- Move down with `j` (to `"pick_old"`) and press `<Return>` to paste after `<`!
+    app_feed_keys(kernel, "j<Return>")# ! { e => panic(e) }
+    check_true(not yanky_svc.picker_open, "yanky-picker closed after <Return>")
+    check_true(world.get_floating_window(FLOAT_ID_YANKY_PICKER) == null, "yanky-picker float removed")
+    check_eq_str(ybuf.line_at(1), "dest=<pick_old>", "j + <Return> in yanky-picker pasted 'pick_old'")
+
+    -- Also verify `:YankyRingHistory` opens picker, `d` deletes an entry, `c` clears ring, and `q` closes it cleanly
+    app_feed_keys(kernel, ":YankyRingHistory<Return>")# ! { e => panic(e) }
+    check_true(world.get_floating_window(FLOAT_ID_YANKY_PICKER) != null, ":YankyRingHistory opens yanky-picker")
+    app_feed_keys(kernel, "d")# ! { e => panic(e) }
+    check_eq_i64(world.registers.yank_history.len(), 1, "d in yanky-picker deleted selected entry")
+    app_feed_keys(kernel, "c")# ! { e => panic(e) }
+    check_eq_i64(world.registers.yank_history.len(), 0, "c in yanky-picker cleared yank ring")
+    app_feed_keys(kernel, "q")# ! { e => panic(e) }
+    check_true(world.get_floating_window(FLOAT_ID_YANKY_PICKER) == null, "q closes yanky-picker")
+
+    -- 1E. Verify mixed charwise <-> linewise yank-ring transition + 1-step undo!
+    ybuf.set_lines([
+        "full_line_item",
+        "word_item",
+        "anchor=()",
+    ])
+    world.registers.yank_history.clear()
+    ybuf.point = Pos.new(0, 0)
+    app_feed_keys(kernel, "yy")# ! { e => panic(e) }
+    ybuf.point = Pos.new(1, 0)
+    app_feed_keys(kernel, "yiw")# ! { e => panic(e) }
+    ybuf.point = Pos.new(2, 7)
+    app_feed_keys(kernel, "p")# ! { e => panic(e) }
+    check_eq_str(ybuf.line_at(2), "anchor=(word_item)", "pasted charwise word_item")
+    app_feed_keys(kernel, "[y")# ! { e => panic(e) }
+    check_eq_str(ybuf.line_at(2), "anchor=()", "charwise -> linewise transition restored line 2")
+    check_eq_str(ybuf.line_at(3), "full_line_item", "charwise -> linewise transition inserted linewise item below")
+    app_feed_keys(kernel, "u")# ! { e => panic(e) }
+    check_eq_str(ybuf.line_at(2), "anchor=(word_item)", "u cleanly undid [y transition in 1 undo step")
+
+    io.println("  [PASS] Part 1: ext_yanky ([y / ]y charwise/linewise cycling, post-yank highlight, yanky-picker float)")
+
+    -- ========================================================================
+    -- PART 2: `ext_treesj` (`lava.org/ext_treesj`)
+    -- ========================================================================
+    -- Guard check: `ext_treesj` MUST NOT bind `"g S"` (owned by `ext_flash`) or bare `"<C-x>"` in `KEYMAP_VIM_NORMAL`!
+    let norm_km_opt = kernel.keymaps.get(KEYMAP_VIM_NORMAL)
+    check_true(norm_km_opt != null, "KEYMAP_VIM_NORMAL exists")
+    let norm_km = norm_km_opt.as(Keymap)
+    check_true(
+        norm_km.bindings.get("g S") == null,
+        "ext_treesj did NOT bind 'g S' in KEYMAP_VIM_NORMAL",
+    )
+    check_true(
+        norm_km.bindings.get("<C-x>") == null,
+        "ext_treesj did NOT bind bare '<C-x>' in KEYMAP_VIM_NORMAL",
+    )
+
+    -- 2A. Feature A — Structural Split / Join (`<Space> j` and `:TSJToggle`)
+    let tsj_file = path.join(tmp_dir, "treesj_demo.ns")
+    let _ = fs.write_string(tsj_file, "fn add(a: i64, b: i64, c: i64)\n") ! { e => panic(e.to_string()) }
+    app_feed_keys(kernel, ":e!<Space>" ++ tsj_file ++ "<Return>")# ! { e => panic(e) }
+    let tbuf = world.active_buffer()
+    check_eq_str(tbuf.major_mode, "nessa", "treesj_demo.ns major_mode == nessa")
+
+    -- Place cursor inside `(...)` and press `<Space>j` -> multi-line indented params with trailing comma in Nessa!
+    tbuf.point = Pos.new(0, 8)
+    app_feed_keys(kernel, "<Space>j")# ! { e => panic(e) }
+    check_eq_i64(tbuf.line_count(), 5, "split fn add(...) into 5 lines")
+    check_eq_str(tbuf.line_at(0), "fn add(", "split line 0")
+    check_eq_str(tbuf.line_at(1), "    a: i64,", "split line 1")
+    check_eq_str(tbuf.line_at(2), "    b: i64,", "split line 2")
+    check_eq_str(tbuf.line_at(3), "    c: i64,", "split line 3 (trailing comma in nessa)")
+    check_eq_str(tbuf.line_at(4), ")", "split line 4")
+
+    -- Join back onto one line via `:TSJToggle` -> strips trailing comma cleanly!
+    app_feed_keys(kernel, ":TSJToggle<Return>")# ! { e => panic(e) }
+    check_eq_i64(tbuf.line_count(), 1, "joined fn add(...) back onto 1 line")
+    check_eq_str(tbuf.line_at(0), "fn add(a: i64, b: i64, c: i64)", "joined fn add(...) exact text")
+
+    -- Test JSON split without trailing commas!
+    let json_file = path.join(tmp_dir, "config.json")
+    let json_src = "{{\"k\": 1, \"m\": [10, 20]}}"
+    let _ = fs.write_string(json_file, json_src ++ "\n") ! { e => panic(e.to_string()) }
+    app_feed_keys(kernel, ":e!<Space>" ++ json_file ++ "<Return>")# ! { e => panic(e) }
+    let jbuf = world.active_buffer()
+    check_eq_str(jbuf.major_mode, "json", "config.json major_mode == json")
+
+    -- Place cursor at col 2 (inside outer `{...}`) and split via `<Space>j`:
+    jbuf.point = Pos.new(0, 2)
+    app_feed_keys(kernel, "<Space>j")# ! { e => panic(e) }
+    check_eq_i64(jbuf.line_count(), 4, "JSON outer object split into 4 lines")
+    check_eq_str(jbuf.line_at(0), "{{", "JSON split line 0")
+    check_eq_str(jbuf.line_at(1), "    \"k\": 1,", "JSON split line 1")
+    check_eq_str(jbuf.line_at(2), "    \"m\": [10, 20]", "JSON split line 2 (NO trailing comma in json!)")
+    check_eq_str(jbuf.line_at(3), "}}", "JSON split line 3")
+
+    -- Also split inner JSON array `[10, 20]` and verify NO trailing comma on `20`!
+    jbuf.point = Pos.new(2, 10)
+    app_feed_keys(kernel, "<Space>j")# ! { e => panic(e) }
+    check_eq_str(jbuf.line_at(4), "        20", "JSON inner array last item has NO trailing comma")
+
+    -- 2B. Feature B — `dial.nvim` Smart Increment / Decrement (`<C-a>` and `g <C-x>`)
+    app_feed_keys(kernel, ":e!<Space>" ++ tsj_file ++ "<Return>")# ! { e => panic(e) }
+    let dbuf = world.active_buffer()
+    dbuf.set_lines([
+        "let count = 41",
+        "let neg = -1",
+        "let mask = 0x0f",
+        "let flag = true",
+        "let cond = a and b",
+        "let eq = x == y",
+        "pub fn helper() {{}}",
+        "let dec_val = 10",
+    ])
+
+    -- `41 -> 42`
+    dbuf.point = Pos.new(0, 12)
+    app_feed_keys(kernel, "<C-a>")# ! { e => panic(e) }
+    check_eq_str(dbuf.line_at(0), "let count = 42", "<C-a> increments 41 -> 42")
+    check_eq_i64(dbuf.point.col, 13, "<C-a> places cursor on last digit of 42")
+
+    -- `-1 -> 0`
+    dbuf.point = Pos.new(1, 10)
+    app_feed_keys(kernel, "<C-a>")# ! { e => panic(e) }
+    check_eq_str(dbuf.line_at(1), "let neg = 0", "<C-a> increments -1 -> 0")
+
+    -- `0x0f -> 0x10`
+    dbuf.point = Pos.new(2, 11)
+    app_feed_keys(kernel, "<C-a>")# ! { e => panic(e) }
+    check_eq_str(dbuf.line_at(2), "let mask = 0x10", "<C-a> increments 0x0f -> 0x10")
+
+    -- `true -> false -> true`
+    dbuf.point = Pos.new(3, 11)
+    app_feed_keys(kernel, "<C-a>")# ! { e => panic(e) }
+    check_eq_str(dbuf.line_at(3), "let flag = false", "<C-a> toggles true -> false")
+    app_feed_keys(kernel, "<C-a>")# ! { e => panic(e) }
+    check_eq_str(dbuf.line_at(3), "let flag = true", "<C-a> toggles false -> true")
+
+    -- `and -> or`
+    dbuf.point = Pos.new(4, 13)
+    app_feed_keys(kernel, "<C-a>")# ! { e => panic(e) }
+    check_eq_str(dbuf.line_at(4), "let cond = a or b", "<C-a> toggles and -> or")
+
+    -- `== -> !=`
+    dbuf.point = Pos.new(5, 11)
+    app_feed_keys(kernel, "<C-a>")# ! { e => panic(e) }
+    check_eq_str(dbuf.line_at(5), "let eq = x != y", "<C-a> toggles == -> !=")
+
+    -- `pub -> private`
+    dbuf.point = Pos.new(6, 0)
+    app_feed_keys(kernel, "<C-a>")# ! { e => panic(e) }
+    check_eq_str(dbuf.line_at(6), "private fn helper() {{}}", "<C-a> toggles pub -> private")
+
+    -- `g <C-x>` decrements `10 -> 9`
+    dbuf.point = Pos.new(7, 14)
+    app_feed_keys(kernel, "g<C-x>")# ! { e => panic(e) }
+    check_eq_str(dbuf.line_at(7), "let dec_val = 9", "g <C-x> decrements 10 -> 9")
+
+    -- Case-preserving booleans, operators, and mutability keywords (`True -> False`, `&& -> ||`, `let -> var`, `const -> let`)
+    dbuf.set_lines([
+        "flag = True",
+        "check = a && b",
+        "let x = 1",
+        "const MAX = 9",
+    ])
+    dbuf.point = Pos.new(0, 7)
+    app_feed_keys(kernel, "<C-a>")# ! { e => panic(e) }
+    check_eq_str(dbuf.line_at(0), "flag = False", "case-preserving True -> False")
+    dbuf.point = Pos.new(1, 10)
+    app_feed_keys(kernel, "<C-a>")# ! { e => panic(e) }
+    check_eq_str(dbuf.line_at(1), "check = a || b", "operator && -> ||")
+    dbuf.point = Pos.new(2, 0)
+    app_feed_keys(kernel, "<C-a>")# ! { e => panic(e) }
+    check_eq_str(dbuf.line_at(2), "var x = 1", "keyword let -> var")
+    dbuf.point = Pos.new(3, 0)
+    app_feed_keys(kernel, "<C-a>")# ! { e => panic(e) }
+    check_eq_str(dbuf.line_at(3), "let MAX = 9", "keyword const -> let")
+
+    -- 2C. Feature C — `mini.move` Structural Line / Visual Block Mover (`<M-j>` / `<M-k>`)
+    dbuf.set_lines([
+        "row_A",
+        "row_B",
+        "row_C",
+        "row_D",
+    ])
+    dbuf.point = Pos.new(0, 2)
+    app_feed_keys(kernel, "<M-j>")# ! { e => panic(e) }
+    check_eq_str(dbuf.line_at(0), "row_B", "Normal <M-j> swapped row_B to line 0")
+    check_eq_str(dbuf.line_at(1), "row_A", "Normal <M-j> moved row_A to line 1")
+    check_eq_i64(dbuf.point.row, 1, "Normal <M-j> moved cursor row to 1")
+
+    app_feed_keys(kernel, "<M-k>")# ! { e => panic(e) }
+    check_eq_str(dbuf.line_at(0), "row_A", "Normal <M-k> restored row_A to line 0")
+    check_eq_str(dbuf.line_at(1), "row_B", "Normal <M-k> restored row_B to line 1")
+    check_eq_i64(dbuf.point.row, 0, "Normal <M-k> moved cursor row back to 0")
+
+    -- VisualLine 2-line block move (`Vj` selects lines 0..=1: `row_A`, `row_B`):
+    dbuf.point = Pos.new(0, 0)
+    app_feed_keys(kernel, "Vj<M-j>")# ! { e => panic(e) }
+    check_eq_str(dbuf.line_at(0), "row_C", "VisualLine <M-j> shifted row_C above block")
+    check_eq_str(dbuf.line_at(1), "row_A", "VisualLine <M-j> block line 1 == row_A")
+    check_eq_str(dbuf.line_at(2), "row_B", "VisualLine <M-j> block line 2 == row_B")
+    check_eq_str(dbuf.line_at(3), "row_D", "VisualLine <M-j> line 3 == row_D")
+    let still_vline_down = vim.mode match {
+        VimMode.VisualLine => true,
+        _ => false,
+    }
+    check_true(still_vline_down, "VisualLine selection remained active after <M-j>")
+    check_eq_i64(vim.visual_anchor.row, 1, "visual_anchor.row shifted to 1")
+    check_eq_i64(dbuf.point.row, 2, "point.row shifted to 2")
+
+    -- Immediately press `<M-k>` without re-entering Visual mode -> moves 2-line block back up!
+    app_feed_keys(kernel, "<M-k>")# ! { e => panic(e) }
+    check_eq_str(dbuf.line_at(0), "row_A", "VisualLine <M-k> moved row_A back to 0")
+    check_eq_str(dbuf.line_at(1), "row_B", "VisualLine <M-k> moved row_B back to 1")
+    check_eq_str(dbuf.line_at(2), "row_C", "VisualLine <M-k> moved row_C back to 2")
+    let still_vline_up = vim.mode match {
+        VimMode.VisualLine => true,
+        _ => false,
+    }
+    check_true(still_vline_up, "VisualLine selection remained active after <M-k>")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+    check_true(treesj_svc.toggle_count >= 4, "treesj_svc tracked split/join operations")
+    check_true(treesj_svc.dial_count >= 9, "treesj_svc tracked dial operations")
+    check_true(treesj_svc.move_count >= 4, "treesj_svc tracked move operations")
+
+    io.println("  [PASS] Part 2: ext_treesj (structural split/join, dial.nvim token cycling, mini.move Normal & VisualLine)")
+
+    -- ========================================================================
+    -- PART 3: `ext_lazy` (`lava.org/ext_lazy`)
+    -- ========================================================================
+    -- 3A. Open `*Lazy*` via `<Space>l`
+    app_feed_keys(kernel, "<Space>l")# ! { e => panic(e) }
+    let lbuf = world.active_buffer()
+    check_eq_str(lbuf.name, LAZY_BUF_NAME, "<Space>l opened *Lazy* buffer")
+    check_eq_str(lbuf.major_mode, MODE_LAZY, "*Lazy* buffer major_mode == 'lazy'")
+    check_true(
+        lbuf.line_at(0).contains("Lava Extension Manager (Lazy) — Total: 11 | Active: 11 | Disabled: 0"),
+        "*Lazy* header reports live Total/Active/Disabled counts: '" ++ lbuf.line_at(0) ++ "'",
+    )
+    check_true(
+        buffer_contains_line_substr(lbuf, "● Active Extensions (11)"),
+        "*Lazy* shows Active Extensions section",
+    )
+    check_true(
+        buffer_contains_line_substr(lbuf, "[lava.org/ext_yanky]"),
+        "*Lazy* lists lava.org/ext_yanky with command & service counts",
+    )
+
+    -- 3B. Move cursor to `ext_yanky` row and press `<Return>` -> opens `"lazy-detail"` 78x20 float!
+    let yanky_row = find_row_with_substr(lbuf, "[lava.org/ext_yanky]")
+    check_true(yanky_row >= 0, "found ext_yanky row in *Lazy*")
+    lbuf.point = Pos.new(yanky_row, 2)
+    app_feed_keys(kernel, "<Return>")# ! { e => panic(e) }
+
+    let detail_opt = world.get_floating_window(FLOAT_ID_LAZY_DETAIL)
+    check_true(detail_opt != null, "<Return> opened 'lazy-detail' FloatingWindow")
+    let detail_fl = detail_opt.as(FloatingWindow)
+    check_eq_i64(detail_fl.width_cols, 78, "lazy-detail width_cols == 78")
+    check_eq_i64(detail_fl.height_rows, 20, "lazy-detail height_rows == 20")
+    check_true(float_contains_line_substr(detail_fl, "ExtId:        lava.org/ext_yanky"), "detail shows ExtId")
+    check_true(float_contains_line_substr(detail_fl, "State:        Active"), "detail shows Active state")
+    check_true(float_contains_line_substr(detail_fl, "Dependencies: "), "detail shows Dependencies")
+    check_true(float_contains_line_substr(detail_fl, SERVICE_YANKY), "detail shows published service lava.yanky.ring")
+    check_true(float_contains_line_substr(detail_fl, "yanky-cycle-prev"), "detail shows registered command yanky-cycle-prev")
+    check_true(float_contains_line_substr(detail_fl, "[ y"), "detail shows bound keystroke '[ y'")
+
+    -- Close `"lazy-detail"` float with `q` (keeps `*Lazy*` open!)
+    app_feed_keys(kernel, "q")# ! { e => panic(e) }
+    check_true(world.get_floating_window(FLOAT_ID_LAZY_DETAIL) == null, "q closed lazy-detail float")
+    check_eq_str(world.active_buffer().name, LAZY_BUF_NAME, "*Lazy* stays open after closing detail float")
+
+    -- 3C. Press `x` on leaf plugin `ext_yanky` -> deactivates it (`ExtState.Disabled`)!
+    let yanky_row_before = find_row_with_substr(lbuf, "[lava.org/ext_yanky]")
+    lbuf.point = Pos.new(yanky_row_before, 2)
+    app_feed_keys(kernel, "x")# ! { e => panic(e) }
+    check_true(is_ext_in_state_disabled(kernel, "ext_yanky"), "x deactivated ext_yanky -> ExtState.Disabled")
+    check_true(kernel.service(SERVICE_YANKY) == null, "ext_yanky service removed upon deactivation")
+    check_true(
+        lbuf.line_at(0).contains("Active: 10 | Disabled: 1"),
+        "*Lazy* refreshed header to Active: 10 | Disabled: 1",
+    )
+    check_true(
+        buffer_contains_line_substr(lbuf, "○ ext_yanky") and buffer_contains_line_substr(lbuf, "[Disabled]"),
+        "*Lazy* lists ext_yanky under Disabled section",
+    )
+
+    -- Press `x` again -> re-activates `ext_yanky` (`ExtState.Active`)!
+    let yanky_disabled_row = find_row_with_substr(lbuf, "[lava.org/ext_yanky]")
+    check_true(yanky_disabled_row >= 0, "found disabled ext_yanky row in *Lazy*")
+    lbuf.point = Pos.new(yanky_disabled_row, 2)
+    app_feed_keys(kernel, "x")# ! { e => panic(e) }
+    check_true(is_ext_in_state_active(kernel, "ext_yanky"), "second x re-activated ext_yanky -> ExtState.Active")
+    check_true(kernel.service(SERVICE_YANKY) != null, "ext_yanky service restored upon re-activation")
+    check_true(
+        lbuf.line_at(0).contains("Active: 11 | Disabled: 0"),
+        "*Lazy* refreshed header back to Active: 11 | Disabled: 0",
+    )
+
+    -- 3D. Press `x` on `ext_document` (foundational core extension with active dependents) ->
+    -- refuses cleanly with warning status/toast without panicking!
+    let doc_row = find_row_with_substr(lbuf, "[lava.org/ext_document]")
+    check_true(doc_row >= 0, "found ext_document row in *Lazy*")
+    lbuf.point = Pos.new(doc_row, 2)
+    app_feed_keys(kernel, "x")# ! { e => panic(e) }
+    check_true(
+        kernel.is_extension_active(ext_document_id()),
+        "ext_document remains Active when pressing x",
+    )
+    check_true(
+        world.status_message.contains("Cannot disable") or world.notifications.len() > 0,
+        "clean warning emitted when attempting to disable ext_document: '" ++ world.status_message ++ "'",
+    )
+
+    -- 3E. Press `c` (`:CheckHealth`) -> produces healthy VM & core services report in `*CheckHealth*`!
+    app_feed_keys(kernel, "c")# ! { e => panic(e) }
+    let hbuf = world.active_buffer()
+    check_eq_str(hbuf.name, CHECKHEALTH_BUF_NAME, "c opened *CheckHealth* buffer")
+    check_true(lazy_svc.last_health_ok, "lazy_svc.last_health_ok == true")
+    check_true(buffer_contains_line_substr(hbuf, "Nessa VM Version"), "*CheckHealth* includes Nessa VM Version")
+    check_true(buffer_contains_line_substr(hbuf, "GC Collections"), "*CheckHealth* includes GC stats")
+    check_true(buffer_contains_line_substr(hbuf, "@lava_accel available"), "*CheckHealth* verifies @lava_accel")
+    check_true(buffer_contains_line_substr(hbuf, "lava.document.world"), "*CheckHealth* verifies world service")
+    check_true(buffer_contains_line_substr(hbuf, "lava.window.manager"), "*CheckHealth* verifies window service")
+    check_true(buffer_contains_line_substr(hbuf, "lava.render.compositor"), "*CheckHealth* verifies render service")
+    check_true(buffer_contains_line_substr(hbuf, "lava.vim.state"), "*CheckHealth* verifies vim service")
+    check_true(buffer_contains_line_substr(hbuf, "lava.emacs.state"), "*CheckHealth* verifies emacs service")
+    check_true(buffer_contains_line_substr(hbuf, "Summary: HEALTHY"), "*CheckHealth* reports Summary: HEALTHY")
+
+    -- Render a full frame of `*CheckHealth*` and close back to `*Lazy*`, test `R` (`lazy-activate-all`), then close `*Lazy*`
+    let _ = app_commit_frame(kernel)# ! { e => panic(e) }
+    app_feed_keys(kernel, "q")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, LAZY_BUF_NAME, "q in *CheckHealth* returns to *Lazy*")
+
+    -- Disable `ext_treesj` with `x`, then press `R` (`lazy-activate-all`) -> restores Active!
+    let tsj_row = find_row_with_substr(lbuf, "[lava.org/ext_treesj]")
+    check_true(tsj_row >= 0, "found ext_treesj row in *Lazy*")
+    lbuf.point = Pos.new(tsj_row, 2)
+    app_feed_keys(kernel, "x")# ! { e => panic(e) }
+    check_true(is_ext_in_state_disabled(kernel, "ext_treesj"), "x disabled ext_treesj")
+    app_feed_keys(kernel, "R")# ! { e => panic(e) }
+    check_true(is_ext_in_state_active(kernel, "ext_treesj"), "R (lazy-activate-all) re-activated ext_treesj")
+
+    app_feed_keys(kernel, "q")# ! { e => panic(e) }
+
+    -- Verify re-activated `ext_yanky` keybinding `<Space>p` still works live after hot disable/re-enable!
+    app_feed_keys(kernel, "<Space>pq")# ! { e => panic(e) }
+    check_true(world.get_floating_window(FLOAT_ID_YANKY_PICKER) == null, "re-activated ext_yanky <Space>p -> q works cleanly")
+
+    let _ = SERVICE_TREESJ
+    let _ = SERVICE_LAZY
+    io.println("  [PASS] Part 3: ext_lazy (*Lazy* introspection, 78x20 detail float, hot enable/disable, dependency guard, *CheckHealth*)")
+    io.println("ALL BATCH 10 PLUGIN TESTS PASSED! (Plugins 28-30 of 30)")
+}
+
+fn main() {
+    run_batch10_suite()
+}

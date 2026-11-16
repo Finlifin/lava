@@ -1,0 +1,836 @@
+-- ext_harpoon: Rapid Project File & Cursor Mark List (`lava.org/ext_harpoon`).
+-- Inspired by `ThePrimeagen/harpoon` v2: pinned mark slots (`<Space>1..4`), quick mark (`<Space>ha`),
+-- interactive centered floating menu (`<Space>hm` with `j`/`k`, `J`/`K` reorder, `d`/`x` delete,
+-- `1..9`/`<Return>` jump, `q`/`<Escape>` close), cycle (`<Space>hn`/`<Space>hp`), and JSON persistence.
+
+use std.fs
+use std.path
+use @lava_sys.{host_read_file_lines, host_write_file_lines, rgb}
+use @lava_core.{
+    ExtId, InteractiveEffects, KeyStroke, PromptKind, PromptRequest, ServiceEffects, SystemKernel,
+    ask_prompt, log_event, status_emit
+}
+use @ext_document.{
+    Buffer, EditorWorld, FloatingWindow, Pos, ext_document_id, require_editor_world
+}
+use @ext_vim.{
+    KEYMAP_VIM_LEADER, ModalInterceptor, VimMode, VimState, ext_vim_id, require_vim_state,
+    sync_world_from_vim
+}
+
+pub const SERVICE_HARPOON: String = "lava.harpoon.state"
+pub const OWNER_HARPOON: String = "ext_harpoon"
+pub const FLOAT_ID_HARPOON: String = "harpoon-menu"
+
+pub fn ext_harpoon_id() -> ExtId = ExtId("lava.org/ext_harpoon")
+
+pub struct HarpoonEntry {
+    pub file_path: String,
+    pub buf_name: String,
+    pub row: i64,
+    pub col: i64,
+}
+derive Eq, PartialEq for HarpoonEntry
+
+pub struct HarpoonState {
+    pub entries: List,
+    pub active_idx: i64,
+    pub menu_open: bool,
+    pub selected_row: i64,
+}
+
+impl HarpoonState {
+    pub fn new() -> HarpoonState {
+        HarpoonState {
+            entries: List(),
+            active_idx: 0,
+            menu_open: false,
+            selected_row: 0,
+        }
+    }
+
+    pub fn len(self) -> i64 = self.entries.len()
+
+    pub fn is_empty(self) -> bool = self.entries.is_empty()
+
+    pub fn entry_at(self, idx: i64) -> ?HarpoonEntry {
+        if idx < 0 or idx >= self.entries.len() {
+            return null
+        }
+        self.entries.get(idx.as(usize)).as(HarpoonEntry)
+    }
+
+    pub fn find_index_for_buffer(self, world: EditorWorld, buf: Buffer) -> i64 {
+        let norm_fp = if buf.file_path != "" { world.resolve_path(buf.file_path) } else { "" }
+        for i in 0..self.entries.len() {
+            let item = self.entries.get(i.as(usize)).as(HarpoonEntry)
+            if norm_fp != "" {
+                if item.file_path == norm_fp {
+                    return i
+                }
+            } else if item.file_path == "" and item.buf_name == buf.name {
+                return i
+            }
+        }
+        -1
+    }
+
+    pub fn clamp_selection(self) {
+        let n = self.entries.len()
+        if n == 0 {
+            self.selected_row = 0
+            self.active_idx = 0
+            return
+        }
+        if self.selected_row < 0 {
+            self.selected_row = 0
+        } else if self.selected_row >= n {
+            self.selected_row = n - 1
+        }
+        if self.active_idx < 0 {
+            self.active_idx = 0
+        } else if self.active_idx >= n {
+            self.active_idx = n - 1
+        }
+    }
+}
+
+pub fn require_harpoon_state(kernel: SystemKernel) -> !String HarpoonState {
+    let raw = kernel.require_service(SERVICE_HARPOON)!
+    raw.as(HarpoonState)
+}
+
+-- ============================================================================
+-- JSON Serialization & Deserialization Helpers
+-- ============================================================================
+
+fn json_escape(s: String) -> String {
+    let n = s.char_len()
+    var out = ""
+    for i in 0..n {
+        let ch = s.slice(i, i + 1)
+        when {
+            ch == "\\" => { out = out ++ "\\\\" },
+            ch == "\"" => { out = out ++ "\\\"" },
+            ch == "\n" => { out = out ++ "\\n" },
+            ch == "\r" => { out = out ++ "\\r" },
+            ch == "\t" => { out = out ++ "\\t" },
+            else => { out = out ++ ch },
+        }
+    }
+    out
+}
+
+fn parse_json_string_after(line: String, key: String) -> ?String {
+    let needle = "\"" ++ key ++ "\""
+    let hits = line.find_indices(needle)
+    if hits.is_empty() {
+        return null
+    }
+    let start_k = hits.get(0).as(i64) + needle.char_len()
+    let n = line.char_len()
+    var i = start_k
+    while i < n and (line.slice(i, i + 1) == " " or line.slice(i, i + 1) == "\t") {
+        i += 1
+    }
+    if i >= n or line.slice(i, i + 1) != ":" {
+        return null
+    }
+    i += 1
+    while i < n and (line.slice(i, i + 1) == " " or line.slice(i, i + 1) == "\t") {
+        i += 1
+    }
+    if i >= n or line.slice(i, i + 1) != "\"" {
+        return null
+    }
+    i += 1
+    var out = ""
+    while i < n {
+        let ch = line.slice(i, i + 1)
+        if ch == "\\" and i + 1 < n {
+            let esc = line.slice(i + 1, i + 2)
+            when {
+                esc == "\\" => { out = out ++ "\\" },
+                esc == "\"" => { out = out ++ "\"" },
+                esc == "n" => { out = out ++ "\n" },
+                esc == "r" => { out = out ++ "\r" },
+                esc == "t" => { out = out ++ "\t" },
+                else => { out = out ++ esc },
+            }
+            i += 2
+            continue
+        }
+        if ch == "\"" {
+            return out
+        }
+        out = out ++ ch
+        i += 1
+    }
+    null
+}
+
+fn parse_json_int_after(line: String, key: String) -> ?i64 {
+    let needle = "\"" ++ key ++ "\""
+    let hits = line.find_indices(needle)
+    if hits.is_empty() {
+        return null
+    }
+    let start_k = hits.get(0).as(i64) + needle.char_len()
+    let n = line.char_len()
+    var i = start_k
+    while i < n and (line.slice(i, i + 1) == " " or line.slice(i, i + 1) == "\t") {
+        i += 1
+    }
+    if i >= n or line.slice(i, i + 1) != ":" {
+        return null
+    }
+    i += 1
+    while i < n and (line.slice(i, i + 1) == " " or line.slice(i, i + 1) == "\t") {
+        i += 1
+    }
+    var j = i
+    if j < n and line.slice(j, j + 1) == "-" {
+        j += 1
+    }
+    while j < n and line.slice(j, j + 1).is_ascii_digit() {
+        j += 1
+    }
+    if j <= i {
+        return null
+    }
+    line.slice(i, j).parse_i64()
+}
+
+pub fn harpoon_serialize_lines(state: HarpoonState) -> List {
+    let out = List()
+    out.push("[")
+    let n = state.entries.len()
+    for i in 0..n {
+        let e = state.entries.get(i.as(usize)).as(HarpoonEntry)
+        let comma = if i + 1 < n { "," } else { "" }
+        let line = "  {{\"file_path\": \"" ++ json_escape(e.file_path)
+            ++ "\", \"buf_name\": \"" ++ json_escape(e.buf_name)
+            ++ "\", \"row\": " ++ e.row.to_string()
+            ++ ", \"col\": " ++ e.col.to_string()
+            ++ "}}" ++ comma
+        out.push(line)
+    }
+    out.push("]")
+    out
+}
+
+pub fn harpoon_deserialize_lines(state: HarpoonState, lines: List) -> i64 {
+    let loaded = List()
+    for i in 0..lines.len() {
+        let ln = lines.get(i.as(usize)).as(String).trim()
+        if ln == "" or ln == "[" or ln == "]" {
+            continue
+        }
+        if ln.starts_with("{{") {
+            let fp_opt = parse_json_string_after(ln, "file_path")
+            let bn_opt = parse_json_string_after(ln, "buf_name")
+            let r_opt = parse_json_int_after(ln, "row")
+            let c_opt = parse_json_int_after(ln, "col")
+            if fp_opt != null and bn_opt != null {
+                let r_val = if r_opt != null { r_opt.as(i64) } else { 0 }
+                let c_val = if c_opt != null { c_opt.as(i64) } else { 0 }
+                loaded.push(HarpoonEntry {
+                    file_path: fp_opt.as(String),
+                    buf_name: bn_opt.as(String),
+                    row: if r_val >= 0 { r_val } else { 0 },
+                    col: if c_val >= 0 { c_val } else { 0 },
+                })
+            }
+        } else if ln.contains("\t") {
+            -- Fallback tab-separated line format: `file_path\tbuf_name\trow\tcol`
+            let parts = ln.split("\t")
+            if parts.len() >= 4 {
+                let fp = parts.get(0).as(String)
+                let bn = parts.get(1).as(String)
+                let r_opt = parts.get(2).as(String).parse_i64()
+                let c_opt = parts.get(3).as(String).parse_i64()
+                let r_val = if r_opt != null { r_opt.as(i64) } else { 0 }
+                let c_val = if c_opt != null { c_opt.as(i64) } else { 0 }
+                loaded.push(HarpoonEntry {
+                    file_path: fp,
+                    buf_name: bn,
+                    row: if r_val >= 0 { r_val } else { 0 },
+                    col: if c_val >= 0 { c_val } else { 0 },
+                })
+            }
+        }
+    }
+    state.entries = loaded
+    state.active_idx = 0
+    state.selected_row = 0
+    state.clamp_selection()
+    loaded.len()
+}
+
+pub fn harpoon_save_state(state: HarpoonState, target_path: String) -> !String Unit {
+    let parent_opt = path.parent(target_path)
+    if parent_opt != null {
+        let pdir = parent_opt.as(String)
+        if pdir != "" and (not fs.exists(pdir)) {
+            let _ = fs.create_dir_all(pdir) ! { _ => () }
+        }
+    }
+    let lines = harpoon_serialize_lines(state)
+    let _ = host_write_file_lines(target_path, lines, true)!
+    ()
+}
+
+pub fn harpoon_load_state(state: HarpoonState, target_path: String) -> !String i64 {
+    let (lines, _) = host_read_file_lines(target_path)!
+    harpoon_deserialize_lines(state, lines)
+}
+
+pub fn harpoon_save(kernel: SystemKernel, file_path: String) -> !String Unit {
+    let world = require_editor_world(kernel)!
+    let state = require_harpoon_state(kernel)!
+    let resolved = if file_path != "" {
+        world.resolve_path(file_path)
+    } else {
+        path.join(world.cwd, ".lava_harpoon.json")
+    }
+    harpoon_save_state(state, resolved)
+}
+
+pub fn harpoon_load(kernel: SystemKernel, file_path: String) -> !String i64 {
+    let world = require_editor_world(kernel)!
+    let state = require_harpoon_state(kernel)!
+    let resolved = if file_path != "" {
+        world.resolve_path(file_path)
+    } else {
+        path.join(world.cwd, ".lava_harpoon.json")
+    }
+    let cnt = harpoon_load_state(state, resolved)!
+    if state.menu_open {
+        refresh_harpoon_floating_window(world, state)
+    }
+    cnt
+}
+
+-- ============================================================================
+-- Floating Window Rendering & Interactive Menu Interceptor
+-- ============================================================================
+
+fn render_menu_lines(world: EditorWorld, state: HarpoonState) -> List {
+    let out = List()
+    if state.entries.is_empty() {
+        out.push("  (Harpoon mark list is empty — press <Space>ha to add buffer)")
+        return out
+    }
+    let cur_buf = world.active_buffer()
+    let cur_fp = if cur_buf.file_path != "" { world.resolve_path(cur_buf.file_path) } else { "" }
+    for i in 0..state.entries.len() {
+        let e = state.entries.get(i.as(usize)).as(HarpoonEntry)
+        let is_cur = if e.file_path != "" {
+            e.file_path == cur_fp
+        } else {
+            cur_fp == "" and e.buf_name == cur_buf.name
+        }
+        let cur_mark = if is_cur { "*" } else { " " }
+        let loc_tag = "(" ++ (e.row + 1).to_string() ++ ":" ++ (e.col + 1).to_string() ++ ")"
+        let disp_path = if e.file_path != "" { " — " ++ e.file_path } else { "" }
+        out.push(
+            cur_mark ++ "[" ++ (i + 1).to_string() ++ "] "
+            ++ e.buf_name ++ " " ++ loc_tag ++ disp_path
+        )
+    }
+    out
+}
+
+fn refresh_harpoon_floating_window(world: EditorWorld, state: HarpoonState) {
+    state.clamp_selection()
+    let lines = render_menu_lines(world, state)
+    let h_rows = if lines.len() < 6 { 6 } else if lines.len() > 16 { 16 } else { lines.len() }
+    let win = FloatingWindow {
+        id: FLOAT_ID_HARPOON,
+        owner: OWNER_HARPOON,
+        title: " Harpoon [" ++ state.entries.len().to_string()
+            ++ "] (j/k:nav  J/K:move  d/x:del  1-9/RET:open  q:close) ",
+        anchor: "center",
+        width_cols: 72,
+        height_rows: h_rows,
+        lines: lines,
+        selected_row: state.selected_row,
+        border_rgba: rgb(137, 180, 250),
+    }
+    world.set_floating_window(win)
+}
+
+fn close_harpoon_menu(world: EditorWorld, vim: VimState, state: HarpoonState) {
+    state.menu_open = false
+    let _ = world.remove_floating_window(FLOAT_ID_HARPOON)
+    if vim.modal_interceptor != null {
+        if vim.modal_interceptor.as(ModalInterceptor).owner == OWNER_HARPOON {
+            vim.clear_interceptor()
+        }
+    }
+}
+
+fn jump_to_harpoon_slot(
+    kernel: SystemKernel,
+    slot_idx: i64,
+) -> #[log_event, status_emit] !String Unit {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let state = require_harpoon_state(kernel)!
+
+    if state.entries.is_empty() {
+        status_emit("Harpoon: mark list is empty")#
+        return ()
+    }
+    if slot_idx < 0 or slot_idx >= state.entries.len() {
+        status_emit("Harpoon: no mark at slot " ++ (slot_idx + 1).to_string())#
+        return ()
+    }
+
+    let entry = state.entries.get(slot_idx.as(usize)).as(HarpoonEntry)
+    let origin_buf = world.active_buffer()
+    world.jumps.record(origin_buf.id, origin_buf.file_path, origin_buf.point)
+    vim.last_jump_origin = origin_buf.point
+
+    var target_buf_opt: ?Buffer = null
+    var was_already_open = false
+
+    if entry.file_path != "" {
+        let existing_by_path = world.find_buffer_by_path(entry.file_path)
+        if existing_by_path != null {
+            let b = existing_by_path.as(Buffer)
+            let _ = world.switch_to_buffer(b.id)
+            target_buf_opt = b
+            was_already_open = true
+        } else {
+            let opened = world.open_file(entry.file_path)#!
+            target_buf_opt = opened
+            was_already_open = false
+        }
+    } else {
+        let existing_by_name = world.find_buffer_by_name(entry.buf_name)
+        if existing_by_name != null {
+            let b = existing_by_name.as(Buffer)
+            let _ = world.switch_to_buffer(b.id)
+            target_buf_opt = b
+            was_already_open = true
+        }
+    }
+
+    let target_buf? = target_buf_opt else {
+        status_emit("Harpoon: buffer no longer exists: " ++ entry.buf_name)#
+        return ()
+    }
+
+    if not was_already_open {
+        target_buf.point = target_buf.clamp_pos(Pos.new(entry.row, entry.col), insert_mode = false)
+        target_buf.preferred_col = target_buf.point.col
+    } else {
+        target_buf.point = target_buf.clamp_pos(target_buf.point, insert_mode = false)
+    }
+
+    state.active_idx = slot_idx
+    state.selected_row = slot_idx
+    if vim.mode != VimMode.Normal {
+        vim.mode = VimMode.Normal
+    }
+    vim.clear_transient()
+    sync_world_from_vim(world, vim)
+    kernel.emit_hook("buffer-switched", target_buf.id)
+
+    let msg = "Harpoon [" ++ (slot_idx + 1).to_string() ++ "]: " ++ target_buf.name
+    world.status_message = msg
+    status_emit(msg)#
+    ()
+}
+
+fn harpoon_menu_interceptor(
+    kernel: SystemKernel,
+    stroke: KeyStroke,
+) -> #ServiceEffects !String bool {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let state = require_harpoon_state(kernel)!
+
+    if not state.menu_open {
+        vim.clear_interceptor()
+        return false
+    }
+
+    let k = stroke.key
+    let plain = (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod)
+    let ctrl_only = stroke.ctrl and (not stroke.alt) and (not stroke.super_mod)
+
+    if k == "Escape" or (plain and k == "q") or (ctrl_only and (k == "[" or k == "c" or k == "g")) {
+        close_harpoon_menu(world, vim, state)
+        status_emit("Harpoon menu closed")#
+        return true
+    }
+
+    let total = state.entries.len()
+    if total == 0 {
+        return true
+    }
+
+    if (plain and (k == "j" or k == "Down")) or (ctrl_only and k == "n") {
+        state.selected_row = (state.selected_row + 1) % total
+        refresh_harpoon_floating_window(world, state)
+        return true
+    }
+
+    if (plain and (k == "k" or k == "Up")) or (ctrl_only and k == "p") {
+        state.selected_row = (state.selected_row - 1 + total) % total
+        refresh_harpoon_floating_window(world, state)
+        return true
+    }
+
+    if plain and k == "J" {
+        let sel = state.selected_row
+        if sel >= 0 and sel + 1 < total {
+            let cur_item = state.entries.get(sel.as(usize)).as(HarpoonEntry)
+            let nxt_item = state.entries.get((sel + 1).as(usize)).as(HarpoonEntry)
+            state.entries.set(sel.as(usize), nxt_item)
+            state.entries.set((sel + 1).as(usize), cur_item)
+            state.selected_row = sel + 1
+            state.active_idx = state.selected_row
+            refresh_harpoon_floating_window(world, state)
+            status_emit("Harpoon: moved mark to slot " ++ (state.selected_row + 1).to_string())#
+        }
+        return true
+    }
+
+    if plain and k == "K" {
+        let sel = state.selected_row
+        if sel > 0 and sel < total {
+            let cur_item = state.entries.get(sel.as(usize)).as(HarpoonEntry)
+            let prv_item = state.entries.get((sel - 1).as(usize)).as(HarpoonEntry)
+            state.entries.set(sel.as(usize), prv_item)
+            state.entries.set((sel - 1).as(usize), cur_item)
+            state.selected_row = sel - 1
+            state.active_idx = state.selected_row
+            refresh_harpoon_floating_window(world, state)
+            status_emit("Harpoon: moved mark to slot " ++ (state.selected_row + 1).to_string())#
+        }
+        return true
+    }
+
+    if plain and (k == "d" or k == "x") {
+        let sel = state.selected_row
+        if sel >= 0 and sel < total {
+            let removed = state.entries.remove(sel.as(usize)).as(HarpoonEntry)
+            state.clamp_selection()
+            refresh_harpoon_floating_window(world, state)
+            status_emit("Harpoon: removed " ++ removed.buf_name)#
+        }
+        return true
+    }
+
+    if k == "Return" or (ctrl_only and k == "m") {
+        let target_idx = state.selected_row
+        close_harpoon_menu(world, vim, state)
+        jump_to_harpoon_slot(kernel, target_idx)#!
+        return true
+    }
+
+    if plain and k.char_len() == 1 and k.is_ascii_digit() {
+        let d_opt = k.parse_i64()
+        if d_opt != null {
+            let d = d_opt.as(i64)
+            if d >= 1 and d <= 9 {
+                close_harpoon_menu(world, vim, state)
+                jump_to_harpoon_slot(kernel, d - 1)#!
+                return true
+            }
+        }
+    }
+
+    true
+}
+
+-- ============================================================================
+-- Command Handlers & Extension Registration
+-- ============================================================================
+
+fn cmd_harpoon_add(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_harpoon_state(kernel)!
+    let buf = world.active_buffer()
+    let norm_fp = if buf.file_path != "" { world.resolve_path(buf.file_path) } else { "" }
+
+    let existing_idx = state.find_index_for_buffer(world, buf)
+    let entry = HarpoonEntry {
+        file_path: norm_fp,
+        buf_name: buf.name,
+        row: buf.point.row,
+        col: buf.point.col,
+    }
+    var slot_num: i64 = 1
+    if existing_idx >= 0 {
+        state.entries.set(existing_idx.as(usize), entry)
+        state.active_idx = existing_idx
+        state.selected_row = existing_idx
+        slot_num = existing_idx + 1
+    } else {
+        state.entries.push(entry)
+        state.active_idx = state.entries.len() - 1
+        state.selected_row = state.active_idx
+        slot_num = state.entries.len()
+    }
+
+    if state.menu_open {
+        refresh_harpoon_floating_window(world, state)
+    }
+
+    let msg = "Harpoon: marked [" ++ slot_num.to_string() ++ "] " ++ buf.name
+    let _ = world.push_notification("info", "Harpoon", msg)
+    world.status_message = msg
+    log_event("info", OWNER_HARPOON, msg)#
+    status_emit(msg)#
+    ()
+}
+
+fn cmd_harpoon_menu(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let state = require_harpoon_state(kernel)!
+
+    if state.menu_open {
+        close_harpoon_menu(world, vim, state)
+        status_emit("Harpoon menu closed")#
+        return ()
+    }
+
+    let cur_idx = state.find_index_for_buffer(world, world.active_buffer())
+    if cur_idx >= 0 {
+        state.selected_row = cur_idx
+    }
+    state.clamp_selection()
+    state.menu_open = true
+    refresh_harpoon_floating_window(world, state)
+    vim.set_interceptor(OWNER_HARPOON, harpoon_menu_interceptor)
+    status_emit("Harpoon menu (" ++ state.entries.len().to_string() ++ " marks)")#
+    ()
+}
+
+fn cmd_harpoon_cycle(kernel: SystemKernel, delta: i64) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_harpoon_state(kernel)!
+    let n = state.entries.len()
+    if n == 0 {
+        status_emit("Harpoon: mark list is empty")#
+        return ()
+    }
+    let cur_in_list = state.find_index_for_buffer(world, world.active_buffer())
+    let base_idx = if cur_in_list >= 0 { cur_in_list } else { state.active_idx }
+    var next_idx = (base_idx + delta) % n
+    if next_idx < 0 {
+        next_idx += n
+    }
+    jump_to_harpoon_slot(kernel, next_idx)#!
+    ()
+}
+
+fn cmd_harpoon_save(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    var target = if not args.is_empty() { args.get(0).as(String).trim() } else { "" }
+    if target == "" {
+        let default_p = path.join(world.cwd, ".lava_harpoon.json")
+        let ans? = ask_prompt(PromptRequest {
+            label: "Save Harpoon marks to: ",
+            initial: default_p,
+            kind: PromptKind.FilePath,
+            candidates: List(),
+        })# else {
+            status_emit("Cancelled")#
+            return ()
+        }
+        target = ans.trim()
+    }
+    harpoon_save(kernel, target)!
+    let state = require_harpoon_state(kernel)!
+    let msg = "Harpoon: saved " ++ state.entries.len().to_string() ++ " marks to " ++ target
+    world.status_message = msg
+    status_emit(msg)#
+    ()
+}
+
+fn cmd_harpoon_load(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    var target = if not args.is_empty() { args.get(0).as(String).trim() } else { "" }
+    if target == "" {
+        let default_p = path.join(world.cwd, ".lava_harpoon.json")
+        let ans? = ask_prompt(PromptRequest {
+            label: "Load Harpoon marks from: ",
+            initial: default_p,
+            kind: PromptKind.FilePath,
+            candidates: List(),
+        })# else {
+            status_emit("Cancelled")#
+            return ()
+        }
+        target = ans.trim()
+    }
+    let count = harpoon_load(kernel, target)!
+    let msg = "Harpoon: loaded " ++ count.to_string() ++ " marks from " ++ target
+    world.status_message = msg
+    status_emit(msg)#
+    ()
+}
+
+pub fn register_harpoon_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_harpoon_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_harpoon",
+        "0.1.0",
+        "Rapid project file & cursor mark list (`<Space>ha`, `<Space>hm`, `<Space>1..4`, JSON persistence).",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let state = HarpoonState.new()
+            k.publish_service(SERVICE_HARPOON, ext_id, state)
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> h a", "harpoon-add", ext_id, description = "Harpoon add/mark buffer")
+            leader_km.bind("<Space> h m", "harpoon-menu", ext_id, description = "Harpoon toggle quick menu")
+            leader_km.bind("<Space> h n", "harpoon-next", ext_id, description = "Harpoon next mark")
+            leader_km.bind("<Space> h p", "harpoon-prev", ext_id, description = "Harpoon previous mark")
+            leader_km.bind("<Space> 1", "harpoon-nav-1", ext_id, description = "Harpoon jump to mark 1")
+            leader_km.bind("<Space> 2", "harpoon-nav-2", ext_id, description = "Harpoon jump to mark 2")
+            leader_km.bind("<Space> 3", "harpoon-nav-3", ext_id, description = "Harpoon jump to mark 3")
+            leader_km.bind("<Space> 4", "harpoon-nav-4", ext_id, description = "Harpoon jump to mark 4")
+
+            k.register_command("harpoon-add", ext_id, "Mark active buffer & cursor in Harpoon list.", cmd_harpoon_add)
+            k.register_command("ex:HarpoonAdd", ext_id, "Ex `:HarpoonAdd`.", cmd_harpoon_add, interactive = false)
+
+            k.register_command("harpoon-menu", ext_id, "Toggle interactive Harpoon floating menu.", cmd_harpoon_menu)
+            k.register_command("harpoon", ext_id, "Toggle interactive Harpoon floating menu.", cmd_harpoon_menu)
+            k.register_command("ex:Harpoon", ext_id, "Ex `:Harpoon`.", cmd_harpoon_menu, interactive = false)
+            k.register_command("ex:HarpoonMenu", ext_id, "Ex `:HarpoonMenu`.", cmd_harpoon_menu, interactive = false)
+
+            k.register_command(
+                "harpoon-nav-1",
+                ext_id,
+                "Switch to Harpoon mark slot 1.",
+                |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any {
+                    jump_to_harpoon_slot(kern, 0)#!
+                    ()
+                },
+            )
+            k.register_command(
+                "harpoon-nav-2",
+                ext_id,
+                "Switch to Harpoon mark slot 2.",
+                |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any {
+                    jump_to_harpoon_slot(kern, 1)#!
+                    ()
+                },
+            )
+            k.register_command(
+                "harpoon-nav-3",
+                ext_id,
+                "Switch to Harpoon mark slot 3.",
+                |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any {
+                    jump_to_harpoon_slot(kern, 2)#!
+                    ()
+                },
+            )
+            k.register_command(
+                "harpoon-nav-4",
+                ext_id,
+                "Switch to Harpoon mark slot 4.",
+                |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any {
+                    jump_to_harpoon_slot(kern, 3)#!
+                    ()
+                },
+            )
+
+            k.register_command(
+                "harpoon-next",
+                ext_id,
+                "Cycle forward to next Harpoon mark.",
+                |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any {
+                    cmd_harpoon_cycle(kern, 1)#
+                },
+            )
+            k.register_command(
+                "ex:HarpoonNext",
+                ext_id,
+                "Ex `:HarpoonNext`.",
+                |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any {
+                    cmd_harpoon_cycle(kern, 1)#
+                },
+                interactive = false,
+            )
+
+            k.register_command(
+                "harpoon-prev",
+                ext_id,
+                "Cycle backward to previous Harpoon mark.",
+                |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any {
+                    cmd_harpoon_cycle(kern, -1)#
+                },
+            )
+            k.register_command(
+                "ex:HarpoonPrev",
+                ext_id,
+                "Ex `:HarpoonPrev`.",
+                |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any {
+                    cmd_harpoon_cycle(kern, -1)#
+                },
+                interactive = false,
+            )
+
+            k.register_command(
+                "harpoon-clear",
+                ext_id,
+                "Clear all Harpoon marks.",
+                |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let st = require_harpoon_state(kern)!
+                    st.entries = List()
+                    st.active_idx = 0
+                    st.selected_row = 0
+                    if st.menu_open {
+                        refresh_harpoon_floating_window(w, st)
+                    }
+                    status_emit("Harpoon: cleared all marks")#
+                    ()
+                },
+            )
+            k.register_command(
+                "ex:HarpoonClear",
+                ext_id,
+                "Ex `:HarpoonClear`.",
+                |kern: SystemKernel, a: List| -> #InteractiveEffects !String Any {
+                    let _ = kern.dispatch_command("harpoon-clear", a)#!
+                    ()
+                },
+                interactive = false,
+            )
+
+            k.register_command("harpoon-save", ext_id, "Save Harpoon marks to JSON file.", cmd_harpoon_save)
+            k.register_command("ex:HarpoonSave", ext_id, "Ex `:HarpoonSave`.", cmd_harpoon_save, interactive = false)
+
+            k.register_command("harpoon-load", ext_id, "Load Harpoon marks from JSON file.", cmd_harpoon_load)
+            k.register_command("ex:HarpoonLoad", ext_id, "Ex `:HarpoonLoad`.", cmd_harpoon_load, interactive = false)
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            let v_opt = k.service("lava.vim.state")
+            if w_opt != null {
+                w_opt.as(EditorWorld).clear_owner_ui(OWNER_HARPOON)
+            }
+            if v_opt != null {
+                let vs = v_opt.as(VimState)
+                if vs.modal_interceptor != null {
+                    if vs.modal_interceptor.as(ModalInterceptor).owner == OWNER_HARPOON {
+                        vs.clear_interceptor()
+                    }
+                }
+            }
+            ()
+        },
+    )
+}

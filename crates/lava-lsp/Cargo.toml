@@ -1,0 +1,6 @@
+[package]
+name = "lava-lsp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

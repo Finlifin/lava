@@ -1,0 +1,684 @@
+-- ext_aerial: Live Symbol Outline Sidebar & Winbar Breadcrumbs (`aerial.nvim` / `nvim-navic`).
+-- Publishes service `"lava.aerial.outline"` (`AerialService`), computes live hierarchical
+-- breadcrumbs in `world.winbar_text`, renders an interactive right-hand `OUTLINE` sidebar,
+-- and provides symbol navigation (`aerial-toggle`, `aerial-next-symbol`, `aerial-prev-symbol`, `aerial-jump`).
+
+use std.collections.HashMap
+use std.path
+use @lava_core.{
+    ExtId, InteractiveEffects, KeyBindingEntry, Keymap, PromptKind, PromptRequest, SystemKernel,
+    ask_prompt, status_emit
+}
+use @lava_accel.{SymbolItem, SymbolOutlineSpan, accel_doc_scan_symbol_spans}
+use @ext_document.{
+    Buffer, BufferId, BufferKind, EditorWorld, Pos, ext_document_id, require_editor_world
+}
+use @ext_vim.{
+    KEYMAP_VIM_LEADER, KEYMAP_VIM_NORMAL, VimMode, VimState, ext_vim_id, sync_world_from_vim
+}
+
+pub const SERVICE_AERIAL: String = "lava.aerial.outline"
+pub const OWNER_AERIAL: String = "ext_aerial"
+pub const AERIAL_SIDEBAR_TITLE: String = "OUTLINE"
+pub const AERIAL_SIDEBAR_WIDTH: i64 = 32
+
+pub fn ext_aerial_id() -> ExtId = ExtId("lava.org/ext_aerial")
+
+-- ============================================================================
+-- 1. Data Model & AerialService
+-- ============================================================================
+
+pub struct ScannedSymbolSpan {
+    pub item: SymbolItem,
+    pub end_row: i64,
+}
+
+struct CachedSymbolOutline {
+    major_mode: String,
+    edit_version: i64,
+    symbols: List,
+    spans: List,
+}
+
+pub struct AerialService {
+    pub active_buf_id: BufferId,
+    pub active_symbols: List,
+    pub active_spans: List,
+    pub sidebar_symbols: List,
+    cache_by_buf: HashMap,
+    last_ctx_buf_id: BufferId,
+    last_ctx_ver: i64,
+    last_ctx_row: i64,
+    last_sidebar_buf_id: BufferId,
+    last_sidebar_ver: i64,
+}
+
+impl AerialService {
+    pub fn new() -> AerialService {
+        AerialService {
+            active_buf_id: BufferId(0),
+            active_symbols: List(),
+            active_spans: List(),
+            sidebar_symbols: List(),
+            cache_by_buf: HashMap.new(),
+            last_ctx_buf_id: BufferId(0),
+            last_ctx_ver: -1,
+            last_ctx_row: -1,
+            last_sidebar_buf_id: BufferId(0),
+            last_sidebar_ver: -1,
+        }
+    }
+
+    pub fn symbols_for_active(self) -> List = self.active_symbols
+}
+
+pub fn require_aerial_service(kernel: SystemKernel) -> !String AerialService {
+    let svc? = kernel.service(SERVICE_AERIAL) else {
+        return error ("required service '" ++ SERVICE_AERIAL ++ "' is not published")
+    }
+    svc.as(AerialService)
+}
+
+-- ============================================================================
+-- 2. Native Symbol Span Scanner & Formatting Helpers
+-- ============================================================================
+
+pub fn kind_icon(kind: String) -> String {
+    when {
+        kind == "Struct" => "[S]",
+        kind == "Function" => "[F]",
+        kind == "Enum" => "[E]",
+        kind == "Impl" => "[I]",
+        kind == "Interface" => "[I]",
+        kind == "Heading" => "[H]",
+        kind == "Class" => "[C]",
+        kind == "Trait" => "[T]",
+        kind == "Module" => "[M]",
+        kind == "Constant" => "[K]",
+        kind == "Variable" => "[V]",
+        else => "[*]",
+    }
+}
+
+fn format_breadcrumb_segment(sym: SymbolItem) -> String {
+    when {
+        sym.kind == "Function" => "fn " ++ sym.name,
+        sym.kind == "Constant" => "const " ++ sym.name,
+        else => sym.name,
+    }
+}
+
+fn display_buffer_title(buf: Buffer) -> String {
+    if buf.name != "" {
+        return buf.name
+    }
+    if buf.file_path != "" {
+        let base_opt = path.file_name(buf.file_path)
+        if base_opt != null {
+            return base_opt.as(String)
+        }
+        return buf.file_path
+    }
+    "[No Name]"
+}
+
+fn is_outline_candidate_buffer(buf: Buffer) -> bool {
+    if buf.kind == BufferKind.Directory {
+        return false
+    }
+    if buf.kind == BufferKind.Special {
+        return false
+    }
+    true
+}
+
+fn ensure_scanned(service: AerialService, buf: Buffer, force: bool) -> (List, List) {
+    buf.sync_external_lines()
+    if (not force) and service.cache_by_buf.contains_key(buf.id) {
+        let cached = service.cache_by_buf.get(buf.id).as(CachedSymbolOutline)
+        if cached.major_mode == buf.major_mode and cached.edit_version == buf.edit_version {
+            service.active_buf_id = buf.id
+            service.active_symbols = cached.symbols
+            service.active_spans = cached.spans
+            return (cached.symbols, cached.spans)
+        }
+    }
+    let raw_spans = accel_doc_scan_symbol_spans(buf.doc_id, buf.major_mode, 4000)
+    let symbols = List()
+    let spans = List()
+    for i in 0..raw_spans.len() {
+        let sp = raw_spans.get(i.as(usize)).as(SymbolOutlineSpan)
+        let sym = SymbolItem {
+            name: sp.name,
+            kind: sp.kind,
+            row: sp.row,
+            col: sp.col,
+            level: sp.level,
+        }
+        symbols.push(sym)
+        spans.push(ScannedSymbolSpan { item: sym, end_row: sp.end_row })
+    }
+    service.cache_by_buf.insert(
+        buf.id,
+        CachedSymbolOutline {
+            major_mode: buf.major_mode,
+            edit_version: buf.edit_version,
+            symbols: symbols,
+            spans: spans,
+        },
+    )
+    service.active_buf_id = buf.id
+    service.active_symbols = symbols
+    service.active_spans = spans
+    (symbols, spans)
+}
+
+-- Compute enclosing symbol chain at `cursor_row` plus nearest/selected symbol index in `symbols`
+-- using O(log N) binary search (`upper_bound` for `sp.item.row <= cursor_row`) + bounded ancestor window.
+fn resolve_aerial_context(spans: List, cursor_row: i64) -> (List, i64) {
+    let chain_indices = List()
+    let n = spans.len()
+    if n == 0 {
+        return (chain_indices, 0)
+    }
+
+    -- Binary search `ub`: first index with `sp.item.row > cursor_row` (in `[0..=n]`).
+    var lo: i64 = 0
+    var hi: i64 = n
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        let mid_sp = spans.get(mid.as(usize)).as(ScannedSymbolSpan)
+        if mid_sp.item.row <= cursor_row {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    let ub = lo
+    let nearest_idx = ub - 1
+
+    -- Inspect at most 128 preceding symbols (covering arbitrarily nested classes/modules/functions)
+    -- plus index 0 if the file is wrapped in a single top-level module/class/impl block.
+    let win_start = if ub > 128 { ub - 128 } else { 0 }
+    if win_start > 0 {
+        let sp0 = spans.get(0).as(ScannedSymbolSpan)
+        if sp0.item.row <= cursor_row and cursor_row <= sp0.end_row {
+            chain_indices.push(0)
+        }
+    }
+    for i in win_start..ub {
+        let sp = spans.get(i.as(usize)).as(ScannedSymbolSpan)
+        let sym = sp.item
+        if cursor_row <= sp.end_row {
+            while not chain_indices.is_empty() {
+                let top_idx = chain_indices.get((chain_indices.len() - 1).as(usize)).as(i64)
+                let top_sp = spans.get(top_idx.as(usize)).as(ScannedSymbolSpan)
+                if top_sp.item.level >= sym.level {
+                    let _ = chain_indices.pop()
+                } else {
+                    break
+                }
+            }
+            chain_indices.push(i)
+        }
+    }
+
+    let selected_idx = if not chain_indices.is_empty() {
+        chain_indices.get((chain_indices.len() - 1).as(usize)).as(i64)
+    } else if nearest_idx >= 0 {
+        nearest_idx
+    } else {
+        0
+    }
+    (chain_indices, selected_idx)
+}
+
+-- ============================================================================
+-- 3. Live Breadcrumbs & Right-Sidebar Outline Synchronization
+-- ============================================================================
+
+pub fn update_aerial(world: EditorWorld, service: AerialService, .force: bool = false) {
+    let buf = world.active_buffer()
+    if not is_outline_candidate_buffer(buf) {
+        if world.winbar_text == "" {
+            world.winbar_text = display_buffer_title(buf)
+        }
+        return
+    }
+
+    let sidebar_owned = world.right_sidebar.visible and world.right_sidebar.owner == OWNER_AERIAL
+    let sidebar_fresh = (not sidebar_owned)
+        or (service.last_sidebar_buf_id == buf.id and service.last_sidebar_ver == buf.edit_version)
+    if (not force) and service.last_ctx_buf_id == buf.id and service.last_ctx_ver == buf.edit_version and service.last_ctx_row == buf.point.row and world.winbar_text != "" and sidebar_fresh {
+        return
+    }
+
+    let (symbols, spans) = ensure_scanned(service, buf, force)
+    let (chain_indices, selected_idx) = resolve_aerial_context(spans, buf.point.row)
+    service.last_ctx_buf_id = buf.id
+    service.last_ctx_ver = buf.edit_version
+    service.last_ctx_row = buf.point.row
+
+    -- 1. Build hierarchical `world.winbar_text` (`"calc.ns > Calculator > fn compute"`)
+    var crumb = display_buffer_title(buf)
+    for i in 0..chain_indices.len() {
+        let idx = chain_indices.get(i.as(usize)).as(i64)
+        let sym = spans.get(idx.as(usize)).as(ScannedSymbolSpan).item
+        crumb = crumb ++ " > " ++ format_breadcrumb_segment(sym)
+    }
+    world.winbar_text = crumb
+
+    -- 2. If `ext_aerial` owns the visible right sidebar, synchronize outline rows & selection
+    if sidebar_owned {
+        if (not force) and service.last_sidebar_buf_id == buf.id and service.last_sidebar_ver == buf.edit_version and (not world.right_sidebar.lines.is_empty()) {
+            world.right_sidebar.selected_row = selected_idx
+            return
+        }
+        let out_lines = List()
+        service.sidebar_symbols = List()
+        if symbols.is_empty() {
+            out_lines.push("  (No symbols)")
+            world.right_sidebar.lines = out_lines
+            world.right_sidebar.selected_row = 0
+        } else {
+            for i in 0..symbols.len() {
+                let sym = symbols.get(i.as(usize)).as(SymbolItem)
+                let indent_lvl = if sym.level > 1 { sym.level - 1 } else { 0 }
+                let indent_pad = "  ".repeat(indent_lvl)
+                out_lines.push(indent_pad ++ kind_icon(sym.kind) ++ " " ++ sym.name)
+                service.sidebar_symbols.push(sym)
+            }
+            world.right_sidebar.lines = out_lines
+            world.right_sidebar.selected_row = selected_idx
+        }
+        service.last_sidebar_buf_id = buf.id
+        service.last_sidebar_ver = buf.edit_version
+    }
+}
+
+-- ============================================================================
+-- 4. Navigation Actions (`aerial-toggle`, `sidebar-clicked`, `next/prev`, `aerial-jump`)
+-- ============================================================================
+
+fn move_cursor_to_symbol_pure(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    service: AerialService,
+    buf: Buffer,
+    sym: SymbolItem,
+) {
+    buf.point = buf.clamp_pos(Pos.new(sym.row, sym.col), insert_mode = false)
+    buf.preferred_col = buf.point.col
+    buf.named_marks.insert(".", buf.point)
+    let v_opt = kernel.service("lava.vim.state")
+    if v_opt != null {
+        let vim = v_opt.as(VimState)
+        if vim.mode != VimMode.Normal {
+            vim.mode = VimMode.Normal
+            vim.clear_transient()
+        }
+        sync_world_from_vim(world, vim)
+    }
+    update_aerial(world, service, force = false)
+    kernel.emit_hook("cursor-moved", buf.id)
+    world.status_message = kind_icon(sym.kind) ++ " " ++ sym.name ++ " (line " ++ (sym.row + 1).to_string() ++ ")"
+}
+
+fn move_cursor_to_symbol(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    service: AerialService,
+    buf: Buffer,
+    sym: SymbolItem,
+) -> #InteractiveEffects !String Unit {
+    move_cursor_to_symbol_pure(kernel, world, service, buf, sym)
+    status_emit(kind_icon(sym.kind) ++ " " ++ sym.name ++ " (line " ++ (sym.row + 1).to_string() ++ ")")#
+    ()
+}
+
+fn jump_adjacent_symbol(kernel: SystemKernel, forward: bool) -> #InteractiveEffects !String Unit {
+    let world = require_editor_world(kernel)!
+    let service = require_aerial_service(kernel)!
+    let buf = world.active_buffer()
+    if not is_outline_candidate_buffer(buf) {
+        status_emit("No symbol outline in special buffer")#
+        return ()
+    }
+    let (symbols, _) = ensure_scanned(service, buf, false)
+    let n = symbols.len()
+    if n == 0 {
+        status_emit("No symbols in buffer")#
+        return ()
+    }
+
+    let cur_row = buf.point.row
+    var chosen_idx: i64 = -1
+    if forward {
+        for i in 0..n {
+            let sym = symbols.get(i.as(usize)).as(SymbolItem)
+            if sym.row > cur_row {
+                chosen_idx = i
+                break
+            }
+        }
+        if chosen_idx < 0 {
+            chosen_idx = 0
+        }
+    } else {
+        var i = n - 1
+        while i >= 0 {
+            let sym = symbols.get(i.as(usize)).as(SymbolItem)
+            if sym.row < cur_row {
+                chosen_idx = i
+                break
+            }
+            i -= 1
+        }
+        if chosen_idx < 0 {
+            chosen_idx = n - 1
+        }
+    }
+
+    let target = symbols.get(chosen_idx.as(usize)).as(SymbolItem)
+    move_cursor_to_symbol(kernel, world, service, buf, target)#!
+    ()
+}
+
+fn format_jump_candidate(sym: SymbolItem) -> String {
+    kind_icon(sym.kind) ++ " " ++ sym.name ++ " :" ++ (sym.row + 1).to_string()
+}
+
+fn match_symbol_choice(symbols: List, answer_raw: String) -> ?SymbolItem {
+    let ans = answer_raw.trim()
+    if ans == "" {
+        return null
+    }
+    -- 1. Exact candidate string match
+    for i in 0..symbols.len() {
+        let sym = symbols.get(i.as(usize)).as(SymbolItem)
+        if format_jump_candidate(sym) == ans {
+            return sym
+        }
+    }
+    -- 2. Exact symbol name match
+    for i in 0..symbols.len() {
+        let sym = symbols.get(i.as(usize)).as(SymbolItem)
+        if sym.name == ans {
+            return sym
+        }
+    }
+    -- 3. Case-insensitive symbol name or substring match
+    let lower_ans = ans.to_lower()
+    for i in 0..symbols.len() {
+        let sym = symbols.get(i.as(usize)).as(SymbolItem)
+        if sym.name.to_lower() == lower_ans {
+            return sym
+        }
+    }
+    for i in 0..symbols.len() {
+        let sym = symbols.get(i.as(usize)).as(SymbolItem)
+        if sym.name.to_lower().contains(lower_ans) or format_jump_candidate(sym).to_lower().contains(lower_ans) {
+            return sym
+        }
+    }
+    null
+}
+
+-- ============================================================================
+-- 5. Hook Handlers & Extension Registration
+-- ============================================================================
+
+fn on_aerial_force_hook(k: SystemKernel, _payload: Any) {
+    let w_opt = k.service("lava.document.world")
+    let s_opt = k.service(SERVICE_AERIAL)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    update_aerial(w_opt.as(EditorWorld), s_opt.as(AerialService), force = true)
+}
+
+fn on_aerial_cursor_hook(k: SystemKernel, _payload: Any) {
+    let w_opt = k.service("lava.document.world")
+    let s_opt = k.service(SERVICE_AERIAL)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    update_aerial(w_opt.as(EditorWorld), s_opt.as(AerialService), force = false)
+}
+
+fn on_aerial_insert_hook(k: SystemKernel, _payload: Any) {
+    let w_opt = k.service("lava.document.world")
+    let s_opt = k.service(SERVICE_AERIAL)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    if world.active_buffer().line_count() > 2000 {
+        return
+    }
+    update_aerial(world, s_opt.as(AerialService), force = false)
+}
+
+fn on_aerial_sidebar_clicked(k: SystemKernel, payload: Any) {
+    let (owner, row_idx) = payload.as((String, i64))
+    if owner != OWNER_AERIAL {
+        return
+    }
+    let w_opt = k.service("lava.document.world")
+    let s_opt = k.service(SERVICE_AERIAL)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let service = s_opt.as(AerialService)
+    if not (world.right_sidebar.visible and world.right_sidebar.owner == OWNER_AERIAL) {
+        return
+    }
+    if row_idx < 0 or row_idx >= service.sidebar_symbols.len() {
+        return
+    }
+    let buf = world.active_buffer()
+    let sym = service.sidebar_symbols.get(row_idx.as(usize)).as(SymbolItem)
+    move_cursor_to_symbol_pure(k, world, service, buf, sym)
+}
+
+fn unbind_owner_from_keymaps(kernel: SystemKernel, owner: ExtId) {
+    for km_key in kernel.keymaps.keys() {
+        let km_name = km_key.as(String)
+        let km = kernel.keymaps.get(km_name).as(Keymap)
+        for chord_key in km.bindings.keys() {
+            let chord = chord_key.as(String)
+            let entry = km.bindings.get(chord).as(KeyBindingEntry)
+            if entry.owner == owner {
+                let _ = km.bindings.remove(chord)
+            }
+        }
+    }
+}
+
+pub fn register_aerial_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_aerial_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_aerial",
+        "0.1.0",
+        "Symbol outline right-sidebar and live hierarchical winbar breadcrumbs (`aerial.nvim` / `nvim-navic`).",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let service = AerialService.new()
+            k.publish_service(SERVICE_AERIAL, ext_id, service)
+
+            let norm_km = k.ensure_keymap(KEYMAP_VIM_NORMAL)
+            norm_km.bind("g ]", "aerial-next-symbol", ext_id, description = "Next symbol (Aerial)")
+            norm_km.bind("g [", "aerial-prev-symbol", ext_id, description = "Previous symbol (Aerial)")
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> c s", "aerial-toggle", ext_id, description = "Toggle Aerial symbol outline")
+            leader_km.bind("<Space> s ]", "aerial-next-symbol", ext_id, description = "Next symbol (Aerial)")
+            leader_km.bind("<Space> s [", "aerial-prev-symbol", ext_id, description = "Previous symbol (Aerial)")
+            leader_km.bind("<Space> c j", "aerial-jump", ext_id, description = "Jump to symbol (Aerial)")
+
+            let aerial_km = k.ensure_keymap("mode:aerial")
+            aerial_km.bind("<Return>", "aerial-jump", ext_id, description = "Jump to symbol")
+            aerial_km.bind("q", "aerial-toggle", ext_id, description = "Close Aerial outline")
+
+            k.register_command(
+                "aerial-toggle",
+                ext_id,
+                "Toggle right-hand Aerial symbol outline sidebar (`:AerialToggle`, `<Space> c s`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let svc = require_aerial_service(kern)!
+                    if world.right_sidebar.visible and world.right_sidebar.owner == OWNER_AERIAL {
+                        world.right_sidebar.visible = false
+                        world.right_sidebar.owner = ""
+                        world.right_sidebar.lines = List()
+                        status_emit("Aerial outline closed")#
+                    } else {
+                        world.right_sidebar.side = "right"
+                        world.right_sidebar.owner = OWNER_AERIAL
+                        world.right_sidebar.title = AERIAL_SIDEBAR_TITLE
+                        world.right_sidebar.width_cols = AERIAL_SIDEBAR_WIDTH
+                        world.right_sidebar.visible = true
+                        update_aerial(world, svc, force = false)
+                        status_emit(
+                            "Aerial outline (" ++ svc.active_symbols.len().to_string() ++ " symbols)"
+                        )#
+                    }
+                    ()
+                },
+            )
+
+            k.register_command(
+                "aerial",
+                ext_id,
+                "Control Aerial symbol outline (`:Aerial [toggle|open|close]`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let svc = require_aerial_service(kern)!
+                    let sub = if args.is_empty() {
+                        "toggle"
+                    } else {
+                        args.get(0).as(String).trim().to_lower()
+                    }
+                    if sub == "close" {
+                        if world.right_sidebar.owner == OWNER_AERIAL {
+                            world.right_sidebar.visible = false
+                            world.right_sidebar.owner = ""
+                            world.right_sidebar.lines = List()
+                        }
+                        status_emit("Aerial outline closed")#
+                        return ()
+                    }
+                    if sub == "open" or (not (world.right_sidebar.visible and world.right_sidebar.owner == OWNER_AERIAL)) {
+                        world.right_sidebar.side = "right"
+                        world.right_sidebar.owner = OWNER_AERIAL
+                        world.right_sidebar.title = AERIAL_SIDEBAR_TITLE
+                        world.right_sidebar.width_cols = AERIAL_SIDEBAR_WIDTH
+                        world.right_sidebar.visible = true
+                        update_aerial(world, svc, force = false)
+                        status_emit(
+                            "Aerial outline (" ++ svc.active_symbols.len().to_string() ++ " symbols)"
+                        )#
+                    } else {
+                        world.right_sidebar.visible = false
+                        world.right_sidebar.owner = ""
+                        world.right_sidebar.lines = List()
+                        status_emit("Aerial outline closed")#
+                    }
+                    ()
+                },
+            )
+
+            k.register_command(
+                "aerial-next-symbol",
+                ext_id,
+                "Jump cursor to next symbol in active buffer (`g ]`, `<Space> s ]`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    jump_adjacent_symbol(kern, true)#!
+                    ()
+                },
+            )
+
+            k.register_command(
+                "aerial-prev-symbol",
+                ext_id,
+                "Jump cursor to previous symbol in active buffer (`g [`, `<Space> s [`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    jump_adjacent_symbol(kern, false)#!
+                    ()
+                },
+            )
+
+            k.register_command(
+                "aerial-jump",
+                ext_id,
+                "Interactive prompt picker to jump to any symbol in active buffer (`:AerialJump`, `<Space> c j`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let svc = require_aerial_service(kern)!
+                    let buf = world.active_buffer()
+                    let (symbols, _) = ensure_scanned(svc, buf, false)
+                    if symbols.is_empty() {
+                        status_emit("No symbols in buffer")#
+                        return ()
+                    }
+                    var query = ""
+                    if not args.is_empty() {
+                        query = args.get(0).as(String)
+                    } else {
+                        let candidates = List()
+                        for i in 0..symbols.len() {
+                            let sym = symbols.get(i.as(usize)).as(SymbolItem)
+                            candidates.push(format_jump_candidate(sym))
+                        }
+                        let ans? = ask_prompt(
+                            PromptRequest.with_candidates(
+                                "Aerial symbol: ",
+                                "",
+                                PromptKind.Choice,
+                                candidates,
+                            ),
+                        )# else {
+                            status_emit("Aerial jump cancelled")#
+                            return ()
+                        }
+                        query = ans
+                    }
+                    let chosen? = match_symbol_choice(symbols, query) else {
+                        status_emit("Symbol not found: " ++ query)#
+                        return ()
+                    }
+                    move_cursor_to_symbol(kern, world, svc, buf, chosen)#!
+                    ()
+                },
+            )
+
+            k.add_hook("buffer-opened", ext_id, on_aerial_force_hook)
+            k.add_hook("buffer-switched", ext_id, on_aerial_cursor_hook)
+            k.add_hook("buffer-modified", ext_id, on_aerial_cursor_hook)
+            k.add_hook("buffer-saved", ext_id, on_aerial_cursor_hook)
+            k.add_hook("cursor-moved", ext_id, on_aerial_cursor_hook)
+            k.add_hook("mode-changed", ext_id, on_aerial_cursor_hook)
+            k.add_hook("after-insert-stroke", ext_id, on_aerial_insert_hook)
+            k.add_hook("sidebar-clicked", ext_id, on_aerial_sidebar_clicked)
+
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                update_aerial(w_opt.as(EditorWorld), service, force = true)
+            }
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                let w = w_opt.as(EditorWorld)
+                w.clear_owner_ui(OWNER_AERIAL)
+                w.winbar_text = ""
+            }
+            unbind_owner_from_keymaps(k, ext_id)
+            ()
+        },
+    )
+}

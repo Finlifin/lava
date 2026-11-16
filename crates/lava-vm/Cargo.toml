@@ -1,0 +1,19 @@
+[package]
+name = "lava-vm"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+driver.workspace = true
+gc.workspace = true
+initialization.workspace = true
+interpreter.workspace = true
+lava-accel.workspace = true
+lava-lsp.workspace = true
+lava-proto.workspace = true
+lava-remote.workspace = true
+lava-term.workspace = true
+nsbc.workspace = true
+nsbc_io.workspace = true
+pkg_manager.workspace = true
+runtime.workspace = true

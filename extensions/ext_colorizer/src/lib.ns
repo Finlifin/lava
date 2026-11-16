@@ -1,0 +1,830 @@
+-- ext_colorizer: Live True-Color Swatches & 6-Level Cyclic Rainbow Delimiters (`lava.org/ext_colorizer`).
+-- Inspired by `nvim-colorizer.lua` and `rainbow-delimiters.nvim`.
+-- Publishes service `"lava.colorizer.state"` (`ColorizerService`) with independent layers:
+--   - `"ext_colorizer"`: `#RRGGBB`, `#RGB`, `#RRGGBBAA`, `0xRRGGBB`, and `rgb(R, G, B)` swatches
+--                        with luminance-adaptive black/white foreground contrast.
+--   - `"ext_rainbow"`:   6-level cyclic balanced bracket coloring skipping strings & comments,
+--                        with bright red underlined error styling on unmatched closing brackets.
+
+use std.collections.HashMap
+use @lava_sys.rgb
+use @lava_core.{
+    ExtId, InteractiveEffects, KeyBindingEntry, Keymap, SystemKernel, status_emit
+}
+use @ext_document.{
+    Buffer, BufferId, BufferKind, EditorWorld, ext_document_id, require_editor_world
+}
+use @ext_vim.{KEYMAP_VIM_LEADER, ext_vim_id}
+
+pub const SERVICE_COLORIZER: String = "lava.colorizer.state"
+pub const OWNER_COLORIZER: String = "ext_colorizer"
+pub const OWNER_RAINBOW: String = "ext_rainbow"
+
+pub fn ext_colorizer_id() -> ExtId = ExtId("lava.org/ext_colorizer")
+
+-- ============================================================================
+-- 1. Service State & Palette Constants
+-- ============================================================================
+
+struct BufferDecorCache {
+    win_start: i64,
+    win_end: i64,
+    colors_enabled: bool,
+    rainbow_enabled: bool,
+    major_mode: String,
+    edit_version: i64,
+}
+
+pub struct ColorizerService {
+    pub colors_enabled: bool,
+    pub rainbow_enabled: bool,
+    pub cache_by_buf: HashMap,
+}
+
+impl ColorizerService {
+    pub fn new() -> ColorizerService {
+        ColorizerService {
+            colors_enabled: true,
+            rainbow_enabled: true,
+            cache_by_buf: HashMap.new(),
+        }
+    }
+
+    pub fn invalidate_all(self) {
+        self.cache_by_buf = HashMap.new()
+    }
+
+    pub fn invalidate_buffer(self, buf_id: BufferId) {
+        let _ = self.cache_by_buf.remove(buf_id)
+    }
+}
+
+pub fn require_colorizer_service(kernel: SystemKernel) -> !String ColorizerService {
+    let raw = kernel.require_service(SERVICE_COLORIZER)!
+    raw.as(ColorizerService)
+}
+
+pub fn rainbow_palette_color(depth: i64) -> i64 {
+    let level = ((depth % 6) + 6) % 6
+    when {
+        level == 0 => rgb(243, 139, 168),
+        level == 1 => rgb(250, 179, 135),
+        level == 2 => rgb(249, 226, 175),
+        level == 3 => rgb(166, 227, 161),
+        level == 4 => rgb(137, 180, 250),
+        else => rgb(203, 166, 247),
+    }
+}
+
+pub fn rainbow_unmatched_error_color() -> i64 = rgb(255, 68, 102)
+
+pub fn swatch_contrast_fg(r: i64, g: i64, b: i64) -> i64 {
+    let luminance = (299 * r + 587 * g + 114 * b) / 1000
+    if luminance >= 140 {
+        rgb(17, 17, 27)
+    } else {
+        rgb(245, 245, 255)
+    }
+}
+
+-- ============================================================================
+-- 2. Lexical Helpers & Feature A: True-Color Swatch Scanner
+-- ============================================================================
+
+fn is_ident_char(ch: String) -> bool {
+    if ch == "" {
+        return false
+    }
+    ch == "_" or ch.is_alphanumeric()
+}
+
+fn hex_digit_val(ch: String) -> i64 {
+    when {
+        ch == "0" => 0,
+        ch == "1" => 1,
+        ch == "2" => 2,
+        ch == "3" => 3,
+        ch == "4" => 4,
+        ch == "5" => 5,
+        ch == "6" => 6,
+        ch == "7" => 7,
+        ch == "8" => 8,
+        ch == "9" => 9,
+        ch == "a" or ch == "A" => 10,
+        ch == "b" or ch == "B" => 11,
+        ch == "c" or ch == "C" => 12,
+        ch == "d" or ch == "D" => 13,
+        ch == "e" or ch == "E" => 14,
+        ch == "f" or ch == "F" => 15,
+        else => -1,
+    }
+}
+
+fn is_all_hex(token: String) -> bool {
+    let n = token.char_len()
+    if n == 0 {
+        return false
+    }
+    for i in 0..n {
+        if hex_digit_val(token.slice(i, i + 1)) < 0 {
+            return false
+        }
+    }
+    true
+}
+
+fn parse_hex_byte(two_chars: String) -> i64 {
+    let hi = hex_digit_val(two_chars.slice(0, 1))
+    let lo = hex_digit_val(two_chars.slice(1, 2))
+    hi * 16 + lo
+}
+
+fn skip_spaces_in_line(line: String, start: i64, llen: i64) -> i64 {
+    var i = start
+    while i < llen {
+        let ch = line.slice(i, i + 1)
+        if ch == " " or ch == "\t" {
+            i += 1
+        } else {
+            break
+        }
+    }
+    i
+}
+
+fn parse_rgb_component(line: String, start: i64, llen: i64) -> ?(i64, i64) {
+    let i0 = skip_spaces_in_line(line, start, llen)
+    var i = i0
+    var val: i64 = 0
+    var digits: i64 = 0
+    while i < llen and digits < 4 {
+        let ch = line.slice(i, i + 1)
+        let d = hex_digit_val(ch)
+        if d >= 0 and d <= 9 {
+            val = val * 10 + d
+            digits += 1
+            i += 1
+        } else {
+            break
+        }
+    }
+    if digits == 0 or digits > 3 or val < 0 or val > 255 {
+        return null
+    }
+    -- Reject trailing identifier characters like `10px` or `100_000`
+    if i < llen and is_ident_char(line.slice(i, i + 1)) {
+        return null
+    }
+    let next_i = skip_spaces_in_line(line, i, llen)
+    (val, next_i)
+}
+
+-- Try to parse `rgb(R, G, B)` at `col`, returning `?(end_col, r, g, b)`.
+fn try_parse_rgb_call(line: String, col: i64, llen: i64) -> ?(i64, i64, i64, i64) {
+    if col + 9 > llen {
+        return null
+    }
+    let head = line.slice(col, col + 4)
+    if head != "rgb(" and head != "RGB(" {
+        return null
+    }
+    let r_res? = parse_rgb_component(line, col + 4, llen) else {
+        return null
+    }
+    let (r, after_r) = r_res
+    if after_r >= llen or line.slice(after_r, after_r + 1) != "," {
+        return null
+    }
+    let g_res? = parse_rgb_component(line, after_r + 1, llen) else {
+        return null
+    }
+    let (g, after_g) = g_res
+    if after_g >= llen or line.slice(after_g, after_g + 1) != "," {
+        return null
+    }
+    let b_res? = parse_rgb_component(line, after_g + 1, llen) else {
+        return null
+    }
+    let (b, after_b) = b_res
+    if after_b >= llen or line.slice(after_b, after_b + 1) != ")" {
+        return null
+    }
+    (after_b + 1, r, g, b)
+}
+
+-- Try to parse `#RGB`, `#RRGGBB`, or `#RRGGBBAA` at `col`, returning `?(end_col, r, g, b)`.
+fn try_parse_hash_hex(line: String, col: i64, llen: i64) -> ?(i64, i64, i64, i64) {
+    if col + 4 > llen or line.slice(col, col + 1) != "#" {
+        return null
+    }
+    if col > 0 and is_ident_char(line.slice(col - 1, col)) {
+        return null
+    }
+    var end_col = col + 1
+    while end_col < llen and is_ident_char(line.slice(end_col, end_col + 1)) {
+        end_col += 1
+    }
+    let token = line.slice(col + 1, end_col)
+    let tlen = token.char_len()
+    if tlen != 3 and tlen != 6 and tlen != 8 {
+        return null
+    }
+    if not is_all_hex(token) {
+        return null
+    }
+    if tlen == 3 {
+        let r = hex_digit_val(token.slice(0, 1)) * 17
+        let g = hex_digit_val(token.slice(1, 2)) * 17
+        let b = hex_digit_val(token.slice(2, 3)) * 17
+        return (end_col, r, g, b)
+    }
+    let r = parse_hex_byte(token.slice(0, 2))
+    let g = parse_hex_byte(token.slice(2, 4))
+    let b = parse_hex_byte(token.slice(4, 6))
+    (end_col, r, g, b)
+}
+
+-- Try to parse `0xRRGGBB` / `0XRRGGBB` at `col`, returning `?(end_col, r, g, b)`.
+fn try_parse_zero_x_hex(line: String, col: i64, llen: i64) -> ?(i64, i64, i64, i64) {
+    if col + 8 > llen {
+        return null
+    }
+    let pfx = line.slice(col, col + 2)
+    if pfx != "0x" and pfx != "0X" {
+        return null
+    }
+    if col > 0 and is_ident_char(line.slice(col - 1, col)) {
+        return null
+    }
+    var end_col = col + 2
+    while end_col < llen and is_ident_char(line.slice(end_col, end_col + 1)) {
+        end_col += 1
+    }
+    let token = line.slice(col + 2, end_col)
+    if token.char_len() != 6 or (not is_all_hex(token)) {
+        return null
+    }
+    let r = parse_hex_byte(token.slice(0, 2))
+    let g = parse_hex_byte(token.slice(2, 4))
+    let b = parse_hex_byte(token.slice(4, 6))
+    (end_col, r, g, b)
+}
+
+fn decorate_line_color_swatches(buf: Buffer, row: i64, line: String) {
+    let llen = line.char_len()
+    var c: i64 = 0
+    while c < llen {
+        let ch = line.slice(c, c + 1)
+        if ch == "#" {
+            let hit_opt = try_parse_hash_hex(line, c, llen)
+            if hit_opt != null {
+                let (ec, r, g, b) = hit_opt.as((i64, i64, i64, i64))
+                buf.add_inline_decor(
+                    OWNER_COLORIZER,
+                    row,
+                    c,
+                    ec,
+                    bg_rgba = rgb(r, g, b),
+                    fg_rgba = swatch_contrast_fg(r, g, b),
+                    underline = false,
+                )
+                c = ec
+                continue
+            }
+            c += 1
+            continue
+        }
+        if ch == "0" and c + 8 <= llen {
+            let hit_opt = try_parse_zero_x_hex(line, c, llen)
+            if hit_opt != null {
+                let (ec, r, g, b) = hit_opt.as((i64, i64, i64, i64))
+                buf.add_inline_decor(
+                    OWNER_COLORIZER,
+                    row,
+                    c,
+                    ec,
+                    bg_rgba = rgb(r, g, b),
+                    fg_rgba = swatch_contrast_fg(r, g, b),
+                    underline = false,
+                )
+                c = ec
+                continue
+            }
+        }
+        if (ch == "r" or ch == "R") and (c == 0 or (not is_ident_char(line.slice(c - 1, c)))) {
+            let hit_opt = try_parse_rgb_call(line, c, llen)
+            if hit_opt != null {
+                let (ec, r, g, b) = hit_opt.as((i64, i64, i64, i64))
+                buf.add_inline_decor(
+                    OWNER_COLORIZER,
+                    row,
+                    c,
+                    ec,
+                    bg_rgba = rgb(r, g, b),
+                    fg_rgba = swatch_contrast_fg(r, g, b),
+                    underline = false,
+                )
+                c = ec
+                continue
+            }
+        }
+        c += 1
+    }
+}
+
+-- ============================================================================
+-- 3. Feature B: 6-Level Cyclic Rainbow Delimiters (`owner = "ext_rainbow"`)
+-- ============================================================================
+
+fn matching_open_for_close(close_ch: String) -> String {
+    when {
+        close_ch == ")" => "(",
+        close_ch == "]" => "[",
+        close_ch == "}}" => "{{",
+        else => "",
+    }
+}
+
+fn find_closing_single_quote(line: String, open_col: i64, llen: i64) -> i64 {
+    var i = open_col + 1
+    while i < llen {
+        let ch = line.slice(i, i + 1)
+        if ch == "\\" {
+            i += 2
+            continue
+        }
+        if ch == "'" {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+fn is_hash_comment_start(line: String, col: i64, llen: i64, mode_low: String) -> bool {
+    if mode_low == "rust" or mode_low == "c" or mode_low == "cpp" or mode_low == "css" or mode_low == "scss" {
+        return false
+    }
+    -- Never treat valid `#RGB`, `#RRGGBB`, or `#RRGGBBAA` color literals as comments!
+    if try_parse_hash_hex(line, col, llen) != null {
+        return false
+    }
+    if mode_low == "python"
+        or mode_low == "shell"
+        or mode_low == "sh"
+        or mode_low == "toml"
+        or mode_low == "yaml"
+        or mode_low == "makefile"
+        or mode_low == "conf" {
+        return true
+    }
+    -- In Nessa / generic text buffers, `# ...` (or `#` at start/after whitespace) starts a comment
+    if col + 1 >= llen {
+        return true
+    }
+    let next_ch = line.slice(col + 1, col + 2)
+    if next_ch == " " or next_ch == "\t" {
+        return true
+    }
+    col == 0 or line.slice(col - 1, col) == " " or line.slice(col - 1, col) == "\t"
+}
+
+fn is_double_dash_comment_mode(mode_low: String) -> bool {
+    mode_low != "c"
+        and mode_low != "cpp"
+        and mode_low != "rust"
+        and mode_low != "go"
+        and mode_low != "javascript"
+        and mode_low != "typescript"
+        and mode_low != "java"
+}
+
+fn decorate_buffer_rainbow(buf: Buffer, win_start: i64, win_end: i64) {
+    let mode_low = buf.major_mode.to_lower()
+    let stack = List()
+    var block_cmt_end = ""
+    let err_col = rainbow_unmatched_error_color()
+    let dash_cmt = is_double_dash_comment_mode(mode_low)
+    let scan_from = if win_start > 80 { win_start - 80 } else { 0 }
+
+    for r in scan_from..win_end {
+        let line = buf.line_at(r)
+        if block_cmt_end == ""
+            and (not line.contains("("))
+            and (not line.contains(")"))
+            and (not line.contains("["))
+            and (not line.contains("]"))
+            and (not line.contains("{{"))
+            and (not line.contains("}}"))
+            and (not line.contains("/*"))
+            and (not line.contains("--[[")) {
+            continue
+        }
+        let llen = line.char_len()
+        let emit_row = r >= win_start
+        var c: i64 = 0
+
+        while c < llen {
+            if block_cmt_end != "" {
+                let elen = block_cmt_end.char_len()
+                if c + elen <= llen and line.slice(c, c + elen) == block_cmt_end {
+                    block_cmt_end = ""
+                    c += elen
+                } else {
+                    c += 1
+                }
+                continue
+            }
+
+            -- Block comments `--[[ ... ]]` and `/* ... */`
+            if dash_cmt and c + 4 <= llen and line.slice(c, c + 4) == "--[[" {
+                block_cmt_end = "]]"
+                c += 4
+                continue
+            }
+            if c + 2 <= llen and line.slice(c, c + 2) == "/*" {
+                block_cmt_end = "*/"
+                c += 2
+                continue
+            }
+
+            -- Line comments `--`, `//`, and `#`
+            if dash_cmt and c + 2 <= llen and line.slice(c, c + 2) == "--" {
+                break
+            }
+            if c + 2 <= llen and line.slice(c, c + 2) == "//" {
+                break
+            }
+
+            let ch = line.slice(c, c + 1)
+            if ch == "#" and is_hash_comment_start(line, c, llen, mode_low) {
+                break
+            }
+
+            -- Double-quoted string literal `"..."`
+            if ch == "\"" {
+                c += 1
+                while c < llen {
+                    let sch = line.slice(c, c + 1)
+                    if sch == "\\" {
+                        c += 2
+                        continue
+                    }
+                    if sch == "\"" {
+                        c += 1
+                        break
+                    }
+                    c += 1
+                }
+                continue
+            }
+
+            -- Single-quoted char/string literal `'...'` (careful with Rust `&'a` lifetimes & contractions)
+            if ch == "'" {
+                if mode_low == "rust" {
+                    if c + 2 < llen and line.slice(c + 1, c + 2) != "\\" and line.slice(c + 2, c + 3) == "'" {
+                        c += 3
+                        continue
+                    }
+                    if c + 3 < llen and line.slice(c + 1, c + 2) == "\\" and line.slice(c + 3, c + 4) == "'" {
+                        c += 4
+                        continue
+                    }
+                } else if c == 0 or (not line.slice(c - 1, c).is_alphanumeric()) {
+                    let close_q = find_closing_single_quote(line, c, llen)
+                    if close_q > c {
+                        c = close_q + 1
+                        continue
+                    }
+                }
+            }
+
+            -- Balanced rainbow brackets
+            if ch == "(" or ch == "[" or ch == "{{" {
+                let depth = stack.len()
+                stack.push((ch, depth))
+                if emit_row {
+                    buf.add_inline_decor(
+                        OWNER_RAINBOW,
+                        r,
+                        c,
+                        c + 1,
+                        bg_rgba = 0,
+                        fg_rgba = rainbow_palette_color(depth),
+                        underline = false,
+                    )
+                }
+            } else if ch == ")" or ch == "]" or ch == "}}" {
+                let want = matching_open_for_close(ch)
+                if stack.is_empty() {
+                    if emit_row {
+                        buf.add_inline_decor(
+                            OWNER_RAINBOW,
+                            r,
+                            c,
+                            c + 1,
+                            bg_rgba = 0,
+                            fg_rgba = err_col,
+                            underline = true,
+                        )
+                    }
+                } else {
+                    let top_idx = (stack.len() - 1).as(usize)
+                    let (open_ch, open_depth) = stack.get(top_idx).as((String, i64))
+                    if open_ch == want {
+                        let _ = stack.pop()
+                        if emit_row {
+                            buf.add_inline_decor(
+                                OWNER_RAINBOW,
+                                r,
+                                c,
+                                c + 1,
+                                bg_rgba = 0,
+                                fg_rgba = rainbow_palette_color(open_depth),
+                                underline = false,
+                            )
+                        }
+                    } else {
+                        if emit_row {
+                            buf.add_inline_decor(
+                                OWNER_RAINBOW,
+                                r,
+                                c,
+                                c + 1,
+                                bg_rgba = 0,
+                                fg_rgba = err_col,
+                                underline = true,
+                            )
+                        }
+                    }
+                }
+            }
+            c += 1
+        }
+    }
+}
+
+-- ============================================================================
+-- 4. Buffer Refresh, Caching & Extension Registration (`lava.org/ext_colorizer`)
+-- ============================================================================
+
+fn is_colorizable_buffer(buf: Buffer) -> bool {
+    buf.kind != BufferKind.Special and buf.kind != BufferKind.Directory
+}
+
+fn compute_scan_window(world: EditorWorld, buf: Buffer) -> (i64, i64) {
+    let lcount = buf.line_count()
+    if lcount <= 300 {
+        return (0, lcount)
+    }
+    let vrows = if world.viewport_rows > 0 { world.viewport_rows } else { 36 }
+    let raw_start = world.viewport_top_row - 60
+    let win_start = if raw_start > 0 { raw_start } else { 0 }
+    let raw_end = world.viewport_top_row + vrows + 80
+    let win_end = if raw_end < lcount { raw_end } else { lcount }
+    (win_start, win_end)
+}
+
+fn colorizer_viewport_covered(world: EditorWorld, lcount: i64, win_start: i64, win_end: i64) -> bool {
+    if lcount <= 300 {
+        return win_start == 0 and win_end == lcount
+    }
+    let top = if world.viewport_top_row > 0 { world.viewport_top_row } else { 0 }
+    let vrows = if world.viewport_rows > 0 { world.viewport_rows } else { 36 }
+    let vis_end = if top + vrows < lcount { top + vrows } else { lcount }
+    let top_ok = win_start == 0 or top >= win_start + 8
+    let bot_ok = win_end >= lcount or vis_end <= win_end - 8
+    top_ok and bot_ok
+}
+
+pub fn refresh_buffer_colorizer(
+    world: EditorWorld,
+    service: ColorizerService,
+    buf: Buffer,
+    force: bool,
+) {
+    if not is_colorizable_buffer(buf) {
+        buf.clear_owner_decors(OWNER_COLORIZER)
+        buf.clear_owner_decors(OWNER_RAINBOW)
+        service.invalidate_buffer(buf.id)
+        return
+    }
+
+    buf.sync_external_lines()
+    let lcount = buf.line_count()
+    if not force {
+        let cached_opt = service.cache_by_buf.get(buf.id)
+        if cached_opt != null {
+            let cached = cached_opt.as(BufferDecorCache)
+            if cached.edit_version == buf.edit_version
+                and cached.colors_enabled == service.colors_enabled
+                and cached.rainbow_enabled == service.rainbow_enabled
+                and cached.major_mode == buf.major_mode
+                and colorizer_viewport_covered(world, lcount, cached.win_start, cached.win_end) {
+                return
+            }
+        }
+    }
+
+    let (win_start, win_end) = compute_scan_window(world, buf)
+    buf.clear_owner_decors(OWNER_COLORIZER)
+    buf.clear_owner_decors(OWNER_RAINBOW)
+
+    if service.colors_enabled {
+        for r in win_start..win_end {
+            let line = buf.line_at(r)
+            if line.contains("#") or line.contains("rgb") or line.contains("RGB") or line.contains("hsl") or line.contains("HSL") {
+                decorate_line_color_swatches(buf, r, line)
+            }
+        }
+    }
+
+    if service.rainbow_enabled {
+        decorate_buffer_rainbow(buf, win_start, win_end)
+    }
+
+    service.cache_by_buf.insert(buf.id, BufferDecorCache {
+        win_start: win_start,
+        win_end: win_end,
+        colors_enabled: service.colors_enabled,
+        rainbow_enabled: service.rainbow_enabled,
+        major_mode: buf.major_mode,
+        edit_version: buf.edit_version,
+    })
+}
+
+fn resolve_colorizer_hook_buf(world: EditorWorld, payload: Any) -> Buffer {
+    if payload matches _: BufferId {
+        let b_opt = world.buffer(payload.as(BufferId))
+        if b_opt != null {
+            return b_opt.as(Buffer)
+        }
+    }
+    world.active_buffer()
+}
+
+fn on_colorizer_force_hook(kern: SystemKernel, payload: Any) {
+    let w_opt = kern.service("lava.document.world")
+    let s_opt = kern.service(SERVICE_COLORIZER)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let service = s_opt.as(ColorizerService)
+    let buf = resolve_colorizer_hook_buf(world, payload)
+    refresh_buffer_colorizer(world, service, buf, true)
+}
+
+fn on_colorizer_sync_hook(kern: SystemKernel, payload: Any) {
+    let w_opt = kern.service("lava.document.world")
+    let s_opt = kern.service(SERVICE_COLORIZER)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let service = s_opt.as(ColorizerService)
+    let buf = resolve_colorizer_hook_buf(world, payload)
+    refresh_buffer_colorizer(world, service, buf, false)
+}
+
+fn on_colorizer_insert_hook(kern: SystemKernel, payload: Any) {
+    let w_opt = kern.service("lava.document.world")
+    let s_opt = kern.service(SERVICE_COLORIZER)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let service = s_opt.as(ColorizerService)
+    let buf = resolve_colorizer_hook_buf(world, payload)
+    if buf.line_count() > 2000 {
+        return
+    }
+    refresh_buffer_colorizer(world, service, buf, false)
+}
+
+fn unbind_owner_from_keymaps(kernel: SystemKernel, owner: ExtId) {
+    for km_key in kernel.keymaps.keys() {
+        let km_name = km_key.as(String)
+        let km = kernel.keymaps.get(km_name).as(Keymap)
+        let to_remove = List()
+        for chord_key in km.bindings.keys() {
+            let chord = chord_key.as(String)
+            let entry = km.bindings.get(chord).as(KeyBindingEntry)
+            if entry.owner == owner {
+                to_remove.push(chord)
+            }
+        }
+        for i in 0..to_remove.len() {
+            let _ = km.bindings.remove(to_remove.get(i.as(usize)).as(String))
+        }
+    }
+}
+
+fn migrate_leader_u_prefix(leader_km: Keymap) {
+    let prev_opt = leader_km.bindings.get("<Space> u")
+    if prev_opt != null {
+        let prev = prev_opt.as(KeyBindingEntry)
+        if prev.command_name == "undo-tree-visualize" {
+            let _ = leader_km.unbind("<Space> u")
+            leader_km.bind("<Space> u u", prev.command_name, prev.owner, description = prev.description)
+        }
+    }
+}
+
+pub fn register_colorizer_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_colorizer_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_colorizer",
+        "0.1.0",
+        "Live true-color hex/rgb swatches with luminance contrast and 6-level cyclic rainbow delimiters.",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let service = ColorizerService.new()
+            k.publish_service(SERVICE_COLORIZER, ext_id, service)
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            migrate_leader_u_prefix(leader_km)
+            leader_km.bind("<Space> u c", "colorizer-toggle", ext_id, description = "Toggle colorizer swatches")
+            leader_km.bind("<Space> u r", "rainbow-toggle", ext_id, description = "Toggle rainbow delimiters")
+
+            k.register_command(
+                "colorizer-toggle",
+                ext_id,
+                "Toggle live true-color hex/rgb swatches (`:ColorizerToggle`, `<Space> u c`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let svc = require_colorizer_service(kern)!
+                    svc.colors_enabled = not svc.colors_enabled
+                    svc.invalidate_all()
+                    if not svc.colors_enabled {
+                        world.clear_owner_ui(OWNER_COLORIZER)
+                        status_emit("Colorizer swatches: OFF")#
+                    } else {
+                        for i in 0..world.buffer_order.len() {
+                            let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+                            let b = world.buffers.get(bid).as(Buffer)
+                            refresh_buffer_colorizer(world, svc, b, true)
+                        }
+                        status_emit("Colorizer swatches: ON")#
+                    }
+                    ()
+                },
+            )
+
+            k.register_command(
+                "rainbow-toggle",
+                ext_id,
+                "Toggle 6-level cyclic rainbow delimiters (`:RainbowToggle`, `<Space> u r`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let svc = require_colorizer_service(kern)!
+                    svc.rainbow_enabled = not svc.rainbow_enabled
+                    svc.invalidate_all()
+                    if not svc.rainbow_enabled {
+                        world.clear_owner_ui(OWNER_RAINBOW)
+                        status_emit("Rainbow delimiters: OFF")#
+                    } else {
+                        for i in 0..world.buffer_order.len() {
+                            let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+                            let b = world.buffers.get(bid).as(Buffer)
+                            refresh_buffer_colorizer(world, svc, b, true)
+                        }
+                        status_emit("Rainbow delimiters: ON")#
+                    }
+                    ()
+                },
+            )
+
+            k.add_hook("buffer-opened", ext_id, on_colorizer_force_hook)
+            k.add_hook("buffer-switched", ext_id, on_colorizer_sync_hook)
+            k.add_hook("buffer-modified", ext_id, on_colorizer_sync_hook)
+            k.add_hook("buffer-saved", ext_id, on_colorizer_sync_hook)
+            k.add_hook("mode-changed", ext_id, on_colorizer_sync_hook)
+            k.add_hook("after-insert-stroke", ext_id, on_colorizer_insert_hook)
+            k.add_hook("cursor-moved", ext_id, on_colorizer_sync_hook)
+
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                let w = w_opt.as(EditorWorld)
+                for i in 0..w.buffer_order.len() {
+                    let bid = w.buffer_order.get(i.as(usize)).as(BufferId)
+                    let b = w.buffers.get(bid).as(Buffer)
+                    refresh_buffer_colorizer(w, service, b, true)
+                }
+            }
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                let w = w_opt.as(EditorWorld)
+                w.clear_owner_ui(OWNER_COLORIZER)
+                w.clear_owner_ui(OWNER_RAINBOW)
+            }
+            unbind_owner_from_keymaps(k, ext_id)
+            ()
+        },
+    )
+}

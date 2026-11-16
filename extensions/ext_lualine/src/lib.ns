@@ -1,0 +1,427 @@
+-- ext_lualine: Rich Modern Statusline Segments (`lava.org/ext_lualine`).
+-- Inspired by `lualine.nvim` and `doom-modeline`: cached Git branch & diff counters,
+-- live diagnostic sign counts (`E:x W:y`), macro recording badge, Visual selection /
+-- multi-cursor indicator, encoding & line-ending badge, filetype, scroll progress,
+-- and active extension counter (`⚡N`) with O(1) cursor-move updates.
+
+use std.collections.HashMap
+use std.fs
+use std.path
+use @lava_core.{
+    ExtId, ExtState, ExtensionRecord, InteractiveEffects, KeyBindingEntry, Keymap, SystemKernel,
+    status_emit
+}
+use @lava_accel.{GitStatusSummary, accel_git_status}
+use @ext_document.{
+    Buffer, EditorWorld, GutterSign, Pos, Span, VisualKind, ext_document_id, require_editor_world
+}
+use @ext_vim.{KEYMAP_VIM_LEADER, ext_vim_id}
+
+pub const SERVICE_LUALINE: String = "lava.lualine.statusline"
+pub const OWNER_LUALINE: String = "ext_lualine"
+
+pub struct LualineGitCacheEntry {
+    pub is_repo: bool,
+    pub branch: String,
+    pub staged_count: i64,
+    pub modified_count: i64,
+    pub untracked_count: i64,
+}
+
+pub struct LualineService {
+    pub enabled: bool,
+    pub git_cache: HashMap,
+    pub dir_cache: HashMap,
+    pub cached_active_exts: i64,
+    pub git_refresh_count: i64,
+}
+
+impl LualineService {
+    pub fn new() -> LualineService {
+        LualineService {
+            enabled: true,
+            git_cache: HashMap.new(),
+            dir_cache: HashMap.new(),
+            cached_active_exts: -1,
+            git_refresh_count: 0,
+        }
+    }
+
+    pub fn clear_cache(self) {
+        self.git_cache = HashMap.new()
+        self.dir_cache = HashMap.new()
+        self.cached_active_exts = -1
+    }
+
+    pub fn lookup_or_fetch_git(self, dir: String, force_refresh: bool) -> LualineGitCacheEntry {
+        let key = if dir != "" { dir } else { "." }
+        if not force_refresh {
+            let cached_opt = self.git_cache.get(key)
+            if cached_opt != null {
+                return cached_opt.as(LualineGitCacheEntry)
+            }
+        }
+        let summary: GitStatusSummary = accel_git_status(key)
+        let entry = LualineGitCacheEntry {
+            is_repo: summary.is_repo,
+            branch: summary.branch,
+            staged_count: summary.staged_count,
+            modified_count: summary.modified_count,
+            untracked_count: summary.untracked_count,
+        }
+        self.git_cache.insert(key, entry)
+        self.git_refresh_count += 1
+        entry
+    }
+}
+
+pub fn require_lualine_service(kernel: SystemKernel) -> !String LualineService {
+    let raw = kernel.require_service(SERVICE_LUALINE)!
+    raw.as(LualineService)
+}
+
+fn abs_i64(v: i64) -> i64 {
+    if v < 0 { -v } else { v }
+}
+
+fn git_dir_for_buffer(svc: LualineService, world: EditorWorld, buf: Buffer) -> String {
+    if buf.file_path != "" {
+        let cache_key = world.cwd ++ "\n" ++ buf.file_path
+        let cached_opt = svc.dir_cache.get(cache_key)
+        if cached_opt != null {
+            return cached_opt.as(String)
+        }
+        let full = world.resolve_path(buf.file_path)
+        let parent_opt = path.parent(full)
+        if parent_opt != null {
+            let pdir = parent_opt.as(String)
+            if pdir != "" and fs.exists(pdir) {
+                svc.dir_cache.insert(cache_key, pdir)
+                return pdir
+            }
+        }
+        let fallback = if world.cwd != "" { world.cwd } else { "." }
+        svc.dir_cache.insert(cache_key, fallback)
+        return fallback
+    }
+    if world.cwd != "" { world.cwd } else { "." }
+}
+
+fn format_git_segment(entry: LualineGitCacheEntry) -> String {
+    if not entry.is_repo {
+        return ""
+    }
+    let br = if entry.branch != "" { entry.branch } else { "HEAD" }
+    var out = "git:" ++ br
+    if entry.staged_count > 0 {
+        out = out ++ " +" ++ entry.staged_count.to_string()
+    }
+    if entry.modified_count > 0 {
+        out = out ++ " ~" ++ entry.modified_count.to_string()
+    }
+    if entry.untracked_count > 0 {
+        out = out ++ " ?" ++ entry.untracked_count.to_string()
+    }
+    out
+}
+
+fn format_diagnostics_segment(buf: Buffer) -> String {
+    let t_err_opt = buf.vars.get("trouble_err_count")
+    let t_warn_opt = buf.vars.get("trouble_warn_count")
+    let l_err_opt = buf.vars.get("lsp_err_count")
+    let l_warn_opt = buf.vars.get("lsp_warn_count")
+
+    var err_cnt: i64 = 0
+    var warn_cnt: i64 = 0
+    if t_err_opt != null or t_warn_opt != null or l_err_opt != null or l_warn_opt != null {
+        if t_err_opt != null {
+            err_cnt += t_err_opt.as(i64)
+        }
+        if l_err_opt != null {
+            err_cnt += l_err_opt.as(i64)
+        }
+        if t_warn_opt != null {
+            warn_cnt += t_warn_opt.as(i64)
+        }
+        if l_warn_opt != null {
+            warn_cnt += l_warn_opt.as(i64)
+        }
+    } else {
+        if buf.signs.is_empty() {
+            return ""
+        }
+        for i in 0..buf.signs.len() {
+            let s = buf.signs.get(i.as(usize)).as(GutterSign)
+            let txt = s.text.trim()
+            if txt == "E" or txt.starts_with("E") {
+                err_cnt += 1
+            } else if txt == "W" or txt.starts_with("W") {
+                warn_cnt += 1
+            }
+        }
+    }
+
+    let parts = List()
+    if err_cnt > 0 {
+        parts.push("E:" ++ err_cnt.to_string())
+    }
+    if warn_cnt > 0 {
+        parts.push("W:" ++ warn_cnt.to_string())
+    }
+    if parts.is_empty() {
+        ""
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn count_char_selection(buf: Buffer, a: Pos, b: Pos) -> i64 {
+    let sp = Span.normalized(a, b)
+    if sp.start.row == sp.end.row {
+        let llen = buf.line_char_len(sp.start.row)
+        if llen <= 0 {
+            return 0
+        }
+        let sc = if sp.start.col < 0 { 0 } else if sp.start.col > llen { llen } else { sp.start.col }
+        let ec_incl = if sp.end.col < llen { sp.end.col + 1 } else { llen }
+        let diff = ec_incl - sc
+        return if diff > 0 { diff } else { 1 }
+    }
+    if sp.end.row - sp.start.row > 500 {
+        return (sp.end.row - sp.start.row + 1) * 40
+    }
+    var total: i64 = 0
+    for r in sp.start.row..(sp.end.row + 1) {
+        let llen = buf.line_char_len(r)
+        if r == sp.start.row {
+            let rem = if llen > sp.start.col { llen - sp.start.col } else { 0 }
+            total += rem + 1
+        } else if r == sp.end.row {
+            let end_take = if sp.end.col < llen { sp.end.col + 1 } else { llen }
+            total += end_take
+        } else {
+            total += llen + 1
+        }
+    }
+    if total > 0 { total } else { 1 }
+}
+
+fn format_selection_segment(world: EditorWorld, buf: Buffer) -> String {
+    let parts = List()
+    if world.secondary_cursors.len() > 0 {
+        parts.push("MC:" ++ (world.secondary_cursors.len() + 1).to_string())
+    }
+    let vk = world.visual.kind
+    if vk == VisualKind.Line {
+        let lines_sel = abs_i64(world.visual.cursor.row - world.visual.anchor.row) + 1
+        parts.push("SEL:" ++ lines_sel.to_string() ++ "L")
+    } else if vk == VisualKind.Char {
+        let chars_sel = count_char_selection(buf, world.visual.anchor, world.visual.cursor)
+        parts.push("SEL:" ++ chars_sel.to_string() ++ "C")
+    } else if vk == VisualKind.Block {
+        let rows_sel = abs_i64(world.visual.cursor.row - world.visual.anchor.row) + 1
+        let cols_sel = abs_i64(world.visual.cursor.col - world.visual.anchor.col) + 1
+        parts.push("SEL:" ++ rows_sel.to_string() ++ "x" ++ cols_sel.to_string() ++ "B")
+    }
+    if parts.is_empty() {
+        ""
+    } else {
+        parts.join(" | ")
+    }
+}
+
+fn format_progress_segment(buf: Buffer) -> String {
+    let total = buf.line_count()
+    let r = buf.point.row
+    if total <= 1 or r <= 0 {
+        return "top"
+    }
+    if r >= total - 1 {
+        return "bot"
+    }
+    let pct = ((r + 1) * 100) / total
+    pct.to_string() ++ "%"
+}
+
+fn count_active_extensions(svc: LualineService, kernel: SystemKernel) -> i64 {
+    if svc.cached_active_exts >= 0 {
+        return svc.cached_active_exts
+    }
+    let recs = kernel.list_extensions()
+    var active_cnt: i64 = 0
+    for i in 0..recs.len() {
+        let rec = recs.get(i.as(usize)).as(ExtensionRecord)
+        if rec.state == ExtState.Active {
+            active_cnt += 1
+        }
+    }
+    svc.cached_active_exts = active_cnt
+    active_cnt
+}
+
+pub fn sync_lualine_segments(kernel: SystemKernel, force_git_refresh: bool) {
+    let w_opt = kernel.service("lava.document.world")
+    let s_opt = kernel.service(SERVICE_LUALINE)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let svc = s_opt.as(LualineService)
+
+    if not svc.enabled {
+        world.statusline_left_extra = ""
+        world.statusline_right_extra = ""
+        return
+    }
+
+    let buf = world.active_buffer()
+    let dir = git_dir_for_buffer(svc, world, buf)
+    let git_entry = svc.lookup_or_fetch_git(dir, force_git_refresh)
+
+    -- Respect distraction-free Zen Mode while still keeping the git cache warm on save/open.
+    if world.options.zen_mode {
+        return
+    }
+
+    let left_parts = List()
+    let git_seg = format_git_segment(git_entry)
+    if git_seg != "" {
+        left_parts.push(git_seg)
+    }
+    let diag_seg = format_diagnostics_segment(buf)
+    if diag_seg != "" {
+        left_parts.push(diag_seg)
+    }
+    if kernel.macros.recording_reg != null {
+        let reg_name = kernel.macros.recording_reg.as(String)
+        left_parts.push("REC @" ++ reg_name)
+    }
+    world.statusline_left_extra = left_parts.join(" | ")
+
+    let right_parts = List()
+    let sel_seg = format_selection_segment(world, buf)
+    if sel_seg != "" {
+        right_parts.push(sel_seg)
+    }
+    right_parts.push("UTF-8 | " ++ (if buf.crlf { "CRLF" } else { "LF" }))
+    let ft = if buf.major_mode != "" { buf.major_mode } else { "text" }
+    right_parts.push(ft)
+    right_parts.push(format_progress_segment(buf))
+    let active_exts = count_active_extensions(svc, kernel)
+    right_parts.push("⚡" ++ active_exts.to_string())
+    world.statusline_right_extra = right_parts.join(" | ")
+}
+
+fn migrate_leader_u_prefix(leader_km: Keymap) {
+    let prev_opt = leader_km.bindings.get("<Space> u")
+    if prev_opt != null {
+        let prev = prev_opt.as(KeyBindingEntry)
+        if prev.command_name == "undo-tree-visualize" {
+            let _ = leader_km.unbind("<Space> u")
+            leader_km.bind("<Space> u u", prev.command_name, prev.owner, description = prev.description)
+        }
+    }
+}
+
+fn cmd_lualine_toggle(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_lualine_service(kernel)!
+    svc.enabled = not svc.enabled
+    if svc.enabled {
+        sync_lualine_segments(kernel, true)
+        status_emit("Lualine enabled")#
+    } else {
+        world.statusline_left_extra = ""
+        world.statusline_right_extra = ""
+        status_emit("Lualine disabled")#
+    }
+    ()
+}
+
+fn cmd_lualine_refresh(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let _ = require_editor_world(kernel)!
+    let svc = require_lualine_service(kernel)!
+    svc.clear_cache()
+    sync_lualine_segments(kernel, true)
+    status_emit("Lualine refreshed")#
+    ()
+}
+
+pub fn ext_lualine_id() -> ExtId = ExtId("lava.org/ext_lualine")
+
+pub fn register_lualine_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_lualine_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_lualine",
+        "0.1.0",
+        "Rich statusline segments with cached Git status, live diagnostics, selection/multi-cursor badges, encoding, filetype, progress, and active plugin count.",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let svc = LualineService.new()
+            k.publish_service(SERVICE_LUALINE, ext_id, svc)
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            migrate_leader_u_prefix(leader_km)
+            leader_km.bind("<Space> u l", "lualine-toggle", ext_id, description = "Toggle Lualine statusline")
+
+            k.register_command("lualine-toggle", ext_id, "Toggle Lualine statusline segments.", cmd_lualine_toggle)
+            k.register_command("ex:LualineToggle", ext_id, "Ex `:LualineToggle`.", cmd_lualine_toggle, interactive = false)
+
+            k.register_command("lualine-refresh", ext_id, "Force refresh Git status cache and re-render Lualine.", cmd_lualine_refresh)
+            k.register_command("ex:LualineRefresh", ext_id, "Ex `:LualineRefresh`.", cmd_lualine_refresh, interactive = false)
+
+            k.add_hook("buffer-opened", ext_id, |kern: SystemKernel, _p: Any| -> Unit {
+                sync_lualine_segments(kern, true)
+            })
+            k.add_hook("buffer-switched", ext_id, |kern: SystemKernel, _p: Any| -> Unit {
+                sync_lualine_segments(kern, false)
+            })
+            k.add_hook("buffer-saved", ext_id, |kern: SystemKernel, _p: Any| -> Unit {
+                sync_lualine_segments(kern, true)
+            })
+            k.add_hook("buffer-modified", ext_id, |kern: SystemKernel, _p: Any| -> Unit {
+                sync_lualine_segments(kern, false)
+            })
+            k.add_hook("cursor-moved", ext_id, |kern: SystemKernel, _p: Any| -> Unit {
+                sync_lualine_segments(kern, false)
+            })
+            k.add_hook("mode-changed", ext_id, |kern: SystemKernel, _p: Any| -> Unit {
+                sync_lualine_segments(kern, false)
+            })
+            k.add_hook("extension-activated", ext_id, |kern: SystemKernel, _p: Any| -> Unit {
+                let s_opt = kern.service(SERVICE_LUALINE)
+                if s_opt != null {
+                    s_opt.as(LualineService).cached_active_exts = -1
+                }
+                sync_lualine_segments(kern, false)
+            })
+            k.add_hook("extension-deactivated", ext_id, |kern: SystemKernel, _p: Any| -> Unit {
+                let s_opt = kern.service(SERVICE_LUALINE)
+                if s_opt != null {
+                    s_opt.as(LualineService).cached_active_exts = -1
+                }
+                sync_lualine_segments(kern, false)
+            })
+            k.add_hook("timer-tick", ext_id, |kern: SystemKernel, _p: Any| -> Unit {
+                sync_lualine_segments(kern, false)
+            })
+
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null and w_opt.as(EditorWorld).active_buffer().file_path != "" {
+                sync_lualine_segments(k, false)
+            }
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                let world = w_opt.as(EditorWorld)
+                world.statusline_left_extra = ""
+                world.statusline_right_extra = ""
+            }
+            ()
+        },
+    )
+}

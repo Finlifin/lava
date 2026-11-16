@@ -1,0 +1,201 @@
+-- srv_git: Server-Side Git Integration Extension (`lava.server/srv_git`).
+-- Implements `git/status`, `git/head_lines`, `git/diff`, `git/blame`, and `git/log`.
+
+use std.fs
+use std.process
+use @server_sys.{
+    SrvGitBlame, SrvGitFileEntry, accel_git_blame_line, accel_git_head_lines, accel_git_status,
+    resolve_server_path
+}
+use @server_core.{
+    JsonValue, ServerKernel, SrvExtId, expect_params_map, opt_i64_param, opt_str_param,
+    require_i64_param, require_str_param
+}
+
+pub fn srv_git_id() -> SrvExtId = SrvExtId("lava.server/srv_git")
+
+private fn rpc_git_status(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_cwd = require_str_param(m, "cwd")!
+    let cwd = resolve_server_path(raw_cwd)
+    if not fs.exists(cwd) {
+        let out = Map()
+        out.set("is_repo", false)
+        out.set("root", "")
+        out.set("branch", "")
+        out.set("staged_count", 0)
+        out.set("modified_count", 0)
+        out.set("untracked_count", 0)
+        out.set("entries", List())
+        return out
+    }
+    let st = accel_git_status(cwd)
+    let entries_json = List()
+    for i in 0..st.entries.len() {
+        let e = st.entries.get(i.as(usize)).as(SrvGitFileEntry)
+        let item = Map()
+        item.set("index_status", e.index_status)
+        item.set("worktree_status", e.worktree_status)
+        item.set("rel_path", e.rel_path)
+        entries_json.push(item)
+    }
+    let out = Map()
+    out.set("is_repo", st.is_repo)
+    out.set("root", st.root)
+    out.set("branch", st.branch)
+    out.set("staged_count", st.staged_count)
+    out.set("modified_count", st.modified_count)
+    out.set("untracked_count", st.untracked_count)
+    out.set("entries", entries_json)
+    out
+}
+
+private fn rpc_git_head_lines(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_cwd = require_str_param(m, "cwd")!
+    let file_path = require_str_param(m, "path")!
+    let rev = opt_str_param(m, "rev", "HEAD")!
+
+    let cwd = resolve_server_path(raw_cwd)
+    let lines_opt = accel_git_head_lines(cwd, file_path, rev = rev)
+    let out = Map()
+    if lines_opt == null {
+        out.set("tracked", false)
+        out.set("lines", List())
+    } else {
+        out.set("tracked", true)
+        out.set("lines", lines_opt.as(List))
+    }
+    out
+}
+
+private fn rpc_git_diff(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_cwd = require_str_param(m, "cwd")!
+    let rev = opt_str_param(m, "rev", "")!
+    let file_path = opt_str_param(m, "path", "")!
+
+    let cwd = resolve_server_path(raw_cwd)
+    if not fs.exists(cwd) or (not fs.is_dir(cwd)) {
+        return error ("git/diff working directory does not exist: " ++ cwd)
+    }
+
+    let args = List()
+    args.push("diff")
+    args.push("--no-color")
+    args.push("--no-ext-diff")
+    if rev.trim() != "" {
+        args.push(rev.trim())
+    }
+    if file_path.trim() != "" {
+        args.push("--")
+        args.push(file_path.trim())
+    }
+
+    let cmd_out = process.exec("git", args = args, cwd = cwd) match {
+        v! => v,
+        error err => return error ("git diff failed: " ++ err.to_string()),
+    }
+    if (not cmd_out.success()) and cmd_out.status != 1 {
+        return error ("git diff exited with status " ++ cmd_out.status.to_string() ++ ": " ++ cmd_out.stderr.trim())
+    }
+
+    let out = Map()
+    out.set("patch", cmd_out.stdout)
+    out
+}
+
+private fn rpc_git_blame(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_cwd = require_str_param(m, "cwd")!
+    let file_path = require_str_param(m, "path")!
+    let row = require_i64_param(m, "row")!
+
+    let cwd = resolve_server_path(raw_cwd)
+    let blame_opt = accel_git_blame_line(cwd, file_path, row)
+    let out = Map()
+    if blame_opt == null {
+        out.set("found", false)
+        out.set("commit_short", "")
+        out.set("author", "")
+        out.set("date_ymd", "")
+        out.set("summary", "")
+    } else {
+        let b = blame_opt.as(SrvGitBlame)
+        out.set("found", true)
+        out.set("commit_short", b.commit_short)
+        out.set("author", b.author)
+        out.set("date_ymd", b.date_ymd)
+        out.set("summary", b.summary)
+    }
+    out
+}
+
+private fn rpc_git_log(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_cwd = require_str_param(m, "cwd")!
+    let limit = opt_i64_param(m, "limit", 50)!
+    let effective_limit = if limit > 0 { limit } else { 50 }
+
+    let cwd = resolve_server_path(raw_cwd)
+    if not fs.exists(cwd) or (not fs.is_dir(cwd)) {
+        return error ("git/log working directory does not exist: " ++ cwd)
+    }
+
+    let args = [
+        "log",
+        "-n",
+        effective_limit.to_string(),
+        "--date=short",
+        "--pretty=format:%h%x1f%an%x1f%ad%x1f%s",
+    ]
+    let cmd_out = process.exec("git", args = args, cwd = cwd) match {
+        v! => v,
+        error err => return error ("git log failed: " ++ err.to_string()),
+    }
+
+    let commits = List()
+    if cmd_out.success() and cmd_out.stdout.trim() != "" {
+        let lines = cmd_out.stdout.replace("\r\n", "\n").split("\n")
+        for i in 0..lines.len() {
+            let line = lines.get(i.as(usize)).as(String)
+            if line == "" {
+                continue
+            }
+            let parts = line.split("\x1f")
+            if parts.len() >= 4 {
+                let item = Map()
+                item.set("hash", parts.get(0).as(String))
+                item.set("author", parts.get(1).as(String))
+                item.set("date", parts.get(2).as(String))
+                item.set("subject", parts.get(3).as(String))
+                commits.push(item)
+            }
+        }
+    }
+
+    let out = Map()
+    out.set("commits", commits)
+    out
+}
+
+pub fn register_git_extension(kernel: ServerKernel) -> !String Unit {
+    let ext_id = srv_git_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.server",
+        "srv_git",
+        "0.1.0",
+        "Server-side Git repository status, HEAD blob retrieval, unified diff, blame, and commit log.",
+        List(),
+        |k: ServerKernel| -> !String Unit {
+            k.register_rpc("git/status", ext_id, "Query Git porcelain status summary.", rpc_git_status)
+            k.register_rpc("git/head_lines", ext_id, "Fetch tracked blob lines at HEAD or rev.", rpc_git_head_lines)
+            k.register_rpc("git/diff", ext_id, "Generate unified Git patch diff.", rpc_git_diff)
+            k.register_rpc("git/blame", ext_id, "Blame single 0-based line.", rpc_git_blame)
+            k.register_rpc("git/log", ext_id, "List recent Git commits.", rpc_git_log)
+            ()
+        },
+        |_k: ServerKernel| -> !String Unit { () },
+    )
+}

@@ -1,0 +1,585 @@
+-- Comprehensive end-to-end integration test suite for:
+--   1. `lava.org/lava_remote` (`ssh://` & `/ssh:` TRAMP URI parsing, normalization, parent/join, mock mount)
+--   2. Transparent VFS open & save (`world.open_file("ssh://devbox/src/main.cpp")` + `world.save_buffer(...)`)
+--   3. `lava.org/ext_remote` (`*Remote*` dashboard, port-forwarding, `remote-exec`, `remote-files`, `remote-grep`)
+--   4. `*Remote Dirvish*` (`remote-browse` Ranger `j`/`k`/`l`/`h`/`a`/`r`/`yy`+`pp`/`yp`/`D`/`<Return>`)
+--   5. Server-side LSP via `ext_lspconfig` + `ext_lsp` on `ssh://devbox/src/main.cpp` (`root_dir == "ssh://devbox"`,
+--      `clangd@devbox`, `[SSH: devbox]` statusline, `gd` cross-file jump into `ssh://devbox/include/calc.hpp`, `gr`, `:LspRename`)
+--   6. `ext_minibuffer` `ssh://` & `/ssh:` host discovery, cached remote directory completion, `<Tab>`, and `<C-l>` up-dir.
+
+use std.fs
+use std.path
+use std.process
+use std.time
+use @lava_sys.{host_clipboard_get, host_clipboard_set, mock_enable}
+use @lava_core.{
+    KeyStroke, PromptKind, PromptRequest, ServiceEffects, SystemKernel,
+    clipboard_get, clipboard_set, log_event, parse_key_sequence, status_emit
+}
+use @lava_remote.{
+    RemoteTunnelInfo, is_ssh_uri, join_ssh_uri, normalize_ssh_uri,
+    parent_ssh_uri, parse_ssh_uri, remote_connect, remote_list_connections,
+    remote_port_forward_list, remote_register_mock_mount, remote_stat,
+    remote_which, ssh_uri_basename
+}
+use @ext_document.{
+    Buffer, EditorWorld, MinibufferRichItem, MinibufferView, Pos, QuickfixEntry,
+    register_document_extension, require_editor_world
+}
+use @ext_window.{WindowManager, register_window_extension, require_window_manager}
+use @ext_render.register_render_extension
+use @ext_minibuffer.{
+    MinibufferController, minibuffer_handle_key, open_prompt_view,
+    register_minibuffer_extension, require_minibuffer_controller
+}
+use @ext_vim.{VimState, register_vim_extension, vim_handle_key}
+use @ext_emacs.{EmacsState, emacs_handle_key, register_emacs_extension}
+use @ext_lsp.{
+    BufferLspAttachment, LSP_INFO_BUF_NAME, LSP_REFS_BUF_NAME, LspService,
+    SERVICE_LSP, ext_lsp_id, register_lsp_extension, require_lsp_service
+}
+use @ext_lspconfig.{
+    LspConfigRegistry, SERVICE_LSPCONFIG, ext_lspconfig_id,
+    register_lspconfig_extension, require_lspconfig_registry
+}
+use @ext_remote.{
+    MODE_REMOTE_DIRVISH, MODE_REMOTE_STATUS, REMOTE_DIRVISH_BUF_NAME,
+    REMOTE_OUTPUT_BUF_NAME, REMOTE_QUICKFIX_BUF_NAME, REMOTE_STATUS_BUF_NAME,
+    RemoteService, SERVICE_REMOTE, build_remote_ssh_shell_command,
+    ext_remote_id, register_remote_extension, require_remote_service
+}
+
+fn check_true(cond: bool, label: String) {
+    if not cond {
+        panic("ASSERTION FAILED: " ++ label)
+    }
+}
+
+fn check_eq_str(actual: String, expected: String, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual='" ++ actual ++ "' expected='" ++ expected ++ "'")
+    }
+}
+
+fn check_eq_i64(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual=" ++ actual.to_string() ++ " expected=" ++ expected.to_string())
+    }
+}
+
+struct TestHostCap {
+    pub world: EditorWorld,
+}
+
+impl TestHostCap {
+    pub fn new(world: EditorWorld) -> TestHostCap {
+        let cap = TestHostCap { world: world }
+        cap
+    }
+
+    pub fn on_log(self, level: String, source: String, message: String) -> Unit handles(log_event) {
+        self.world.append_message("[" ++ level ++ "] " ++ source ++ ": " ++ message)
+    }
+
+    pub fn on_status(self, message: String) -> Unit handles(status_emit) {
+        self.world.status_message = message
+        if message != "" {
+            self.world.append_message(message)
+        }
+    }
+
+    pub fn on_clip_get(self) -> String handles(clipboard_get) {
+        host_clipboard_get()
+    }
+
+    pub fn on_clip_set(self, text: String) -> Unit handles(clipboard_set) {
+        host_clipboard_set(text)
+    }
+}
+
+fn sync_prompt_view_local(kernel: SystemKernel, world: EditorWorld) {
+    if kernel.active_prompt != null {
+        if not world.minibuffer_view.active {
+            let (req, _) = kernel.active_prompt.as((PromptRequest, Continuation))
+            open_prompt_view(kernel, req)
+        }
+    } else if world.minibuffer_view.active {
+        world.minibuffer_view = MinibufferView.inactive()
+    }
+}
+
+fn route_stroke_local(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    stroke: KeyStroke,
+) -> #ServiceEffects !String bool {
+    if kernel.active_prompt != null {
+        sync_prompt_view_local(kernel, world)
+        return minibuffer_handle_key(kernel, stroke)#!
+    }
+    let emacs_opt = kernel.service("lava.emacs.state")
+    if emacs_opt != null {
+        let es = emacs_opt.as(EmacsState)
+        if (not es.pending_strokes.is_empty()) or es.universal_active {
+            return emacs_handle_key(kernel, stroke)#!
+        }
+    }
+    let vh = vim_handle_key(kernel, stroke)#!
+    if vh {
+        return true
+    }
+    emacs_handle_key(kernel, stroke)#!
+}
+
+fn feed(
+    kernel: SystemKernel,
+    keys: String,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] Unit {
+    let strokes = parse_key_sequence(keys)
+    for i in 0..strokes.len() {
+        let stroke = strokes.get(i.as(usize)).as(KeyStroke)
+        let world = require_editor_world(kernel) ! { e => panic(e) }
+        let outcome = route_stroke_local(kernel, world, stroke)#
+        outcome match {
+            _! => (),
+            error err_msg => panic("feed('" ++ keys ++ "') failed: " ++ err_msg),
+        }
+        sync_prompt_view_local(kernel, world)
+        let wm_opt = kernel.service("lava.window.manager")
+        if wm_opt != null {
+            wm_opt.as(WindowManager).sync_from_world(world)
+        }
+        if world.quit_requested {
+            break
+        }
+    }
+}
+
+fn boot_remote_kernel() -> (
+    SystemKernel,
+    EditorWorld,
+    WindowManager,
+    MinibufferController,
+    LspService,
+    LspConfigRegistry,
+    RemoteService,
+) {
+    mock_enable(true)
+    let kernel = SystemKernel.new()
+    register_document_extension(kernel) ! { e => panic("doc: " ++ e) }
+    register_window_extension(kernel) ! { e => panic("win: " ++ e) }
+    register_render_extension(kernel) ! { e => panic("render: " ++ e) }
+    register_minibuffer_extension(kernel) ! { e => panic("minibuffer: " ++ e) }
+    register_vim_extension(kernel) ! { e => panic("vim: " ++ e) }
+    register_emacs_extension(kernel) ! { e => panic("emacs: " ++ e) }
+    register_lsp_extension(kernel) ! { e => panic("lsp: " ++ e) }
+    register_lspconfig_extension(kernel) ! { e => panic("lspconfig: " ++ e) }
+    register_remote_extension(kernel) ! { e => panic("remote: " ++ e) }
+
+    kernel.activate_all() ! { e => panic("activate_all: " ++ e) }
+    check_true(kernel.is_extension_active(ext_lsp_id()), "ext_lsp active")
+    check_true(kernel.is_extension_active(ext_lspconfig_id()), "ext_lspconfig active")
+    check_true(kernel.is_extension_active(ext_remote_id()), "ext_remote active")
+    check_true(kernel.service(SERVICE_LSP) != null, "SERVICE_LSP published")
+    check_true(kernel.service(SERVICE_LSPCONFIG) != null, "SERVICE_LSPCONFIG published")
+    check_true(kernel.service(SERVICE_REMOTE) != null, "SERVICE_REMOTE published")
+
+    let world = require_editor_world(kernel) ! { e => panic(e) }
+    let wm = require_window_manager(kernel) ! { e => panic(e) }
+    let mb = require_minibuffer_controller(kernel) ! { e => panic(e) }
+    let lsp_svc = require_lsp_service(kernel) ! { e => panic(e) }
+    let lsp_reg = require_lspconfig_registry(kernel) ! { e => panic(e) }
+    let rem_svc = require_remote_service(kernel) ! { e => panic(e) }
+    wm.resize_viewport(1440, 900, world)
+    (kernel, world, wm, mb, lsp_svc, lsp_reg, rem_svc)
+}
+
+fn setup_remote_cpp_fixture() -> (String, String, String) {
+    let stamp = time.unix_millis().to_string()
+    let base = "/tmp/lava_test_remote_ssh_lsp_" ++ stamp
+    let remote_root = path.join(base, "devbox_mount")
+    let inc_dir = path.join(remote_root, "include")
+    let src_dir = path.join(remote_root, "src")
+    let mock_bin = path.join(base, "mock_bin")
+
+    let _ = fs.create_dir_all(inc_dir) ! { e => panic("mkdir include: " ++ e.to_string()) }
+    let _ = fs.create_dir_all(src_dir) ! { e => panic("mkdir src: " ++ e.to_string()) }
+    let _ = fs.create_dir_all(mock_bin) ! { e => panic("mkdir mock_bin: " ++ e.to_string()) }
+
+    -- Ensure a mock `clangd` binary exists in `mock_bin` in case host machine lacks `/usr/bin/clangd`
+    let mock_clangd = path.join(mock_bin, "clangd")
+    let _ = fs.write_string(mock_clangd, "#!/bin/sh\nexit 0\n") ! { e => panic("write clangd: " ++ e.to_string()) }
+    let _ = process.shell("chmod +x " ++ mock_clangd) ! { e => panic("chmod clangd: " ++ e.to_string()) }
+
+    let cc_json = "[\n  {{\"directory\": \"/\", \"command\": \"clang++ -Iinclude -c src/main.cpp\", \"file\": \"src/main.cpp\"}}\n]\n"
+    let _ = fs.write_string(path.join(remote_root, "compile_commands.json"), cc_json) ! {
+        e => panic("write compile_commands.json: " ++ e.to_string())
+    }
+
+    let calc_hpp = [
+        "#pragma once",
+        "",
+        "// Adds two integers on the remote build server.",
+        "inline int calc_add(int lhs, int rhs) {{",
+        "    return lhs + rhs;",
+        "}}",
+        "",
+        "struct RemoteAccumulator {{",
+        "    int total;",
+        "}};",
+        "",
+    ].join("\n")
+    let _ = fs.write_string(path.join(inc_dir, "calc.hpp"), calc_hpp) ! {
+        e => panic("write calc.hpp: " ++ e.to_string())
+    }
+
+    let main_cpp = [
+        "#include \"calc.hpp\"",
+        "",
+        "int main() {{",
+        "    int sum = calc_add(20, 22);",
+        "    return sum;",
+        "}}",
+        "",
+    ].join("\n")
+    let _ = fs.write_string(path.join(src_dir, "main.cpp"), main_cpp) ! {
+        e => panic("write main.cpp: " ++ e.to_string())
+    }
+
+    (base, remote_root, mock_bin)
+}
+
+fn find_line_containing(buf: Buffer, needle: String) -> i64 {
+    for r in 0..buf.line_count() {
+        if buf.line_at(r).contains(needle) {
+            return r
+        }
+    }
+    -1
+}
+
+fn main() {
+    let (tmp_base, tmp_remote_root, mock_bin) = setup_remote_cpp_fixture()
+
+    -- ========================================================================
+    -- Scenario 1: `ssh://` & `/ssh:` TRAMP URI Parsing, Normalization & Mount
+    -- ========================================================================
+    check_true(is_ssh_uri("ssh://alice@devbox:2222/work/src/main.cpp"), "is_ssh_uri ssh://")
+    check_true(is_ssh_uri("/ssh:alice@devbox#2222:/work/src/main.cpp"), "is_ssh_uri TRAMP /ssh:")
+    check_true(not is_ssh_uri("/tmp/local/file.cpp"), "local path is not ssh uri")
+
+    let p_ssh = parse_ssh_uri("ssh://alice@devbox:2222/work/src/../include/calc.hpp") ! { e => panic(e) }
+    check_eq_str(p_ssh.authority, "alice@devbox:2222", "ssh authority")
+    check_eq_str(p_ssh.prefix, "ssh://alice@devbox:2222", "ssh prefix")
+    check_eq_str(p_ssh.remote_path, "/work/include/calc.hpp", "normalized remote_path")
+
+    let p_tramp = parse_ssh_uri("/ssh:alice@devbox#2222:/work/src/main.cpp") ! { e => panic(e) }
+    check_eq_str(p_tramp.canonical_uri(), "ssh://alice@devbox:2222/work/src/main.cpp", "TRAMP canonical_uri")
+    check_eq_str(
+        normalize_ssh_uri("/ssh:devbox:/src//./main.cpp"),
+        "ssh://devbox/src/main.cpp",
+        "normalize_ssh_uri TRAMP",
+    )
+    check_eq_str(
+        parent_ssh_uri("ssh://devbox/src/main.cpp"),
+        "ssh://devbox/src",
+        "parent_ssh_uri file -> src",
+    )
+    check_eq_str(
+        join_ssh_uri("ssh://devbox/src", "../include/calc.hpp"),
+        "ssh://devbox/include/calc.hpp",
+        "join_ssh_uri ..",
+    )
+    check_eq_str(ssh_uri_basename("ssh://devbox/include/calc.hpp"), "calc.hpp", "ssh_uri_basename")
+
+    let shell_cmd = build_remote_ssh_shell_command(p_ssh, "/work/include")
+    check_true(shell_cmd.contains("ssh -t -p 2222 alice@devbox"), "remote shell ssh -t -p")
+    check_true(shell_cmd.contains("cd '/work/include'"), "remote shell cd")
+
+    remote_register_mock_mount("devbox", tmp_remote_root) ! { e => panic("mock mount: " ++ e) }
+    let conn = remote_connect("ssh://devbox") ! { e => panic("remote_connect: " ++ e) }
+    check_eq_str(conn.authority, "devbox", "connected authority")
+    check_true(conn.alive, "mock devbox alive")
+    println("  [PASS] 1. ssh:// & /ssh: TRAMP URI parsing, normalization, parent/join & mock mount")
+
+    -- Boot kernel + extensions
+    let (kernel, world, _wm, mb, lsp_svc, lsp_reg, rem_svc) = boot_remote_kernel()
+    lsp_reg.prepend_search_path(lsp_svc, mock_bin)
+
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let _cap = TestHostCap.new(world)
+
+    -- ====================================================================
+    -- Scenario 2: Transparent VFS Open & Save + Server-Side LSP Attachment
+    -- ====================================================================
+        let main_buf = world.open_file("ssh://devbox/src/main.cpp")# ! { e => panic("open remote main.cpp: " ++ e) }
+        kernel.emit_hook("buffer-opened", main_buf.id)
+        kernel.emit_hook("buffer-switched", main_buf.id)
+
+        check_eq_str(main_buf.file_path, "ssh://devbox/src/main.cpp", "remote buffer canonical file_path")
+        check_true(main_buf.to_text().contains("calc_add(20, 22)"), "remote main.cpp loaded content")
+        check_eq_str(world.statusline_left_extra, "[SSH: devbox]", "statusline_left_extra shows [SSH: devbox]")
+
+        -- Append comment line & save back through transparent remote VFS
+        main_buf.lines.push("// saved over ssh vfs")
+        main_buf.modified = true
+        let _ = world.save_buffer(main_buf.id)# ! { e => panic("save remote main.cpp: " ++ e) }
+        check_true(not main_buf.modified, "remote buffer marked clean after save")
+        let disk_after_save = fs.read_to_string(path.join(path.join(tmp_remote_root, "src"), "main.cpp")) ! {
+            e => panic("read saved backing file: " ++ e.to_string())
+        }
+        check_true(disk_after_save.contains("// saved over ssh vfs"), "backing file on remote mount updated")
+
+        -- Verify Emacs TRAMP `/ssh:devbox:/include/calc.hpp` resolves to canonical `ssh://devbox/include/calc.hpp`
+        check_eq_str(
+            world.resolve_path("/ssh:devbox:/include/calc.hpp"),
+            "ssh://devbox/include/calc.hpp",
+            "EditorWorld.resolve_path normalizes TRAMP /ssh: URI",
+        )
+        println("  [PASS] 2. Transparent SSH VFS open, edit & save verified on remote backing filesystem")
+
+        -- ====================================================================
+        -- Scenario 5 (Part A): Server-Side LSP Attachment, Root & Cross-File `gd`
+        -- ====================================================================
+        let att_opt = lsp_svc.buf_attachments.get(main_buf.id)
+        check_true(att_opt != null, "server-side LSP attached on buffer-opened")
+        let att = att_opt.as(BufferLspAttachment)
+        check_eq_str(
+            att.root_dir,
+            "ssh://devbox",
+            "remote LSP root_dir == ssh://devbox via remote compile_commands.json",
+        )
+        check_eq_str(att.server_name, "clangd@devbox", "remote LSP server_name clangd@devbox")
+        check_true(att.binary_found, "clangd resolved via remote_which / search dirs")
+        check_true(
+            world.statusline_right_extra.contains("clangd@devbox")
+                and world.statusline_right_extra.contains("[REMOTE devbox]"),
+            "statusline_right_extra displays clangd@devbox [REMOTE devbox]",
+        )
+
+        -- Inspect `*LspInfo*` for `[REMOTE devbox]`
+        feed(kernel, ":LspInfo<Return>")#
+        check_eq_str(world.active_buffer().name, LSP_INFO_BUF_NAME, "*LspInfo* opened")
+        check_true(world.active_buffer().to_text().contains("[REMOTE devbox]"), "*LspInfo* shows [REMOTE devbox]")
+        feed(kernel, "q")#
+        check_eq_str(world.active_buffer().file_path, "ssh://devbox/src/main.cpp", "closed *LspInfo* back to main.cpp")
+
+        -- Position cursor on `calc_add` in `int sum = calc_add(20, 22);` and press `gd`!
+        let call_row = find_line_containing(main_buf, "calc_add(20, 22)")
+        check_true(call_row >= 0, "found calc_add call line")
+        let call_col = main_buf.line_at(call_row).find_indices("calc_add").get(0).as(i64)
+        main_buf.point = Pos.new(call_row, call_col + 2)
+
+        feed(kernel, "gd")#
+        let jumped_buf = world.active_buffer()
+        check_eq_str(
+            jumped_buf.file_path,
+            "ssh://devbox/include/calc.hpp",
+            "gd jumped across remote project into ssh://devbox/include/calc.hpp",
+        )
+        check_true(
+            jumped_buf.line_at(jumped_buf.point.row).contains("calc_add"),
+            "gd landed directly on remote calc_add declaration",
+        )
+        -- Verify second remote file in same project reused the SAME server-side clangd client!
+        check_eq_i64(lsp_svc.client_order.len(), 1, "single shared clangd@devbox client across remote project")
+
+        -- Jump back with `<C-o>` and test `gr` (`lsp-references`) across remote files
+        feed(kernel, "<C-o>")#
+        check_eq_str(world.active_buffer().file_path, "ssh://devbox/src/main.cpp", "<C-o> returned to main.cpp")
+        feed(kernel, "gr")#
+        check_eq_str(world.active_buffer().name, LSP_REFS_BUF_NAME, "gr opened *LSP References*")
+        check_true(world.quickfix.len() >= 2, "gr found references in both main.cpp and calc.hpp")
+        feed(kernel, "q")#
+        println("  [PASS] 3. Server-side LSP attachment (root_dir=ssh://devbox, clangd@devbox, gd -> calc.hpp, gr)")
+
+        -- ====================================================================
+        -- Scenario 3: `*Remote*` Dashboard, Port-Forward, Exec, Files & Grep
+        -- ====================================================================
+        feed(kernel, ":RemoteStatus<Return>")#
+        let st_buf = world.active_buffer()
+        check_eq_str(st_buf.name, REMOTE_STATUS_BUF_NAME, "*Remote* dashboard opened")
+        check_eq_str(st_buf.major_mode, MODE_REMOTE_STATUS, "major_mode == remote-status")
+        check_true(st_buf.to_text().contains("devbox"), "*Remote* lists active devbox connection")
+
+        -- Start SSH port-forward `8080:127.0.0.1:80`
+        feed(kernel, ":RemotePortForward<Space>8080:127.0.0.1:80<Return>")#
+        let tunnels = remote_port_forward_list()
+        check_eq_i64(tunnels.len(), 1, "1 active SSH port-forward started")
+        let t0 = tunnels.get(0).as(RemoteTunnelInfo)
+        check_eq_i64(t0.local_port, 8080, "tunnel local_port == 8080")
+        check_eq_i64(t0.remote_port, 80, "tunnel remote_port == 80")
+        check_true(st_buf.to_text().contains("127.0.0.1:8080 -> 127.0.0.1:80"), "*Remote* refreshed with tunnel")
+
+        -- Run `:RemoteExec`
+        feed(kernel, ":RemoteExec<Space>echo<Space>lava_remote_exec_ok<Return>")#
+        let out_buf = world.active_buffer()
+        check_eq_str(out_buf.name, REMOTE_OUTPUT_BUF_NAME, "*Remote Output* opened")
+        check_eq_i64(rem_svc.last_exec_status, 0, "remote_exec exit code 0")
+        check_true(out_buf.to_text().contains("lava_remote_exec_ok"), "*Remote Output* captured stdout")
+        feed(kernel, "q")#
+
+        -- Run `remote-files` (`<Space> S f`) interactive picker -> type `calc.hpp<Return>`
+        feed(kernel, "<Space>Sf")#
+        check_true(world.minibuffer_view.active, "remote-files (<Space> S f) opened minibuffer picker")
+        feed(kernel, "calc.hpp<Return>")#
+        check_eq_str(
+            world.active_buffer().file_path,
+            "ssh://devbox/include/calc.hpp",
+            "RemoteFiles opened ssh://devbox/include/calc.hpp",
+        )
+
+        -- Run `:RemoteGrep RemoteAccumulator` -> populates `world.quickfix` with `ssh://devbox/...`
+        feed(kernel, ":RemoteGrep<Space>RemoteAccumulator<Return>")#
+        check_eq_str(world.active_buffer().name, REMOTE_QUICKFIX_BUF_NAME, "*Quickfix* opened by RemoteGrep")
+        check_true(not world.quickfix.is_empty(), "world.quickfix populated by RemoteGrep")
+        let qf0 = world.quickfix.get(0).as(QuickfixEntry)
+        check_eq_str(qf0.file_path, "ssh://devbox/include/calc.hpp", "quickfix entry has canonical ssh:// URI")
+        feed(kernel, "<Return>")#
+        check_eq_str(world.active_buffer().file_path, "ssh://devbox/include/calc.hpp", "RET in *Quickfix* jumped to remote hit")
+
+        -- Stop port-forward cleanly
+        feed(kernel, ":RemotePortForwardStop<Space>" ++ t0.id.to_string() ++ "<Return>")#
+        check_eq_i64(remote_port_forward_list().len(), 0, "port-forward stopped cleanly")
+        println("  [PASS] 4. *Remote* dashboard, port-forward, RemoteExec, RemoteFiles & RemoteGrep quickfix")
+
+        -- ====================================================================
+        -- Scenario 4: `*Remote Dirvish*` Ranger Navigation & File Operations
+        -- ====================================================================
+        feed(kernel, ":RemoteBrowse<Space>ssh://devbox/<Return>")#
+        let dv_buf = world.active_buffer()
+        check_eq_str(dv_buf.name, REMOTE_DIRVISH_BUF_NAME, "*Remote Dirvish* opened")
+        check_eq_str(dv_buf.major_mode, MODE_REMOTE_DIRVISH, "major_mode == remote-dirvish")
+        check_eq_str(rem_svc.current_uri, "ssh://devbox/", "browsing ssh://devbox/")
+        check_true(dv_buf.to_text().contains("include/") and dv_buf.to_text().contains("src/"), "lists include/ and src/")
+
+        -- Move down with `j` onto `src/` (`include/` is row 3, `src/` is row 4) and press `l` to enter `src/`!
+        feed(kernel, "j")#
+        feed(kernel, "l")#
+        check_eq_str(rem_svc.current_uri, "ssh://devbox/src/", "l entered ssh://devbox/src/")
+        check_true(world.active_buffer().to_text().contains("main.cpp"), "src/ lists main.cpp")
+
+        -- Press `h` to ascend to `ssh://devbox/` and verify cursor highlights `src`!
+        feed(kernel, "h")#
+        check_eq_str(rem_svc.current_uri, "ssh://devbox/", "h ascended to ssh://devbox/")
+        let cur_line_after_up = world.active_buffer().line_at(world.active_buffer().point.row)
+        check_true(cur_line_after_up.contains("src/"), "h highlighted previous child directory src/")
+
+        -- Press `a` to create a new remote file `notes.txt` (creates & opens `ssh://devbox/notes.txt`), then return to browse
+        feed(kernel, "anotes.txt<Return>")#
+        check_eq_str(world.active_buffer().file_path, "ssh://devbox/notes.txt", "a created & opened ssh://devbox/notes.txt")
+        let st_notes = remote_stat("ssh://devbox/notes.txt") ! { e => panic(e) }
+        check_true(st_notes.exists and st_notes.is_file, "notes.txt exists on remote mount")
+
+        -- Return to `*Remote Dirvish*` on `ssh://devbox/`, focus `notes.txt`, rename via `r` -> `notes_renamed.txt`
+        feed(kernel, ":RemoteBrowse<Space>ssh://devbox/<Return>")#
+        let notes_row = find_line_containing(world.active_buffer(), "notes.txt")
+        check_true(notes_row >= 0, "notes.txt listed in *Remote Dirvish*")
+        world.active_buffer().point = Pos.new(notes_row, 23)
+
+        -- Clear initial prompt text with `<C-u>` and type `notes_renamed.txt`
+        feed(kernel, "r<C-u>notes_renamed.txt<Return>")#
+        let st_ren = remote_stat("ssh://devbox/notes_renamed.txt") ! { e => panic(e) }
+        check_true(st_ren.exists, "r renamed notes.txt -> notes_renamed.txt")
+
+        -- Copy + Paste in same dir via `yy` + `pp` -> creates auto-disambiguated `notes_renamed_copy.txt`!
+        feed(kernel, "yy")#
+        check_eq_str(rem_svc.yanked_uri, "ssh://devbox/notes_renamed.txt", "yy yanked canonical URI")
+        feed(kernel, "pp")#
+        let st_copy = remote_stat("ssh://devbox/notes_renamed_copy.txt") ! { e => panic(e) }
+        check_true(st_copy.exists, "pp pasted notes_renamed_copy.txt")
+
+        -- Copy canonical URI to clipboard via `yp`
+        feed(kernel, "yp")#
+        check_eq_str(host_clipboard_get(), "ssh://devbox/notes_renamed_copy.txt", "yp copied canonical ssh:// URI")
+
+        -- Delete `notes_renamed_copy.txt` via `D` + `y` confirmation!
+        feed(kernel, "Dy")#
+        let st_del = remote_stat("ssh://devbox/notes_renamed_copy.txt") ! { e => panic(e) }
+        check_true(not st_del.exists, "D + y deleted notes_renamed_copy.txt")
+
+        -- Move to `src/`, enter with `l`, and press `<Return>` on `main.cpp` to open it!
+        let src_row = find_line_containing(world.active_buffer(), "src/")
+        check_true(src_row >= 0, "found src/ row")
+        world.active_buffer().point = Pos.new(src_row, 23)
+        feed(kernel, "l")#
+        check_eq_str(rem_svc.current_uri, "ssh://devbox/src/", "entered ssh://devbox/src/")
+        let main_row = find_line_containing(world.active_buffer(), "main.cpp")
+        check_true(main_row >= 0, "found main.cpp row")
+        world.active_buffer().point = Pos.new(main_row, 23)
+        feed(kernel, "<Return>")#
+        check_eq_str(
+            world.active_buffer().file_path,
+            "ssh://devbox/src/main.cpp",
+            "<Return> in *Remote Dirvish* opened ssh://devbox/src/main.cpp",
+        )
+        println("  [PASS] 5. *Remote Dirvish* Ranger j/k/l/h, a (create), r (rename), yy+pp (copy/paste), yp, D (delete) & RET")
+
+        -- ====================================================================
+        -- Scenario 6: Minibuffer `ssh://` Host & Cached Remote Path Completion
+        -- ====================================================================
+        feed(kernel, "<C-x><C-f>")#
+        check_true(world.minibuffer_view.active, "C-x C-f opened FilePath minibuffer")
+        check_true(mb.request.kind == PromptKind.FilePath, "PromptKind.FilePath active")
+
+        -- Clear initial local dir and type `ssh://` -> suggests `ssh://devbox/` with `[CONN]` badge!
+        feed(kernel, "<C-u>ssh://")#
+        check_true(not mb.items.is_empty(), "ssh:// produced remote host candidates")
+        var found_devbox_host = false
+        for i in 0..mb.items.len() {
+            let (cand, _) = mb.items.get(i.as(usize)).as((String, String))
+            let rich = mb.rich_items.get(i.as(usize)).as(MinibufferRichItem)
+            if cand == "ssh://devbox/" and rich.kind_badge == "[CONN]" {
+                found_devbox_host = true
+            }
+        }
+        check_true(found_devbox_host, "ssh:// offers ssh://devbox/ with [CONN] badge")
+
+        -- Type `devbox/src/` -> caches `mb.cached_path_dir == "ssh://devbox/src/"` and lists `main.cpp`!
+        feed(kernel, "devbox/src/")#
+        check_eq_str(mb.cached_path_dir, "ssh://devbox/src/", "cached_path_dir == ssh://devbox/src/")
+        var found_remote_main = false
+        for i in 0..mb.items.len() {
+            let (cand, _) = mb.items.get(i.as(usize)).as((String, String))
+            if cand == "ssh://devbox/src/main.cpp" {
+                found_remote_main = true
+            }
+        }
+        check_true(found_remote_main, "ssh://devbox/src/ lists ssh://devbox/src/main.cpp")
+
+        -- Typing characters filters cached entries without changing `cached_path_dir`
+        feed(kernel, "ma")#
+        check_eq_str(mb.cached_path_dir, "ssh://devbox/src/", "typing filter reuses cached remote dir")
+        check_eq_i64(mb.items.len(), 1, "filtered to single candidate main.cpp")
+
+        -- `<C-l>` (`vertico_up_directory`) steps cleanly up `ssh://devbox/src/ma` -> `ssh://devbox/src/` -> `ssh://devbox/` -> `ssh://`!
+        feed(kernel, "<C-l>")#
+        check_eq_str(mb.input_text, "ssh://devbox/src/", "C-l #1 -> ssh://devbox/src/")
+        feed(kernel, "<C-l>")#
+        check_eq_str(mb.input_text, "ssh://devbox/", "C-l #2 -> ssh://devbox/")
+        feed(kernel, "<C-l>")#
+        check_eq_str(mb.input_text, "ssh://", "C-l #3 -> ssh://")
+        feed(kernel, "<Escape>")#
+        check_true(not world.minibuffer_view.active, "Esc cancelled minibuffer cleanly")
+
+        -- Also verify `:e ssh://devbox/include/` Ex Stage 2 remote completion + `<Tab>`!
+        feed(kernel, ":e<Space>ssh://devbox/include/<Tab><Return>")#
+        check_eq_str(
+            world.active_buffer().file_path,
+            "ssh://devbox/include/calc.hpp",
+            ":e ssh://devbox/include/<Tab><Return> completed & opened calc.hpp",
+        )
+
+        -- Verify cross-file remote `:LspRename` across `calc.hpp` and `main.cpp`
+        let decl_row = find_line_containing(world.active_buffer(), "calc_add")
+        check_true(decl_row >= 0, "found calc_add in calc.hpp")
+        let decl_col = world.active_buffer().line_at(decl_row).find_indices("calc_add").get(0).as(i64)
+        world.active_buffer().point = Pos.new(decl_row, decl_col + 2)
+        feed(kernel, ":LspRename<Space>calc_sum<Return>")#
+        check_true(world.active_buffer().to_text().contains("calc_sum(int lhs"), "calc.hpp updated by remote LspRename")
+        check_true(main_buf.to_text().contains("calc_sum(20, 22)"), "main.cpp updated across remote workspace by LspRename")
+        println("  [PASS] 6. Minibuffer ssh:// [CONN] host completion, cached remote readdir, <Tab>, <C-l> & remote LspRename")
+
+    -- Clean up temporary fixture directory
+    let _ = fs.remove_dir_all(tmp_base) ! { _ => () }
+    println("ALL REMOTE SSH + SERVER-SIDE LSP + MINIBUFFER TESTS PASSED!")
+}

@@ -1,0 +1,873 @@
+-- ext_cmp: Multi-Source Auto-Completion & Fuzzy Popup Engine (`lava.org/ext_cmp`).
+-- Inspired by nvim-cmp / blink.cmp / Corfu: publishes `"lava.cmp.engine"` (`CmpService`),
+-- aggregates Snippets, Language Keywords, Buffer Identifiers, File Paths, and Custom Sources,
+-- ranks candidates via `@lava_accel.accel_fuzzy_rank`, and drives `world.completion_popup`.
+
+use std.collections.{HashMap, Set}
+use std.fs
+use std.fs.DirEntry
+use std.path
+use @lava_core.{
+    ExtId, InteractiveEffects, KeyStroke, ServiceEffects, SystemKernel, status_emit
+}
+use @lava_accel.{FuzzyHit, accel_doc_collect_words, accel_fuzzy_rank}
+use @ext_document.{
+    Buffer, BufferId, CompletionItem, CompletionPopup, EditorWorld, Pos, Span, ext_document_id,
+    require_editor_world
+}
+use @ext_vim.{
+    SERVICE_VIM, VimMode, VimState, ext_vim_id, require_vim_state
+}
+use @ext_snippets.{
+    SERVICE_SNIPPETS, SnippetService, SnippetSpec, ext_snippets_id
+}
+
+pub const SERVICE_CMP: String = "lava.cmp.engine"
+pub const OWNER_CMP: String = "ext_cmp"
+
+pub fn ext_cmp_id() -> ExtId = ExtId("lava.org/ext_cmp")
+
+pub struct CmpCustomSource {
+    pub name: String,
+    pub provider: fn(Buffer, String) -> List,
+}
+
+pub struct CmpService {
+    pub enabled: bool,
+    pub min_chars: i64,
+    pub max_items: i64,
+    pub custom_sources: List,
+    pub suppress_next_hook: bool,
+}
+
+struct PrefixContext {
+    kind: String,
+    replace_start_col: i64,
+    prefix: String,
+    dir_part: String,
+}
+
+fn is_ident_char(ch: String) -> bool {
+    if ch == "" {
+        return false
+    }
+    ch == "_" or ch.is_alphanumeric()
+}
+
+fn is_ident_start(ch: String) -> bool {
+    if ch == "" {
+        return false
+    }
+    ch == "_" or ch.is_alphabetic()
+}
+
+fn is_path_delimiter(ch: String) -> bool {
+    ch == " "
+        or ch == "\t"
+        or ch == "\""
+        or ch == "'"
+        or ch == "`"
+        or ch == "("
+        or ch == ")"
+        or ch == "["
+        or ch == "]"
+        or ch == "{{"
+        or ch == "}}"
+        or ch == "<"
+        or ch == ">"
+        or ch == ":"
+        or ch == ";"
+        or ch == ","
+        or ch == "="
+}
+
+fn find_last_slash(s: String) -> i64 {
+    var idx = s.char_len() - 1
+    while idx >= 0 {
+        if s.slice(idx, idx + 1) == "/" {
+            return idx
+        }
+        idx -= 1
+    }
+    -1
+}
+
+fn extract_prefix_context(world: EditorWorld, buf: Buffer, row: i64, col: i64) -> PrefixContext {
+    let line = buf.line_at(row)
+    let safe_col = if col < 0 {
+        0
+    } else if col > line.char_len() {
+        line.char_len()
+    } else {
+        col
+    }
+
+    -- 1. Check path prefix (`./`, `../`, `/...`, or `dir/...` when directory exists)
+    var p_start = safe_col
+    while p_start > 0 {
+        let prev = line.slice(p_start - 1, p_start)
+        if is_path_delimiter(prev) {
+            break
+        }
+        p_start -= 1
+    }
+    let raw_tok = line.slice(p_start, safe_col)
+    if raw_tok != ""
+        and (not raw_tok.starts_with("//"))
+        and (not raw_tok.starts_with("/*"))
+        and raw_tok.contains("/") {
+        let slash_idx = find_last_slash(raw_tok)
+        if slash_idx >= 0 {
+            let dir_part = raw_tok.slice(0, slash_idx + 1)
+            let leaf = raw_tok.slice(slash_idx + 1, raw_tok.char_len())
+            let explicit_rel_or_abs = raw_tok.starts_with("./")
+                or raw_tok.starts_with("../")
+                or raw_tok.starts_with("/")
+            let resolved_dir = resolve_completion_dir(world, buf, dir_part)
+            if resolved_dir != "" and (explicit_rel_or_abs or fs.is_dir(resolved_dir)) {
+                if fs.exists(resolved_dir) and fs.is_dir(resolved_dir) {
+                    return (PrefixContext {
+                        kind: "path",
+                        replace_start_col: p_start + slash_idx + 1,
+                        prefix: leaf,
+                        dir_part: resolved_dir,
+                    })
+                }
+            }
+        }
+    }
+
+    -- 2. Identifier / Snippet / Keyword prefix
+    var id_start = safe_col
+    while id_start > 0 {
+        let prev = line.slice(id_start - 1, id_start)
+        if is_ident_char(prev) {
+            id_start -= 1
+        } else {
+            break
+        }
+    }
+    PrefixContext {
+        kind: "ident",
+        replace_start_col: id_start,
+        prefix: line.slice(id_start, safe_col),
+        dir_part: "",
+    }
+}
+
+fn resolve_completion_dir(world: EditorWorld, buf: Buffer, dir_part: String) -> String {
+    let base_dir = if buf.file_path != "" {
+        let p_opt = path.parent(buf.file_path)
+        if p_opt != null and p_opt.as(String) != "" {
+            p_opt.as(String)
+        } else {
+            world.cwd
+        }
+    } else {
+        world.cwd
+    }
+    if dir_part == "/" {
+        return "/"
+    }
+    if path.is_absolute(dir_part) {
+        return path.normalize(dir_part)
+    }
+    path.normalize(path.join(base_dir, dir_part))
+}
+
+fn collect_path_candidates(search_dir: String, leaf_prefix: String, max_items: i64) -> List {
+    let entries! = fs.read_dir_entries(search_dir) else {
+        return List()
+    }
+    let show_hidden = leaf_prefix.starts_with(".")
+    let dirs = List()
+    let files = List()
+    for i in 0..entries.len() {
+        let e = entries.get(i.as(usize)).as(DirEntry)
+        if e.name == "" or e.name == "." or e.name == ".." {
+            continue
+        }
+        if (not show_hidden) and e.name.starts_with(".") {
+            continue
+        }
+        if e.is_dir {
+            dirs.push(e)
+        } else {
+            files.push(e)
+        }
+    }
+    dirs.sort_by(|a: Any, b: Any| {
+        a.as(DirEntry).name.to_lower().cmp(b.as(DirEntry).name.to_lower())
+    })
+    files.sort_by(|a: Any, b: Any| {
+        a.as(DirEntry).name.to_lower().cmp(b.as(DirEntry).name.to_lower())
+    })
+
+    let raw_items = List()
+    let labels = List()
+    for i in 0..dirs.len() {
+        let d = dirs.get(i.as(usize)).as(DirEntry)
+        let disp = d.name ++ "/"
+        raw_items.push(CompletionItem {
+            label: disp,
+            insert_text: disp,
+            kind: "Path",
+            detail: "[Dir]",
+        })
+        labels.push(d.name)
+    }
+    for i in 0..files.len() {
+        let f = files.get(i.as(usize)).as(DirEntry)
+        raw_items.push(CompletionItem {
+            label: f.name,
+            insert_text: f.name,
+            kind: "Path",
+            detail: "[File]",
+        })
+        labels.push(f.name)
+    }
+
+    if raw_items.is_empty() {
+        return raw_items
+    }
+    let lim = if max_items > 0 { max_items } else { 15 }
+    if leaf_prefix == "" {
+        let out = List()
+        let count = if raw_items.len() > lim { lim } else { raw_items.len() }
+        for i in 0..count {
+            out.push(raw_items.get(i.as(usize)))
+        }
+        return out
+    }
+    let hits = accel_fuzzy_rank(leaf_prefix, labels, limit = lim)
+    let ranked = List()
+    for i in 0..hits.len() {
+        let h = hits.get(i.as(usize)).as(FuzzyHit)
+        ranked.push(raw_items.get(h.index.as(usize)))
+    }
+    ranked
+}
+
+fn keywords_for_mode(mode: String) -> List {
+    when {
+        mode == "nessa" => [
+            "fn", "pub", "private", "let", "var", "struct", "enum", "impl", "use", "mod",
+            "const", "newtype", "effect", "handles", "async", "await", "if", "else", "while",
+            "for", "in", "match", "when", "return", "break", "continue", "true", "false",
+            "null", "and", "or", "not", "derive", "error", "String", "i64", "f64", "bool",
+            "usize", "Unit", "Any", "List", "HashMap", "Set"
+        ],
+        mode == "rust" => [
+            "fn", "pub", "let", "mut", "struct", "enum", "impl", "trait", "use", "mod",
+            "const", "static", "type", "where", "async", "await", "if", "else", "while",
+            "for", "in", "loop", "match", "return", "break", "continue", "true", "false",
+            "Self", "self", "super", "crate", "Result", "Option", "Some", "None", "Ok",
+            "Err", "String", "Vec"
+        ],
+        mode == "python" => [
+            "def", "class", "import", "from", "as", "return", "yield", "async", "await",
+            "if", "elif", "else", "while", "for", "in", "try", "except", "finally", "with",
+            "raise", "pass", "break", "continue", "lambda", "True", "False", "None",
+            "and", "or", "not", "self"
+        ],
+        mode == "javascript" or mode == "typescript" => [
+            "function", "const", "let", "var", "class", "extends", "import", "export",
+            "from", "default", "async", "await", "return", "if", "else", "switch", "case",
+            "for", "while", "try", "catch", "finally", "throw", "new", "typeof",
+            "interface", "type", "implements", "readonly", "true", "false", "null", "undefined"
+        ],
+        mode == "go" => [
+            "func", "package", "import", "type", "struct", "interface", "map", "chan",
+            "var", "const", "return", "if", "else", "switch", "case", "select", "for",
+            "range", "go", "defer", "fallthrough", "break", "continue", "true", "false",
+            "nil", "error", "string", "int"
+        ],
+        mode == "c" => [
+            "int", "char", "void", "long", "double", "float", "unsigned", "signed",
+            "struct", "enum", "union", "typedef", "static", "const", "extern", "inline",
+            "sizeof", "return", "if", "else", "switch", "case", "while", "for", "do",
+            "break", "continue", "include", "define", "NULL"
+        ],
+        mode == "shell" => [
+            "if", "then", "elif", "else", "fi", "for", "in", "do", "done", "while",
+            "case", "esac", "function", "return", "local", "export", "readonly", "set",
+            "unset", "shift", "echo", "exit"
+        ],
+        else => List(),
+    }
+}
+
+fn scan_buffer_words(
+    src_buf: Buffer,
+    center_row: i64,
+    radius_rows: i64,
+    skip_row: i64,
+    skip_col: i64,
+    max_words: i64,
+    seen_words: Set,
+    out_words: List,
+) {
+    src_buf.sync_external_lines()
+    let collected = accel_doc_collect_words(
+        src_buf.doc_id,
+        center_row,
+        radius_rows,
+        skip_row,
+        skip_col,
+        max_words,
+    )
+    for i in 0..collected.len() {
+        let word = collected.get(i.as(usize)).as(String)
+        if not seen_words.contains(word) {
+            seen_words.insert(word)
+            out_words.push(word)
+        }
+    }
+}
+
+pub fn collect_candidates(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    buf: Buffer,
+    prefix: String,
+    .replace_start_col: i64 = -1,
+    .limit: i64 = 15,
+) -> List {
+    let raw_items = List()
+    let labels = List()
+    let seen_non_snippet = Set.new()
+
+    -- 1. Snippets from `SnippetService` (`"lava.snippets.registry"`)
+    let snip_opt = kernel.service(SERVICE_SNIPPETS)
+    if snip_opt != null {
+        let snip_svc = snip_opt.as(SnippetService)
+        let snips = snip_svc.snippets_for_mode(buf.major_mode)
+        for i in 0..snips.len() {
+            let s = snips.get(i.as(usize)).as(SnippetSpec)
+            raw_items.push(CompletionItem {
+                label: s.trigger,
+                insert_text: s.body,
+                kind: "Snippet",
+                detail: s.description,
+            })
+            labels.push(s.trigger)
+        }
+    }
+
+    -- 2. Custom registered completion sources on `CmpService`
+    let cmp_opt = kernel.service(SERVICE_CMP)
+    if cmp_opt != null {
+        let cmp = cmp_opt.as(CmpService)
+        for si in 0..cmp.custom_sources.len() {
+            let cs = cmp.custom_sources.get(si.as(usize)).as(CmpCustomSource)
+            let provided = (cs.provider)(buf, prefix)
+            for pi in 0..provided.len() {
+                let item = provided.get(pi.as(usize)).as(CompletionItem)
+                raw_items.push(item)
+                labels.push(item.label)
+                if item.kind != "Snippet" {
+                    seen_non_snippet.insert(item.label)
+                }
+            }
+        }
+    }
+
+    -- 3. Mode-aware Language Keywords (`kind = "Keyword"`)
+    let kws = keywords_for_mode(buf.major_mode)
+    let kw_set = Set.new()
+    for i in 0..kws.len() {
+        let kw = kws.get(i.as(usize)).as(String)
+        kw_set.insert(kw)
+    }
+
+    -- 4. Buffer Identifiers (`kind = "Identifier"`) from active buffer + other open buffers
+    let start_col = if replace_start_col >= 0 {
+        replace_start_col
+    } else {
+        let line = buf.line_at(buf.point.row)
+        var sc = buf.point.col
+        while sc > 0 and is_ident_char(line.slice(sc - 1, sc)) {
+            sc -= 1
+        }
+        sc
+    }
+    let words = List()
+    let seen_scan = Set.new()
+    scan_buffer_words(buf, buf.point.row, 250, buf.point.row, start_col, 400, seen_scan, words)
+    var other_scanned: i64 = 0
+    var bi = world.buffer_order.len() - 1
+    while bi >= 0 and other_scanned < 4 {
+        let bid = world.buffer_order.get(bi.as(usize)).as(BufferId)
+        bi -= 1
+        if bid == buf.id or bid == world.messages_id {
+            continue
+        }
+        let other = world.buffers.get(bid).as(Buffer)
+        if other.name.starts_with("*") and other.id != world.scratch_id {
+            continue
+        }
+        scan_buffer_words(other, other.point.row, 120, -1, -1, 150, seen_scan, words)
+        other_scanned += 1
+    }
+
+    for i in 0..words.len() {
+        let w = words.get(i.as(usize)).as(String)
+        if (not kw_set.contains(w)) and (not seen_non_snippet.contains(w)) {
+            seen_non_snippet.insert(w)
+            raw_items.push(CompletionItem {
+                label: w,
+                insert_text: w,
+                kind: "Identifier",
+                detail: "[Buf]",
+            })
+            labels.push(w)
+        }
+    }
+
+    for i in 0..kws.len() {
+        let kw = kws.get(i.as(usize)).as(String)
+        if not seen_non_snippet.contains(kw) {
+            seen_non_snippet.insert(kw)
+            raw_items.push(CompletionItem {
+                label: kw,
+                insert_text: kw,
+                kind: "Keyword",
+                detail: "[Kw]",
+            })
+            labels.push(kw)
+        }
+    }
+
+    if raw_items.is_empty() {
+        return raw_items
+    }
+    let lim = if limit > 0 { limit } else { 15 }
+    let hits = accel_fuzzy_rank(prefix, labels, limit = lim)
+    let ranked = List()
+    for i in 0..hits.len() {
+        let h = hits.get(i.as(usize)).as(FuzzyHit)
+        ranked.push(raw_items.get(h.index.as(usize)))
+    }
+    ranked
+}
+
+impl CmpService {
+    pub fn new() -> CmpService {
+        CmpService {
+            enabled: true,
+            min_chars: 2,
+            max_items: 15,
+            custom_sources: List(),
+            suppress_next_hook: false,
+        }
+    }
+
+    pub fn register_source(self, name: String, provider: fn(Buffer, String) -> List) {
+        let entry = CmpCustomSource {
+            name: name,
+            provider: provider,
+        }
+        for i in 0..self.custom_sources.len() {
+            let cur = self.custom_sources.get(i.as(usize)).as(CmpCustomSource)
+            if cur.name == name {
+                self.custom_sources.set(i.as(usize), entry)
+                return
+            }
+        }
+        self.custom_sources.push(entry)
+    }
+
+    pub fn unregister_source(self, name: String) {
+        let kept = List()
+        for i in 0..self.custom_sources.len() {
+            let cur = self.custom_sources.get(i.as(usize)).as(CmpCustomSource)
+            if cur.name != name {
+                kept.push(cur)
+            }
+        }
+        self.custom_sources = kept
+    }
+
+    pub fn dismiss(self, world: EditorWorld) -> bool {
+        let was_active = world.completion_popup.active
+        if world.completion_popup.owner == OWNER_CMP or world.completion_popup.owner == "" {
+            world.completion_popup = CompletionPopup.inactive()
+        }
+        was_active
+    }
+
+    pub fn select_next(self, world: EditorWorld) -> bool {
+        let cp = world.completion_popup
+        if (not cp.active) or cp.items.is_empty() {
+            return false
+        }
+        let n = cp.items.len()
+        cp.selected_idx = (cp.selected_idx + 1) % n
+        true
+    }
+
+    pub fn select_prev(self, world: EditorWorld) -> bool {
+        let cp = world.completion_popup
+        if (not cp.active) or cp.items.is_empty() {
+            return false
+        }
+        let n = cp.items.len()
+        cp.selected_idx = (cp.selected_idx - 1 + n) % n
+        true
+    }
+
+    pub fn trigger(self, kernel: SystemKernel, .manual: bool = true) -> !String bool {
+        let world = require_editor_world(kernel)!
+        let buf = world.active_buffer()
+        if buf.read_only {
+            let _ = self.dismiss(world)
+            return false
+        }
+        let p = buf.clamp_pos(buf.point, insert_mode = true)
+        let ctx = extract_prefix_context(world, buf, p.row, p.col)
+
+        if ctx.kind == "path" {
+            let items = collect_path_candidates(ctx.dir_part, ctx.prefix, self.max_items)
+            if items.is_empty() {
+                let _ = self.dismiss(world)
+                return false
+            }
+            world.completion_popup = CompletionPopup {
+                active: true,
+                anchor_pos: Pos.new(p.row, ctx.replace_start_col),
+                replace_start_col: ctx.replace_start_col,
+                prefix: ctx.prefix,
+                items: items,
+                selected_idx: 0,
+                owner: OWNER_CMP,
+            }
+            return true
+        }
+
+        if (not manual) and ctx.prefix.char_len() < self.min_chars {
+            let _ = self.dismiss(world)
+            return false
+        }
+
+        let items = collect_candidates(
+            kernel,
+            world,
+            buf,
+            ctx.prefix,
+            replace_start_col = ctx.replace_start_col,
+            limit = self.max_items,
+        )
+        if items.is_empty() {
+            let _ = self.dismiss(world)
+            return false
+        }
+
+        world.completion_popup = CompletionPopup {
+            active: true,
+            anchor_pos: Pos.new(p.row, ctx.replace_start_col),
+            replace_start_col: ctx.replace_start_col,
+            prefix: ctx.prefix,
+            items: items,
+            selected_idx: 0,
+            owner: OWNER_CMP,
+        }
+        true
+    }
+
+    pub fn accept(self, kernel: SystemKernel) -> !String bool {
+        let world = require_editor_world(kernel)!
+        let cp = world.completion_popup
+        if (not cp.active) or cp.items.is_empty() {
+            return false
+        }
+        let buf = world.active_buffer()
+        if buf.read_only {
+            let _ = self.dismiss(world)
+            return false
+        }
+        let n = cp.items.len()
+        let idx = if cp.selected_idx < 0 {
+            0
+        } else if cp.selected_idx >= n {
+            n - 1
+        } else {
+            cp.selected_idx
+        }
+        let item = cp.items.get(idx.as(usize)).as(CompletionItem)
+        let rep_col = cp.replace_start_col
+        world.completion_popup = CompletionPopup.inactive()
+
+        if item.kind == "Snippet" {
+            let snip_opt = kernel.service(SERVICE_SNIPPETS)
+            if snip_opt != null {
+                let snip_svc = snip_opt.as(SnippetService)
+                return snip_svc.expand_snippet_body(
+                    buf,
+                    rep_col,
+                    item.insert_text,
+                    world.options.shiftwidth,
+                    world.options.expandtab,
+                )
+            }
+        }
+
+        let p = buf.clamp_pos(buf.point, insert_mode = true)
+        let safe_start = if rep_col < 0 {
+            0
+        } else if rep_col > p.col {
+            p.col
+        } else {
+            rep_col
+        }
+        buf.checkpoint(p, "cmp-pre-accept")
+        let (end_pos, _) = buf.replace_span(
+            Span.normalized(Pos.new(p.row, safe_start), Pos.new(p.row, p.col)),
+            item.insert_text,
+        )!
+        buf.point = end_pos
+        buf.preferred_col = end_pos.col
+        true
+    }
+}
+
+pub fn require_cmp_service(kernel: SystemKernel) -> !String CmpService {
+    let raw = kernel.require_service(SERVICE_CMP)!
+    raw.as(CmpService)
+}
+
+fn is_editing_insert_stroke(stroke: KeyStroke) -> bool {
+    if stroke.ctrl {
+        return stroke.key == "h" or stroke.key == "w"
+    }
+    if stroke.alt or stroke.super_mod {
+        return false
+    }
+    if stroke.key == "BackSpace" or stroke.key == "Delete" or stroke.key == "Space" {
+        return true
+    }
+    if stroke.text != "" and stroke.text.char_len() == 1 {
+        return true
+    }
+    stroke.key.char_len() == 1
+}
+
+fn cmp_insert_interceptor(
+    kernel: SystemKernel,
+    stroke: KeyStroke,
+) -> #ServiceEffects !String bool {
+    let cmp_opt = kernel.service(SERVICE_CMP)
+    if cmp_opt == null {
+        return false
+    }
+    let cmp = cmp_opt.as(CmpService)
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    if vim.mode != VimMode.Insert or vim.block_insert_active {
+        return false
+    }
+    let buf = world.active_buffer()
+    if buf.read_only {
+        return false
+    }
+
+    let ctrl_only = stroke.ctrl and (not stroke.alt) and (not stroke.super_mod)
+    let plain = (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod)
+    let cp = world.completion_popup
+
+    if cp.active and cp.owner == OWNER_CMP and (not cp.items.is_empty()) {
+        if (ctrl_only and stroke.key == "n") or (plain and stroke.key == "Down") {
+            let _ = cmp.select_next(world)
+            cmp.suppress_next_hook = true
+            return true
+        }
+        if (ctrl_only and stroke.key == "p") or (plain and stroke.key == "Up") {
+            let _ = cmp.select_prev(world)
+            cmp.suppress_next_hook = true
+            return true
+        }
+        if (ctrl_only and stroke.key == "y") or (plain and stroke.key == "Tab") {
+            let ok = cmp.accept(kernel)!
+            cmp.suppress_next_hook = true
+            return ok
+        }
+        if ctrl_only and stroke.key == "e" {
+            let _ = cmp.dismiss(world)
+            cmp.suppress_next_hook = true
+            return true
+        }
+    }
+
+    -- Manual popup trigger when popup is currently inactive
+    if ctrl_only and (stroke.key == "Space" or stroke.key == " " or stroke.key == "@") {
+        let _ = cmp.trigger(kernel, manual = true)!
+        cmp.suppress_next_hook = true
+        return true
+    }
+
+    if cmp.enabled and ctrl_only and stroke.key == "n" {
+        let p = buf.clamp_pos(buf.point, insert_mode = true)
+        let ctx = extract_prefix_context(world, buf, p.row, p.col)
+        if ctx.kind == "path" or ctx.prefix.char_len() >= 1 {
+            let opened = cmp.trigger(kernel, manual = true)!
+            if opened {
+                cmp.suppress_next_hook = true
+                return true
+            }
+        }
+    }
+
+    false
+}
+
+fn cmd_cmp_complete(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let cmp = require_cmp_service(kern)!
+    let opened = cmp.trigger(kern, manual = true)!
+    if not opened {
+        status_emit("No completion candidates")#
+    }
+    opened
+}
+
+fn cmd_cmp_confirm(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let cmp = require_cmp_service(kern)!
+    cmp.accept(kern)!
+}
+
+fn cmd_cmp_abort(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let cmp = require_cmp_service(kern)!
+    cmp.dismiss(world)
+}
+
+fn cmd_cmp_toggle(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let cmp = require_cmp_service(kern)!
+    cmp.enabled = not cmp.enabled
+    if not cmp.enabled {
+        let _ = cmp.dismiss(world)
+    }
+    let state_s = if cmp.enabled { "enabled" } else { "disabled" }
+    status_emit("Completion " ++ state_s)#
+    cmp.enabled
+}
+
+pub fn register_cmp_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_cmp_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_cmp",
+        "0.1.0",
+        "Multi-source fuzzy completion popup engine (snippets, buffer identifiers, language keywords, file paths).",
+        [ext_document_id(), ext_vim_id(), ext_snippets_id()],
+        |k: SystemKernel| -> !String Unit {
+            let cmp = CmpService.new()
+            k.publish_service(SERVICE_CMP, ext_id, cmp)
+
+            let vim = require_vim_state(k)!
+            vim.add_insert_interceptor(ext_id, cmp_insert_interceptor)
+
+            k.register_command(
+                "cmp-complete",
+                ext_id,
+                "Trigger completion popup at cursor (`<C-Space>`).",
+                cmd_cmp_complete,
+            )
+            k.register_command(
+                "cmp-confirm",
+                ext_id,
+                "Accept currently selected completion candidate (`<Tab>` / `<C-y>`).",
+                cmd_cmp_confirm,
+            )
+            k.register_command(
+                "cmp-abort",
+                ext_id,
+                "Dismiss active completion popup (`<C-e>`).",
+                cmd_cmp_abort,
+            )
+            k.register_command(
+                "cmp-Abort",
+                ext_id,
+                "Dismiss active completion popup (`<C-e>`).",
+                cmd_cmp_abort,
+                interactive = false,
+            )
+            k.register_command(
+                "cmp-toggle",
+                ext_id,
+                "Toggle live auto-completion popup (`:CmpToggle`).",
+                cmd_cmp_toggle,
+            )
+
+            k.add_hook(
+                "after-insert-stroke",
+                ext_id,
+                |kern: SystemKernel, payload: Any| -> Unit {
+                    let cmp_opt = kern.service(SERVICE_CMP)
+                    let w_opt = kern.service("lava.document.world")
+                    let v_opt = kern.service(SERVICE_VIM)
+                    if cmp_opt == null or w_opt == null or v_opt == null {
+                        return
+                    }
+                    let c = cmp_opt.as(CmpService)
+                    if c.suppress_next_hook {
+                        c.suppress_next_hook = false
+                        return
+                    }
+                    let w = w_opt.as(EditorWorld)
+                    let vs = v_opt.as(VimState)
+                    if (not c.enabled) or vs.mode != VimMode.Insert or vs.block_insert_active {
+                        let _ = c.dismiss(w)
+                        return
+                    }
+                    let stroke = payload.as(KeyStroke)
+                    if not is_editing_insert_stroke(stroke) {
+                        return
+                    }
+                    let _ = c.trigger(kern, manual = false) ! { _ => false }
+                },
+            )
+
+            k.add_hook(
+                "mode-changed",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| -> Unit {
+                    let cmp_opt = kern.service(SERVICE_CMP)
+                    let w_opt = kern.service("lava.document.world")
+                    let v_opt = kern.service(SERVICE_VIM)
+                    if cmp_opt != null and w_opt != null and v_opt != null {
+                        let vs = v_opt.as(VimState)
+                        if vs.mode != VimMode.Insert {
+                            let _ = cmp_opt.as(CmpService).dismiss(w_opt.as(EditorWorld))
+                        }
+                    }
+                },
+            )
+
+            k.add_hook(
+                "buffer-switched",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| -> Unit {
+                    let cmp_opt = kern.service(SERVICE_CMP)
+                    let w_opt = kern.service("lava.document.world")
+                    if cmp_opt != null and w_opt != null {
+                        let _ = cmp_opt.as(CmpService).dismiss(w_opt.as(EditorWorld))
+                    }
+                },
+            )
+
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let vim_opt = k.service(SERVICE_VIM)
+            if vim_opt != null {
+                vim_opt.as(VimState).remove_insert_interceptors(ext_id)
+            }
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                w_opt.as(EditorWorld).clear_owner_ui(OWNER_CMP)
+            }
+            ()
+        },
+    )
+}

@@ -1,0 +1,405 @@
+-- lava_lsp: Native Non-Blocking JSON-RPC 2.0 Stdio Language Server Bridge for Lava.
+-- Bridges `lava-lsp` (`LspManager`) via `std.runtime.host_call` when running inside the
+-- Lava host runtime, and provides pure-Nessa `$PATH` / project-root fallbacks in standalone
+-- `nessa run` unit tests.
+
+use std.env
+use std.fs
+use std.path
+use std.runtime
+
+pub const LSP_WAKE_TIMER_ID: i64 = 1280528384 -- `0x4C535000`
+
+pub struct LspDiag {
+    pub row: i64,
+    pub col: i64,
+    pub end_row: i64,
+    pub end_col: i64,
+    pub severity: String,
+    pub source: String,
+    pub code: String,
+    pub message: String,
+}
+
+pub struct LspLoc {
+    pub file_path: String,
+    pub row: i64,
+    pub col: i64,
+    pub end_row: i64,
+    pub end_col: i64,
+}
+
+pub struct LspSym {
+    pub name: String,
+    pub kind: String,
+    pub detail: String,
+    pub row: i64,
+    pub col: i64,
+    pub end_row: i64,
+}
+
+pub struct LspCompItem {
+    pub label: String,
+    pub insert_text: String,
+    pub kind: String,
+    pub detail: String,
+}
+
+pub struct LspTextEdit {
+    pub file_path: String,
+    pub start_row: i64,
+    pub start_col: i64,
+    pub end_row: i64,
+    pub end_col: i64,
+    pub new_text: String,
+}
+
+pub struct LspCodeAct {
+    pub title: String,
+    pub kind: String,
+    pub edits: List,
+}
+
+pub struct LspStatus {
+    pub id: i64,
+    pub command: String,
+    pub root_dir: String,
+    pub pid: i64,
+    pub alive: bool,
+    pub initialized: bool,
+    pub server_name: String,
+    pub server_version: String,
+    pub capabilities: String,
+    pub pending_requests: i64,
+}
+
+pub enum LspWireEvent {
+    pub Initialized(server_name: String, server_version: String, capabilities: String),
+    pub Diagnostics(file_path: String, items: List),
+    pub Hover(req_id: i64, markdown: String),
+    pub Locations(req_id: i64, kind: String, items: List),
+    pub Symbols(req_id: i64, items: List),
+    pub Completions(req_id: i64, items: List),
+    pub WorkspaceEdit(req_id: i64, label: String, edits: List),
+    pub CodeActions(req_id: i64, items: List),
+    pub Log(level: String, message: String),
+    pub RequestError(req_id: i64, method: String, message: String),
+    pub Exited(exit_code: i64),
+}
+
+pub fn lsp_available() -> bool {
+    let raw! = runtime.host_call("lsp_available", List()) else {
+        return false
+    }
+    raw.as(bool)
+}
+
+pub fn lsp_which(bin: String) -> String {
+    let trimmed = bin.trim()
+    if trimmed == "" {
+        return ""
+    }
+    let raw_res = runtime.host_call("lsp_which", [trimmed])
+    raw_res match {
+        v! => return v.as(String),
+        error _ => (),
+    }
+    if trimmed.contains("/") {
+        if fs.exists(trimmed) and (not fs.is_dir(trimmed)) {
+            return trimmed
+        }
+        return ""
+    }
+    let path_env = env.get_or("PATH", "/usr/local/bin:/usr/bin:/bin")
+    let dirs = path_env.split(":")
+    for i in 0..dirs.len() {
+        let d = dirs.get(i.as(usize)).as(String).trim()
+        if d != "" {
+            let full = path.join(d, trimmed)
+            if fs.exists(full) and (not fs.is_dir(full)) {
+                return full
+            }
+        }
+    }
+    ""
+}
+
+pub fn lsp_find_root(start_path: String, markers: List) -> String {
+    let raw_res = runtime.host_call("lsp_find_root", [start_path, markers])
+    raw_res match {
+        v! => return v.as(String),
+        error _ => (),
+    }
+    let base = if start_path.trim() == "" {
+        env.get_or("PWD", ".")
+    } else if fs.exists(start_path) and fs.is_dir(start_path) {
+        path.normalize(start_path)
+    } else {
+        let p_opt = path.parent(start_path)
+        if p_opt != null { path.normalize(p_opt.as(String)) } else { "." }
+    }
+    for mi in 0..markers.len() {
+        let m = markers.get(mi.as(usize)).as(String)
+        if m != "" {
+            var cur = base
+            var guard: i64 = 0
+            while guard < 32 and cur != "" {
+                if fs.exists(path.join(cur, m)) {
+                    return cur
+                }
+                let par_opt = path.parent(cur)
+                if par_opt == null {
+                    break
+                }
+                let next_c = par_opt.as(String)
+                if next_c == cur {
+                    break
+                }
+                cur = next_c
+                guard += 1
+            }
+        }
+    }
+    base
+}
+
+pub fn lsp_spawn(
+    cmd: String,
+    args: List,
+    cwd: String,
+    root_dir: String,
+    .init_options_json: String = "",
+) -> !String i64 {
+    let raw = runtime.host_call("lsp_spawn", [cmd, args, cwd, root_dir, init_options_json])!
+    raw.as(i64)
+}
+
+pub fn lsp_spawn_remote(
+    transport_bin: String,
+    transport_args: List,
+    remote_prefix: String,
+    remote_root_dir: String,
+    display_server_name: String,
+    .init_options_json: String = "",
+) -> !String i64 {
+    let raw = runtime.host_call(
+        "lsp_spawn_remote",
+        [
+            transport_bin,
+            transport_args,
+            remote_prefix,
+            remote_root_dir,
+            display_server_name,
+            init_options_json,
+        ],
+    )!
+    raw.as(i64)
+}
+
+pub fn lsp_did_open(
+    session_id: i64,
+    file_path: String,
+    language_id: String,
+    version: i64,
+    text: String,
+) -> !String Unit {
+    let _ = runtime.host_call("lsp_did_open", [session_id, file_path, language_id, version, text])!
+    ()
+}
+
+pub fn lsp_did_change(
+    session_id: i64,
+    file_path: String,
+    version: i64,
+    full_text: String,
+) -> !String Unit {
+    let _ = runtime.host_call("lsp_did_change", [session_id, file_path, version, full_text])!
+    ()
+}
+
+pub fn lsp_did_save(session_id: i64, file_path: String, text: String) -> !String Unit {
+    let _ = runtime.host_call("lsp_did_save", [session_id, file_path, text])!
+    ()
+}
+
+pub fn lsp_did_close(session_id: i64, file_path: String) -> !String Unit {
+    let _ = runtime.host_call("lsp_did_close", [session_id, file_path])!
+    ()
+}
+
+pub fn lsp_request(
+    session_id: i64,
+    kind: String,
+    file_path: String,
+    row: i64,
+    col: i64,
+    .extra: String = "",
+) -> !String i64 {
+    let raw = runtime.host_call("lsp_request", [session_id, kind, file_path, row, col, extra])!
+    raw.as(i64)
+}
+
+private fn decode_text_edits(raw_edits: List) -> List {
+    let out = List()
+    for i in 0..raw_edits.len() {
+        let e = raw_edits.get(i.as(usize)).as(List)
+        out.push(LspTextEdit {
+            file_path: e.get(0).as(String),
+            start_row: e.get(1).as(i64),
+            start_col: e.get(2).as(i64),
+            end_row: e.get(3).as(i64),
+            end_col: e.get(4).as(i64),
+            new_text: e.get(5).as(String),
+        })
+    }
+    out
+}
+
+pub fn lsp_poll_events(session_id: i64) -> !String List {
+    let raw = runtime.host_call("lsp_poll_events", [session_id])!
+    let raw_list = raw.as(List)
+    let out = List()
+    for i in 0..raw_list.len() {
+        let rec = raw_list.get(i.as(usize)).as(List)
+        let tag = rec.get(0).as(String)
+        when {
+            tag == "initialized" => {
+                out.push(LspWireEvent.Initialized(
+                    rec.get(1).as(String),
+                    rec.get(2).as(String),
+                    rec.get(3).as(String),
+                ))
+            },
+            tag == "diagnostics" => {
+                let fp = rec.get(1).as(String)
+                let raw_items = rec.get(2).as(List)
+                let items = List()
+                for di in 0..raw_items.len() {
+                    let d = raw_items.get(di.as(usize)).as(List)
+                    items.push(LspDiag {
+                        row: d.get(0).as(i64),
+                        col: d.get(1).as(i64),
+                        end_row: d.get(2).as(i64),
+                        end_col: d.get(3).as(i64),
+                        severity: d.get(4).as(String),
+                        source: d.get(5).as(String),
+                        code: d.get(6).as(String),
+                        message: d.get(7).as(String),
+                    })
+                }
+                out.push(LspWireEvent.Diagnostics(fp, items))
+            },
+            tag == "hover" => {
+                out.push(LspWireEvent.Hover(rec.get(1).as(i64), rec.get(2).as(String)))
+            },
+            tag == "locations" => {
+                let req_id = rec.get(1).as(i64)
+                let lkind = rec.get(2).as(String)
+                let raw_locs = rec.get(3).as(List)
+                let locs = List()
+                for li in 0..raw_locs.len() {
+                    let lc = raw_locs.get(li.as(usize)).as(List)
+                    locs.push(LspLoc {
+                        file_path: lc.get(0).as(String),
+                        row: lc.get(1).as(i64),
+                        col: lc.get(2).as(i64),
+                        end_row: lc.get(3).as(i64),
+                        end_col: lc.get(4).as(i64),
+                    })
+                }
+                out.push(LspWireEvent.Locations(req_id, lkind, locs))
+            },
+            tag == "symbols" => {
+                let req_id = rec.get(1).as(i64)
+                let raw_syms = rec.get(2).as(List)
+                let syms = List()
+                for si in 0..raw_syms.len() {
+                    let sy = raw_syms.get(si.as(usize)).as(List)
+                    syms.push(LspSym {
+                        name: sy.get(0).as(String),
+                        kind: sy.get(1).as(String),
+                        detail: sy.get(2).as(String),
+                        row: sy.get(3).as(i64),
+                        col: sy.get(4).as(i64),
+                        end_row: sy.get(5).as(i64),
+                    })
+                }
+                out.push(LspWireEvent.Symbols(req_id, syms))
+            },
+            tag == "completions" => {
+                let req_id = rec.get(1).as(i64)
+                let raw_cmps = rec.get(2).as(List)
+                let cmps = List()
+                for ci in 0..raw_cmps.len() {
+                    let cm = raw_cmps.get(ci.as(usize)).as(List)
+                    cmps.push(LspCompItem {
+                        label: cm.get(0).as(String),
+                        insert_text: cm.get(1).as(String),
+                        kind: cm.get(2).as(String),
+                        detail: cm.get(3).as(String),
+                    })
+                }
+                out.push(LspWireEvent.Completions(req_id, cmps))
+            },
+            tag == "workspace_edit" => {
+                let req_id = rec.get(1).as(i64)
+                let lbl = rec.get(2).as(String)
+                let edits = decode_text_edits(rec.get(3).as(List))
+                out.push(LspWireEvent.WorkspaceEdit(req_id, lbl, edits))
+            },
+            tag == "code_actions" => {
+                let req_id = rec.get(1).as(i64)
+                let raw_acts = rec.get(2).as(List)
+                let acts = List()
+                for ai in 0..raw_acts.len() {
+                    let ac = raw_acts.get(ai.as(usize)).as(List)
+                    acts.push(LspCodeAct {
+                        title: ac.get(0).as(String),
+                        kind: ac.get(1).as(String),
+                        edits: decode_text_edits(ac.get(2).as(List)),
+                    })
+                }
+                out.push(LspWireEvent.CodeActions(req_id, acts))
+            },
+            tag == "log" => {
+                out.push(LspWireEvent.Log(rec.get(1).as(String), rec.get(2).as(String)))
+            },
+            tag == "error" => {
+                out.push(LspWireEvent.RequestError(
+                    rec.get(1).as(i64),
+                    rec.get(2).as(String),
+                    rec.get(3).as(String),
+                ))
+            },
+            tag == "exited" => {
+                out.push(LspWireEvent.Exited(rec.get(1).as(i64)))
+            },
+            else => (),
+        }
+    }
+    out
+}
+
+pub fn lsp_status(session_id: i64) -> !String LspStatus {
+    let raw = runtime.host_call("lsp_status", [session_id])!
+    let f = raw.as(List)
+    LspStatus {
+        id: f.get(0).as(i64),
+        command: f.get(1).as(String),
+        root_dir: f.get(2).as(String),
+        pid: f.get(3).as(i64),
+        alive: f.get(4).as(bool),
+        initialized: f.get(5).as(bool),
+        server_name: f.get(6).as(String),
+        server_version: f.get(7).as(String),
+        capabilities: f.get(8).as(String),
+        pending_requests: f.get(9).as(i64),
+    }
+}
+
+pub fn lsp_stop(session_id: i64) -> bool {
+    let raw! = runtime.host_call("lsp_stop", [session_id]) else {
+        return false
+    }
+    raw.as(bool)
+}

@@ -1,0 +1,396 @@
+-- End-to-End Deterministic Test Suite for Lava Plugins Batch 01:
+--   Plugin 01: `lava.org/ext_surround` (`ys`, `yss`, `ds`, `cs`, Visual `S`, HTML/XML tags `t`)
+--   Plugin 02: `lava.org/ext_comment`  (`gcc`, `<Space>/`, Visual `gc`, `gbc` across languages)
+--   Plugin 03: `lava.org/ext_autopairs` (auto-close, step-over, `{<Return>`, `<Space>`/`<BS>`, `don't`, `:set noautopairs`)
+
+use @lava_sys.mock_enable
+use @lava_core.{
+    HostClipboardCap, LogCollectorCap, StatusCollectorCap, SystemKernel, clipboard_get,
+    clipboard_set, log_event, status_emit
+}
+use @ext_document.{
+    Buffer, EditorWorld, Pos, register_document_extension, require_editor_world
+}
+use @ext_vim.{
+    VimMode, VimState, register_vim_extension, require_vim_state, vim_feed_keys
+}
+use @ext_surround.{ext_surround_id, register_surround_extension}
+use @ext_comment.{ext_comment_id, register_comment_extension}
+use @ext_autopairs.{ext_autopairs_id, register_autopairs_extension}
+
+fn fail_test(msg: String) -> NoReturn {
+    panic("TEST FAILED: " ++ msg)
+}
+
+fn assert_true(cond: bool, msg: String) {
+    if not cond {
+        fail_test(msg)
+    }
+}
+
+fn assert_str_eq(actual: String, expected: String, label: String) {
+    if actual != expected {
+        fail_test(
+            label ++ "\n  expected: " ++ expected.escape_debug()
+            ++ "\n  actual:   " ++ actual.escape_debug()
+        )
+    }
+}
+
+fn assert_i64_eq(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        fail_test(
+            label ++ " expected=" ++ expected.to_string() ++ " actual=" ++ actual.to_string()
+        )
+    }
+}
+
+fn assert_pos_eq(actual: Pos, expected_row: i64, expected_col: i64, label: String) {
+    if actual.row != expected_row or actual.col != expected_col {
+        fail_test(
+            label ++ " expected=(" ++ expected_row.to_string() ++ "," ++ expected_col.to_string()
+            ++ ") actual=(" ++ actual.row.to_string() ++ "," ++ actual.col.to_string() ++ ")"
+        )
+    }
+}
+
+fn make_batch01_kernel() -> !String (SystemKernel, EditorWorld, VimState) {
+    mock_enable(true)
+    let kernel = SystemKernel.new()
+    register_document_extension(kernel)!
+    register_vim_extension(kernel)!
+    register_surround_extension(kernel)!
+    register_comment_extension(kernel)!
+    register_autopairs_extension(kernel)!
+    kernel.activate_all()!
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    (kernel, world, vim)
+}
+
+fn setup_buffer(world: EditorWorld, major_mode: String, lines: List) -> Buffer {
+    let buf = world.active_buffer()
+    buf.read_only = false
+    buf.major_mode = major_mode
+    buf.set_lines(lines, record_undo = false)
+    buf.modified = false
+    buf.point = Pos.zero()
+    buf.preferred_col = 0
+    buf
+}
+
+fn unwrap_ok(res: !String Unit, ctx: String) {
+    let _! = res else {
+        fail_test(ctx ++ " returned unexpected error")
+    }
+}
+
+-- ============================================================================
+-- Suite 1: `ext_surround` (`ysiw"`, `yss)`, `ds"`, `cs)(`, `cs){{`, `viwS]`, `ysiwt`/`dst`, `u`)
+-- ============================================================================
+
+fn test_ext_surround() -> #[log_event, status_emit, clipboard_get, clipboard_set] !String Unit {
+    let (kernel, world, vim) = make_batch01_kernel()!
+    assert_str_eq(ext_surround_id().raw(), "lava.org/ext_surround", "ext_surround_id")
+    assert_true(kernel.is_extension_active(ext_surround_id()), "ext_surround is active")
+
+    -- 1. `ysiw"` wraps word under cursor and single `u` undoes cleanly
+    let buf = setup_buffer(world, "nessa", ["let greeting = hello"])
+    vim_feed_keys(kernel, "$bysiw\"")#!
+    assert_str_eq(buf.line_at(0), "let greeting = \"hello\"", "ysiw\" wraps identifier")
+    assert_true(vim.mode == VimMode.Normal, "ysiw\" returns to Normal mode")
+    vim_feed_keys(kernel, "u")#!
+    assert_str_eq(buf.line_at(0), "let greeting = hello", "single u undoes ysiw\"")
+    vim_feed_keys(kernel, "<C-r>")#!
+    assert_str_eq(buf.line_at(0), "let greeting = \"hello\"", "C-r redoes ysiw\"")
+
+    -- 2. `ds"` removes surrounding quotes and single `u` restores them
+    vim_feed_keys(kernel, "0ds\"")#!
+    assert_str_eq(buf.line_at(0), "let greeting = hello", "ds\" from line start strips quotes")
+    vim_feed_keys(kernel, "u")#!
+    assert_str_eq(buf.line_at(0), "let greeting = \"hello\"", "single u undoes ds\"")
+
+    -- 3. `yss)` wraps entire current line's non-blank content preserving leading/trailing whitespace
+    let lbuf = setup_buffer(world, "nessa", ["    alpha + beta  "])
+    vim_feed_keys(kernel, "0yss)")#!
+    assert_str_eq(lbuf.line_at(0), "    (alpha + beta)  ", "yss) wraps non-blank span")
+    assert_pos_eq(lbuf.point, 0, 4, "yss) places cursor at opening '('")
+
+    -- 4. `cs)(` adds inner padding spaces, `cs()` strips them, and `cs){{` wraps with `{ ... }`!
+    vim_feed_keys(kernel, "cs)(")#!
+    assert_str_eq(lbuf.line_at(0), "    ( alpha + beta )  ", "cs)( adds inner spaces")
+    vim_feed_keys(kernel, "u")#!
+    assert_str_eq(lbuf.line_at(0), "    (alpha + beta)  ", "single u undoes cs)(")
+
+    vim_feed_keys(kernel, "cs){{")#!
+    assert_str_eq(lbuf.line_at(0), "    {{ alpha + beta }}  ", "cs){{ replaces () with {{ ... }}")
+    vim_feed_keys(kernel, "ds{{")#!
+    assert_str_eq(lbuf.line_at(0), "    alpha + beta  ", "ds{{ removes padded braces cleanly")
+
+    -- 5. Motions with `ys`: `ys$]` and `ysw'` and `<Escape>` cancel
+    let mbuf = setup_buffer(world, "nessa", ["return x + 1"])
+    vim_feed_keys(kernel, "wys<Escape>")#!
+    assert_str_eq(mbuf.line_at(0), "return x + 1", "ys<Escape> cancels cleanly")
+    vim_feed_keys(kernel, "ys$]")#!
+    assert_str_eq(mbuf.line_at(0), "return [x + 1]", "ys$] wraps to end of line")
+    vim_feed_keys(kernel, "0ysw'")#!
+    assert_str_eq(mbuf.line_at(0), "'return' [x + 1]", "ysw' wraps word without trailing space")
+
+    -- 6. Visual `viwS]` and VisualLine `V...S}}` + single `u`
+    let vbuf = setup_buffer(world, "nessa", ["first target_token last"])
+    vim_feed_keys(kernel, "wviwS]")#!
+    assert_str_eq(vbuf.line_at(0), "first [target_token] last", "Visual viwS] wraps selection")
+    assert_true(vim.mode == VimMode.Normal, "Visual S returns to Normal mode")
+    vim_feed_keys(kernel, "u")#!
+    assert_str_eq(vbuf.line_at(0), "first target_token last", "single u undoes viwS]")
+
+    let vlbuf = setup_buffer(world, "nessa", ["    stmt_a()", "    stmt_b()"])
+    vim_feed_keys(kernel, "ggVjS}}")#!
+    assert_str_eq(
+        vlbuf.to_text(),
+        "    {{\n    stmt_a()\n    stmt_b()\n    }}",
+        "VisualLine VjS}} wraps lines in braces"
+    )
+    vim_feed_keys(kernel, "u")#!
+    assert_str_eq(vlbuf.to_text(), "    stmt_a()\n    stmt_b()", "single u undoes VisualLine S")
+
+    -- 7. HTML/XML tags: `ysiwt`, `<tag attr="...">`, `dst`, and `cst`!
+    let tbuf = setup_buffer(world, "html", ["hello world"])
+    vim_feed_keys(kernel, "0ysiwtdiv<Return>")#!
+    assert_str_eq(tbuf.line_at(0), "<div>hello</div> world", "ysiwtdiv<Return> wraps in <div>...</div>")
+    vim_feed_keys(kernel, "u")#!
+    assert_str_eq(tbuf.line_at(0), "hello world", "single u undoes ysiwt")
+
+    vim_feed_keys(kernel, "0ysiwt<lt>span<Space>class=\"badge\"<gt>")#!
+    assert_str_eq(
+        tbuf.line_at(0),
+        "<span class=\"badge\">hello</span> world",
+        "ysiwt<span class=\"badge\"> wraps with attributes and clean closing </span>"
+    )
+
+    -- Nested tags: `dst` strips innermost `<b>...</b>` first, then `cst` changes outer tag!
+    let tbuf2 = setup_buffer(world, "html", ["<div class=\"card\"><b>inner</b></div>"])
+    tbuf2.point = Pos.new(0, 22)
+    vim_feed_keys(kernel, "dst")#!
+    assert_str_eq(tbuf2.line_at(0), "<div class=\"card\">inner</div>", "dst strips innermost <b> tag")
+    vim_feed_keys(kernel, "csttsection<Return>")#!
+    assert_str_eq(tbuf2.line_at(0), "<section>inner</section>", "csttsection<Return> changes tag")
+    vim_feed_keys(kernel, "dst")#!
+    assert_str_eq(tbuf2.line_at(0), "inner", "dst strips <section> tag")
+    vim_feed_keys(kernel, "u")#!
+    assert_str_eq(tbuf2.line_at(0), "<section>inner</section>", "single u undoes dst")
+
+    -- 8. Scripted Ex / M-x commands (`surround-line`, `surround-change`, `surround-delete`) + multi-line tag `dst`
+    let sbuf = setup_buffer(world, "nessa", ["  value  "])
+    let _ = kernel.dispatch_command("evil-ex", ["SurroundLine )"])#!
+    assert_str_eq(sbuf.line_at(0), "  (value)  ", ":SurroundLine ) via Ex")
+    let _ = kernel.dispatch_command("surround-change", [")", "["])#!
+    assert_str_eq(sbuf.line_at(0), "  [ value ]  ", "surround-change command with args")
+    let _ = kernel.dispatch_command("surround-delete", ["["])#!
+    assert_str_eq(sbuf.line_at(0), "  value  ", "surround-delete command with args")
+
+    let mt_buf = setup_buffer(world, "html", ["<div>", "  body", "</div>"])
+    mt_buf.point = Pos.new(1, 2)
+    vim_feed_keys(kernel, "csttarticle<Return>")#!
+    assert_str_eq(mt_buf.to_text(), "<article>\n  body\n</article>", "multi-line cst changes outer tag")
+    ()
+}
+
+-- ============================================================================
+-- Suite 2: `ext_comment` (`gcc`, `<Space>/`, `Vjgc` indent alignment, `gbc`, `u`)
+-- ============================================================================
+
+fn test_ext_comment() -> #[log_event, status_emit, clipboard_get, clipboard_set] !String Unit {
+    let (kernel, world, vim) = make_batch01_kernel()!
+    assert_str_eq(ext_comment_id().raw(), "lava.org/ext_comment", "ext_comment_id")
+    assert_true(kernel.is_extension_active(ext_comment_id()), "ext_comment is active")
+
+    -- 1. `gcc` comment + uncomment in `nessa` (`-- `) + `<Space> /` leader toggle
+    let nbuf = setup_buffer(world, "nessa", ["    let x = 42"])
+    vim_feed_keys(kernel, "gcc")#!
+    assert_str_eq(nbuf.line_at(0), "    -- let x = 42", "nessa gcc comments at indent")
+    vim_feed_keys(kernel, "gcc")#!
+    assert_str_eq(nbuf.line_at(0), "    let x = 42", "nessa gcc uncomments cleanly")
+    vim_feed_keys(kernel, "<Space>/")#!
+    assert_str_eq(nbuf.line_at(0), "    -- let x = 42", "<Space>/ toggles line comment")
+    vim_feed_keys(kernel, "u")#!
+    assert_str_eq(nbuf.line_at(0), "    let x = 42", "single u undoes line comment")
+
+    -- 2. `gcc` comment + uncomment in `rust` (`// `)
+    let rbuf = setup_buffer(world, "rust", ["  let mut count = 0;"])
+    vim_feed_keys(kernel, "gcc")#!
+    assert_str_eq(rbuf.line_at(0), "  // let mut count = 0;", "rust gcc adds // ")
+    vim_feed_keys(kernel, "gcc")#!
+    assert_str_eq(rbuf.line_at(0), "  let mut count = 0;", "rust gcc removes // ")
+
+    -- 3. `gcc` comment + uncomment in `html` (`<!-- ... -->`) and `css` (`/* ... */`) and `lisp` (`;; `)
+    let hbuf = setup_buffer(world, "html", ["  <h1>Title</h1>"])
+    vim_feed_keys(kernel, "gcc")#!
+    assert_str_eq(hbuf.line_at(0), "  <!-- <h1>Title</h1> -->", "html gcc wraps with <!-- ... -->")
+    vim_feed_keys(kernel, "gcc")#!
+    assert_str_eq(hbuf.line_at(0), "  <h1>Title</h1>", "html gcc unwraps <!-- ... -->")
+
+    let cbuf = setup_buffer(world, "css", ["  color: #fff;"])
+    vim_feed_keys(kernel, "gcc")#!
+    assert_str_eq(cbuf.line_at(0), "  /* color: #fff; */", "css gcc wraps with /* ... */")
+    vim_feed_keys(kernel, "gcc")#!
+    assert_str_eq(cbuf.line_at(0), "  color: #fff;", "css gcc unwraps /* ... */")
+
+    let lbuf = setup_buffer(world, "elisp", ["  (setq evil t)"])
+    vim_feed_keys(kernel, "gcc")#!
+    assert_str_eq(lbuf.line_at(0), "  ;; (setq evil t)", "elisp gcc adds ;; ")
+    vim_feed_keys(kernel, "gcc")#!
+    assert_str_eq(lbuf.line_at(0), "  (setq evil t)", "elisp gcc removes ;; ")
+
+    -- 4. Visual `Vjgc` multi-line shared-minimum-indent comment/uncomment + blank line preservation + single `u`!
+    let vbuf = setup_buffer(world, "rust", [
+        "    if ready {{",
+        "        run_step();",
+        "",
+        "    }}",
+        "    done();"
+    ])
+    vim_feed_keys(kernel, "ggV3jgc")#!
+    assert_true(vim.mode == VimMode.Normal, "Visual gc returns to Normal mode")
+    assert_str_eq(vbuf.line_at(0), "    // if ready {{", "Visual gc row 0 at col 4")
+    assert_str_eq(vbuf.line_at(1), "    //     run_step();", "Visual gc row 1 preserves relative indent")
+    assert_str_eq(vbuf.line_at(2), "", "Visual gc leaves blank line untouched")
+    assert_str_eq(vbuf.line_at(3), "    // }}", "Visual gc row 3 at col 4")
+    assert_str_eq(vbuf.line_at(4), "    done();", "Visual gc row 4 outside selection untouched")
+
+    -- Toggle back with `ggV3jgc`
+    vim_feed_keys(kernel, "ggV3jgc")#!
+    assert_str_eq(vbuf.line_at(0), "    if ready {{", "Visual gc uncomment row 0")
+    assert_str_eq(vbuf.line_at(1), "        run_step();", "Visual gc uncomment row 1 restores 8-space indent")
+    assert_str_eq(vbuf.line_at(2), "", "Visual gc uncomment row 2 still blank")
+    assert_str_eq(vbuf.line_at(3), "    }}", "Visual gc uncomment row 3")
+
+    -- Single `u` restores the commented multi-line block in one step!
+    vim_feed_keys(kernel, "u")#!
+    assert_str_eq(vbuf.line_at(1), "    //     run_step();", "single u restores multi-line comment state")
+
+    -- 5. `gbc` block comment toggle across languages + single `u`
+    let bbuf = setup_buffer(world, "rust", ["    let total = a + b;"])
+    vim_feed_keys(kernel, "gbc")#!
+    assert_str_eq(bbuf.line_at(0), "    /* let total = a + b; */", "rust gbc wraps non-blank span")
+    vim_feed_keys(kernel, "gbc")#!
+    assert_str_eq(bbuf.line_at(0), "    let total = a + b;", "rust gbc unwraps block comment")
+    vim_feed_keys(kernel, "u")#!
+    assert_str_eq(bbuf.line_at(0), "    /* let total = a + b; */", "single u undoes gbc unwrap")
+
+    let nbbuf = setup_buffer(world, "nessa", ["  compute(x)"])
+    vim_feed_keys(kernel, "gbc")#!
+    assert_str_eq(nbbuf.line_at(0), "  --[[ compute(x) ]]", "nessa gbc wraps with --[[ ... ]]")
+    vim_feed_keys(kernel, "gbc")#!
+    assert_str_eq(nbbuf.line_at(0), "  compute(x)", "nessa gbc unwraps --[[ ... ]]")
+    ()
+}
+
+-- ============================================================================
+-- Suite 3: `ext_autopairs` (`fn foo()`, `{<Return>`, `"hello"`, `<Space>`/`<BS>`, `don't`, `:set noautopairs`)
+-- ============================================================================
+
+fn test_ext_autopairs() -> #[log_event, status_emit, clipboard_get, clipboard_set] !String Unit {
+    let (kernel, world, _vim) = make_batch01_kernel()!
+    assert_str_eq(ext_autopairs_id().raw(), "lava.org/ext_autopairs", "ext_autopairs_id")
+    assert_true(kernel.is_extension_active(ext_autopairs_id()), "ext_autopairs is active")
+    assert_true(world.options.autopairs, "autopairs enabled by default")
+
+    -- 1. Typing `fn foo(` -> `fn foo(|)`, typing `)` steps over, `{<Return>` expands block with smart indent!
+    let buf = setup_buffer(world, "nessa", [""])
+    vim_feed_keys(kernel, "ifn<Space>foo(")#!
+    assert_str_eq(buf.line_at(0), "fn foo()", "typing '(' auto-inserts '()'")
+    assert_pos_eq(buf.point, 0, 7, "cursor placed inside '(|)'")
+
+    vim_feed_keys(kernel, ")")#!
+    assert_str_eq(buf.line_at(0), "fn foo()", "typing ')' steps over without duplicate")
+    assert_pos_eq(buf.point, 0, 8, "cursor stepped past ')'")
+
+    vim_feed_keys(kernel, "<Space>{{<Return>return<Space>1<Escape>")#!
+    assert_i64_eq(buf.line_count(), 3, "{{<Return> expanded into 3-line block")
+    assert_str_eq(buf.line_at(0), "fn foo() {{", "{{<Return> header line")
+    assert_str_eq(buf.line_at(1), "    return 1", "{{<Return> smart-indented body line")
+    assert_str_eq(buf.line_at(2), "}}", "{{<Return> aligned closing brace")
+
+    -- 2. `"hello"` and escaped inner quotes `"say \"hi\""` step over closing `"` cleanly
+    let qbuf = setup_buffer(world, "nessa", [""])
+    vim_feed_keys(kernel, "i\"hello\"<Escape>")#!
+    assert_str_eq(qbuf.line_at(0), "\"hello\"", "typing \"hello\" steps over closing quote")
+
+    let eqbuf = setup_buffer(world, "nessa", [""])
+    vim_feed_keys(kernel, "i\"say<Space>\\\"hi\\\"\"<Escape>")#!
+    assert_str_eq(eqbuf.line_at(0), "\"say \\\"hi\\\"\"", "escaped quotes inside string literal")
+
+    -- 3. `<Space>` inside `(|)` -> `( | )`, `<BackSpace>` -> `(|)`, `<BackSpace>` -> empty!
+    let sbuf = setup_buffer(world, "nessa", [""])
+    vim_feed_keys(kernel, "i(")#!
+    assert_str_eq(sbuf.line_at(0), "()", "initial ()")
+    assert_pos_eq(sbuf.point, 0, 1, "cursor inside (|)")
+
+    vim_feed_keys(kernel, "<Space>")#!
+    assert_str_eq(sbuf.line_at(0), "(  )", "<Space> inside (|) inserts symmetric spaces")
+    assert_pos_eq(sbuf.point, 0, 2, "cursor centered in ( | )")
+
+    vim_feed_keys(kernel, "<BackSpace>")#!
+    assert_str_eq(sbuf.line_at(0), "()", "<BackSpace> inside ( | ) deletes both spaces back to (|)")
+    assert_pos_eq(sbuf.point, 0, 1, "cursor back at (|)")
+
+    vim_feed_keys(kernel, "<BackSpace><Escape>")#!
+    assert_str_eq(sbuf.line_at(0), "", "second <BackSpace> deletes adjacent empty () pair")
+
+    -- 4. Apostrophe context: `don't` and Rust lifetime `&'a` do not double `'`!
+    let abuf = setup_buffer(world, "text", [""])
+    vim_feed_keys(kernel, "idon't<Escape>")#!
+    assert_str_eq(abuf.line_at(0), "don't", "don't single apostrophe does not auto-pair")
+
+    let ltbuf = setup_buffer(world, "rust", [""])
+    vim_feed_keys(kernel, "ifn<Space>ref_it(&'a<Space>str)<Escape>")#!
+    assert_str_eq(ltbuf.line_at(0), "fn ref_it(&'a str)", "Rust lifetime &'a does not double apostrophe")
+
+    -- 5. Word-char right after cursor suppresses bracket auto-pairing
+    let wbuf = setup_buffer(world, "nessa", ["word"])
+    vim_feed_keys(kernel, "0i(<Escape>")#!
+    assert_str_eq(wbuf.line_at(0), "(word", "no auto-pair when alphanumeric char immediately follows cursor")
+
+    -- 6. `:set noautopairs` and `:AutopairsToggle` disable/re-enable pairing!
+    let opt_buf = setup_buffer(world, "nessa", [""])
+    let _ = kernel.dispatch_command("evil-ex", ["set noautopairs"])#!
+    assert_true(not world.options.autopairs, ":set noautopairs sets world.options.autopairs=false")
+    vim_feed_keys(kernel, "i([\"<Escape>")#!
+    assert_str_eq(opt_buf.line_at(0), "([\"", "with noautopairs, opening delimiters insert literally")
+
+    let _ = kernel.dispatch_command("evil-ex", ["AutopairsToggle"])#!
+    assert_true(world.options.autopairs, ":AutopairsToggle re-enables autopairs")
+    let opt_buf2 = setup_buffer(world, "nessa", [""])
+    vim_feed_keys(kernel, "i[<Escape>")#!
+    assert_str_eq(opt_buf2.line_at(0), "[]", "re-enabled autopairs closes '[' -> '[]'")
+
+    -- 7. Extension deactivation cleanly removes insert interceptor and keymaps
+    kernel.deactivate_extension(ext_autopairs_id())!
+    assert_true(not kernel.is_extension_active(ext_autopairs_id()), "ext_autopairs deactivated")
+    let opt_buf3 = setup_buffer(world, "nessa", [""])
+    vim_feed_keys(kernel, "i(<Escape>")#!
+    assert_str_eq(opt_buf3.line_at(0), "(", "deactivated ext_autopairs no longer intercepts '('")
+    kernel.activate_extension(ext_autopairs_id())!
+    assert_true(kernel.is_extension_active(ext_autopairs_id()), "ext_autopairs reactivated")
+    ()
+}
+
+fn run_all() -> #[log_event, status_emit, clipboard_get, clipboard_set] !String Unit {
+    println("[1/3] test_ext_surround...")
+    test_ext_surround()#!
+    println("[2/3] test_ext_comment...")
+    test_ext_comment()#!
+    println("[3/3] test_ext_autopairs...")
+    test_ext_autopairs()#!
+    ()
+}
+
+fn main() {
+    handles(clipboard_get) handles(clipboard_set) let _clip = HostClipboardCap {}
+    handles(log_event) let _logs = LogCollectorCap.new()
+    handles(status_emit) let _status = StatusCollectorCap.new()
+
+    unwrap_ok(run_all()#, "test_plugins_batch_01")
+    println("ALL BATCH 01 PLUGIN TESTS PASSED (3/3 suites)")
+}

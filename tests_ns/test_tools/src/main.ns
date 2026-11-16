@@ -1,0 +1,432 @@
+-- Comprehensive integration & verification suite for `lava.org/ext_tools`:
+-- 1. Emacs Dired (`dired`, `+` mkdir, `C` copy, `R` rename, `d`+`x` continuation confirm delete, `<Return>`, `^`).
+-- 2. `occur`, concurrent 4-shard Nessa `async effect` + `Future(List)` + `.await` `project-search`,
+--    non-blocking background `grep`, and `next-error` / `previous-error` quickfix navigation.
+-- 3. `shell-command`, `async-shell-command`, `compile` + `tools_on_async_job_done` & `C-g` cancellation.
+-- 4. Org-Outline `<Tab>` subtree folding (`buf.folded_rows`) and `C-c C-t` / `org-todo` state cycling.
+-- 5. Live `*scratch*` Single-VM expression, session variable, option mutation & kernel introspection evaluator.
+
+use std.fs
+use std.io
+use std.path
+use std.process.{assert, assert_eq}
+use @lava_sys.{RawUiEvent, host_poll_events, mock_enable}
+use @lava_core.{
+    HostClipboardCap, KeyStroke, LogCollectorCap, PromptKind, PromptRequest,
+    PromptTurn, StatusCollectorCap, SystemKernel, parse_key_sequence
+}
+use @ext_document.{
+    ActiveBgJob, BufferId, BufferKind, Pos, register_document_extension, require_editor_world
+}
+use @ext_tools.{
+    SERVICE_TOOLS, ext_tools_id, register_tools_extension, require_tools_manager,
+    tools_dispatch_command, tools_handle_key, tools_on_async_job_done
+}
+
+fn find_row_containing(lines: List, needle: String) -> i64 {
+    for i in 0..lines.len() {
+        if lines.get(i.as(usize)).as(String).contains(needle) {
+            return i
+        }
+    }
+    -1
+}
+
+fn move_dired_to_entry(kernel: SystemKernel, needle: String) -> !String Unit {
+    let logs = LogCollectorCap.new()
+    let status = StatusCollectorCap.new()
+    let clip = HostClipboardCap {}
+    let world = require_editor_world(kernel)!
+    let buf = world.active_buffer()
+    let target_row = find_row_containing(buf.lines, needle)
+    assert(target_row >= 2, message = "expected Dired entry containing: " ++ needle)
+    while buf.point.row < target_row {
+        let handled = tools_handle_key(kernel, KeyStroke.plain("j")).use(logs).use(status).use(clip)!
+        assert(handled, message = "expected j handled in dired")
+    }
+    while buf.point.row > target_row {
+        let handled = tools_handle_key(kernel, KeyStroke.plain("k")).use(logs).use(status).use(clip)!
+        assert(handled, message = "expected k handled in dired")
+    }
+    assert_eq(buf.point.row, target_row, message = "cursor landed on target Dired row")
+    ()
+}
+
+fn run_all_tests() -> !String Unit {
+    mock_enable(true)
+
+    let logs = LogCollectorCap.new()
+    let status = StatusCollectorCap.new()
+    let clip = HostClipboardCap {}
+
+    let kernel = SystemKernel.new()
+    register_document_extension(kernel)!
+    register_tools_extension(kernel)!
+    kernel.activate_all()!
+
+    assert(kernel.is_extension_active(ext_tools_id()), message = "ext_tools should be active")
+    assert(kernel.service(SERVICE_TOOLS) != null, message = "SERVICE_TOOLS should be published")
+
+    let world = require_editor_world(kernel)!
+    let _mgr = require_tools_manager(kernel)!
+
+    let switched_count = List()
+    switched_count.push(0)
+    kernel.add_hook("buffer-switched", ext_tools_id(), |_k: SystemKernel, _payload: Any| {
+        let prev = switched_count.get(0).as(i64)
+        switched_count.set(0, prev + 1)
+    })
+
+    let tmp_base! = fs.temp_file_path(prefix = "lava_ext_tools_test_") else {
+        return error "failed generating temp_file_path"
+    }
+    let tmp_root = tmp_base ++ "_dir"
+    let _! = fs.create_dir_all(tmp_root) else {
+        return error ("failed creating temp dir: " ++ tmp_root)
+    }
+    defer {
+        let _ = fs.remove_dir_all(tmp_root) ! { _ => () }
+    }
+
+    world.cwd = tmp_root
+
+    -- ========================================================================
+    -- Test 1: Emacs Dired (listing, + mkdir, C copy, R rename, d+x confirm delete, <Return>, ^)
+    -- ========================================================================
+    let docs_dir = path.join(tmp_root, "docs")
+    let _! = fs.create_dir_all(docs_dir) else {
+        return error "failed creating docs dir"
+    }
+    let alpha_path = path.join(tmp_root, "alpha.ns")
+    let beta_path = path.join(tmp_root, "beta.txt")
+    let guide_path = path.join(docs_dir, "guide.md")
+    let _! = fs.write_string(alpha_path, "fn alpha() -> i64 {{\n    let x = 10\n    x + 32\n}}\n") else {
+        return error "failed writing alpha.ns"
+    }
+    let _! = fs.write_string(beta_path, "hello beta world\n") else {
+        return error "failed writing beta.txt"
+    }
+    let _! = fs.write_string(guide_path, "# Guide\nWelcome to docs.\n") else {
+        return error "failed writing guide.md"
+    }
+
+    let t_dired = tools_dispatch_command(kernel, "dired", [tmp_root]).use(logs).use(status).use(clip)!
+    assert(t_dired matches PromptTurn.Completed(_), message = "dired should complete immediately with path arg")
+
+    let dired_buf = world.active_buffer()
+    assert_eq(dired_buf.kind, BufferKind.Directory, message = "dired buffer kind")
+    assert_eq(dired_buf.major_mode, "dired", message = "dired major_mode")
+    assert(dired_buf.read_only, message = "dired buffer must be read_only")
+    assert(dired_buf.line_at(0).contains(tmp_root ++ ":"), message = "dired header contains directory path")
+    assert(find_row_containing(dired_buf.lines, "..") >= 2, message = "dired listing includes ..")
+    assert(find_row_containing(dired_buf.lines, "docs/") > find_row_containing(dired_buf.lines, ".."), message = "dired lists docs/")
+    assert(find_row_containing(dired_buf.lines, "alpha.ns") > find_row_containing(dired_buf.lines, "docs/"), message = "subdirs sorted before files")
+
+    -- `+` mkdir via continuation prompt (exercising kernel.dispatch_command + kernel.submit_prompt_answer)
+    let plus_handled = tools_handle_key(kernel, KeyStroke.plain("+")).use(logs).use(status).use(clip)!
+    assert(plus_handled, message = "+ handled in dired")
+    assert(kernel.active_prompt != null, message = "+ should suspend with active_prompt")
+    let _ = kernel.submit_prompt_answer("created_sub").use(logs).use(status).use(clip)!
+    let created_sub_path = path.join(tmp_root, "created_sub")
+    assert(fs.is_dir(created_sub_path), message = "created_sub directory exists on disk")
+    assert(find_row_containing(world.active_buffer().lines, "created_sub/") >= 2, message = "dired refreshed with created_sub/")
+
+    -- `C` copy beta.txt -> beta_copy.txt via continuation prompt
+    move_dired_to_entry(kernel, "beta.txt")!
+    let copy_handled = tools_handle_key(kernel, KeyStroke.plain("C")).use(logs).use(status).use(clip)!
+    assert(copy_handled, message = "C handled in dired")
+    assert(kernel.active_prompt != null, message = "C should suspend for destination")
+    let _ = kernel.submit_prompt_answer("beta_copy.txt").use(logs).use(status).use(clip)!
+    let beta_copy_path = path.join(tmp_root, "beta_copy.txt")
+    assert(fs.is_file(beta_copy_path), message = "beta_copy.txt created on disk")
+    let copied_content! = fs.read_to_string(beta_copy_path) else {
+        return error "failed reading beta_copy.txt"
+    }
+    assert_eq(copied_content, "hello beta world\n", message = "copied file content matches")
+
+    -- `R` rename beta_copy.txt -> beta_renamed.txt via continuation prompt
+    move_dired_to_entry(kernel, "beta_copy.txt")!
+    let ren_handled = tools_handle_key(kernel, KeyStroke.plain("R")).use(logs).use(status).use(clip)!
+    assert(ren_handled, message = "R handled in dired")
+    assert(kernel.active_prompt != null, message = "R should suspend for destination")
+    let _ = kernel.submit_prompt_answer("beta_renamed.txt").use(logs).use(status).use(clip)!
+    let beta_renamed_path = path.join(tmp_root, "beta_renamed.txt")
+    assert(not fs.exists(beta_copy_path), message = "old beta_copy.txt removed after rename")
+    assert(fs.is_file(beta_renamed_path), message = "beta_renamed.txt exists on disk")
+
+    -- `m` mark + `U` unmark all + `d` flag + `x` delete with Confirm "n" then "y"
+    move_dired_to_entry(kernel, "beta_renamed.txt")!
+    let _ = tools_handle_key(kernel, KeyStroke.plain("m")).use(logs).use(status).use(clip)!
+    let marked_row = find_row_containing(world.active_buffer().lines, "beta_renamed.txt")
+    assert(world.active_buffer().line_at(marked_row).starts_with("* "), message = "m marks entry with *")
+    let _ = tools_handle_key(kernel, KeyStroke.plain("U")).use(logs).use(status).use(clip)!
+    assert(world.active_buffer().line_at(marked_row).starts_with("  "), message = "U clears all marks")
+
+    move_dired_to_entry(kernel, "beta_renamed.txt")!
+    let _ = tools_handle_key(kernel, KeyStroke.plain("d")).use(logs).use(status).use(clip)!
+    assert(world.active_buffer().line_at(marked_row).starts_with("D "), message = "d flags entry with D")
+
+    -- Press `x` and answer "n" first -> file stays
+    let _ = tools_handle_key(kernel, KeyStroke.plain("x")).use(logs).use(status).use(clip)!
+    let pending? = kernel.active_prompt else {
+        return error "x should suspend for confirmation"
+    }
+    let (typed_req, _) = pending
+    assert_eq(typed_req.kind, PromptKind.Confirm, message = "x uses PromptKind.Confirm")
+    assert_eq(typed_req.label, "Delete 1 flagged item(s)? (y/n)", message = "exact delete confirm label")
+    let _ = kernel.submit_prompt_answer("n").use(logs).use(status).use(clip)!
+    assert(fs.exists(beta_renamed_path), message = "answering 'n' preserves flagged file")
+
+    -- Press `x` again and answer "y" -> file deleted & Dired refreshed
+    let _ = tools_handle_key(kernel, KeyStroke.plain("x")).use(logs).use(status).use(clip)!
+    let _ = kernel.submit_prompt_answer("y").use(logs).use(status).use(clip)!
+    assert(not fs.exists(beta_renamed_path), message = "answering 'y' deletes flagged file")
+    assert_eq(find_row_containing(world.active_buffer().lines, "beta_renamed.txt"), -1, message = "deleted file gone from Dired")
+
+    -- Enter `docs/` with `<Return>`, then go up with `^`, then open `alpha.ns` with `<Return>`
+    move_dired_to_entry(kernel, "docs/")!
+    let ret_stroke = parse_key_sequence("<Return>").get(0).as(KeyStroke)
+    let _ = tools_handle_key(kernel, ret_stroke).use(logs).use(status).use(clip)!
+    assert_eq(world.active_buffer().file_path, docs_dir, message = "<Return> on directory enters subdir Dired")
+    assert(find_row_containing(world.active_buffer().lines, "guide.md") >= 2, message = "subdir Dired shows guide.md")
+
+    let _ = tools_handle_key(kernel, KeyStroke.plain("^")).use(logs).use(status).use(clip)!
+    assert_eq(world.active_buffer().file_path, tmp_root, message = "^ navigates to parent directory in Dired")
+
+    move_dired_to_entry(kernel, "alpha.ns")!
+    let switches_before = switched_count.get(0).as(i64)
+    let _ = tools_handle_key(kernel, ret_stroke).use(logs).use(status).use(clip)!
+    assert_eq(world.active_buffer().file_path, alpha_path, message = "<Return> on file opens alpha.ns")
+    assert_eq(world.active_buffer().major_mode, "nessa", message = "alpha.ns opened in nessa mode")
+    assert(switched_count.get(0).as(i64) > switches_before, message = "buffer-switched hook emitted")
+    io.println("  [ok] Test 1 (Dired) complete")
+
+    -- ========================================================================
+    -- Test 2: `occur`, 4-Shard `async effect` `project-search`, `grep`, & Quickfix
+    -- ========================================================================
+    -- `occur` on active `alpha.ns` buffer via continuation prompt
+    let t_occur = tools_dispatch_command(kernel, "occur", []).use(logs).use(status).use(clip)!
+    assert(t_occur matches PromptTurn.Suspended(_, _), message = "occur without args suspends for pattern")
+    let _ = kernel.submit_prompt_answer("let x").use(logs).use(status).use(clip)!
+    assert_eq(world.active_buffer().name, "*Occur*", message = "occur switches to *Occur*")
+    assert_eq(world.active_buffer().major_mode, "grep", message = "*Occur* uses grep major_mode")
+    assert_eq(world.quickfix.len(), 1, message = "occur populated 1 quickfix entry")
+
+    -- `<Return>` inside `*Occur*` jumps straight to `alpha.ns` row 1 (`let x = 10`)
+    let _ = tools_handle_key(kernel, ret_stroke).use(logs).use(status).use(clip)!
+    assert_eq(world.active_buffer().file_path, alpha_path, message = "<Return> in *Occur* jumps back to alpha.ns")
+    assert_eq(world.active_buffer().point, Pos.new(1, 4), message = "<Return> in *Occur* lands on exact match row/col")
+
+    -- Prepare multi-file workspace (plus ignored `.git` and `target` dirs) for 4-shard `project-search`
+    let src_dir = path.join(tmp_root, "src")
+    let git_dir = path.join(tmp_root, ".git")
+    let target_dir = path.join(tmp_root, "target")
+    let _! = fs.create_dir_all(src_dir) else { return error "mkdir src failed" }
+    let _! = fs.create_dir_all(git_dir) else { return error "mkdir .git failed" }
+    let _! = fs.create_dir_all(target_dir) else { return error "mkdir target failed" }
+
+    let f1 = path.join(src_dir, "m1.ns")
+    let f2 = path.join(src_dir, "m2.ns")
+    let f3 = path.join(src_dir, "m3.ns")
+    let f4 = path.join(docs_dir, "m4.ns")
+    let _! = fs.write_string(f1, "-- header\nlet a = SHARD_NEEDLE + 1\n") else { return error "write f1" }
+    let _! = fs.write_string(f2, "fn demo() {{\n    -- comment\n    return SHARD_NEEDLE\n}}\n") else { return error "write f2" }
+    let _! = fs.write_string(f3, "no match here\n") else { return error "write f3" }
+    let _! = fs.write_string(f4, "pub const K = \"SHARD_NEEDLE\"\n") else { return error "write f4" }
+    let _! = fs.write_string(path.join(git_dir, "ignored.ns"), "SHARD_NEEDLE\n") else { return error "write git" }
+    let _! = fs.write_string(path.join(target_dir, "ignored.ns"), "SHARD_NEEDLE\n") else { return error "write target" }
+
+    let t_psearch = tools_dispatch_command(kernel, "project-search", ["SHARD_NEEDLE", tmp_root]).use(logs).use(status).use(clip)!
+    assert(t_psearch matches PromptTurn.Completed(_), message = "project-search completes synchronously via async effect futures")
+    assert_eq(world.active_buffer().name, "*Grep*", message = "project-search opens *Grep*")
+    assert_eq(world.quickfix.len(), 3, message = "project-search found exactly 3 matches (skipping .git and target)")
+
+    -- Verify deterministic order: docs/m4.ns (row 0, col 15), src/m1.ns (row 1, col 8), src/m2.ns (row 2, col 11)
+    let _ = tools_dispatch_command(kernel, "next-error", []).use(logs).use(status).use(clip)!
+    assert_eq(world.active_buffer().file_path, f4, message = "1st next-error jumps to docs/m4.ns")
+    assert_eq(world.active_buffer().point, Pos.new(0, 15), message = "1st next-error exact row/col")
+
+    let _ = tools_dispatch_command(kernel, "next-error", []).use(logs).use(status).use(clip)!
+    assert_eq(world.active_buffer().file_path, f1, message = "2nd next-error jumps to src/m1.ns")
+    assert_eq(world.active_buffer().point, Pos.new(1, 8), message = "2nd next-error exact row/col")
+
+    let _ = tools_dispatch_command(kernel, "next-error", []).use(logs).use(status).use(clip)!
+    assert_eq(world.active_buffer().file_path, f2, message = "3rd next-error jumps to src/m2.ns")
+    assert_eq(world.active_buffer().point, Pos.new(2, 11), message = "3rd next-error exact row/col")
+
+    let _ = tools_dispatch_command(kernel, "previous-error", []).use(logs).use(status).use(clip)!
+    assert_eq(world.active_buffer().file_path, f1, message = "previous-error jumps back to src/m1.ns")
+    assert_eq(world.active_buffer().point, Pos.new(1, 8), message = "previous-error exact row/col")
+    assert(world.jumps.entries.len() >= 2, message = "world.jumps recorded quickfix jumps")
+
+    -- Non-blocking OS background `grep` + `tools_on_async_job_done`
+    let _ = host_poll_events()
+    let _ = tools_dispatch_command(kernel, "grep", ["SHARD_NEEDLE"]).use(logs).use(status).use(clip)!
+    assert_eq(world.active_buffer().name, "*Grep*", message = "grep switches to *Grep*")
+    assert(world.active_buffer().line_at(1).contains("[Running grep"), message = "*Grep* shows running placeholder")
+    assert_eq(world.active_jobs.len(), 1, message = "active_jobs tracks running grep job")
+
+    let polled = host_poll_events()
+    assert_eq(polled.len(), 1, message = "mock host queued AsyncJobDone for grep")
+    polled.get(0).as(RawUiEvent) match {
+        RawUiEvent.AsyncJobDone(jid, ok, code, out, err) => {
+            let claimed = tools_on_async_job_done(kernel, jid, ok, code, out, err).use(logs).use(status)!
+            assert(claimed, message = "tools_on_async_job_done claimed grep job")
+        },
+        _ => assert(false, message = "expected AsyncJobDone event"),
+    }
+    assert(world.active_jobs.is_empty(), message = "active_jobs cleared after grep finished")
+    assert(world.quickfix.len() >= 3, message = "background grep populated world.quickfix")
+    io.println("  [ok] Test 2 (Occur + Async Project Search + Grep + Quickfix) complete")
+
+    -- ========================================================================
+    -- Test 3: `compile` + `tools_on_async_job_done` jumping to `src/demo.ns:3:5` + Shell & C-g
+    -- ========================================================================
+    let demo_path = path.join(src_dir, "demo.ns")
+    let _! = fs.write_string(
+        demo_path,
+        "fn demo_entry() -> i64 {{\n    let ok_val = 1\n    bad_symbol(ok_val)\n}}\n",
+    ) else {
+        return error "write src/demo.ns failed"
+    }
+
+    let _ = host_poll_events()
+    let _ = tools_dispatch_command(kernel, "compile", ["echo compiling"]).use(logs).use(status).use(clip)!
+    let _ = host_poll_events()
+    assert_eq(world.active_buffer().name, "*Compilation*", message = "compile opens *Compilation*")
+    assert_eq(world.active_buffer().major_mode, "compilation", message = "*Compilation* mode")
+    assert_eq(world.active_jobs.len(), 1, message = "compile tracked in active_jobs")
+    let comp_job_id = world.active_jobs.get(0).as(ActiveBgJob).job_id
+
+    let diag_stderr = "src/demo.ns:3:5: error: unresolved identifier `bad_symbol`\n"
+    let comp_claimed = tools_on_async_job_done(
+        kernel,
+        comp_job_id,
+        false,
+        1,
+        "Checking package demo...\n",
+        diag_stderr,
+    ).use(logs).use(status)!
+    assert(comp_claimed, message = "compile job claimed by tools_on_async_job_done")
+    assert(world.active_jobs.is_empty(), message = "compile job removed from active_jobs")
+    assert_eq(world.quickfix.len(), 1, message = "compiler diagnostic parsed into world.quickfix")
+
+    -- `<Return>` on the diagnostic row in `*Compilation*` jumps right to `src/demo.ns:3:5` (`Pos(2, 4)`)
+    let _ = tools_handle_key(kernel, ret_stroke).use(logs).use(status).use(clip)!
+    assert_eq(world.active_buffer().file_path, demo_path, message = "jumped to src/demo.ns")
+    assert_eq(world.active_buffer().point, Pos.new(2, 4), message = "jumped to exact line 3, col 5 (0-based 2, 4)")
+
+    -- Synchronous `shell-command` (`M-!`) single-line echo & multi-line buffer
+    let _ = tools_dispatch_command(kernel, "shell-command", ["printf 'hello-echo'"]).use(logs).use(status).use(clip)!
+    assert_eq(status.latest, "hello-echo", message = "1-line shell-command emits directly in echo area")
+
+    let _ = tools_dispatch_command(kernel, "shell-command", ["printf 'lineA\\nlineB\\n'"]).use(logs).use(status).use(clip)!
+    assert_eq(world.active_buffer().name, "*Shell Command Output*", message = "multi-line shell-command opens *Shell Command Output*")
+    assert_eq(world.active_buffer().line_count(), 2, message = "2 output lines in *Shell Command Output*")
+
+    -- `async-shell-command` + `<C-g>` cancellation
+    let _ = tools_dispatch_command(kernel, "async-shell-command", ["echo bg"]).use(logs).use(status).use(clip)!
+    let _ = host_poll_events()
+    assert_eq(world.active_jobs.len(), 1, message = "async-shell-command tracked in active_jobs")
+    let ctrl_g = parse_key_sequence("<C-g>").get(0).as(KeyStroke)
+    let cg_handled = tools_handle_key(kernel, ctrl_g).use(logs).use(status).use(clip)!
+    assert(cg_handled, message = "<C-g> cancels running background job in compilation buffer")
+    assert(world.active_jobs.is_empty(), message = "active_jobs empty after <C-g>")
+    io.println("  [ok] Test 3 (Compile + Shell + C-g) complete")
+
+    -- ========================================================================
+    -- Test 4: Org-Mode `<Tab>` Subtree Fold/Unfold & `C-c C-t` `org-todo` Cycling
+    -- ========================================================================
+    let org_path = path.join(tmp_root, "plan.org")
+    let _! = fs.write_string(
+        org_path,
+        "* Engine Roadmap\nIntro notes\n** Parser Tasks\nShip lexer\n* Release Checklist\nTag v0.1\n",
+    ) else {
+        return error "write plan.org failed"
+    }
+    let org_buf = world.open_file(org_path).use(logs).use(status)!
+    assert_eq(org_buf.major_mode, "org", message = "plan.org detected as org mode")
+    org_buf.point = Pos.new(0, 0)
+
+    let tab_stroke = parse_key_sequence("<Tab>").get(0).as(KeyStroke)
+    let folded_ok = tools_handle_key(kernel, tab_stroke).use(logs).use(status).use(clip)!
+    assert(folded_ok, message = "<Tab> handled on Org heading")
+    assert(org_buf.folded_rows.contains(1), message = "row 1 folded under * Engine Roadmap")
+    assert(org_buf.folded_rows.contains(2), message = "row 2 (** Parser Tasks) folded")
+    assert(org_buf.folded_rows.contains(3), message = "row 3 folded")
+    assert(not org_buf.folded_rows.contains(4), message = "sibling * Release Checklist (row 4) NOT folded")
+
+    let unfolded_ok = tools_handle_key(kernel, tab_stroke).use(logs).use(status).use(clip)!
+    assert(unfolded_ok, message = "second <Tab> unfolds subtree")
+    assert(org_buf.folded_rows.is_empty(), message = "folded_rows empty after unfold")
+
+    -- Cycle TODO states via `<C-c> <C-t>` chord through `tools_handle_key`
+    let cc_seq = parse_key_sequence("<C-c> <C-t>")
+    let _ = tools_handle_key(kernel, cc_seq.get(0).as(KeyStroke)).use(logs).use(status).use(clip)!
+    let _ = tools_handle_key(kernel, cc_seq.get(1).as(KeyStroke)).use(logs).use(status).use(clip)!
+    assert_eq(org_buf.line_at(0), "* TODO Engine Roadmap", message = "1st C-c C-t -> TODO")
+
+    let _ = tools_dispatch_command(kernel, "org-todo", []).use(logs).use(status).use(clip)!
+    assert_eq(org_buf.line_at(0), "* DONE Engine Roadmap", message = "2nd org-todo -> DONE")
+
+    let _ = tools_dispatch_command(kernel, "org-todo", []).use(logs).use(status).use(clip)!
+    assert_eq(org_buf.line_at(0), "* Engine Roadmap", message = "3rd org-todo -> clean title")
+    io.println("  [ok] Test 4 (Org-Outline) complete")
+
+    -- ========================================================================
+    -- Test 5: Live `*scratch*` Evaluator (`eval-scratch-line` & `eval-expression`)
+    -- ========================================================================
+    let _ = world.switch_to_buffer(world.scratch_id)
+    let scratch_buf = world.active_buffer()
+    scratch_buf.set_lines([
+        "let answer = 6 * 7",
+        "\"Lava-\" ++ (answer + 8)",
+        "extensions",
+        "services",
+        "commands",
+        "set tabstop = 2",
+    ], record_undo = false)
+
+    scratch_buf.point = Pos.new(0, 0)
+    let _ = tools_dispatch_command(kernel, "eval-scratch-line", []).use(logs).use(status).use(clip)!
+    assert_eq(scratch_buf.line_at(0), "let answer = 6 * 7 -- => 42", message = "scratch let binding annotated")
+    assert_eq(status.latest, "=> 42", message = "scratch echo output")
+
+    scratch_buf.point = Pos.new(1, 0)
+    let _ = tools_dispatch_command(kernel, "eval-scratch-line", []).use(logs).use(status).use(clip)!
+    assert_eq(scratch_buf.line_at(1), "\"Lava-\" ++ (answer + 8) -- => Lava-50", message = "scratch string/math evaluation")
+
+    scratch_buf.point = Pos.new(2, 0)
+    let _ = tools_dispatch_command(kernel, "eval-scratch-line", []).use(logs).use(status).use(clip)!
+    assert(scratch_buf.line_at(2).contains("lava.org/ext_tools[Active]"), message = "scratch extensions introspection")
+
+    scratch_buf.point = Pos.new(3, 0)
+    let _ = tools_dispatch_command(kernel, "eval-scratch-line", []).use(logs).use(status).use(clip)!
+    assert(scratch_buf.line_at(3).contains("lava.tools.manager"), message = "scratch services introspection")
+
+    scratch_buf.point = Pos.new(4, 0)
+    let _ = tools_dispatch_command(kernel, "eval-scratch-line", []).use(logs).use(status).use(clip)!
+    assert(scratch_buf.line_at(4).contains("project-search"), message = "scratch commands introspection")
+
+    scratch_buf.point = Pos.new(5, 0)
+    let _ = tools_dispatch_command(kernel, "eval-scratch-line", []).use(logs).use(status).use(clip)!
+    assert_eq(world.options.tabstop, 2, message = "scratch set tabstop mutated live EditorOptions")
+    assert_eq(scratch_buf.line_at(5), "set tabstop = 2 -- => tabstop = 2", message = "scratch set tabstop annotation")
+
+    let t_eval = tools_dispatch_command(kernel, "eval-expression", ["call next-buffer"]).use(logs).use(status).use(clip)!
+    assert(t_eval matches PromptTurn.Completed(_), message = "eval-expression `call next-buffer` succeeded")
+    assert(world.active_buffer_id != BufferId(1), message = "call next-buffer switched active buffer in live VM")
+    io.println("  [ok] Test 5 (Live *scratch* & eval-expression) complete")
+
+    io.println("PASS: all ext_tools integration tests succeeded!")
+    ()
+}
+
+fn main() {
+    run_all_tests() ! {
+        err => {
+            io.println("FAIL: " ++ err)
+            assert(false, message = err)
+        },
+    }
+}

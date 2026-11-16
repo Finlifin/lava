@@ -1,0 +1,15 @@
+[package]
+name = "srv_app"
+domain = "lava.server"
+version = "0.1.0"
+type = "lib"
+description = "Top-level coordinator and stdio JSON-RPC 2.0 event loop for Lava Server."
+
+[dependencies]
+"lava.server/server_sys" = { path = "../../packages/server_sys" }
+"lava.server/server_core" = { path = "../../packages/server_core" }
+"lava.server/srv_fs" = { path = "../srv_fs" }
+"lava.server/srv_search" = { path = "../srv_search" }
+"lava.server/srv_git" = { path = "../srv_git" }
+"lava.server/srv_exec" = { path = "../srv_exec" }
+"lava.server/srv_lsp" = { path = "../srv_lsp" }

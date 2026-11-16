@@ -1,0 +1,1143 @@
+-- ext_snippets: Programmable Snippet Engine & Tabstop Session Manager (`lava.org/ext_snippets`).
+-- Inspired by LuaSnip / YASnippet: publishes `"lava.snippets.registry"` (`SnippetService`),
+-- ships mode-aware snippet libraries across Nessa, Rust, Python, JS/TS, C, Go, Shell, Markdown,
+-- and `"all"`, parses `$1`, `$2`, `${1:default}`, `$0` with base-indentation preservation,
+-- tracks active per-buffer tabstop sessions with dynamic column shifts, and binds `<C-k>` / `<C-j>`.
+
+use std.collections.HashMap
+use @lava_core.{
+    ExtId, InteractiveEffects, KeyStroke, Keymap, ServiceEffects, SystemKernel, status_emit
+}
+use @ext_document.{
+    Buffer, BufferId, CompletionPopup, EditorWorld, Pos, Span, ext_document_id,
+    require_editor_world
+}
+use @ext_vim.{
+    KEYMAP_VIM_INSERT, SERVICE_VIM, VimMode, VimState, ext_vim_id, require_vim_state
+}
+
+pub const SERVICE_SNIPPETS: String = "lava.snippets.registry"
+pub const SNIPPETS_BUF_NAME: String = "*Snippets*"
+
+pub fn ext_snippets_id() -> ExtId = ExtId("lava.org/ext_snippets")
+
+pub struct SnippetSpec {
+    pub mode: String,
+    pub trigger: String,
+    pub body: String,
+    pub description: String,
+}
+
+pub struct SnippetTabstop {
+    pub index: i64,
+    pub row: i64,
+    pub start_col: i64,
+    pub end_col: i64,
+}
+
+pub struct SnippetSession {
+    pub buf_id: BufferId,
+    pub stops: List,
+    pub current_idx: i64,
+    pub placeholder_armed: bool,
+    pub tracked_row: i64,
+    pub tracked_line_len: i64,
+}
+
+pub struct SnippetService {
+    pub specs: List,
+    pub sessions: HashMap,
+    pub last_source_mode: String,
+}
+
+fn is_trigger_char(ch: String) -> bool {
+    if ch == "" {
+        return false
+    }
+    ch == "_" or ch == "-" or ch == "!" or ch.is_alphanumeric()
+}
+
+fn leading_indent_of(line: String) -> String {
+    let n = line.char_len()
+    var i: i64 = 0
+    while i < n {
+        let ch = line.slice(i, i + 1)
+        if ch == " " or ch == "\t" {
+            i += 1
+        } else {
+            break
+        }
+    }
+    line.slice(0, i)
+}
+
+fn extract_trigger_before_cursor(line: String, col: i64) -> (i64, String) {
+    let safe_col = if col > line.char_len() {
+        line.char_len()
+    } else if col < 0 {
+        0
+    } else {
+        col
+    }
+    var start = safe_col
+    while start > 0 {
+        let prev = line.slice(start - 1, start)
+        if is_trigger_char(prev) {
+            start -= 1
+        } else {
+            break
+        }
+    }
+    (start, line.slice(start, safe_col))
+}
+
+fn append_expanded_chunk(
+    chunk: String,
+    base_indent: String,
+    indent_unit: String,
+    cur_rel_row: i64,
+    cur_col: i64,
+) -> (String, i64, i64) {
+    let n = chunk.char_len()
+    var out = ""
+    var rel_r = cur_rel_row
+    var col = cur_col
+    var i: i64 = 0
+    while i < n {
+        let ch = chunk.slice(i, i + 1)
+        if ch == "\n" {
+            out = out ++ "\n" ++ base_indent
+            rel_r += 1
+            col = base_indent.char_len()
+            i += 1
+        } else if ch == "\t" {
+            out = out ++ indent_unit
+            col += indent_unit.char_len()
+            i += 1
+        } else {
+            out = out ++ ch
+            col += 1
+            i += 1
+        }
+    }
+    (out, rel_r, col)
+}
+
+fn parse_snippet_template(
+    body: String,
+    start_row: i64,
+    start_col: i64,
+    base_indent: String,
+    indent_unit: String,
+) -> (String, List) {
+    let n = body.char_len()
+    var out = ""
+    var rel_row: i64 = 0
+    var col = start_col
+    let raw_stops = List()
+    let default_by_idx = HashMap.new()
+    var i: i64 = 0
+
+    while i < n {
+        let ch = body.slice(i, i + 1)
+        if ch == "\\" and i + 1 < n {
+            let nxt = body.slice(i + 1, i + 2)
+            if nxt == "$" or nxt == "}}" or nxt == "{{" or nxt == "\\" {
+                out = out ++ nxt
+                col += 1
+                i += 2
+                continue
+            }
+        }
+
+        if ch == "$" and i + 1 < n {
+            let nxt = body.slice(i + 1, i + 2)
+            -- Form 1: `$0`, `$1`, `$2`, ...
+            if nxt.is_ascii_digit() {
+                var j = i + 1
+                while j < n and body.slice(j, j + 1).is_ascii_digit() {
+                    j += 1
+                }
+                let idx_opt = body.slice(i + 1, j).parse_i64()
+                if idx_opt != null {
+                    let idx = idx_opt.as(i64)
+                    let stop_row = start_row + rel_row
+                    let stop_sc = col
+                    let prev_def_opt = default_by_idx.get(idx)
+                    if prev_def_opt != null and idx > 0 {
+                        let prev_def = prev_def_opt.as(String)
+                        let (chunk_s, nr, nc) = append_expanded_chunk(
+                            prev_def,
+                            base_indent,
+                            indent_unit,
+                            rel_row,
+                            col,
+                        )
+                        out = out ++ chunk_s
+                        rel_row = nr
+                        col = nc
+                    }
+                    raw_stops.push(SnippetTabstop {
+                        index: idx,
+                        row: stop_row,
+                        start_col: stop_sc,
+                        end_col: col,
+                    })
+                    i = j
+                    continue
+                }
+            }
+
+            -- Form 2: `${1}` or `${1:default_text}`
+            if nxt == "{{" and i + 2 < n {
+                var j = i + 2
+                while j < n and body.slice(j, j + 1).is_ascii_digit() {
+                    j += 1
+                }
+                if j > i + 2 and j < n {
+                    let idx_opt = body.slice(i + 2, j).parse_i64()
+                    let sep = body.slice(j, j + 1)
+                    if idx_opt != null and sep == "}}" {
+                        let idx = idx_opt.as(i64)
+                        raw_stops.push(SnippetTabstop {
+                            index: idx,
+                            row: start_row + rel_row,
+                            start_col: col,
+                            end_col: col,
+                        })
+                        i = j + 1
+                        continue
+                    }
+                    if idx_opt != null and sep == ":" {
+                        let idx = idx_opt.as(i64)
+                        var k = j + 1
+                        var depth: i64 = 1
+                        var def_txt = ""
+                        while k < n {
+                            let dch = body.slice(k, k + 1)
+                            if dch == "\\" and k + 1 < n {
+                                let dnxt = body.slice(k + 1, k + 2)
+                                if dnxt == "}}" or dnxt == "$" or dnxt == "\\" {
+                                    def_txt = def_txt ++ dnxt
+                                    k += 2
+                                    continue
+                                }
+                            }
+                            if dch == "{{" {
+                                depth += 1
+                                def_txt = def_txt ++ dch
+                                k += 1
+                                continue
+                            }
+                            if dch == "}}" {
+                                depth -= 1
+                                if depth == 0 {
+                                    break
+                                }
+                                def_txt = def_txt ++ dch
+                                k += 1
+                                continue
+                            }
+                            def_txt = def_txt ++ dch
+                            k += 1
+                        }
+                        if depth == 0 {
+                            if not default_by_idx.contains_key(idx) {
+                                default_by_idx.insert(idx, def_txt)
+                            }
+                            let stop_row = start_row + rel_row
+                            let stop_sc = col
+                            let (chunk_s, nr, nc) = append_expanded_chunk(
+                                def_txt,
+                                base_indent,
+                                indent_unit,
+                                rel_row,
+                                col,
+                            )
+                            out = out ++ chunk_s
+                            rel_row = nr
+                            col = nc
+                            raw_stops.push(SnippetTabstop {
+                                index: idx,
+                                row: stop_row,
+                                start_col: stop_sc,
+                                end_col: if stop_row == start_row + rel_row { col } else { stop_sc },
+                            })
+                            i = k + 1
+                            continue
+                        }
+                    }
+                }
+            }
+        }
+
+        let (chunk_s, nr, nc) = append_expanded_chunk(ch, base_indent, indent_unit, rel_row, col)
+        out = out ++ chunk_s
+        rel_row = nr
+        col = nc
+        i += 1
+    }
+
+    -- Deduplicate by tabstop index (keeping first occurrence per index), sort `$1..$N`, then `$0` last.
+    let seen = HashMap.new()
+    let pos_stops = List()
+    var zero_stop: ?SnippetTabstop = null
+    for si in 0..raw_stops.len() {
+        let st = raw_stops.get(si.as(usize)).as(SnippetTabstop)
+        if st.index == 0 {
+            if zero_stop == null {
+                zero_stop = st
+            }
+        } else if st.index > 0 and (not seen.contains_key(st.index)) {
+            seen.insert(st.index, true)
+            pos_stops.push(st)
+        }
+    }
+
+    pos_stops.sort_by(|a: Any, b: Any| {
+        a.as(SnippetTabstop).index.cmp(b.as(SnippetTabstop).index)
+    })
+
+    if zero_stop != null {
+        pos_stops.push(zero_stop.as(SnippetTabstop))
+    } else {
+        pos_stops.push(SnippetTabstop {
+            index: 0,
+            row: start_row + rel_row,
+            start_col: col,
+            end_col: col,
+        })
+    }
+
+    (out, pos_stops)
+}
+
+fn sync_session_line_delta(buf: Buffer, session: SnippetSession) {
+    if session.current_idx < 0 or session.current_idx >= session.stops.len() {
+        return
+    }
+    let cur = session.stops.get(session.current_idx.as(usize)).as(SnippetTabstop)
+    let r = session.tracked_row
+    if r < 0 or r >= buf.line_count() {
+        return
+    }
+    let cur_len = buf.line_char_len(r)
+    let delta = cur_len - session.tracked_line_len
+    if delta == 0 {
+        return
+    }
+    let old_end = cur.end_col
+    let updated_end = if cur.end_col + delta >= cur.start_col {
+        cur.end_col + delta
+    } else {
+        cur.start_col
+    }
+    session.stops.set(
+        session.current_idx.as(usize),
+        SnippetTabstop {
+            index: cur.index,
+            row: cur.row,
+            start_col: cur.start_col,
+            end_col: updated_end,
+        },
+    )
+    for i in 0..session.stops.len() {
+        if i == session.current_idx {
+            continue
+        }
+        let other = session.stops.get(i.as(usize)).as(SnippetTabstop)
+        if other.row == r and other.start_col >= old_end {
+            let nsc = if other.start_col + delta >= 0 { other.start_col + delta } else { 0 }
+            let nec = if other.end_col + delta >= nsc { other.end_col + delta } else { nsc }
+            session.stops.set(
+                i.as(usize),
+                SnippetTabstop {
+                    index: other.index,
+                    row: other.row,
+                    start_col: nsc,
+                    end_col: nec,
+                },
+            )
+        }
+    }
+    session.tracked_line_len = cur_len
+}
+
+impl SnippetService {
+    pub fn new() -> SnippetService {
+        let svc = SnippetService {
+            specs: List(),
+            sessions: HashMap.new(),
+            last_source_mode: "nessa",
+        }
+        populate_builtin_snippets(svc)
+        svc
+    }
+
+    pub fn register_snippet(self, mode: String, trigger: String, body: String, description: String) {
+        let norm_mode = if mode.trim() == "" { "all" } else { mode.trim() }
+        let spec = SnippetSpec {
+            mode: norm_mode,
+            trigger: trigger,
+            body: body,
+            description: description,
+        }
+        for i in 0..self.specs.len() {
+            let existing = self.specs.get(i.as(usize)).as(SnippetSpec)
+            if existing.mode == norm_mode and existing.trigger == trigger {
+                self.specs.set(i.as(usize), spec)
+                return
+            }
+        }
+        self.specs.push(spec)
+    }
+
+    pub fn snippets_for_mode(self, major_mode: String) -> List {
+        let out = List()
+        let seen_triggers = HashMap.new()
+        -- Mode-specific snippets take precedence over `"all"` triggers
+        for i in 0..self.specs.len() {
+            let s = self.specs.get(i.as(usize)).as(SnippetSpec)
+            if s.mode == major_mode and major_mode != "all" {
+                seen_triggers.insert(s.trigger, true)
+                out.push(s)
+            }
+        }
+        for i in 0..self.specs.len() {
+            let s = self.specs.get(i.as(usize)).as(SnippetSpec)
+            if s.mode == "all" and (not seen_triggers.contains_key(s.trigger)) {
+                seen_triggers.insert(s.trigger, true)
+                out.push(s)
+            }
+        }
+        out
+    }
+
+    pub fn find_snippet(self, major_mode: String, trigger: String) -> ?SnippetSpec {
+        if trigger == "" {
+            return null
+        }
+        for i in 0..self.specs.len() {
+            let s = self.specs.get(i.as(usize)).as(SnippetSpec)
+            if s.mode == major_mode and s.trigger == trigger {
+                return s
+            }
+        }
+        for i in 0..self.specs.len() {
+            let s = self.specs.get(i.as(usize)).as(SnippetSpec)
+            if s.mode == "all" and s.trigger == trigger {
+                return s
+            }
+        }
+        null
+    }
+
+    pub fn has_active_session(self, buf_id: BufferId) -> bool {
+        self.sessions.contains_key(buf_id)
+    }
+
+    pub fn clear_session(self, buf_id: BufferId) {
+        let _ = self.sessions.remove(buf_id)
+    }
+
+    pub fn expand_snippet_body(
+        self,
+        buf: Buffer,
+        replace_start_col: i64,
+        body: String,
+        shiftwidth: i64,
+        expandtab: bool,
+    ) -> !String bool {
+        buf.ensure_writable()!
+        let p = buf.clamp_pos(buf.point, insert_mode = true)
+        let row = p.row
+        let cur_line = buf.line_at(row)
+        let safe_start = if replace_start_col < 0 {
+            0
+        } else if replace_start_col > p.col {
+            p.col
+        } else {
+            replace_start_col
+        }
+        let base_indent = leading_indent_of(cur_line.slice(0, safe_start))
+        let sw = if shiftwidth > 0 { shiftwidth } else { 4 }
+        let indent_unit = if expandtab { " ".repeat(sw) } else { "\t" }
+
+        let (expanded_text, stops) = parse_snippet_template(
+            body,
+            row,
+            safe_start,
+            base_indent,
+            indent_unit,
+        )
+
+        buf.checkpoint(p, "snippet-pre-expand")
+        let _ = buf.replace_span(
+            Span.normalized(Pos.new(row, safe_start), Pos.new(row, p.col)),
+            expanded_text,
+        )!
+
+        let first_stop = stops.get(0).as(SnippetTabstop)
+        let dest = buf.clamp_pos(Pos.new(first_stop.row, first_stop.start_col), insert_mode = true)
+        buf.point = dest
+        buf.preferred_col = dest.col
+        buf.checkpoint(dest, "snippet-expand")
+
+        if stops.len() <= 1 or first_stop.index == 0 {
+            self.clear_session(buf.id)
+            return true
+        }
+
+        self.sessions.insert(
+            buf.id,
+            SnippetSession {
+                buf_id: buf.id,
+                stops: stops,
+                current_idx: 0,
+                placeholder_armed: first_stop.end_col > first_stop.start_col,
+                tracked_row: first_stop.row,
+                tracked_line_len: buf.line_char_len(first_stop.row),
+            },
+        )
+        true
+    }
+
+    pub fn jump_next(self, world: EditorWorld) -> !String bool {
+        let buf = world.active_buffer()
+        let sess_opt = self.sessions.get(buf.id)
+        if sess_opt == null {
+            return false
+        }
+        let session = sess_opt.as(SnippetSession)
+        sync_session_line_delta(buf, session)
+        let next_i = session.current_idx + 1
+        if next_i >= session.stops.len() {
+            self.clear_session(buf.id)
+            return false
+        }
+        session.current_idx = next_i
+        let target = session.stops.get(next_i.as(usize)).as(SnippetTabstop)
+        let dest = buf.clamp_pos(Pos.new(target.row, target.start_col), insert_mode = true)
+        buf.point = dest
+        buf.preferred_col = dest.col
+
+        if target.index == 0 or next_i >= session.stops.len() - 1 {
+            self.clear_session(buf.id)
+        } else {
+            session.placeholder_armed = target.end_col > target.start_col
+            session.tracked_row = target.row
+            session.tracked_line_len = buf.line_char_len(target.row)
+        }
+        true
+    }
+
+    pub fn jump_prev(self, world: EditorWorld) -> !String bool {
+        let buf = world.active_buffer()
+        let sess_opt = self.sessions.get(buf.id)
+        if sess_opt == null {
+            return false
+        }
+        let session = sess_opt.as(SnippetSession)
+        if session.current_idx <= 0 {
+            return false
+        }
+        sync_session_line_delta(buf, session)
+        let prev_i = session.current_idx - 1
+        session.current_idx = prev_i
+        let target = session.stops.get(prev_i.as(usize)).as(SnippetTabstop)
+        let dest = buf.clamp_pos(Pos.new(target.row, target.start_col), insert_mode = true)
+        buf.point = dest
+        buf.preferred_col = dest.col
+        session.placeholder_armed = target.end_col > target.start_col
+        session.tracked_row = target.row
+        session.tracked_line_len = buf.line_char_len(target.row)
+        true
+    }
+}
+
+pub fn require_snippet_service(kernel: SystemKernel) -> !String SnippetService {
+    let raw = kernel.require_service(SERVICE_SNIPPETS)!
+    raw.as(SnippetService)
+}
+
+fn populate_builtin_snippets(svc: SnippetService) {
+    -- Global `"all"` snippets
+    svc.register_snippet("all", "date", "${{1:2026-01-01}}$0", "ISO date stamp")
+    svc.register_snippet("all", "todo", "TODO(${{1:owner}}): $0", "TODO annotation")
+    svc.register_snippet("all", "fixme", "FIXME(${{1:owner}}): $0", "FIXME annotation")
+
+    -- Nessa (`"nessa"`)
+    svc.register_snippet(
+        "nessa",
+        "fn",
+        "fn ${{1:name}}(${{2:args}}) -> ${{3:Unit}} {{\n\t$0\n}}",
+        "Function definition",
+    )
+    svc.register_snippet(
+        "nessa",
+        "pubfn",
+        "pub fn ${{1:name}}(${{2:args}}) -> ${{3:Unit}} {{\n\t$0\n}}",
+        "Public function definition",
+    )
+    svc.register_snippet(
+        "nessa",
+        "struct",
+        "pub struct ${{1:Name}} {{\n\tpub ${{2:field}}: ${{3:i64}},\n}}",
+        "Struct declaration",
+    )
+    svc.register_snippet(
+        "nessa",
+        "enum",
+        "pub enum ${{1:Name}} {{\n\tpub ${{2:Variant}},\n\t$0\n}}",
+        "Enum declaration",
+    )
+    svc.register_snippet(
+        "nessa",
+        "impl",
+        "impl ${{1:Type}} {{\n\tpub fn ${{2:method}}(self) -> ${{3:Unit}} {{\n\t\t$0\n\t}}\n}}",
+        "Impl block",
+    )
+    svc.register_snippet(
+        "nessa",
+        "match",
+        "${{1:expr}} match {{\n\t${{2:pat}} => {{\n\t\t$0\n\t}},\n}}",
+        "Pattern match expression",
+    )
+    svc.register_snippet(
+        "nessa",
+        "for",
+        "for ${{1:i}} in ${{2:0..n}} {{\n\t$0\n}}",
+        "For-in range loop",
+    )
+    svc.register_snippet(
+        "nessa",
+        "if",
+        "if ${{1:cond}} {{\n\t$0\n}}",
+        "If conditional block",
+    )
+    svc.register_snippet(
+        "nessa",
+        "test",
+        "fn test_${{1:case}}() {{\n\t$0\n}}",
+        "Test case function",
+    )
+
+    -- Rust (`"rust"`)
+    svc.register_snippet(
+        "rust",
+        "fn",
+        "fn ${{1:name}}(${{2:args}}) -> ${{3:()}} {{\n\t$0\n}}",
+        "Rust function",
+    )
+    svc.register_snippet(
+        "rust",
+        "pfn",
+        "pub fn ${{1:name}}(${{2:args}}) -> ${{3:()}} {{\n\t$0\n}}",
+        "Public Rust function",
+    )
+    svc.register_snippet(
+        "rust",
+        "struct",
+        "pub struct ${{1:Name}} {{\n\tpub ${{2:field}}: ${{3:i64}},\n}}",
+        "Rust struct",
+    )
+    svc.register_snippet(
+        "rust",
+        "enum",
+        "pub enum ${{1:Name}} {{\n\t${{2:Variant}},\n\t$0\n}}",
+        "Rust enum",
+    )
+    svc.register_snippet(
+        "rust",
+        "impl",
+        "impl ${{1:Type}} {{\n\t$0\n}}",
+        "Rust impl block",
+    )
+    svc.register_snippet(
+        "rust",
+        "match",
+        "match ${{1:expr}} {{\n\t${{2:_}} => $0,\n}}",
+        "Rust match expression",
+    )
+    svc.register_snippet(
+        "rust",
+        "test",
+        "#[test]\nfn test_${{1:name}}() {{\n\t$0\n}}",
+        "Rust #[test] function",
+    )
+    svc.register_snippet(
+        "rust",
+        "derive",
+        "#[derive(${{1:Debug, Clone, PartialEq}})]\n$0",
+        "Rust #[derive(...)] attribute",
+    )
+
+    -- Python (`"python"`)
+    svc.register_snippet(
+        "python",
+        "def",
+        "def ${{1:name}}(${{2:args}}):\n\t$0",
+        "Python function",
+    )
+    svc.register_snippet(
+        "python",
+        "class",
+        "class ${{1:Name}}:\n\tdef __init__(self, ${{2:args}}):\n\t\t$0",
+        "Python class",
+    )
+    svc.register_snippet(
+        "python",
+        "ifmain",
+        "if __name__ == \"__main__\":\n\t$0",
+        "Python __main__ guard",
+    )
+    svc.register_snippet(
+        "python",
+        "for",
+        "for ${{1:item}} in ${{2:items}}:\n\t$0",
+        "Python for loop",
+    )
+
+    -- JavaScript & TypeScript (`"javascript"`, `"typescript"`)
+    let js_modes = ["javascript", "typescript"]
+    for mi in 0..js_modes.len() {
+        let m = js_modes.get(mi.as(usize)).as(String)
+        svc.register_snippet(
+            m,
+            "fn",
+            "function ${{1:name}}(${{2:args}}) {{\n\t$0\n}}",
+            "Function declaration",
+        )
+        svc.register_snippet(
+            m,
+            "afn",
+            "const ${{1:name}} = (${{2:args}}) => {{\n\t$0\n}}",
+            "Arrow function",
+        )
+        svc.register_snippet(
+            m,
+            "imp",
+            "import {{ ${{2:symbol}} }} from \"${{1:module}}\"\n$0",
+            "ES module import",
+        )
+        svc.register_snippet(
+            m,
+            "clg",
+            "console.log(${{1:value}})$0",
+            "Console log",
+        )
+    }
+
+    -- C / C++ (`"c"`)
+    svc.register_snippet(
+        "c",
+        "fn",
+        "${{1:int}} ${{2:name}}(${{3:void}}) {{\n\t$0\n}}",
+        "C function",
+    )
+    svc.register_snippet(
+        "c",
+        "main",
+        "int main(int argc, char **argv) {{\n\t$0\n\treturn 0;\n}}",
+        "C main entry point",
+    )
+    svc.register_snippet(
+        "c",
+        "struct",
+        "typedef struct ${{1:Name}} {{\n\t${{2:int field}};\n}} ${{1:Name}};\n$0",
+        "C typedef struct",
+    )
+    svc.register_snippet(
+        "c",
+        "for",
+        "for (int ${{1:i}} = 0; ${{1:i}} < ${{2:n}}; ${{1:i}}++) {{\n\t$0\n}}",
+        "C for loop",
+    )
+    svc.register_snippet(
+        "c",
+        "if",
+        "if (${{1:cond}}) {{\n\t$0\n}}",
+        "C if block",
+    )
+
+    -- Go (`"go"`)
+    svc.register_snippet(
+        "go",
+        "fn",
+        "func ${{1:name}}(${{2:args}}) ${{3:error}} {{\n\t$0\n}}",
+        "Go function",
+    )
+    svc.register_snippet(
+        "go",
+        "main",
+        "func main() {{\n\t$0\n}}",
+        "Go main function",
+    )
+    svc.register_snippet(
+        "go",
+        "iferr",
+        "if err != nil {{\n\treturn ${{1:err}}\n}}\n$0",
+        "Go error check",
+    )
+    svc.register_snippet(
+        "go",
+        "struct",
+        "type ${{1:Name}} struct {{\n\t${{2:Field}} ${{3:string}}\n}}\n$0",
+        "Go struct type",
+    )
+    svc.register_snippet(
+        "go",
+        "for",
+        "for ${{1:i}}, ${{2:v}} := range ${{3:items}} {{\n\t$0\n}}",
+        "Go range loop",
+    )
+
+    -- Shell (`"shell"`)
+    svc.register_snippet(
+        "shell",
+        "shebang",
+        "#!/usr/bin/env bash\nset -euo pipefail\n\n$0",
+        "Bash strict header",
+    )
+    svc.register_snippet(
+        "shell",
+        "if",
+        "if [[ ${{1:cond}} ]]; then\n\t$0\nfi",
+        "Bash [[ ... ]] conditional",
+    )
+    svc.register_snippet(
+        "shell",
+        "for",
+        "for ${{1:item}} in ${{2:\"$@\"}}; do\n\t$0\ndone",
+        "Bash for loop",
+    )
+    svc.register_snippet(
+        "shell",
+        "fn",
+        "${{1:name}}() {{\n\t$0\n}}",
+        "Shell function",
+    )
+
+    -- Markdown (`"markdown"`)
+    svc.register_snippet(
+        "markdown",
+        "code",
+        "```${{1:lang}}\n$0\n```",
+        "Fenced code block",
+    )
+    svc.register_snippet(
+        "markdown",
+        "link",
+        "[${{1:text}}](${{2:url}})$0",
+        "Markdown hyperlink",
+    )
+    svc.register_snippet(
+        "markdown",
+        "todo",
+        "- [ ] ${{1:task}}$0",
+        "Markdown task checkbox",
+    )
+}
+
+fn stroke_is_printable_input(stroke: KeyStroke) -> bool {
+    if stroke.ctrl or stroke.alt or stroke.super_mod {
+        return false
+    }
+    if stroke.key == "Space" {
+        return true
+    }
+    if stroke.text != "" and stroke.text.char_len() == 1 {
+        return true
+    }
+    stroke.key.char_len() == 1
+}
+
+fn snippets_insert_interceptor(
+    kernel: SystemKernel,
+    stroke: KeyStroke,
+) -> #ServiceEffects !String bool {
+    let svc_opt = kernel.service(SERVICE_SNIPPETS)
+    if svc_opt == null {
+        return false
+    }
+    let svc = svc_opt.as(SnippetService)
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    if vim.mode != VimMode.Insert {
+        return false
+    }
+    let buf = world.active_buffer()
+    if buf.read_only {
+        return false
+    }
+    let sess_opt = svc.sessions.get(buf.id)
+    if sess_opt == null {
+        return false
+    }
+    let session = sess_opt.as(SnippetSession)
+    if not session.placeholder_armed {
+        return false
+    }
+    if session.current_idx < 0 or session.current_idx >= session.stops.len() {
+        session.placeholder_armed = false
+        return false
+    }
+    let stop = session.stops.get(session.current_idx.as(usize)).as(SnippetTabstop)
+    if buf.point.row != stop.row or buf.point.col != stop.start_col or stop.end_col <= stop.start_col {
+        session.placeholder_armed = false
+        return false
+    }
+
+    let is_bs = (not stroke.ctrl) and (not stroke.alt) and stroke.key == "BackSpace"
+    let is_print = stroke_is_printable_input(stroke)
+    if (not is_bs) and (not is_print) {
+        return false
+    }
+
+    -- Replace armed default placeholder cleanly when user begins typing at `$k`!
+    let _ = buf.delete_span(
+        Span.normalized(Pos.new(stop.row, stop.start_col), Pos.new(stop.row, stop.end_col))
+    )!
+    buf.point = Pos.new(stop.row, stop.start_col)
+    buf.preferred_col = stop.start_col
+    session.placeholder_armed = false
+    sync_session_line_delta(buf, session)
+    if is_bs {
+        return true
+    }
+    false
+}
+
+fn render_snippets_buffer_lines(svc: SnippetService, mode: String) -> List {
+    let list = svc.snippets_for_mode(mode)
+    let lines = List()
+    lines.push("Snippets Registry — Active Mode: " ++ mode ++ " (" ++ list.len().to_string() ++ " available)")
+    lines.push("Keys: Insert <C-k> expand/jump-next | <C-j> jump-prev | Normal q close")
+    lines.push("================================================================================")
+    lines.push("Trigger       Scope       Description                   Template Preview")
+    lines.push("------------  ----------  ----------------------------  ------------------------")
+    for i in 0..list.len() {
+        let s = list.get(i.as(usize)).as(SnippetSpec)
+        let preview = s.body.replace("\n", "\\n").replace("\t", "  ")
+        lines.push(
+            s.trigger.pad_end(12, " ") ++ "  "
+            ++ ("[" ++ s.mode ++ "]").pad_end(10, " ") ++ "  "
+            ++ s.description.pad_end(28, " ") ++ "  "
+            ++ preview
+        )
+    }
+    lines
+}
+
+fn cmd_snippet_expand_or_jump(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let svc = require_snippet_service(kern)!
+    let buf = world.active_buffer()
+    if buf.read_only {
+        return false
+    }
+    let p = buf.clamp_pos(buf.point, insert_mode = true)
+    let line = buf.line_at(p.row)
+    let (trig_start, trig) = extract_trigger_before_cursor(line, p.col)
+    if trig != "" {
+        let spec_opt = svc.find_snippet(buf.major_mode, trig)
+        if spec_opt != null {
+            let spec = spec_opt.as(SnippetSpec)
+            world.completion_popup = CompletionPopup.inactive()
+            let expanded = svc.expand_snippet_body(
+                buf,
+                trig_start,
+                spec.body,
+                world.options.shiftwidth,
+                world.options.expandtab,
+            )!
+            status_emit("Expanded snippet '" ++ spec.trigger ++ "'")#
+            return expanded
+        }
+    }
+    if svc.has_active_session(buf.id) {
+        world.completion_popup = CompletionPopup.inactive()
+        let jumped = svc.jump_next(world)!
+        if jumped {
+            status_emit("Snippet next tabstop")#
+            return true
+        }
+    }
+    status_emit("No matching snippet or active tabstop")#
+    false
+}
+
+fn cmd_snippet_jump_next(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let svc = require_snippet_service(kern)!
+    world.completion_popup = CompletionPopup.inactive()
+    let jumped = svc.jump_next(world)!
+    if jumped {
+        status_emit("Snippet next tabstop")#
+    }
+    jumped
+}
+
+fn cmd_snippet_jump_prev(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let svc = require_snippet_service(kern)!
+    world.completion_popup = CompletionPopup.inactive()
+    let jumped = svc.jump_prev(world)!
+    if jumped {
+        status_emit("Snippet previous tabstop")#
+    }
+    jumped
+}
+
+fn cmd_snippets_list(kern: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let svc = require_snippet_service(kern)!
+    let cur = world.active_buffer()
+    let mode = if (not args.is_empty()) and args.get(0).as(String).trim() != "" {
+        args.get(0).as(String).trim()
+    } else if cur.major_mode != "snippets" {
+        svc.last_source_mode = cur.major_mode
+        cur.major_mode
+    } else {
+        svc.last_source_mode
+    }
+    let lines = render_snippets_buffer_lines(svc, mode)
+    let sb = world.ensure_special_buffer(SNIPPETS_BUF_NAME, "snippets", lines, read_only = true)
+    sb.point = Pos.zero()
+    let _ = world.switch_to_buffer(sb.id)
+    kern.emit_hook("buffer-switched", sb.id)
+    status_emit("Showing *Snippets* for mode '" ++ mode ++ "'")#
+    sb.id
+}
+
+fn cmd_snippets_close(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let cur = world.active_buffer()
+    if cur.name == SNIPPETS_BUF_NAME or cur.major_mode == "snippets" {
+        let next_id = world.kill_buffer(cur.id, force = true)!
+        kern.emit_hook("buffer-switched", next_id)
+    }
+    ()
+}
+
+pub fn register_snippets_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_snippets_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_snippets",
+        "0.1.0",
+        "LuaSnip/YASnippet-style template expansion engine with multi-tabstop sessions and mode snippet libraries.",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let svc = SnippetService.new()
+            k.publish_service(SERVICE_SNIPPETS, ext_id, svc)
+
+            let vim = require_vim_state(k)!
+            vim.add_insert_interceptor(ext_id, snippets_insert_interceptor)
+
+            let ins_km = k.ensure_keymap(KEYMAP_VIM_INSERT)
+            ins_km.bind("<C-k>", "snippet-expand-or-jump", ext_id, description = "Expand snippet or jump to next tabstop")
+            ins_km.bind("<C-j>", "snippet-jump-prev", ext_id, description = "Jump to previous snippet tabstop")
+
+            let snip_mode_km = k.ensure_keymap("mode:snippets")
+            snip_mode_km.bind("q", "snippets-close", ext_id, description = "Close *Snippets* buffer")
+
+            k.register_command(
+                "snippet-expand-or-jump",
+                ext_id,
+                "Expand trigger word before cursor or jump to next snippet tabstop (`<C-k>`).",
+                cmd_snippet_expand_or_jump,
+            )
+            k.register_command(
+                "snippet-jump-next",
+                ext_id,
+                "Jump forward to next active snippet tabstop.",
+                cmd_snippet_jump_next,
+            )
+            k.register_command(
+                "snippet-jump-prev",
+                ext_id,
+                "Jump backward to previous active snippet tabstop (`<C-j>`).",
+                cmd_snippet_jump_prev,
+            )
+            k.register_command(
+                "snippets-list",
+                ext_id,
+                "Open *Snippets* buffer listing available snippets for current mode (`:Snippets`).",
+                cmd_snippets_list,
+            )
+            k.register_command(
+                "snippets",
+                ext_id,
+                "Open *Snippets* buffer listing available snippets for current mode (`:Snippets`).",
+                cmd_snippets_list,
+                interactive = false,
+            )
+            k.register_command(
+                "snippets-close",
+                ext_id,
+                "Close *Snippets* inspector buffer (`q`).",
+                cmd_snippets_close,
+                interactive = false,
+            )
+
+            k.add_hook(
+                "after-insert-stroke",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| -> Unit {
+                    let s_opt = kern.service(SERVICE_SNIPPETS)
+                    let w_opt = kern.service("lava.document.world")
+                    if s_opt != null and w_opt != null {
+                        let s = s_opt.as(SnippetService)
+                        let w = w_opt.as(EditorWorld)
+                        let b = w.active_buffer()
+                        let sess_opt = s.sessions.get(b.id)
+                        if sess_opt != null {
+                            let sess = sess_opt.as(SnippetSession)
+                            if b.point.row == sess.tracked_row {
+                                sync_session_line_delta(b, sess)
+                            }
+                        }
+                    }
+                },
+            )
+
+            k.add_hook(
+                "mode-changed",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| -> Unit {
+                    let s_opt = kern.service(SERVICE_SNIPPETS)
+                    let v_opt = kern.service(SERVICE_VIM)
+                    let w_opt = kern.service("lava.document.world")
+                    if s_opt != null and v_opt != null and w_opt != null {
+                        let vs = v_opt.as(VimState)
+                        if vs.mode != VimMode.Insert {
+                            let s = s_opt.as(SnippetService)
+                            let w = w_opt.as(EditorWorld)
+                            let sess_opt = s.sessions.get(w.active_buffer_id)
+                            if sess_opt != null {
+                                sess_opt.as(SnippetSession).placeholder_armed = false
+                            }
+                        }
+                    }
+                },
+            )
+
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let vim_opt = k.service(SERVICE_VIM)
+            if vim_opt != null {
+                vim_opt.as(VimState).remove_insert_interceptors(ext_id)
+            }
+            let ikm_opt = k.keymaps.get(KEYMAP_VIM_INSERT)
+            if ikm_opt != null {
+                let ikm = ikm_opt.as(Keymap)
+                let _ = ikm.unbind("<C-k>")
+                let _ = ikm.unbind("<C-j>")
+            }
+            ()
+        },
+    )
+}

@@ -1,0 +1,1976 @@
+-- ext_remote: SSH Remote Client Extension for Lava (`lava.org/ext_remote`).
+-- Provides `*Remote*` SSH connection & port-forward dashboard (`:RemoteStatus`),
+-- `*Remote Dirvish*` Ranger remote directory explorer (`:RemoteBrowse`),
+-- remote file finder (`:RemoteFiles`), remote workspace grep (`:RemoteGrep`),
+-- remote SSH shell (`:RemoteShell`), remote command runner (`:RemoteExec`),
+-- SSH port-forwarding (`:RemotePortForward`), `lava-server` deployment (`:RemoteDeploy`),
+-- and live `[SSH: <authority>]` statusline integration.
+
+use std.collections.{HashMap, Set}
+use std.env
+use std.fs
+use std.path
+use @lava_sys.rgb
+use @lava_core.{
+    ExtId, InteractiveEffects, PromptKind, PromptRequest, SystemKernel,
+    ask_prompt, clipboard_set, log_event, status_emit
+}
+use @lava_remote.{
+    RemoteConnectionInfo, RemoteDirItem, RemoteGrepMatch, RemoteTarget,
+    RemoteTunnelInfo, SshHostConfigEntry, is_ssh_uri, join_ssh_uri,
+    normalize_ssh_uri, parent_ssh_uri, parse_ssh_uri, remote_connect,
+    remote_copy, remote_deploy_server, remote_disconnect,
+    remote_discover_ssh_hosts, remote_exec, remote_find_root,
+    remote_host_available, remote_list_connections, remote_mkdir, remote_port_forward_list,
+    remote_port_forward_start, remote_port_forward_stop, remote_read_lines,
+    remote_readdir, remote_remove, remote_rename, remote_search_files,
+    remote_search_grep, remote_stat, remote_write_lines, ssh_uri_basename
+}
+use @lava_term.pty_available
+use @ext_document.{
+    Buffer, BufferId, EditorWorld, Pos, QuickfixEntry, RegisterValue,
+    ext_document_id, require_editor_world
+}
+use @ext_window.{SERVICE_WINDOW_MANAGER, WindowManager, ext_window_id}
+use @ext_vim.{
+    KEYMAP_VIM_LEADER, KEYMAP_VIM_NORMAL, SERVICE_VIM, VimMode, VimState, ext_vim_id
+}
+
+pub const SERVICE_REMOTE: String = "lava.remote.service"
+pub const OWNER_REMOTE: String = "ext_remote"
+pub const REMOTE_STATUS_BUF_NAME: String = "*Remote*"
+pub const REMOTE_DIRVISH_BUF_NAME: String = "*Remote Dirvish*"
+pub const REMOTE_OUTPUT_BUF_NAME: String = "*Remote Output*"
+pub const REMOTE_QUICKFIX_BUF_NAME: String = "*Quickfix*"
+pub const MODE_REMOTE_STATUS: String = "remote-status"
+pub const MODE_REMOTE_DIRVISH: String = "remote-dirvish"
+pub const MODE_REMOTE_OUTPUT: String = "remote-output"
+pub const REMOTE_DIRVISH_HEADER_ROWS: i64 = 3
+
+pub fn ext_remote_id() -> ExtId = ExtId("lava.org/ext_remote")
+
+-- ============================================================================
+-- 1. RemoteService State & Helpers
+-- ============================================================================
+
+pub struct RemoteService {
+    pub active_target: String,
+    pub current_uri: String,
+    pub show_hidden: bool,
+    pub entries: List,
+    pub yanked_uri: String,
+    pub cut_mode: bool,
+    pub last_exec_cmd: String,
+    pub last_exec_status: i64,
+    pub last_exec_output: String,
+    pub last_shell_cmd: String,
+    pub origin_buf_id: ?BufferId,
+    pub status_row_targets: HashMap,
+}
+
+impl RemoteService {
+    pub fn new() -> RemoteService {
+        let svc = RemoteService {
+            active_target: "",
+            current_uri: "",
+            show_hidden: false,
+            entries: List(),
+            yanked_uri: "",
+            cut_mode: false,
+            last_exec_cmd: "",
+            last_exec_status: 0,
+            last_exec_output: "",
+            last_shell_cmd: "",
+            origin_buf_id: null,
+            status_row_targets: HashMap.new(),
+        }
+        svc
+    }
+}
+
+pub fn require_remote_service(kernel: SystemKernel) -> !String RemoteService {
+    let raw = kernel.require_service(SERVICE_REMOTE)!
+    raw.as(RemoteService)
+}
+
+private fn sync_wm(kernel: SystemKernel, world: EditorWorld) {
+    let wm_opt = kernel.service(SERVICE_WINDOW_MANAGER)
+    if wm_opt != null {
+        let wm = wm_opt.as(WindowManager)
+        let ap = wm.active_pane()
+        ap.buffer_id = world.active_buffer_id
+        ap.cursor = world.active_buffer().point
+        wm.sync_from_world(world)
+    }
+}
+
+private fn ensure_vim_normal(kernel: SystemKernel, _world: EditorWorld) {
+    let v_opt = kernel.service(SERVICE_VIM)
+    if v_opt != null {
+        let vs = v_opt.as(VimState)
+        vs.mode = VimMode.Normal
+        vs.clear_transient()
+    }
+}
+
+private fn sync_remote_statusline(world: EditorWorld, svc: RemoteService) {
+    let buf = world.active_buffer()
+    if is_ssh_uri(buf.file_path) {
+        let pt_res = parse_ssh_uri(buf.file_path)
+        pt_res match {
+            pt! => {
+                svc.active_target = pt.prefix
+                world.statusline_left_extra = "[SSH: " ++ pt.authority ++ "]"
+                return
+            },
+            error _ => (),
+        }
+    }
+    if buf.major_mode == MODE_REMOTE_DIRVISH and is_ssh_uri(svc.current_uri) {
+        let pt_res = parse_ssh_uri(svc.current_uri)
+        pt_res match {
+            pt! => {
+                svc.active_target = pt.prefix
+                world.statusline_left_extra = "[SSH: " ++ pt.authority ++ "]"
+                return
+            },
+            error _ => (),
+        }
+    }
+    if buf.major_mode == MODE_REMOTE_STATUS and svc.active_target != "" {
+        let pt_res = parse_ssh_uri(svc.active_target)
+        pt_res match {
+            pt! => {
+                world.statusline_left_extra = "[SSH: " ++ pt.authority ++ "]"
+                return
+            },
+            error _ => (),
+        }
+    }
+    if world.statusline_left_extra.starts_with("[SSH: ") {
+        world.statusline_left_extra = ""
+    }
+}
+
+private fn format_human_size(bytes: i64, is_dir: bool) -> String {
+    if is_dir {
+        return "-"
+    }
+    if bytes <= 0 {
+        return "0B"
+    }
+    if bytes < 1024 {
+        return bytes.to_string() ++ "B"
+    }
+    if bytes < 1048576 {
+        let kb = bytes / 1024
+        return kb.to_string() ++ "K"
+    }
+    let mb = bytes / 1048576
+    mb.to_string() ++ "M"
+}
+
+private fn remember_origin_buffer(world: EditorWorld, svc: RemoteService) {
+    let cur = world.active_buffer()
+    if cur.name != REMOTE_STATUS_BUF_NAME
+        and cur.name != REMOTE_DIRVISH_BUF_NAME
+        and cur.name != REMOTE_OUTPUT_BUF_NAME
+        and cur.id != world.messages_id {
+        svc.origin_buf_id = cur.id
+    }
+}
+
+private fn restore_previous_buffer(kernel: SystemKernel, world: EditorWorld, svc: RemoteService) -> Buffer {
+    var target_id = world.scratch_id
+    var found = false
+    svc.origin_buf_id match {
+        orig? => {
+            let ob_opt = world.buffer(orig)
+            if ob_opt != null {
+                let ob = ob_opt.as(Buffer)
+                if ob.name != REMOTE_STATUS_BUF_NAME and ob.name != REMOTE_DIRVISH_BUF_NAME {
+                    target_id = orig
+                    found = true
+                }
+            }
+        },
+        null => (),
+    }
+    if not found {
+        var idx = world.buffer_order.len() - 1
+        while idx >= 0 {
+            let bid = world.buffer_order.get(idx.as(usize)).as(BufferId)
+            let b = world.buffers.get(bid).as(Buffer)
+            if b.name != REMOTE_STATUS_BUF_NAME
+                and b.name != REMOTE_DIRVISH_BUF_NAME
+                and bid != world.messages_id {
+                target_id = bid
+                break
+            }
+            idx -= 1
+        }
+    }
+    world.active_buffer_id = target_id
+    sync_wm(kernel, world)
+    ensure_vim_normal(kernel, world)
+    kernel.emit_hook("buffer-switched", target_id)
+    sync_remote_statusline(world, svc)
+    world.active_buffer()
+}
+
+private fn canonical_dir_uri(raw_uri: String) -> !String String {
+    let parsed = parse_ssh_uri(raw_uri)!
+    if parsed.remote_path.ends_with("/") {
+        parsed.prefix ++ parsed.remote_path
+    } else {
+        parsed.prefix ++ parsed.remote_path ++ "/"
+    }
+}
+
+private fn resolve_active_remote_uri(world: EditorWorld, svc: RemoteService, explicit_arg: String) -> String {
+    if explicit_arg.trim() != "" {
+        let t = explicit_arg.trim()
+        if is_ssh_uri(t) {
+            return normalize_ssh_uri(t)
+        }
+        let parsed_res = parse_ssh_uri(t)
+        parsed_res match {
+            pt! => {
+                return pt.canonical_uri()
+            },
+            error _ => (),
+        }
+    }
+    let buf = world.active_buffer()
+    if buf.major_mode == MODE_REMOTE_STATUS {
+        let hit_opt = svc.status_row_targets.get(buf.point.row)
+        if hit_opt != null {
+            let (kind, val) = hit_opt.as((String, String))
+            if kind == "conn" or kind == "host" {
+                return val
+            }
+        }
+    }
+    if is_ssh_uri(buf.file_path) {
+        return parent_ssh_uri(buf.file_path)
+    }
+    if svc.current_uri != "" and is_ssh_uri(svc.current_uri) {
+        return svc.current_uri
+    }
+    if svc.active_target != "" {
+        return normalize_ssh_uri(svc.active_target)
+    }
+    let conns = remote_list_connections()
+    if not conns.is_empty() {
+        let c0 = conns.get(0).as(RemoteConnectionInfo)
+        return c0.prefix ++ "/"
+    }
+    ""
+}
+
+private fn resolve_remote_project_root(
+    world: EditorWorld,
+    svc: RemoteService,
+    explicit_arg: String,
+) -> String {
+    let base_uri = resolve_active_remote_uri(world, svc, explicit_arg)
+    if base_uri == "" or explicit_arg.trim() != "" {
+        return base_uri
+    }
+    let root_res = remote_find_root(
+        base_uri,
+        [
+            ".git",
+            "compile_commands.json",
+            "Cargo.toml",
+            "package.toml",
+            "pyproject.toml",
+            "package.json",
+            "go.mod",
+            "CMakeLists.txt",
+            "Makefile",
+        ],
+    )
+    root_res match {
+        found! => found,
+        error _ => base_uri,
+    }
+}
+
+private fn collect_host_prompt_candidates() -> List {
+    let out = List()
+    let seen = Set.new()
+    let conns = remote_list_connections()
+    for i in 0..conns.len() {
+        let c = conns.get(i.as(usize)).as(RemoteConnectionInfo)
+        let uri = "ssh://" ++ c.authority ++ "/"
+        if not seen.contains(uri) {
+            seen.insert(uri)
+            let detail = "[" ++ c.mode ++ "] " ++ c.hostname ++ " (" ++ c.os ++ "/" ++ c.arch ++ ")"
+            out.push((uri, detail))
+        }
+    }
+    let hosts = remote_discover_ssh_hosts()
+    for i in 0..hosts.len() {
+        let h = hosts.get(i.as(usize)).as(SshHostConfigEntry)
+        if h.alias_name != "" {
+            var auth = ""
+            if h.user != "" {
+                auth = h.user ++ "@"
+            }
+            auth = auth ++ h.alias_name
+            if h.port > 0 and h.port != 22 {
+                auth = auth ++ ":" ++ h.port.to_string()
+            }
+            let uri = "ssh://" ++ auth ++ "/"
+            if not seen.contains(uri) {
+                seen.insert(uri)
+                let up = if h.user != "" { h.user ++ "@" } else { "" }
+                let hp = if h.hostname != "" { h.hostname } else { h.alias_name }
+                let pp = if h.port > 0 { ":" ++ h.port.to_string() } else { ":22" }
+                let jp = if h.proxy_jump != "" { " via " ++ h.proxy_jump } else { "" }
+                out.push((uri, "[ssh-config] " ++ up ++ hp ++ pp ++ jp))
+            }
+        }
+    }
+    out
+}
+
+pub fn build_remote_ssh_shell_command(target: RemoteTarget, remote_dir: String) -> String {
+    let clean_dir = if remote_dir.trim() != "" { remote_dir.trim() } else { "/" }
+    let safe_dir = clean_dir.replace("'", "'\\''")
+    var port_flag = ""
+    if target.port > 0 and target.port != 22 {
+        port_flag = "-p " ++ target.port.to_string() ++ " "
+    }
+    "ssh -t " ++ port_flag ++ target.ssh_destination()
+        ++ " \"cd '" ++ safe_dir ++ "' && exec ${{SHELL:-/bin/sh}} -l\""
+}
+
+private fn store_to_clipboard_and_registers(world: EditorWorld, text: String) -> #clipboard_set Unit {
+    let val = RegisterValue {
+        text: text,
+        linewise: false,
+        blockwise: false,
+    }
+    world.registers.yank_store(val)#
+    world.registers.set_reg("+", val)#
+    clipboard_set(text)#
+}
+
+-- ============================================================================
+-- 2. `*Remote*` Status & Port-Forward Dashboard (`mode:remote-status`)
+-- ============================================================================
+
+private fn render_remote_status_buffer(world: EditorWorld, svc: RemoteService, buf: Buffer) {
+    svc.status_row_targets = HashMap.new()
+    let conns = remote_list_connections()
+    let tunnels = remote_port_forward_list()
+    let hosts = remote_discover_ssh_hosts()
+
+    let lines = List()
+    let section_rows = List()
+    let conn_rows = List()
+    let tunnel_rows = List()
+    let host_rows = List()
+
+    lines.push("================================================================================")
+    lines.push(
+        " Lava SSH Remote Dashboard (*Remote*)   ["
+        ++ conns.len().to_string() ++ " active | "
+        ++ tunnels.len().to_string() ++ " tunnel(s) | "
+        ++ hosts.len().to_string() ++ " ssh-config host(s)]"
+    )
+    lines.push(" Keys: [RET] connect/browse  [b] dirvish  [f] files  [g] grep  [s] shell  [p] port-fwd  [x/d] stop  [D] deploy  [r] refresh  [q] close")
+    lines.push("================================================================================")
+    lines.push("")
+
+    section_rows.push(lines.len())
+    lines.push(" Active SSH Connections (" ++ conns.len().to_string() ++ "):")
+    lines.push(" ──────────────────────────────────────────────────────────────────────────────")
+    if conns.is_empty() {
+        lines.push("   (no active SSH sessions — press RET on a host below or run :RemoteConnect ssh://user@host)")
+    } else {
+        for i in 0..conns.len() {
+            let c = conns.get(i.as(usize)).as(RemoteConnectionInfo)
+            let st_tag = if c.alive { "ONLINE" } else { "OFFLINE" }
+            let ver_tag = if c.server_version != "" { " v" ++ c.server_version } else { "" }
+            let row_idx = lines.len()
+            let browse_uri = if c.remote_cwd != "" and c.remote_cwd != "/" {
+                join_ssh_uri(c.prefix ++ "/", c.remote_cwd)
+            } else {
+                c.prefix ++ "/"
+            }
+            lines.push(
+                "   • " ++ c.authority ++ "  [" ++ c.mode ++ ver_tag ++ "]  [" ++ st_tag ++ "]  "
+                ++ c.hostname ++ " (" ++ c.os ++ "/" ++ c.arch ++ ")  "
+                ++ c.latency_us.to_string() ++ "µs  cwd=" ++ c.remote_cwd
+            )
+            svc.status_row_targets.insert(row_idx, ("conn", browse_uri))
+            conn_rows.push((row_idx, c.alive))
+        }
+    }
+
+    lines.push("")
+    section_rows.push(lines.len())
+    lines.push(" Active SSH Port Forwards (" ++ tunnels.len().to_string() ++ "):")
+    lines.push(" ──────────────────────────────────────────────────────────────────────────────")
+    if tunnels.is_empty() {
+        lines.push("   (no active port forwards — press `p` or run :RemotePortForward 8080:127.0.0.1:80)")
+    } else {
+        for i in 0..tunnels.len() {
+            let t = tunnels.get(i.as(usize)).as(RemoteTunnelInfo)
+            let dir_arrow = if t.direction == "R" {
+                "REMOTE " ++ t.remote_host ++ ":" ++ t.remote_port.to_string()
+                    ++ " -> LOCAL 127.0.0.1:" ++ t.local_port.to_string()
+            } else {
+                "LOCAL 127.0.0.1:" ++ t.local_port.to_string()
+                    ++ " -> " ++ t.remote_host ++ ":" ++ t.remote_port.to_string()
+            }
+            let alive_str = if t.alive { "ACTIVE" } else { "STOPPED" }
+            let row_idx = lines.len()
+            lines.push(
+                "   [#" ++ t.id.to_string() ++ "] [" ++ t.authority ++ "]  "
+                ++ dir_arrow ++ "  [" ++ alive_str ++ "]"
+            )
+            svc.status_row_targets.insert(row_idx, ("tunnel", t.id.to_string()))
+            tunnel_rows.push((row_idx, t.alive))
+        }
+    }
+
+    lines.push("")
+    section_rows.push(lines.len())
+    lines.push(" Discovered ~/.ssh/config Hosts (" ++ hosts.len().to_string() ++ "):")
+    lines.push(" ──────────────────────────────────────────────────────────────────────────────")
+    if hosts.is_empty() {
+        lines.push("   (no Host aliases found in ~/.ssh/config)")
+    } else {
+        for i in 0..hosts.len() {
+            let h = hosts.get(i.as(usize)).as(SshHostConfigEntry)
+            var auth = ""
+            if h.user != "" {
+                auth = h.user ++ "@"
+            }
+            auth = auth ++ h.alias_name
+            if h.port > 0 and h.port != 22 {
+                auth = auth ++ ":" ++ h.port.to_string()
+            }
+            let uri = "ssh://" ++ auth ++ "/"
+            let up = if h.user != "" { h.user ++ "@" } else { "" }
+            let hp = if h.hostname != "" { h.hostname } else { h.alias_name }
+            let pp = if h.port > 0 { ":" ++ h.port.to_string() } else { ":22" }
+            let jp = if h.proxy_jump != "" { "  ProxyJump=" ++ h.proxy_jump } else { "" }
+            let row_idx = lines.len()
+            lines.push("   ◦ " ++ h.alias_name.pad_end(18, " ") ++ " -> " ++ up ++ hp ++ pp ++ jp)
+            svc.status_row_targets.insert(row_idx, ("host", uri))
+            host_rows.push(row_idx)
+        }
+    }
+
+    let prev_row = buf.point.row
+    buf.read_only = false
+    buf.major_mode = MODE_REMOTE_STATUS
+    buf.set_lines(lines, record_undo = false)
+    buf.modified = false
+    buf.read_only = true
+    buf.clear_owner_decors(OWNER_REMOTE)
+
+    -- Decorations (strictly zero bold everywhere)
+    if buf.line_count() >= 3 {
+        buf.add_inline_decor(
+            OWNER_REMOTE,
+            1,
+            0,
+            buf.line_char_len(1),
+            bg_rgba = 0,
+            fg_rgba = rgb(137, 180, 250),
+            underline = false,
+            replace_label = "",
+        )
+        buf.add_inline_decor(
+            OWNER_REMOTE,
+            2,
+            0,
+            buf.line_char_len(2),
+            bg_rgba = 0,
+            fg_rgba = rgb(148, 226, 213),
+            underline = false,
+            replace_label = "",
+        )
+    }
+    for i in 0..section_rows.len() {
+        let r = section_rows.get(i.as(usize)).as(i64)
+        if r >= 0 and r < buf.line_count() {
+            buf.add_inline_decor(
+                OWNER_REMOTE,
+                r,
+                0,
+                buf.line_char_len(r),
+                bg_rgba = 0,
+                fg_rgba = rgb(180, 190, 254),
+                underline = false,
+                replace_label = "",
+            )
+        }
+    }
+    for i in 0..conn_rows.len() {
+        let (r, ok_flag) = conn_rows.get(i.as(usize)).as((i64, bool))
+        let fg = if ok_flag { rgb(166, 227, 161) } else { rgb(243, 139, 168) }
+        buf.add_sign(OWNER_REMOTE, r, "●", fg, priority = 50)
+        buf.add_inline_decor(
+            OWNER_REMOTE,
+            r,
+            0,
+            buf.line_char_len(r),
+            bg_rgba = 0,
+            fg_rgba = fg,
+            underline = false,
+            replace_label = "",
+        )
+    }
+    for i in 0..tunnel_rows.len() {
+        let (r, ok_flag) = tunnel_rows.get(i.as(usize)).as((i64, bool))
+        let fg = if ok_flag { rgb(148, 226, 213) } else { rgb(147, 153, 178) }
+        buf.add_sign(OWNER_REMOTE, r, "⇄", fg, priority = 45)
+        buf.add_inline_decor(
+            OWNER_REMOTE,
+            r,
+            0,
+            buf.line_char_len(r),
+            bg_rgba = 0,
+            fg_rgba = fg,
+            underline = false,
+            replace_label = "",
+        )
+    }
+    for i in 0..host_rows.len() {
+        let r = host_rows.get(i.as(usize)).as(i64)
+        buf.add_inline_decor(
+            OWNER_REMOTE,
+            r,
+            0,
+            buf.line_char_len(r),
+            bg_rgba = 0,
+            fg_rgba = rgb(205, 214, 244),
+            underline = false,
+            replace_label = "",
+        )
+    }
+
+    let default_row = if not conn_rows.is_empty() {
+        let (r0, _) = conn_rows.get(0).as((i64, bool))
+        r0
+    } else if not host_rows.is_empty() {
+        host_rows.get(0).as(i64)
+    } else {
+        0
+    }
+    let target_r = if prev_row > 0 and prev_row < buf.line_count() { prev_row } else { default_row }
+    buf.point = buf.clamp_pos(Pos.new(target_r, 0), insert_mode = false)
+    sync_remote_statusline(world, svc)
+}
+
+private fn refresh_remote_status_if_open(world: EditorWorld, svc: RemoteService) {
+    let b_opt = world.find_buffer_by_name(REMOTE_STATUS_BUF_NAME)
+    if b_opt != null {
+        render_remote_status_buffer(world, svc, b_opt.as(Buffer))
+    }
+}
+
+-- ============================================================================
+-- 3. `*Remote Dirvish*` Explorer (`mode:remote-dirvish`)
+-- ============================================================================
+
+private fn entry_at_dirvish_cursor(svc: RemoteService, buf: Buffer) -> ?RemoteDirItem {
+    let idx = buf.point.row - REMOTE_DIRVISH_HEADER_ROWS
+    if idx < 0 or idx >= svc.entries.len() {
+        return null
+    }
+    svc.entries.get(idx.as(usize)).as(RemoteDirItem)
+}
+
+private fn render_remote_dirvish_buffer(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    svc: RemoteService,
+    dir_uri_raw: String,
+    .focus_name: String = "",
+    .preferred_row: i64 = -1,
+) -> !String Buffer {
+    let dir_uri = canonical_dir_uri(dir_uri_raw)!
+    let parsed = parse_ssh_uri(dir_uri)!
+    let items = remote_readdir(dir_uri, show_hidden = svc.show_hidden)!
+    svc.current_uri = dir_uri
+    svc.active_target = parsed.prefix
+    svc.entries = items
+
+    let hidden_tag = if svc.show_hidden { " | dotfiles:ON" } else { "" }
+    let ring_tag = if svc.yanked_uri != "" {
+        let mode_lbl = if svc.cut_mode { "CUT" } else { "YANK" }
+        " | " ++ mode_lbl ++ ":" ++ ssh_uri_basename(svc.yanked_uri)
+    } else {
+        ""
+    }
+
+    let lines = List()
+    lines.push(
+        " SSH Dirvish: " ++ dir_uri ++ "   ["
+        ++ items.len().to_string() ++ " item(s)" ++ hidden_tag ++ ring_tag ++ "]"
+    )
+    lines.push(" Keys: [j/k] move  [l/RET] open  [h/-] parent  [zh/.] hidden  [a] create  [r/cw] rename  [yy/dd/pp] ring  [D] del  [q] quit")
+    lines.push("────────────────────────────────────────────────────────────────────────────────")
+
+    var focus_row: i64 = -1
+    if items.is_empty() {
+        lines.push("  (empty remote directory)")
+    } else {
+        for i in 0..items.len() {
+            let it = items.get(i.as(usize)).as(RemoteDirItem)
+            let mark_ch = if svc.yanked_uri != "" and svc.yanked_uri == it.full_uri {
+                if svc.cut_mode { "x" } else { "y" }
+            } else {
+                " "
+            }
+            let mode_str = if it.is_dir { "drwxr-xr-x" } else { "-rw-r--r--" }
+            let sz_str = format_human_size(it.size, it.is_dir).pad_start(7, " ")
+            let disp_name = if it.is_dir { it.name ++ "/" } else { it.name }
+            let row_idx = lines.len()
+            lines.push(" " ++ mark_ch ++ " " ++ mode_str ++ " " ++ sz_str ++ "  " ++ disp_name)
+            if focus_name != "" and it.name == focus_name {
+                focus_row = row_idx
+            }
+        }
+    }
+
+    let buf = world.ensure_special_buffer(REMOTE_DIRVISH_BUF_NAME, MODE_REMOTE_DIRVISH, lines, read_only = true)
+    buf.clear_owner_decors(OWNER_REMOTE)
+
+    -- Colorize header & entry rows (zero bold styles)
+    buf.add_inline_decor(
+        OWNER_REMOTE,
+        0,
+        0,
+        buf.line_char_len(0),
+        bg_rgba = 0,
+        fg_rgba = rgb(137, 180, 250),
+        underline = false,
+        replace_label = "",
+    )
+    buf.add_inline_decor(
+        OWNER_REMOTE,
+        1,
+        0,
+        buf.line_char_len(1),
+        bg_rgba = 0,
+        fg_rgba = rgb(147, 153, 178),
+        underline = false,
+        replace_label = "",
+    )
+    buf.add_inline_decor(
+        OWNER_REMOTE,
+        2,
+        0,
+        buf.line_char_len(2),
+        bg_rgba = 0,
+        fg_rgba = rgb(88, 91, 112),
+        underline = false,
+        replace_label = "",
+    )
+
+    for i in 0..items.len() {
+        let it = items.get(i.as(usize)).as(RemoteDirItem)
+        let r = REMOTE_DIRVISH_HEADER_ROWS + i
+        let ln_len = buf.line_char_len(r)
+        let meta_end = if ln_len < 23 { ln_len } else { 23 }
+        if meta_end > 0 {
+            buf.add_inline_decor(
+                OWNER_REMOTE,
+                r,
+                0,
+                meta_end,
+                bg_rgba = 0,
+                fg_rgba = rgb(147, 153, 178),
+                underline = false,
+                replace_label = "",
+            )
+        }
+        if ln_len > meta_end {
+            let name_fg = if it.is_dir {
+                rgb(137, 180, 250)
+            } else if it.name.ends_with(".rs") or it.name.ends_with(".cpp") or it.name.ends_with(".hpp") or it.name.ends_with(".c") or it.name.ends_with(".h") or it.name.ends_with(".ns") {
+                rgb(205, 214, 244)
+            } else {
+                rgb(186, 194, 222)
+            }
+            buf.add_inline_decor(
+                OWNER_REMOTE,
+                r,
+                meta_end,
+                ln_len,
+                bg_rgba = 0,
+                fg_rgba = name_fg,
+                underline = false,
+                replace_label = "",
+            )
+        }
+        if svc.yanked_uri != "" and svc.yanked_uri == it.full_uri {
+            let ring_fg = if svc.cut_mode { rgb(243, 139, 168) } else { rgb(249, 226, 175) }
+            buf.add_sign(OWNER_REMOTE, r, if svc.cut_mode { "✂" } else { "★" }, ring_fg, priority = 55)
+        }
+    }
+
+    let first_entry_row = if items.is_empty() { 0 } else { REMOTE_DIRVISH_HEADER_ROWS }
+    let max_entry_row = if items.is_empty() {
+        0
+    } else {
+        REMOTE_DIRVISH_HEADER_ROWS + items.len() - 1
+    }
+    var target_row = first_entry_row
+    if focus_row >= 0 {
+        target_row = focus_row
+    } else if preferred_row >= REMOTE_DIRVISH_HEADER_ROWS {
+        target_row = if preferred_row > max_entry_row { max_entry_row } else { preferred_row }
+    }
+    let name_col = if items.is_empty() { 0 } else { 23 }
+    buf.point = buf.clamp_pos(Pos.new(target_row, name_col), insert_mode = false)
+    world.active_buffer_id = buf.id
+    sync_wm(kernel, world)
+    ensure_vim_normal(kernel, world)
+    kernel.emit_hook("buffer-switched", buf.id)
+    sync_remote_statusline(world, svc)
+    buf
+}
+
+-- ============================================================================
+-- 4. Interactive Command Implementations
+-- ============================================================================
+
+private fn connect_and_route(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    svc: RemoteService,
+    raw_target: String,
+) -> #InteractiveEffects !String Any {
+    let trimmed = raw_target.trim()
+    if trimmed == "" {
+        return ()
+    }
+    let info = remote_connect(trimmed)!
+    svc.active_target = info.prefix
+    log_event("info", "ext_remote", "Connected to " ++ info.authority ++ " [" ++ info.mode ++ "]")#
+
+    -- Check if target specifies an existing remote directory or file
+    let has_explicit_subpath = if trimmed.starts_with("ssh://") {
+        trimmed.drop(6).contains("/")
+    } else if trimmed.starts_with("/ssh:") {
+        trimmed.drop(5).contains(":")
+    } else {
+        false
+    }
+
+    if has_explicit_subpath {
+        let st_res = remote_stat(trimmed)
+        st_res match {
+            st! => {
+                if st.exists and st.is_dir {
+                    remember_origin_buffer(world, svc)
+                    let _ = render_remote_dirvish_buffer(kernel, world, svc, trimmed)!
+                    status_emit("Connected to " ++ info.authority ++ " — browsing " ++ svc.current_uri)#
+                    return ()
+                }
+                if st.exists and st.is_file {
+                    let fbuf = world.open_file(trimmed)#!
+                    sync_wm(kernel, world)
+                    ensure_vim_normal(kernel, world)
+                    kernel.emit_hook("buffer-opened", fbuf.id)
+                    kernel.emit_hook("buffer-switched", fbuf.id)
+                    sync_remote_statusline(world, svc)
+                    status_emit("Opened remote file " ++ fbuf.file_path)#
+                    return ()
+                }
+            },
+            error _ => (),
+        }
+    }
+
+    remember_origin_buffer(world, svc)
+    let sbuf = world.ensure_special_buffer(REMOTE_STATUS_BUF_NAME, MODE_REMOTE_STATUS, [""], read_only = true)
+    render_remote_status_buffer(world, svc, sbuf)
+    world.active_buffer_id = sbuf.id
+    sync_wm(kernel, world)
+    ensure_vim_normal(kernel, world)
+    kernel.emit_hook("buffer-switched", sbuf.id)
+    status_emit("Connected to " ++ info.authority ++ " [" ++ info.mode ++ "]")#
+    ()
+}
+
+fn cmd_remote_connect(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    if not args.is_empty() {
+        let a0 = args.get(0).as(String).trim()
+        if a0 != "" {
+            return connect_and_route(kernel, world, svc, a0)#!
+        }
+    }
+    let cands = collect_host_prompt_candidates()
+    let req = if cands.is_empty() {
+        PromptRequest.text("Remote SSH Connect (ssh://user@host[:port]/path): ", "ssh://")
+    } else {
+        PromptRequest.with_candidates("Remote SSH Connect: ", "", PromptKind.Choice, cands)
+    }
+    let ans? = ask_prompt(req)# else {
+        return ()
+    }
+    if ans.trim() == "" {
+        return ()
+    }
+    connect_and_route(kernel, world, svc, ans.trim())#!
+}
+
+fn cmd_remote_disconnect(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    var target = ""
+    if not args.is_empty() {
+        target = args.get(0).as(String).trim()
+    }
+    if target == "" {
+        let cur = world.active_buffer()
+        if cur.major_mode == MODE_REMOTE_STATUS {
+            let hit_opt = svc.status_row_targets.get(cur.point.row)
+            if hit_opt != null {
+                let (kind, val) = hit_opt.as((String, String))
+                if kind == "conn" {
+                    target = val
+                }
+            }
+        }
+    }
+    if target == "" {
+        let conns = remote_list_connections()
+        if conns.len() == 1 {
+            target = conns.get(0).as(RemoteConnectionInfo).prefix
+        } else if conns.len() > 1 {
+            let cands = List()
+            for i in 0..conns.len() {
+                let c = conns.get(i.as(usize)).as(RemoteConnectionInfo)
+                cands.push((c.prefix, "[" ++ c.mode ++ "] " ++ c.hostname))
+            }
+            let ans? = ask_prompt(PromptRequest.with_candidates("Disconnect SSH session: ", "", PromptKind.Choice, cands))# else {
+                return ()
+            }
+            target = ans.trim()
+        } else {
+            target = svc.active_target
+        }
+    }
+    if target == "" {
+        status_emit("No active SSH connection to disconnect")#
+        return ()
+    }
+    let ok = remote_disconnect(target)
+    if svc.active_target != "" and normalize_ssh_uri(target).starts_with(svc.active_target) {
+        svc.active_target = ""
+    }
+    refresh_remote_status_if_open(world, svc)
+    sync_remote_statusline(world, svc)
+    if ok {
+        status_emit("Disconnected SSH session: " ++ target)#
+    } else {
+        status_emit("SSH session already closed: " ++ target)#
+    }
+    ()
+}
+
+fn cmd_remote_status(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    remember_origin_buffer(world, svc)
+    let sbuf = world.ensure_special_buffer(REMOTE_STATUS_BUF_NAME, MODE_REMOTE_STATUS, [""], read_only = true)
+    render_remote_status_buffer(world, svc, sbuf)
+    world.active_buffer_id = sbuf.id
+    sync_wm(kernel, world)
+    ensure_vim_normal(kernel, world)
+    kernel.emit_hook("buffer-switched", sbuf.id)
+    status_emit("*Remote* SSH dashboard (`RET` browse, `p` port-forward, `q` close)")#
+    ()
+}
+
+fn cmd_remote_status_enter(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let buf = world.active_buffer()
+    let hit_opt = svc.status_row_targets.get(buf.point.row)
+    if hit_opt == null {
+        status_emit("Move cursor onto a connection, port-forward, or SSH host row")#
+        return ()
+    }
+    let (kind, val) = hit_opt.as((String, String))
+    if kind == "tunnel" {
+        status_emit("Port-forward #" ++ val ++ " (press `x` or `d` to stop tunnel)")#
+        return ()
+    }
+    let _ = remote_connect(val)!
+    let _ = render_remote_dirvish_buffer(kernel, world, svc, val)!
+    status_emit("Browsing " ++ svc.current_uri)#
+    ()
+}
+
+fn cmd_remote_status_stop_row(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let buf = world.active_buffer()
+    let hit_opt = svc.status_row_targets.get(buf.point.row)
+    if hit_opt != null {
+        let (kind, val) = hit_opt.as((String, String))
+        if kind == "tunnel" {
+            let tid_opt = val.parse_i64()
+            if tid_opt != null {
+                let tid = tid_opt.as(i64)
+                let _ = remote_port_forward_stop(tid)
+                render_remote_status_buffer(world, svc, buf)
+                status_emit("Stopped SSH port-forward #" ++ tid.to_string())#
+                return ()
+            }
+        }
+        if kind == "conn" {
+            let _ = remote_disconnect(val)
+            render_remote_status_buffer(world, svc, buf)
+            status_emit("Disconnected " ++ val)#
+            return ()
+        }
+    }
+    cmd_remote_disconnect(kernel, List())#!
+}
+
+fn cmd_remote_browse(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let raw_arg = if not args.is_empty() { args.get(0).as(String).trim() } else { "" }
+    var target_uri = resolve_active_remote_uri(world, svc, raw_arg)
+    if target_uri == "" {
+        let cands = collect_host_prompt_candidates()
+        let req = if cands.is_empty() {
+            PromptRequest.text("Remote Browse URI (ssh://user@host/dir): ", "ssh://")
+        } else {
+            PromptRequest.with_candidates("Remote Browse: ", "", PromptKind.Choice, cands)
+        }
+        let ans? = ask_prompt(req)# else {
+            return ()
+        }
+        target_uri = ans.trim()
+    }
+    if target_uri == "" {
+        return ()
+    }
+    remember_origin_buffer(world, svc)
+    let _ = render_remote_dirvish_buffer(kernel, world, svc, target_uri)!
+    status_emit("Remote Dirvish: " ++ svc.current_uri)#
+    ()
+}
+
+fn cmd_remote_dirvish_next(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let buf = world.active_buffer()
+    if svc.entries.is_empty() {
+        return ()
+    }
+    let min_r = REMOTE_DIRVISH_HEADER_ROWS
+    let max_r = REMOTE_DIRVISH_HEADER_ROWS + svc.entries.len() - 1
+    let next_r = if buf.point.row < min_r {
+        min_r
+    } else if buf.point.row < max_r {
+        buf.point.row + 1
+    } else {
+        max_r
+    }
+    buf.point = buf.clamp_pos(Pos.new(next_r, 23), insert_mode = false)
+    sync_wm(kernel, world)
+    ()
+}
+
+fn cmd_remote_dirvish_prev(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let buf = world.active_buffer()
+    if svc.entries.is_empty() {
+        return ()
+    }
+    let min_r = REMOTE_DIRVISH_HEADER_ROWS
+    let max_r = REMOTE_DIRVISH_HEADER_ROWS + svc.entries.len() - 1
+    let prev_r = if buf.point.row > max_r {
+        max_r
+    } else if buf.point.row > min_r {
+        buf.point.row - 1
+    } else {
+        min_r
+    }
+    buf.point = buf.clamp_pos(Pos.new(prev_r, 23), insert_mode = false)
+    sync_wm(kernel, world)
+    ()
+}
+
+fn cmd_remote_dirvish_top(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let buf = world.active_buffer()
+    if not svc.entries.is_empty() {
+        buf.point = buf.clamp_pos(Pos.new(REMOTE_DIRVISH_HEADER_ROWS, 23), insert_mode = false)
+        sync_wm(kernel, world)
+    }
+    ()
+}
+
+fn cmd_remote_dirvish_bottom(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let buf = world.active_buffer()
+    if not svc.entries.is_empty() {
+        let last_r = REMOTE_DIRVISH_HEADER_ROWS + svc.entries.len() - 1
+        buf.point = buf.clamp_pos(Pos.new(last_r, 23), insert_mode = false)
+        sync_wm(kernel, world)
+    }
+    ()
+}
+
+fn cmd_remote_dirvish_enter(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let buf = world.active_buffer()
+    let item? = entry_at_dirvish_cursor(svc, buf) else {
+        status_emit("No remote entry under cursor")#
+        return ()
+    }
+    if item.is_dir {
+        let _ = render_remote_dirvish_buffer(kernel, world, svc, item.full_uri)!
+        status_emit("Remote Dirvish: " ++ svc.current_uri)#
+        return ()
+    }
+    let fbuf = world.open_file(item.full_uri)#!
+    sync_wm(kernel, world)
+    ensure_vim_normal(kernel, world)
+    kernel.emit_hook("buffer-opened", fbuf.id)
+    kernel.emit_hook("buffer-switched", fbuf.id)
+    sync_remote_statusline(world, svc)
+    status_emit("Opened " ++ fbuf.file_path)#
+    ()
+}
+
+fn cmd_remote_dirvish_up(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    if svc.current_uri == "" {
+        return ()
+    }
+    var trimmed = svc.current_uri
+    let parsed = parse_ssh_uri(trimmed)!
+    if parsed.remote_path == "/" {
+        status_emit("Already at remote root " ++ parsed.prefix ++ "/")#
+        return ()
+    }
+    let child_name = ssh_uri_basename(parsed.prefix ++ parsed.remote_path)
+    let par_uri = parent_ssh_uri(parsed.prefix ++ parsed.remote_path)
+    let _ = render_remote_dirvish_buffer(kernel, world, svc, par_uri, focus_name = child_name)!
+    status_emit("Remote Dirvish: " ++ svc.current_uri)#
+    ()
+}
+
+fn cmd_remote_dirvish_toggle_hidden(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let buf = world.active_buffer()
+    let cur_opt = entry_at_dirvish_cursor(svc, buf)
+    let keep = if cur_opt != null { cur_opt.as(RemoteDirItem).name } else { "" }
+    svc.show_hidden = not svc.show_hidden
+    let _ = render_remote_dirvish_buffer(kernel, world, svc, svc.current_uri, focus_name = keep)!
+    status_emit("Remote Dirvish dotfiles: " ++ (if svc.show_hidden { "ON" } else { "OFF" }))#
+    ()
+}
+
+fn cmd_remote_dirvish_create(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    if svc.current_uri == "" {
+        return ()
+    }
+    var name_in = if not args.is_empty() { args.get(0).as(String).trim() } else { "" }
+    if name_in == "" {
+        let ans? = ask_prompt(PromptRequest.text("Create in " ++ svc.current_uri ++ " (trailing `/` for dir): ", ""))# else {
+            return ()
+        }
+        name_in = ans.trim()
+    }
+    if name_in == "" {
+        return ()
+    }
+    let is_dir_req = name_in.ends_with("/")
+    let clean_name = if is_dir_req {
+        name_in.slice(0, name_in.char_len() - 1).trim()
+    } else {
+        name_in
+    }
+    if clean_name == "" {
+        return ()
+    }
+    if clean_name.starts_with(".") {
+        svc.show_hidden = true
+    }
+    let target_uri = join_ssh_uri(svc.current_uri, clean_name)
+    if is_dir_req {
+        remote_mkdir(target_uri)!
+        let _ = render_remote_dirvish_buffer(kernel, world, svc, svc.current_uri, focus_name = clean_name)!
+        status_emit("Created remote directory: " ++ target_uri)#
+        return ()
+    }
+    let _ = remote_write_lines(target_uri, [""], false)!
+    let _ = render_remote_dirvish_buffer(kernel, world, svc, svc.current_uri, focus_name = clean_name)!
+    let fbuf = world.open_file(target_uri)#!
+    sync_wm(kernel, world)
+    ensure_vim_normal(kernel, world)
+    kernel.emit_hook("buffer-opened", fbuf.id)
+    kernel.emit_hook("buffer-switched", fbuf.id)
+    sync_remote_statusline(world, svc)
+    status_emit("Created & opened remote file: " ++ target_uri)#
+    ()
+}
+
+fn cmd_remote_dirvish_rename(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let buf = world.active_buffer()
+    let item? = entry_at_dirvish_cursor(svc, buf) else {
+        status_emit("No remote entry under cursor")#
+        return ()
+    }
+    var new_name = if not args.is_empty() { args.get(0).as(String).trim() } else { "" }
+    if new_name == "" {
+        let ans? = ask_prompt(PromptRequest.text("Rename `" ++ item.name ++ "` to: ", item.name))# else {
+            return ()
+        }
+        new_name = ans.trim()
+    }
+    if new_name == "" or new_name == item.name {
+        return ()
+    }
+    let dst_uri = join_ssh_uri(svc.current_uri, new_name)
+    remote_rename(item.full_uri, dst_uri)!
+    let focus_leaf = ssh_uri_basename(dst_uri)
+    let _ = render_remote_dirvish_buffer(kernel, world, svc, svc.current_uri, focus_name = focus_leaf)!
+    status_emit("Renamed `" ++ item.name ++ "` -> `" ++ new_name ++ "`")#
+    ()
+}
+
+fn cmd_remote_dirvish_delete(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let buf = world.active_buffer()
+    let item? = entry_at_dirvish_cursor(svc, buf) else {
+        status_emit("No remote entry under cursor")#
+        return ()
+    }
+    let cur_row = buf.point.row
+    var confirmed = false
+    if not args.is_empty() {
+        let a0 = args.get(0).as(String).trim().to_lower()
+        confirmed = a0 == "y" or a0 == "yes" or a0 == "--yes"
+    }
+    if not confirmed {
+        let kind_lbl = if item.is_dir { "directory" } else { "file" }
+        let ans? = ask_prompt(PromptRequest.with_candidates(
+            "Delete remote " ++ kind_lbl ++ " `" ++ item.name ++ "`? (y/n) ",
+            "",
+            PromptKind.Confirm,
+            List(),
+        ))# else {
+            status_emit("Delete cancelled")#
+            return ()
+        }
+        confirmed = ans.trim().to_lower() == "y"
+    }
+    if not confirmed {
+        status_emit("Delete cancelled")#
+        return ()
+    }
+    remote_remove(item.full_uri, recursive = item.is_dir)!
+    if svc.yanked_uri == item.full_uri {
+        svc.yanked_uri = ""
+        svc.cut_mode = false
+    }
+    let _ = render_remote_dirvish_buffer(kernel, world, svc, svc.current_uri, preferred_row = cur_row)!
+    status_emit("Deleted remote entry: " ++ item.name)#
+    ()
+}
+
+fn cmd_remote_dirvish_yank(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let buf = world.active_buffer()
+    let item? = entry_at_dirvish_cursor(svc, buf) else {
+        status_emit("No remote entry under cursor")#
+        return ()
+    }
+    svc.yanked_uri = item.full_uri
+    svc.cut_mode = false
+    let _ = render_remote_dirvish_buffer(kernel, world, svc, svc.current_uri, focus_name = item.name)!
+    status_emit("Yanked remote URI: " ++ item.full_uri)#
+    ()
+}
+
+fn cmd_remote_dirvish_cut(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let buf = world.active_buffer()
+    let item? = entry_at_dirvish_cursor(svc, buf) else {
+        status_emit("No remote entry under cursor")#
+        return ()
+    }
+    svc.yanked_uri = item.full_uri
+    svc.cut_mode = true
+    let _ = render_remote_dirvish_buffer(kernel, world, svc, svc.current_uri, focus_name = item.name)!
+    status_emit("Cut remote URI: " ++ item.full_uri)#
+    ()
+}
+
+private fn disambiguate_remote_copy_dest(base_dir_uri: String, orig_name: String) -> String {
+    var cand_name = orig_name
+    var attempt: i64 = 0
+    while attempt < 50 {
+        let cand_uri = join_ssh_uri(base_dir_uri, cand_name)
+        let st_res = remote_stat(cand_uri)
+        var exists_now = false
+        st_res match {
+            st! => {
+                exists_now = st.exists
+            },
+            error _ => (),
+        }
+        if not exists_now {
+            return cand_uri
+        }
+        attempt += 1
+        let dot_hits = orig_name.find_indices(".")
+        let suffix = if attempt == 1 { "_copy" } else { "_copy" ++ attempt.to_string() }
+        if (not dot_hits.is_empty()) and dot_hits.get(0).as(i64) > 0 {
+            let last_dot = dot_hits.get((dot_hits.len() - 1).as(usize)).as(i64)
+            cand_name = orig_name.slice(0, last_dot) ++ suffix ++ orig_name.slice(last_dot, orig_name.char_len())
+        } else {
+            cand_name = orig_name ++ suffix
+        }
+    }
+    join_ssh_uri(base_dir_uri, orig_name ++ "_copy")
+}
+
+fn cmd_remote_dirvish_paste(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    if svc.yanked_uri == "" or svc.current_uri == "" {
+        status_emit("Remote copy/cut ring is empty")#
+        return ()
+    }
+    let src_uri = svc.yanked_uri
+    let base_name = ssh_uri_basename(src_uri)
+    if svc.cut_mode {
+        let dst_uri = join_ssh_uri(svc.current_uri, base_name)
+        if dst_uri != src_uri {
+            remote_rename(src_uri, dst_uri)!
+        }
+        svc.yanked_uri = ""
+        svc.cut_mode = false
+        let _ = render_remote_dirvish_buffer(kernel, world, svc, svc.current_uri, focus_name = base_name)!
+        status_emit("Moved remote entry -> " ++ dst_uri)#
+        return ()
+    }
+    let dst_uri = disambiguate_remote_copy_dest(svc.current_uri, base_name)
+    let pasted_name = ssh_uri_basename(dst_uri)
+    remote_copy(src_uri, dst_uri)!
+    let _ = render_remote_dirvish_buffer(kernel, world, svc, svc.current_uri, focus_name = pasted_name)!
+    status_emit("Copied remote entry -> " ++ dst_uri)#
+    ()
+}
+
+fn cmd_remote_dirvish_yank_path(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let buf = world.active_buffer()
+    let item_opt = entry_at_dirvish_cursor(svc, buf)
+    let uri = if item_opt != null {
+        item_opt.as(RemoteDirItem).full_uri
+    } else {
+        svc.current_uri
+    }
+    store_to_clipboard_and_registers(world, uri)#
+    status_emit("Yanked canonical SSH URI: " ++ uri)#
+    ()
+}
+
+fn cmd_remote_dirvish_refresh(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    if svc.current_uri == "" {
+        return ()
+    }
+    let buf = world.active_buffer()
+    let cur_opt = entry_at_dirvish_cursor(svc, buf)
+    let keep = if cur_opt != null { cur_opt.as(RemoteDirItem).name } else { "" }
+    let _ = render_remote_dirvish_buffer(kernel, world, svc, svc.current_uri, focus_name = keep)!
+    status_emit("Refreshed " ++ svc.current_uri)#
+    ()
+}
+
+fn cmd_remote_quit_panel(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let restored = restore_previous_buffer(kernel, world, svc)
+    status_emit("Restored buffer " ++ restored.name)#
+    ()
+}
+
+private fn walk_mock_remote_files(
+    dir_uri: String,
+    q_low: String,
+    limit: i64,
+    depth: i64,
+    out: List,
+) {
+    if depth > 12 or out.len() >= limit {
+        return
+    }
+    let items = remote_readdir(dir_uri, show_hidden = false) ! { _ => List() }
+    for i in 0..items.len() {
+        if out.len() >= limit {
+            return
+        }
+        let item = items.get(i.as(usize)).as(RemoteDirItem)
+        if item.is_dir {
+            if item.name != ".git" and item.name != "target" and item.name != "node_modules" {
+                walk_mock_remote_files(item.full_uri, q_low, limit, depth + 1, out)
+            }
+        } else if q_low == "" or item.full_uri.to_lower().contains(q_low) {
+            out.push(item.full_uri)
+        }
+    }
+}
+
+private fn query_remote_files(root_uri: String, query: String, limit: i64) -> !String List {
+    if remote_host_available() {
+        return remote_search_files(root_uri, query, limit = limit)!
+    }
+    let out = List()
+    walk_mock_remote_files(root_uri, query.trim().to_lower(), limit, 0, out)
+    out
+}
+
+private fn query_remote_grep(root_uri: String, pattern: String, limit: i64) -> !String List {
+    if remote_host_available() {
+        return remote_search_grep(root_uri, pattern, limit = limit)!
+    }
+    let files = List()
+    walk_mock_remote_files(root_uri, "", 400, 0, files)
+    let pat_low = pattern.to_lower()
+    let out = List()
+    for fi in 0..files.len() {
+        let furi = files.get(fi.as(usize)).as(String)
+        let rl_res = remote_read_lines(furi)
+        rl_res match {
+            pair! => {
+                let (flines, _) = pair
+                for r in 0..flines.len() {
+                    let ln = flines.get(r.as(usize)).as(String)
+                    let hits = ln.to_lower().find_indices(pat_low)
+                    if not hits.is_empty() {
+                        out.push(RemoteGrepMatch {
+                            full_uri: furi,
+                            row: r,
+                            col: hits.get(0).as(i64),
+                            line_text: ln,
+                        })
+                        if out.len() >= limit {
+                            return out
+                        }
+                    }
+                }
+            },
+            error _ => (),
+        }
+    }
+    out
+}
+
+fn cmd_remote_files(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let raw_arg = if not args.is_empty() { args.get(0).as(String).trim() } else { "" }
+    if raw_arg != "" and is_ssh_uri(raw_arg) {
+        let st_res = remote_stat(raw_arg)
+        st_res match {
+            st! => {
+                if st.exists and st.is_file {
+                    let fbuf = world.open_file(raw_arg)#!
+                    sync_wm(kernel, world)
+                    ensure_vim_normal(kernel, world)
+                    kernel.emit_hook("buffer-opened", fbuf.id)
+                    kernel.emit_hook("buffer-switched", fbuf.id)
+                    sync_remote_statusline(world, svc)
+                    status_emit("Opened remote file: " ++ fbuf.file_path)#
+                    return ()
+                }
+            },
+            error _ => (),
+        }
+    }
+    let dir_arg = if raw_arg != "" and is_ssh_uri(raw_arg) { raw_arg } else { "" }
+    let filter_q = if raw_arg != "" and (not is_ssh_uri(raw_arg)) { raw_arg } else { "" }
+    let root_uri = resolve_remote_project_root(world, svc, dir_arg)
+    if root_uri == "" {
+        status_emit("RemoteFiles: no active SSH connection (run :RemoteConnect first)")#
+        return ()
+    }
+    let files = query_remote_files(root_uri, filter_q, 300)!
+    if files.is_empty() {
+        status_emit("RemoteFiles: no files found under " ++ root_uri)#
+        return ()
+    }
+    if filter_q != "" and files.len() == 1 {
+        let only_uri = files.get(0).as(String)
+        let fbuf = world.open_file(only_uri)#!
+        sync_wm(kernel, world)
+        ensure_vim_normal(kernel, world)
+        kernel.emit_hook("buffer-opened", fbuf.id)
+        kernel.emit_hook("buffer-switched", fbuf.id)
+        sync_remote_statusline(world, svc)
+        status_emit("Opened remote file: " ++ fbuf.file_path)#
+        return ()
+    }
+    let ans? = ask_prompt(PromptRequest.with_candidates(
+        "Remote Files (" ++ root_uri ++ "): ",
+        "",
+        PromptKind.Choice,
+        files,
+    ))# else {
+        return ()
+    }
+    let chosen = ans.trim()
+    if chosen == "" {
+        return ()
+    }
+    let target_uri = if is_ssh_uri(chosen) { chosen } else { join_ssh_uri(root_uri, chosen) }
+    let fbuf = world.open_file(target_uri)#!
+    sync_wm(kernel, world)
+    ensure_vim_normal(kernel, world)
+    kernel.emit_hook("buffer-opened", fbuf.id)
+    kernel.emit_hook("buffer-switched", fbuf.id)
+    sync_remote_statusline(world, svc)
+    status_emit("Opened remote file: " ++ fbuf.file_path)#
+    ()
+}
+
+fn cmd_remote_grep(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let root_uri = resolve_remote_project_root(world, svc, "")
+    if root_uri == "" {
+        status_emit("RemoteGrep: no active SSH connection (run :RemoteConnect first)")#
+        return ()
+    }
+    var pattern = if not args.is_empty() { args.join(" ").trim() } else { "" }
+    if pattern == "" {
+        let ans? = ask_prompt(PromptRequest.text("Remote Grep (" ++ root_uri ++ "): ", ""))# else {
+            return ()
+        }
+        pattern = ans.trim()
+    }
+    if pattern == "" {
+        return ()
+    }
+    let hits = query_remote_grep(root_uri, pattern, 200)!
+    let qf = List()
+    let lines = List()
+    lines.push("Remote Grep in " ++ root_uri ++ " for `" ++ pattern ++ "` (" ++ hits.len().to_string() ++ " hit(s))  [RET: jump | q: close]")
+    lines.push("────────────────────────────────────────────────────────────────────────────────")
+    for i in 0..hits.len() {
+        let h = hits.get(i.as(usize)).as(RemoteGrepMatch)
+        qf.push(QuickfixEntry {
+            file_path: h.full_uri,
+            row: h.row,
+            col: h.col,
+            text: h.line_text.trim(),
+        })
+        lines.push(
+            h.full_uri ++ ":" ++ (h.row + 1).to_string() ++ ":" ++ (h.col + 1).to_string()
+            ++ ": " ++ h.line_text.trim()
+        )
+    }
+    world.quickfix = qf
+    world.quickfix_idx = 0
+    world.quickfix_title = "Remote Grep: " ++ pattern
+    remember_origin_buffer(world, svc)
+    let qbuf = world.ensure_special_buffer(REMOTE_QUICKFIX_BUF_NAME, "qf", lines, read_only = true)
+    qbuf.point = Pos.new(if qf.is_empty() { 0 } else { 2 }, 0)
+    world.active_buffer_id = qbuf.id
+    sync_wm(kernel, world)
+    ensure_vim_normal(kernel, world)
+    kernel.emit_hook("buffer-switched", qbuf.id)
+    status_emit("Remote Grep `" ++ pattern ++ "`: " ++ qf.len().to_string() ++ " match(es)")#
+    ()
+}
+
+fn cmd_remote_qf_jump(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let buf = world.active_buffer()
+    let idx = buf.point.row - 2
+    if idx < 0 or idx >= world.quickfix.len() {
+        return ()
+    }
+    world.quickfix_idx = idx
+    let entry = world.quickfix.get(idx.as(usize)).as(QuickfixEntry)
+    let fbuf = world.open_file(entry.file_path)#!
+    fbuf.point = fbuf.clamp_pos(Pos.new(entry.row, entry.col), insert_mode = false)
+    sync_wm(kernel, world)
+    ensure_vim_normal(kernel, world)
+    kernel.emit_hook("buffer-opened", fbuf.id)
+    kernel.emit_hook("buffer-switched", fbuf.id)
+    sync_remote_statusline(world, svc)
+    status_emit("Quickfix [" ++ (idx + 1).to_string() ++ "/" ++ world.quickfix.len().to_string() ++ "] " ++ fbuf.file_path)#
+    ()
+}
+
+fn cmd_remote_exec(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let target_uri = resolve_active_remote_uri(world, svc, "")
+    if target_uri == "" {
+        status_emit("RemoteExec: no active SSH connection (run :RemoteConnect first)")#
+        return ()
+    }
+    let parsed = parse_ssh_uri(target_uri)!
+    var cmd_str = if not args.is_empty() { args.join(" ").trim() } else { "" }
+    if cmd_str == "" {
+        let ans? = ask_prompt(PromptRequest.text("Remote Exec [" ++ parsed.authority ++ "]: ", svc.last_exec_cmd))# else {
+            return ()
+        }
+        cmd_str = ans.trim()
+    }
+    if cmd_str == "" {
+        return ()
+    }
+    let (exit_code, out_s, err_s) = remote_exec(target_uri, cmd_str, cwd = parsed.remote_path)!
+    var combined = out_s
+    if err_s != "" {
+        if combined != "" and (not combined.ends_with("\n")) {
+            combined = combined ++ "\n"
+        }
+        combined = combined ++ err_s
+    }
+    svc.last_exec_cmd = cmd_str
+    svc.last_exec_status = exit_code
+    svc.last_exec_output = combined
+
+    let lines = List()
+    lines.push(
+        "[" ++ parsed.authority ++ ":" ++ parsed.remote_path ++ "]$ " ++ cmd_str
+        ++ "   (exit=" ++ exit_code.to_string() ++ ")"
+    )
+    lines.push("────────────────────────────────────────────────────────────────────────────────")
+    let clean = combined.replace("\r\n", "\n").trim_end_matches("\n")
+    if clean == "" {
+        lines.push("(no output)")
+    } else {
+        let body = clean.split("\n")
+        for i in 0..body.len() {
+            lines.push(body.get(i.as(usize)).as(String))
+        }
+    }
+    remember_origin_buffer(world, svc)
+    let obuf = world.ensure_special_buffer(REMOTE_OUTPUT_BUF_NAME, MODE_REMOTE_OUTPUT, lines, read_only = true)
+    obuf.point = Pos.zero()
+    world.active_buffer_id = obuf.id
+    sync_wm(kernel, world)
+    ensure_vim_normal(kernel, world)
+    kernel.emit_hook("buffer-switched", obuf.id)
+    status_emit("RemoteExec [" ++ parsed.authority ++ "] exit=" ++ exit_code.to_string() ++ ": " ++ cmd_str)#
+    ()
+}
+
+fn cmd_remote_shell(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let raw_arg = if not args.is_empty() { args.get(0).as(String).trim() } else { "" }
+    let target_uri = resolve_active_remote_uri(world, svc, raw_arg)
+    if target_uri == "" {
+        status_emit("RemoteShell: no active SSH connection (run :RemoteConnect first)")#
+        return ()
+    }
+    let parsed = parse_ssh_uri(target_uri)!
+    let ssh_cmd = build_remote_ssh_shell_command(parsed, parsed.remote_path)
+    svc.last_shell_cmd = ssh_cmd
+
+    if pty_available() and remote_host_available() and kernel.get_command("terminal") != null {
+        let _ = kernel.dispatch_command("terminal", [ssh_cmd])#!
+        status_emit("Opened remote SSH terminal: " ++ parsed.authority)#
+        return ()
+    }
+    -- Headless / mock environment without PTY: run non-interactive remote shell probe
+    cmd_remote_exec(kernel, ["pwd"])#!
+}
+
+private fn parse_port_forward_spec(raw_spec: String) -> !String (String, i64, String, i64) {
+    let cleaned = raw_spec.trim()
+    if cleaned == "" {
+        return error "empty port-forward specification"
+    }
+    let raw_toks = cleaned.split(" ")
+    let toks = List()
+    for i in 0..raw_toks.len() {
+        let tk = raw_toks.get(i.as(usize)).as(String).trim()
+        if tk != "" {
+            toks.push(tk)
+        }
+    }
+    var dir = "L"
+    var idx: usize = 0
+    if not toks.is_empty() {
+        let t0 = toks.get(0).as(String).to_upper()
+        if t0 == "L" or t0 == "-L" or t0 == "LOCAL" {
+            dir = "L"
+            idx = 1
+        } else if t0 == "R" or t0 == "-R" or t0 == "REMOTE" {
+            dir = "R"
+            idx = 1
+        }
+    }
+    let rem_count = toks.len().as(i64) - idx.as(i64)
+    if rem_count <= 0 {
+        return error "expected `<local_port>:<remote_host>:<remote_port>` or `L <local_port> <remote_host>:<remote_port>`"
+    }
+    if rem_count == 1 {
+        let spec_tok = toks.get(idx).as(String)
+        let parts = spec_tok.split(":")
+        if parts.len() == 2 {
+            let lp? = parts.get(0).as(String).parse_i64() else {
+                return error ("invalid local port in '" ++ spec_tok ++ "'")
+            }
+            let rp? = parts.get(1).as(String).parse_i64() else {
+                return error ("invalid remote port in '" ++ spec_tok ++ "'")
+            }
+            return (dir, lp, "127.0.0.1", rp)
+        }
+        if parts.len() == 3 {
+            let lp? = parts.get(0).as(String).parse_i64() else {
+                return error ("invalid local port in '" ++ spec_tok ++ "'")
+            }
+            let rhost = parts.get(1).as(String).trim()
+            let rp? = parts.get(2).as(String).parse_i64() else {
+                return error ("invalid remote port in '" ++ spec_tok ++ "'")
+            }
+            return (dir, lp, if rhost == "" { "127.0.0.1" } else { rhost }, rp)
+        }
+        return error ("invalid port-forward spec: " ++ spec_tok)
+    }
+    let lp_str = toks.get(idx).as(String)
+    let lp? = lp_str.parse_i64() else {
+        return error ("invalid local port: " ++ lp_str)
+    }
+    let rhs = toks.get((idx.as(i64) + 1).as(usize)).as(String)
+    if rhs.contains(":") {
+        let sp = rhs.split_once(":").as((String, String))
+        let (rh, rp_s) = sp
+        let rp? = rp_s.parse_i64() else {
+            return error ("invalid remote port: " ++ rp_s)
+        }
+        return (dir, lp, if rh.trim() == "" { "127.0.0.1" } else { rh.trim() }, rp)
+    }
+    let rp? = rhs.parse_i64() else {
+        return error ("invalid remote port: " ++ rhs)
+    }
+    (dir, lp, "127.0.0.1", rp)
+}
+
+fn cmd_remote_port_forward(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let target_uri = resolve_active_remote_uri(world, svc, "")
+    if target_uri == "" {
+        status_emit("RemotePortForward: no active SSH connection")#
+        return ()
+    }
+    var spec_str = if not args.is_empty() { args.join(" ").trim() } else { "" }
+    if spec_str == "" {
+        let ans? = ask_prompt(PromptRequest.text(
+            "SSH Port Forward ([L|R] local_port [remote_host:]remote_port): ",
+            "8080:127.0.0.1:80",
+        ))# else {
+            return ()
+        }
+        spec_str = ans.trim()
+    }
+    if spec_str == "" {
+        return ()
+    }
+    let (dir, lp, rhost, rp) = parse_port_forward_spec(spec_str)!
+    let tid = remote_port_forward_start(target_uri, dir, lp, rhost, rp)!
+    refresh_remote_status_if_open(world, svc)
+    status_emit(
+        "Started SSH port-forward #" ++ tid.to_string() ++ " [" ++ dir ++ "] 127.0.0.1:"
+        ++ lp.to_string() ++ " <-> " ++ rhost ++ ":" ++ rp.to_string()
+    )#
+    ()
+}
+
+fn cmd_remote_port_forward_stop(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    var id_str = if not args.is_empty() { args.get(0).as(String).trim() } else { "" }
+    if id_str == "" {
+        let tunnels = remote_port_forward_list()
+        if tunnels.is_empty() {
+            status_emit("No active SSH port forwards")#
+            return ()
+        }
+        let cands = List()
+        for i in 0..tunnels.len() {
+            let t = tunnels.get(i.as(usize)).as(RemoteTunnelInfo)
+            cands.push((
+                t.id.to_string(),
+                "[" ++ t.authority ++ "] 127.0.0.1:" ++ t.local_port.to_string()
+                    ++ " -> " ++ t.remote_host ++ ":" ++ t.remote_port.to_string(),
+            ))
+        }
+        let ans? = ask_prompt(PromptRequest.with_candidates("Stop SSH Port Forward ID: ", "", PromptKind.Choice, cands))# else {
+            return ()
+        }
+        id_str = ans.trim()
+    }
+    if id_str.starts_with("#") {
+        id_str = id_str.drop(1)
+    }
+    let tid? = id_str.parse_i64() else {
+        return error ("invalid tunnel id: " ++ id_str)
+    }
+    let ok = remote_port_forward_stop(tid)
+    refresh_remote_status_if_open(world, svc)
+    if ok {
+        status_emit("Stopped SSH port-forward #" ++ tid.to_string())#
+    } else {
+        status_emit("Tunnel #" ++ tid.to_string() ++ " not found")#
+    }
+    ()
+}
+
+private fn locate_local_lava_server_bin(cwd: String, explicit_bin: String) -> String {
+    if explicit_bin.trim() != "" and fs.exists(explicit_bin.trim()) {
+        return explicit_bin.trim()
+    }
+    let candidates = [
+        path.join(cwd, "target/release/lava-server"),
+        path.join(cwd, "target/debug/lava-server"),
+        "/home/fin/apps/lava/target/release/lava-server",
+        "/home/fin/apps/lava/target/debug/lava-server",
+    ]
+    for i in 0..candidates.len() {
+        let p = candidates.get(i.as(usize)).as(String)
+        if fs.exists(p) and (not fs.is_dir(p)) {
+            return p
+        }
+    }
+    let path_env = env.get_or("PATH", "")
+    let dirs = path_env.split(":")
+    for i in 0..dirs.len() {
+        let d = dirs.get(i.as(usize)).as(String).trim()
+        if d != "" {
+            let full = path.join(d, "lava-server")
+            if fs.exists(full) and (not fs.is_dir(full)) {
+                return full
+            }
+        }
+    }
+    ""
+}
+
+fn cmd_remote_deploy(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    let raw_target = if not args.is_empty() { args.get(0).as(String).trim() } else { "" }
+    let explicit_bin = if args.len() >= 2 { args.get(1).as(String).trim() } else { "" }
+    let target_uri = resolve_active_remote_uri(world, svc, raw_target)
+    if target_uri == "" {
+        status_emit("RemoteDeploy: no active SSH target")#
+        return ()
+    }
+    let bin_path = locate_local_lava_server_bin(world.cwd, explicit_bin)
+    let info = remote_deploy_server(target_uri, bin_path)!
+    svc.active_target = info.prefix
+    refresh_remote_status_if_open(world, svc)
+    status_emit("Deployed lava-server to " ++ info.authority ++ " [" ++ info.mode ++ " v" ++ info.server_version ++ "]")#
+    ()
+}
+
+-- ============================================================================
+-- 5. Extension Registration (single-line signature contract)
+-- ============================================================================
+
+pub fn register_remote_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_remote_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_remote",
+        "0.1.0",
+        "SSH Remote VFS, *Remote* dashboard, *Remote Dirvish*, remote grep/files/shell, port-forwarding & lava-server deploy.",
+        [ext_document_id(), ext_window_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let svc = RemoteService.new()
+            k.publish_service(SERVICE_REMOTE, ext_id, svc)
+
+            let on_buf_sync = |kern: SystemKernel, _payload: Any| -> Unit {
+                let w_opt = kern.service("lava.document.world")
+                if w_opt != null {
+                    sync_remote_statusline(w_opt.as(EditorWorld), svc)
+                }
+            }
+            k.add_hook("buffer-switched", ext_id, on_buf_sync, priority = 60)
+            k.add_hook("buffer-opened", ext_id, on_buf_sync, priority = 60)
+
+            -- Core interactive commands + Ex aliases
+            k.register_command("remote-connect", ext_id, "Connect to an SSH remote host (`:RemoteConnect [ssh://user@host]`).", cmd_remote_connect)
+            k.register_command("ex:RemoteConnect", ext_id, ":RemoteConnect [ssh://user@host[:port][/path]]", cmd_remote_connect, interactive = false)
+
+            k.register_command("remote-disconnect", ext_id, "Disconnect an active SSH remote session (`:RemoteDisconnect`).", cmd_remote_disconnect)
+            k.register_command("ex:RemoteDisconnect", ext_id, ":RemoteDisconnect [target]", cmd_remote_disconnect, interactive = false)
+
+            k.register_command("remote-status", ext_id, "Open *Remote* SSH connections & port-forwarding dashboard (`:RemoteStatus`).", cmd_remote_status)
+            k.register_command("remote-info", ext_id, "Open *Remote* SSH connections & port-forwarding dashboard (`:RemoteInfo`).", cmd_remote_status)
+            k.register_command("ex:RemoteStatus", ext_id, ":RemoteStatus — open *Remote* dashboard.", cmd_remote_status, interactive = false)
+            k.register_command("ex:RemoteInfo", ext_id, ":RemoteInfo — open *Remote* dashboard.", cmd_remote_status, interactive = false)
+
+            k.register_command("remote-browse", ext_id, "Open *Remote Dirvish* Ranger browser on SSH host (`:RemoteBrowse`).", cmd_remote_browse)
+            k.register_command("ex:RemoteBrowse", ext_id, ":RemoteBrowse [ssh://host/dir]", cmd_remote_browse, interactive = false)
+
+            k.register_command("remote-files", ext_id, "Fuzzy find files on remote SSH workspace (`:RemoteFiles`).", cmd_remote_files)
+            k.register_command("ex:RemoteFiles", ext_id, ":RemoteFiles [ssh://host/dir]", cmd_remote_files, interactive = false)
+
+            k.register_command("remote-grep", ext_id, "Search text across remote SSH workspace (`:RemoteGrep`).", cmd_remote_grep)
+            k.register_command("ex:RemoteGrep", ext_id, ":RemoteGrep [pattern]", cmd_remote_grep, interactive = false)
+
+            k.register_command("remote-shell", ext_id, "Open interactive SSH shell in remote directory (`:RemoteShell`).", cmd_remote_shell)
+            k.register_command("remote-term", ext_id, "Open interactive SSH terminal (`:RemoteTerm`).", cmd_remote_shell)
+            k.register_command("ex:RemoteShell", ext_id, ":RemoteShell — open remote SSH terminal.", cmd_remote_shell, interactive = false)
+            k.register_command("ex:RemoteTerm", ext_id, ":RemoteTerm — open remote SSH terminal.", cmd_remote_shell, interactive = false)
+
+            k.register_command("remote-exec", ext_id, "Execute command on remote SSH server (`:RemoteExec <cmd>`).", cmd_remote_exec)
+            k.register_command("ex:RemoteExec", ext_id, ":RemoteExec <cmd>", cmd_remote_exec, interactive = false)
+
+            k.register_command("remote-port-forward", ext_id, "Start SSH port forward (`:RemotePortForward 8080:127.0.0.1:80`).", cmd_remote_port_forward)
+            k.register_command("ex:RemotePortForward", ext_id, ":RemotePortForward [L|R] local_port [remote_host:]remote_port", cmd_remote_port_forward, interactive = false)
+
+            k.register_command("remote-port-forward-stop", ext_id, "Stop active SSH port forward (`:RemotePortForwardStop <id>`).", cmd_remote_port_forward_stop)
+            k.register_command("ex:RemotePortForwardStop", ext_id, ":RemotePortForwardStop <id>", cmd_remote_port_forward_stop, interactive = false)
+
+            k.register_command("remote-deploy", ext_id, "Deploy local lava-server binary to remote SSH host (`:RemoteDeploy`).", cmd_remote_deploy)
+            k.register_command("ex:RemoteDeploy", ext_id, ":RemoteDeploy [target [local_lava_server_bin]]", cmd_remote_deploy, interactive = false)
+
+            -- Internal buffer mode action commands
+            k.register_command("remote-status-enter", ext_id, "Connect or browse selected item in *Remote*.", cmd_remote_status_enter, interactive = false)
+            k.register_command("remote-status-stop", ext_id, "Disconnect or stop tunnel on current *Remote* row.", cmd_remote_status_stop_row, interactive = false)
+            k.register_command("remote-dirvish-next", ext_id, "Next entry in *Remote Dirvish*.", cmd_remote_dirvish_next, interactive = false)
+            k.register_command("remote-dirvish-prev", ext_id, "Previous entry in *Remote Dirvish*.", cmd_remote_dirvish_prev, interactive = false)
+            k.register_command("remote-dirvish-top", ext_id, "First entry in *Remote Dirvish*.", cmd_remote_dirvish_top, interactive = false)
+            k.register_command("remote-dirvish-bottom", ext_id, "Last entry in *Remote Dirvish*.", cmd_remote_dirvish_bottom, interactive = false)
+            k.register_command("remote-dirvish-enter", ext_id, "Enter directory or open file in *Remote Dirvish*.", cmd_remote_dirvish_enter, interactive = false)
+            k.register_command("remote-dirvish-up", ext_id, "Ascend to parent directory in *Remote Dirvish*.", cmd_remote_dirvish_up, interactive = false)
+            k.register_command("remote-dirvish-toggle-hidden", ext_id, "Toggle hidden dotfiles in *Remote Dirvish*.", cmd_remote_dirvish_toggle_hidden, interactive = false)
+            k.register_command("remote-dirvish-create", ext_id, "Create remote file or directory in *Remote Dirvish*.", cmd_remote_dirvish_create, interactive = false)
+            k.register_command("remote-dirvish-rename", ext_id, "Rename remote entry in *Remote Dirvish*.", cmd_remote_dirvish_rename, interactive = false)
+            k.register_command("remote-dirvish-delete", ext_id, "Delete remote entry in *Remote Dirvish*.", cmd_remote_dirvish_delete, interactive = false)
+            k.register_command("remote-dirvish-yank", ext_id, "Yank remote entry URI in *Remote Dirvish*.", cmd_remote_dirvish_yank, interactive = false)
+            k.register_command("remote-dirvish-cut", ext_id, "Cut remote entry URI in *Remote Dirvish*.", cmd_remote_dirvish_cut, interactive = false)
+            k.register_command("remote-dirvish-paste", ext_id, "Paste yanked/cut remote entry in *Remote Dirvish*.", cmd_remote_dirvish_paste, interactive = false)
+            k.register_command("remote-dirvish-yank-path", ext_id, "Copy canonical ssh:// URI to clipboard.", cmd_remote_dirvish_yank_path, interactive = false)
+            k.register_command("remote-dirvish-refresh", ext_id, "Refresh *Remote Dirvish* listing.", cmd_remote_dirvish_refresh, interactive = false)
+            k.register_command("remote-quit-panel", ext_id, "Close remote panel buffer and restore previous buffer.", cmd_remote_quit_panel, interactive = false)
+            k.register_command("remote-qf-jump", ext_id, "Jump to remote quickfix entry under cursor.", cmd_remote_qf_jump, interactive = false)
+
+            -- Leader keybindings (`<Space> S ...` and `<Space> r ...`)
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> S c", "remote-connect", ext_id, description = "SSH Remote Connect")
+            leader_km.bind("<Space> S d", "remote-disconnect", ext_id, description = "SSH Remote Disconnect")
+            leader_km.bind("<Space> S i", "remote-status", ext_id, description = "SSH Remote Status Dashboard")
+            leader_km.bind("<Space> S b", "remote-browse", ext_id, description = "SSH Remote Dirvish Browse")
+            leader_km.bind("<Space> S f", "remote-files", ext_id, description = "SSH Remote Find Files")
+            leader_km.bind("<Space> S g", "remote-grep", ext_id, description = "SSH Remote Grep")
+            leader_km.bind("<Space> S s", "remote-shell", ext_id, description = "SSH Remote Shell")
+            leader_km.bind("<Space> S !", "remote-exec", ext_id, description = "SSH Remote Exec Command")
+            leader_km.bind("<Space> S p", "remote-port-forward", ext_id, description = "SSH Remote Port Forward")
+            leader_km.bind("<Space> S D", "remote-deploy", ext_id, description = "SSH Deploy lava-server")
+
+            leader_km.bind("<Space> r c", "remote-connect", ext_id, description = "SSH Remote Connect")
+            leader_km.bind("<Space> r d", "remote-disconnect", ext_id, description = "SSH Remote Disconnect")
+            leader_km.bind("<Space> r i", "remote-status", ext_id, description = "SSH Remote Status Dashboard")
+            leader_km.bind("<Space> r b", "remote-browse", ext_id, description = "SSH Remote Dirvish Browse")
+            leader_km.bind("<Space> r f", "remote-files", ext_id, description = "SSH Remote Find Files")
+            leader_km.bind("<Space> r g", "remote-grep", ext_id, description = "SSH Remote Grep")
+            leader_km.bind("<Space> r s", "remote-shell", ext_id, description = "SSH Remote Shell")
+            leader_km.bind("<Space> r p", "remote-port-forward", ext_id, description = "SSH Remote Port Forward")
+
+            let _ = k.ensure_keymap(KEYMAP_VIM_NORMAL)
+
+            -- `mode:remote-status` interactive bindings
+            let st_km = k.ensure_keymap("mode:" ++ MODE_REMOTE_STATUS)
+            st_km.bind("<Return>", "remote-status-enter", ext_id, description = "Connect / browse selected SSH host")
+            st_km.bind("b", "remote-browse", ext_id, description = "Browse remote directory")
+            st_km.bind("s", "remote-shell", ext_id, description = "Open remote SSH shell")
+            st_km.bind("f", "remote-files", ext_id, description = "Find remote files")
+            st_km.bind("g", "remote-grep", ext_id, description = "Remote workspace grep")
+            st_km.bind("p", "remote-port-forward", ext_id, description = "Start SSH port forward")
+            st_km.bind("x", "remote-status-stop", ext_id, description = "Disconnect or stop tunnel")
+            st_km.bind("d", "remote-status-stop", ext_id, description = "Disconnect or stop tunnel")
+            st_km.bind("D", "remote-deploy", ext_id, description = "Deploy lava-server")
+            st_km.bind("r", "remote-status", ext_id, description = "Refresh *Remote* dashboard")
+            st_km.bind("q", "remote-quit-panel", ext_id, description = "Close *Remote* dashboard")
+
+            -- `mode:remote-dirvish` Ranger keybindings
+            let dv_km = k.ensure_keymap("mode:" ++ MODE_REMOTE_DIRVISH)
+            dv_km.bind("j", "remote-dirvish-next", ext_id, description = "Next remote entry")
+            dv_km.bind("<Down>", "remote-dirvish-next", ext_id, description = "Next remote entry")
+            dv_km.bind("k", "remote-dirvish-prev", ext_id, description = "Previous remote entry")
+            dv_km.bind("<Up>", "remote-dirvish-prev", ext_id, description = "Previous remote entry")
+            dv_km.bind("g g", "remote-dirvish-top", ext_id, description = "First remote entry")
+            dv_km.bind("G", "remote-dirvish-bottom", ext_id, description = "Last remote entry")
+            dv_km.bind("l", "remote-dirvish-enter", ext_id, description = "Enter remote dir or open file")
+            dv_km.bind("<Right>", "remote-dirvish-enter", ext_id, description = "Enter remote dir or open file")
+            dv_km.bind("<Return>", "remote-dirvish-enter", ext_id, description = "Enter remote dir or open file")
+            dv_km.bind("h", "remote-dirvish-up", ext_id, description = "Parent remote directory")
+            dv_km.bind("<Left>", "remote-dirvish-up", ext_id, description = "Parent remote directory")
+            dv_km.bind("-", "remote-dirvish-up", ext_id, description = "Parent remote directory")
+            dv_km.bind("z h", "remote-dirvish-toggle-hidden", ext_id, description = "Toggle hidden dotfiles")
+            dv_km.bind(".", "remote-dirvish-toggle-hidden", ext_id, description = "Toggle hidden dotfiles")
+            dv_km.bind("a", "remote-dirvish-create", ext_id, description = "Create remote file or directory")
+            dv_km.bind("r", "remote-dirvish-rename", ext_id, description = "Rename remote entry")
+            dv_km.bind("c w", "remote-dirvish-rename", ext_id, description = "Rename remote entry")
+            dv_km.bind("D", "remote-dirvish-delete", ext_id, description = "Delete remote entry")
+            dv_km.bind("d D", "remote-dirvish-delete", ext_id, description = "Delete remote entry")
+            dv_km.bind("y y", "remote-dirvish-yank", ext_id, description = "Yank remote entry")
+            dv_km.bind("d d", "remote-dirvish-cut", ext_id, description = "Cut remote entry")
+            dv_km.bind("p p", "remote-dirvish-paste", ext_id, description = "Paste remote entry")
+            dv_km.bind("y p", "remote-dirvish-yank-path", ext_id, description = "Copy canonical ssh:// URI")
+            dv_km.bind("R", "remote-dirvish-refresh", ext_id, description = "Refresh remote directory")
+            dv_km.bind("g r", "remote-dirvish-refresh", ext_id, description = "Refresh remote directory")
+            dv_km.bind("s", "remote-shell", ext_id, description = "Open SSH shell in directory")
+            dv_km.bind("!", "remote-exec", ext_id, description = "Run remote command in directory")
+            dv_km.bind("q", "remote-quit-panel", ext_id, description = "Quit *Remote Dirvish*")
+
+            -- `mode:remote-output` & `mode:qf` convenience bindings
+            let out_km = k.ensure_keymap("mode:" ++ MODE_REMOTE_OUTPUT)
+            out_km.bind("q", "remote-quit-panel", ext_id, description = "Close *Remote Output*")
+
+            let qf_km = k.ensure_keymap("mode:qf")
+            qf_km.bind("<Return>", "remote-qf-jump", ext_id, description = "Jump to quickfix location")
+            qf_km.bind("q", "remote-quit-panel", ext_id, description = "Close *Quickfix*")
+
+            ()
+        },
+        |_k: SystemKernel| -> !String Unit { () },
+    )
+}

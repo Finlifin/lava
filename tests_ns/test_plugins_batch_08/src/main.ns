@@ -1,0 +1,643 @@
+-- End-to-end integration test suite for Lava Batch 08 Plugins (22–24):
+--   22. `ext_todo_comments` (`todo-comments.nvim` / `hl-todo`: semantic pill badges & gutter signs,
+--       strict identifier boundary rejection, `]t`/`[t` wrap-around & jump list, `:TodoQuickfix` /
+--       `<Space> s t` workspace scanner, `*Todos*` filter `f`, `<Return>` jump, `:TodoCommentsToggle`)
+--   23. `ext_illuminate` (`vim-illuminate` / `symbol-overlay`: whole-word cursor occurrence
+--       highlights excluding substrings, `]r`/`[r` reference cycling, whitespace clear, `:IlluminateToggle`)
+--   24. `ext_colorizer` (`nvim-colorizer.lua` + `rainbow-delimiters.nvim`: `#RRGGBB`, `#RGB`,
+--       `#RRGGBBAA`, `0xRRGGBB`, `rgb(R, G, B)`, luminance-adaptive black/white `fg_rgba`, `#include`
+--       rejection, 6-level cyclic rainbow brackets skipping strings/comments, unmatched error underline,
+--       `compose_frame` rendering, independent `:ColorizerToggle` & `:RainbowToggle`)
+
+use std.fs
+use std.path
+use std.time
+use @lava_sys.{RawUiEvent, mock_enable, rgb, rgba}
+use @lava_core.{ServiceEffects, SystemKernel, clipboard_get, clipboard_set, log_event, status_emit}
+use @ext_document.{
+    Buffer, BufferKind, EditorWorld, GutterSign, InlineSpanDecor, Pos, QuickfixEntry,
+    require_editor_world
+}
+use @ext_window.require_window_manager
+use @ext_render.compose_frame
+use @ext_app.{AppHostCap, app_commit_frame, app_feed_keys, app_step_event, boot_kernel}
+use @ext_todo_comments.{
+    OWNER_TODO_COMMENTS, TODOS_BUF_NAME, TodoCommentsService, ext_todo_comments_id,
+    register_todo_comments_extension, require_todo_comments_service
+}
+use @ext_illuminate.{
+    IlluminateService, OWNER_ILLUMINATE, ext_illuminate_id, register_illuminate_extension,
+    require_illuminate_service
+}
+use @ext_colorizer.{
+    ColorizerService, OWNER_COLORIZER, OWNER_RAINBOW, ext_colorizer_id, rainbow_palette_color,
+    rainbow_unmatched_error_color, register_colorizer_extension, require_colorizer_service
+}
+
+fn check_true(cond: bool, label: String) {
+    if not cond {
+        panic("FAILED: " ++ label)
+    }
+}
+
+fn check_eq_str(actual: String, expected: String, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual='" ++ actual ++ "' expected='" ++ expected ++ "'")
+    }
+}
+
+fn check_eq_i64(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual=" ++ actual.to_string() ++ " expected=" ++ expected.to_string())
+    }
+}
+
+fn boot_batch08_kernel() -> SystemKernel {
+    let kernel: SystemKernel = (boot_kernel() ! { e => panic(e) }).as(SystemKernel)
+    let _ = register_todo_comments_extension(kernel) ! { e => panic(e) }
+    let _ = register_illuminate_extension(kernel) ! { e => panic(e) }
+    let _ = register_colorizer_extension(kernel) ! { e => panic(e) }
+    let _ = kernel.activate_all() ! { e => panic(e) }
+    kernel
+}
+
+fn find_sign_for_owner_row(buf: Buffer, owner: String, row: i64) -> ?GutterSign {
+    for i in 0..buf.signs.len() {
+        let s = buf.signs.get(i.as(usize)).as(GutterSign)
+        if s.owner == owner and s.row == row {
+            return s
+        }
+    }
+    null
+}
+
+fn count_signs_for_owner(buf: Buffer, owner: String) -> i64 {
+    var count: i64 = 0
+    for i in 0..buf.signs.len() {
+        let s = buf.signs.get(i.as(usize)).as(GutterSign)
+        if s.owner == owner {
+            count += 1
+        }
+    }
+    count
+}
+
+fn find_decor_exact(
+    buf: Buffer,
+    owner: String,
+    row: i64,
+    start_col: i64,
+    end_col: i64,
+) -> ?InlineSpanDecor {
+    for i in 0..buf.inline_decors.len() {
+        let d = buf.inline_decors.get(i.as(usize)).as(InlineSpanDecor)
+        if d.owner == owner and d.row == row and d.start_col == start_col and d.end_col == end_col {
+            return d
+        }
+    }
+    null
+}
+
+fn decors_for_owner_on_row(buf: Buffer, owner: String, row: i64) -> List {
+    let out = List()
+    for i in 0..buf.inline_decors.len() {
+        let d = buf.inline_decors.get(i.as(usize)).as(InlineSpanDecor)
+        if d.owner == owner and d.row == row {
+            out.push(d)
+        }
+    }
+    out
+}
+
+fn count_decors_for_owner(buf: Buffer, owner: String) -> i64 {
+    var count: i64 = 0
+    for i in 0..buf.inline_decors.len() {
+        let d = buf.inline_decors.get(i.as(usize)).as(InlineSpanDecor)
+        if d.owner == owner {
+            count += 1
+        }
+    }
+    count
+}
+
+fn buffer_contains_substr(buf: Buffer, needle: String) -> bool {
+    for i in 0..buf.line_count() {
+        if buf.line_at(i).contains(needle) {
+            return true
+        }
+    }
+    false
+}
+
+fn find_row_containing(buf: Buffer, needle: String) -> i64 {
+    for i in 0..buf.line_count() {
+        if buf.line_at(i).contains(needle) {
+            return i
+        }
+    }
+    -1
+}
+
+fn test_batch_08_plugins() {
+    mock_enable(true)
+
+    let tmp_dir = "/tmp/lava_batch08_" ++ time.unix_millis().to_string()
+    let _ = fs.create_dir_all(tmp_dir) ! { e => panic(e.to_string()) }
+
+    let kernel = boot_batch08_kernel()
+    check_eq_str(ext_todo_comments_id().raw(), "lava.org/ext_todo_comments", "ext_todo_comments_id")
+    check_eq_str(ext_illuminate_id().raw(), "lava.org/ext_illuminate", "ext_illuminate_id")
+    check_eq_str(ext_colorizer_id().raw(), "lava.org/ext_colorizer", "ext_colorizer_id")
+    check_eq_i64(kernel.list_extensions().len(), 11, "11 active extensions (8 core + 3 batch08)")
+
+    let world: EditorWorld = (require_editor_world(kernel) ! { e => panic(e) }).as(EditorWorld)
+    world.cwd = tmp_dir
+    let todo_svc: TodoCommentsService =
+        (require_todo_comments_service(kernel) ! { e => panic(e) }).as(TodoCommentsService)
+    let illum_svc: IlluminateService =
+        (require_illuminate_service(kernel) ! { e => panic(e) }).as(IlluminateService)
+    let color_svc: ColorizerService =
+        (require_colorizer_service(kernel) ! { e => panic(e) }).as(ColorizerService)
+
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
+    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+
+    -- ========================================================================
+    -- PART A: Plugin 22 — `ext_todo_comments`
+    -- ========================================================================
+    println("PART A: testing ext_todo_comments...")
+
+    let tbuf_file = path.join(tmp_dir, "engine_notes.ns")
+    let tbuf = world.create_buffer(
+        "engine_notes.ns",
+        BufferKind.File,
+        file_path = tbuf_file,
+        major_mode = "nessa",
+        initial_lines = [
+            "let TODOS = 42",
+            "let MY_TODO: i64 = 7",
+            "-- TODO: wire incremental parser",
+            "-- FIXME: handle empty slice",
+            "-- NOTE: invariant holds after clamp",
+            "-- PERF: preallocate arena chunks",
+            "-- WARN: fallback path is slower",
+        ],
+    )
+    let _ = world.switch_to_buffer(tbuf.id)
+    kernel.emit_hook("buffer-switched", tbuf.id)
+
+    -- 1. Identifier boundaries (`TODOS`, `MY_TODO:`) MUST be rejected; 5 real TODO tags decorated!
+    check_eq_i64(count_signs_for_owner(tbuf, OWNER_TODO_COMMENTS), 5, "5 gutter signs for valid TODO tags")
+    check_true(
+        find_sign_for_owner_row(tbuf, OWNER_TODO_COMMENTS, 0) == null,
+        "TODOS identifier on row 0 NOT matched",
+    )
+    check_true(
+        find_sign_for_owner_row(tbuf, OWNER_TODO_COMMENTS, 1) == null,
+        "MY_TODO: identifier on row 1 NOT matched",
+    )
+    check_eq_i64(
+        decors_for_owner_on_row(tbuf, OWNER_TODO_COMMENTS, 0).len(),
+        0,
+        "zero todo decors on row 0",
+    )
+    check_eq_i64(
+        decors_for_owner_on_row(tbuf, OWNER_TODO_COMMENTS, 1).len(),
+        0,
+        "zero todo decors on row 1",
+    )
+
+    -- Verify exact GutterSigns & pill InlineSpanDecors (`fg = rgb(24, 24, 37)`) + message tinting
+    let pill_fg = rgb(24, 24, 37)
+    let col_todo = rgb(137, 180, 250)
+    let col_fixme = rgb(243, 139, 168)
+    let col_note = rgb(166, 227, 161)
+    let col_perf = rgb(250, 179, 135)
+    let col_warn = rgb(249, 226, 175)
+
+    let sg_todo = find_sign_for_owner_row(tbuf, OWNER_TODO_COMMENTS, 2).as(GutterSign)
+    check_eq_str(sg_todo.text, "T", "TODO gutter sign 'T'")
+    check_eq_i64(sg_todo.fg_rgba, col_todo, "TODO sign fg")
+    let pill_todo = find_decor_exact(tbuf, OWNER_TODO_COMMENTS, 2, 3, 7).as(InlineSpanDecor)
+    check_eq_i64(pill_todo.bg_rgba, col_todo, "TODO pill bg")
+    check_eq_i64(pill_todo.fg_rgba, pill_fg, "TODO pill dark fg")
+    let tail_todo = find_decor_exact(
+        tbuf,
+        OWNER_TODO_COMMENTS,
+        2,
+        7,
+        tbuf.line_at(2).char_len(),
+    ).as(InlineSpanDecor)
+    check_eq_i64(tail_todo.bg_rgba, 0, "TODO message tail transparent bg")
+    check_eq_i64(tail_todo.fg_rgba, col_todo, "TODO message tail tinted fg")
+
+    let sg_fixme = find_sign_for_owner_row(tbuf, OWNER_TODO_COMMENTS, 3).as(GutterSign)
+    check_eq_str(sg_fixme.text, "!", "FIXME gutter sign '!'")
+    check_eq_i64(sg_fixme.fg_rgba, col_fixme, "FIXME sign fg")
+    let pill_fixme = find_decor_exact(tbuf, OWNER_TODO_COMMENTS, 3, 3, 8).as(InlineSpanDecor)
+    check_eq_i64(pill_fixme.bg_rgba, col_fixme, "FIXME pill bg")
+    check_eq_i64(pill_fixme.fg_rgba, pill_fg, "FIXME pill fg")
+
+    let sg_note = find_sign_for_owner_row(tbuf, OWNER_TODO_COMMENTS, 4).as(GutterSign)
+    check_eq_str(sg_note.text, "N", "NOTE gutter sign 'N'")
+    let pill_note = find_decor_exact(tbuf, OWNER_TODO_COMMENTS, 4, 3, 7).as(InlineSpanDecor)
+    check_eq_i64(pill_note.bg_rgba, col_note, "NOTE pill bg")
+
+    let sg_perf = find_sign_for_owner_row(tbuf, OWNER_TODO_COMMENTS, 5).as(GutterSign)
+    check_eq_str(sg_perf.text, "P", "PERF gutter sign 'P'")
+    let pill_perf = find_decor_exact(tbuf, OWNER_TODO_COMMENTS, 5, 3, 7).as(InlineSpanDecor)
+    check_eq_i64(pill_perf.bg_rgba, col_perf, "PERF pill bg")
+
+    let sg_warn = find_sign_for_owner_row(tbuf, OWNER_TODO_COMMENTS, 6).as(GutterSign)
+    check_eq_str(sg_warn.text, "W", "WARN gutter sign 'W'")
+    let pill_warn = find_decor_exact(tbuf, OWNER_TODO_COMMENTS, 6, 3, 7).as(InlineSpanDecor)
+    check_eq_i64(pill_warn.bg_rgba, col_warn, "WARN pill bg")
+
+    -- 2. `]t` and `[t` cycle accurately across TODOs with wrap-around and record `world.jumps`
+    app_feed_keys(kernel, "gg0j")# ! { e => panic(e) }
+    let jumps_before = world.jumps.entries.len()
+    app_feed_keys(kernel, "]t")# ! { e => panic(e) }
+    check_eq_i64(tbuf.point.row, 2, "]t jumped to row 2 (TODO)")
+    check_eq_i64(tbuf.point.col, 3, "]t placed cursor at TODO col 3")
+    check_true(world.jumps.entries.len() > jumps_before, "]t recorded jump in world.jumps")
+
+    app_feed_keys(kernel, "]t")# ! { e => panic(e) }
+    check_eq_i64(tbuf.point.row, 3, "]t jumped to row 3 (FIXME)")
+    app_feed_keys(kernel, "]t]t]t")# ! { e => panic(e) }
+    check_eq_i64(tbuf.point.row, 6, "]t reached row 6 (WARN)")
+    app_feed_keys(kernel, "]t")# ! { e => panic(e) }
+    check_eq_i64(tbuf.point.row, 2, "]t wrapped around to first TODO on row 2")
+
+    app_feed_keys(kernel, "[t")# ! { e => panic(e) }
+    check_eq_i64(tbuf.point.row, 6, "[t wrapped backward to last TODO on row 6")
+    app_feed_keys(kernel, "[t")# ! { e => panic(e) }
+    check_eq_i64(tbuf.point.row, 5, "[t stepped back to row 5 (PERF)")
+
+    -- 3. `:TodoCommentsToggle` disables & cleans up decors, then re-enables cleanly
+    app_feed_keys(kernel, ":TodoCommentsToggle<Return>")# ! { e => panic(e) }
+    check_true(not todo_svc.enabled, ":TodoCommentsToggle disabled service")
+    check_eq_i64(count_signs_for_owner(tbuf, OWNER_TODO_COMMENTS), 0, "signs cleared when disabled")
+    check_eq_i64(count_decors_for_owner(tbuf, OWNER_TODO_COMMENTS), 0, "decors cleared when disabled")
+
+    app_feed_keys(kernel, ":TodoCommentsToggle<Return>")# ! { e => panic(e) }
+    check_true(todo_svc.enabled, ":TodoCommentsToggle re-enabled service")
+    check_eq_i64(count_signs_for_owner(tbuf, OWNER_TODO_COMMENTS), 5, "signs restored when re-enabled")
+
+    -- 4. Workspace scan `:TodoQuickfix` & `<Space> s t`, `f` tag filter cycling, `<Return>` jump
+    let ws_dir = path.join(tmp_dir, "todo_ws")
+    let _ = fs.create_dir_all(path.join(ws_dir, "src")) ! { e => panic(e.to_string()) }
+    let file_a = path.join(ws_dir, "src/lexer.ns")
+    let file_b = path.join(ws_dir, "src/parser.ns")
+    let _ = fs.write_string(
+        file_a,
+        [
+            "pub fn lex() {{",
+            "    -- TODO: support raw strings",
+            "    -- NOTE: utf8 validated",
+            "}}",
+        ].join("\n") ++ "\n",
+    ) ! { e => panic(e.to_string()) }
+    let _ = fs.write_string(
+        file_b,
+        [
+            "pub fn parse() {{",
+            "    -- FIXME: recover after missing semicolon",
+            "    -- PERF: reuse token buffer",
+            "}}",
+        ].join("\n") ++ "\n",
+    ) ! { e => panic(e.to_string()) }
+
+    world.cwd = ws_dir
+    app_feed_keys(kernel, ":TodoQuickfix<Return>")# ! { e => panic(e) }
+    let todos_panel = world.active_buffer()
+    check_eq_str(todos_panel.name, TODOS_BUF_NAME, ":TodoQuickfix opened *Todos*")
+    check_eq_str(todos_panel.major_mode, "todos", "*Todos* major_mode == todos")
+    check_eq_str(world.quickfix_title, "Workspace TODOs", "world.quickfix_title populated")
+    check_eq_i64(world.quickfix.len(), 4, "world.quickfix has all 4 workspace TODOs")
+    check_true(
+        buffer_contains_substr(todos_panel, "FIXME: 1, TODO: 1, NOTE: 1, PERF: 1"),
+        "*Todos* header shows exact tag counts",
+    )
+
+    -- Cycle filter via `f`: `ALL` -> `TODO` -> `FIXME`
+    app_feed_keys(kernel, "f")# ! { e => panic(e) }
+    check_eq_str(todo_svc.tag_filter, "TODO", "first 'f' filtered to TODO")
+    check_eq_i64(world.quickfix.len(), 1, "TODO filter narrowed quickfix to 1")
+    check_true(buffer_contains_substr(todos_panel, "lexer.ns:2:"), "TODO filter shows lexer.ns")
+    check_true(not buffer_contains_substr(todos_panel, "parser.ns:2:"), "TODO filter hides FIXME")
+
+    app_feed_keys(kernel, "f")# ! { e => panic(e) }
+    check_eq_str(todo_svc.tag_filter, "FIXME", "second 'f' filtered to FIXME")
+    check_eq_i64(world.quickfix.len(), 1, "FIXME filter narrowed quickfix to 1")
+    let qf_entry = world.quickfix.get(0).as(QuickfixEntry)
+    check_true(qf_entry.file_path.contains("parser.ns"), "quickfix entry points to parser.ns")
+
+    -- `<Return>` in `*Todos*` jumps to `parser.ns` at `(row = 1, col = 7)`!
+    app_feed_keys(kernel, "<Return>")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, "parser.ns", "<Return> opened parser.ns")
+    check_eq_i64(world.active_buffer().point.row, 1, "<Return> landed on FIXME row 1")
+    check_eq_i64(world.active_buffer().point.col, 7, "<Return> landed on FIXME col 7")
+
+    -- Verify `<Space> s t` re-opens `*Todos*` (resetting filter to `ALL`) and `q` closes it
+    app_feed_keys(kernel, "<Space>st")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, TODOS_BUF_NAME, "<Space> s t opened *Todos*")
+    check_eq_str(todo_svc.tag_filter, "ALL", "<Space> s t reset filter to ALL")
+    check_eq_i64(world.quickfix.len(), 4, "all 4 items shown again")
+    app_feed_keys(kernel, "q")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, "parser.ns", "q closed *Todos* back to parser.ns")
+
+    -- ========================================================================
+    -- PART B: Plugin 23 — `ext_illuminate`
+    -- ========================================================================
+    println("PART B: testing ext_illuminate...")
+
+    let ibuf = world.create_buffer(
+        "symbols.ns",
+        BufferKind.File,
+        file_path = path.join(tmp_dir, "symbols.ns"),
+        major_mode = "nessa",
+        initial_lines = [
+            "let alpha = 10",
+            "let alphabet = alpha + 1",
+            "let pre_alpha = 2",
+            "let res = alpha * singleton_var",
+            "    ",
+        ],
+    )
+    let _ = world.switch_to_buffer(ibuf.id)
+    kernel.emit_hook("buffer-switched", ibuf.id)
+
+    -- Move cursor onto `alpha` at `(0, 4)`: 3 whole-word `alpha` spans (`(0,4..9)`, `(1,15..20)`, `(3,10..15)`)
+    -- excluding `alphabet` on row 1 and `pre_alpha` on row 2!
+    app_feed_keys(kernel, "gg0w")# ! { e => panic(e) }
+    check_eq_i64(ibuf.point.row, 0, "cursor on row 0")
+    check_eq_i64(ibuf.point.col, 4, "cursor at 'alpha' col 4")
+    check_eq_str(illum_svc.current_word, "alpha", "current_word == 'alpha'")
+    check_eq_i64(illum_svc.occurrences.len(), 3, "3 whole-word occurrences of 'alpha'")
+    check_eq_i64(count_decors_for_owner(ibuf, OWNER_ILLUMINATE), 3, "3 illuminate decors added")
+
+    let il_0 = find_decor_exact(ibuf, OWNER_ILLUMINATE, 0, 4, 9).as(InlineSpanDecor)
+    check_eq_i64(il_0.bg_rgba, rgba(137, 180, 250, 55), "illuminate subtle bg_rgba")
+    check_true(il_0.underline, "illuminate underline == true")
+    check_true(
+        find_decor_exact(ibuf, OWNER_ILLUMINATE, 1, 15, 20) != null,
+        "row 1 whole-word 'alpha' highlighted",
+    )
+    check_true(
+        find_decor_exact(ibuf, OWNER_ILLUMINATE, 1, 4, 9) == null,
+        "'alphabet' prefix NOT highlighted",
+    )
+    check_true(
+        decors_for_owner_on_row(ibuf, OWNER_ILLUMINATE, 2).is_empty(),
+        "'pre_alpha' on row 2 NOT highlighted",
+    )
+    check_true(
+        find_decor_exact(ibuf, OWNER_ILLUMINATE, 3, 10, 15) != null,
+        "row 3 whole-word 'alpha' highlighted",
+    )
+
+    -- Reference cycling with `]r` and `[r` (including wrap-around & status message)
+    app_feed_keys(kernel, "]r")# ! { e => panic(e) }
+    check_eq_i64(ibuf.point.row, 1, "]r jumped to 2nd 'alpha' on row 1")
+    check_eq_i64(ibuf.point.col, 15, "]r col 15")
+    check_eq_str(world.status_message, "[2/3] alpha", "]r status [2/3] alpha")
+
+    app_feed_keys(kernel, "]r")# ! { e => panic(e) }
+    check_eq_i64(ibuf.point.row, 3, "]r jumped to 3rd 'alpha' on row 3")
+    check_eq_i64(ibuf.point.col, 10, "]r col 10")
+    check_eq_str(world.status_message, "[3/3] alpha", "]r status [3/3] alpha")
+
+    app_feed_keys(kernel, "]r")# ! { e => panic(e) }
+    check_eq_i64(ibuf.point.row, 0, "]r wrapped around to 1st 'alpha' on row 0")
+    check_eq_i64(ibuf.point.col, 4, "]r wrapped col 4")
+    check_eq_str(world.status_message, "[1/3] alpha", "]r wrapped status [1/3] alpha")
+
+    app_feed_keys(kernel, "[r")# ! { e => panic(e) }
+    check_eq_i64(ibuf.point.row, 3, "[r wrapped backward to 3rd 'alpha' on row 3")
+    check_eq_i64(ibuf.point.col, 10, "[r wrapped col 10")
+    check_eq_str(world.status_message, "[3/3] alpha", "[r status [3/3] alpha")
+
+    -- Moving onto whitespace (`f<Space>` on row 0 col 3) clears `"ext_illuminate"` decors!
+    app_feed_keys(kernel, "gg03l")# ! { e => panic(e) }
+    check_eq_str(ibuf.line_at(0).slice(ibuf.point.col, ibuf.point.col + 1), " ", "cursor on space")
+    check_eq_str(illum_svc.current_word, "", "whitespace cleared current_word")
+    check_eq_i64(count_decors_for_owner(ibuf, OWNER_ILLUMINATE), 0, "whitespace cleared illuminate decors")
+
+    -- Single-occurrence symbol (`singleton_var`) sets `occurrences.len() == 1` but adds 0 decors (`< 2`)
+    app_feed_keys(kernel, "4G$")# ! { e => panic(e) }
+    check_eq_str(illum_svc.current_word, "singleton_var", "current_word == singleton_var")
+    check_eq_i64(illum_svc.occurrences.len(), 1, "1 occurrence of singleton_var")
+    check_eq_i64(count_decors_for_owner(ibuf, OWNER_ILLUMINATE), 0, "no decors when occurrences < 2")
+
+    -- `:IlluminateToggle` disables and re-enables cleanly
+    app_feed_keys(kernel, "gg0w")# ! { e => panic(e) }
+    check_eq_i64(count_decors_for_owner(ibuf, OWNER_ILLUMINATE), 3, "3 decors before toggle")
+    app_feed_keys(kernel, ":IlluminateToggle<Return>")# ! { e => panic(e) }
+    check_true(not illum_svc.enabled, ":IlluminateToggle disabled illuminate")
+    check_eq_i64(count_decors_for_owner(ibuf, OWNER_ILLUMINATE), 0, "decors cleared when disabled")
+    app_feed_keys(kernel, ":IlluminateToggle<Return>")# ! { e => panic(e) }
+    check_true(illum_svc.enabled, ":IlluminateToggle re-enabled illuminate")
+    check_eq_i64(count_decors_for_owner(ibuf, OWNER_ILLUMINATE), 3, "decors restored when re-enabled")
+
+    -- ========================================================================
+    -- PART C: Plugin 24 — `ext_colorizer` (True-Color Swatches + Rainbow)
+    -- ========================================================================
+    println("PART C: testing ext_colorizer...")
+
+    let cbuf = world.create_buffer(
+        "palette.ns",
+        BufferKind.File,
+        file_path = path.join(tmp_dir, "palette.ns"),
+        major_mode = "nessa",
+        initial_lines = [
+            "let c1 = \"#ff8800\" -- #0f0 #112233ff",
+            "let bw = \"#ffffff #111111 0x336699\"",
+            "let call = rgb(10, 200, 100)",
+            "#include <stdio.h>",
+            "let s = \"({{[\" -- ignore ( [ {{ in comment",
+            "fn f() {{ a([1 + (2)]) }}",
+            "let cyc = (((((((0)))))))",
+            "let bad = )",
+            "let sq = '({{[' // also ignore [ in slash comment",
+            "# ignore ( [ {{ in hash comment",
+        ],
+    )
+    let _ = world.switch_to_buffer(cbuf.id)
+    kernel.emit_hook("buffer-switched", cbuf.id)
+
+    let dark_fg = rgb(17, 17, 27)
+    let light_fg = rgb(245, 245, 255)
+
+    -- 1. Verify True-Color Swatches (`OWNER_COLORIZER`)
+    -- Row 0: `#ff8800` at 10..17, `#0f0` at 22..26, `#112233ff` at 27..36
+    let sw_orange = find_decor_exact(cbuf, OWNER_COLORIZER, 0, 10, 17).as(InlineSpanDecor)
+    check_eq_i64(sw_orange.bg_rgba, rgb(255, 136, 0), "#ff8800 swatch bg")
+    check_eq_i64(sw_orange.fg_rgba, dark_fg, "#ff8800 high-luminance -> dark fg")
+
+    let sw_green3 = find_decor_exact(cbuf, OWNER_COLORIZER, 0, 22, 26).as(InlineSpanDecor)
+    check_eq_i64(sw_green3.bg_rgba, rgb(0, 255, 0), "#0f0 expanded to rgb(0, 255, 0)")
+    check_eq_i64(sw_green3.fg_rgba, dark_fg, "#0f0 high-luminance -> dark fg")
+
+    let sw_hex8 = find_decor_exact(cbuf, OWNER_COLORIZER, 0, 27, 36).as(InlineSpanDecor)
+    check_eq_i64(sw_hex8.bg_rgba, rgb(17, 34, 51), "#112233ff swatch bg")
+    check_eq_i64(sw_hex8.fg_rgba, light_fg, "#112233ff low-luminance -> light fg")
+
+    -- Row 1: `#ffffff` (light -> dark fg), `#111111` (dark -> light fg), `0x336699`
+    let sw_white = find_decor_exact(cbuf, OWNER_COLORIZER, 1, 10, 17).as(InlineSpanDecor)
+    check_eq_i64(sw_white.bg_rgba, rgb(255, 255, 255), "#ffffff bg")
+    check_eq_i64(sw_white.fg_rgba, dark_fg, "#ffffff light -> crisp dark fg_rgba")
+
+    let sw_black = find_decor_exact(cbuf, OWNER_COLORIZER, 1, 18, 25).as(InlineSpanDecor)
+    check_eq_i64(sw_black.bg_rgba, rgb(17, 17, 17), "#111111 bg")
+    check_eq_i64(sw_black.fg_rgba, light_fg, "#111111 dark -> crisp light fg_rgba")
+
+    let sw_0x = find_decor_exact(cbuf, OWNER_COLORIZER, 1, 26, 34).as(InlineSpanDecor)
+    check_eq_i64(sw_0x.bg_rgba, rgb(51, 102, 153), "0x336699 bg")
+    check_eq_i64(sw_0x.fg_rgba, light_fg, "0x336699 low-luminance -> light fg")
+
+    -- Row 2: `rgb(10, 200, 100)` at 11..28
+    let sw_rgb = find_decor_exact(cbuf, OWNER_COLORIZER, 2, 11, 28).as(InlineSpanDecor)
+    check_eq_i64(sw_rgb.bg_rgba, rgb(10, 200, 100), "rgb(10, 200, 100) bg")
+    check_eq_i64(sw_rgb.fg_rgba, light_fg, "rgb(10, 200, 100) luminance 131 < 140 -> light fg")
+
+    -- Row 3: `#include <stdio.h>` MUST be rejected!
+    check_eq_i64(
+        decors_for_owner_on_row(cbuf, OWNER_COLORIZER, 3).len(),
+        0,
+        "#include rejected — NOT a hex color",
+    )
+
+    -- 2. Verify Rainbow Delimiters (`OWNER_RAINBOW`)
+    -- Row 4: `"({["` inside string literal + `-- ignore ( [ {` inside comment -> 0 rainbow decors!
+    check_eq_i64(
+        decors_for_owner_on_row(cbuf, OWNER_RAINBOW, 4).len(),
+        0,
+        "brackets inside string literal and -- comment ignored",
+    )
+
+    -- Row 5: `fn f() { a([1 + (2)]) }`
+    -- Cols:  01234567890123456789012
+    --        f( -> 4, ) -> 5 (depth 0)
+    --        { -> 7 (depth 0), a( -> 10 (depth 1), [ -> 11 (depth 2), ( -> 16 (depth 3),
+    --        ) -> 18 (depth 3), ] -> 19 (depth 2), ) -> 20 (depth 1), } -> 22 (depth 0)
+    let rb_f_open = find_decor_exact(cbuf, OWNER_RAINBOW, 5, 4, 5).as(InlineSpanDecor)
+    let rb_f_close = find_decor_exact(cbuf, OWNER_RAINBOW, 5, 5, 6).as(InlineSpanDecor)
+    check_eq_i64(rb_f_open.fg_rgba, rainbow_palette_color(0), "f( depth 0")
+    check_eq_i64(rb_f_close.fg_rgba, rainbow_palette_color(0), "f) depth 0")
+
+    let rb_blk_open = find_decor_exact(cbuf, OWNER_RAINBOW, 5, 7, 8).as(InlineSpanDecor)
+    let rb_a_open = find_decor_exact(cbuf, OWNER_RAINBOW, 5, 10, 11).as(InlineSpanDecor)
+    let rb_arr_open = find_decor_exact(cbuf, OWNER_RAINBOW, 5, 11, 12).as(InlineSpanDecor)
+    let rb_in_open = find_decor_exact(cbuf, OWNER_RAINBOW, 5, 16, 17).as(InlineSpanDecor)
+    let rb_in_close = find_decor_exact(cbuf, OWNER_RAINBOW, 5, 18, 19).as(InlineSpanDecor)
+    let rb_arr_close = find_decor_exact(cbuf, OWNER_RAINBOW, 5, 19, 20).as(InlineSpanDecor)
+    let rb_a_close = find_decor_exact(cbuf, OWNER_RAINBOW, 5, 20, 21).as(InlineSpanDecor)
+    let rb_blk_close = find_decor_exact(cbuf, OWNER_RAINBOW, 5, 22, 23).as(InlineSpanDecor)
+
+    check_eq_i64(rb_blk_open.fg_rgba, rainbow_palette_color(0), "open brace depth 0")
+    check_eq_i64(rb_a_open.fg_rgba, rainbow_palette_color(1), "a( depth 1")
+    check_eq_i64(rb_arr_open.fg_rgba, rainbow_palette_color(2), "[ depth 2")
+    check_eq_i64(rb_in_open.fg_rgba, rainbow_palette_color(3), "(2 depth 3")
+    check_eq_i64(rb_in_close.fg_rgba, rainbow_palette_color(3), "2) depth 3")
+    check_eq_i64(rb_arr_close.fg_rgba, rainbow_palette_color(2), "] depth 2")
+    check_eq_i64(rb_a_close.fg_rgba, rainbow_palette_color(1), "a) depth 1")
+    check_eq_i64(rb_blk_close.fg_rgba, rainbow_palette_color(0), "close brace depth 0")
+
+    -- Verify single-quote `'({['`, `//` comment, and `#` comment rows have 0 rainbow decors
+    check_eq_i64(
+        decors_for_owner_on_row(cbuf, OWNER_RAINBOW, 8).len(),
+        0,
+        "brackets inside single-quoted literal and // comment ignored",
+    )
+    check_eq_i64(
+        decors_for_owner_on_row(cbuf, OWNER_RAINBOW, 9).len(),
+        0,
+        "brackets inside # comment ignored",
+    )
+
+    -- Row 6: `let cyc = (((((((0)))))))` -> 7th `(` at col 16 wraps `6 % 6 == 0`!
+    let rb_d5 = find_decor_exact(cbuf, OWNER_RAINBOW, 6, 15, 16).as(InlineSpanDecor)
+    let rb_d6 = find_decor_exact(cbuf, OWNER_RAINBOW, 6, 16, 17).as(InlineSpanDecor)
+    check_eq_i64(rb_d5.fg_rgba, rainbow_palette_color(5), "6th '(' uses mauve level 5")
+    check_eq_i64(rb_d6.fg_rgba, rainbow_palette_color(0), "7th '(' wraps around to level 0")
+
+    -- Row 7: `let bad = )` -> unmatched `)` at col 10 gets bright red error + underline!
+    let rb_err = find_decor_exact(cbuf, OWNER_RAINBOW, 7, 10, 11).as(InlineSpanDecor)
+    check_eq_i64(rb_err.fg_rgba, rainbow_unmatched_error_color(), "unmatched ')' error fg_rgba")
+    check_true(rb_err.underline, "unmatched ')' underline == true")
+
+    -- 3. Verify `compose_frame` & `app_commit_frame` render swatches + rainbow without error
+    let wm = (require_window_manager(kernel) ! { e => panic(e) })
+    wm.sync_from_world(world)
+    let (_win_spec, draw_cmds) = compose_frame(kernel, world, wm)
+    check_true(draw_cmds.len() > 20, "compose_frame emitted DrawCmd scene with swatches & rainbow")
+    let gen_col = app_commit_frame(kernel) ! { e => panic(e) }
+    check_true(gen_col > 0, "app_commit_frame succeeded on colorized buffer")
+
+    -- 4. Independent toggling via `:ColorizerToggle` and `:RainbowToggle`
+    let initial_swatches = count_decors_for_owner(cbuf, OWNER_COLORIZER)
+    let initial_rainbows = count_decors_for_owner(cbuf, OWNER_RAINBOW)
+    check_true(initial_swatches >= 7, "at least 7 swatch decors initially")
+    check_true(initial_rainbows >= 25, "at least 25 rainbow decors initially")
+
+    app_feed_keys(kernel, ":ColorizerToggle<Return>")# ! { e => panic(e) }
+    check_true(not color_svc.colors_enabled, ":ColorizerToggle turned swatches off")
+    check_true(color_svc.rainbow_enabled, "rainbow stayed enabled")
+    check_eq_i64(count_decors_for_owner(cbuf, OWNER_COLORIZER), 0, "swatch decors cleared")
+    check_eq_i64(count_decors_for_owner(cbuf, OWNER_RAINBOW), initial_rainbows, "rainbow decors untouched")
+
+    app_feed_keys(kernel, ":RainbowToggle<Return>")# ! { e => panic(e) }
+    check_true(not color_svc.rainbow_enabled, ":RainbowToggle turned rainbow off")
+    check_eq_i64(count_decors_for_owner(cbuf, OWNER_RAINBOW), 0, "rainbow decors cleared")
+
+    app_feed_keys(kernel, ":ColorizerToggle<Return>")# ! { e => panic(e) }
+    check_true(color_svc.colors_enabled, ":ColorizerToggle turned swatches back on")
+    check_eq_i64(count_decors_for_owner(cbuf, OWNER_COLORIZER), initial_swatches, "swatches restored alone")
+    check_eq_i64(count_decors_for_owner(cbuf, OWNER_RAINBOW), 0, "rainbow still off")
+
+    app_feed_keys(kernel, ":RainbowToggle<Return>")# ! { e => panic(e) }
+    check_true(color_svc.rainbow_enabled, ":RainbowToggle turned rainbow back on")
+    check_eq_i64(count_decors_for_owner(cbuf, OWNER_RAINBOW), initial_rainbows, "rainbow restored")
+
+    -- Test leader chords `<Space> u c`, `<Space> u r`, `<Space> u i`, and `:TodoTrouble`
+    app_feed_keys(kernel, "<Space>uc")# ! { e => panic(e) }
+    check_true(not color_svc.colors_enabled, "<Space> u c toggled swatches off")
+    app_feed_keys(kernel, "<Space>uc")# ! { e => panic(e) }
+    check_true(color_svc.colors_enabled, "<Space> u c toggled swatches back on")
+
+    app_feed_keys(kernel, "<Space>ur")# ! { e => panic(e) }
+    check_true(not color_svc.rainbow_enabled, "<Space> u r toggled rainbow off")
+    app_feed_keys(kernel, "<Space>ur")# ! { e => panic(e) }
+    check_true(color_svc.rainbow_enabled, "<Space> u r toggled rainbow back on")
+
+    app_feed_keys(kernel, "<Space>ui")# ! { e => panic(e) }
+    check_true(not illum_svc.enabled, "<Space> u i toggled illuminate off")
+    app_feed_keys(kernel, "<Space>ui")# ! { e => panic(e) }
+    check_true(illum_svc.enabled, "<Space> u i toggled illuminate back on")
+
+    app_feed_keys(kernel, ":TodoTrouble<Space>PERF<Return>")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, TODOS_BUF_NAME, ":TodoTrouble opened *Todos*")
+    check_eq_str(todo_svc.tag_filter, "PERF", ":TodoTrouble PERF set filter")
+    check_eq_i64(world.quickfix.len(), 1, "1 PERF item in quickfix")
+    app_feed_keys(kernel, "q")# ! { e => panic(e) }
+
+    -- 5. Verify `on_deactivate` cleans up all owned signs & inline decors across buffers
+    let _ = kernel.deactivate_extension(ext_colorizer_id()) ! { e => panic(e) }
+    check_eq_i64(count_decors_for_owner(cbuf, OWNER_COLORIZER), 0, "deactivate cleared ext_colorizer")
+    check_eq_i64(count_decors_for_owner(cbuf, OWNER_RAINBOW), 0, "deactivate cleared ext_rainbow")
+
+    let _ = kernel.deactivate_extension(ext_illuminate_id()) ! { e => panic(e) }
+    check_eq_i64(count_decors_for_owner(ibuf, OWNER_ILLUMINATE), 0, "deactivate cleared ext_illuminate")
+
+    let _ = kernel.deactivate_extension(ext_todo_comments_id()) ! { e => panic(e) }
+    check_eq_i64(count_signs_for_owner(tbuf, OWNER_TODO_COMMENTS), 0, "deactivate cleared todo signs")
+    check_eq_i64(count_decors_for_owner(tbuf, OWNER_TODO_COMMENTS), 0, "deactivate cleared todo decors")
+
+    let _ = cap
+    let _ = fs.remove_dir_all(tmp_dir) ! { _ => () }
+}
+
+fn main() {
+    test_batch_08_plugins()
+    println("test_plugins_batch_08: ALL PASSED")
+}

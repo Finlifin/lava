@@ -1,0 +1,11 @@
+[package]
+name = "lava-gtk"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lava-proto.workspace = true
+libc.workspace = true
+
+[build-dependencies]
+pkg-config.workspace = true

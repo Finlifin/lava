@@ -1,0 +1,990 @@
+-- ext_trouble: Live Code & Quickfix Diagnostics Panel, Gutter Signs, Underlines & Virtual Text (`trouble.nvim` / `Flycheck`).
+-- Publishes service `"lava.trouble.diagnostics"` (`TroubleService`) and provides `]d` / `[d` diagnostic navigation
+-- plus the interactive `*Trouble*` workspace diagnostics buffer (`<Space> x x`, `:Trouble`, `:TroubleToggle`).
+
+use std.collections.{HashMap, Set}
+use std.path
+use @lava_core.{
+    ExtId, InteractiveEffects, KeyBindingEntry, Keymap, SystemKernel, status_emit
+}
+use @lava_accel.{NativeDiagHit, accel_doc_analyze_diagnostics}
+use @ext_document.{
+    Buffer, BufferId, BufferKind, EditorWorld, Pos, QuickfixEntry, ext_document_id,
+    require_editor_world
+}
+use @ext_vim.{
+    KEYMAP_VIM_LEADER, KEYMAP_VIM_NORMAL, VimMode, VimState, ext_vim_id, require_vim_state,
+    sync_world_from_vim
+}
+
+pub const SERVICE_TROUBLE: String = "lava.trouble.diagnostics"
+pub const OWNER_TROUBLE: String = "ext_trouble"
+pub const TROUBLE_BUF_NAME: String = "*Trouble*"
+
+pub const COLOR_DIAG_ERROR: i64 = 0xF38BA8FF
+pub const COLOR_DIAG_WARN: i64 = 0xF9E2AFFF
+pub const SIGN_PRIORITY_ERROR: i64 = 30
+pub const SIGN_PRIORITY_WARN: i64 = 25
+
+pub fn ext_trouble_id() -> ExtId = ExtId("lava.org/ext_trouble")
+
+-- ============================================================================
+-- 1. Diagnostic Data Model & TroubleService
+-- ============================================================================
+
+pub struct DiagnosticItem {
+    pub buf_id: BufferId,
+    pub file_path: String,
+    pub row: i64,
+    pub col: i64,
+    pub end_col: i64,
+    pub severity: String,
+    pub source: String,
+    pub message: String,
+}
+
+struct CachedBufState {
+    major_mode: String,
+    file_path: String,
+    qf_sig: String,
+    edit_version: i64,
+    win_start: i64,
+    win_end: i64,
+}
+
+pub struct TroubleService {
+    pub diagnostics_by_buf: HashMap,
+    pub counts_by_buf: HashMap,
+    pub cache_by_buf: HashMap,
+    pub filter_mode: String,
+    pub source_buf_id: BufferId,
+    pub panel_row_map: HashMap,
+}
+
+impl TroubleService {
+    pub fn new() -> TroubleService {
+        TroubleService {
+            diagnostics_by_buf: HashMap.new(),
+            counts_by_buf: HashMap.new(),
+            cache_by_buf: HashMap.new(),
+            filter_mode: "all",
+            source_buf_id: BufferId(1),
+            panel_row_map: HashMap.new(),
+        }
+    }
+
+    pub fn buffer_diagnostics(self, buf_id: BufferId) -> List {
+        let existing? = self.diagnostics_by_buf.get(buf_id) else {
+            return List()
+        }
+        existing.as(List)
+    }
+
+    pub fn diagnostics_for_buffer(self, buf_id: BufferId) -> List = self.buffer_diagnostics(buf_id)
+
+    pub fn counts_for_buffer(self, buf_id: BufferId) -> (i64, i64) {
+        let cached_cnt = self.counts_by_buf.get(buf_id)
+        if cached_cnt != null {
+            return cached_cnt.as((i64, i64))
+        }
+        let diags = self.buffer_diagnostics(buf_id)
+        var errs: i64 = 0
+        var warns: i64 = 0
+        for i in 0..diags.len() {
+            let d = diags.get(i.as(usize)).as(DiagnosticItem)
+            if d.severity == "ERROR" {
+                errs += 1
+            } else {
+                warns += 1
+            }
+        }
+        (errs, warns)
+    }
+}
+
+pub fn require_trouble_service(kernel: SystemKernel) -> !String TroubleService {
+    let raw = kernel.require_service(SERVICE_TROUBLE)!
+    raw.as(TroubleService)
+}
+
+-- ============================================================================
+-- 2. Live Buffer Analyzer (Native Rope/Line Accelerator + Quickfix + Viewport)
+-- ============================================================================
+
+fn is_analyzable_buffer(buf: Buffer) -> bool {
+    if buf.name == TROUBLE_BUF_NAME or buf.name == "*Messages*" {
+        return false
+    }
+    buf.kind == BufferKind.File or buf.kind == BufferKind.Scratch
+}
+
+fn quickfix_matches_buffer(world: EditorWorld, qf_path: String, buf_path: String) -> bool {
+    if qf_path == "" or buf_path == "" {
+        return false
+    }
+    if qf_path == buf_path {
+        return true
+    }
+    world.resolve_path(qf_path) == world.resolve_path(buf_path)
+}
+
+fn compute_qf_signature(world: EditorWorld, buf_path: String) -> String {
+    if buf_path == "" or world.quickfix.is_empty() {
+        return ""
+    }
+    let parts = List()
+    for i in 0..world.quickfix.len() {
+        let qf = world.quickfix.get(i.as(usize)).as(QuickfixEntry)
+        if quickfix_matches_buffer(world, qf.file_path, buf_path) {
+            parts.push(qf.row.to_string() ++ ":" ++ qf.col.to_string() ++ ":" ++ qf.text)
+        }
+    }
+    parts.join("|")
+}
+
+fn severity_rank(sev: String) -> i64 {
+    if sev == "ERROR" { 0 } else { 1 }
+}
+
+fn compute_trouble_window(world: EditorWorld, lcount: i64) -> (i64, i64) {
+    if lcount <= 400 {
+        return (0, lcount)
+    }
+    let vrows = if world.viewport_rows > 40 { world.viewport_rows } else { 40 }
+    let raw_start = world.viewport_top_row - 30
+    let win_start = if raw_start > 0 { raw_start } else { 0 }
+    let raw_end = world.viewport_top_row + vrows + 50
+    let win_end = if raw_end < lcount { raw_end } else { lcount }
+    (win_start, win_end)
+}
+
+fn viewport_escaped_trouble_window(
+    world: EditorWorld,
+    lcount: i64,
+    win_start: i64,
+    win_end: i64,
+) -> bool {
+    if lcount <= 400 {
+        return false
+    }
+    let top_r = if world.viewport_top_row > 0 { world.viewport_top_row } else { 0 }
+    let vrows = if world.viewport_rows > 40 { world.viewport_rows } else { 40 }
+    let bot_r = if top_r + vrows < lcount { top_r + vrows } else { lcount }
+    (win_start > 0 and top_r < win_start + 10)
+        or (win_end < lcount and bot_r > win_end - 10)
+}
+
+fn render_buffer_diagnostics(buf: Buffer, diags: List, win_start: i64, win_end: i64) {
+    buf.clear_owner_decors(OWNER_TROUBLE)
+    for i in 0..diags.len() {
+        let d = diags.get(i.as(usize)).as(DiagnosticItem)
+        if d.row < win_start {
+            continue
+        }
+        if d.row >= win_end {
+            break
+        }
+        let is_err = d.severity == "ERROR"
+        let fg = if is_err { COLOR_DIAG_ERROR } else { COLOR_DIAG_WARN }
+        let sign_txt = if is_err { "E" } else { "W" }
+        let sign_prio = if is_err { SIGN_PRIORITY_ERROR } else { SIGN_PRIORITY_WARN }
+
+        buf.add_sign(OWNER_TROUBLE, d.row, sign_txt, fg, priority = sign_prio)
+
+        let llen = buf.line_char_len(d.row)
+        let sc = if d.col < 0 { 0 } else if d.col > llen { llen } else { d.col }
+        var ec = if d.end_col > sc { d.end_col } else { sc + 1 }
+        if llen > 0 and sc >= llen {
+            ec = llen
+        }
+        let adj_sc = if llen > 0 and sc >= llen { llen - 1 } else { sc }
+        let adj_ec = if adj_sc < ec { ec } else { adj_sc + 1 }
+
+        buf.add_inline_decor(
+            OWNER_TROUBLE,
+            d.row,
+            adj_sc,
+            adj_ec,
+            bg_rgba = 0,
+            fg_rgba = fg,
+            underline = true,
+        )
+        buf.add_virt_text(
+            OWNER_TROUBLE,
+            d.row,
+            "■ " ++ d.message,
+            fg,
+            italic = true,
+        )
+    }
+}
+
+pub fn analyze_buffer(world: EditorWorld, service: TroubleService, buf: Buffer) -> List {
+    if not is_analyzable_buffer(buf) {
+        buf.clear_owner_decors(OWNER_TROUBLE)
+        let _ = service.diagnostics_by_buf.remove(buf.id)
+        let _ = service.counts_by_buf.remove(buf.id)
+        let _ = service.cache_by_buf.remove(buf.id)
+        let _ = buf.vars.remove("trouble_err_count")
+        let _ = buf.vars.remove("trouble_warn_count")
+        return List()
+    }
+
+    buf.sync_external_lines()
+    let lcount = buf.line_count()
+    let (raw_diags, native_errs, native_warns) = accel_doc_analyze_diagnostics(
+        buf.doc_id,
+        buf.major_mode,
+        2000,
+    )
+
+    let diags = List()
+    for i in 0..raw_diags.len() {
+        let hit = raw_diags.get(i.as(usize)).as(NativeDiagHit)
+        diags.push(DiagnosticItem {
+            buf_id: buf.id,
+            file_path: buf.file_path,
+            row: hit.row,
+            col: hit.col,
+            end_col: hit.end_col,
+            severity: hit.severity,
+            source: hit.source,
+            message: hit.message,
+        })
+    }
+
+    var qf_errs: i64 = 0
+    var qf_warns: i64 = 0
+    if buf.file_path != "" and (not world.quickfix.is_empty()) {
+        for qi in 0..world.quickfix.len() {
+            let qf = world.quickfix.get(qi.as(usize)).as(QuickfixEntry)
+            if quickfix_matches_buffer(world, qf.file_path, buf.file_path) {
+                let qr = if qf.row < 0 {
+                    0
+                } else if qf.row >= lcount {
+                    lcount - 1
+                } else {
+                    qf.row
+                }
+                let qlen = buf.line_char_len(qr)
+                let qc = if qf.col < 0 {
+                    0
+                } else if qf.col > qlen {
+                    qlen
+                } else {
+                    qf.col
+                }
+                let qlow = qf.text.to_lower()
+                let sev = if qlow.contains("warn") { "WARN" } else { "ERROR" }
+                if sev == "ERROR" {
+                    qf_errs += 1
+                } else {
+                    qf_warns += 1
+                }
+                let msg_clean = if qf.text.trim() != "" { qf.text.trim() } else { "Quickfix diagnostic" }
+                diags.push(DiagnosticItem {
+                    buf_id: buf.id,
+                    file_path: buf.file_path,
+                    row: qr,
+                    col: qc,
+                    end_col: if qlen > qc { qlen } else { qc + 1 },
+                    severity: sev,
+                    source: "quickfix",
+                    message: msg_clean,
+                })
+            }
+        }
+    }
+
+    diags.sort_by(|a: Any, b: Any| {
+        let da = a.as(DiagnosticItem)
+        let db = b.as(DiagnosticItem)
+        if da.row != db.row {
+            da.row.cmp(db.row)
+        } else if da.col != db.col {
+            da.col.cmp(db.col)
+        } else {
+            severity_rank(da.severity).cmp(severity_rank(db.severity))
+        }
+    })
+
+    let total_err = native_errs + qf_errs
+    let total_warn = native_warns + qf_warns
+    buf.vars.insert("trouble_err_count", total_err)
+    buf.vars.insert("trouble_warn_count", total_warn)
+    service.counts_by_buf.insert(buf.id, (total_err, total_warn))
+    service.diagnostics_by_buf.insert(buf.id, diags)
+
+    let (win_start, win_end) = compute_trouble_window(world, lcount)
+    service.cache_by_buf.insert(
+        buf.id,
+        CachedBufState {
+            major_mode: buf.major_mode,
+            file_path: buf.file_path,
+            qf_sig: compute_qf_signature(world, buf.file_path),
+            edit_version: buf.edit_version,
+            win_start: win_start,
+            win_end: win_end,
+        },
+    )
+    render_buffer_diagnostics(buf, diags, win_start, win_end)
+    diags
+}
+
+fn ensure_buffer_analyzed(world: EditorWorld, service: TroubleService, buf: Buffer) -> List {
+    if not is_analyzable_buffer(buf) {
+        return List()
+    }
+    buf.sync_external_lines()
+    let cached_opt = service.cache_by_buf.get(buf.id)
+    if cached_opt != null {
+        let cached = cached_opt.as(CachedBufState)
+        if cached.major_mode == buf.major_mode
+            and cached.file_path == buf.file_path
+            and cached.qf_sig == compute_qf_signature(world, buf.file_path)
+            and cached.edit_version == buf.edit_version {
+            let diags = service.buffer_diagnostics(buf.id)
+            let lcount = buf.line_count()
+            if viewport_escaped_trouble_window(world, lcount, cached.win_start, cached.win_end) {
+                let (win_start, win_end) = compute_trouble_window(world, lcount)
+                render_buffer_diagnostics(buf, diags, win_start, win_end)
+                service.cache_by_buf.insert(
+                    buf.id,
+                    CachedBufState {
+                        major_mode: cached.major_mode,
+                        file_path: cached.file_path,
+                        qf_sig: cached.qf_sig,
+                        edit_version: cached.edit_version,
+                        win_start: win_start,
+                        win_end: win_end,
+                    },
+                )
+            }
+            return diags
+        }
+    }
+    analyze_buffer(world, service, buf)
+}
+
+-- ============================================================================
+-- 3. `*Trouble*` Interactive Panel Rendering & Filtering
+-- ============================================================================
+
+fn display_label_for_diag(world: EditorWorld, d: DiagnosticItem) -> String {
+    if d.buf_id.raw() > 0 {
+        let b_opt = world.buffer(d.buf_id)
+        if b_opt != null {
+            let b = b_opt.as(Buffer)
+            if b.file_path != "" {
+                let fn_opt = path.file_name(b.file_path)
+                if fn_opt != null {
+                    return fn_opt.as(String)
+                }
+            }
+            return b.name
+        }
+    }
+    if d.file_path != "" {
+        let fn_opt = path.file_name(d.file_path)
+        if fn_opt != null {
+            return fn_opt.as(String)
+        }
+        return d.file_path
+    }
+    "[unnamed]"
+}
+
+fn matches_filter(d: DiagnosticItem, filter_mode: String) -> bool {
+    when {
+        filter_mode == "error" => d.severity == "ERROR",
+        filter_mode == "warning" => d.severity == "WARN",
+        else => true,
+    }
+}
+
+fn collect_workspace_diagnostics(world: EditorWorld, service: TroubleService) -> List {
+    let all = List()
+    let covered_paths = Set.new()
+
+    for i in 0..world.buffer_order.len() {
+        let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+        let b = world.buffers.get(bid).as(Buffer)
+        if is_analyzable_buffer(b) {
+            if b.file_path != "" {
+                covered_paths.insert(world.resolve_path(b.file_path))
+            }
+            let bdiags = ensure_buffer_analyzed(world, service, b)
+            for j in 0..bdiags.len() {
+                all.push(bdiags.get(j.as(usize)).as(DiagnosticItem))
+            }
+        }
+    }
+
+    -- Include quickfix entries for files not currently open in a buffer
+    for qi in 0..world.quickfix.len() {
+        let qf = world.quickfix.get(qi.as(usize)).as(QuickfixEntry)
+        let resolved = if qf.file_path != "" { world.resolve_path(qf.file_path) } else { "" }
+        if resolved != "" and covered_paths.contains(resolved) {
+            continue
+        }
+        let sev = if qf.text.to_lower().contains("warn") { "WARN" } else { "ERROR" }
+        let msg = if qf.text.trim() != "" { qf.text.trim() } else { "Quickfix diagnostic" }
+        all.push(DiagnosticItem {
+            buf_id: BufferId(0),
+            file_path: qf.file_path,
+            row: if qf.row >= 0 { qf.row } else { 0 },
+            col: if qf.col >= 0 { qf.col } else { 0 },
+            end_col: if qf.col >= 0 { qf.col + 1 } else { 1 },
+            severity: sev,
+            source: "quickfix",
+            message: msg,
+        })
+    }
+
+    all
+}
+
+pub fn refresh_trouble_panel(world: EditorWorld, service: TroubleService) -> (Buffer, i64) {
+    let all_diags = collect_workspace_diagnostics(world, service)
+    var total_errs: i64 = 0
+    var total_warns: i64 = 0
+    for i in 0..all_diags.len() {
+        let d = all_diags.get(i.as(usize)).as(DiagnosticItem)
+        if d.severity == "ERROR" {
+            total_errs += 1
+        } else {
+            total_warns += 1
+        }
+    }
+
+    let lines = List()
+    service.panel_row_map = HashMap.new()
+
+    lines.push(
+        "Trouble Diagnostics [filter: " ++ service.filter_mode
+        ++ "] — Errors: " ++ total_errs.to_string()
+        ++ ", Warnings: " ++ total_warns.to_string()
+    )
+    lines.push("Keys: <Enter> jump  |  f cycle filter  |  r refresh  |  q close")
+    lines.push("────────────────────────────────────────────────────────────────────────")
+
+    let filtered = List()
+    for i in 0..all_diags.len() {
+        let d = all_diags.get(i.as(usize)).as(DiagnosticItem)
+        if matches_filter(d, service.filter_mode) {
+            filtered.push(d)
+        }
+    }
+
+    var first_item_row: i64 = -1
+
+    if filtered.is_empty() {
+        lines.push("  ✓ No matching diagnostics (" ++ service.filter_mode ++ ").")
+    } else {
+        -- Group diagnostics by source label preserving appearance order
+        let group_order = List()
+        let group_items = HashMap.new()
+        for i in 0..filtered.len() {
+            let d = filtered.get(i.as(usize)).as(DiagnosticItem)
+            let gkey = if d.buf_id.raw() > 0 {
+                "buf:" ++ d.buf_id.raw().to_string()
+            } else {
+                "file:" ++ d.file_path
+            }
+            if not group_items.contains_key(gkey) {
+                group_order.push(gkey)
+                group_items.insert(gkey, List())
+            }
+            group_items.get(gkey).as(List).push(d)
+        }
+
+        for gi in 0..group_order.len() {
+            let gkey = group_order.get(gi.as(usize)).as(String)
+            let items = group_items.get(gkey).as(List)
+            let first_d = items.get(0).as(DiagnosticItem)
+            let label = display_label_for_diag(world, first_d)
+            var g_errs: i64 = 0
+            var g_warns: i64 = 0
+            for k in 0..items.len() {
+                if items.get(k.as(usize)).as(DiagnosticItem).severity == "ERROR" {
+                    g_errs += 1
+                } else {
+                    g_warns += 1
+                }
+            }
+            let hdr_row = lines.len()
+            lines.push(
+                "▼ " ++ label ++ " (Errors: " ++ g_errs.to_string()
+                ++ ", Warnings: " ++ g_warns.to_string() ++ ")"
+            )
+            service.panel_row_map.insert(hdr_row, first_d)
+
+            for k in 0..items.len() {
+                let item = items.get(k.as(usize)).as(DiagnosticItem)
+                let icon = if item.severity == "ERROR" { "[E]" } else { "[W]" }
+                let loc = (item.row + 1).to_string() ++ ":" ++ (item.col + 1).to_string()
+                let item_row = lines.len()
+                if first_item_row < 0 {
+                    first_item_row = item_row
+                }
+                lines.push(
+                    "    " ++ icon ++ " " ++ loc.pad_end(8, " ")
+                    ++ " (" ++ item.source ++ ") " ++ item.message
+                )
+                service.panel_row_map.insert(item_row, item)
+            }
+        }
+    }
+
+    let tbuf = world.ensure_special_buffer(TROUBLE_BUF_NAME, "trouble", lines, read_only = true)
+    let cursor_row = if first_item_row >= 0 { first_item_row } else { 0 }
+    (tbuf, cursor_row)
+}
+
+-- ============================================================================
+-- 4. Navigation & Panel Commands
+-- ============================================================================
+
+fn jump_diagnostic_in_buffer(
+    kernel: SystemKernel,
+    forward: bool,
+) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let service = require_trouble_service(kernel)!
+    let buf = world.active_buffer()
+
+    let diags = ensure_buffer_analyzed(world, service, buf)
+    let total = diags.len()
+    if total == 0 {
+        status_emit("No diagnostics in " ++ buf.name)#
+        return ()
+    }
+
+    let step = vim.effective_count()
+    var cur = buf.point
+    var chosen_idx: i64 = 0
+
+    for _ in 0..step {
+        if forward {
+            var found: i64 = -1
+            for i in 0..total {
+                let d = diags.get(i.as(usize)).as(DiagnosticItem)
+                let dp = Pos.new(d.row, d.col)
+                if dp > cur {
+                    found = i
+                    break
+                }
+            }
+            chosen_idx = if found >= 0 { found } else { 0 }
+        } else {
+            var found: i64 = -1
+            var i = total - 1
+            while i >= 0 {
+                let d = diags.get(i.as(usize)).as(DiagnosticItem)
+                let dp = Pos.new(d.row, d.col)
+                if dp < cur {
+                    found = i
+                    break
+                }
+                i -= 1
+            }
+            chosen_idx = if found >= 0 { found } else { total - 1 }
+        }
+        let picked = diags.get(chosen_idx.as(usize)).as(DiagnosticItem)
+        cur = Pos.new(picked.row, picked.col)
+    }
+
+    let target = diags.get(chosen_idx.as(usize)).as(DiagnosticItem)
+    world.jumps.record(buf.id, buf.file_path, buf.point)
+    buf.point = buf.clamp_pos(Pos.new(target.row, target.col), insert_mode = false)
+    buf.preferred_col = buf.point.col
+    vim.mode = VimMode.Normal
+    vim.clear_transient()
+    sync_world_from_vim(world, vim)
+    kernel.emit_hook("cursor-moved", buf.id)
+    status_emit(
+        "[" ++ (chosen_idx + 1).to_string() ++ "/" ++ total.to_string() ++ "] "
+        ++ target.severity ++ " (" ++ target.source ++ "): " ++ target.message
+    )#
+    ()
+}
+
+fn close_trouble_panel(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    vim: VimState,
+    service: TroubleService,
+) -> #InteractiveEffects Unit {
+    var dest_id = service.source_buf_id
+    if (not world.buffers.contains_key(dest_id))
+        or world.buffers.get(dest_id).as(Buffer).name == TROUBLE_BUF_NAME {
+        dest_id = world.scratch_id
+        for i in 0..world.buffer_order.len() {
+            let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+            let b = world.buffers.get(bid).as(Buffer)
+            if b.name != TROUBLE_BUF_NAME and b.id != world.messages_id {
+                dest_id = bid
+                break
+            }
+        }
+    }
+    let _ = world.switch_to_buffer(dest_id)
+    vim.mode = VimMode.Normal
+    vim.clear_transient()
+    sync_world_from_vim(world, vim)
+    kernel.emit_hook("buffer-switched", dest_id)
+    kernel.emit_hook("cursor-moved", dest_id)
+    status_emit("Trouble closed")#
+}
+
+fn open_trouble_panel(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    vim: VimState,
+    service: TroubleService,
+) -> #InteractiveEffects Unit {
+    let cur = world.active_buffer()
+    if cur.name != TROUBLE_BUF_NAME {
+        service.source_buf_id = cur.id
+    }
+    let (tbuf, first_row) = refresh_trouble_panel(world, service)
+    tbuf.point = tbuf.clamp_pos(Pos.new(first_row, 0), insert_mode = false)
+    tbuf.preferred_col = 0
+    let _ = world.switch_to_buffer(tbuf.id)
+    vim.mode = VimMode.Normal
+    vim.clear_transient()
+    sync_world_from_vim(world, vim)
+    kernel.emit_hook("buffer-switched", tbuf.id)
+    status_emit("Trouble diagnostics (" ++ service.filter_mode ++ ")")#
+}
+
+fn find_diag_near_panel_row(service: TroubleService, row: i64, max_rows: i64) -> ?DiagnosticItem {
+    let exact_opt = service.panel_row_map.get(row)
+    if exact_opt != null {
+        return exact_opt.as(DiagnosticItem)
+    }
+    for r in (row + 1)..max_rows {
+        let fwd_opt = service.panel_row_map.get(r)
+        if fwd_opt != null {
+            return fwd_opt.as(DiagnosticItem)
+        }
+    }
+    var b = row - 1
+    while b >= 0 {
+        let back_opt = service.panel_row_map.get(b)
+        if back_opt != null {
+            return back_opt.as(DiagnosticItem)
+        }
+        b -= 1
+    }
+    null
+}
+
+-- ============================================================================
+-- 5. Hook Callbacks & Extension Registration (`lava.org/ext_trouble`)
+-- ============================================================================
+
+fn resolve_hook_buffer(world: EditorWorld, payload: Any) -> Buffer {
+    if payload matches _: BufferId {
+        let b_opt = world.buffer(payload.as(BufferId))
+        if b_opt != null {
+            return b_opt.as(Buffer)
+        }
+    }
+    world.active_buffer()
+}
+
+fn on_trouble_force_hook(kern: SystemKernel, payload: Any) {
+    let w_opt = kern.service("lava.document.world")
+    let t_opt = kern.service(SERVICE_TROUBLE)
+    if w_opt == null or t_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let service = t_opt.as(TroubleService)
+    let buf = resolve_hook_buffer(world, payload)
+    if is_analyzable_buffer(buf) {
+        let _ = analyze_buffer(world, service, buf)
+    }
+}
+
+fn on_trouble_sync_hook(kern: SystemKernel, payload: Any) {
+    let w_opt = kern.service("lava.document.world")
+    let t_opt = kern.service(SERVICE_TROUBLE)
+    if w_opt == null or t_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let service = t_opt.as(TroubleService)
+    let buf = resolve_hook_buffer(world, payload)
+    if is_analyzable_buffer(buf) {
+        let _ = ensure_buffer_analyzed(world, service, buf)
+    }
+}
+
+fn on_trouble_insert_hook(kern: SystemKernel, payload: Any) {
+    let w_opt = kern.service("lava.document.world")
+    let t_opt = kern.service(SERVICE_TROUBLE)
+    if w_opt == null or t_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let service = t_opt.as(TroubleService)
+    let buf = resolve_hook_buffer(world, payload)
+    if buf.line_count() > 2000 {
+        return
+    }
+    if is_analyzable_buffer(buf) {
+        let _ = ensure_buffer_analyzed(world, service, buf)
+    }
+}
+
+fn unbind_owner_from_keymaps(kernel: SystemKernel, owner: ExtId) {
+    for km_key in kernel.keymaps.keys() {
+        let km_name = km_key.as(String)
+        let km = kernel.keymaps.get(km_name).as(Keymap)
+        for chord_key in km.bindings.keys() {
+            let chord = chord_key.as(String)
+            let entry = km.bindings.get(chord).as(KeyBindingEntry)
+            if entry.owner == owner {
+                let _ = km.bindings.remove(chord)
+            }
+        }
+    }
+}
+
+pub fn register_trouble_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_trouble_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_trouble",
+        "0.1.0",
+        "Live syntax, conflict, style, and quickfix diagnostics with gutter signs, underlines, virtual text, ]d/[d navigation, and *Trouble* panel.",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let service = TroubleService.new()
+            k.publish_service(SERVICE_TROUBLE, ext_id, service)
+
+            let norm_km = k.ensure_keymap(KEYMAP_VIM_NORMAL)
+            norm_km.bind("] d", "trouble-next", ext_id, description = "Next diagnostic")
+            norm_km.bind("[ d", "trouble-prev", ext_id, description = "Previous diagnostic")
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> x x", "trouble-toggle", ext_id, description = "Toggle Trouble diagnostics")
+
+            let trouble_km = k.ensure_keymap("mode:trouble")
+            trouble_km.bind("<Return>", "trouble-jump", ext_id, description = "Jump to diagnostic")
+            trouble_km.bind("f", "trouble-cycle-filter", ext_id, description = "Cycle diagnostic filter")
+            trouble_km.bind("r", "trouble-refresh", ext_id, description = "Refresh diagnostics")
+            trouble_km.bind("q", "trouble-close", ext_id, description = "Close Trouble panel")
+
+            k.register_command(
+                "trouble-next",
+                ext_id,
+                "Jump to next diagnostic in active buffer (`]d`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    jump_diagnostic_in_buffer(kern, true)#
+                },
+            )
+
+            k.register_command(
+                "trouble-prev",
+                ext_id,
+                "Jump to previous diagnostic in active buffer (`[d`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    jump_diagnostic_in_buffer(kern, false)#
+                },
+            )
+
+            k.register_command(
+                "trouble-toggle",
+                ext_id,
+                "Toggle interactive *Trouble* workspace diagnostics panel (`<Space> x x`, `:TroubleToggle`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let vim = require_vim_state(kern)!
+                    let svc = require_trouble_service(kern)!
+                    if world.active_buffer().name == TROUBLE_BUF_NAME {
+                        close_trouble_panel(kern, world, vim, svc)#
+                    } else {
+                        open_trouble_panel(kern, world, vim, svc)#
+                    }
+                    ()
+                },
+            )
+
+            k.register_command(
+                "trouble",
+                ext_id,
+                "Open, toggle, or control *Trouble* diagnostics (`:Trouble [toggle|open|close|refresh|error|warning|all]`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let vim = require_vim_state(kern)!
+                    let svc = require_trouble_service(kern)!
+                    if args.is_empty() {
+                        if world.active_buffer().name == TROUBLE_BUF_NAME {
+                            close_trouble_panel(kern, world, vim, svc)#
+                        } else {
+                            open_trouble_panel(kern, world, vim, svc)#
+                        }
+                        return ()
+                    }
+                    let sub = args.get(0).as(String).trim().to_lower()
+                    when {
+                        sub == "close" => close_trouble_panel(kern, world, vim, svc)#,
+                        sub == "open" => open_trouble_panel(kern, world, vim, svc)#,
+                        sub == "refresh" => {
+                            let (tbuf, first_row) = refresh_trouble_panel(world, svc)
+                            if world.active_buffer().name == TROUBLE_BUF_NAME {
+                                tbuf.point = tbuf.clamp_pos(Pos.new(first_row, 0), insert_mode = false)
+                            }
+                            status_emit("Trouble diagnostics refreshed")#
+                        },
+                        sub == "error" or sub == "errors" => {
+                            svc.filter_mode = "error"
+                            open_trouble_panel(kern, world, vim, svc)#
+                        },
+                        sub == "warning" or sub == "warnings" or sub == "warn" => {
+                            svc.filter_mode = "warning"
+                            open_trouble_panel(kern, world, vim, svc)#
+                        },
+                        sub == "all" => {
+                            svc.filter_mode = "all"
+                            open_trouble_panel(kern, world, vim, svc)#
+                        },
+                        else => {
+                            if world.active_buffer().name == TROUBLE_BUF_NAME {
+                                close_trouble_panel(kern, world, vim, svc)#
+                            } else {
+                                open_trouble_panel(kern, world, vim, svc)#
+                            }
+                        },
+                    }
+                    ()
+                },
+            )
+
+            k.register_command(
+                "trouble-jump",
+                ext_id,
+                "Jump from *Trouble* panel row to target buffer and diagnostic location (`<Return>`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let vim = require_vim_state(kern)!
+                    let svc = require_trouble_service(kern)!
+                    let cur = world.active_buffer()
+                    if cur.name != TROUBLE_BUF_NAME {
+                        return ()
+                    }
+                    let diag? = find_diag_near_panel_row(svc, cur.point.row, cur.line_count()) else {
+                        status_emit("No diagnostic on selected line")#
+                        return ()
+                    }
+                    var target_buf: ?Buffer = null
+                    if diag.buf_id.raw() > 0 and world.buffers.contains_key(diag.buf_id) {
+                        let _ = world.switch_to_buffer(diag.buf_id)
+                        target_buf = world.buffer(diag.buf_id)
+                    } else if diag.file_path != "" {
+                        let opened = world.open_file(diag.file_path)#!
+                        target_buf = opened
+                    }
+                    let tb? = target_buf else {
+                        status_emit("Cannot open diagnostic target")#
+                        return ()
+                    }
+                    tb.point = tb.clamp_pos(Pos.new(diag.row, diag.col), insert_mode = false)
+                    tb.preferred_col = tb.point.col
+                    vim.mode = VimMode.Normal
+                    vim.clear_transient()
+                    sync_world_from_vim(world, vim)
+                    kern.emit_hook("buffer-switched", tb.id)
+                    kern.emit_hook("cursor-moved", tb.id)
+                    status_emit(diag.severity ++ ": " ++ diag.message)#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "trouble-cycle-filter",
+                ext_id,
+                "Cycle *Trouble* severity filter (`all` -> `error` -> `warning`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let svc = require_trouble_service(kern)!
+                    svc.filter_mode = when {
+                        svc.filter_mode == "all" => "error",
+                        svc.filter_mode == "error" => "warning",
+                        else => "all",
+                    }
+                    let (tbuf, first_row) = refresh_trouble_panel(world, svc)
+                    tbuf.point = tbuf.clamp_pos(Pos.new(first_row, 0), insert_mode = false)
+                    tbuf.preferred_col = 0
+                    status_emit("Trouble filter: " ++ svc.filter_mode)#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "trouble-refresh",
+                ext_id,
+                "Re-analyze open buffers and refresh *Trouble* diagnostics panel (`r`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let svc = require_trouble_service(kern)!
+                    if world.active_buffer().name == TROUBLE_BUF_NAME {
+                        let (tbuf, first_row) = refresh_trouble_panel(world, svc)
+                        tbuf.point = tbuf.clamp_pos(Pos.new(first_row, 0), insert_mode = false)
+                    } else {
+                        let _ = analyze_buffer(world, svc, world.active_buffer())
+                    }
+                    status_emit("Trouble diagnostics refreshed")#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "trouble-close",
+                ext_id,
+                "Close *Trouble* panel and return to previous buffer (`q`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let vim = require_vim_state(kern)!
+                    let svc = require_trouble_service(kern)!
+                    close_trouble_panel(kern, world, vim, svc)#
+                    ()
+                },
+            )
+
+            k.add_hook("buffer-opened", ext_id, on_trouble_force_hook)
+            k.add_hook("buffer-switched", ext_id, on_trouble_sync_hook)
+            k.add_hook("buffer-modified", ext_id, on_trouble_sync_hook)
+            k.add_hook("buffer-saved", ext_id, on_trouble_sync_hook)
+            k.add_hook("cursor-moved", ext_id, on_trouble_sync_hook)
+            k.add_hook("mode-changed", ext_id, on_trouble_sync_hook)
+            k.add_hook("after-insert-stroke", ext_id, on_trouble_insert_hook)
+
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                let w = w_opt.as(EditorWorld)
+                for i in 0..w.buffer_order.len() {
+                    let bid = w.buffer_order.get(i.as(usize)).as(BufferId)
+                    let b = w.buffers.get(bid).as(Buffer)
+                    if is_analyzable_buffer(b) {
+                        let _ = analyze_buffer(w, service, b)
+                    }
+                }
+            }
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                w_opt.as(EditorWorld).clear_owner_ui(OWNER_TROUBLE)
+            }
+            unbind_owner_from_keymaps(k, ext_id)
+            ()
+        },
+    )
+}

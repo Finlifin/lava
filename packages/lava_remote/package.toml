@@ -1,0 +1,6 @@
+[package]
+name = "lava_remote"
+domain = "lava.org"
+version = "0.1.0"
+type = "lib"
+description = "SSH remote transport, lava-server JSON-RPC 2.0 client, TRAMP/ssh:// URI parser, ~/.ssh/config scanner, and port-forwarding bridge"

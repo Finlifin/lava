@@ -1,0 +1,1515 @@
+-- ext_conform: Deterministic Buffer & Range Code Formatter + Format-on-Save (`conform.nvim` / `Apheleia`).
+-- Publishes service `"lava.conform.formatter"` (`ConformService`), provides built-in offline
+-- deterministic formatters (stateful/recursive JSON AST pretty-printer, brace-nesting code formatter
+-- for Nessa/Rust/C/Go/JS/TS/CSS, and indentation/prose cleanup for Python/YAML/TOML/Markdown/Shell/Text),
+-- optional custom/external per-mode formatters, single-checkpoint undo preservation, and format-on-save.
+
+use std.collections.HashMap
+use std.fs
+use std.path
+use std.process
+use std.time
+use @lava_core.{
+    ExtId, InteractiveEffects, KeyBindingEntry, Keymap, SystemKernel, log_event, status_emit
+}
+use @ext_document.{
+    Buffer, BufferId, BufferKind, EditorWorld, NarrowRegion, Pos, ext_document_id,
+    require_editor_world
+}
+use @ext_vim.{
+    KEYMAP_VIM_LEADER, KEYMAP_VIM_VISUAL, VimMode, ext_vim_id, require_vim_state,
+    sync_world_from_vim
+}
+
+pub const SERVICE_CONFORM: String = "lava.conform.formatter"
+pub const OWNER_CONFORM: String = "ext_conform"
+pub const CONFORM_INFO_BUF_NAME: String = "*ConformInfo*"
+
+pub fn ext_conform_id() -> ExtId = ExtId("lava.org/ext_conform")
+
+-- ============================================================================
+-- 1. Formatter Registry & ConformService
+-- ============================================================================
+
+pub struct CustomFormatterSpec {
+    pub name: String,
+    pub mode: String,
+    pub func: fn(List, i64, bool) -> !String List,
+}
+
+pub struct ExternalFormatterSpec {
+    pub name: String,
+    pub mode: String,
+    pub command: String,
+    pub args: List,
+}
+
+pub struct ConformService {
+    pub custom_formatters: HashMap,
+    pub external_formatters: HashMap,
+    pub last_status: String,
+    pub format_count: i64,
+    pub prev_buf_id: BufferId,
+    upgraded_leader_u: bool,
+}
+
+impl ConformService {
+    pub fn new() -> ConformService {
+        ConformService {
+            custom_formatters: HashMap.new(),
+            external_formatters: HashMap.new(),
+            last_status: "Ready",
+            format_count: 0,
+            prev_buf_id: BufferId(0),
+            upgraded_leader_u: false,
+        }
+    }
+
+    pub fn register_formatter(
+        self,
+        mode: String,
+        name: String,
+        func: fn(List, i64, bool) -> !String List,
+    ) {
+        let key = mode.trim().to_lower()
+        self.custom_formatters.insert(
+            key,
+            CustomFormatterSpec {
+                name: name,
+                mode: key,
+                func: func,
+            },
+        )
+    }
+
+    pub fn register_external_formatter(
+        self,
+        mode: String,
+        name: String,
+        command: String,
+        args: List,
+    ) {
+        let key = mode.trim().to_lower()
+        self.external_formatters.insert(
+            key,
+            ExternalFormatterSpec {
+                name: name,
+                mode: key,
+                command: command,
+                args: args,
+            },
+        )
+    }
+
+    pub fn active_formatter_name(self, major_mode: String) -> String {
+        let m = major_mode.trim().to_lower()
+        if self.custom_formatters.contains_key(m) {
+            return self.custom_formatters.get(m).as(CustomFormatterSpec).name ++ " (custom)"
+        }
+        if self.external_formatters.contains_key(m) {
+            return self.external_formatters.get(m).as(ExternalFormatterSpec).name ++ " (external)"
+        }
+        builtin_formatter_name(m)
+    }
+}
+
+pub fn require_conform_service(kernel: SystemKernel) -> !String ConformService {
+    let svc? = kernel.service(SERVICE_CONFORM) else {
+        return error ("required service '" ++ SERVICE_CONFORM ++ "' is not published")
+    }
+    svc.as(ConformService)
+}
+
+fn str_lists_eq(a: List, b: List) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    for i in 0..a.len() {
+        if a.get(i.as(usize)).as(String) != b.get(i.as(usize)).as(String) {
+            return false
+        }
+    }
+    true
+}
+
+fn indent_unit_str(shiftwidth: i64, expandtab: bool) -> String {
+    let sw = if shiftwidth > 0 { shiftwidth } else { 4 }
+    if expandtab {
+        " ".repeat(sw)
+    } else {
+        "\t"
+    }
+}
+
+fn is_brace_structured_mode(mode: String) -> bool {
+    mode == "nessa"
+        or mode == "rust"
+        or mode == "c"
+        or mode == "cpp"
+        or mode == "h"
+        or mode == "hpp"
+        or mode == "go"
+        or mode == "javascript"
+        or mode == "js"
+        or mode == "typescript"
+        or mode == "ts"
+        or mode == "tsx"
+        or mode == "jsx"
+        or mode == "java"
+        or mode == "csharp"
+        or mode == "zig"
+        or mode == "css"
+        or mode == "scss"
+}
+
+fn builtin_formatter_name(mode: String) -> String {
+    if mode == "json" or mode == "jsonc" {
+        return "lava-json-pretty (built-in)"
+    }
+    if is_brace_structured_mode(mode) {
+        return "lava-brace-fmt[" ++ mode ++ "] (built-in)"
+    }
+    if mode == "makefile" or mode == "make" {
+        return "lava-whitespace-preserve-tabs (built-in)"
+    }
+    "lava-indent-trim[" ++ (if mode == "" { "text" } else { mode }) ++ "] (built-in)"
+}
+
+-- ============================================================================
+-- 2. Built-in Formatter 1: Full Stateful JSON Tokenizer, Parser & Pretty-Printer
+-- ============================================================================
+
+enum JsonTokKind {
+    LBrace,
+    RBrace,
+    LBracket,
+    RBracket,
+    Colon,
+    Comma,
+    Str,
+    Num,
+    BoolLit,
+    NullLit,
+}
+derive Eq, PartialEq for JsonTokKind
+
+struct JsonToken {
+    kind: JsonTokKind,
+    raw: String,
+    line: i64,
+    col: i64,
+}
+
+enum JsonNode {
+    Obj(entries: List),
+    Arr(items: List),
+    Scalar(raw: String),
+}
+
+struct JsonProp {
+    key_raw: String,
+    val: JsonNode,
+}
+
+struct JsonCursor {
+    pos: i64,
+}
+
+fn is_hex_char(ch: String) -> bool {
+    if ch.char_len() != 1 {
+        return false
+    }
+    ch.is_ascii_digit()
+        or ch == "a" or ch == "b" or ch == "c" or ch == "d" or ch == "e" or ch == "f"
+        or ch == "A" or ch == "B" or ch == "C" or ch == "D" or ch == "E" or ch == "F"
+}
+
+fn is_json_ws(ch: String) -> bool {
+    ch == " " or ch == "\t" or ch == "\n" or ch == "\r"
+}
+
+fn is_json_delim_or_ws(ch: String) -> bool {
+    is_json_ws(ch) or ch == "," or ch == "}}" or ch == "]" or ch == ":"
+}
+
+fn tokenize_json(src: String) -> !String List {
+    let tokens = List()
+    let n = src.char_len()
+    var i: i64 = 0
+    var line: i64 = 1
+    var col: i64 = 1
+
+    while i < n {
+        let ch = src.slice(i, i + 1)
+        if ch == "\n" {
+            i += 1
+            line += 1
+            col = 1
+            continue
+        }
+        if ch == " " or ch == "\t" or ch == "\r" {
+            i += 1
+            col += 1
+            continue
+        }
+        if ch == "{{" {
+            tokens.push(JsonToken { kind: JsonTokKind.LBrace, raw: "{{", line: line, col: col })
+            i += 1
+            col += 1
+            continue
+        }
+        if ch == "}}" {
+            tokens.push(JsonToken { kind: JsonTokKind.RBrace, raw: "}}", line: line, col: col })
+            i += 1
+            col += 1
+            continue
+        }
+        if ch == "[" {
+            tokens.push(JsonToken { kind: JsonTokKind.LBracket, raw: "[", line: line, col: col })
+            i += 1
+            col += 1
+            continue
+        }
+        if ch == "]" {
+            tokens.push(JsonToken { kind: JsonTokKind.RBracket, raw: "]", line: line, col: col })
+            i += 1
+            col += 1
+            continue
+        }
+        if ch == ":" {
+            tokens.push(JsonToken { kind: JsonTokKind.Colon, raw: ":", line: line, col: col })
+            i += 1
+            col += 1
+            continue
+        }
+        if ch == "," {
+            tokens.push(JsonToken { kind: JsonTokKind.Comma, raw: ",", line: line, col: col })
+            i += 1
+            col += 1
+            continue
+        }
+
+        -- String literal with full JSON escape validation
+        if ch == "\"" {
+            let start_i = i
+            let start_line = line
+            let start_col = col
+            i += 1
+            col += 1
+            var closed = false
+            while i < n {
+                let sch = src.slice(i, i + 1)
+                if sch == "\n" or sch == "\r" {
+                    return error (
+                        "Malformed JSON at line " ++ start_line.to_string()
+                        ++ ", col " ++ start_col.to_string() ++ ": unescaped newline in string"
+                    )
+                }
+                if sch == "\"" {
+                    i += 1
+                    col += 1
+                    closed = true
+                    break
+                }
+                if sch == "\\" {
+                    if i + 1 >= n {
+                        return error (
+                            "Malformed JSON at line " ++ line.to_string()
+                            ++ ", col " ++ col.to_string() ++ ": unterminated escape sequence"
+                        )
+                    }
+                    let esc = src.slice(i + 1, i + 2)
+                    if esc == "\"" or esc == "\\" or esc == "/" or esc == "b"
+                        or esc == "f" or esc == "n" or esc == "r" or esc == "t" {
+                        i += 2
+                        col += 2
+                        continue
+                    }
+                    if esc == "u" {
+                        if i + 5 >= n {
+                            return error (
+                                "Malformed JSON at line " ++ line.to_string()
+                                ++ ", col " ++ col.to_string() ++ ": incomplete \\uXXXX escape"
+                            )
+                        }
+                        for hk in 2..6 {
+                            let hch = src.slice(i + hk, i + hk + 1)
+                            if not is_hex_char(hch) {
+                                return error (
+                                    "Malformed JSON at line " ++ line.to_string()
+                                    ++ ", col " ++ col.to_string() ++ ": invalid \\uXXXX hex digit"
+                                )
+                            }
+                        }
+                        i += 6
+                        col += 6
+                        continue
+                    }
+                    return error (
+                        "Malformed JSON at line " ++ line.to_string()
+                        ++ ", col " ++ col.to_string() ++ ": invalid string escape '\\" ++ esc ++ "'"
+                    )
+                }
+                i += 1
+                col += 1
+            }
+            if not closed {
+                return error (
+                    "Malformed JSON at line " ++ start_line.to_string()
+                    ++ ", col " ++ start_col.to_string() ++ ": unterminated string literal"
+                )
+            }
+            tokens.push(JsonToken {
+                kind: JsonTokKind.Str,
+                raw: src.slice(start_i, i),
+                line: start_line,
+                col: start_col,
+            })
+            continue
+        }
+
+        -- Number literal (`-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`)
+        if ch == "-" or ch.is_ascii_digit() {
+            let start_i = i
+            let start_col = col
+            if ch == "-" {
+                i += 1
+                col += 1
+                if i >= n or (not src.slice(i, i + 1).is_ascii_digit()) {
+                    return error (
+                        "Malformed JSON at line " ++ line.to_string()
+                        ++ ", col " ++ start_col.to_string() ++ ": invalid number"
+                    )
+                }
+            }
+            let first_d = src.slice(i, i + 1)
+            i += 1
+            col += 1
+            if first_d == "0" {
+                if i < n and src.slice(i, i + 1).is_ascii_digit() {
+                    return error (
+                        "Malformed JSON at line " ++ line.to_string()
+                        ++ ", col " ++ start_col.to_string() ++ ": leading zero in number"
+                    )
+                }
+            } else {
+                while i < n and src.slice(i, i + 1).is_ascii_digit() {
+                    i += 1
+                    col += 1
+                }
+            }
+            if i < n and src.slice(i, i + 1) == "." {
+                i += 1
+                col += 1
+                if i >= n or (not src.slice(i, i + 1).is_ascii_digit()) {
+                    return error (
+                        "Malformed JSON at line " ++ line.to_string()
+                        ++ ", col " ++ start_col.to_string() ++ ": expected digit after decimal point"
+                    )
+                }
+                while i < n and src.slice(i, i + 1).is_ascii_digit() {
+                    i += 1
+                    col += 1
+                }
+            }
+            if i < n and (src.slice(i, i + 1) == "e" or src.slice(i, i + 1) == "E") {
+                i += 1
+                col += 1
+                if i < n and (src.slice(i, i + 1) == "+" or src.slice(i, i + 1) == "-") {
+                    i += 1
+                    col += 1
+                }
+                if i >= n or (not src.slice(i, i + 1).is_ascii_digit()) {
+                    return error (
+                        "Malformed JSON at line " ++ line.to_string()
+                        ++ ", col " ++ start_col.to_string() ++ ": expected digit in exponent"
+                    )
+                }
+                while i < n and src.slice(i, i + 1).is_ascii_digit() {
+                    i += 1
+                    col += 1
+                }
+            }
+            if i < n and (not is_json_delim_or_ws(src.slice(i, i + 1))) {
+                return error (
+                    "Malformed JSON at line " ++ line.to_string()
+                    ++ ", col " ++ col.to_string() ++ ": unexpected character in number"
+                )
+            }
+            tokens.push(JsonToken {
+                kind: JsonTokKind.Num,
+                raw: src.slice(start_i, i),
+                line: line,
+                col: start_col,
+            })
+            continue
+        }
+
+        -- Keywords `true`, `false`, `null`
+        if i + 4 <= n and src.slice(i, i + 4) == "true"
+            and (i + 4 == n or is_json_delim_or_ws(src.slice(i + 4, i + 5))) {
+            tokens.push(JsonToken { kind: JsonTokKind.BoolLit, raw: "true", line: line, col: col })
+            i += 4
+            col += 4
+            continue
+        }
+        if i + 5 <= n and src.slice(i, i + 5) == "false"
+            and (i + 5 == n or is_json_delim_or_ws(src.slice(i + 5, i + 6))) {
+            tokens.push(JsonToken { kind: JsonTokKind.BoolLit, raw: "false", line: line, col: col })
+            i += 5
+            col += 5
+            continue
+        }
+        if i + 4 <= n and src.slice(i, i + 4) == "null"
+            and (i + 4 == n or is_json_delim_or_ws(src.slice(i + 4, i + 5))) {
+            tokens.push(JsonToken { kind: JsonTokKind.NullLit, raw: "null", line: line, col: col })
+            i += 4
+            col += 4
+            continue
+        }
+
+        return error (
+            "Malformed JSON at line " ++ line.to_string()
+            ++ ", col " ++ col.to_string() ++ ": unexpected token '" ++ ch ++ "'"
+        )
+    }
+    tokens
+}
+
+fn parse_json_value(tokens: List, cur: JsonCursor) -> !String JsonNode {
+    if cur.pos >= tokens.len() {
+        return error "Malformed JSON: unexpected end of input"
+    }
+    let tok = tokens.get(cur.pos.as(usize)).as(JsonToken)
+    cur.pos += 1
+
+    if tok.kind == JsonTokKind.Str
+        or tok.kind == JsonTokKind.Num
+        or tok.kind == JsonTokKind.BoolLit
+        or tok.kind == JsonTokKind.NullLit {
+        return JsonNode.Scalar(tok.raw)
+    }
+
+    if tok.kind == JsonTokKind.LBrace {
+        let entries = List()
+        if cur.pos < tokens.len()
+            and tokens.get(cur.pos.as(usize)).as(JsonToken).kind == JsonTokKind.RBrace {
+            cur.pos += 1
+            return JsonNode.Obj(entries)
+        }
+        while true {
+            if cur.pos >= tokens.len() {
+                return error (
+                    "Malformed JSON at line " ++ tok.line.to_string()
+                    ++ ": unclosed object '{{'"
+                )
+            }
+            let key_tok = tokens.get(cur.pos.as(usize)).as(JsonToken)
+            if key_tok.kind != JsonTokKind.Str {
+                return error (
+                    "Malformed JSON at line " ++ key_tok.line.to_string()
+                    ++ ", col " ++ key_tok.col.to_string()
+                    ++ ": expected string property key, got '" ++ key_tok.raw ++ "'"
+                )
+            }
+            cur.pos += 1
+            if cur.pos >= tokens.len() {
+                return error "Malformed JSON: expected ':' after object key"
+            }
+            let colon_tok = tokens.get(cur.pos.as(usize)).as(JsonToken)
+            if colon_tok.kind != JsonTokKind.Colon {
+                return error (
+                    "Malformed JSON at line " ++ colon_tok.line.to_string()
+                    ++ ", col " ++ colon_tok.col.to_string()
+                    ++ ": expected ':', got '" ++ colon_tok.raw ++ "'"
+                )
+            }
+            cur.pos += 1
+            let val = parse_json_value(tokens, cur)!
+            entries.push(JsonProp { key_raw: key_tok.raw, val: val })
+
+            if cur.pos >= tokens.len() {
+                return error (
+                    "Malformed JSON at line " ++ tok.line.to_string()
+                    ++ ": unclosed object '{{'"
+                )
+            }
+            let sep_tok = tokens.get(cur.pos.as(usize)).as(JsonToken)
+            if sep_tok.kind == JsonTokKind.RBrace {
+                cur.pos += 1
+                break
+            }
+            if sep_tok.kind == JsonTokKind.Comma {
+                cur.pos += 1
+                if cur.pos < tokens.len()
+                    and tokens.get(cur.pos.as(usize)).as(JsonToken).kind == JsonTokKind.RBrace {
+                    let rb = tokens.get(cur.pos.as(usize)).as(JsonToken)
+                    return error (
+                        "Malformed JSON at line " ++ rb.line.to_string()
+                        ++ ", col " ++ rb.col.to_string() ++ ": trailing comma in object"
+                    )
+                }
+                continue
+            }
+            return error (
+                "Malformed JSON at line " ++ sep_tok.line.to_string()
+                ++ ", col " ++ sep_tok.col.to_string()
+                ++ ": expected ',' or '}}' in object, got '" ++ sep_tok.raw ++ "'"
+            )
+        }
+        return JsonNode.Obj(entries)
+    }
+
+    if tok.kind == JsonTokKind.LBracket {
+        let items = List()
+        if cur.pos < tokens.len()
+            and tokens.get(cur.pos.as(usize)).as(JsonToken).kind == JsonTokKind.RBracket {
+            cur.pos += 1
+            return JsonNode.Arr(items)
+        }
+        while true {
+            let item = parse_json_value(tokens, cur)!
+            items.push(item)
+            if cur.pos >= tokens.len() {
+                return error (
+                    "Malformed JSON at line " ++ tok.line.to_string()
+                    ++ ": unclosed array '['"
+                )
+            }
+            let sep_tok = tokens.get(cur.pos.as(usize)).as(JsonToken)
+            if sep_tok.kind == JsonTokKind.RBracket {
+                cur.pos += 1
+                break
+            }
+            if sep_tok.kind == JsonTokKind.Comma {
+                cur.pos += 1
+                if cur.pos < tokens.len()
+                    and tokens.get(cur.pos.as(usize)).as(JsonToken).kind == JsonTokKind.RBracket {
+                    let rb = tokens.get(cur.pos.as(usize)).as(JsonToken)
+                    return error (
+                        "Malformed JSON at line " ++ rb.line.to_string()
+                        ++ ", col " ++ rb.col.to_string() ++ ": trailing comma in array"
+                    )
+                }
+                continue
+            }
+            return error (
+                "Malformed JSON at line " ++ sep_tok.line.to_string()
+                ++ ", col " ++ sep_tok.col.to_string()
+                ++ ": expected ',' or ']' in array, got '" ++ sep_tok.raw ++ "'"
+            )
+        }
+        return JsonNode.Arr(items)
+    }
+
+    error (
+        "Malformed JSON at line " ++ tok.line.to_string()
+        ++ ", col " ++ tok.col.to_string() ++ ": unexpected '" ++ tok.raw ++ "'"
+    )
+}
+
+fn render_json_node(
+    node: JsonNode,
+    depth: i64,
+    unit: String,
+    prefix: String,
+    suffix: String,
+    out_lines: List,
+) {
+    let pad = unit.repeat(depth)
+    node match {
+        JsonNode.Scalar(raw) => {
+            out_lines.push(pad ++ prefix ++ raw ++ suffix)
+        },
+        JsonNode.Obj(entries) => {
+            if entries.is_empty() {
+                out_lines.push(pad ++ prefix ++ "{{}}" ++ suffix)
+            } else {
+                out_lines.push(pad ++ prefix ++ "{{")
+                let cnt = entries.len()
+                for i in 0..cnt {
+                    let prop = entries.get(i.as(usize)).as(JsonProp)
+                    let child_suffix = if i + 1 < cnt { "," } else { "" }
+                    render_json_node(
+                        prop.val,
+                        depth + 1,
+                        unit,
+                        prop.key_raw ++ ": ",
+                        child_suffix,
+                        out_lines,
+                    )
+                }
+                out_lines.push(pad ++ "}}" ++ suffix)
+            }
+        },
+        JsonNode.Arr(items) => {
+            if items.is_empty() {
+                out_lines.push(pad ++ prefix ++ "[]" ++ suffix)
+            } else {
+                out_lines.push(pad ++ prefix ++ "[")
+                let cnt = items.len()
+                for i in 0..cnt {
+                    let elem = items.get(i.as(usize)).as(JsonNode)
+                    let child_suffix = if i + 1 < cnt { "," } else { "" }
+                    render_json_node(elem, depth + 1, unit, "", child_suffix, out_lines)
+                }
+                out_lines.push(pad ++ "]" ++ suffix)
+            }
+        },
+    }
+}
+
+pub fn format_json_lines(lines: List, shiftwidth: i64, expandtab: bool) -> !String List {
+    let joined = lines.join("\n")
+    if joined.trim() == "" {
+        return error "Malformed JSON: empty input"
+    }
+    let tokens = tokenize_json(joined)!
+    if tokens.is_empty() {
+        return error "Malformed JSON: empty input"
+    }
+    let cur = JsonCursor { pos: 0 }
+    let root = parse_json_value(tokens, cur)!
+    if cur.pos < tokens.len() {
+        let extra = tokens.get(cur.pos.as(usize)).as(JsonToken)
+        return error (
+            "Malformed JSON at line " ++ extra.line.to_string()
+            ++ ", col " ++ extra.col.to_string()
+            ++ ": trailing token '" ++ extra.raw ++ "' after root value"
+        )
+    }
+    let out = List()
+    let unit = indent_unit_str(shiftwidth, expandtab)
+    render_json_node(root, 0, unit, "", "", out)
+    out
+}
+
+-- ============================================================================
+-- 3. Built-in Formatter 2: Brace-Structured Languages (`nessa`, `rust`, `c`, `go`, `js`, `ts`, `css`)
+-- ============================================================================
+
+struct BraceLineScan {
+    leading_closes: i64,
+    net_delta: i64,
+    next_in_block_comment: bool,
+}
+
+fn is_close_delim(ch: String) -> bool {
+    ch == "}}" or ch == "]" or ch == ")"
+}
+
+fn is_open_delim(ch: String) -> bool {
+    ch == "{{" or ch == "[" or ch == "("
+}
+
+fn uses_dash_line_comment(mode: String) -> bool {
+    mode == "nessa" or mode == "lua" or mode == "sql" or mode == "haskell"
+}
+
+fn uses_slash_comments(mode: String) -> bool {
+    mode != "nessa"
+}
+
+-- Scan a trimmed brace-mode line for leading closing delimiters (`}`, `]`, `)`)
+-- and overall net bracket delta while ignoring strings, char literals, and comments.
+fn scan_brace_code_line(trimmed: String, mode: String, in_block_comment_start: bool) -> BraceLineScan {
+    let n = trimmed.char_len()
+    var i: i64 = 0
+    var in_block = in_block_comment_start
+    var in_quote = ""
+    var leading_closes: i64 = 0
+    var still_leading = not in_block_comment_start
+    var net_delta: i64 = 0
+
+    while i < n {
+        if in_block {
+            if i + 1 < n and trimmed.slice(i, i + 2) == "*/" {
+                in_block = false
+                i += 2
+                continue
+            }
+            i += 1
+            continue
+        }
+
+        let ch = trimmed.slice(i, i + 1)
+
+        if in_quote != "" {
+            if ch == "\\" and i + 1 < n {
+                i += 2
+                continue
+            }
+            if ch == in_quote {
+                in_quote = ""
+            }
+            i += 1
+            continue
+        }
+
+        -- Line comments
+        if uses_dash_line_comment(mode) and ch == "-" and i + 1 < n and trimmed.slice(i + 1, i + 2) == "-" {
+            break
+        }
+        if uses_slash_comments(mode) and ch == "/" and i + 1 < n {
+            let nxt = trimmed.slice(i + 1, i + 2)
+            if nxt == "/" {
+                break
+            }
+            if nxt == "*" {
+                still_leading = false
+                in_block = true
+                i += 2
+                continue
+            }
+        }
+
+        if ch == "\"" or ch == "`" {
+            still_leading = false
+            in_quote = ch
+            i += 1
+            continue
+        }
+
+        if ch == "'" {
+            still_leading = false
+            -- Distinguish character literals `'x'` / `'\n'` from Rust lifetimes `'a`
+            if mode == "javascript" or mode == "js" or mode == "typescript" or mode == "ts"
+                or mode == "css" or mode == "scss" {
+                in_quote = "'"
+                i += 1
+                continue
+            }
+            if i + 2 < n and trimmed.slice(i + 2, i + 3) == "'" {
+                i += 3
+                continue
+            }
+            if i + 3 < n and trimmed.slice(i + 1, i + 2) == "\\" and trimmed.slice(i + 3, i + 4) == "'" {
+                i += 4
+                continue
+            }
+            i += 1
+            continue
+        }
+
+        if ch == " " or ch == "\t" {
+            i += 1
+            continue
+        }
+
+        if is_close_delim(ch) {
+            if still_leading {
+                leading_closes += 1
+            }
+            net_delta -= 1
+            i += 1
+            continue
+        }
+
+        still_leading = false
+        if is_open_delim(ch) {
+            net_delta += 1
+        }
+        i += 1
+    }
+
+    BraceLineScan {
+        leading_closes: leading_closes,
+        net_delta: net_delta,
+        next_in_block_comment: in_block,
+    }
+}
+
+fn trim_trailing_blank_lines(lines: List) -> List {
+    while lines.len() > 1 and lines.get((lines.len() - 1).as(usize)).as(String) == "" {
+        let _ = lines.pop()
+    }
+    if lines.is_empty() {
+        lines.push("")
+    }
+    lines
+}
+
+fn normalize_internal_tabs(body: String, shiftwidth: i64, expandtab: bool) -> String {
+    if (not expandtab) or (not body.contains("\t")) {
+        return body
+    }
+    -- Replace tabs outside string literals, or replace leading/formatting tabs cleanly
+    let sw = if shiftwidth > 0 { shiftwidth } else { 4 }
+    let spaces = " ".repeat(sw)
+    let n = body.char_len()
+    var i: i64 = 0
+    var in_quote = ""
+    var out = ""
+    while i < n {
+        let ch = body.slice(i, i + 1)
+        if in_quote != "" {
+            out = out ++ ch
+            if ch == "\\" and i + 1 < n {
+                out = out ++ body.slice(i + 1, i + 2)
+                i += 2
+                continue
+            }
+            if ch == in_quote {
+                in_quote = ""
+            }
+            i += 1
+            continue
+        }
+        if ch == "\"" or ch == "`" {
+            in_quote = ch
+            out = out ++ ch
+            i += 1
+            continue
+        }
+        if ch == "\t" {
+            out = out ++ spaces
+        } else {
+            out = out ++ ch
+        }
+        i += 1
+    }
+    out
+}
+
+pub fn format_brace_lines_with_context(
+    all_lines: List,
+    start_row: i64,
+    end_row: i64,
+    mode: String,
+    shiftwidth: i64,
+    expandtab: bool,
+    trim_eof_blanks: bool,
+) -> List {
+    let unit = indent_unit_str(shiftwidth, expandtab)
+    var depth: i64 = 0
+    var in_block_comment = false
+
+    -- Pre-scan lines `0..start_row` when formatting a Visual/Ex sub-range
+    for r in 0..start_row {
+        let pre_trimmed = all_lines.get(r.as(usize)).as(String).trim()
+        if pre_trimmed != "" {
+            let scan = scan_brace_code_line(pre_trimmed, mode, in_block_comment)
+            depth += scan.net_delta
+            if depth < 0 {
+                depth = 0
+            }
+            in_block_comment = scan.next_in_block_comment
+        }
+    }
+
+    let formatted_slice = List()
+    var consecutive_blanks: i64 = 0
+
+    for r in start_row..(end_row + 1) {
+        let raw_line = all_lines.get(r.as(usize)).as(String)
+        let trimmed = raw_line.trim()
+        if trimmed == "" {
+            consecutive_blanks += 1
+            if consecutive_blanks <= 1 {
+                formatted_slice.push("")
+            }
+            continue
+        }
+        consecutive_blanks = 0
+
+        let started_in_block = in_block_comment
+        let scan = scan_brace_code_line(trimmed, mode, started_in_block)
+        var line_depth = depth - scan.leading_closes
+        if line_depth < 0 {
+            line_depth = 0
+        }
+
+        let clean_body = normalize_internal_tabs(trimmed, shiftwidth, expandtab)
+        let extra_star_space = if started_in_block and clean_body.starts_with("*") {
+            " "
+        } else {
+            ""
+        }
+        formatted_slice.push(unit.repeat(line_depth) ++ extra_star_space ++ clean_body)
+
+        depth += scan.net_delta
+        if depth < 0 {
+            depth = 0
+        }
+        in_block_comment = scan.next_in_block_comment
+    }
+
+    if trim_eof_blanks {
+        return trim_trailing_blank_lines(formatted_slice)
+    }
+    if formatted_slice.is_empty() {
+        formatted_slice.push("")
+    }
+    formatted_slice
+}
+
+-- ============================================================================
+-- 4. Built-in Formatter 3: Indentation & Prose Modes (`python`, `yaml`, `toml`, `markdown`, `sh`, `text`)
+-- ============================================================================
+
+fn normalize_leading_whitespace(line: String, mode: String, shiftwidth: i64, expandtab: bool) -> String {
+    let trimmed_end = line.trim_end()
+    -- Preserve Markdown 2-space hard line break (`"  "`) when a non-blank line explicitly ends with >=2 spaces
+    let preserve_md_break = mode == "markdown"
+        and trimmed_end != ""
+        and line.ends_with("  ")
+        and (not line.ends_with("   "))
+        and (not line.ends_with("\t"))
+
+    if trimmed_end == "" {
+        return ""
+    }
+
+    -- Makefiles require literal tabs for recipe lines
+    if mode == "makefile" or mode == "make" {
+        return trimmed_end
+    }
+
+    let sw = if shiftwidth > 0 { shiftwidth } else { 4 }
+    let n = trimmed_end.char_len()
+    var i: i64 = 0
+    var visual_cols: i64 = 0
+    var saw_tab = false
+    while i < n {
+        let ch = trimmed_end.slice(i, i + 1)
+        if ch == " " {
+            visual_cols += 1
+            i += 1
+        } else if ch == "\t" {
+            saw_tab = true
+            let rem = visual_cols % sw
+            visual_cols += (sw - rem)
+            i += 1
+        } else {
+            break
+        }
+    }
+
+    let rest = trimmed_end.slice(i, n)
+    let suffix = if preserve_md_break { "  " } else { "" }
+    if expandtab {
+        if saw_tab {
+            return " ".repeat(visual_cols) ++ rest ++ suffix
+        }
+        return trimmed_end ++ suffix
+    }
+    let tabs = visual_cols / sw
+    let rem_spaces = visual_cols % sw
+    "\t".repeat(tabs) ++ " ".repeat(rem_spaces) ++ rest ++ suffix
+}
+
+pub fn format_prose_or_indent_lines(
+    lines: List,
+    mode: String,
+    shiftwidth: i64,
+    expandtab: bool,
+    trim_eof_blanks: bool,
+) -> List {
+    let out = List()
+    var consecutive_blanks: i64 = 0
+    -- Collapse `>= 3` consecutive blank lines (max 2 in Python, max 1 in config/prose, so >=3 always collapses!)
+    let max_blanks: i64 = if mode == "python" { 2 } else { 1 }
+
+    for i in 0..lines.len() {
+        let raw = lines.get(i.as(usize)).as(String)
+        let cleaned = normalize_leading_whitespace(raw, mode, shiftwidth, expandtab)
+        if cleaned == "" {
+            consecutive_blanks += 1
+            if consecutive_blanks <= max_blanks {
+                out.push("")
+            }
+        } else {
+            consecutive_blanks = 0
+            out.push(cleaned)
+        }
+    }
+
+    if trim_eof_blanks {
+        return trim_trailing_blank_lines(out)
+    }
+    if out.is_empty() {
+        out.push("")
+    }
+    out
+}
+
+-- ============================================================================
+-- 5. Unified Buffer & Range Formatting Engine (Single Undo Checkpoint)
+-- ============================================================================
+
+fn run_external_formatter(spec: ExternalFormatterSpec, lines: List, cwd: String) -> !String List {
+    let tmp_path = "/tmp/lava_conform_" ++ time.unix_millis().to_string() ++ ".tmp"
+    let text = lines.join("\n") ++ "\n"
+    let _ = fs.write_string(tmp_path, text) ! {
+        e => return error ("external formatter temp write failed: " ++ e.to_string()),
+    }
+    let full_args = List()
+    for i in 0..spec.args.len() {
+        let a = spec.args.get(i.as(usize)).as(String)
+        if a == "$FILENAME" or a == "{{file}}" {
+            full_args.push(tmp_path)
+        } else {
+            full_args.push(a)
+        }
+    }
+    let exec_res = process.exec(spec.command, args = full_args, cwd = cwd)
+    let _ = fs.remove_file(tmp_path) ! { _ => () }
+    exec_res match {
+        out! => {
+            if out.status != 0 {
+                return error (
+                    spec.name ++ " exited with status " ++ out.status.to_string()
+                    ++ ": " ++ out.stderr.trim()
+                )
+            }
+            let norm = out.stdout.replace("\r\n", "\n").replace("\r", "\n")
+            let parts = norm.split("\n")
+            if parts.len() > 1 and norm.ends_with("\n") {
+                let _ = parts.pop()
+            }
+            if parts.is_empty() {
+                parts.push("")
+            }
+            parts
+        },
+        error err => error (spec.name ++ " failed: " ++ err.to_string()),
+    }
+}
+
+pub fn compute_formatted_lines(
+    world: EditorWorld,
+    service: ConformService,
+    buf: Buffer,
+    start_row: i64,
+    end_row: i64,
+) -> !String List {
+    buf.sync_external_lines()
+    let total_lines = buf.line_count()
+    if total_lines > 50000 {
+        return error "Buffer too large to format (> 50,000 lines)"
+    }
+    let lo = if start_row <= end_row { start_row } else { end_row }
+    let hi = if start_row <= end_row { end_row } else { start_row }
+    let min_r = buf.min_row()
+    let max_r = buf.max_row()
+    let clamped_lo = if lo < min_r { min_r } else if lo > max_r { max_r } else { lo }
+    let clamped_hi = if hi < clamped_lo { clamped_lo } else if hi > max_r { max_r } else { hi }
+    let is_whole_buffer = clamped_lo == 0 and clamped_hi == total_lines - 1
+
+    let mode = buf.major_mode.trim().to_lower()
+    let sw = world.options.shiftwidth
+    let et = world.options.expandtab
+
+    let slice_in = buf.slice_lines(clamped_lo, clamped_hi + 1)
+
+    var formatted_part = List()
+    if service.custom_formatters.contains_key(mode) {
+        let spec = service.custom_formatters.get(mode).as(CustomFormatterSpec)
+        let f = spec.func
+        formatted_part = f(slice_in, sw, et)!
+    } else if service.external_formatters.contains_key(mode) {
+        let ext_spec = service.external_formatters.get(mode).as(ExternalFormatterSpec)
+        formatted_part = run_external_formatter(ext_spec, slice_in, world.cwd)!
+    } else if mode == "json" or mode == "jsonc" {
+        formatted_part = format_json_lines(slice_in, sw, et)!
+    } else if is_brace_structured_mode(mode) {
+        let ctx_lines = buf.slice_lines(0, clamped_hi + 1)
+        formatted_part = format_brace_lines_with_context(
+            ctx_lines,
+            clamped_lo,
+            clamped_hi,
+            mode,
+            sw,
+            et,
+            is_whole_buffer,
+        )
+    } else {
+        formatted_part = format_prose_or_indent_lines(
+            slice_in,
+            mode,
+            sw,
+            et,
+            is_whole_buffer,
+        )
+    }
+
+    if is_whole_buffer {
+        return formatted_part
+    }
+
+    -- Splice formatted sub-range back into full buffer lines
+    let merged = List()
+    if clamped_lo > 0 {
+        let head_part = buf.slice_lines(0, clamped_lo)
+        for i in 0..head_part.len() {
+            merged.push(head_part.get(i.as(usize)).as(String))
+        }
+    }
+    for i in 0..formatted_part.len() {
+        merged.push(formatted_part.get(i.as(usize)).as(String))
+    }
+    if clamped_hi + 1 < total_lines {
+        let tail_part = buf.slice_lines(clamped_hi + 1, total_lines)
+        for i in 0..tail_part.len() {
+            merged.push(tail_part.get(i.as(usize)).as(String))
+        }
+    }
+    if merged.is_empty() {
+        merged.push("")
+    }
+    merged
+}
+
+fn apply_format_to_buffer_pure(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    service: ConformService,
+    buf: Buffer,
+    start_row: i64,
+    end_row: i64,
+) -> !String bool {
+    if buf.kind == BufferKind.Directory or buf.kind == BufferKind.Special or buf.read_only {
+        return error ("Buffer '" ++ buf.name ++ "' is not a writable document buffer")
+    }
+    buf.ensure_writable()!
+
+    let res = compute_formatted_lines(world, service, buf, start_row, end_row)
+    let new_lines = res match {
+        ok_lines! => ok_lines,
+        error err => {
+            service.last_status = "Error: " ++ err
+            return error err
+        },
+    }
+
+    let old_len = buf.line_count()
+    let cur_lines = buf.slice_lines(0, old_len)
+    if str_lists_eq(cur_lines, new_lines) {
+        service.last_status = "Unchanged (" ++ service.active_formatter_name(buf.major_mode) ++ ")"
+        return false
+    }
+
+    let old_pos = buf.point
+    let saved_narrow = buf.narrow
+    buf.set_lines(new_lines, record_undo = true, label = "format")
+
+    if saved_narrow != null {
+        let nr = saved_narrow.as(NarrowRegion)
+        let delta = new_lines.len() - old_len
+        var new_end = nr.end_row + delta
+        if new_end < nr.start_row {
+            new_end = nr.start_row
+        }
+        if new_end >= new_lines.len() {
+            new_end = new_lines.len() - 1
+        }
+        buf.narrow = NarrowRegion { start_row: nr.start_row, end_row: new_end }
+    }
+
+    buf.modified = true
+    buf.point = buf.clamp_pos(old_pos, insert_mode = false)
+    buf.preferred_col = buf.point.col
+    buf.named_marks.insert(".", buf.point)
+    buf.checkpoint(buf.point, "format")
+
+    service.format_count += 1
+    service.last_status = "Formatted with " ++ service.active_formatter_name(buf.major_mode)
+    kernel.emit_hook("buffer-modified", buf.id)
+    true
+}
+
+-- Format `buf` over `[start_row ..= end_row]`, preserving clamped cursor `Pos` and
+-- recording AT MOST 1 undo checkpoint (`"format"`) ONLY when lines actually changed!
+pub fn format_buffer_range(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    service: ConformService,
+    buf: Buffer,
+    start_row: i64,
+    end_row: i64,
+    emit_feedback: bool,
+) -> #InteractiveEffects !String bool {
+    let res = apply_format_to_buffer_pure(kernel, world, service, buf, start_row, end_row)
+    res match {
+        changed! => {
+            if emit_feedback {
+                if changed {
+                    status_emit("Formatted buffer with " ++ service.active_formatter_name(buf.major_mode))#
+                } else {
+                    status_emit("Buffer already formatted (" ++ service.active_formatter_name(buf.major_mode) ++ ")")#
+                }
+            }
+            changed
+        },
+        error err => {
+            if emit_feedback {
+                status_emit("Format error: " ++ err)#
+            }
+            log_event("warn", OWNER_CONFORM, err)#
+            error err
+        },
+    }
+}
+
+-- ============================================================================
+-- 6. `*ConformInfo*` Panel, Format-on-Save Hook & Extension Registration
+-- ============================================================================
+
+fn build_conform_info_lines(world: EditorWorld, service: ConformService, target_buf: Buffer) -> List {
+    let fos = if world.options.format_on_save { "ENABLED" } else { "DISABLED" }
+    let active_fmt = service.active_formatter_name(target_buf.major_mode)
+    let lines = [
+        "Conform Formatter Status",
+        "════════════════════════════════════════════════════════════",
+        "  Target buffer   : " ++ target_buf.name,
+        "  Major mode      : " ++ target_buf.major_mode,
+        "  Active formatter: " ++ active_fmt,
+        "  Format on save  : " ++ fos,
+        "  Indent options  : shiftwidth=" ++ world.options.shiftwidth.to_string()
+            ++ ", expandtab=" ++ (if world.options.expandtab { "true" } else { "false" }),
+        "  Total formats   : " ++ service.format_count.to_string(),
+        "  Last status     : " ++ service.last_status,
+        "",
+        "Built-in Deterministic Formatters:",
+        "  • json / jsonc  : lava-json-pretty (strict tokenizer + AST pretty-printer)",
+        "  • brace modes   : lava-brace-fmt (nessa, rust, c, cpp, go, js, ts, css)",
+        "  • indent/prose  : lava-indent-trim (python, yaml, toml, markdown, sh, text)",
+        "",
+        "Press `q` to close *ConformInfo*.",
+    ]
+    lines
+}
+
+fn execute_conform_command(kern: SystemKernel, args: List) -> #InteractiveEffects !String Unit {
+    let world = require_editor_world(kern)!
+    let vim = require_vim_state(kern)!
+    let svc = require_conform_service(kern)!
+    let buf = world.active_buffer()
+
+    var lo = buf.min_row()
+    var hi = buf.max_row()
+    let in_visual = vim.mode == VimMode.VisualChar
+        or vim.mode == VimMode.VisualLine
+        or vim.mode == VimMode.VisualBlock
+
+    if in_visual {
+        let r1 = vim.visual_anchor.row
+        let r2 = buf.point.row
+        lo = if r1 <= r2 { r1 } else { r2 }
+        hi = if r1 <= r2 { r2 } else { r1 }
+        vim.mode = VimMode.Normal
+        vim.clear_transient()
+        sync_world_from_vim(world, vim)
+    } else if args.len() >= 2 {
+        let a0_opt = args.get(0).as(String).trim().parse_i64()
+        let a1_opt = args.get(1).as(String).trim().parse_i64()
+        if a0_opt != null and a1_opt != null {
+            let r1 = a0_opt.as(i64) - 1
+            let r2 = a1_opt.as(i64) - 1
+            lo = if r1 <= r2 { r1 } else { r2 }
+            hi = if r1 <= r2 { r2 } else { r1 }
+        }
+    }
+
+    let res = format_buffer_range(kern, world, svc, buf, lo, hi, true)#
+    res match {
+        _! => (),
+        error _ => (),
+    }
+    sync_world_from_vim(world, vim)
+    ()
+}
+
+fn on_buffer_will_save(k: SystemKernel, payload: Any) {
+    let w_opt = k.service("lava.document.world")
+    let s_opt = k.service(SERVICE_CONFORM)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    if not world.options.format_on_save {
+        return
+    }
+    let svc = s_opt.as(ConformService)
+    let bid = payload.as(BufferId)
+    let buf? = world.buffer(bid) else {
+        return
+    }
+    if buf.kind == BufferKind.Directory or buf.kind == BufferKind.Special or buf.read_only {
+        return
+    }
+    -- Catch formatting errors (e.g. malformed JSON) cleanly so disk save never corrupts `buf.lines`
+    let _ = apply_format_to_buffer_pure(k, world, svc, buf, buf.min_row(), buf.max_row()) ! {
+        err => {
+            world.status_message = "Format-on-save skipped: " ++ err
+            false
+        },
+    }
+}
+
+fn unbind_owner_from_keymaps(kernel: SystemKernel, owner: ExtId) {
+    for km_key in kernel.keymaps.keys() {
+        let km_name = km_key.as(String)
+        let km = kernel.keymaps.get(km_name).as(Keymap)
+        for chord_key in km.bindings.keys() {
+            let chord = chord_key.as(String)
+            let entry = km.bindings.get(chord).as(KeyBindingEntry)
+            if entry.owner == owner {
+                let _ = km.bindings.remove(chord)
+            }
+        }
+    }
+}
+
+pub fn register_conform_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_conform_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_conform",
+        "0.1.0",
+        "Deterministic code & JSON formatter with single-step undo, range formatting, and format-on-save (`conform.nvim`).",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let service = ConformService.new()
+            k.publish_service(SERVICE_CONFORM, ext_id, service)
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> c f", "conform-format", ext_id, description = "Format buffer / selection")
+
+            -- Upgrade exact `<Space> u` (`undo-tree-visualize`) to `<Space> u u` so `<Space> u` acts as a toggle prefix!
+            let existing_u = leader_km.bindings.get("<Space> u")
+            if existing_u != null {
+                let entry = existing_u.as(KeyBindingEntry)
+                if entry.command_name == "undo-tree-visualize" {
+                    let _ = leader_km.bindings.remove("<Space> u")
+                    leader_km.bind("<Space> u u", "undo-tree-visualize", entry.owner, description = entry.description)
+                    service.upgraded_leader_u = true
+                }
+            }
+            leader_km.bind("<Space> u f", "format-on-save-toggle", ext_id, description = "Toggle format on save")
+
+            let vis_km = k.ensure_keymap(KEYMAP_VIM_VISUAL)
+            vis_km.bind("<Space> c f", "conform-format", ext_id, description = "Format visual selection")
+
+            let info_km = k.ensure_keymap("mode:conform-info")
+            info_km.bind("q", "conform-info-close", ext_id, description = "Close *ConformInfo*")
+
+            k.register_command(
+                "format",
+                ext_id,
+                "Format active buffer or Visual selection (`:Format`, `<Space> c f`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    execute_conform_command(kern, args)#!
+                    ()
+                },
+            )
+
+            k.register_command(
+                "conform-format",
+                ext_id,
+                "Format active buffer or Visual selection (`:ConformFormat`, `<Space> c f`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    execute_conform_command(kern, args)#!
+                    ()
+                },
+            )
+
+            k.register_command(
+                "format-on-save-toggle",
+                ext_id,
+                "Toggle `world.options.format_on_save` (`:FormatOnSaveToggle`, `<Space> u f`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    world.options.format_on_save = not world.options.format_on_save
+                    let state_lbl = if world.options.format_on_save { "enabled" } else { "disabled" }
+                    status_emit("Format on save: " ++ state_lbl)#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "conform-info",
+                ext_id,
+                "Open *ConformInfo* buffer and report active formatter & format_on_save status (`:ConformInfo`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let vim = require_vim_state(kern)!
+                    let svc = require_conform_service(kern)!
+                    let cur = world.active_buffer()
+                    let target = if cur.name == CONFORM_INFO_BUF_NAME
+                        and svc.prev_buf_id.raw() > 0
+                        and world.buffers.contains_key(svc.prev_buf_id) {
+                        world.buffer(svc.prev_buf_id).as(Buffer)
+                    } else {
+                        svc.prev_buf_id = cur.id
+                        cur
+                    }
+                    let lines = build_conform_info_lines(world, svc, target)
+                    let ibuf = world.ensure_special_buffer(
+                        CONFORM_INFO_BUF_NAME,
+                        "conform-info",
+                        lines,
+                        read_only = true,
+                    )
+                    let _ = world.switch_to_buffer(ibuf.id)
+                    vim.mode = VimMode.Normal
+                    vim.clear_transient()
+                    sync_world_from_vim(world, vim)
+                    kern.emit_hook("buffer-switched", ibuf.id)
+                    let fos = if world.options.format_on_save { "on" } else { "off" }
+                    status_emit(
+                        "Conform [" ++ target.major_mode ++ "]: "
+                        ++ svc.active_formatter_name(target.major_mode)
+                        ++ " | format_on_save=" ++ fos
+                    )#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "conform-info-close",
+                ext_id,
+                "Close *ConformInfo* buffer and return to previous buffer (`q`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let vim = require_vim_state(kern)!
+                    let svc = require_conform_service(kern)!
+                    if svc.prev_buf_id.raw() > 0 and world.buffers.contains_key(svc.prev_buf_id) {
+                        let _ = world.switch_to_buffer(svc.prev_buf_id)
+                    } else {
+                        let _ = world.cycle_buffer(-1)
+                    }
+                    vim.mode = VimMode.Normal
+                    vim.clear_transient()
+                    sync_world_from_vim(world, vim)
+                    kern.emit_hook("buffer-switched", world.active_buffer_id)
+                    ()
+                },
+            )
+
+            k.add_hook("buffer-will-save", ext_id, on_buffer_will_save)
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let svc_opt = k.service(SERVICE_CONFORM)
+            unbind_owner_from_keymaps(k, ext_id)
+            if svc_opt != null and svc_opt.as(ConformService).upgraded_leader_u {
+                let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+                var other_u_prefix = false
+                for ck in leader_km.bindings.keys() {
+                    let chord = ck.as(String)
+                    if chord.starts_with("<Space> u ") and chord != "<Space> u u" {
+                        other_u_prefix = true
+                    }
+                }
+                if (not other_u_prefix) and leader_km.bindings.contains_key("<Space> u u") {
+                    let u_entry = leader_km.bindings.get("<Space> u u").as(KeyBindingEntry)
+                    let _ = leader_km.bindings.remove("<Space> u u")
+                    leader_km.bind("<Space> u", u_entry.command_name, u_entry.owner, description = u_entry.description)
+                }
+            }
+            ()
+        },
+    )
+}

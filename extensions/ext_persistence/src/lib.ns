@@ -1,0 +1,795 @@
+-- ext_persistence: Startup Dashboard & Workspace Session Persistence (`lava.org/ext_persistence`).
+-- Combines `goolord/alpha-nvim` / `dashboard-nvim` (`*Dashboard*` on `"session-empty-startup"`,
+-- `:Dashboard`, `<Space>sd`, with quick actions `f`/`n`/`g`/`s`/`l`/`q` and `1..5` recent files)
+-- with `folke/persistence.nvim` (`:SessionSave` `<Space>qs`, `:SessionRestore` `<Space>ql`,
+-- `:SessionDelete` `<Space>qd` preserving `cwd`, theme, zen_mode, open files, cursors, and MRU).
+
+use std.fs
+use std.path
+use @lava_sys.{host_read_file_lines, host_request_quit, host_write_file_lines}
+use @lava_core.{
+    ExtId, ExtensionRecord, InteractiveEffects, KeyStroke, ServiceEffects, SystemKernel, log_event,
+    status_emit
+}
+use @ext_document.{
+    Buffer, BufferId, BufferKind, EditorWorld, Pos, ext_document_id, require_editor_world
+}
+use @ext_window.{WindowManager, ext_window_id}
+use @ext_render.{RenderCompositor, SERVICE_RENDERER, ext_render_id}
+use @ext_vim.{
+    KEYMAP_VIM_LEADER, ModalInterceptor, VimMode, VimState, ext_vim_id, require_vim_state,
+    sync_world_from_vim
+}
+
+pub const SERVICE_PERSISTENCE: String = "lava.persistence.session"
+pub const OWNER_PERSISTENCE: String = "ext_persistence"
+pub const DASHBOARD_BUF_NAME: String = "*Dashboard*"
+pub const DEFAULT_SESSION_FILE: String = ".lava_session.txt"
+pub const ALT_SESSION_FILE: String = ".lava-session"
+pub const MAX_RECENT_FILES: i64 = 20
+
+pub fn ext_persistence_id() -> ExtId = ExtId("lava.org/ext_persistence")
+
+-- ============================================================================
+-- 1. PersistenceService & MRU Recent Files Tracking
+-- ============================================================================
+
+pub struct SavedFileEntry {
+    pub file_path: String,
+    pub row: i64,
+    pub col: i64,
+}
+
+pub struct PersistenceService {
+    pub recent_files: List,
+    pub session_file_path: String,
+    pub dashboard_enabled: bool,
+}
+
+impl PersistenceService {
+    pub fn new() -> PersistenceService {
+        PersistenceService {
+            recent_files: List(),
+            session_file_path: "",
+            dashboard_enabled: true,
+        }
+    }
+
+    pub fn record_recent_file(self, raw_path: String) {
+        let fp = raw_path.trim()
+        if fp == "" {
+            return
+        }
+        let norm = path.normalize(fp)
+        let updated = List()
+        updated.push(norm)
+        for i in 0..self.recent_files.len() {
+            let cur = self.recent_files.get(i.as(usize)).as(String)
+            if cur != norm and updated.len() < MAX_RECENT_FILES {
+                updated.push(cur)
+            }
+        }
+        self.recent_files = updated
+    }
+
+    pub fn resolve_session_path(self, world: EditorWorld, arg_path: String, .for_read: bool = false) -> String {
+        let trimmed = arg_path.trim()
+        if trimmed != "" {
+            return world.resolve_path(trimmed)
+        }
+        if self.session_file_path.trim() != "" {
+            return world.resolve_path(self.session_file_path.trim())
+        }
+        let primary = path.join(world.cwd, DEFAULT_SESSION_FILE)
+        if for_read and (not fs.exists(primary)) {
+            let alt = path.join(world.cwd, ALT_SESSION_FILE)
+            if fs.exists(alt) {
+                return alt
+            }
+        }
+        primary
+    }
+}
+
+pub fn require_persistence_service(kernel: SystemKernel) -> !String PersistenceService {
+    let raw = kernel.require_service(SERVICE_PERSISTENCE)!
+    raw.as(PersistenceService)
+}
+
+-- ============================================================================
+-- 2. Startup Dashboard (`*Dashboard*`, `major_mode = "dashboard"`)
+-- ============================================================================
+
+pub fn render_dashboard_lines(kernel: SystemKernel, world: EditorWorld, svc: PersistenceService) -> List {
+    let lines = List()
+    lines.push("")
+    lines.push("      ██╗      █████╗ ██╗   ██╗ █████╗ ")
+    lines.push("      ██║     ██╔══██╗██║   ██║██╔══██╗")
+    lines.push("      ██║     ███████║██║   ██║███████║")
+    lines.push("      ██║     ██╔══██║╚██╗ ██╔╝██╔══██║")
+    lines.push("      ███████╗██║  ██║ ╚████╔╝ ██║  ██║")
+    lines.push("      ╚══════╝╚═╝  ╚═╝  ╚═══╝  ╚═╝  ╚═╝")
+    lines.push("      Programmable Single-VM Interactive Editor in Nessa")
+    lines.push("")
+
+    let ext_count = kernel.list_extensions().len()
+    lines.push(
+        "      ⚡ Loaded " ++ ext_count.to_string() ++ " extensions   |   Workspace: " ++ world.cwd
+    )
+    lines.push("      ──────────────────────────────────────────────────────────")
+    lines.push("")
+    lines.push("      Quick Actions:")
+    lines.push("        [f]  Find File                (Telescope / Find File)")
+    lines.push("        [n]  New Empty Buffer         (Create untitled buffer)")
+    lines.push("        [g]  Live Grep                (Telescope / Project Search)")
+    lines.push("        [s]  Restore Session          (Restore saved workspace)")
+    lines.push("        [l]  Extensions               (Lazy plugin manager / list)")
+    lines.push("        [q]  Quit Lava                (Exit editor)")
+    lines.push("")
+    lines.push("      Recent Files:")
+
+    if svc.recent_files.is_empty() {
+        lines.push("        (No recent files recorded yet)")
+    } else {
+        let limit = if svc.recent_files.len() < 5 { svc.recent_files.len() } else { 5 }
+        for i in 0..limit {
+            let fp = svc.recent_files.get(i.as(usize)).as(String)
+            lines.push("        [" ++ (i + 1).to_string() ++ "]  " ++ fp)
+        }
+    }
+    lines.push("")
+    lines
+}
+
+fn attach_dashboard_interceptor(vim: VimState) {
+    if vim.modal_interceptor == null {
+        vim.set_interceptor(OWNER_PERSISTENCE, dashboard_modal_interceptor)
+    } else if vim.modal_interceptor.as(ModalInterceptor).owner == OWNER_PERSISTENCE {
+        vim.set_interceptor(OWNER_PERSISTENCE, dashboard_modal_interceptor)
+    }
+}
+
+fn detach_dashboard_interceptor(vim: VimState) {
+    if vim.modal_interceptor != null {
+        if vim.modal_interceptor.as(ModalInterceptor).owner == OWNER_PERSISTENCE {
+            vim.clear_interceptor()
+        }
+    }
+}
+
+pub fn open_dashboard_buffer(kernel: SystemKernel, world: EditorWorld, svc: PersistenceService) -> Buffer {
+    let lines = render_dashboard_lines(kernel, world, svc)
+    let dbuf = world.ensure_special_buffer(DASHBOARD_BUF_NAME, "dashboard", lines, read_only = true)
+    -- Position cursor on the first Quick Action row (`[f] Find File`)
+    let start_row = if dbuf.line_count() > 13 { 13 } else { 0 }
+    dbuf.point = dbuf.clamp_pos(Pos.new(start_row, 8), insert_mode = false)
+    let _ = world.switch_to_buffer(dbuf.id)
+
+    let vim_opt = kernel.service("lava.vim.state")
+    if vim_opt != null {
+        let vs = vim_opt.as(VimState)
+        vs.mode = VimMode.Normal
+        vs.clear_transient()
+        attach_dashboard_interceptor(vs)
+        sync_world_from_vim(world, vs)
+    }
+
+    let wm_opt = kernel.service("lava.window.manager")
+    if wm_opt != null {
+        wm_opt.as(WindowManager).sync_from_world(world)
+    }
+    kernel.emit_hook("buffer-switched", dbuf.id)
+    dbuf
+}
+
+fn open_recent_slot(kernel: SystemKernel, slot_one_based: i64) -> #[log_event, status_emit] !String bool {
+    let world = require_editor_world(kernel)!
+    let svc = require_persistence_service(kernel)!
+    let idx = slot_one_based - 1
+    if idx < 0 or idx >= svc.recent_files.len() {
+        status_emit("Dashboard: no recent file at [" ++ slot_one_based.to_string() ++ "]")#
+        return true
+    }
+    let fp = svc.recent_files.get(idx.as(usize)).as(String)
+    let vim_opt = kernel.service("lava.vim.state")
+    if vim_opt != null {
+        detach_dashboard_interceptor(vim_opt.as(VimState))
+    }
+    let opened = world.open_file(fp)#!
+    svc.record_recent_file(fp)
+    if vim_opt != null {
+        sync_world_from_vim(world, vim_opt.as(VimState))
+    }
+    let wm_opt = kernel.service("lava.window.manager")
+    if wm_opt != null {
+        wm_opt.as(WindowManager).sync_from_world(world)
+    }
+    kernel.emit_hook("buffer-switched", opened.id)
+    status_emit("Opened recent file [" ++ slot_one_based.to_string() ++ "]: " ++ opened.name)#
+    true
+}
+
+-- Intercepts `1`..`5` on `*Dashboard*` before Vim count accumulation swallows digits,
+-- while passing all other keys (`:`, `<Space>`, `j`/`k`, `<C-\>`, and `"mode:dashboard"` bindings) through!
+fn dashboard_modal_interceptor(kernel: SystemKernel, stroke: KeyStroke) -> #ServiceEffects !String bool {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let buf = world.active_buffer()
+
+    if buf.major_mode != "dashboard" {
+        detach_dashboard_interceptor(vim)
+        return false
+    }
+
+    -- Never interfere with active `<Space>` leader sequences, prefixes, plugin chords, or non-Normal modes
+    if vim.mode != VimMode.Normal
+        or (not vim.leader_strokes.is_empty())
+        or vim.pending_prefix != ""
+        or (not vim.plugin_strokes.is_empty())
+        or vim.count1 > 0 {
+        return false
+    }
+
+    let plain = (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod)
+    if plain and stroke.key.char_len() == 1 and stroke.key.is_ascii_digit() {
+        let d_opt = stroke.key.parse_i64()
+        if d_opt != null {
+            let d = d_opt.as(i64)
+            if d >= 1 and d <= 5 {
+                return open_recent_slot(kernel, d)#!
+            }
+        }
+    }
+
+    false
+}
+
+-- ============================================================================
+-- 3. Dashboard Action Commands (`f`, `n`, `g`, `s`, `l`, `1..5`, `q`, `<Return>`)
+-- ============================================================================
+
+fn dispatch_first_available(kernel: SystemKernel, primary: String, fallback: String) -> #InteractiveEffects !String bool {
+    if kernel.get_command(primary) != null {
+        let _ = kernel.dispatch_command(primary, List())#!
+        return true
+    }
+    if fallback != "" and kernel.get_command(fallback) != null {
+        let _ = kernel.dispatch_command(fallback, List())#!
+        return true
+    }
+    false
+}
+
+fn cmd_dashboard_open(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_persistence_service(kernel)!
+    let _ = open_dashboard_buffer(kernel, world, svc)
+    status_emit("Lava Dashboard")#
+    ()
+}
+
+fn cmd_dashboard_find_file(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let vim_opt = kernel.service("lava.vim.state")
+    if vim_opt != null {
+        detach_dashboard_interceptor(vim_opt.as(VimState))
+    }
+    let ok = dispatch_first_available(kernel, "telescope-find-files", "find-file")#!
+    if not ok {
+        status_emit("Dashboard: find-file command not registered")#
+    }
+    ()
+}
+
+fn cmd_new_empty_buffer(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim_opt = kernel.service("lava.vim.state")
+    if vim_opt != null {
+        detach_dashboard_interceptor(vim_opt.as(VimState))
+    }
+    let nbuf = world.create_buffer("Untitled", BufferKind.Scratch, major_mode = "text", initial_lines = [""])
+    nbuf.modified = false
+    let _ = world.switch_to_buffer(nbuf.id)
+    if vim_opt != null {
+        let vs = vim_opt.as(VimState)
+        vs.mode = VimMode.Insert
+        vs.clear_transient()
+        sync_world_from_vim(world, vs)
+    }
+    let wm_opt = kernel.service("lava.window.manager")
+    if wm_opt != null {
+        wm_opt.as(WindowManager).sync_from_world(world)
+    }
+    kernel.emit_hook("buffer-switched", nbuf.id)
+    status_emit("Created " ++ nbuf.name)#
+    ()
+}
+
+fn cmd_dashboard_live_grep(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let vim_opt = kernel.service("lava.vim.state")
+    if vim_opt != null {
+        detach_dashboard_interceptor(vim_opt.as(VimState))
+    }
+    let ok = dispatch_first_available(kernel, "telescope-live-grep", "project-search")#!
+    if not ok {
+        let _ = dispatch_first_available(kernel, "grep", "")#!
+    }
+    ()
+}
+
+fn cmd_dashboard_extensions(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim_opt = kernel.service("lava.vim.state")
+    if vim_opt != null {
+        detach_dashboard_interceptor(vim_opt.as(VimState))
+    }
+    let ok = dispatch_first_available(kernel, "lazy", "list-extensions")#!
+    if not ok {
+        let exts = kernel.list_extensions()
+        let lines = List()
+        lines.push("Loaded Extensions (" ++ exts.len().to_string() ++ "):")
+        lines.push("────────────────────────────────────────────────────────")
+        for i in 0..exts.len() {
+            let rec = exts.get(i.as(usize)).as(ExtensionRecord)
+            lines.push("  • " ++ rec.id.to_string() ++ " (" ++ rec.version ++ ") — " ++ rec.description)
+        }
+        let eb = world.ensure_special_buffer("*Extensions*", "text", lines, read_only = true)
+        let _ = world.switch_to_buffer(eb.id)
+        kernel.emit_hook("buffer-switched", eb.id)
+        status_emit("Showing *Extensions*")#
+    }
+    ()
+}
+
+fn cmd_dashboard_quit(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim_opt = kernel.service("lava.vim.state")
+    if vim_opt != null {
+        detach_dashboard_interceptor(vim_opt.as(VimState))
+    }
+    if kernel.get_command("save-buffers-kill-lava") != null {
+        let _ = kernel.dispatch_command("save-buffers-kill-lava", List())#!
+    }
+    world.quit_requested = true
+    host_request_quit(world.exit_code)
+    ()
+}
+
+fn cmd_dashboard_activate_line(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let buf = world.active_buffer()
+    if buf.major_mode != "dashboard" {
+        return ()
+    }
+    let line = buf.line_at(buf.point.row).trim()
+    when {
+        line.starts_with("[f]") => cmd_dashboard_find_file(kernel, List())#,
+        line.starts_with("[n]") => cmd_new_empty_buffer(kernel, List())#,
+        line.starts_with("[g]") => cmd_dashboard_live_grep(kernel, List())#,
+        line.starts_with("[s]") => cmd_session_restore(kernel, List())#,
+        line.starts_with("[l]") => cmd_dashboard_extensions(kernel, List())#,
+        line.starts_with("[q]") => cmd_dashboard_quit(kernel, List())#,
+        line.starts_with("[1]") => { let _ = open_recent_slot(kernel, 1)#!; () },
+        line.starts_with("[2]") => { let _ = open_recent_slot(kernel, 2)#!; () },
+        line.starts_with("[3]") => { let _ = open_recent_slot(kernel, 3)#!; () },
+        line.starts_with("[4]") => { let _ = open_recent_slot(kernel, 4)#!; () },
+        line.starts_with("[5]") => { let _ = open_recent_slot(kernel, 5)#!; () },
+        else => (),
+    }
+}
+
+-- ============================================================================
+-- 4. Workspace Session Serialization & Restoration (`persistence.nvim`)
+-- ============================================================================
+
+pub fn serialize_session_lines(world: EditorWorld, svc: PersistenceService) -> List {
+    let out = List()
+    out.push("LAVA_SESSION_V1")
+    out.push("cwd\t" ++ world.cwd)
+    out.push("theme\t" ++ world.options.theme_name)
+    out.push("zen_mode\t" ++ (if world.options.zen_mode { "true" } else { "false" }))
+
+    let active_buf = world.active_buffer()
+    let active_fp = if active_buf.kind == BufferKind.File and active_buf.file_path != "" {
+        world.resolve_path(active_buf.file_path)
+    } else {
+        ""
+    }
+    out.push("active_file\t" ++ active_fp)
+
+    for i in 0..world.buffer_order.len() {
+        let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+        let b = world.buffers.get(bid).as(Buffer)
+        if b.kind == BufferKind.File and b.file_path != "" {
+            let norm_fp = world.resolve_path(b.file_path)
+            svc.record_recent_file(norm_fp)
+            out.push(
+                "file\t" ++ b.point.row.to_string()
+                ++ "\t" ++ b.point.col.to_string()
+                ++ "\t" ++ norm_fp
+            )
+        }
+    }
+
+    for i in 0..svc.recent_files.len() {
+        let rfp = svc.recent_files.get(i.as(usize)).as(String)
+        if rfp != "" {
+            out.push("recent\t" ++ rfp)
+        }
+    }
+    out
+}
+
+pub fn save_workspace_session(kernel: SystemKernel, custom_path: String) -> #[log_event, status_emit] !String String {
+    let world = require_editor_world(kernel)!
+    let svc = require_persistence_service(kernel)!
+    let target = svc.resolve_session_path(world, custom_path, for_read = false)
+
+    let parent_opt = path.parent(target)
+    if parent_opt != null {
+        let pdir = parent_opt.as(String)
+        if pdir != "" and (not fs.exists(pdir)) {
+            let _ = fs.create_dir_all(pdir) ! { _ => () }
+        }
+    }
+
+    let lines = serialize_session_lines(world, svc)
+    let _ = host_write_file_lines(target, lines, true)!
+    let _ = world.push_notification("info", "Session", "Saved session to " ++ target)
+    log_event("info", OWNER_PERSISTENCE, "Saved session to " ++ target)#
+    status_emit("Session saved: " ++ target)#
+    target
+}
+
+pub fn restore_workspace_session(kernel: SystemKernel, custom_path: String) -> #[log_event, status_emit] !String i64 {
+    let world = require_editor_world(kernel)!
+    let svc = require_persistence_service(kernel)!
+    let target = svc.resolve_session_path(world, custom_path, for_read = true)
+
+    if not fs.exists(target) {
+        return error ("session file does not exist: " ++ target)
+    }
+
+    let (lines, _) = host_read_file_lines(target)!
+
+    var saved_cwd = ""
+    var saved_theme = ""
+    var has_zen = false
+    var saved_zen = false
+    var saved_active_file = ""
+    let saved_files = List()
+    let saved_recents = List()
+
+    for i in 0..lines.len() {
+        let ln = lines.get(i.as(usize)).as(String).trim_end()
+        if ln == "" or ln == "LAVA_SESSION_V1" {
+            continue
+        }
+        let parts = ln.split("\t")
+        if parts.len() < 2 {
+            continue
+        }
+        let tag = parts.get(0).as(String)
+        if tag == "cwd" {
+            saved_cwd = parts.get(1).as(String).trim()
+        } else if tag == "theme" {
+            saved_theme = parts.get(1).as(String).trim()
+        } else if tag == "zen_mode" {
+            has_zen = true
+            saved_zen = parts.get(1).as(String).trim() == "true"
+        } else if tag == "active_file" {
+            saved_active_file = parts.get(1).as(String).trim()
+        } else if tag == "file" and parts.len() >= 4 {
+            let r_opt = parts.get(1).as(String).trim().parse_i64()
+            let c_opt = parts.get(2).as(String).trim().parse_i64()
+            let fp = parts.get(3).as(String).trim()
+            if fp != "" {
+                let r_val = if r_opt != null and r_opt.as(i64) >= 0 { r_opt.as(i64) } else { 0 }
+                let c_val = if c_opt != null and c_opt.as(i64) >= 0 { c_opt.as(i64) } else { 0 }
+                saved_files.push(SavedFileEntry {
+                    file_path: path.normalize(fp),
+                    row: r_val,
+                    col: c_val,
+                })
+            }
+        } else if tag == "recent" {
+            let rfp = parts.get(1).as(String).trim()
+            if rfp != "" and saved_recents.len() < MAX_RECENT_FILES {
+                saved_recents.push(path.normalize(rfp))
+            }
+        }
+    }
+
+    let vim_opt = kernel.service("lava.vim.state")
+    if vim_opt != null {
+        detach_dashboard_interceptor(vim_opt.as(VimState))
+    }
+
+    -- 1. Restore working directory & zen_mode
+    if saved_cwd != "" and fs.is_dir(saved_cwd) {
+        world.cwd = path.normalize(saved_cwd)
+    }
+    if has_zen {
+        world.options.zen_mode = saved_zen
+    }
+
+    -- 2. Restore theme & sync `RenderCompositor`
+    if saved_theme != "" {
+        world.options.theme_name = saved_theme
+        let comp_opt = kernel.service(SERVICE_RENDERER)
+        if comp_opt != null {
+            let comp = comp_opt.as(RenderCompositor)
+            if comp.themes.contains_key(saved_theme) {
+                let _ = comp.set_theme(saved_theme, world)!
+            } else {
+                comp.active_theme_name = saved_theme
+            }
+        }
+        kernel.emit_hook("theme-changed", saved_theme)
+    }
+
+    -- 3. Restore MRU `recent_files`
+    if not saved_recents.is_empty() {
+        svc.recent_files = saved_recents
+    }
+
+    -- 4. Reopen all saved existing files and restore their exact `(row, col)` cursors
+    let reopened = List()
+    for i in 0..saved_files.len() {
+        let entry = saved_files.get(i.as(usize)).as(SavedFileEntry)
+        if fs.exists(entry.file_path) and (not fs.is_dir(entry.file_path)) {
+            let buf = world.open_file(entry.file_path)#!
+            buf.point = buf.clamp_pos(Pos.new(entry.row, entry.col), insert_mode = false)
+            buf.preferred_col = buf.point.col
+            reopened.push((buf, entry))
+            kernel.emit_hook("buffer-opened", buf.id)
+        }
+    }
+
+    -- Preserve exact saved MRU order if `saved_recents` was present
+    if not saved_recents.is_empty() {
+        svc.recent_files = saved_recents
+    }
+
+    -- 5. Activate the saved active file buffer and re-verify every buffer's cursor
+    if saved_active_file != "" {
+        let norm_active = path.normalize(saved_active_file)
+        let active_opt = world.find_buffer_by_path(norm_active)
+        if active_opt != null {
+            let ab = active_opt.as(Buffer)
+            let _ = world.switch_to_buffer(ab.id)
+        }
+    }
+
+    for i in 0..reopened.len() {
+        let (buf, entry) = reopened.get(i.as(usize)).as((Buffer, SavedFileEntry))
+        buf.point = buf.clamp_pos(Pos.new(entry.row, entry.col), insert_mode = false)
+        buf.preferred_col = buf.point.col
+    }
+
+    if vim_opt != null {
+        let vs = vim_opt.as(VimState)
+        vs.mode = VimMode.Normal
+        vs.clear_transient()
+        sync_world_from_vim(world, vs)
+    }
+    let wm_opt = kernel.service("lava.window.manager")
+    if wm_opt != null {
+        wm_opt.as(WindowManager).sync_from_world(world)
+    }
+    kernel.emit_hook("buffer-switched", world.active_buffer_id)
+
+    -- Re-pin cursors after `buffer-switched` listeners run
+    for i in 0..reopened.len() {
+        let (buf, entry) = reopened.get(i.as(usize)).as((Buffer, SavedFileEntry))
+        buf.point = buf.clamp_pos(Pos.new(entry.row, entry.col), insert_mode = false)
+        buf.preferred_col = buf.point.col
+    }
+    if wm_opt != null {
+        wm_opt.as(WindowManager).sync_from_world(world)
+    }
+
+    let count = reopened.len()
+    let msg = "Restored session (" ++ count.to_string() ++ " file(s)) from " ++ target
+    let _ = world.push_notification("info", "Session", msg)
+    log_event("info", OWNER_PERSISTENCE, msg)#
+    status_emit(msg)#
+    count
+}
+
+pub fn delete_workspace_session(kernel: SystemKernel, custom_path: String) -> #[log_event, status_emit] !String bool {
+    let world = require_editor_world(kernel)!
+    let svc = require_persistence_service(kernel)!
+    let target = svc.resolve_session_path(world, custom_path, for_read = true)
+
+    if not fs.exists(target) {
+        status_emit("Session: no saved session file at " ++ target)#
+        return false
+    }
+    fs.remove_file(target) ! {
+        err => return error ("failed to remove session file " ++ target ++ ": " ++ err.to_string()),
+    }
+    let _ = world.push_notification("info", "Session", "Deleted session " ++ target)
+    log_event("info", OWNER_PERSISTENCE, "Deleted session " ++ target)#
+    status_emit("Deleted session: " ++ target)#
+    true
+}
+
+fn cmd_session_save(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let arg = if not args.is_empty() { args.get(0).as(String) } else { "" }
+    save_workspace_session(kernel, arg)#!
+}
+
+fn cmd_session_restore(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let arg = if not args.is_empty() { args.get(0).as(String) } else { "" }
+    restore_workspace_session(kernel, arg)#!
+}
+
+fn cmd_session_delete(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let arg = if not args.is_empty() { args.get(0).as(String) } else { "" }
+    delete_workspace_session(kernel, arg)#!
+}
+
+-- ============================================================================
+-- 5. Hook Callbacks & Extension Registration (`composer.rs` single-line contract)
+-- ============================================================================
+
+fn track_buffer_in_mru(kernel: SystemKernel, payload: Any) {
+    let w_opt = kernel.service("lava.document.world")
+    let s_opt = kernel.service(SERVICE_PERSISTENCE)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let svc = s_opt.as(PersistenceService)
+    payload match {
+        bid: BufferId => {
+            let b_opt = world.buffer(bid)
+            if b_opt != null {
+                let b = b_opt.as(Buffer)
+                if b.kind == BufferKind.File and b.file_path != "" {
+                    svc.record_recent_file(world.resolve_path(b.file_path))
+                }
+            }
+        },
+        _ => (),
+    }
+}
+
+pub fn register_persistence_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_persistence_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_persistence",
+        "0.1.0",
+        "Startup `*Dashboard*` (`alpha-nvim`) and workspace session save/restore/delete (`persistence.nvim`).",
+        [ext_document_id(), ext_window_id(), ext_render_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let svc = PersistenceService.new()
+            k.publish_service(SERVICE_PERSISTENCE, ext_id, svc)
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> s d", "dashboard", ext_id, description = "Open startup dashboard")
+            leader_km.bind("<Space> q s", "session-save", ext_id, description = "Save workspace session")
+            leader_km.bind("<Space> q l", "session-restore", ext_id, description = "Restore workspace session")
+            leader_km.bind("<Space> q d", "session-delete", ext_id, description = "Delete workspace session")
+
+            let dash_km = k.ensure_keymap("mode:dashboard")
+            dash_km.bind("f", "dashboard-find-file", ext_id, description = "Find file")
+            dash_km.bind("n", "new-empty-buffer", ext_id, description = "New empty buffer")
+            dash_km.bind("g", "dashboard-live-grep", ext_id, description = "Live grep")
+            dash_km.bind("s", "session-restore", ext_id, description = "Restore session")
+            dash_km.bind("l", "dashboard-extensions", ext_id, description = "Extensions manager")
+            dash_km.bind("q", "dashboard-quit", ext_id, description = "Quit Lava")
+            dash_km.bind("<Return>", "dashboard-activate-line", ext_id, description = "Activate dashboard item")
+            dash_km.bind(
+                "1",
+                "dashboard-recent-1",
+                ext_id,
+                description = "Open recent file 1",
+            )
+            dash_km.bind(
+                "2",
+                "dashboard-recent-2",
+                ext_id,
+                description = "Open recent file 2",
+            )
+            dash_km.bind(
+                "3",
+                "dashboard-recent-3",
+                ext_id,
+                description = "Open recent file 3",
+            )
+            dash_km.bind(
+                "4",
+                "dashboard-recent-4",
+                ext_id,
+                description = "Open recent file 4",
+            )
+            dash_km.bind(
+                "5",
+                "dashboard-recent-5",
+                ext_id,
+                description = "Open recent file 5",
+            )
+
+            k.register_command("dashboard", ext_id, "Open Lava `*Dashboard*` home screen.", cmd_dashboard_open)
+            k.register_command("ex:Dashboard", ext_id, "Ex `:Dashboard`.", cmd_dashboard_open, interactive = false)
+
+            k.register_command("new-empty-buffer", ext_id, "Create fresh untitled buffer and enter editing.", cmd_new_empty_buffer)
+            k.register_command("dashboard-find-file", ext_id, "Dashboard shortcut: find file.", cmd_dashboard_find_file, interactive = false)
+            k.register_command("dashboard-live-grep", ext_id, "Dashboard shortcut: live grep.", cmd_dashboard_live_grep, interactive = false)
+            k.register_command("dashboard-extensions", ext_id, "Dashboard shortcut: open extensions list.", cmd_dashboard_extensions, interactive = false)
+            k.register_command("dashboard-quit", ext_id, "Dashboard shortcut: quit Lava.", cmd_dashboard_quit, interactive = false)
+            k.register_command("dashboard-activate-line", ext_id, "Activate dashboard shortcut on current line.", cmd_dashboard_activate_line, interactive = false)
+
+            for slot in 1..6 {
+                let s_num = slot
+                k.register_command(
+                    "dashboard-recent-" ++ s_num.to_string(),
+                    ext_id,
+                    "Open recent file #" ++ s_num.to_string() ++ ".",
+                    |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any {
+                        let _ = open_recent_slot(kern, s_num)#!
+                        ()
+                    },
+                    interactive = false,
+                )
+            }
+
+            k.register_command("session-save", ext_id, "Save current workspace session to disk.", cmd_session_save)
+            k.register_command("ex:SessionSave", ext_id, "Ex `:SessionSave [path]`.", cmd_session_save, interactive = false)
+
+            k.register_command("session-restore", ext_id, "Restore saved workspace session from disk.", cmd_session_restore)
+            k.register_command("ex:SessionRestore", ext_id, "Ex `:SessionRestore [path]`.", cmd_session_restore, interactive = false)
+
+            k.register_command("session-delete", ext_id, "Delete saved workspace session file from disk.", cmd_session_delete)
+            k.register_command("ex:SessionDelete", ext_id, "Ex `:SessionDelete [path]`.", cmd_session_delete, interactive = false)
+
+            k.add_hook(
+                "session-empty-startup",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| -> Unit {
+                    let w_opt = kern.service("lava.document.world")
+                    let s_opt = kern.service(SERVICE_PERSISTENCE)
+                    if w_opt != null and s_opt != null {
+                        let w = w_opt.as(EditorWorld)
+                        let st = s_opt.as(PersistenceService)
+                        if st.dashboard_enabled {
+                            let _ = open_dashboard_buffer(kern, w, st)
+                        }
+                    }
+                },
+            )
+
+            k.add_hook("buffer-opened", ext_id, track_buffer_in_mru)
+            k.add_hook("buffer-saved", ext_id, track_buffer_in_mru)
+            k.add_hook(
+                "buffer-switched",
+                ext_id,
+                |kern: SystemKernel, payload: Any| -> Unit {
+                    track_buffer_in_mru(kern, payload)
+                    let w_opt = kern.service("lava.document.world")
+                    let v_opt = kern.service("lava.vim.state")
+                    if w_opt != null and v_opt != null {
+                        let w = w_opt.as(EditorWorld)
+                        let vs = v_opt.as(VimState)
+                        if w.active_buffer().major_mode == "dashboard" {
+                            attach_dashboard_interceptor(vs)
+                        } else {
+                            detach_dashboard_interceptor(vs)
+                        }
+                    }
+                },
+            )
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let v_opt = k.service("lava.vim.state")
+            if v_opt != null {
+                detach_dashboard_interceptor(v_opt.as(VimState))
+            }
+            ()
+        },
+    )
+}

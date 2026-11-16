@@ -1,0 +1,1293 @@
+-- ex_cmd.ns: Complete Evil-Vim Ex Command Engine (`:`).
+-- Supports ranges (`%`, `.`, `$`, `'<,'>`, `'a,'b`, `<n>,<m>`, `+/-` offsets),
+-- file/buffer/window/tab commands, `:s/pat/rep/[gi]`, `:g/pat/d`, `:v/pat/d`,
+-- `:set`, `:noh`, `:theme`, `:reg`, `:marks`, `:undotree`, `:ext`, `:Ex`, `:grep`, `:make`, `:!`.
+
+use std.fs
+use std.process
+use @lava_sys.{host_request_quit, host_write_file_lines}
+use @lava_remote.{is_ssh_uri, remote_stat, remote_write_lines}
+use @lava_core.{
+    CommandSpec, ExtensionRecord, InteractiveEffects, ServiceEntry, SystemKernel, clipboard_get,
+    clipboard_set, log_event, status_emit
+}
+use @ext_document.{
+    Buffer, BufferId, EditorWorld, JumpEntry, NarrowRegion, Pos, RegisterValue,
+    require_editor_world
+}
+
+struct ParsedRange {
+    has_range: bool,
+    start_row: i64,
+    end_row: i64,
+    rest: String,
+    valid: bool,
+}
+
+fn clamp_row(buf: Buffer, r: i64) -> i64 {
+    let lo = buf.min_row()
+    let hi = buf.max_row()
+    if r < lo {
+        lo
+    } else if r > hi {
+        hi
+    } else {
+        r
+    }
+}
+
+-- Parse a single Ex line address atom + optional `+N`/`-N` offset at index `idx`.
+-- Returns `?(resolved_row, next_idx)`.
+fn parse_single_address(world: EditorWorld, buf: Buffer, s: String, start_idx: i64) -> ?(i64, i64) {
+    let n = s.char_len()
+    var i = start_idx
+    while i < n and s.slice(i, i + 1) == " " {
+        i += 1
+    }
+    if i >= n {
+        return null
+    }
+
+    var base_row: i64 = -1
+    let ch = s.slice(i, i + 1)
+
+    if ch == "." {
+        base_row = buf.point.row
+        i += 1
+    } else if ch == "$" {
+        base_row = buf.max_row()
+        i += 1
+    } else if ch == "'" and i + 1 < n {
+        let mname = s.slice(i + 1, i + 2)
+        i += 2
+        let local_opt = buf.named_marks.get(mname)
+        if local_opt != null {
+            base_row = local_opt.as(Pos).row
+        } else {
+            let glob_opt = world.global_marks.get(mname)
+            if glob_opt != null {
+                base_row = glob_opt.as(JumpEntry).pos.row
+            } else {
+                return null
+            }
+        }
+    } else if ch.is_ascii_digit() {
+        var j = i
+        while j < n and s.slice(j, j + 1).is_ascii_digit() {
+            j += 1
+        }
+        let num_opt = s.slice(i, j).parse_i64()
+        if num_opt == null {
+            return null
+        }
+        let num = num_opt.as(i64)
+        base_row = if num > 0 { num - 1 } else { 0 }
+        i = j
+    } else {
+        return null
+    }
+
+    -- Optional `+N` / `-N` offset
+    while i < n {
+        let sign_ch = s.slice(i, i + 1)
+        if sign_ch != "+" and sign_ch != "-" {
+            break
+        }
+        let sign: i64 = if sign_ch == "+" { 1 } else { -1 }
+        i += 1
+        var j = i
+        while j < n and s.slice(j, j + 1).is_ascii_digit() {
+            j += 1
+        }
+        let delta = if j > i {
+            let parsed_opt = s.slice(i, j).parse_i64()
+            if parsed_opt != null { parsed_opt.as(i64) } else { 1 }
+        } else {
+            1
+        }
+        base_row += sign * delta
+        i = j
+    }
+
+    (clamp_row(buf, base_row), i)
+}
+
+fn parse_ex_range(world: EditorWorld, buf: Buffer, input: String) -> ParsedRange {
+    let trimmed = input.trim_start()
+    let n = trimmed.char_len()
+    if n == 0 {
+        return (ParsedRange {
+            has_range: false,
+            start_row: buf.point.row,
+            end_row: buf.point.row,
+            rest: "",
+            valid: true,
+        })
+    }
+
+    if trimmed.starts_with("%") {
+        return (ParsedRange {
+            has_range: true,
+            start_row: buf.min_row(),
+            end_row: buf.max_row(),
+            rest: trimmed.drop(1).trim_start(),
+            valid: true,
+        })
+    }
+
+    let first_pair? = parse_single_address(world, buf, trimmed, 0) else {
+        -- Check malformed mark reference like `'z` when mark doesn't exist
+        if trimmed.starts_with("'") {
+            return (ParsedRange {
+                has_range: false,
+                start_row: 0,
+                end_row: 0,
+                rest: trimmed,
+                valid: false,
+            })
+        }
+        return (ParsedRange {
+            has_range: false,
+            start_row: buf.point.row,
+            end_row: buf.point.row,
+            rest: trimmed,
+            valid: true,
+        })
+    }
+
+    let (r1, idx1) = first_pair
+    var cur = idx1
+    while cur < n and trimmed.slice(cur, cur + 1) == " " {
+        cur += 1
+    }
+
+    if cur < n and (trimmed.slice(cur, cur + 1) == "," or trimmed.slice(cur, cur + 1) == ";") {
+        let second_pair? = parse_single_address(world, buf, trimmed, cur + 1) else {
+            return (ParsedRange {
+                has_range: false,
+                start_row: 0,
+                end_row: 0,
+                rest: trimmed,
+                valid: false,
+            })
+        }
+        let (r2, idx2) = second_pair
+        let lo = if r1 <= r2 { r1 } else { r2 }
+        let hi = if r1 <= r2 { r2 } else { r1 }
+        return (ParsedRange {
+            has_range: true,
+            start_row: lo,
+            end_row: hi,
+            rest: trimmed.slice(idx2, n).trim_start(),
+            valid: true,
+        })
+    }
+
+    ParsedRange {
+        has_range: true,
+        start_row: r1,
+        end_row: r1,
+        rest: trimmed.slice(cur, n).trim_start(),
+        valid: true,
+    }
+}
+
+-- Read delimiter-separated segment from `s` starting at `start_idx`, honoring `\delim` escapes.
+-- Returns `(unescaped_segment, index_after_closing_delimiter_or_end, found_closing_delim)`.
+fn read_delimited_part(s: String, start_idx: i64, delim: String, unescape_delim_only: bool) -> (String, i64, bool) {
+    let n = s.char_len()
+    var i = start_idx
+    var out = ""
+    while i < n {
+        let ch = s.slice(i, i + 1)
+        if ch == "\\" and i + 1 < n {
+            let nxt = s.slice(i + 1, i + 2)
+            if nxt == delim {
+                out = out ++ delim
+                i += 2
+                continue
+            }
+            if not unescape_delim_only {
+                if nxt == "n" {
+                    out = out ++ "\n"
+                    i += 2
+                    continue
+                }
+                if nxt == "t" {
+                    out = out ++ "\t"
+                    i += 2
+                    continue
+                }
+                if nxt == "\\" {
+                    out = out ++ "\\"
+                    i += 2
+                    continue
+                }
+                if nxt == "&" {
+                    out = out ++ "\x00AMP\x00"
+                    i += 2
+                    continue
+                }
+            }
+        }
+        if ch == delim {
+            return (out, i + 1, true)
+        }
+        out = out ++ ch
+        i += 1
+    }
+    (out, n, false)
+}
+
+fn expand_replacement(rep_template: String, matched_sub: String) -> String {
+    let with_amp = rep_template.replace("&", matched_sub)
+    with_amp.replace("\x00AMP\x00", "&")
+}
+
+fn substitute_in_line(
+    line: String,
+    pat: String,
+    rep_template: String,
+    ignore_case: bool,
+    replace_all: bool,
+) -> (String, i64) {
+    let plen = pat.char_len()
+    if plen == 0 {
+        return (line, 0)
+    }
+    let hay = if ignore_case { line.to_lower() } else { line }
+    let needle = if ignore_case { pat.to_lower() } else { pat }
+    let indices = hay.find_indices(needle)
+    let mcount = indices.len()
+    if mcount == 0 {
+        return (line, 0)
+    }
+
+    let limit = if replace_all { mcount } else { 1 }
+    var out = ""
+    var last_end: i64 = 0
+    for i in 0..limit {
+        let sc = indices.get(i.as(usize)).as(i64)
+        let ec = sc + plen
+        out = out ++ line.slice(last_end, sc)
+        let orig_match = line.slice(sc, ec)
+        out = out ++ expand_replacement(rep_template, orig_match)
+        last_end = ec
+    }
+    out = out ++ line.slice(last_end, line.char_len())
+    (out, limit)
+}
+
+fn run_substitute_on_rows(
+    world: EditorWorld,
+    buf: Buffer,
+    rows: List,
+    body_after_s: String,
+) -> !String (i64, i64, String) {
+    if body_after_s == "" {
+        return error "E471: Argument required for :substitute"
+    }
+    let delim = body_after_s.slice(0, 1)
+    let (raw_pat, idx1, found1) = read_delimited_part(body_after_s, 1, delim, true)
+    if not found1 {
+        return error "E146: Regular expressions can't be delimited by Missing delimiter"
+    }
+    let (rep_tpl, idx2, _) = read_delimited_part(body_after_s, idx1, delim, false)
+    let flags = body_after_s.slice(idx2, body_after_s.char_len()).trim()
+
+    let pat = if raw_pat == "" { world.last_search } else { raw_pat }
+    if pat == "" {
+        return error "E35: No previous regular expression"
+    }
+    world.last_search = pat
+
+    let replace_all = flags.contains("g")
+    let ignore_case = if flags.contains("I") {
+        false
+    } else if flags.contains("i") {
+        true
+    } else {
+        world.effective_ignore_case(pat)
+    }
+
+    var total_subs: i64 = 0
+    var changed_lines: i64 = 0
+    var last_changed_row = buf.point.row
+
+    -- Iterate in reverse so multi-line `\n` replacements do not shift earlier row indices!
+    var ri = rows.len() - 1
+    while ri >= 0 {
+        let r = rows.get(ri.as(usize)).as(i64)
+        let old_line = buf.line_at(r)
+        let (new_line, cnt) = substitute_in_line(old_line, pat, rep_tpl, ignore_case, replace_all)
+        if cnt > 0 {
+            total_subs += cnt
+            changed_lines += 1
+            last_changed_row = r
+            if new_line.contains("\n") {
+                let split_parts = new_line.split("\n")
+                buf.set_line_at(r, split_parts.get(0).as(String))
+                for pi in 1..split_parts.len() {
+                    buf.insert_line_at(r + pi, split_parts.get(pi.as(usize)).as(String))
+                }
+                if buf.narrow != null {
+                    let nr = buf.narrow.as(NarrowRegion)
+                    buf.narrow = NarrowRegion {
+                        start_row: nr.start_row,
+                        end_row: nr.end_row + split_parts.len() - 1,
+                    }
+                }
+            } else {
+                buf.set_line_at(r, new_line)
+            }
+        }
+        ri -= 1
+    }
+
+    if total_subs > 0 {
+        buf.modified = true
+        let clamped_r = clamp_row(buf, last_changed_row)
+        buf.point = buf.clamp_pos(Pos.new(clamped_r, buf.first_non_blank_col(clamped_r)), insert_mode = false)
+    }
+
+    (total_subs, changed_lines, pat)
+}
+
+fn dispatch_if_available(
+    kernel: SystemKernel,
+    cmd_name: String,
+    args: List,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String bool {
+    if kernel.get_command(cmd_name) == null {
+        return false
+    }
+    let _ = kernel.dispatch_command(cmd_name, args)#!
+    true
+}
+
+fn render_marks_lines(world: EditorWorld, buf: Buffer) -> List {
+    let out = List()
+    out.push("mark line  col file/text")
+    out.push("---- ---- ---- ----------------------------------------")
+    let local_keys = buf.named_marks.keys()
+    local_keys.sort()
+    for i in 0..local_keys.len() {
+        let k = local_keys.get(i.as(usize)).as(String)
+        let p = buf.named_marks.get(k).as(Pos)
+        let preview = buf.line_at(p.row).trim()
+        out.push(
+            " " ++ k ++ "   "
+            ++ (p.row + 1).to_string().pad_start(4, " ") ++ " "
+            ++ p.col.to_string().pad_start(4, " ") ++ " "
+            ++ preview
+        )
+    }
+    let glob_keys = world.global_marks.keys()
+    glob_keys.sort()
+    for i in 0..glob_keys.len() {
+        let k = glob_keys.get(i.as(usize)).as(String)
+        let je = world.global_marks.get(k).as(JumpEntry)
+        let label = if je.file_path != "" { je.file_path } else { je.buf_id.to_string() }
+        out.push(
+            " " ++ k ++ "   "
+            ++ (je.pos.row + 1).to_string().pad_start(4, " ") ++ " "
+            ++ je.pos.col.to_string().pad_start(4, " ") ++ " "
+            ++ label
+        )
+    }
+    out
+}
+
+fn render_buffers_lines(world: EditorWorld) -> List {
+    let out = List()
+    out.push("  ID  Flags  Name                     Lines  File")
+    out.push("----  -----  -----------------------  -----  ------------------------------")
+    for i in 0..world.buffer_order.len() {
+        let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+        let b = world.buffers.get(bid).as(Buffer)
+        let active_flag = if bid == world.active_buffer_id { "%" } else { " " }
+        let mod_flag = if b.modified { "+" } else if b.read_only { "-" } else { " " }
+        out.push(
+            bid.raw().to_string().pad_start(4, " ")
+            ++ "  " ++ active_flag ++ mod_flag ++ "   "
+            ++ b.name.pad_end(23, " ") ++ "  "
+            ++ b.line_count().to_string().pad_start(5, " ") ++ "  "
+            ++ b.file_path
+        )
+    }
+    out
+}
+
+fn render_extensions_lines(kernel: SystemKernel) -> List {
+    let out = List()
+    out.push("Lava Active Extension Graph (" ++ kernel.ext_order.len().to_string() ++ " registered)")
+    out.push("========================================================================")
+    for i in 0..kernel.ext_order.len() {
+        let eid = kernel.ext_order.get(i.as(usize))
+        let rec = kernel.extensions.get(eid).as(ExtensionRecord)
+        out.push(
+            "• " ++ rec.id.to_string() ++ " v" ++ rec.version
+            ++ " [" ++ rec.state.to_string() ++ "]"
+        )
+        out.push("    " ++ rec.description)
+    }
+    out.push("")
+    out.push("Published Services (" ++ kernel.services.len().to_string() ++ "):")
+    let skeys = kernel.services.keys()
+    skeys.sort()
+    for i in 0..skeys.len() {
+        let sk = skeys.get(i.as(usize)).as(String)
+        let se = kernel.services.get(sk).as(ServiceEntry)
+        out.push("  - " ++ sk ++ " (owner: " ++ se.owner.to_string() ++ ")")
+    }
+    out.push("")
+    out.push("Registered Commands (" ++ kernel.commands.len().to_string() ++ "):")
+    let cmds = kernel.list_commands(interactive_only = false)
+    for i in 0..cmds.len() {
+        let cs = cmds.get(i.as(usize)).as(CommandSpec)
+        out.push("  - " ++ cs.name.pad_end(28, " ") ++ " [" ++ cs.owner.to_string() ++ "] " ++ cs.summary)
+    }
+    out
+}
+
+fn apply_set_options(world: EditorWorld, arg_str: String) -> !String String {
+    let trimmed = arg_str.trim()
+    if trimmed == "" {
+        return (
+            "nu=" ++ world.options.number.to_string()
+            ++ " rnu=" ++ world.options.relativenumber.to_string()
+            ++ " ic=" ++ world.options.ignorecase.to_string()
+            ++ " scs=" ++ world.options.smartcase.to_string()
+            ++ " ts=" ++ world.options.tabstop.to_string()
+            ++ " sw=" ++ world.options.shiftwidth.to_string()
+            ++ " et=" ++ world.options.expandtab.to_string()
+        )
+    }
+    let tokens = trimmed.split_whitespace()
+    let applied = List()
+    for i in 0..tokens.len() {
+        let tok = tokens.get(i.as(usize)).as(String)
+        if tok == "nu" or tok == "number" {
+            world.options.number = true
+            applied.push("number")
+        } else if tok == "nonu" or tok == "nonumber" {
+            world.options.number = false
+            applied.push("nonumber")
+        } else if tok == "nu!" or tok == "number!" {
+            world.options.number = not world.options.number
+            applied.push("number=" ++ world.options.number.to_string())
+        } else if tok == "rnu" or tok == "relativenumber" {
+            world.options.relativenumber = true
+            applied.push("relativenumber")
+        } else if tok == "nornu" or tok == "norelativenumber" {
+            world.options.relativenumber = false
+            applied.push("norelativenumber")
+        } else if tok == "rnu!" or tok == "relativenumber!" {
+            world.options.relativenumber = not world.options.relativenumber
+            applied.push("relativenumber=" ++ world.options.relativenumber.to_string())
+        } else if tok == "ic" or tok == "ignorecase" {
+            world.options.ignorecase = true
+            applied.push("ignorecase")
+        } else if tok == "noic" or tok == "noignorecase" {
+            world.options.ignorecase = false
+            applied.push("noignorecase")
+        } else if tok == "scs" or tok == "smartcase" {
+            world.options.smartcase = true
+            applied.push("smartcase")
+        } else if tok == "noscs" or tok == "nosmartcase" {
+            world.options.smartcase = false
+            applied.push("nosmartcase")
+        } else if tok == "wrap" {
+            world.options.wrap = true
+            applied.push("wrap")
+        } else if tok == "nowrap" {
+            world.options.wrap = false
+            applied.push("nowrap")
+        } else if tok == "hls" or tok == "hlsearch" {
+            world.options.hlsearch = true
+            world.search_highlight_active = world.last_search != ""
+            applied.push("hlsearch")
+        } else if tok == "nohls" or tok == "nohlsearch" {
+            world.options.hlsearch = false
+            world.search_highlight_active = false
+            applied.push("nohlsearch")
+        } else if tok == "is" or tok == "incsearch" {
+            world.options.incsearch = true
+            applied.push("incsearch")
+        } else if tok == "nois" or tok == "noincsearch" {
+            world.options.incsearch = false
+            applied.push("noincsearch")
+        } else if tok == "et" or tok == "expandtab" {
+            world.options.expandtab = true
+            applied.push("expandtab")
+        } else if tok == "noet" or tok == "noexpandtab" {
+            world.options.expandtab = false
+            applied.push("noexpandtab")
+        } else if tok.starts_with("ts=") or tok.starts_with("tabstop=") {
+            let eq_pair? = tok.split_once("=") else {
+                return error ("E521: Number required after =: " ++ tok)
+            }
+            let (_, val_s) = eq_pair
+            let v? = val_s.parse_i64() else {
+                return error ("E521: Number required after =: " ++ tok)
+            }
+            if v >= 1 {
+                world.options.tabstop = v
+            }
+            applied.push("tabstop=" ++ world.options.tabstop.to_string())
+        } else if tok.starts_with("sw=") or tok.starts_with("shiftwidth=") {
+            let eq_pair? = tok.split_once("=") else {
+                return error ("E521: Number required after =: " ++ tok)
+            }
+            let (_, val_s) = eq_pair
+            let v? = val_s.parse_i64() else {
+                return error ("E521: Number required after =: " ++ tok)
+            }
+            if v >= 1 {
+                world.options.shiftwidth = v
+            }
+            applied.push("shiftwidth=" ++ world.options.shiftwidth.to_string())
+        } else if tok.starts_with("so=") or tok.starts_with("scrolloff=") {
+            let eq_pair? = tok.split_once("=") else {
+                return error ("E521: Number required after =: " ++ tok)
+            }
+            let (_, val_s) = eq_pair
+            let v? = val_s.parse_i64() else {
+                return error ("E521: Number required after =: " ++ tok)
+            }
+            if v >= 0 {
+                world.options.scrolloff = v
+            }
+            applied.push("scrolloff=" ++ world.options.scrolloff.to_string())
+        } else if tok.starts_with("siso=") or tok.starts_with("sidescrolloff=") {
+            let eq_pair? = tok.split_once("=") else {
+                return error ("E521: Number required after =: " ++ tok)
+            }
+            let (_, val_s) = eq_pair
+            let v? = val_s.parse_i64() else {
+                return error ("E521: Number required after =: " ++ tok)
+            }
+            if v >= 0 {
+                world.options.sidescrolloff = v
+            }
+            applied.push("sidescrolloff=" ++ world.options.sidescrolloff.to_string())
+        } else if tok == "cul" or tok == "cursorline" {
+            world.options.cursorline = true
+            applied.push("cursorline")
+        } else if tok == "nocul" or tok == "nocursorline" {
+            world.options.cursorline = false
+            applied.push("nocursorline")
+        } else if tok == "signcolumn" {
+            world.options.signcolumn = true
+            applied.push("signcolumn")
+        } else if tok == "nosigncolumn" {
+            world.options.signcolumn = false
+            applied.push("nosigncolumn")
+        } else if tok == "indentguides" {
+            world.options.indent_guides = true
+            applied.push("indentguides")
+        } else if tok == "noindentguides" {
+            world.options.indent_guides = false
+            applied.push("noindentguides")
+        } else if tok == "autopairs" {
+            world.options.autopairs = true
+            applied.push("autopairs")
+        } else if tok == "noautopairs" {
+            world.options.autopairs = false
+            applied.push("noautopairs")
+        } else if tok == "ai" or tok == "autoindent" {
+            world.options.auto_indent = true
+            applied.push("autoindent")
+        } else if tok == "noai" or tok == "noautoindent" {
+            world.options.auto_indent = false
+            applied.push("noautoindent")
+        } else if tok == "clipboard=unnamedplus" {
+            world.options.clipboard_unnamedplus = true
+            world.registers.unnamedplus = true
+            applied.push("clipboard=unnamedplus")
+        } else if tok == "clipboard=" {
+            world.options.clipboard_unnamedplus = false
+            world.registers.unnamedplus = false
+            applied.push("clipboard=")
+        } else if tok == "zen" {
+            world.options.zen_mode = true
+            applied.push("zen")
+        } else if tok == "nozen" {
+            world.options.zen_mode = false
+            applied.push("nozen")
+        } else if tok == "twilight" {
+            world.options.twilight_mode = true
+            applied.push("twilight")
+        } else if tok == "notwilight" {
+            world.options.twilight_mode = false
+            applied.push("notwilight")
+        } else if tok == "formatonsave" {
+            world.options.format_on_save = true
+            applied.push("formatonsave")
+        } else if tok == "noformatonsave" {
+            world.options.format_on_save = false
+            applied.push("noformatonsave")
+        } else {
+            return error ("E518: Unknown option: " ++ tok)
+        }
+    }
+    "set " ++ applied.join(" ")
+}
+
+pub fn execute_ex_command(kernel: SystemKernel, raw_cmd: String) -> #InteractiveEffects !String Unit {
+    let world = require_editor_world(kernel)!
+    let buf = world.active_buffer()
+
+    var stripped = raw_cmd.trim()
+    while stripped.starts_with(":") {
+        stripped = stripped.drop(1).trim_start()
+    }
+    if stripped == "" or stripped.starts_with("\"") {
+        return ()
+    }
+
+    let pr = parse_ex_range(world, buf, stripped)
+    if not pr.valid {
+        status_emit("E20: Mark not set or invalid range: " ++ stripped)#
+        return ()
+    }
+
+    -- Pure line jump (`:42`, `:$`, `:.`)
+    if pr.has_range and pr.rest == "" {
+        world.jumps.record(buf.id, buf.file_path, buf.point)
+        let dest_r = clamp_row(buf, pr.end_row)
+        buf.point = buf.clamp_pos(Pos.new(dest_r, buf.first_non_blank_col(dest_r)), insert_mode = false)
+        status_emit("Line " ++ (dest_r + 1).to_string())#
+        return ()
+    }
+
+    let rest = pr.rest
+
+    -- Shell escape `:!<shell_cmd>`
+    if rest.starts_with("!") {
+        let shell_cmd = rest.drop(1).trim()
+        if shell_cmd == "" {
+            status_emit("E471: Argument required for :!")#
+            return ()
+        }
+        let handled_shell = dispatch_if_available(kernel, "shell-command", [shell_cmd])#!
+        if handled_shell {
+            return ()
+        }
+        let out! = process.shell(shell_cmd) else {
+            status_emit("Shell execution failed: " ++ shell_cmd)#
+            return ()
+        }
+        let combined = if out.stderr != "" {
+            out.stdout ++ (if out.stdout != "" and not out.stdout.ends_with("\n") { "\n" } else { "" }) ++ out.stderr
+        } else {
+            out.stdout
+        }
+        let lines = if combined.trim() == "" {
+            ["(Command exited with status " ++ out.status.to_string() ++ ")"]
+        } else {
+            combined.split("\n")
+        }
+        let sb = world.ensure_special_buffer("*Shell Command Output*", "text", lines, read_only = true)
+        let _ = world.switch_to_buffer(sb.id)
+        kernel.emit_hook("buffer-switched", sb.id)
+        status_emit(":!" ++ shell_cmd ++ " (exit " ++ out.status.to_string() ++ ")")#
+        return ()
+    }
+
+    -- Extract command verb (`s`, `g`, `v`, `w`, `wq`, `set`, `Ex`, `Telescope`, `SessionSave`, etc.)
+    let rlen = rest.char_len()
+    var ci: i64 = 0
+    if rlen > 0 and rest.slice(0, 1).is_ascii_alphabetic() {
+        ci = 1
+        while ci < rlen {
+            let vch = rest.slice(ci, ci + 1)
+            if vch.is_ascii_alphanumeric() or vch == "_" or vch == "-" {
+                ci += 1
+            } else {
+                break
+            }
+        }
+    }
+    let verb = rest.slice(0, ci)
+    var after_verb = rest.slice(ci, rlen)
+    var bang = false
+    if after_verb.starts_with("!") {
+        bang = true
+        after_verb = after_verb.drop(1)
+    }
+    let arg = after_verb.trim()
+
+    -- 1. Substitution `:[range]s/pat/rep/[gi]`
+    if (verb == "s" or verb == "sub" or verb == "substitute") and not bang {
+        let sub_body = rest.slice(ci, rlen).trim_start()
+        if sub_body != "" and not sub_body.slice(0, 1).is_ascii_alphanumeric() {
+            buf.ensure_writable()!
+            let sr = if pr.has_range { pr.start_row } else { buf.point.row }
+            let er = if pr.has_range { pr.end_row } else { buf.point.row }
+            let rows = List()
+            for r in sr..(er + 1) {
+                rows.push(r)
+            }
+            let res! = run_substitute_on_rows(world, buf, rows, sub_body) else {
+                status_emit("Substitute error")#
+                return ()
+            }
+            let (subs, lcnt, pat) = res
+            if subs == 0 {
+                status_emit("E486: Pattern not found: " ++ pat)#
+            } else {
+                buf.checkpoint(buf.point, "ex-substitute")
+                world.search_highlight_active = world.options.hlsearch
+                status_emit(subs.to_string() ++ " substitutions on " ++ lcnt.to_string() ++ " lines")#
+            }
+            return ()
+        }
+    }
+
+    -- 2. Global / Inverted Global `:[range]g/pat/<cmd>`, `:[range]g!/pat/<cmd>`, `:[range]v/pat/<cmd>`
+    if verb == "g" or verb == "global" or verb == "v" or verb == "vglobal" {
+        let invert = (verb == "v" or verb == "vglobal") or bang
+        let gbody = after_verb.trim_start()
+        if gbody == "" {
+            status_emit("E148: Regular expression missing from :global")#
+            return ()
+        }
+        let delim = gbody.slice(0, 1)
+        let (raw_pat, after_pat_idx, _) = read_delimited_part(gbody, 1, delim, true)
+        let pat = if raw_pat == "" { world.last_search } else { raw_pat }
+        if pat == "" {
+            status_emit("E35: No previous regular expression")#
+            return ()
+        }
+        world.last_search = pat
+        let subcmd = gbody.slice(after_pat_idx, gbody.char_len()).trim()
+        let sr = if pr.has_range { pr.start_row } else { buf.min_row() }
+        let er = if pr.has_range { pr.end_row } else { buf.max_row() }
+        let ic = world.effective_ignore_case(pat)
+
+        let matched_rows = List()
+        for r in sr..(er + 1) {
+            let has_match = not buf.find_all_in_line(r, pat, ic).is_empty()
+            if ((not invert) and has_match) or (invert and (not has_match)) {
+                if matched_rows.len() < 60000 {
+                    matched_rows.push(r)
+                }
+            }
+        }
+
+        if matched_rows.is_empty() {
+            status_emit("Pattern not found: " ++ pat)#
+            return ()
+        }
+
+        if subcmd == "" or subcmd == "d" or subcmd == "delete" {
+            buf.ensure_writable()!
+            let captured = List()
+            var cap_chars: i64 = 0
+            let cap_limit = if matched_rows.len() < 8000 { matched_rows.len() } else { 8000 }
+            for i in 0..cap_limit {
+                let r = matched_rows.get(i.as(usize)).as(i64)
+                let ln = buf.line_at(r)
+                let lch = ln.char_len()
+                if cap_chars + lch > 200000 and (not captured.is_empty()) {
+                    break
+                }
+                captured.push(ln)
+                cap_chars += lch + 1
+            }
+            let yanked_txt = captured.join("\n") ++ "\n"
+            let removed_count = matched_rows.len()
+            if removed_count >= buf.line_count() {
+                let _ = buf.delete_lines(0, buf.max_row())!
+                buf.point = Pos.zero()
+            } else {
+                var mi = removed_count - 1
+                while mi >= 0 {
+                    let r = matched_rows.get(mi.as(usize)).as(i64)
+                    let _ = buf.remove_line_at(r)
+                    mi -= 1
+                }
+                if buf.narrow != null {
+                    let nr = buf.narrow.as(NarrowRegion)
+                    let next_end = if nr.end_row - removed_count < nr.start_row {
+                        nr.start_row
+                    } else {
+                        nr.end_row - removed_count
+                    }
+                    buf.narrow = NarrowRegion { start_row: nr.start_row, end_row: next_end }
+                }
+                let first_r = clamp_row(buf, matched_rows.get(0).as(i64))
+                buf.point = buf.clamp_pos(Pos.new(first_r, buf.first_non_blank_col(first_r)), insert_mode = false)
+            }
+            buf.modified = true
+            world.registers.delete_store(RegisterValue.lines(yanked_txt), world.kill_ring)#
+            buf.checkpoint(buf.point, "ex-global-delete")
+            status_emit(removed_count.to_string() ++ " fewer lines")#
+            return ()
+        }
+
+        if subcmd == "y" or subcmd == "yank" {
+            let captured = List()
+            var cap_chars: i64 = 0
+            let cap_limit = if matched_rows.len() < 8000 { matched_rows.len() } else { 8000 }
+            for i in 0..cap_limit {
+                let r = matched_rows.get(i.as(usize)).as(i64)
+                let ln = buf.line_at(r)
+                let lch = ln.char_len()
+                if cap_chars + lch > 200000 and (not captured.is_empty()) {
+                    break
+                }
+                captured.push(ln)
+                cap_chars += lch + 1
+            }
+            world.registers.yank_store(RegisterValue.lines(captured.join("\n") ++ "\n"))#
+            status_emit(matched_rows.len().to_string() ++ " lines yanked")#
+            return ()
+        }
+
+        if subcmd.starts_with("s") {
+            buf.ensure_writable()!
+            var sj: i64 = 0
+            while sj < subcmd.char_len() and subcmd.slice(sj, sj + 1).is_ascii_alphabetic() {
+                sj += 1
+            }
+            let sbody = subcmd.slice(sj, subcmd.char_len()).trim_start()
+            let (subs, lcnt, _) = run_substitute_on_rows(world, buf, matched_rows, sbody)!
+            if subs > 0 {
+                buf.checkpoint(buf.point, "ex-global-substitute")
+            }
+            status_emit(subs.to_string() ++ " substitutions on " ++ lcnt.to_string() ++ " lines")#
+            return ()
+        }
+
+        status_emit("Unsupported :global subcommand: " ++ subcmd)#
+        return ()
+    }
+
+    -- 3. Range delete & yank (`:[range]d [reg]`, `:[range]y [reg]`)
+    if verb == "d" or verb == "delete" {
+        let sr = if pr.has_range { pr.start_row } else { buf.point.row }
+        let er = if pr.has_range { pr.end_row } else { buf.point.row }
+        let reg_name = if arg != "" { arg.take(1) } else { "" }
+        let (_, removed) = buf.delete_lines(sr, er)!
+        world.registers.delete_store(RegisterValue.lines(removed), world.kill_ring, reg = reg_name)#
+        buf.checkpoint(buf.point, "ex-delete")
+        let cnt = er - sr + 1
+        status_emit(cnt.to_string() ++ " fewer lines")#
+        return ()
+    }
+
+    if verb == "y" or verb == "yank" {
+        let sr = if pr.has_range { pr.start_row } else { buf.point.row }
+        let er = if pr.has_range { pr.end_row } else { buf.point.row }
+        let reg_name = if arg != "" { arg.take(1) } else { "" }
+        let max_yank_r = if er - sr + 1 > 8000 { sr + 7999 } else { er }
+        let lines = List()
+        var cap_chars: i64 = 0
+        for r in sr..(max_yank_r + 1) {
+            let ln = buf.line_at(r)
+            let lch = ln.char_len()
+            if cap_chars + lch > 200000 and (not lines.is_empty()) {
+                break
+            }
+            lines.push(ln)
+            cap_chars += lch + 1
+        }
+        world.registers.yank_store(RegisterValue.lines(lines.join("\n") ++ "\n"), reg = reg_name)#
+        let cnt = er - sr + 1
+        status_emit(cnt.to_string() ++ " lines yanked")#
+        return ()
+    }
+
+    -- 4. File, Write & Quit commands
+    if verb == "e" or verb == "edit" {
+        if arg == "" {
+            if buf.file_path == "" {
+                let _ = dispatch_if_available(kernel, "find-file", List())#!
+                return ()
+            }
+            if buf.modified and not bang {
+                status_emit("E37: No write since last change (add ! to override)")#
+                return ()
+            }
+            let target_p = buf.file_path
+            let _ = world.kill_buffer(buf.id, force = true)!
+            let reopened = world.open_file(target_p)#!
+            kernel.emit_hook("buffer-switched", reopened.id)
+            return ()
+        }
+        let resolved = world.resolve_path(arg)
+        if is_ssh_uri(resolved) {
+            let st_res = remote_stat(resolved)
+            st_res match {
+                st! => {
+                    if st.exists and st.is_dir {
+                        let handled_rb = dispatch_if_available(kernel, "remote-browse", [resolved])#!
+                        if handled_rb {
+                            return ()
+                        }
+                    }
+                },
+                error _ => (),
+            }
+        }
+        if fs.exists(resolved) and fs.is_dir(resolved) {
+            let handled_dirvish = dispatch_if_available(kernel, "dirvish", [resolved])#!
+            if handled_dirvish {
+                return ()
+            }
+            let handled_dired = dispatch_if_available(kernel, "dired", [resolved])#!
+            if handled_dired {
+                return ()
+            }
+        }
+        let opened = world.open_file(arg)#!
+        kernel.emit_hook("buffer-switched", opened.id)
+        return ()
+    }
+
+    if verb == "w" or verb == "write" {
+        if pr.has_range and arg != "" {
+            let sub_lines = List()
+            for r in pr.start_row..(pr.end_row + 1) {
+                sub_lines.push(buf.line_at(r))
+            }
+            let target = world.resolve_path(arg)
+            let written = if is_ssh_uri(target) {
+                remote_write_lines(target, sub_lines, buf.crlf)!
+            } else {
+                host_write_file_lines(target, sub_lines, true)!
+            }
+            status_emit("\"" ++ arg ++ "\" " ++ sub_lines.len().to_string() ++ "L, " ++ written.to_string() ++ "B written")#
+            return ()
+        }
+        if arg == "" and kernel.get_command("write-buffer-mode:" ++ buf.major_mode) != null {
+            let _ = kernel.dispatch_command("write-buffer-mode:" ++ buf.major_mode, List())#!
+            return ()
+        }
+        if buf.file_path == "" and arg == "" {
+            let _ = dispatch_if_available(kernel, "save-buffer", List())#!
+            return ()
+        }
+        kernel.emit_hook("buffer-will-save", buf.id)
+        world.save_buffer(buf.id, override_path = arg)#!
+        kernel.emit_hook("buffer-saved", buf.id)
+        return ()
+    }
+
+    if verb == "q" or verb == "quit" or verb == "qa" or verb == "qall" {
+        if not bang {
+            let unsaved = world.unsaved_file_buffers()
+            if not unsaved.is_empty() {
+                let first_b = unsaved.get(0).as(Buffer)
+                let msg = "E37: No write since last change for buffer \"" ++ first_b.name ++ "\" (add ! to override)"
+                world.append_message(msg)
+                status_emit(msg)#
+                return ()
+            }
+        }
+        world.quit_requested = true
+        world.exit_code = 0
+        host_request_quit(0)
+        status_emit("Quit")#
+        return ()
+    }
+
+    if verb == "wq" or verb == "x" or verb == "xit" {
+        if verb == "wq" or buf.modified or arg != "" {
+            if arg == "" and kernel.get_command("write-buffer-mode:" ++ buf.major_mode) != null {
+                let _ = kernel.dispatch_command("write-buffer-mode:" ++ buf.major_mode, List())#!
+            } else {
+                kernel.emit_hook("buffer-will-save", buf.id)
+                world.save_buffer(buf.id, override_path = arg)#!
+                kernel.emit_hook("buffer-saved", buf.id)
+            }
+        }
+        if not bang {
+            let unsaved = world.unsaved_file_buffers()
+            if not unsaved.is_empty() {
+                let first_b = unsaved.get(0).as(Buffer)
+                let msg = "E37: Other buffer \"" ++ first_b.name ++ "\" has unsaved changes (add ! to override)"
+                world.append_message(msg)
+                status_emit(msg)#
+                return ()
+            }
+        }
+        world.quit_requested = true
+        world.exit_code = 0
+        host_request_quit(0)
+        return ()
+    }
+
+    -- 5. Buffer management
+    if verb == "bd" or verb == "bdelete" {
+        let next_id! = world.kill_buffer(buf.id, force = bang) else {
+            status_emit("E89: No write since last change for buffer \"" ++ buf.name ++ "\" (add ! to override)")#
+            return ()
+        }
+        kernel.emit_hook("buffer-switched", next_id)
+        status_emit("Buffer: " ++ world.active_buffer().name)#
+        return ()
+    }
+
+    if verb == "bn" or verb == "bnext" {
+        let bid = world.cycle_buffer(1)
+        kernel.emit_hook("buffer-switched", bid)
+        status_emit("Buffer: " ++ world.active_buffer().name)#
+        return ()
+    }
+
+    if verb == "bp" or verb == "bprev" or verb == "bprevious" {
+        let bid = world.cycle_buffer(-1)
+        kernel.emit_hook("buffer-switched", bid)
+        status_emit("Buffer: " ++ world.active_buffer().name)#
+        return ()
+    }
+
+    if verb == "b" or verb == "buffer" {
+        if arg == "" {
+            let _ = dispatch_if_available(kernel, "switch-to-buffer", List())#!
+            return ()
+        }
+        let exact_opt = world.find_buffer_by_name(arg)
+        if exact_opt != null {
+            let b = exact_opt.as(Buffer)
+            let _ = world.switch_to_buffer(b.id)
+            kernel.emit_hook("buffer-switched", b.id)
+            status_emit("Buffer: " ++ b.name)#
+            return ()
+        }
+        -- Substring match fallback
+        let lower_q = arg.to_lower()
+        for i in 0..world.buffer_order.len() {
+            let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+            let b = world.buffers.get(bid).as(Buffer)
+            if b.name.to_lower().contains(lower_q) {
+                let _ = world.switch_to_buffer(b.id)
+                kernel.emit_hook("buffer-switched", b.id)
+                status_emit("Buffer: " ++ b.name)#
+                return ()
+            }
+        }
+        status_emit("E94: No matching buffer for " ++ arg)#
+        return ()
+    }
+
+    if verb == "ls" or verb == "buffers" {
+        let lines = render_buffers_lines(world)
+        let bb = world.ensure_special_buffer("*Buffers*", "text", lines, read_only = true)
+        let _ = world.switch_to_buffer(bb.id)
+        kernel.emit_hook("buffer-switched", bb.id)
+        status_emit(world.buffer_order.len().to_string() ++ " buffers")#
+        return ()
+    }
+
+    -- 6. Windows & Tabs
+    if verb == "sp" or verb == "split" {
+        let _ = dispatch_if_available(kernel, "split-window-below", List())#!
+        if arg != "" {
+            let opened = world.open_file(arg)#!
+            kernel.emit_hook("buffer-switched", opened.id)
+        }
+        return ()
+    }
+
+    if verb == "vsp" or verb == "vsplit" {
+        let _ = dispatch_if_available(kernel, "split-window-right", List())#!
+        if arg != "" {
+            let opened = world.open_file(arg)#!
+            kernel.emit_hook("buffer-switched", opened.id)
+        }
+        return ()
+    }
+
+    if verb == "only" or verb == "on" {
+        let _ = dispatch_if_available(kernel, "delete-other-windows", List())#!
+        return ()
+    }
+
+    if verb == "close" or verb == "clo" {
+        let _ = dispatch_if_available(kernel, "delete-window", List())#!
+        return ()
+    }
+
+    if verb == "tabnew" {
+        let _ = dispatch_if_available(kernel, "tab-new", List())#!
+        if arg != "" {
+            let opened = world.open_file(arg)#!
+            kernel.emit_hook("buffer-switched", opened.id)
+        }
+        return ()
+    }
+
+    if verb == "tabn" or verb == "tabnext" {
+        let _ = dispatch_if_available(kernel, "tab-next", List())#!
+        return ()
+    }
+
+    if verb == "tabp" or verb == "tabprev" or verb == "tabprevious" {
+        let _ = dispatch_if_available(kernel, "tab-previous", List())#!
+        return ()
+    }
+
+    if verb == "tabc" or verb == "tabclose" {
+        let _ = dispatch_if_available(kernel, "tab-close", List())#!
+        return ()
+    }
+
+    -- 7. Options, Highlight, Theme & Inspectors
+    if verb == "set" or verb == "se" {
+        let msg! = apply_set_options(world, arg) else {
+            status_emit("Invalid :set option: " ++ arg)#
+            return ()
+        }
+        status_emit(msg)#
+        return ()
+    }
+
+    if verb == "noh" or verb == "nohlsearch" {
+        world.search_highlight_active = false
+        status_emit("search highlight cleared")#
+        return ()
+    }
+
+    if verb == "theme" or verb == "colorscheme" or verb == "colo" {
+        if arg == "" {
+            status_emit("Theme: " ++ world.options.theme_name)#
+            return ()
+        }
+        world.options.theme_name = arg
+        kernel.emit_hook("theme-changed", arg)
+        status_emit("Theme: " ++ arg)#
+        return ()
+    }
+
+    if verb == "reg" or verb == "registers" {
+        let lines = world.registers.summary_lines()
+        let rb = world.ensure_special_buffer("*Registers*", "text", lines, read_only = true)
+        let _ = world.switch_to_buffer(rb.id)
+        kernel.emit_hook("buffer-switched", rb.id)
+        status_emit("Showing *Registers*")#
+        return ()
+    }
+
+    if verb == "marks" {
+        let lines = render_marks_lines(world, buf)
+        let mb = world.ensure_special_buffer("*Marks*", "text", lines, read_only = true)
+        let _ = world.switch_to_buffer(mb.id)
+        kernel.emit_hook("buffer-switched", mb.id)
+        status_emit("Showing *Marks*")#
+        return ()
+    }
+
+    if verb == "undotree" {
+        let _ = dispatch_if_available(kernel, "undo-tree-visualize", List())#!
+        return ()
+    }
+
+    if verb == "ext" or verb == "extensions" {
+        let handled_ext = dispatch_if_available(kernel, "list-extensions", List())#!
+        if handled_ext {
+            return ()
+        }
+        let lines = render_extensions_lines(kernel)
+        let eb = world.ensure_special_buffer("*Extensions*", "text", lines, read_only = true)
+        let _ = world.switch_to_buffer(eb.id)
+        kernel.emit_hook("buffer-switched", eb.id)
+        status_emit("Showing *Extensions*")#
+        return ()
+    }
+
+    if verb == "pwd" {
+        status_emit(world.cwd)#
+        return ()
+    }
+
+    if verb == "cd" {
+        let target_dir = if arg == "" {
+            world.cwd
+        } else {
+            world.resolve_path(arg)
+        }
+        if not (fs.exists(target_dir) and fs.is_dir(target_dir)) {
+            status_emit("E344: Can't find directory \"" ++ target_dir ++ "\"")#
+            return ()
+        }
+        world.cwd = target_dir
+        status_emit(world.cwd)#
+        return ()
+    }
+
+    if verb == "Ex" or verb == "Explore" {
+        let dir_args = if arg != "" { [arg] } else { List() }
+        let handled_dirvish = dispatch_if_available(kernel, "dirvish", dir_args)#!
+        if handled_dirvish {
+            return ()
+        }
+        let handled_ex = dispatch_if_available(kernel, "dired", dir_args)#!
+        if not handled_ex {
+            status_emit("directory explorer extension is not active")#
+        }
+        return ()
+    }
+
+    if verb == "grep" {
+        if arg == "" {
+            let _ = dispatch_if_available(kernel, "grep", List())#!
+        } else {
+            let _ = dispatch_if_available(kernel, "grep", [arg])#!
+        }
+        return ()
+    }
+
+    if verb == "make" {
+        let make_args = if arg != "" { [arg] } else { List() }
+        let _ = dispatch_if_available(kernel, "compile", make_args)#!
+        return ()
+    }
+
+    -- Fallback: allow invoking any registered Lava or plugin Ex command (`:Telescope`, `:Magit`, `:Lazy`, `:<command-name>`)!
+    let call_args = if arg != "" { [arg] } else { List() }
+    let camel_kebab = camel_to_kebab(verb)
+    let candidates = [
+        "ex:" ++ verb,
+        "ex:" ++ verb.to_lower(),
+        verb,
+        verb.replace("_", "-"),
+        verb.to_lower(),
+        verb.to_lower().replace("_", "-"),
+        camel_kebab,
+    ]
+    for cand_i in 0..candidates.len() {
+        let cand_cmd = candidates.get(cand_i.as(usize)).as(String)
+        if cand_cmd != "" and kernel.get_command(cand_cmd) != null {
+            let _ = kernel.dispatch_command(cand_cmd, call_args)#!
+            return ()
+        }
+    }
+
+    status_emit("E492: Not an editor command: " ++ stripped)#
+    ()
+}
+
+fn camel_to_kebab(s: String) -> String {
+    let n = s.char_len()
+    var out = ""
+    for i in 0..n {
+        let ch = s.slice(i, i + 1)
+        if ch == "_" {
+            out = out ++ "-"
+        } else if ch.is_ascii_uppercase() {
+            let prev_lower = i > 0 and s.slice(i - 1, i).is_ascii_lowercase()
+            let next_lower = (i + 1 < n) and s.slice(i + 1, i + 2).is_ascii_lowercase()
+            if i > 0 and (prev_lower or (s.slice(i - 1, i).is_ascii_uppercase() and next_lower)) {
+                out = out ++ "-"
+            }
+            out = out ++ ch.to_lower()
+        } else {
+            out = out ++ ch
+        }
+    }
+    out
+}

@@ -1,0 +1,111 @@
+use std.io
+use @lava_sys.DrawCmd
+use @lava_core.{
+    SystemKernel, clipboard_get, clipboard_set, log_event, status_emit
+}
+use @ext_document.{
+    BufferKind, register_document_extension, require_editor_world
+}
+use @ext_window.{
+    register_window_extension, require_window_manager
+}
+use @ext_vim.register_vim_extension
+use @ext_render.{compose_frame, register_render_extension}
+use @ext_tablist.{
+    OWNER_TABLIST, is_tablist_open, register_tablist_extension, require_tablist_service
+}
+
+fn assert_true(cond: bool, msg: String) {
+    if not cond {
+        panic("ASSERTION FAILED: " ++ msg)
+    }
+}
+
+fn run_cmd(kernel: SystemKernel, cmd_name: String, args: List) -> Any {
+    handles(log_event)(_lvl: String, _src: String, _msg: String) -> Unit { () }
+    handles(status_emit)(_msg: String) -> Unit { () }
+    handles(clipboard_get)() -> String { "" }
+    handles(clipboard_set)(_s: String) -> Unit { () }
+    kernel.dispatch_command(cmd_name, args)
+}
+
+fn main() {
+    let kernel = SystemKernel.new()
+    let _ = register_document_extension(kernel) ! { e => panic(e) }
+    let _ = register_window_extension(kernel) ! { e => panic(e) }
+    let _ = register_vim_extension(kernel) ! { e => panic(e) }
+    let _ = register_render_extension(kernel) ! { e => panic(e) }
+    let _ = register_tablist_extension(kernel) ! { e => panic(e) }
+    let _ = kernel.activate_all() ! { e => panic(e) }
+
+    let world = require_editor_world(kernel) ! { e => panic(e) }
+    let wm = require_window_manager(kernel) ! { e => panic(e) }
+    let svc = require_tablist_service(kernel) ! { e => panic(e) }
+
+    -- 1. Default state: horizontal tab bar is off, vertical tablist is closed by default
+    assert_true(not world.options.show_tab_bar, "show_tab_bar defaults to false")
+    assert_true(not world.left_sidebar.visible, "left_sidebar defaults to closed")
+    assert_true(not is_tablist_open(world), "vertical tablist is closed by default")
+
+    let b1 = world.active_buffer()
+    let b2 = world.create_buffer("alpha.ns", BufferKind.File)
+    let b3 = world.create_buffer("beta.ns", BufferKind.File)
+    let _ = world.switch_to_buffer(b1.id)
+
+    -- 2. Toggle open: renders vertically in left_sidebar
+    let _ = run_cmd(kernel, "tablist-toggle", [])
+    assert_true(is_tablist_open(world), "tablist-toggle opens vertical tablist")
+    assert_true(world.left_sidebar.side == "left", "tablist renders in left sidebar")
+    assert_true(world.left_sidebar.owner == OWNER_TABLIST, "sidebar owner is ext_tablist")
+    assert_true(world.left_sidebar.lines.len() >= 4, "vertical list has header + 3 buffer rows")
+    assert_true(
+        world.left_sidebar.lines.get(0).as(String).starts_with("▾ BUFFERS"),
+        "first row is BUFFERS header",
+    )
+
+    -- Compose frame and verify Tablist title is drawn in sidebar
+    let (_, cmds) = compose_frame(kernel, world, wm)
+    var saw_tablist_hdr = false
+    for i in 0..cmds.len() {
+        let cmd = cmds.get(i.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.TextRun(_, _, text, _, _, _, _, _, _) => {
+                if text == "Tablist" {
+                    saw_tablist_hdr = true
+                }
+            },
+            _ => (),
+        }
+    }
+    assert_true(saw_tablist_hdr, "compose_frame renders vertical Tablist sidebar header")
+
+    -- 3. Click row for beta.ns
+    var beta_row: i64 = -1
+    for i in 0..world.left_sidebar.lines.len() {
+        let ln = world.left_sidebar.lines.get(i.as(usize)).as(String)
+        if ln.contains("beta.ns") {
+            beta_row = i
+            break
+        }
+    }
+    assert_true(beta_row > 0, "found beta.ns row in vertical tablist")
+    kernel.emit_hook("sidebar-clicked", (OWNER_TABLIST, beta_row))
+    assert_true(world.active_buffer_id == b3.id, "clicking vertical tablist row switches buffer")
+    assert_true(world.left_sidebar.selected_row == beta_row, "selected_row updates to clicked buffer")
+
+    -- 4. Multi-tab workspace shows vertical TABS section too
+    let _ = run_cmd(kernel, "tab-new", [])
+    let _ = run_cmd(kernel, "tablist-refresh", [])
+    assert_true(
+        world.left_sidebar.lines.get(0).as(String).starts_with("▾ TABS"),
+        "multi-tab workspace shows vertical TABS section",
+    )
+    assert_true(svc.entries.len() == world.left_sidebar.lines.len(), "entries stay aligned with rows")
+
+    -- 5. Close via tablist-toggle
+    let _ = run_cmd(kernel, "tablist-toggle", [])
+    assert_true(not is_tablist_open(world), "second tablist-toggle closes vertical tablist")
+    assert_true(not world.left_sidebar.visible, "left_sidebar is hidden again")
+
+    io.println("PASS: test_tablist — vertical tablist defaults to closed, toggles cleanly, and switches tabs/buffers!")
+}

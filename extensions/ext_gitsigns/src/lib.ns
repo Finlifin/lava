@@ -1,0 +1,914 @@
+-- ext_gitsigns: Real-time Git Buffer Hunk Decorations, Inline Blame & Hunk Actions (`gitsigns.nvim`).
+-- Publishes service `"lava.gitsigns.state"` exposing per-buffer `(added, changed, deleted)` counts.
+
+use std.collections.{HashMap, Set}
+use std.fs
+use std.path
+use std.process
+use @lava_sys.rgba
+use @lava_core.{
+    ExtId, InteractiveEffects, SystemKernel, clipboard_get, clipboard_set, log_event, status_emit
+}
+use @lava_accel.{
+    DiffHunk, GitBlame, accel_doc_diff_head, accel_git_blame_line, accel_git_head_lines,
+    accel_git_status
+}
+use @ext_document.{
+    Buffer, BufferId, BufferKind, EditorWorld, FloatingWindow, Pos, ext_document_id,
+    require_editor_world
+}
+use @ext_vim.{KEYMAP_VIM_LEADER, KEYMAP_VIM_NORMAL, ext_vim_id}
+
+pub const SERVICE_GITSIGNS: String = "lava.gitsigns.state"
+pub const OWNER_GITSIGNS: String = "ext_gitsigns"
+pub const FLOAT_GITSIGNS_PREVIEW: String = "gitsigns-preview"
+
+pub fn ext_gitsigns_id() -> ExtId = ExtId("lava.org/ext_gitsigns")
+
+pub fn rgba_hex(hex_rgb: i64, alpha: i64) -> i64 {
+    let r = (hex_rgb / 65536) % 256
+    let g = (hex_rgb / 256) % 256
+    let b = hex_rgb % 256
+    rgba(r, g, b, alpha)
+}
+
+fn max_i64(a: i64, b: i64) -> i64 {
+    if a >= b { a } else { b }
+}
+
+fn min_i64(a: i64, b: i64) -> i64 {
+    if a <= b { a } else { b }
+}
+
+fn clone_str_list(src: List) -> List {
+    let out = List()
+    for i in 0..src.len() {
+        out.push(src.get(i.as(usize)).as(String))
+    }
+    out
+}
+
+pub struct GitsignsState {
+    pub head_cache: HashMap,
+    pub untracked_cache: Set,
+    pub hunks_by_buf: HashMap,
+    pub counts_by_buf: HashMap,
+    pub last_ver_by_buf: HashMap,
+    pub last_win_by_buf: HashMap,
+    pub tracked_by_buf: HashMap,
+    pub blame_enabled: bool,
+}
+
+impl GitsignsState {
+    pub fn new() -> GitsignsState {
+        GitsignsState {
+            head_cache: HashMap.new(),
+            untracked_cache: Set.new(),
+            hunks_by_buf: HashMap.new(),
+            counts_by_buf: HashMap.new(),
+            last_ver_by_buf: HashMap.new(),
+            last_win_by_buf: HashMap.new(),
+            tracked_by_buf: HashMap.new(),
+            blame_enabled: false,
+        }
+    }
+
+    pub fn hunk_counts(self, buf_id: BufferId) -> (i64, i64, i64) {
+        let entry? = self.counts_by_buf.get(buf_id) else {
+            return (0, 0, 0)
+        }
+        entry.as((i64, i64, i64))
+    }
+
+    pub fn buffer_counts(self, buf_id: BufferId) -> (i64, i64, i64) {
+        self.hunk_counts(buf_id)
+    }
+
+    pub fn buffer_hunks(self, buf_id: BufferId) -> List {
+        let entry? = self.hunks_by_buf.get(buf_id) else {
+            return List()
+        }
+        entry.as(List)
+    }
+
+    pub fn invalidate_file(self, file_path: String) {
+        if file_path != "" {
+            let norm = path.normalize(file_path)
+            let _ = self.head_cache.remove(norm)
+            let _ = self.untracked_cache.remove(norm)
+        }
+    }
+
+    pub fn clear_all_caches(self) {
+        self.head_cache = HashMap.new()
+        self.untracked_cache = Set.new()
+        self.hunks_by_buf = HashMap.new()
+        self.counts_by_buf = HashMap.new()
+        self.last_ver_by_buf = HashMap.new()
+        self.last_win_by_buf = HashMap.new()
+        self.tracked_by_buf = HashMap.new()
+    }
+}
+
+pub fn require_gitsigns_state(kernel: SystemKernel) -> !String GitsignsState {
+    let raw = kernel.require_service(SERVICE_GITSIGNS)!
+    raw.as(GitsignsState)
+}
+
+fn effective_git_cwd(world: EditorWorld, file_path: String) -> String {
+    if file_path != "" {
+        let p_opt = path.parent(file_path)
+        if p_opt != null {
+            let pdir = p_opt.as(String)
+            if pdir != "" and fs.is_dir(pdir) {
+                return pdir
+            }
+        }
+    }
+    world.cwd
+}
+
+fn fetch_base_lines(world: EditorWorld, state: GitsignsState, file_path: String, force_reload: bool) -> ?List {
+    if file_path == "" {
+        return null
+    }
+    let norm = path.normalize(file_path)
+    if not force_reload {
+        if state.head_cache.contains_key(norm) {
+            return state.head_cache.get(norm).as(List)
+        }
+        if state.untracked_cache.contains(norm) {
+            return null
+        }
+    } else {
+        let _ = state.head_cache.remove(norm)
+        let _ = state.untracked_cache.remove(norm)
+    }
+
+    let cwd = effective_git_cwd(world, norm)
+    let head_opt = accel_git_head_lines(cwd, norm)
+    let raw_lines? = head_opt else {
+        state.untracked_cache.insert(norm)
+        return null
+    }
+    let lines = clone_str_list(raw_lines)
+    state.head_cache.insert(norm, lines)
+    lines
+}
+
+fn hunk_anchor_row(buf: Buffer, hunk: DiffHunk) -> i64 {
+    let raw_row = if hunk.kind == "delete" {
+        max_i64(0, hunk.new_start - 1)
+    } else {
+        hunk.new_start
+    }
+    let max_r = buf.max_row()
+    if raw_row < 0 {
+        0
+    } else if raw_row > max_r {
+        max_r
+    } else {
+        raw_row
+    }
+}
+
+fn compute_gitsigns_window(world: EditorWorld, lcount: i64) -> (i64, i64) {
+    if lcount <= 400 {
+        return (0, lcount)
+    }
+    let vrows = if world.viewport_rows > 0 { world.viewport_rows } else { 36 }
+    let raw_start = world.viewport_top_row - 30
+    let win_start = if raw_start > 0 { raw_start } else { 0 }
+    let raw_end = world.viewport_top_row + vrows + 50
+    let win_end = if raw_end < lcount { raw_end } else { lcount }
+    (win_start, win_end)
+}
+
+fn viewport_escaped_gitsigns_window(
+    world: EditorWorld,
+    lcount: i64,
+    win_start: i64,
+    win_end: i64,
+) -> bool {
+    if lcount <= 400 {
+        return false
+    }
+    let top_r = if world.viewport_top_row > 0 { world.viewport_top_row } else { 0 }
+    let vrows = if world.viewport_rows > 0 { world.viewport_rows } else { 36 }
+    let bot_r = if top_r + vrows < lcount { top_r + vrows } else { lcount }
+    (win_start > 0 and top_r < win_start + 10)
+        or (win_end < lcount and bot_r > win_end - 10)
+}
+
+fn apply_gitsigns_decorations(world: EditorWorld, state: GitsignsState, buf: Buffer, hunks: List, is_tracked: bool) {
+    buf.clear_owner_decors(OWNER_GITSIGNS)
+    let lcount = buf.line_count()
+    let (win_start, win_end) = compute_gitsigns_window(world, lcount)
+    state.last_win_by_buf.insert(buf.id, (win_start, win_end, buf.point.row))
+    if not is_tracked {
+        return
+    }
+
+    let add_col = rgba_hex(0x9ECE6A, 255)
+    let chg_col = rgba_hex(0x7AA2F7, 255)
+    let del_col = rgba_hex(0xF7768E, 255)
+    let max_r = buf.max_row()
+
+    for i in 0..hunks.len() {
+        let h = hunks.get(i.as(usize)).as(DiffHunk)
+        if h.kind == "add" {
+            let lo_r = max_i64(h.new_start, win_start)
+            let hi_r = min_i64(h.new_start + h.new_count, win_end)
+            for r in lo_r..hi_r {
+                if r >= 0 and r <= max_r {
+                    buf.add_sign(OWNER_GITSIGNS, r, "▍", add_col, priority = 15)
+                }
+            }
+        } else if h.kind == "change" {
+            let lo_r = max_i64(h.new_start, win_start)
+            let hi_r = min_i64(h.new_start + h.new_count, win_end)
+            for r in lo_r..hi_r {
+                if r >= 0 and r <= max_r {
+                    buf.add_sign(OWNER_GITSIGNS, r, "▍", chg_col, priority = 15)
+                }
+            }
+        } else if h.kind == "delete" {
+            let sign_r = max_i64(0, h.new_start - 1)
+            let clamped_r = if sign_r > max_r { max_r } else { sign_r }
+            if clamped_r >= win_start and clamped_r < win_end {
+                buf.add_sign(OWNER_GITSIGNS, clamped_r, "▁", del_col, priority = 16)
+            }
+        }
+    }
+
+    if state.blame_enabled and buf.file_path != "" {
+        let cur_row = buf.point.row
+        let cwd = effective_git_cwd(world, buf.file_path)
+        let blame_opt = accel_git_blame_line(cwd, buf.file_path, cur_row)
+        let blame = if blame_opt != null {
+            blame_opt.as(GitBlame)
+        } else {
+            GitBlame {
+                commit_short: "0000000",
+                author: "Uncommitted",
+                date_ymd: "recent",
+                summary: "Not committed yet",
+            }
+        }
+        let vt_text = "   " ++ blame.author ++ ", " ++ blame.date_ymd ++ " • " ++ blame.summary
+        buf.add_virt_text(OWNER_GITSIGNS, cur_row, vt_text, rgba_hex(0x6C7086, 255), italic = true)
+    }
+}
+
+pub fn refresh_buffer_gitsigns(
+    world: EditorWorld,
+    state: GitsignsState,
+    buf: Buffer,
+    force_reload_head: bool,
+) {
+    if buf.kind != BufferKind.File or buf.file_path == "" {
+        buf.clear_owner_decors(OWNER_GITSIGNS)
+        let _ = state.hunks_by_buf.remove(buf.id)
+        let _ = state.counts_by_buf.remove(buf.id)
+        let _ = state.last_ver_by_buf.remove(buf.id)
+        let _ = state.last_win_by_buf.remove(buf.id)
+        let _ = state.tracked_by_buf.remove(buf.id)
+        return
+    }
+
+    if force_reload_head {
+        state.invalidate_file(buf.file_path)
+    }
+
+    buf.sync_external_lines()
+    let diff_opt = accel_doc_diff_head(buf.doc_id, buf.file_path, force_reload_head)
+    let diff_res? = diff_opt else {
+        buf.clear_owner_decors(OWNER_GITSIGNS)
+        state.hunks_by_buf.insert(buf.id, List())
+        state.counts_by_buf.insert(buf.id, (0, 0, 0))
+        state.tracked_by_buf.insert(buf.id, false)
+        state.last_ver_by_buf.insert(buf.id, buf.edit_version)
+        let lcount = buf.line_count()
+        let (ws, we) = compute_gitsigns_window(world, lcount)
+        state.last_win_by_buf.insert(buf.id, (ws, we, buf.point.row))
+        buf.vars.insert("gitsigns_counts", (0, 0, 0))
+        return
+    }
+
+    let (hunks, added, changed, deleted) = diff_res
+    state.hunks_by_buf.insert(buf.id, hunks)
+    state.counts_by_buf.insert(buf.id, (added, changed, deleted))
+    state.tracked_by_buf.insert(buf.id, true)
+    state.last_ver_by_buf.insert(buf.id, buf.edit_version)
+    buf.vars.insert("gitsigns_counts", (added, changed, deleted))
+    buf.vars.insert("gitsigns_added", added)
+    buf.vars.insert("gitsigns_changed", changed)
+    buf.vars.insert("gitsigns_deleted", deleted)
+
+    apply_gitsigns_decorations(world, state, buf, hunks, true)
+}
+
+fn ensure_buffer_diff_current(world: EditorWorld, state: GitsignsState, buf: Buffer) {
+    if buf.kind != BufferKind.File or buf.file_path == "" {
+        return
+    }
+    buf.sync_external_lines()
+    let last_ver_opt = state.last_ver_by_buf.get(buf.id)
+    if last_ver_opt == null or last_ver_opt.as(i64) != buf.edit_version {
+        refresh_buffer_gitsigns(world, state, buf, false)
+        return
+    }
+
+    let lcount = buf.line_count()
+    let win_opt = state.last_win_by_buf.get(buf.id)
+    if win_opt != null {
+        let (ws, we, prev_row) = win_opt.as((i64, i64, i64))
+        let escaped = viewport_escaped_gitsigns_window(world, lcount, ws, we)
+        if (not state.blame_enabled) and (not escaped) {
+            return
+        }
+        if state.blame_enabled and buf.point.row == prev_row and (not escaped) {
+            return
+        }
+    }
+
+    let hunks = state.buffer_hunks(buf.id)
+    let tracked_opt = state.tracked_by_buf.get(buf.id)
+    let tracked = if tracked_opt != null { tracked_opt.as(bool) } else { false }
+    apply_gitsigns_decorations(world, state, buf, hunks, tracked)
+}
+
+fn find_hunk_at_cursor(buf: Buffer, hunks: List) -> ?(i64, DiffHunk) {
+    if hunks.is_empty() {
+        return null
+    }
+    let row = buf.point.row
+    for i in 0..hunks.len() {
+        let h = hunks.get(i.as(usize)).as(DiffHunk)
+        if h.kind == "delete" {
+            let sr = max_i64(0, h.new_start - 1)
+            if row == sr or row == h.new_start {
+                return (i, h)
+            }
+        } else {
+            if row >= h.new_start and row < h.new_start + h.new_count {
+                return (i, h)
+            }
+        }
+    }
+    -- Fallback to hunk within 1 line if cursor is right adjacent
+    for i in 0..hunks.len() {
+        let h = hunks.get(i.as(usize)).as(DiffHunk)
+        let ar = hunk_anchor_row(buf, h)
+        if ar - row >= -1 and ar - row <= 1 {
+            return (i, h)
+        }
+    }
+    null
+}
+
+fn format_hunk_unified_lines(head_lines: List, buf: Buffer, hunk: DiffHunk) -> List {
+    let old_1 = if hunk.old_count == 0 { hunk.old_start } else { hunk.old_start + 1 }
+    let new_1 = if hunk.new_count == 0 { hunk.new_start } else { hunk.new_start + 1 }
+    let hdr = "@@ -" ++ old_1.to_string() ++ "," ++ hunk.old_count.to_string()
+        ++ " +" ++ new_1.to_string() ++ "," ++ hunk.new_count.to_string() ++ " @@"
+    let out = List()
+    out.push(hdr)
+    for i in 0..hunk.old_count {
+        let idx = hunk.old_start + i
+        if idx >= 0 and idx < head_lines.len() {
+            out.push("-" ++ head_lines.get(idx.as(usize)).as(String))
+        }
+    }
+    let lcount = buf.line_count()
+    let slice_lo = max_i64(0, hunk.new_start)
+    let slice_hi = min_i64(lcount, hunk.new_start + hunk.new_count)
+    if slice_hi > slice_lo {
+        let added_slice = buf.slice_lines(slice_lo, slice_hi)
+        for j in 0..added_slice.len() {
+            out.push("+" ++ added_slice.get(j.as(usize)).as(String))
+        }
+    }
+    out
+}
+
+fn splice_hunk_into_base(base_lines: List, buf: Buffer, hunk: DiffHunk) -> List {
+    let out = List()
+    for i in 0..hunk.old_start {
+        if i < base_lines.len() {
+            out.push(base_lines.get(i.as(usize)).as(String))
+        }
+    }
+    let lcount = buf.line_count()
+    let slice_lo = max_i64(0, hunk.new_start)
+    let slice_hi = min_i64(lcount, hunk.new_start + hunk.new_count)
+    if slice_hi > slice_lo {
+        let added_slice = buf.slice_lines(slice_lo, slice_hi)
+        for j in 0..added_slice.len() {
+            out.push(added_slice.get(j.as(usize)).as(String))
+        }
+    }
+    let tail_start = hunk.old_start + hunk.old_count
+    for k in tail_start..base_lines.len() {
+        out.push(base_lines.get(k.as(usize)).as(String))
+    }
+    out
+}
+
+fn replace_hunk_in_buffer(buf: Buffer, start_row: i64, del_count: i64, old_slice: List) -> !String Unit {
+    let old_total = buf.line_count()
+    if del_count <= 0 {
+        if old_slice.is_empty() {
+            return ()
+        }
+        if start_row <= 0 {
+            let _ = buf.insert_lines_above(0, old_slice)!
+        } else if start_row >= old_total {
+            let _ = buf.insert_lines_below(old_total - 1, old_slice)!
+        } else {
+            let _ = buf.insert_lines_above(start_row, old_slice)!
+        }
+        return ()
+    }
+
+    if start_row <= 0 and del_count >= old_total {
+        let _ = buf.delete_lines(0, old_total - 1)!
+        if not old_slice.is_empty() {
+            buf.set_line_at(0, old_slice.get(0).as(String))
+            if old_slice.len() > 1 {
+                let tail = List()
+                for i in 1..old_slice.len() {
+                    tail.push(old_slice.get(i.as(usize)).as(String))
+                }
+                let _ = buf.insert_lines_below(0, tail)!
+            }
+        }
+        return ()
+    }
+
+    let del_hi = min_i64(old_total - 1, start_row + del_count - 1)
+    let reached_eof = start_row + del_count >= old_total
+    let _ = buf.delete_lines(start_row, del_hi)!
+    if not old_slice.is_empty() {
+        if reached_eof {
+            let _ = buf.insert_lines_below(start_row - 1, old_slice)!
+        } else {
+            let _ = buf.insert_lines_above(start_row, old_slice)!
+        }
+    }
+    ()
+}
+
+fn cmd_jump_hunk(kernel: SystemKernel, forward: bool) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_gitsigns_state(kernel)!
+    let buf = world.active_buffer()
+    ensure_buffer_diff_current(world, state, buf)
+    let hunks = state.buffer_hunks(buf.id)
+    if hunks.is_empty() {
+        status_emit("No git hunks in buffer")#
+        return ()
+    }
+
+    let cur_row = buf.point.row
+    var target_idx: i64 = -1
+    if forward {
+        for i in 0..hunks.len() {
+            let h = hunks.get(i.as(usize)).as(DiffHunk)
+            let ar = hunk_anchor_row(buf, h)
+            if ar > cur_row {
+                target_idx = i
+                break
+            }
+        }
+        if target_idx < 0 {
+            target_idx = 0
+        }
+    } else {
+        var i = hunks.len() - 1
+        while i >= 0 {
+            let h = hunks.get(i.as(usize)).as(DiffHunk)
+            let ar = hunk_anchor_row(buf, h)
+            if ar < cur_row {
+                target_idx = i
+                break
+            }
+            i -= 1
+        }
+        if target_idx < 0 {
+            target_idx = hunks.len() - 1
+        }
+    }
+
+    let chosen = hunks.get(target_idx.as(usize)).as(DiffHunk)
+    let dest_row = hunk_anchor_row(buf, chosen)
+    world.jumps.record(buf.id, buf.file_path, buf.point)
+    buf.point = buf.clamp_pos(Pos.new(dest_row, buf.first_non_blank_col(dest_row)), insert_mode = false)
+    buf.preferred_col = buf.point.col
+    ensure_buffer_diff_current(world, state, buf)
+    status_emit(
+        "Hunk " ++ (target_idx + 1).to_string() ++ "/" ++ hunks.len().to_string()
+        ++ " (" ++ chosen.kind ++ ")"
+    )#
+    ()
+}
+
+fn cmd_preview_hunk(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_gitsigns_state(kernel)!
+    let buf = world.active_buffer()
+    ensure_buffer_diff_current(world, state, buf)
+    let hunks = state.buffer_hunks(buf.id)
+    let hit? = find_hunk_at_cursor(buf, hunks) else {
+        let _ = world.remove_floating_window(FLOAT_GITSIGNS_PREVIEW)
+        status_emit("No git hunk at cursor")#
+        return ()
+    }
+    let (idx, hunk) = hit
+    let head_opt = fetch_base_lines(world, state, buf.file_path, false)
+    if head_opt == null {
+        status_emit("File is not tracked in git HEAD")#
+        return ()
+    }
+    let diff_lines = format_hunk_unified_lines(head_opt.as(List), buf, hunk)
+    var max_w: i64 = 44
+    for i in 0..diff_lines.len() {
+        let ln_len = diff_lines.get(i.as(usize)).as(String).char_len() + 4
+        if ln_len > max_w {
+            max_w = ln_len
+        }
+    }
+    if max_w > 96 {
+        max_w = 96
+    }
+    let height_r = if diff_lines.len() < 3 {
+        3
+    } else if diff_lines.len() > 18 {
+        18
+    } else {
+        diff_lines.len()
+    }
+    let title = " Hunk " ++ (idx + 1).to_string() ++ "/" ++ hunks.len().to_string() ++ " [" ++ hunk.kind ++ "] "
+    world.set_floating_window(FloatingWindow {
+        id: FLOAT_GITSIGNS_PREVIEW,
+        owner: OWNER_GITSIGNS,
+        title: title,
+        anchor: "center",
+        width_cols: max_w,
+        height_rows: height_r,
+        lines: diff_lines,
+        selected_row: 0,
+        border_rgba: rgba_hex(0x7AA2F7, 255),
+    })
+    status_emit("Previewing hunk " ++ (idx + 1).to_string() ++ "/" ++ hunks.len().to_string())#
+    ()
+}
+
+fn cmd_reset_hunk(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_gitsigns_state(kernel)!
+    let buf = world.active_buffer()
+    buf.ensure_writable()!
+    ensure_buffer_diff_current(world, state, buf)
+    let hunks = state.buffer_hunks(buf.id)
+    let hit? = find_hunk_at_cursor(buf, hunks) else {
+        status_emit("No git hunk at cursor")#
+        return ()
+    }
+    let (_, hunk) = hit
+    let head_opt = fetch_base_lines(world, state, buf.file_path, false)
+    if head_opt == null {
+        status_emit("File is not tracked in git HEAD")#
+        return ()
+    }
+    let head_lines = head_opt.as(List)
+    let old_slice = List()
+    for j in 0..hunk.old_count {
+        let hi = hunk.old_start + j
+        if hi >= 0 and hi < head_lines.len() {
+            old_slice.push(head_lines.get(hi.as(usize)).as(String))
+        }
+    }
+
+    replace_hunk_in_buffer(buf, hunk.new_start, hunk.new_count, old_slice)!
+    let dest_r = if hunk.new_start <= buf.max_row() { hunk.new_start } else { buf.max_row() }
+    buf.point = buf.clamp_pos(Pos.new(dest_r, buf.first_non_blank_col(dest_r)), insert_mode = false)
+    buf.preferred_col = buf.point.col
+    buf.checkpoint(buf.point, "gitsigns-reset-hunk")
+
+    let _ = world.remove_floating_window(FLOAT_GITSIGNS_PREVIEW)
+    refresh_buffer_gitsigns(world, state, buf, false)
+    buf.modified = not state.buffer_hunks(buf.id).is_empty()
+    kernel.emit_hook("buffer-modified", buf.id)
+    status_emit("Reset git hunk (" ++ hunk.kind ++ ")")#
+    ()
+}
+
+fn cmd_stage_hunk(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_gitsigns_state(kernel)!
+    let buf = world.active_buffer()
+    ensure_buffer_diff_current(world, state, buf)
+    let hunks = state.buffer_hunks(buf.id)
+    let hit? = find_hunk_at_cursor(buf, hunks) else {
+        status_emit("No git hunk at cursor")#
+        return ()
+    }
+    let (hunk_idx, hunk) = hit
+    let head_opt = fetch_base_lines(world, state, buf.file_path, false)
+    if head_opt == null {
+        status_emit("File is not tracked in git")#
+        return ()
+    }
+    let base_lines = head_opt.as(List)
+    let cwd = effective_git_cwd(world, buf.file_path)
+    let st = accel_git_status(cwd)
+    if not st.is_repo {
+        status_emit("Not inside a git repository")#
+        return ()
+    }
+    let full = path.normalize(buf.file_path)
+    let prefix = st.root ++ "/"
+    if not full.starts_with(prefix) {
+        status_emit("File is outside git repository root")#
+        return ()
+    }
+    let rel = full.drop(prefix.char_len())
+    let body_lines = format_hunk_unified_lines(base_lines, buf, hunk)
+    let patch = "diff --git a/" ++ rel ++ " b/" ++ rel ++ "\n"
+        ++ "--- a/" ++ rel ++ "\n"
+        ++ "+++ b/" ++ rel ++ "\n"
+        ++ body_lines.join("\n") ++ "\n"
+
+    let apply_res = process.exec(
+        "git",
+        args = ["apply", "--cached", "--unidiff-zero", "-"],
+        stdin_data = patch,
+        cwd = st.root,
+    )
+    var staged_ok = false
+    apply_res match {
+        out! => {
+            if out.success() {
+                staged_ok = true
+            }
+        },
+        error _ => (),
+    }
+
+    if not staged_ok {
+        status_emit("Failed to stage hunk into git index")#
+        return ()
+    }
+
+    let updated_base = splice_hunk_into_base(base_lines, buf, hunk)
+    state.head_cache.insert(full, updated_base)
+    let remaining_hunks = List()
+    var added: i64 = 0
+    var changed: i64 = 0
+    var deleted: i64 = 0
+    for hi in 0..hunks.len() {
+        if hi != hunk_idx {
+            let rh = hunks.get(hi.as(usize)).as(DiffHunk)
+            remaining_hunks.push(rh)
+            if rh.kind == "add" {
+                added += rh.new_count
+            } else if rh.kind == "change" {
+                changed += max_i64(rh.new_count, rh.old_count)
+            } else if rh.kind == "delete" {
+                deleted += rh.old_count
+            }
+        }
+    }
+    state.hunks_by_buf.insert(buf.id, remaining_hunks)
+    state.counts_by_buf.insert(buf.id, (added, changed, deleted))
+    buf.vars.insert("gitsigns_counts", (added, changed, deleted))
+    buf.vars.insert("gitsigns_added", added)
+    buf.vars.insert("gitsigns_changed", changed)
+    buf.vars.insert("gitsigns_deleted", deleted)
+    let _ = world.remove_floating_window(FLOAT_GITSIGNS_PREVIEW)
+    apply_gitsigns_decorations(world, state, buf, remaining_hunks, true)
+    status_emit("Staged git hunk (" ++ hunk.kind ++ ")")#
+    ()
+}
+
+fn cmd_toggle_blame(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_gitsigns_state(kernel)!
+    state.blame_enabled = not state.blame_enabled
+    let buf = world.active_buffer()
+    let _ = state.last_win_by_buf.remove(buf.id)
+    ensure_buffer_diff_current(world, state, buf)
+    let flag_txt = if state.blame_enabled { "ON" } else { "OFF" }
+    status_emit("Gitsigns current-line blame: " ++ flag_txt)#
+    ()
+}
+
+fn cmd_refresh_gitsigns(kernel: SystemKernel) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_gitsigns_state(kernel)!
+    let buf = world.active_buffer()
+    refresh_buffer_gitsigns(world, state, buf, true)
+    let (a, c, d) = state.hunk_counts(buf.id)
+    status_emit(
+        "Gitsigns refreshed (+" ++ a.to_string()
+        ++ " ~" ++ c.to_string()
+        ++ " -" ++ d.to_string() ++ ")"
+    )#
+    ()
+}
+
+fn on_buffer_reload_hook(kernel: SystemKernel, payload: Any) {
+    let w_opt = kernel.service("lava.document.world")
+    let s_opt = kernel.service(SERVICE_GITSIGNS)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let state = s_opt.as(GitsignsState)
+    let buf = if payload matches _: BufferId {
+        let b_opt = world.buffer(payload.as(BufferId))
+        if b_opt != null { b_opt.as(Buffer) } else { world.active_buffer() }
+    } else {
+        world.active_buffer()
+    }
+    refresh_buffer_gitsigns(world, state, buf, true)
+}
+
+fn on_buffer_sync_hook(kernel: SystemKernel, _payload: Any) {
+    let w_opt = kernel.service("lava.document.world")
+    let s_opt = kernel.service(SERVICE_GITSIGNS)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let state = s_opt.as(GitsignsState)
+    let buf = world.active_buffer()
+    ensure_buffer_diff_current(world, state, buf)
+}
+
+fn on_gitsigns_insert_hook(kernel: SystemKernel, _payload: Any) {
+    let w_opt = kernel.service("lava.document.world")
+    let s_opt = kernel.service(SERVICE_GITSIGNS)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let buf = world.active_buffer()
+    if buf.line_count() > 2000 {
+        return
+    }
+    let state = s_opt.as(GitsignsState)
+    ensure_buffer_diff_current(world, state, buf)
+}
+
+pub fn register_gitsigns_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_gitsigns_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_gitsigns",
+        "0.1.0",
+        "Real-time Git buffer hunk signs, inline line blame, hunk preview float, stage & reset.",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let state = GitsignsState.new()
+            k.publish_service(SERVICE_GITSIGNS, ext_id, state)
+
+            k.register_command(
+                "gitsigns-next-hunk",
+                ext_id,
+                "Jump to next Git diff hunk (`]c`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    cmd_jump_hunk(kern, true)#
+                },
+            )
+
+            k.register_command(
+                "gitsigns-prev-hunk",
+                ext_id,
+                "Jump to previous Git diff hunk (`[c`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    cmd_jump_hunk(kern, false)#
+                },
+            )
+
+            k.register_command(
+                "gitsigns-stage-hunk",
+                ext_id,
+                "Stage Git diff hunk under cursor into Git index (`<Space> h s`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    cmd_stage_hunk(kern)#
+                },
+            )
+
+            k.register_command(
+                "gitsigns-reset-hunk",
+                ext_id,
+                "Reset Git diff hunk under cursor back to HEAD (`<Space> h r`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    cmd_reset_hunk(kern)#
+                },
+            )
+
+            k.register_command(
+                "gitsigns-preview-hunk",
+                ext_id,
+                "Preview unified diff of hunk under cursor in floating window (`<Space> h p`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    cmd_preview_hunk(kern)#
+                },
+            )
+
+            k.register_command(
+                "gitsigns-toggle-blame",
+                ext_id,
+                "Toggle end-of-line Git blame virtual text (`<Space> g b`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    cmd_toggle_blame(kern)#
+                },
+            )
+
+            k.register_command(
+                "gitsigns-refresh",
+                ext_id,
+                "Reload HEAD baseline and recompute Git diff signs (`:Gitsigns refresh`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    cmd_refresh_gitsigns(kern)#
+                },
+            )
+
+            k.register_command(
+                "gitsigns",
+                ext_id,
+                "Gitsigns dispatcher (`:Gitsigns [refresh|toggle_blame|preview_hunk|reset_hunk|stage_hunk|next_hunk|prev_hunk]`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let sub = if args.is_empty() {
+                        "refresh"
+                    } else {
+                        args.get(0).as(String).trim().to_lower()
+                    }
+                    when {
+                        sub == "toggle_blame" or sub == "blame" => cmd_toggle_blame(kern)#,
+                        sub == "preview_hunk" or sub == "preview" => cmd_preview_hunk(kern)#,
+                        sub == "reset_hunk" or sub == "reset" => cmd_reset_hunk(kern)#,
+                        sub == "stage_hunk" or sub == "stage" => cmd_stage_hunk(kern)#,
+                        sub == "next_hunk" or sub == "next" => cmd_jump_hunk(kern, true)#,
+                        sub == "prev_hunk" or sub == "prev" => cmd_jump_hunk(kern, false)#,
+                        sub == "close_preview" => {
+                            let w = require_editor_world(kern)!
+                            let _ = w.remove_floating_window(FLOAT_GITSIGNS_PREVIEW)
+                            ()
+                        },
+                        else => cmd_refresh_gitsigns(kern)#,
+                    }
+                },
+            )
+
+            let norm_km = k.ensure_keymap(KEYMAP_VIM_NORMAL)
+            norm_km.bind("] c", "gitsigns-next-hunk", ext_id, description = "Next git hunk")
+            norm_km.bind("[ c", "gitsigns-prev-hunk", ext_id, description = "Previous git hunk")
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> g b", "gitsigns-toggle-blame", ext_id, description = "Toggle git line blame")
+            leader_km.bind("<Space> h s", "gitsigns-stage-hunk", ext_id, description = "Stage git hunk")
+            leader_km.bind("<Space> h r", "gitsigns-reset-hunk", ext_id, description = "Reset git hunk")
+            leader_km.bind("<Space> h p", "gitsigns-preview-hunk", ext_id, description = "Preview git hunk")
+
+            k.add_hook("buffer-opened", ext_id, on_buffer_reload_hook)
+            k.add_hook("buffer-saved", ext_id, on_buffer_reload_hook)
+            k.add_hook("buffer-switched", ext_id, |kern: SystemKernel, payload: Any| -> Unit {
+                let w_opt = kern.service("lava.document.world")
+                if w_opt != null {
+                    let _ = w_opt.as(EditorWorld).remove_floating_window(FLOAT_GITSIGNS_PREVIEW)
+                }
+                on_buffer_sync_hook(kern, payload)
+            })
+            k.add_hook("buffer-modified", ext_id, on_buffer_sync_hook)
+            k.add_hook("cursor-moved", ext_id, on_buffer_sync_hook)
+            k.add_hook("mode-changed", ext_id, on_buffer_sync_hook)
+            k.add_hook("after-insert-stroke", ext_id, on_gitsigns_insert_hook)
+            k.add_hook("vim-yank", ext_id, on_buffer_sync_hook)
+
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                let w = w_opt.as(EditorWorld)
+                refresh_buffer_gitsigns(w, state, w.active_buffer(), true)
+            }
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                w_opt.as(EditorWorld).clear_owner_ui(OWNER_GITSIGNS)
+            }
+            let _ = k.ensure_keymap(KEYMAP_VIM_NORMAL).unbind("] c")
+            let _ = k.ensure_keymap(KEYMAP_VIM_NORMAL).unbind("[ c")
+            let _ = k.ensure_keymap(KEYMAP_VIM_LEADER).unbind("<Space> g b")
+            let _ = k.ensure_keymap(KEYMAP_VIM_LEADER).unbind("<Space> h s")
+            let _ = k.ensure_keymap(KEYMAP_VIM_LEADER).unbind("<Space> h r")
+            let _ = k.ensure_keymap(KEYMAP_VIM_LEADER).unbind("<Space> h p")
+            ()
+        },
+    )
+}

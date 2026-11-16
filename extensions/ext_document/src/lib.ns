@@ -1,0 +1,2855 @@
+-- ext_document: Independent Document, Buffer, Undo-Tree, Kill-Ring & World State Extension.
+-- Publishes service `"lava.document.world"` (`EditorWorld`) and core buffer/document commands
+-- onto `SystemKernel` using ordinary Nessa mechanisms and algebraic effects.
+
+use std.collections.{HashMap, Set}
+use std.env
+use std.fs
+use std.path
+use @lava_sys.{CaretShape}
+use @lava_accel.{
+    accel_doc_clone_from_lines, accel_doc_delete_lines, accel_doc_delete_span,
+    accel_doc_extract_span, accel_doc_find_backward, accel_doc_find_forward,
+    accel_doc_find_matching_bracket, accel_doc_free, accel_doc_insert_line,
+    accel_doc_insert_lines, accel_doc_insert_text, accel_doc_line_at, accel_doc_line_char_len,
+    accel_doc_line_count, accel_doc_new, accel_doc_open_file, accel_doc_remove_line,
+    accel_doc_save_file, accel_doc_set_line, accel_doc_slice_lines,
+    accel_doc_snapshot_matches, accel_doc_snapshot_restore, accel_doc_snapshot_take,
+    accel_doc_to_text_capped
+}
+use @lava_remote.{
+    is_ssh_uri, join_ssh_uri, normalize_ssh_uri, remote_read_lines, remote_stat,
+    remote_write_lines, ssh_uri_basename
+}
+use @lava_core.{
+    ExtId, InteractiveEffects, KeyBindingEntry, PromptKind, PromptRequest, ServiceEffects,
+    SystemKernel, ask_prompt, clipboard_get, clipboard_set, log_event, status_emit
+}
+
+pub const SERVICE_EDITOR_WORLD: String = "lava.document.world"
+pub const SMALL_MIRROR_LIMIT: i64 = 2048
+
+pub fn ext_document_id() -> ExtId = ExtId("lava.org/ext_document")
+
+-- ============================================================================
+-- 1. Nominal BufferId, Coordinates, Spans & Narrowing
+-- ============================================================================
+
+pub newtype BufferId = i64
+derive Eq, PartialEq, Ord, PartialOrd, Display, Hash for BufferId
+
+impl BufferId {
+    pub fn raw(self) -> i64 {
+        let BufferId(n) = self
+        n
+    }
+}
+
+pub struct Pos {
+    pub row: i64,
+    pub col: i64,
+}
+derive Eq, PartialEq, Ord, PartialOrd, Hash for Pos
+
+impl Pos {
+    pub fn zero() -> Pos = Pos { row: 0, col: 0 }
+
+    pub fn new(row: i64, col: i64) -> Pos = Pos { row: row, col: col }
+}
+
+impl Display for Pos {
+    pub fn to_string(self) -> String {
+        "(" ++ (self.row + 1).to_string() ++ ":" ++ (self.col + 1).to_string() ++ ")"
+    }
+}
+
+pub struct Span {
+    pub start: Pos,
+    pub end: Pos,
+}
+derive Eq, PartialEq for Span
+
+impl Span {
+    pub fn normalized(a: Pos, b: Pos) -> Span {
+        if a <= b {
+            Span { start: a, end: b }
+        } else {
+            Span { start: b, end: a }
+        }
+    }
+
+    pub fn contains(self, p: Pos) -> bool {
+        p >= self.start and p < self.end
+    }
+}
+
+pub struct NarrowRegion {
+    pub start_row: i64,
+    pub end_row: i64,
+}
+derive Eq, PartialEq for NarrowRegion
+
+pub enum BufferKind {
+    pub File,
+    pub Scratch,
+    pub Special,
+    pub Directory,
+    pub Results,
+}
+derive Eq, PartialEq, Display for BufferKind
+
+-- ============================================================================
+-- 2. Branching UndoTree
+-- ============================================================================
+
+pub struct UndoNode {
+    pub id: i64,
+    pub parent_id: i64,
+    pub children: List,
+    pub active_branch: i64,
+    pub doc_id: i64,
+    pub snap_id: i64,
+    pub cursor: Pos,
+    pub label: String,
+    pub seq: i64,
+}
+
+fn clone_string_list(src: List) -> List {
+    let out = List()
+    let n = src.len()
+    for i in 0..n {
+        out.push(src.get(i.as(usize)).as(String))
+    }
+    out
+}
+
+pub struct UndoTree {
+    pub nodes: List,
+    pub current_id: i64,
+    pub next_seq: i64,
+}
+
+impl UndoTree {
+    pub fn new_doc(doc_id: i64, cursor: Pos) -> UndoTree {
+        let snap_id = accel_doc_snapshot_take(doc_id)
+        let root = UndoNode {
+            id: 0,
+            parent_id: -1,
+            children: List(),
+            active_branch: 0,
+            doc_id: doc_id,
+            snap_id: snap_id,
+            cursor: cursor,
+            label: "initial",
+            seq: 0,
+        }
+        let nodes = List()
+        nodes.push(root)
+        UndoTree {
+            nodes: nodes,
+            current_id: 0,
+            next_seq: 1,
+        }
+    }
+
+    pub fn new(initial_lines: List, cursor: Pos) -> UndoTree {
+        let clean = if initial_lines.is_empty() { [""] } else { initial_lines }
+        let doc_id = accel_doc_new(clean)
+        UndoTree.new_doc(doc_id, cursor)
+    }
+
+    pub fn reinit_doc(self, doc_id: i64, cursor: Pos) {
+        let fresh = UndoTree.new_doc(doc_id, cursor)
+        self.nodes = fresh.nodes
+        self.current_id = 0
+        self.next_seq = 1
+    }
+
+    pub fn reinit(self, lines: List, cursor: Pos) {
+        if not self.nodes.is_empty() {
+            let root = self.nodes.get(0).as(UndoNode)
+            if root.doc_id > 0 {
+                if not lines.is_empty() and lines.len() <= SMALL_MIRROR_LIMIT {
+                    accel_doc_clone_from_lines(root.doc_id, lines)
+                }
+                self.reinit_doc(root.doc_id, cursor)
+                return
+            }
+        }
+        let clean = if lines.is_empty() { [""] } else { lines }
+        let doc_id = accel_doc_new(clean)
+        self.reinit_doc(doc_id, cursor)
+    }
+
+    pub fn checkpoint_doc(self, doc_id: i64, cursor: Pos, label: String) {
+        let cur = self.nodes.get(self.current_id.as(usize)).as(UndoNode)
+        if cur.doc_id == doc_id and accel_doc_snapshot_matches(doc_id, cur.snap_id) {
+            cur.cursor = cursor
+            return
+        }
+        let snap_id = accel_doc_snapshot_take(doc_id)
+        let new_id = self.nodes.len()
+        let seq = self.next_seq
+        self.next_seq += 1
+        let node = UndoNode {
+            id: new_id,
+            parent_id: self.current_id,
+            children: List(),
+            active_branch: 0,
+            doc_id: doc_id,
+            snap_id: snap_id,
+            cursor: cursor,
+            label: label,
+            seq: seq,
+        }
+        self.nodes.push(node)
+        cur.children.push(new_id)
+        cur.active_branch = cur.children.len() - 1
+        self.current_id = new_id
+    }
+
+    pub fn checkpoint(self, lines: List, cursor: Pos, label: String) {
+        if not self.nodes.is_empty() {
+            let root = self.nodes.get(0).as(UndoNode)
+            if root.doc_id > 0 {
+                if not lines.is_empty() and lines.len() <= SMALL_MIRROR_LIMIT {
+                    accel_doc_clone_from_lines(root.doc_id, lines)
+                }
+                self.checkpoint_doc(root.doc_id, cursor, label)
+                return
+            }
+        }
+        let clean = if lines.is_empty() { [""] } else { lines }
+        let doc_id = accel_doc_new(clean)
+        self.reinit_doc(doc_id, cursor)
+    }
+
+    pub fn undo_doc(self) -> ?(i64, Pos, String) {
+        let cur = self.nodes.get(self.current_id.as(usize)).as(UndoNode)
+        if cur.parent_id < 0 {
+            return null
+        }
+        let parent = self.nodes.get(cur.parent_id.as(usize)).as(UndoNode)
+        self.current_id = parent.id
+        (parent.snap_id, parent.cursor, cur.label)
+    }
+
+    pub fn redo_doc(self) -> ?(i64, Pos, String) {
+        let cur = self.nodes.get(self.current_id.as(usize)).as(UndoNode)
+        let n = cur.children.len()
+        if n == 0 {
+            return null
+        }
+        var b = cur.active_branch
+        if b < 0 or b >= n {
+            b = n - 1
+        }
+        let child_id = cur.children.get(b.as(usize)).as(i64)
+        let child = self.nodes.get(child_id.as(usize)).as(UndoNode)
+        self.current_id = child_id
+        (child.snap_id, child.cursor, child.label)
+    }
+
+    pub fn switch_branch_doc(self, delta: i64) -> ?(i64, Pos, String) {
+        let cur = self.nodes.get(self.current_id.as(usize)).as(UndoNode)
+        if cur.parent_id < 0 {
+            return null
+        }
+        let parent = self.nodes.get(cur.parent_id.as(usize)).as(UndoNode)
+        let count = parent.children.len()
+        if count <= 1 {
+            return null
+        }
+        var next_idx = (parent.active_branch + delta) % count
+        if next_idx < 0 {
+            next_idx += count
+        }
+        parent.active_branch = next_idx
+        let sibling_id = parent.children.get(next_idx.as(usize)).as(i64)
+        let sibling = self.nodes.get(sibling_id.as(usize)).as(UndoNode)
+        self.current_id = sibling_id
+        (sibling.snap_id, sibling.cursor, sibling.label)
+    }
+
+    pub fn undo(self) -> ?(List, Pos, String) {
+        let cur = self.nodes.get(self.current_id.as(usize)).as(UndoNode)
+        let step? = self.undo_doc() else {
+            return null
+        }
+        let (snap_id, cursor, label) = step
+        let _ = accel_doc_snapshot_restore(cur.doc_id, snap_id)
+        let count = accel_doc_line_count(cur.doc_id)
+        let lines = if count <= SMALL_MIRROR_LIMIT {
+            accel_doc_slice_lines(cur.doc_id, 0, count)
+        } else {
+            List()
+        }
+        (lines, cursor, label)
+    }
+
+    pub fn redo(self) -> ?(List, Pos, String) {
+        let cur = self.nodes.get(self.current_id.as(usize)).as(UndoNode)
+        let step? = self.redo_doc() else {
+            return null
+        }
+        let (snap_id, cursor, label) = step
+        let _ = accel_doc_snapshot_restore(cur.doc_id, snap_id)
+        let count = accel_doc_line_count(cur.doc_id)
+        let lines = if count <= SMALL_MIRROR_LIMIT {
+            accel_doc_slice_lines(cur.doc_id, 0, count)
+        } else {
+            List()
+        }
+        (lines, cursor, label)
+    }
+
+    pub fn switch_branch(self, delta: i64) -> ?(List, Pos, String) {
+        let cur = self.nodes.get(self.current_id.as(usize)).as(UndoNode)
+        let step? = self.switch_branch_doc(delta) else {
+            return null
+        }
+        let (snap_id, cursor, label) = step
+        let _ = accel_doc_snapshot_restore(cur.doc_id, snap_id)
+        let count = accel_doc_line_count(cur.doc_id)
+        let lines = if count <= SMALL_MIRROR_LIMIT {
+            accel_doc_slice_lines(cur.doc_id, 0, count)
+        } else {
+            List()
+        }
+        (lines, cursor, label)
+    }
+
+    pub fn node_count(self) -> i64 = self.nodes.len()
+
+    pub fn branch_count_at_parent(self) -> i64 {
+        let cur = self.nodes.get(self.current_id.as(usize)).as(UndoNode)
+        if cur.parent_id < 0 {
+            return 1
+        }
+        self.nodes.get(cur.parent_id.as(usize)).as(UndoNode).children.len()
+    }
+
+    pub fn render_tree_lines(self) -> List {
+        let out = List()
+        out.push("Undo-Tree (" ++ self.nodes.len().to_string() ++ " states, current #" ++ self.current_id.to_string() ++ ")")
+        out.push("========================================================")
+        self.render_dfs(0, "", true, out)
+        out
+    }
+
+    private fn render_dfs(self, node_id: i64, indent: String, is_last: bool, out: List) {
+        let node = self.nodes.get(node_id.as(usize)).as(UndoNode)
+        let marker = if node.id == self.current_id { " * [CURRENT]" } else { "" }
+        let connector = if node.id == 0 {
+            ""
+        } else if is_last {
+            "└─ "
+        } else {
+            "├─ "
+        }
+        out.push(
+            indent ++ connector ++ "#" ++ node.seq.to_string() ++ " (" ++ node.label ++ ") "
+            ++ node.cursor.to_string() ++ marker
+        )
+        let child_indent = if node.id == 0 {
+            ""
+        } else if is_last {
+            indent ++ "   "
+        } else {
+            indent ++ "│  "
+        }
+        let count = node.children.len()
+        for i in 0..count {
+            let cid = node.children.get(i.as(usize)).as(i64)
+            self.render_dfs(cid, child_indent, i == count - 1, out)
+        }
+    }
+}
+
+-- ============================================================================
+-- 3. KillRing & Unified Vim/Emacs RegisterBank
+-- ============================================================================
+
+pub struct RegisterValue {
+    pub text: String,
+    pub linewise: bool,
+    pub blockwise: bool,
+}
+
+impl RegisterValue {
+    pub fn chars(text: String) -> RegisterValue {
+        RegisterValue { text: text, linewise: false, blockwise: false }
+    }
+
+    pub fn lines(text: String) -> RegisterValue {
+        RegisterValue { text: text, linewise: true, blockwise: false }
+    }
+
+    pub fn block(text: String) -> RegisterValue {
+        RegisterValue { text: text, linewise: false, blockwise: true }
+    }
+}
+
+pub struct KillRing {
+    pub entries: List,
+    pub yank_index: i64,
+    pub max_entries: i64,
+    pub last_was_kill: bool,
+    pub last_yank_span: ?(BufferId, Span),
+}
+
+impl KillRing {
+    pub fn new() -> KillRing {
+        KillRing {
+            entries: List(),
+            yank_index: 0,
+            max_entries: 60,
+            last_was_kill: false,
+            last_yank_span: null,
+        }
+    }
+
+    pub fn push(self, text: String, .linewise: bool = false, .append: bool = false) {
+        if text == "" {
+            return
+        }
+        if append and self.last_was_kill and (not self.entries.is_empty()) {
+            let top_idx = (self.entries.len() - 1).as(usize)
+            let prev = self.entries.get(top_idx).as(RegisterValue)
+            self.entries.set(
+                top_idx,
+                RegisterValue {
+                    text: prev.text ++ text,
+                    linewise: prev.linewise or linewise,
+                    blockwise: false,
+                },
+            )
+        } else {
+            self.entries.push(RegisterValue {
+                text: text,
+                linewise: linewise,
+                blockwise: false,
+            })
+            if self.entries.len() > self.max_entries {
+                let _ = self.entries.remove(0)
+            }
+        }
+        self.yank_index = self.entries.len() - 1
+        self.last_was_kill = true
+    }
+
+    pub fn clear_kill_streak(self) {
+        self.last_was_kill = false
+    }
+
+    pub fn current(self) -> ?RegisterValue {
+        if self.entries.is_empty() {
+            return null
+        }
+        var idx = self.yank_index
+        if idx < 0 or idx >= self.entries.len() {
+            idx = self.entries.len() - 1
+            self.yank_index = idx
+        }
+        self.entries.get(idx.as(usize)).as(RegisterValue)
+    }
+
+    pub fn rotate_yank_pop(self) -> ?RegisterValue {
+        let n = self.entries.len()
+        if n == 0 {
+            return null
+        }
+        self.yank_index = (self.yank_index - 1 + n) % n
+        self.entries.get(self.yank_index.as(usize)).as(RegisterValue)
+    }
+}
+
+pub struct RegisterBank {
+    pub named: HashMap,
+    pub unnamedplus: bool,
+    pub yank_history: List,
+}
+
+impl RegisterBank {
+    pub fn new() -> RegisterBank {
+        RegisterBank {
+            named: HashMap.new(),
+            unnamedplus: true,
+            yank_history: List(),
+        }
+    }
+
+    pub fn record_yank_history(self, val: RegisterValue) {
+        if val.text == "" {
+            return
+        }
+        if not self.yank_history.is_empty() {
+            let top = self.yank_history.get((self.yank_history.len() - 1).as(usize)).as(RegisterValue)
+            if top.text == val.text and top.linewise == val.linewise {
+                return
+            }
+        }
+        self.yank_history.push(val)
+        if self.yank_history.len() > 50 {
+            let _ = self.yank_history.remove(0)
+        }
+    }
+
+    pub fn get_reg(self, name: String) -> #clipboard_get ?RegisterValue {
+        let target = if name == "" { "\"" } else { name }
+        if target == "+" or target == "*" {
+            let clip = clipboard_get()#
+            if clip == "" {
+                let fallback? = self.named.get("+") else {
+                    return null
+                }
+                return fallback.as(RegisterValue)
+            }
+            let linewise = clip.ends_with("\n")
+            return (RegisterValue { text: clip, linewise: linewise, blockwise: false })
+        }
+        let key = if target.char_len() == 1 and target.is_ascii_uppercase() {
+            target.to_lower()
+        } else {
+            target
+        }
+        let v_opt = self.named.get(key)
+        if v_opt != null {
+            return v_opt.as(RegisterValue)
+        }
+        if key == "\"" and self.unnamedplus {
+            let clip = clipboard_get()#
+            if clip != "" {
+                return (RegisterValue {
+                    text: clip,
+                    linewise: clip.ends_with("\n"),
+                    blockwise: false,
+                })
+            }
+        }
+        null
+    }
+
+    pub fn set_reg(self, name: String, val: RegisterValue) -> #clipboard_set Unit {
+        let target = if name == "" { "\"" } else { name }
+        if target == "_" {
+            -- Black-hole register discards writes
+            return ()
+        }
+        self.named.insert("\"", val)
+        if target == "+" or target == "*" {
+            self.named.insert("+", val)
+            clipboard_set(val.text)#
+            return ()
+        }
+        if target == "\"" and self.unnamedplus {
+            self.named.insert("+", val)
+            clipboard_set(val.text)#
+            return ()
+        }
+        if target.char_len() == 1 and target.is_ascii_uppercase() {
+            let lower = target.to_lower()
+            let prev_opt = self.named.get(lower)
+            if prev_opt != null {
+                let prev = prev_opt.as(RegisterValue)
+                let sep = if prev.linewise and (not prev.text.ends_with("\n")) { "\n" } else { "" }
+                let merged = RegisterValue {
+                    text: prev.text ++ sep ++ val.text,
+                    linewise: prev.linewise or val.linewise,
+                    blockwise: false,
+                }
+                self.named.insert(lower, merged)
+                self.named.insert("\"", merged)
+                return ()
+            }
+            self.named.insert(lower, val)
+            return ()
+        }
+        self.named.insert(target, val)
+        ()
+    }
+
+    pub fn yank_store(self, val: RegisterValue, .reg: String = "") -> #clipboard_set Unit {
+        if reg != "_" {
+            self.record_yank_history(val)
+        }
+        self.named.insert("0", val)
+        self.set_reg(reg, val)#
+    }
+
+    pub fn delete_store(
+        self,
+        val: RegisterValue,
+        kill_ring: KillRing,
+        .reg: String = "",
+        .append_kill: bool = false,
+    ) -> #clipboard_set Unit {
+        if reg == "_" {
+            return ()
+        }
+        self.record_yank_history(val)
+        kill_ring.push(val.text, linewise = val.linewise, append = append_kill)
+        -- Shift numbered delete registers "8 -> "9 ... "1 -> "2 when multi-line or linewise
+        if val.linewise or val.text.contains("\n") {
+            var k: i64 = 8
+            while k >= 1 {
+                let old_opt = self.named.get(k.to_string())
+                if old_opt != null {
+                    self.named.insert((k + 1).to_string(), old_opt.as(RegisterValue))
+                }
+                k -= 1
+            }
+            self.named.insert("1", val)
+        } else {
+            self.named.insert("-", val)
+        }
+        self.set_reg(reg, val)#
+    }
+
+    pub fn summary_lines(self) -> List {
+        let out = List()
+        out.push("Type Name  Content")
+        out.push("---- ----  ----------------------------------------")
+        let keys = self.named.keys()
+        keys.sort()
+        let n = keys.len()
+        for i in 0..n {
+            let k = keys.get(i.as(usize)).as(String)
+            let v = self.named.get(k).as(RegisterValue)
+            let kind_tag = if v.blockwise {
+                "  b "
+            } else if v.linewise {
+                "  l "
+            } else {
+                "  c "
+            }
+            let preview = v.text.replace("\n", "^J")
+            let clipped = if preview.char_len() > 64 {
+                preview.take(64) ++ "..."
+            } else {
+                preview
+            }
+            out.push(kind_tag ++ " \"" ++ k ++ "    " ++ clipped)
+        }
+        out
+    }
+}
+
+-- ============================================================================
+-- 4. JumpList & Quickfix Entries (`*Grep*` / `*Compilation*`)
+-- ============================================================================
+
+pub struct JumpEntry {
+    pub buf_id: BufferId,
+    pub file_path: String,
+    pub pos: Pos,
+}
+
+pub struct JumpList {
+    pub entries: List,
+    pub index: i64,
+}
+
+impl JumpList {
+    pub fn new() -> JumpList {
+        JumpList { entries: List(), index: 0 }
+    }
+
+    pub fn record(self, buf_id: BufferId, file_path: String, pos: Pos) {
+        -- Truncate forward history if jumping from the middle
+        while self.entries.len() > self.index {
+            let _ = self.entries.pop()
+        }
+        if not self.entries.is_empty() {
+            let last = self.entries.get((self.entries.len() - 1).as(usize)).as(JumpEntry)
+            if last.buf_id == buf_id and last.pos.row == pos.row {
+                return
+            }
+        }
+        self.entries.push(JumpEntry {
+            buf_id: buf_id,
+            file_path: file_path,
+            pos: pos,
+        })
+        if self.entries.len() > 100 {
+            let _ = self.entries.remove(0)
+        }
+        self.index = self.entries.len()
+    }
+
+    pub fn jump_back(self, cur_buf: BufferId, cur_file: String, cur_pos: Pos) -> ?JumpEntry {
+        if self.entries.is_empty() {
+            return null
+        }
+        if self.index == self.entries.len() {
+            self.entries.push(JumpEntry {
+                buf_id: cur_buf,
+                file_path: cur_file,
+                pos: cur_pos,
+            })
+            self.index = self.entries.len() - 1
+        }
+        if self.index <= 0 {
+            return null
+        }
+        self.index -= 1
+        self.entries.get(self.index.as(usize)).as(JumpEntry)
+    }
+
+    pub fn jump_forward(self) -> ?JumpEntry {
+        if self.index + 1 >= self.entries.len() {
+            return null
+        }
+        self.index += 1
+        self.entries.get(self.index.as(usize)).as(JumpEntry)
+    }
+}
+
+pub struct QuickfixEntry {
+    pub file_path: String,
+    pub row: i64,
+    pub col: i64,
+    pub text: String,
+}
+
+-- Parse `path:line:col:text` or `path:line:text` diagnostic/grep output lines.
+pub fn parse_quickfix_line(line: String) -> ?QuickfixEntry {
+    let first_split? = line.split_once(":") else {
+        return null
+    }
+    let (fpath, rest1) = first_split
+    if fpath.trim() == "" {
+        return null
+    }
+    let second_split? = rest1.split_once(":") else {
+        return null
+    }
+    let (line_str, rest2) = second_split
+    let line_num? = line_str.trim().parse_i64() else {
+        return null
+    }
+    if line_num < 1 {
+        return null
+    }
+    -- Optional `:col:` segment
+    let third_opt = rest2.split_once(":")
+    if third_opt != null {
+        let (col_str, msg) = third_opt.as((String, String))
+        let col_num_opt = col_str.trim().parse_i64()
+        if col_num_opt != null {
+            let cnum = col_num_opt.as(i64)
+            let safe_col = if cnum > 0 { cnum - 1 } else { 0 }
+            return (QuickfixEntry {
+                file_path: fpath.trim(),
+                row: line_num - 1,
+                col: safe_col,
+                text: msg,
+            })
+        }
+    }
+    QuickfixEntry {
+        file_path: fpath.trim(),
+        row: line_num - 1,
+        col: 0,
+        text: rest2,
+    }
+}
+
+-- ============================================================================
+-- 5. Buffer Document Model, Plugin Decorations & Rich Editing Primitives
+-- ============================================================================
+
+pub struct GutterSign {
+    pub owner: String,
+    pub row: i64,
+    pub text: String,
+    pub fg_rgba: i64,
+    pub priority: i64,
+}
+
+pub struct InlineSpanDecor {
+    pub owner: String,
+    pub row: i64,
+    pub start_col: i64,
+    pub end_col: i64,
+    pub bg_rgba: i64,
+    pub fg_rgba: i64,
+    pub underline: bool,
+    pub replace_label: String,
+}
+
+pub struct VirtualTextDecor {
+    pub owner: String,
+    pub row: i64,
+    pub text: String,
+    pub fg_rgba: i64,
+    pub italic: bool,
+}
+
+pub fn detect_major_mode(file_path: String) -> String {
+    if file_path == "" {
+        return "text"
+    }
+    let lower = file_path.to_lower()
+    when {
+        lower.ends_with(".ns") => "nessa",
+        lower.ends_with(".rs") => "rust",
+        lower.ends_with(".py") => "python",
+        lower.ends_with(".c") or lower.ends_with(".h") or lower.ends_with(".cpp") or lower.ends_with(".hpp") => "c",
+        lower.ends_with(".ts") or lower.ends_with(".tsx") => "typescript",
+        lower.ends_with(".js") or lower.ends_with(".jsx") or lower.ends_with(".mjs") => "javascript",
+        lower.ends_with(".go") => "go",
+        lower.ends_with(".lua") => "lua",
+        lower.ends_with(".org") => "org",
+        lower.ends_with(".md") or lower.ends_with(".markdown") => "markdown",
+        lower.ends_with(".toml") => "toml",
+        lower.ends_with(".json") => "json",
+        lower.ends_with(".yaml") or lower.ends_with(".yml") => "yaml",
+        lower.ends_with(".html") or lower.ends_with(".htm") or lower.ends_with(".xml") => "html",
+        lower.ends_with(".css") or lower.ends_with(".scss") => "css",
+        lower.ends_with(".sh") or lower.ends_with(".bash") or lower.ends_with(".zsh") => "shell",
+        lower.ends_with(".diff") or lower.ends_with(".patch") => "diff",
+        lower.ends_with("makefile") or lower.ends_with("/makefile") => "makefile",
+        else => "text",
+    }
+}
+
+fn split_text_preserving_empty_lines(text: String) -> List {
+    if text == "" {
+        return [""]
+    }
+    let normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    let parts = normalized.split("\n")
+    -- If text ended with a trailing newline, drop the single trailing empty artifact so saving round-trips cleanly.
+    if parts.len() > 1 and normalized.ends_with("\n") {
+        let _ = parts.pop()
+    }
+    if parts.is_empty() {
+        parts.push("")
+    }
+    parts
+}
+
+pub struct Buffer {
+    pub id: BufferId,
+    pub name: String,
+    pub file_path: String,
+    pub kind: BufferKind,
+    pub major_mode: String,
+    pub doc_id: i64,
+    pub edit_version: i64,
+    pub native_large: bool,
+    pub lines: List,
+    pub crlf: bool,
+    pub modified: bool,
+    pub read_only: bool,
+    pub point: Pos,
+    pub preferred_col: i64,
+    pub mark: ?Pos,
+    pub mark_active: bool,
+    pub mark_ring: List,
+    pub named_marks: HashMap,
+    pub narrow: ?NarrowRegion,
+    pub folded_rows: Set,
+    pub undo_tree: UndoTree,
+    pub vars: HashMap,
+    pub signs: List,
+    pub inline_decors: List,
+    pub virt_texts: List,
+}
+
+impl Buffer {
+    pub fn new(
+        id: BufferId,
+        name: String,
+        kind: BufferKind,
+        .file_path: String = "",
+        .major_mode: String = "text",
+        .initial_lines: ?List = null,
+    ) -> Buffer {
+        var doc_id: i64 = 0
+        var is_large = false
+        var mirror = List()
+        if initial_lines != null {
+            let l = initial_lines.as(List)
+            if l.is_empty() {
+                mirror = [""]
+                doc_id = accel_doc_new(mirror)
+            } else if l.len() > SMALL_MIRROR_LIMIT {
+                is_large = true
+                doc_id = accel_doc_new(l)
+            } else {
+                mirror = clone_string_list(l)
+                doc_id = accel_doc_new(mirror)
+            }
+        } else {
+            mirror = [""]
+            doc_id = accel_doc_new(mirror)
+        }
+        let p0 = Pos.zero()
+        Buffer {
+            id: id,
+            name: name,
+            file_path: file_path,
+            kind: kind,
+            major_mode: major_mode,
+            doc_id: doc_id,
+            edit_version: 1,
+            native_large: is_large,
+            lines: mirror,
+            crlf: false,
+            modified: false,
+            read_only: false,
+            point: p0,
+            preferred_col: 0,
+            mark: null,
+            mark_active: false,
+            mark_ring: List(),
+            named_marks: HashMap.new(),
+            narrow: null,
+            folded_rows: Set.new(),
+            undo_tree: UndoTree.new_doc(doc_id, p0),
+            vars: HashMap.new(),
+            signs: List(),
+            inline_decors: List(),
+            virt_texts: List(),
+        }
+    }
+
+    pub fn create_from_doc_id(
+        id: BufferId,
+        name: String,
+        kind: BufferKind,
+        doc_id: i64,
+        line_count: i64,
+        crlf: bool,
+        .file_path: String = "",
+        .major_mode: String = "text",
+    ) -> Buffer {
+        let eff_count = if line_count > 0 { line_count } else { accel_doc_line_count(doc_id) }
+        let is_large = eff_count > SMALL_MIRROR_LIMIT
+        let mirror = if is_large {
+            List()
+        } else {
+            accel_doc_slice_lines(doc_id, 0, eff_count)
+        }
+        let p0 = Pos.zero()
+        Buffer {
+            id: id,
+            name: name,
+            file_path: file_path,
+            kind: kind,
+            major_mode: major_mode,
+            doc_id: doc_id,
+            edit_version: 1,
+            native_large: is_large,
+            lines: mirror,
+            crlf: crlf,
+            modified: false,
+            read_only: false,
+            point: p0,
+            preferred_col: 0,
+            mark: null,
+            mark_active: false,
+            mark_ring: List(),
+            named_marks: HashMap.new(),
+            narrow: null,
+            folded_rows: Set.new(),
+            undo_tree: UndoTree.new_doc(doc_id, p0),
+            vars: HashMap.new(),
+            signs: List(),
+            inline_decors: List(),
+            virt_texts: List(),
+        }
+    }
+
+    pub fn bump_version(self) {
+        self.edit_version += 1
+    }
+
+    pub fn sync_external_lines(self) {
+        if not self.native_large {
+            let doc_cnt = accel_doc_line_count(self.doc_id)
+            if self.lines.len() != doc_cnt {
+                if self.lines.is_empty() {
+                    self.lines.push("")
+                }
+                accel_doc_clone_from_lines(self.doc_id, self.lines)
+                if self.lines.len() > SMALL_MIRROR_LIMIT {
+                    self.native_large = true
+                    self.lines = List()
+                }
+                self.edit_version += 1
+            }
+        }
+    }
+
+    private fn refresh_mirror_from_doc(self) {
+        let count = accel_doc_line_count(self.doc_id)
+        if count > SMALL_MIRROR_LIMIT {
+            self.native_large = true
+            self.lines = List()
+        } else {
+            self.native_large = false
+            self.lines = accel_doc_slice_lines(self.doc_id, 0, count)
+        }
+    }
+
+    pub fn line_count(self) -> i64 {
+        self.sync_external_lines()
+        let c = accel_doc_line_count(self.doc_id)
+        if c <= 0 { 1 } else { c }
+    }
+
+    pub fn is_narrowed(self) -> bool = self.narrow != null
+
+    pub fn min_row(self) -> i64 {
+        let nr? = self.narrow else {
+            return 0
+        }
+        let max_idx = self.line_count() - 1
+        if nr.start_row < 0 {
+            0
+        } else if nr.start_row > max_idx {
+            max_idx
+        } else {
+            nr.start_row
+        }
+    }
+
+    pub fn max_row(self) -> i64 {
+        let max_idx = self.line_count() - 1
+        let nr? = self.narrow else {
+            return max_idx
+        }
+        let lo = self.min_row()
+        if nr.end_row < lo {
+            lo
+        } else if nr.end_row > max_idx {
+            max_idx
+        } else {
+            nr.end_row
+        }
+    }
+
+    pub fn narrow_to_region(self, start_row: i64, end_row: i64) {
+        let lo = if start_row <= end_row { start_row } else { end_row }
+        let hi = if start_row <= end_row { end_row } else { start_row }
+        let max_idx = self.line_count() - 1
+        let clamped_lo = if lo < 0 { 0 } else if lo > max_idx { max_idx } else { lo }
+        let clamped_hi = if hi < clamped_lo { clamped_lo } else if hi > max_idx { max_idx } else { hi }
+        self.narrow = NarrowRegion { start_row: clamped_lo, end_row: clamped_hi }
+        self.point = self.clamp_pos(self.point, insert_mode = true)
+    }
+
+    pub fn widen(self) {
+        self.narrow = null
+    }
+
+    pub fn line_at(self, row: i64) -> String {
+        self.sync_external_lines()
+        let count = accel_doc_line_count(self.doc_id)
+        if row < 0 or row >= count {
+            return ""
+        }
+        accel_doc_line_at(self.doc_id, row)
+    }
+
+    pub fn line_char_len(self, row: i64) -> i64 {
+        self.sync_external_lines()
+        let count = accel_doc_line_count(self.doc_id)
+        if row < 0 or row >= count {
+            return 0
+        }
+        accel_doc_line_char_len(self.doc_id, row)
+    }
+
+    pub fn slice_lines(self, start_row: i64, end_row_exclusive: i64) -> List {
+        self.sync_external_lines()
+        accel_doc_slice_lines(self.doc_id, start_row, end_row_exclusive)
+    }
+
+    pub fn set_line_at(self, row: i64, text: String) {
+        self.sync_external_lines()
+        let count = accel_doc_line_count(self.doc_id)
+        if row < 0 or row >= count {
+            return
+        }
+        accel_doc_set_line(self.doc_id, row, text)
+        if (not self.native_large) and row < self.lines.len() {
+            self.lines.set(row.as(usize), text)
+        }
+        self.edit_version += 1
+    }
+
+    pub fn insert_line_at(self, row: i64, text: String) {
+        self.sync_external_lines()
+        let count = accel_doc_line_count(self.doc_id)
+        let r = if row < 0 { 0 } else if row > count { count } else { row }
+        accel_doc_insert_line(self.doc_id, r, text)
+        let new_count = accel_doc_line_count(self.doc_id)
+        if new_count > SMALL_MIRROR_LIMIT {
+            self.native_large = true
+            self.lines = List()
+        } else if self.native_large {
+            self.native_large = false
+            self.lines = accel_doc_slice_lines(self.doc_id, 0, new_count)
+        } else {
+            self.lines.insert(r.as(usize), text)
+        }
+        self.edit_version += 1
+    }
+
+    pub fn remove_line_at(self, row: i64) -> String {
+        self.sync_external_lines()
+        let count = accel_doc_line_count(self.doc_id)
+        if row < 0 or row >= count {
+            return ""
+        }
+        let removed = accel_doc_remove_line(self.doc_id, row)
+        let new_count = accel_doc_line_count(self.doc_id)
+        if new_count > SMALL_MIRROR_LIMIT {
+            self.native_large = true
+            self.lines = List()
+        } else if self.native_large {
+            self.native_large = false
+            self.lines = accel_doc_slice_lines(self.doc_id, 0, new_count)
+        } else {
+            if row < self.lines.len() {
+                let _ = self.lines.remove(row.as(usize))
+            }
+            if self.lines.is_empty() {
+                self.lines.push("")
+            }
+        }
+        self.edit_version += 1
+        removed
+    }
+
+    pub fn push_line(self, text: String) {
+        self.insert_line_at(self.line_count(), text)
+    }
+
+    pub fn first_non_blank_col(self, row: i64) -> i64 {
+        let s = self.line_at(row)
+        let n = s.char_len()
+        for i in 0..n {
+            let ch = s.slice(i, i + 1)
+            if ch != " " and ch != "\t" {
+                return i
+            }
+        }
+        0
+    }
+
+    pub fn clamp_pos(self, pos: Pos, .insert_mode: bool = false) -> Pos {
+        let lo_row = self.min_row()
+        let hi_row = self.max_row()
+        let r = if pos.row < lo_row {
+            lo_row
+        } else if pos.row > hi_row {
+            hi_row
+        } else {
+            pos.row
+        }
+        let llen = self.line_char_len(r)
+        let max_col = if insert_mode {
+            llen
+        } else if llen > 0 {
+            llen - 1
+        } else {
+            0
+        }
+        let c = if pos.col < 0 {
+            0
+        } else if pos.col > max_col {
+            max_col
+        } else {
+            pos.col
+        }
+        Pos.new(r, c)
+    }
+
+    pub fn to_text(self) -> String {
+        self.sync_external_lines()
+        accel_doc_to_text_capped(self.doc_id, self.crlf)
+    }
+
+    pub fn set_text(self, text: String, .record_undo: bool = false, .label: String = "set-text") {
+        let new_lines = split_text_preserving_empty_lines(text)
+        self.set_lines(new_lines, record_undo = record_undo, label = label)
+    }
+
+    pub fn set_lines(self, new_lines: List, .record_undo: bool = false, .label: String = "set-lines") {
+        if new_lines.is_empty() {
+            let fallback = [""]
+            accel_doc_clone_from_lines(self.doc_id, fallback)
+            self.native_large = false
+            self.lines = fallback
+        } else if new_lines.len() > SMALL_MIRROR_LIMIT {
+            accel_doc_clone_from_lines(self.doc_id, new_lines)
+            self.native_large = true
+            self.lines = List()
+        } else {
+            let clean = clone_string_list(new_lines)
+            accel_doc_clone_from_lines(self.doc_id, clean)
+            self.native_large = false
+            self.lines = clean
+        }
+        self.edit_version += 1
+        self.point = self.clamp_pos(self.point, insert_mode = true)
+        if record_undo {
+            self.modified = true
+            self.undo_tree.checkpoint_doc(self.doc_id, self.point, label)
+        } else {
+            self.undo_tree.reinit_doc(self.doc_id, self.point)
+        }
+    }
+
+    pub fn set_mark(self, pos: Pos, .activate: bool = true) {
+        if self.mark != null {
+            self.mark_ring.push(self.mark.as(Pos))
+            if self.mark_ring.len() > 32 {
+                let _ = self.mark_ring.remove(0)
+            }
+        }
+        self.mark = pos
+        self.mark_active = activate
+    }
+
+    pub fn ensure_writable(self) -> !String Unit {
+        if self.read_only {
+            return error ("Buffer is read-only: " ++ self.name)
+        }
+        ()
+    }
+
+    pub fn checkpoint(self, cursor: Pos, label: String) {
+        self.sync_external_lines()
+        self.undo_tree.checkpoint_doc(self.doc_id, cursor, label)
+    }
+
+    private fn restore_undo_snap(self, snap_id: i64, cur: Pos) -> Pos {
+        let _ = accel_doc_snapshot_restore(self.doc_id, snap_id)
+        let count = accel_doc_line_count(self.doc_id)
+        self.edit_version += 1
+        if count <= SMALL_MIRROR_LIMIT {
+            self.native_large = false
+            self.lines = accel_doc_slice_lines(self.doc_id, 0, count)
+        } else {
+            self.native_large = true
+            self.lines = List()
+        }
+        self.modified = self.undo_tree.current_id != 0
+        let p = self.clamp_pos(cur, insert_mode = true)
+        self.point = p
+        p
+    }
+
+    pub fn undo(self) -> !String ?Pos {
+        self.ensure_writable()!
+        let snap? = self.undo_tree.undo_doc() else {
+            return null
+        }
+        let (snap_id, cur, _) = snap
+        self.restore_undo_snap(snap_id, cur)
+    }
+
+    pub fn redo(self) -> !String ?Pos {
+        self.ensure_writable()!
+        let snap? = self.undo_tree.redo_doc() else {
+            return null
+        }
+        let (snap_id, cur, _) = snap
+        self.restore_undo_snap(snap_id, cur)
+    }
+
+    pub fn undo_switch_branch(self, delta: i64) -> !String ?Pos {
+        self.ensure_writable()!
+        let snap? = self.undo_tree.switch_branch_doc(delta) else {
+            return null
+        }
+        let (snap_id, cur, _) = snap
+        self.restore_undo_snap(snap_id, cur)
+    }
+
+    pub fn insert_char(self, pos: Pos, ch: String) -> !String Pos {
+        self.insert_text(pos, ch)
+    }
+
+    pub fn insert_text(self, pos: Pos, text: String) -> !String Pos {
+        self.ensure_writable()!
+        self.sync_external_lines()
+        let p = self.clamp_pos(pos, insert_mode = true)
+        if text == "" {
+            return p
+        }
+        let normalized = if text.contains("\r") {
+            text.replace("\r\n", "\n").replace("\r", "\n")
+        } else {
+            text
+        }
+        let old_count = accel_doc_line_count(self.doc_id)
+        let (end_row, end_col) = accel_doc_insert_text(self.doc_id, p.row, p.col, normalized)
+        let new_count = accel_doc_line_count(self.doc_id)
+        let added_rows = new_count - old_count
+        if added_rows == 0 {
+            if (not self.native_large) and p.row < self.lines.len() {
+                self.lines.set(p.row.as(usize), accel_doc_line_at(self.doc_id, p.row))
+            }
+        } else {
+            self.refresh_mirror_from_doc()
+            if self.narrow != null {
+                let nr = self.narrow.as(NarrowRegion)
+                self.narrow = NarrowRegion {
+                    start_row: nr.start_row,
+                    end_row: nr.end_row + added_rows,
+                }
+            }
+        }
+        self.edit_version += 1
+        self.modified = true
+        let next_pos = Pos.new(end_row, end_col)
+        self.point = next_pos
+        next_pos
+    }
+
+    pub fn insert_lines_below(self, row: i64, new_lines: List) -> !String Pos {
+        self.ensure_writable()!
+        self.sync_external_lines()
+        let r = if row < self.min_row() {
+            self.min_row()
+        } else if row > self.max_row() {
+            self.max_row()
+        } else {
+            row
+        }
+        let n = new_lines.len()
+        if n == 0 {
+            return Pos.new(r, 0)
+        }
+        accel_doc_insert_lines(self.doc_id, r + 1, new_lines)
+        self.refresh_mirror_from_doc()
+        if self.narrow != null {
+            let nr = self.narrow.as(NarrowRegion)
+            self.narrow = NarrowRegion { start_row: nr.start_row, end_row: nr.end_row + n }
+        }
+        self.edit_version += 1
+        self.modified = true
+        let next_pos = Pos.new(r + 1, self.first_non_blank_col(r + 1))
+        self.point = next_pos
+        next_pos
+    }
+
+    pub fn insert_lines_above(self, row: i64, new_lines: List) -> !String Pos {
+        self.ensure_writable()!
+        self.sync_external_lines()
+        let r = if row < self.min_row() {
+            self.min_row()
+        } else if row > self.max_row() {
+            self.max_row()
+        } else {
+            row
+        }
+        let n = new_lines.len()
+        if n == 0 {
+            return Pos.new(r, 0)
+        }
+        accel_doc_insert_lines(self.doc_id, r, new_lines)
+        self.refresh_mirror_from_doc()
+        if self.narrow != null {
+            let nr = self.narrow.as(NarrowRegion)
+            self.narrow = NarrowRegion { start_row: nr.start_row, end_row: nr.end_row + n }
+        }
+        self.edit_version += 1
+        self.modified = true
+        let next_pos = Pos.new(r, self.first_non_blank_col(r))
+        self.point = next_pos
+        next_pos
+    }
+
+    pub fn delete_char_at(self, pos: Pos) -> !String String {
+        self.ensure_writable()!
+        self.sync_external_lines()
+        let p = self.clamp_pos(pos, insert_mode = true)
+        let llen = self.line_char_len(p.row)
+        if p.col < llen {
+            let deleted = accel_doc_delete_span(self.doc_id, p.row, p.col, p.row, p.col + 1)
+            if (not self.native_large) and p.row < self.lines.len() {
+                self.lines.set(p.row.as(usize), accel_doc_line_at(self.doc_id, p.row))
+            }
+            self.edit_version += 1
+            self.modified = true
+            return deleted
+        }
+        if p.row < self.max_row() {
+            let _ = accel_doc_delete_span(self.doc_id, p.row, llen, p.row + 1, 0)
+            self.refresh_mirror_from_doc()
+            if self.narrow != null {
+                let nr = self.narrow.as(NarrowRegion)
+                if nr.end_row > nr.start_row {
+                    self.narrow = NarrowRegion { start_row: nr.start_row, end_row: nr.end_row - 1 }
+                }
+            }
+            self.edit_version += 1
+            self.modified = true
+            return "\n"
+        }
+        ""
+    }
+
+    pub fn delete_backward(self, pos: Pos) -> !String Pos {
+        self.ensure_writable()!
+        let p = self.clamp_pos(pos, insert_mode = true)
+        if p.col > 0 {
+            let prev = Pos.new(p.row, p.col - 1)
+            let _ = self.delete_char_at(prev)!
+            self.point = prev
+            return prev
+        }
+        if p.row > self.min_row() {
+            let prev_len = self.line_char_len(p.row - 1)
+            let prev = Pos.new(p.row - 1, prev_len)
+            let _ = self.delete_char_at(prev)!
+            self.point = prev
+            return prev
+        }
+        p
+    }
+
+    pub fn extract_span(self, span: Span) -> String {
+        self.sync_external_lines()
+        let norm = Span.normalized(
+            self.clamp_pos(span.start, insert_mode = true),
+            self.clamp_pos(span.end, insert_mode = true),
+        )
+        let s = norm.start
+        let e = norm.end
+        if s == e {
+            return ""
+        }
+        accel_doc_extract_span(self.doc_id, s.row, s.col, e.row, e.col)
+    }
+
+    pub fn delete_span(self, span: Span) -> !String (Pos, String) {
+        self.ensure_writable()!
+        self.sync_external_lines()
+        let norm = Span.normalized(
+            self.clamp_pos(span.start, insert_mode = true),
+            self.clamp_pos(span.end, insert_mode = true),
+        )
+        let s = norm.start
+        let e = norm.end
+        if s == e {
+            return (s, "")
+        }
+        let rows_removed = e.row - s.row
+        let removed = accel_doc_delete_span(self.doc_id, s.row, s.col, e.row, e.col)
+        if rows_removed == 0 {
+            if (not self.native_large) and s.row < self.lines.len() {
+                self.lines.set(s.row.as(usize), accel_doc_line_at(self.doc_id, s.row))
+            }
+        } else {
+            self.refresh_mirror_from_doc()
+            if self.narrow != null {
+                let nr = self.narrow.as(NarrowRegion)
+                let next_end = if nr.end_row - rows_removed < nr.start_row {
+                    nr.start_row
+                } else {
+                    nr.end_row - rows_removed
+                }
+                self.narrow = NarrowRegion { start_row: nr.start_row, end_row: next_end }
+            }
+        }
+        self.edit_version += 1
+        self.modified = true
+        self.point = s
+        (s, removed)
+    }
+
+    pub fn replace_span(self, span: Span, replacement: String) -> !String (Pos, String) {
+        let (pos_after_del, removed) = self.delete_span(span)!
+        let final_pos = self.insert_text(pos_after_del, replacement)!
+        (final_pos, removed)
+    }
+
+    pub fn delete_lines(self, start_row: i64, end_row: i64) -> !String (Pos, String) {
+        self.ensure_writable()!
+        self.sync_external_lines()
+        let lo = if start_row < self.min_row() { self.min_row() } else { start_row }
+        let hi = if end_row > self.max_row() { self.max_row() } else { end_row }
+        if hi < lo {
+            return (self.point, "")
+        }
+        let total_before = accel_doc_line_count(self.doc_id)
+        let count = hi - lo + 1
+        let raw_removed = accel_doc_delete_lines(self.doc_id, lo, hi)
+        let removed_text = if raw_removed.ends_with("\n") {
+            raw_removed
+        } else {
+            raw_removed ++ "\n"
+        }
+        self.refresh_mirror_from_doc()
+        self.edit_version += 1
+        if count >= total_before {
+            if self.narrow != null {
+                self.narrow = NarrowRegion { start_row: 0, end_row: 0 }
+            }
+            self.modified = true
+            let p0 = Pos.zero()
+            self.point = p0
+            return (p0, removed_text)
+        }
+        if self.narrow != null {
+            let nr = self.narrow.as(NarrowRegion)
+            let next_end = if nr.end_row - count < nr.start_row {
+                nr.start_row
+            } else {
+                nr.end_row - count
+            }
+            self.narrow = NarrowRegion { start_row: nr.start_row, end_row: next_end }
+        }
+        self.modified = true
+        let target_row = if lo > self.max_row() { self.max_row() } else { lo }
+        let next_pos = Pos.new(target_row, self.first_non_blank_col(target_row))
+        self.point = next_pos
+        (next_pos, removed_text)
+    }
+
+    pub fn indent_lines(
+        self,
+        start_row: i64,
+        end_row: i64,
+        width: i64,
+        expand_tab: bool,
+    ) -> !String Unit {
+        self.ensure_writable()!
+        self.sync_external_lines()
+        let lo = if start_row < self.min_row() { self.min_row() } else { start_row }
+        let hi = if end_row > self.max_row() { self.max_row() } else { end_row }
+        let pad = if expand_tab { " ".repeat(width) } else { "\t" }
+        for r in lo..(hi + 1) {
+            let s = self.line_at(r)
+            if s != "" {
+                self.set_line_at(r, pad ++ s)
+            }
+        }
+        self.modified = true
+        ()
+    }
+
+    pub fn dedent_lines(self, start_row: i64, end_row: i64, width: i64) -> !String Unit {
+        self.ensure_writable()!
+        self.sync_external_lines()
+        let lo = if start_row < self.min_row() { self.min_row() } else { start_row }
+        let hi = if end_row > self.max_row() { self.max_row() } else { end_row }
+        for r in lo..(hi + 1) {
+            let s = self.line_at(r)
+            if s.starts_with("\t") {
+                self.set_line_at(r, s.drop(1))
+            } else {
+                var strip_count: i64 = 0
+                let limit = if s.char_len() < width { s.char_len() } else { width }
+                while strip_count < limit and s.slice(strip_count, strip_count + 1) == " " {
+                    strip_count += 1
+                }
+                if strip_count > 0 {
+                    self.set_line_at(r, s.drop(strip_count))
+                }
+            }
+        }
+        self.modified = true
+        ()
+    }
+
+    pub fn join_line_with_next(self, row: i64) -> !String Pos {
+        self.ensure_writable()!
+        self.sync_external_lines()
+        if row >= self.max_row() {
+            return self.point
+        }
+        let cur = self.line_at(row).trim_end()
+        let nxt = self.remove_line_at(row + 1).trim_start()
+        let sep = if cur == "" or nxt == "" { "" } else { " " }
+        let join_col = cur.char_len()
+        self.set_line_at(row, cur ++ sep ++ nxt)
+        if self.narrow != null {
+            let nr = self.narrow.as(NarrowRegion)
+            if nr.end_row > nr.start_row {
+                self.narrow = NarrowRegion { start_row: nr.start_row, end_row: nr.end_row - 1 }
+            }
+        }
+        self.modified = true
+        let next_pos = Pos.new(row, join_col)
+        self.point = next_pos
+        next_pos
+    }
+
+    pub fn find_all_in_line(self, row: i64, needle: String, ignore_case: bool) -> List {
+        let out = List()
+        if needle == "" {
+            return out
+        }
+        let line = self.line_at(row)
+        let hay = if ignore_case { line.to_lower() } else { line }
+        let pat = if ignore_case { needle.to_lower() } else { needle }
+        let plen = pat.char_len()
+        if plen == 0 {
+            return out
+        }
+        let indices = hay.find_indices(pat)
+        let n = indices.len()
+        for i in 0..n {
+            let start_col = indices.get(i.as(usize)).as(i64)
+            out.push((start_col, start_col + plen))
+        }
+        out
+    }
+
+    pub fn find_forward(self, needle: String, from: Pos, ignore_case: bool, wrap: bool) -> ?Pos {
+        if needle == "" {
+            return null
+        }
+        self.sync_external_lines()
+        let lo = self.min_row()
+        let hi = self.max_row()
+        let hit? = accel_doc_find_forward(
+            self.doc_id,
+            needle,
+            from.row,
+            from.col,
+            lo,
+            hi,
+            ignore_case,
+            wrap,
+        ) else {
+            return null
+        }
+        let (r, c) = hit
+        Pos.new(r, c)
+    }
+
+    pub fn find_backward(self, needle: String, from: Pos, ignore_case: bool, wrap: bool) -> ?Pos {
+        if needle == "" {
+            return null
+        }
+        self.sync_external_lines()
+        let lo = self.min_row()
+        let hi = self.max_row()
+        let hit? = accel_doc_find_backward(
+            self.doc_id,
+            needle,
+            from.row,
+            from.col,
+            lo,
+            hi,
+            ignore_case,
+            wrap,
+        ) else {
+            return null
+        }
+        let (r, c) = hit
+        Pos.new(r, c)
+    }
+
+    pub fn clear_owner_decors(self, owner: String) {
+        if not self.signs.is_empty() {
+            var has_sign = false
+            for i in 0..self.signs.len() {
+                if self.signs.get(i.as(usize)).as(GutterSign).owner == owner {
+                    has_sign = true
+                    break
+                }
+            }
+            if has_sign {
+                let next_signs = List()
+                for i in 0..self.signs.len() {
+                    let s = self.signs.get(i.as(usize)).as(GutterSign)
+                    if s.owner != owner {
+                        next_signs.push(s)
+                    }
+                }
+                self.signs = next_signs
+            }
+        }
+
+        if not self.inline_decors.is_empty() {
+            var has_inline = false
+            for i in 0..self.inline_decors.len() {
+                if self.inline_decors.get(i.as(usize)).as(InlineSpanDecor).owner == owner {
+                    has_inline = true
+                    break
+                }
+            }
+            if has_inline {
+                let next_inline = List()
+                for i in 0..self.inline_decors.len() {
+                    let d = self.inline_decors.get(i.as(usize)).as(InlineSpanDecor)
+                    if d.owner != owner {
+                        next_inline.push(d)
+                    }
+                }
+                self.inline_decors = next_inline
+            }
+        }
+
+        if not self.virt_texts.is_empty() {
+            var has_vt = false
+            for i in 0..self.virt_texts.len() {
+                if self.virt_texts.get(i.as(usize)).as(VirtualTextDecor).owner == owner {
+                    has_vt = true
+                    break
+                }
+            }
+            if has_vt {
+                let next_vt = List()
+                for i in 0..self.virt_texts.len() {
+                    let vt = self.virt_texts.get(i.as(usize)).as(VirtualTextDecor)
+                    if vt.owner != owner {
+                        next_vt.push(vt)
+                    }
+                }
+                self.virt_texts = next_vt
+            }
+        }
+    }
+
+    pub fn clear_all_decors(self) {
+        self.signs = List()
+        self.inline_decors = List()
+        self.virt_texts = List()
+    }
+
+    pub fn add_sign(
+        self,
+        owner: String,
+        row: i64,
+        text: String,
+        fg_rgba: i64,
+        .priority: i64 = 10,
+    ) {
+        self.signs.push(GutterSign {
+            owner: owner,
+            row: row,
+            text: text,
+            fg_rgba: fg_rgba,
+            priority: priority,
+        })
+    }
+
+    pub fn add_inline_decor(
+        self,
+        owner: String,
+        row: i64,
+        start_col: i64,
+        end_col: i64,
+        .bg_rgba: i64 = 0,
+        .fg_rgba: i64 = 0,
+        .underline: bool = false,
+        .replace_label: String = "",
+    ) {
+        self.inline_decors.push(InlineSpanDecor {
+            owner: owner,
+            row: row,
+            start_col: start_col,
+            end_col: end_col,
+            bg_rgba: bg_rgba,
+            fg_rgba: fg_rgba,
+            underline: underline,
+            replace_label: replace_label,
+        })
+    }
+
+    pub fn add_virt_text(
+        self,
+        owner: String,
+        row: i64,
+        text: String,
+        fg_rgba: i64,
+        .italic: bool = true,
+    ) {
+        self.virt_texts.push(VirtualTextDecor {
+            owner: owner,
+            row: row,
+            text: text,
+            fg_rgba: fg_rgba,
+            italic: italic,
+        })
+    }
+
+    pub fn compute_smart_indent(self, row: i64, shiftwidth: i64, expandtab: bool) -> String {
+        let line = self.line_at(row)
+        let fnb = self.first_non_blank_col(row)
+        let base_indent = line.take(fnb)
+        let trimmed = line.trim_end()
+        let opens_block = trimmed.ends_with("{{")
+            or trimmed.ends_with("(")
+            or trimmed.ends_with("[")
+            or (
+                (self.major_mode == "python" or self.major_mode == "yaml")
+                and trimmed.ends_with(":")
+            )
+        if opens_block {
+            let sw = if shiftwidth > 0 { shiftwidth } else { 4 }
+            let extra = if expandtab { " ".repeat(sw) } else { "\t" }
+            return base_indent ++ extra
+        }
+        base_indent
+    }
+
+    pub fn find_matching_bracket_bounded(self, pos: Pos, max_scan_lines: i64) -> ?Pos {
+        self.sync_external_lines()
+        let hit? = accel_doc_find_matching_bracket(
+            self.doc_id,
+            pos.row,
+            pos.col,
+            self.min_row(),
+            self.max_row(),
+            max_scan_lines,
+        ) else {
+            return null
+        }
+        let (r, c) = hit
+        Pos.new(r, c)
+    }
+
+    pub fn find_matching_bracket(self, pos: Pos) -> ?Pos {
+        self.find_matching_bracket_bounded(pos, 0)
+    }
+}
+
+-- ============================================================================
+-- 6. EditorOptions, Plugin UI Chrome & EditorWorld Service
+-- ============================================================================
+
+pub struct EditorOptions {
+    pub number: bool,
+    pub relativenumber: bool,
+    pub tabstop: i64,
+    pub shiftwidth: i64,
+    pub expandtab: bool,
+    pub ignorecase: bool,
+    pub smartcase: bool,
+    pub wrap: bool,
+    pub hlsearch: bool,
+    pub incsearch: bool,
+    pub scrolloff: i64,
+    pub sidescrolloff: i64,
+    pub cursorline: bool,
+    pub signcolumn: bool,
+    pub indent_guides: bool,
+    pub match_brackets: bool,
+    pub auto_indent: bool,
+    pub autopairs: bool,
+    pub clipboard_unnamedplus: bool,
+    pub mouse_enabled: bool,
+    pub zen_mode: bool,
+    pub zen_width: i64,
+    pub twilight_mode: bool,
+    pub format_on_save: bool,
+    pub theme_name: String,
+    pub font_family: String,
+    pub font_size_pt: f64,
+    pub cursor_blink: bool,
+    pub evil_mode: bool,
+    pub show_tab_bar: bool,
+}
+
+impl EditorOptions {
+    pub fn defaults() -> EditorOptions {
+        EditorOptions {
+            number: true,
+            relativenumber: false,
+            tabstop: 4,
+            shiftwidth: 4,
+            expandtab: true,
+            ignorecase: true,
+            smartcase: true,
+            wrap: false,
+            hlsearch: true,
+            incsearch: true,
+            scrolloff: 5,
+            sidescrolloff: 8,
+            cursorline: true,
+            signcolumn: true,
+            indent_guides: true,
+            match_brackets: true,
+            auto_indent: true,
+            autopairs: true,
+            clipboard_unnamedplus: true,
+            mouse_enabled: true,
+            zen_mode: false,
+            zen_width: 92,
+            twilight_mode: false,
+            format_on_save: false,
+            theme_name: "catppuccin-mocha",
+            font_family: "Monospace",
+            font_size_pt: 13.0,
+            cursor_blink: true,
+            evil_mode: true,
+            show_tab_bar: false,
+        }
+    }
+}
+
+pub struct SidebarPanel {
+    pub visible: bool,
+    pub side: String,
+    pub title: String,
+    pub width_cols: i64,
+    pub lines: List,
+    pub selected_row: i64,
+    pub owner: String,
+}
+
+impl SidebarPanel {
+    pub fn hidden(side: String) -> SidebarPanel {
+        SidebarPanel {
+            visible: false,
+            side: side,
+            title: "",
+            width_cols: 30,
+            lines: List(),
+            selected_row: 0,
+            owner: "",
+        }
+    }
+}
+
+pub struct FloatingWindow {
+    pub id: String,
+    pub owner: String,
+    pub title: String,
+    pub anchor: String,
+    pub width_cols: i64,
+    pub height_rows: i64,
+    pub lines: List,
+    pub selected_row: i64,
+    pub border_rgba: i64,
+}
+
+pub struct ToastNotification {
+    pub id: i64,
+    pub level: String,
+    pub title: String,
+    pub message: String,
+    pub ttl_ticks: i64,
+}
+
+pub struct CompletionItem {
+    pub label: String,
+    pub insert_text: String,
+    pub kind: String,
+    pub detail: String,
+}
+
+pub struct CompletionPopup {
+    pub active: bool,
+    pub anchor_pos: Pos,
+    pub replace_start_col: i64,
+    pub prefix: String,
+    pub items: List,
+    pub selected_idx: i64,
+    pub owner: String,
+}
+
+impl CompletionPopup {
+    pub fn inactive() -> CompletionPopup {
+        CompletionPopup {
+            active: false,
+            anchor_pos: Pos.zero(),
+            replace_start_col: 0,
+            prefix: "",
+            items: List(),
+            selected_idx: 0,
+            owner: "",
+        }
+    }
+}
+
+pub struct ActiveBgJob {
+    pub job_id: i64,
+    pub title: String,
+    pub target_buffer: String,
+}
+
+pub enum VisualKind {
+    pub None,
+    pub Char,
+    pub Line,
+    pub Block,
+}
+derive Eq, PartialEq, Display for VisualKind
+
+pub struct VisualSelection {
+    pub kind: VisualKind,
+    pub anchor: Pos,
+    pub cursor: Pos,
+}
+
+impl VisualSelection {
+    pub fn none() -> VisualSelection {
+        VisualSelection {
+            kind: VisualKind.None,
+            anchor: Pos.zero(),
+            cursor: Pos.zero(),
+        }
+    }
+}
+
+pub struct MinibufferRichItem {
+    pub kind_badge: String,
+    pub badge_rgba: i64,
+    pub label: String,
+    pub key_hint: String,
+    pub marginalia: String,
+    pub match_indices: List,
+}
+
+pub struct MinibufferView {
+    pub active: bool,
+    pub prompt_label: String,
+    pub input_text: String,
+    pub cursor_col: i64,
+    pub items: List,
+    pub selected_idx: i64,
+    pub total_matches: i64,
+}
+
+impl MinibufferView {
+    pub fn inactive() -> MinibufferView {
+        MinibufferView {
+            active: false,
+            prompt_label: "",
+            input_text: "",
+            cursor_col: 0,
+            items: List(),
+            selected_idx: 0,
+            total_matches: 0,
+        }
+    }
+}
+
+pub struct EditorWorld {
+    pub buffers: HashMap,
+    pub buffer_order: List,
+    pub active_buffer_id: BufferId,
+    pub scratch_id: BufferId,
+    pub messages_id: BufferId,
+    pub next_buf_num: i64,
+    pub options: EditorOptions,
+    pub kill_ring: KillRing,
+    pub registers: RegisterBank,
+    pub jumps: JumpList,
+    pub global_marks: HashMap,
+    pub quickfix: List,
+    pub quickfix_idx: i64,
+    pub quickfix_title: String,
+    pub last_search: String,
+    pub last_search_forward: bool,
+    pub search_highlight_active: bool,
+    pub mode_name: String,
+    pub caret_shape: CaretShape,
+    pub visual: VisualSelection,
+    pub minibuffer_view: MinibufferView,
+    pub viewport_rows: i64,
+    pub viewport_cols: i64,
+    pub viewport_top_row: i64,
+    pub pending_keys_display: String,
+    pub which_key_items: List,
+    pub status_message: String,
+    pub cwd: String,
+    pub quit_requested: bool,
+    pub exit_code: i64,
+    pub active_jobs: List,
+    pub left_sidebar: SidebarPanel,
+    pub right_sidebar: SidebarPanel,
+    pub floating_windows: List,
+    pub notifications: List,
+    pub notification_history: List,
+    pub next_notification_id: i64,
+    pub completion_popup: CompletionPopup,
+    pub statusline_left_extra: String,
+    pub statusline_right_extra: String,
+    pub winbar_text: String,
+    pub secondary_cursors: List,
+    pub minibuffer_rich_items: List,
+    pub minibuffer_mode_badge: String,
+    pub minibuffer_hint_bar: String,
+    pub floating_window_spans: HashMap,
+    pub floating_window_cursor: HashMap,
+}
+
+impl EditorWorld {
+    pub fn new() -> EditorWorld {
+        let cwd = env.current_dir() ! { _ => "." }
+        let buffers = HashMap.new()
+        let order = List()
+
+        let scratch_id = BufferId(1)
+        let scratch_lines = [
+            "-- Welcome to Lava: Single-VM Nessa Programmable Interactive Environment",
+            "-- Evil-Vim modal keys (`hjkl`, `ciw`, `C-v`, `.`, `q`/`@`, `:`) + Emacs Core (`M-x`, `C-x`, `C-h`)",
+            "-- Press `M-x` or `:` for commands, `<Space>` for Which-Key, `:Telescope`, `:Neotree`, `:Magit`, `:Lazy`.",
+            ""
+        ]
+        let scratch = Buffer.new(
+            scratch_id,
+            "*scratch*",
+            BufferKind.Scratch,
+            major_mode = "nessa",
+            initial_lines = scratch_lines,
+        )
+        buffers.insert(scratch_id, scratch)
+        order.push(scratch_id)
+
+        let messages_id = BufferId(2)
+        let messages = Buffer.new(
+            messages_id,
+            "*Messages*",
+            BufferKind.Special,
+            major_mode = "messages",
+            initial_lines = ["[Lava] Runtime initialized."],
+        )
+        messages.read_only = true
+        buffers.insert(messages_id, messages)
+        order.push(messages_id)
+
+        EditorWorld {
+            buffers: buffers,
+            buffer_order: order,
+            active_buffer_id: scratch_id,
+            scratch_id: scratch_id,
+            messages_id: messages_id,
+            next_buf_num: 3,
+            options: EditorOptions.defaults(),
+            kill_ring: KillRing.new(),
+            registers: RegisterBank.new(),
+            jumps: JumpList.new(),
+            global_marks: HashMap.new(),
+            quickfix: List(),
+            quickfix_idx: 0,
+            quickfix_title: "",
+            last_search: "",
+            last_search_forward: true,
+            search_highlight_active: false,
+            mode_name: "NORMAL",
+            caret_shape: CaretShape.Block,
+            visual: VisualSelection.none(),
+            minibuffer_view: MinibufferView.inactive(),
+            viewport_rows: 36,
+            viewport_cols: 120,
+            viewport_top_row: 0,
+            pending_keys_display: "",
+            which_key_items: List(),
+            status_message: "Lava ready",
+            cwd: cwd,
+            quit_requested: false,
+            exit_code: 0,
+            active_jobs: List(),
+            left_sidebar: SidebarPanel.hidden("left"),
+            right_sidebar: SidebarPanel.hidden("right"),
+            floating_windows: List(),
+            notifications: List(),
+            notification_history: List(),
+            next_notification_id: 1,
+            completion_popup: CompletionPopup.inactive(),
+            statusline_left_extra: "",
+            statusline_right_extra: "",
+            winbar_text: "",
+            secondary_cursors: List(),
+            minibuffer_rich_items: List(),
+            minibuffer_mode_badge: "",
+            minibuffer_hint_bar: "",
+            floating_window_spans: HashMap.new(),
+            floating_window_cursor: HashMap.new(),
+        }
+    }
+
+    pub fn effective_ignore_case(self, pattern: String) -> bool {
+        if not self.options.ignorecase {
+            return false
+        }
+        if self.options.smartcase {
+            let n = pattern.char_len()
+            for i in 0..n {
+                if pattern.slice(i, i + 1).is_uppercase() {
+                    return false
+                }
+            }
+        }
+        true
+    }
+
+    pub fn active_buffer(self) -> Buffer {
+        let b_opt = self.buffers.get(self.active_buffer_id)
+        if b_opt != null {
+            return b_opt.as(Buffer)
+        }
+        self.buffers.get(self.scratch_id).as(Buffer)
+    }
+
+    pub fn buffer(self, id: BufferId) -> ?Buffer {
+        let b? = self.buffers.get(id) else {
+            return null
+        }
+        b.as(Buffer)
+    }
+
+    pub fn find_buffer_by_name(self, name: String) -> ?Buffer {
+        let n = self.buffer_order.len()
+        for i in 0..n {
+            let bid = self.buffer_order.get(i.as(usize)).as(BufferId)
+            let b = self.buffers.get(bid).as(Buffer)
+            if b.name == name {
+                return b
+            }
+        }
+        null
+    }
+
+    pub fn find_buffer_by_path(self, file_path: String) -> ?Buffer {
+        if file_path == "" {
+            return null
+        }
+        let n = self.buffer_order.len()
+        for i in 0..n {
+            let bid = self.buffer_order.get(i.as(usize)).as(BufferId)
+            let b = self.buffers.get(bid).as(Buffer)
+            if b.file_path == file_path {
+                return b
+            }
+        }
+        null
+    }
+
+    pub fn unique_buffer_name(self, base_name: String) -> String {
+        if self.find_buffer_by_name(base_name) == null {
+            return base_name
+        }
+        var suffix: i64 = 2
+        while true {
+            let candidate = base_name ++ "<" ++ suffix.to_string() ++ ">"
+            if self.find_buffer_by_name(candidate) == null {
+                return candidate
+            }
+            suffix += 1
+        }
+        base_name
+    }
+
+    pub fn create_buffer(
+        self,
+        name: String,
+        kind: BufferKind,
+        .file_path: String = "",
+        .major_mode: String = "text",
+        .initial_lines: ?List = null,
+    ) -> Buffer {
+        let id = BufferId(self.next_buf_num)
+        self.next_buf_num += 1
+        let uniq = self.unique_buffer_name(name)
+        let buf = Buffer.new(
+            id,
+            uniq,
+            kind,
+            file_path = file_path,
+            major_mode = major_mode,
+            initial_lines = initial_lines,
+        )
+        self.buffers.insert(id, buf)
+        self.buffer_order.push(id)
+        buf
+    }
+
+    pub fn create_buffer_from_doc(
+        self,
+        name: String,
+        kind: BufferKind,
+        doc_id: i64,
+        line_count: i64,
+        crlf: bool,
+        .file_path: String = "",
+        .major_mode: String = "text",
+    ) -> Buffer {
+        let id = BufferId(self.next_buf_num)
+        self.next_buf_num += 1
+        let uniq = self.unique_buffer_name(name)
+        let buf = Buffer.create_from_doc_id(
+            id,
+            uniq,
+            kind,
+            doc_id,
+            line_count,
+            crlf,
+            file_path = file_path,
+            major_mode = major_mode,
+        )
+        self.buffers.insert(id, buf)
+        self.buffer_order.push(id)
+        buf
+    }
+
+    pub fn ensure_special_buffer(
+        self,
+        name: String,
+        major_mode: String,
+        lines: List,
+        .read_only: bool = true,
+    ) -> Buffer {
+        let existing_opt = self.find_buffer_by_name(name)
+        if existing_opt != null {
+            let b = existing_opt.as(Buffer)
+            b.read_only = false
+            b.major_mode = major_mode
+            b.set_lines(lines, record_undo = false)
+            b.modified = false
+            b.read_only = read_only
+            return b
+        }
+        let b = self.create_buffer(
+            name,
+            BufferKind.Special,
+            major_mode = major_mode,
+            initial_lines = lines,
+        )
+        b.modified = false
+        b.read_only = read_only
+        b
+    }
+
+    pub fn append_message(self, msg: String) {
+        if msg == "" {
+            return
+        }
+        self.status_message = msg
+        let mb_opt = self.buffers.get(self.messages_id)
+        if mb_opt != null {
+            let mb = mb_opt.as(Buffer)
+            mb.push_line(msg)
+            if mb.line_count() > 500 {
+                let _ = mb.remove_line_at(0)
+            }
+            mb.point = Pos.new(mb.line_count() - 1, 0)
+        }
+    }
+
+    pub fn resolve_path(self, raw_path: String) -> String {
+        let trimmed = raw_path.trim()
+        if trimmed == "" {
+            return self.cwd
+        }
+        if is_ssh_uri(trimmed) {
+            return normalize_ssh_uri(trimmed)
+        }
+        if is_ssh_uri(self.cwd) and (not path.is_absolute(trimmed)) {
+            return join_ssh_uri(self.cwd, trimmed)
+        }
+        if path.is_absolute(trimmed) {
+            return path.normalize(trimmed)
+        }
+        path.normalize(path.join(self.cwd, trimmed))
+    }
+
+    pub fn open_file(self, raw_path: String) -> #[log_event, status_emit] !String Buffer {
+        let full_path = self.resolve_path(raw_path)
+        let existing_opt = self.find_buffer_by_path(full_path)
+        if existing_opt != null {
+            let b = existing_opt.as(Buffer)
+            self.active_buffer_id = b.id
+            let msg = "Switched to " ++ b.name
+            self.status_message = msg
+            status_emit(msg)#
+            return b
+        }
+        if is_ssh_uri(full_path) {
+            let rbase = ssh_uri_basename(full_path)
+            let rmode = detect_major_mode(full_path)
+            let st = remote_stat(full_path)!
+            if st.exists {
+                if st.is_dir {
+                    return error ("path is a remote directory (use :RemoteBrowse): " ++ full_path)
+                }
+                let (file_lines, crlf) = remote_read_lines(full_path)!
+                let buf = self.create_buffer(
+                    rbase,
+                    BufferKind.File,
+                    file_path = full_path,
+                    major_mode = rmode,
+                    initial_lines = file_lines,
+                )
+                buf.crlf = crlf
+                buf.read_only = st.readonly
+                buf.modified = false
+                self.active_buffer_id = buf.id
+                log_event("info", "ext_document", "Opened remote file " ++ full_path)#
+                let msg = "[SSH] \"" ++ rbase ++ "\" " ++ buf.line_count().to_string() ++ "L (" ++ full_path ++ ")"
+                self.status_message = msg
+                status_emit(msg)#
+                return buf
+            }
+            let buf = self.create_buffer(
+                rbase,
+                BufferKind.File,
+                file_path = full_path,
+                major_mode = rmode,
+                initial_lines = [""],
+            )
+            buf.modified = false
+            self.active_buffer_id = buf.id
+            let msg = "[SSH] \"" ++ rbase ++ "\" [New Remote File] (" ++ full_path ++ ")"
+            self.status_message = msg
+            status_emit(msg)#
+            return buf
+        }
+        let base_opt = path.file_name(full_path)
+        let base_name = if base_opt != null { base_opt.as(String) } else { full_path }
+        let mode = detect_major_mode(full_path)
+        if fs.exists(full_path) {
+            if fs.is_dir(full_path) {
+                return error ("path is a directory (use dired): " ++ full_path)
+            }
+            let (doc_id, lcount, crlf) = accel_doc_open_file(full_path)!
+            let buf = self.create_buffer_from_doc(
+                base_name,
+                BufferKind.File,
+                doc_id,
+                lcount,
+                crlf,
+                file_path = full_path,
+                major_mode = mode,
+            )
+            buf.modified = false
+            self.active_buffer_id = buf.id
+            log_event("info", "ext_document", "Opened file " ++ full_path)#
+            let msg = "\"" ++ base_name ++ "\" " ++ buf.line_count().to_string() ++ "L"
+            self.status_message = msg
+            status_emit(msg)#
+            return buf
+        }
+        -- New unsaved file buffer
+        let buf = self.create_buffer(
+            base_name,
+            BufferKind.File,
+            file_path = full_path,
+            major_mode = mode,
+            initial_lines = [""],
+        )
+        buf.modified = false
+        self.active_buffer_id = buf.id
+        let msg = "\"" ++ base_name ++ "\" [New File]"
+        self.status_message = msg
+        status_emit(msg)#
+        buf
+    }
+
+    pub fn save_buffer(self, id: BufferId, .override_path: String = "") -> #[log_event, status_emit] !String Unit {
+        let buf? = self.buffer(id) else {
+            return error ("unknown buffer: " ++ id.to_string())
+        }
+        var target = if override_path != "" {
+            self.resolve_path(override_path)
+        } else {
+            buf.file_path
+        }
+        if target == "" {
+            return error ("buffer has no file name: " ++ buf.name)
+        }
+        buf.sync_external_lines()
+        if is_ssh_uri(target) {
+            let total_l = buf.line_count()
+            let ssh_lines = if not buf.native_large {
+                buf.lines
+            } else {
+                let cap = if total_l < 60000 { total_l } else { 60000 }
+                buf.slice_lines(0, cap)
+            }
+            let written = remote_write_lines(target, ssh_lines, buf.crlf)!
+            buf.file_path = target
+            buf.kind = BufferKind.File
+            buf.name = ssh_uri_basename(target)
+            buf.major_mode = detect_major_mode(target)
+            buf.modified = false
+            log_event("info", "ext_document", "Wrote remote " ++ target)#
+            let msg = "[SSH] \"" ++ buf.name ++ "\" " ++ total_l.to_string() ++ "L, " ++ written.to_string() ++ "B written"
+            self.status_message = msg
+            status_emit(msg)#
+            return ()
+        }
+        let parent_opt = path.parent(target)
+        if parent_opt != null {
+            let pdir = parent_opt.as(String)
+            if pdir != "" and (not fs.exists(pdir)) {
+                let _ = fs.create_dir_all(pdir) ! { _ => () }
+            }
+        }
+        let written = accel_doc_save_file(buf.doc_id, target, buf.crlf)!
+        buf.file_path = target
+        buf.kind = BufferKind.File
+        let base_opt = path.file_name(target)
+        if base_opt != null {
+            buf.name = base_opt.as(String)
+        }
+        buf.major_mode = detect_major_mode(target)
+        buf.modified = false
+        log_event("info", "ext_document", "Wrote " ++ target)#
+        let msg = "\"" ++ buf.name ++ "\" " ++ buf.line_count().to_string() ++ "L, " ++ written.to_string() ++ "B written"
+        self.status_message = msg
+        status_emit(msg)#
+        ()
+    }
+
+    pub fn switch_to_buffer(self, id: BufferId) -> bool {
+        if not self.buffers.contains_key(id) {
+            return false
+        }
+        self.active_buffer_id = id
+        true
+    }
+
+    pub fn cycle_buffer(self, delta: i64) -> BufferId {
+        let n = self.buffer_order.len()
+        if n == 0 {
+            return self.scratch_id
+        }
+        var cur_idx: i64 = 0
+        for i in 0..n {
+            if self.buffer_order.get(i.as(usize)).as(BufferId) == self.active_buffer_id {
+                cur_idx = i
+                break
+            }
+        }
+        var next_idx = (cur_idx + delta) % n
+        if next_idx < 0 {
+            next_idx += n
+        }
+        let next_id = self.buffer_order.get(next_idx.as(usize)).as(BufferId)
+        self.active_buffer_id = next_id
+        next_id
+    }
+
+    pub fn kill_buffer(self, id: BufferId, .force: bool = false) -> !String BufferId {
+        let buf? = self.buffer(id) else {
+            return error ("unknown buffer: " ++ id.to_string())
+        }
+        if id == self.messages_id {
+            return error "cannot kill *Messages* buffer"
+        }
+        if buf.modified and (not force) and buf.kind == BufferKind.File {
+            return error ("buffer " ++ buf.name ++ " has unsaved changes (use force to discard)")
+        }
+        if self.buffer_order.len() <= 1 or (id == self.scratch_id and self.buffer_order.len() <= 2) {
+            buf.set_lines([""], record_undo = false)
+            buf.modified = false
+            return buf.id
+        }
+        let _ = self.buffers.remove(id)
+        accel_doc_free(buf.doc_id)
+        let new_order = List()
+        for i in 0..self.buffer_order.len() {
+            let bid = self.buffer_order.get(i.as(usize)).as(BufferId)
+            if bid != id {
+                new_order.push(bid)
+            }
+        }
+        self.buffer_order = new_order
+        if self.active_buffer_id == id {
+            self.active_buffer_id = self.buffer_order.get((self.buffer_order.len() - 1).as(usize)).as(BufferId)
+        }
+        self.active_buffer_id
+    }
+
+    pub fn unsaved_file_buffers(self) -> List {
+        let out = List()
+        for i in 0..self.buffer_order.len() {
+            let bid = self.buffer_order.get(i.as(usize)).as(BufferId)
+            let b = self.buffers.get(bid).as(Buffer)
+            if b.modified and b.kind == BufferKind.File {
+                out.push(b)
+            }
+        }
+        out
+    }
+
+    pub fn buffer_names(self) -> List {
+        let out = List()
+        for i in 0..self.buffer_order.len() {
+            let bid = self.buffer_order.get(i.as(usize)).as(BufferId)
+            out.push(self.buffers.get(bid).as(Buffer).name)
+        }
+        out
+    }
+
+    pub fn set_floating_window(self, win: FloatingWindow) {
+        for i in 0..self.floating_windows.len() {
+            let existing = self.floating_windows.get(i.as(usize)).as(FloatingWindow)
+            if existing.id == win.id {
+                self.floating_windows.set(i.as(usize), win)
+                return
+            }
+        }
+        self.floating_windows.push(win)
+    }
+
+    pub fn remove_floating_window(self, id: String) -> bool {
+        for i in 0..self.floating_windows.len() {
+            let existing = self.floating_windows.get(i.as(usize)).as(FloatingWindow)
+            if existing.id == id {
+                let _ = self.floating_windows.remove(i.as(usize))
+                return true
+            }
+        }
+        false
+    }
+
+    pub fn get_floating_window(self, id: String) -> ?FloatingWindow {
+        for i in 0..self.floating_windows.len() {
+            let existing = self.floating_windows.get(i.as(usize)).as(FloatingWindow)
+            if existing.id == id {
+                return existing
+            }
+        }
+        null
+    }
+
+    pub fn push_notification(
+        self,
+        level: String,
+        title: String,
+        message: String,
+        .ttl_ticks: i64 = 12,
+    ) -> i64 {
+        let id = self.next_notification_id
+        self.next_notification_id += 1
+        let toast = ToastNotification {
+            id: id,
+            level: level,
+            title: title,
+            message: message,
+            ttl_ticks: ttl_ticks,
+        }
+        self.notifications.push(toast)
+        while self.notifications.len() > 5 {
+            let _ = self.notifications.remove(0)
+        }
+        self.notification_history.push(toast)
+        while self.notification_history.len() > 200 {
+            let _ = self.notification_history.remove(0)
+        }
+        id
+    }
+
+    pub fn tick_notifications(self) {
+        if self.notifications.is_empty() {
+            return
+        }
+        let next = List()
+        for i in 0..self.notifications.len() {
+            let t = self.notifications.get(i.as(usize)).as(ToastNotification)
+            if t.ttl_ticks > 1 {
+                next.push(ToastNotification {
+                    id: t.id,
+                    level: t.level,
+                    title: t.title,
+                    message: t.message,
+                    ttl_ticks: t.ttl_ticks - 1,
+                })
+            }
+        }
+        self.notifications = next
+    }
+
+    pub fn clear_owner_ui(self, owner: String) {
+        if self.left_sidebar.owner == owner {
+            self.left_sidebar = SidebarPanel.hidden("left")
+        }
+        if self.right_sidebar.owner == owner {
+            self.right_sidebar = SidebarPanel.hidden("right")
+        }
+        if self.completion_popup.owner == owner {
+            self.completion_popup = CompletionPopup.inactive()
+        }
+        let next_floats = List()
+        for i in 0..self.floating_windows.len() {
+            let fw = self.floating_windows.get(i.as(usize)).as(FloatingWindow)
+            if fw.owner != owner {
+                next_floats.push(fw)
+            }
+        }
+        self.floating_windows = next_floats
+        for i in 0..self.buffer_order.len() {
+            let bid = self.buffer_order.get(i.as(usize)).as(BufferId)
+            let b = self.buffers.get(bid).as(Buffer)
+            b.clear_owner_decors(owner)
+        }
+    }
+}
+
+-- ============================================================================
+-- 7. Extension Registration & Service Lookup
+-- ============================================================================
+
+pub fn require_editor_world(kernel: SystemKernel) -> !String EditorWorld {
+    let raw = kernel.require_service(SERVICE_EDITOR_WORLD)!
+    raw.as(EditorWorld)
+}
+
+pub fn register_document_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_document_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_document",
+        "0.1.0",
+        "Document buffers, branching undo-tree, Emacs kill-ring, Vim/Emacs register bank, and jump/quickfix services.",
+        [],
+        |k: SystemKernel| -> !String Unit {
+            let world = EditorWorld.new()
+            k.publish_service(SERVICE_EDITOR_WORLD, ext_id, world)
+
+            k.register_command(
+                "save-buffer",
+                ext_id,
+                "Save active buffer to disk (prompts for file path if unnamed).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let buf = w.active_buffer()
+                    let custom_writer = "write-buffer-mode:" ++ buf.major_mode
+                    if kern.get_command(custom_writer) != null {
+                        let _ = kern.dispatch_command(custom_writer, args)#!
+                        return ()
+                    }
+                    kern.emit_hook("buffer-will-save", buf.id)
+                    var override_p = if not args.is_empty() { args.get(0).as(String) } else { "" }
+                    if buf.file_path == "" and override_p == "" {
+                        let ans? = ask_prompt(PromptRequest {
+                            label: "Write file: ",
+                            initial: w.cwd ++ "/",
+                            kind: PromptKind.FilePath,
+                            candidates: List(),
+                        })# else {
+                            status_emit("Quit")#
+                            return ()
+                        }
+                        override_p = ans
+                    }
+                    w.save_buffer(buf.id, override_path = override_p)#!
+                    kern.emit_hook("buffer-saved", buf.id)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "undo",
+                ext_id,
+                "Undo last change along current undo-tree branch.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let buf = w.active_buffer()
+                    let p_opt = buf.undo()!
+                    if p_opt == null {
+                        status_emit("Already at oldest change")#
+                    } else {
+                        status_emit("Undo (state #" ++ buf.undo_tree.current_id.to_string() ++ ")")#
+                    }
+                    ()
+                },
+            )
+
+            k.register_command(
+                "redo",
+                ext_id,
+                "Redo change along active undo-tree branch.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let buf = w.active_buffer()
+                    let p_opt = buf.redo()!
+                    if p_opt == null {
+                        status_emit("Already at newest change")#
+                    } else {
+                        status_emit("Redo (state #" ++ buf.undo_tree.current_id.to_string() ++ ")")#
+                    }
+                    ()
+                },
+            )
+
+            k.register_command(
+                "undo-tree-visualize",
+                ext_id,
+                "Open *undo-tree* buffer visualizing branching undo history of active buffer.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let src = w.active_buffer()
+                    let lines = src.undo_tree.render_tree_lines()
+                    let ub = w.ensure_special_buffer("*undo-tree*", "text", lines, read_only = true)
+                    let _ = w.switch_to_buffer(ub.id)
+                    kern.emit_hook("buffer-switched", ub.id)
+                    status_emit("Showing *undo-tree* for " ++ src.name)#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "narrow-to-region",
+                ext_id,
+                "Restrict editing in active buffer to rows between mark and point (`C-x n n`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let buf = w.active_buffer()
+                    let m? = buf.mark else {
+                        status_emit("No mark set in this buffer")#
+                        return ()
+                    }
+                    buf.narrow_to_region(m.row, buf.point.row)
+                    buf.mark_active = false
+                    status_emit(
+                        "Narrowed to lines " ++ (buf.min_row() + 1).to_string()
+                        ++ ".." ++ (buf.max_row() + 1).to_string()
+                    )#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "widen",
+                ext_id,
+                "Remove narrowing restriction from active buffer (`C-x n w`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let buf = w.active_buffer()
+                    buf.widen()
+                    status_emit("Widened buffer " ++ buf.name)#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "next-buffer",
+                ext_id,
+                "Switch to next buffer in buffer list.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let bid = w.cycle_buffer(1)
+                    kern.emit_hook("buffer-switched", bid)
+                    status_emit("Buffer: " ++ w.active_buffer().name)#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "previous-buffer",
+                ext_id,
+                "Switch to previous buffer in buffer list.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let bid = w.cycle_buffer(-1)
+                    kern.emit_hook("buffer-switched", bid)
+                    status_emit("Buffer: " ++ w.active_buffer().name)#
+                    ()
+                },
+            )
+            ()
+        },
+        |_k: SystemKernel| -> !String Unit { () },
+    )
+}

@@ -1,0 +1,12 @@
+[package]
+name = "ext_minibuffer"
+domain = "lava.org"
+version = "0.1.0"
+type = "lib"
+
+[dependencies]
+"lava.org/lava_sys" = { path = "../../packages/lava_sys" }
+"lava.org/lava_core" = { path = "../../packages/lava_core" }
+"lava.org/lava_accel" = { path = "../../packages/lava_accel" }
+"lava.org/lava_remote" = { path = "../../packages/lava_remote" }
+"lava.org/ext_document" = { path = "../ext_document" }

@@ -1,0 +1,1051 @@
+-- ext_lspconfig: Out-of-the-Box 18-Language LSP Preset Registry, `$PATH` Scanner,
+-- Auto-Attach Lifecycle & Interactive `*LspConfig*` / `:Mason` Health Dashboard.
+
+use std.collections.{HashMap, Set}
+use std.env
+use std.fs
+use std.path
+use @lava_sys.rgb
+use @lava_core.{
+    ExtId, InteractiveEffects, SystemKernel, clipboard_set, status_emit
+}
+use @lava_remote.{is_ssh_uri, remote_host_available, remote_which}
+use @ext_document.{
+    Buffer, BufferId, BufferKind, EditorWorld, Pos, ext_document_id, require_editor_world
+}
+use @ext_window.{SERVICE_WINDOW_MANAGER, WindowManager, ext_window_id}
+use @ext_vim.{KEYMAP_VIM_LEADER, ext_vim_id}
+use @ext_lsp.{
+    BufferLspAttachment, LspServerSpec, LspService, detect_project_root, ext_lsp_id,
+    require_lsp_service
+}
+
+pub const SERVICE_LSPCONFIG: String = "lava.lspconfig.registry"
+pub const OWNER_LSPCONFIG: String = "ext_lspconfig"
+pub const LSPCONFIG_BUF_NAME: String = "*LspConfig*"
+pub const MODE_LSPCONFIG: String = "lspconfig"
+
+pub fn ext_lspconfig_id() -> ExtId = ExtId("lava.org/ext_lspconfig")
+
+-- ============================================================================
+-- 1. Candidate Binary & 18-Language Preset Data Model
+-- ============================================================================
+
+pub struct LspBinaryCandidate {
+    pub cmd: String,
+    pub args: List,
+}
+
+pub struct LspLanguagePreset {
+    pub server_id: String,
+    pub language_name: String,
+    pub candidates: List,
+    pub active_cmd: String,
+    pub active_args: List,
+    pub resolved_path: String,
+    pub installed: bool,
+    pub filetypes: List,
+    pub extensions: List,
+    pub root_markers: List,
+    pub install_hint: String,
+    pub settings_json: String,
+    pub description: String,
+}
+
+pub struct LspConfigRegistry {
+    pub presets: HashMap,
+    pub preset_order: List,
+    pub auto_attach: bool,
+    pub extra_search_dirs: List,
+    pub prev_buf_id: BufferId,
+    pub row_to_server_id: HashMap,
+    pub detected_presets: Set,
+    pub all_detected: bool,
+}
+
+-- ============================================================================
+-- 2. `$PATH` Scanner & 18 Built-in Presets
+-- ============================================================================
+
+pub fn scan_executable_in_path(bin: String, extra_dirs: List) -> String {
+    let trimmed = bin.trim()
+    if trimmed == "" {
+        return ""
+    }
+    if trimmed.contains("/") {
+        if fs.exists(trimmed) and (not fs.is_dir(trimmed)) {
+            return trimmed
+        }
+        return ""
+    }
+    for i in 0..extra_dirs.len() {
+        let d = extra_dirs.get(i.as(usize)).as(String).trim()
+        if d != "" {
+            let full = path.join(d, trimmed)
+            if fs.exists(full) and (not fs.is_dir(full)) {
+                return full
+            }
+        }
+    }
+    let path_env = env.get_or("PATH", "")
+    let dirs = path_env.split(":")
+    for i in 0..dirs.len() {
+        let d = dirs.get(i.as(usize)).as(String).trim()
+        if d != "" {
+            let full = path.join(d, trimmed)
+            if fs.exists(full) and (not fs.is_dir(full)) {
+                return full
+            }
+        }
+    }
+    ""
+}
+
+private fn cand(cmd: String, args: List) -> LspBinaryCandidate {
+    LspBinaryCandidate { cmd: cmd, args: args }
+}
+
+private fn make_preset(
+    server_id: String,
+    language_name: String,
+    candidates: List,
+    filetypes: List,
+    extensions: List,
+    root_markers: List,
+    install_hint: String,
+    settings_json: String,
+    description: String,
+) -> LspLanguagePreset {
+    let first = candidates.get(0).as(LspBinaryCandidate)
+    LspLanguagePreset {
+        server_id: server_id,
+        language_name: language_name,
+        candidates: candidates,
+        active_cmd: first.cmd,
+        active_args: first.args,
+        resolved_path: "",
+        installed: false,
+        filetypes: filetypes,
+        extensions: extensions,
+        root_markers: root_markers,
+        install_hint: install_hint,
+        settings_json: settings_json,
+        description: description,
+    }
+}
+
+private fn build_builtin_18_presets() -> List {
+    [
+        -- 1. Nessa
+        make_preset(
+            "nessa",
+            "Nessa",
+            [cand("nessa-lsp", List())],
+            ["nessa", ".ns"],
+            [".ns"],
+            ["package.toml", "AGENTS.md"],
+            "cargo build --release -p nessa-lsp (or built-in Nessa analyzer)",
+            "{{}}",
+            "Nessa language server & built-in workspace symbol/effect analyzer",
+        ),
+        -- 2. Rust
+        make_preset(
+            "rust",
+            "Rust",
+            [cand("rust-analyzer", List())],
+            ["rust", ".rs"],
+            [".rs"],
+            ["Cargo.toml", "rust-project.json"],
+            "rustup component add rust-analyzer",
+            "{{}}",
+            "Official Rust language server (rust-analyzer)",
+        ),
+        -- 3. Python
+        make_preset(
+            "python",
+            "Python",
+            [
+                cand("pyright-langserver", ["--stdio"]),
+                cand("basedpyright-langserver", ["--stdio"]),
+                cand("pylsp", List()),
+                cand("ruff", ["server"])
+            ],
+            ["python", ".py", ".pyi"],
+            [".py", ".pyi"],
+            ["pyproject.toml", "setup.py", "requirements.txt"],
+            "npm install -g pyright",
+            "{{}}",
+            "Python type checker & language server (pyright / basedpyright / pylsp / ruff)",
+        ),
+        -- 4. TypeScript / JavaScript
+        make_preset(
+            "ts_ls",
+            "TypeScript / JavaScript",
+            [
+                cand("typescript-language-server", ["--stdio"]),
+                cand("vtsls", ["--stdio"])
+            ],
+            ["typescript", "javascript", ".ts", ".tsx", ".js", ".jsx", ".mjs"],
+            [".ts", ".tsx", ".js", ".jsx", ".mjs"],
+            ["tsconfig.json", "jsconfig.json", "package.json"],
+            "npm install -g typescript typescript-language-server",
+            "{{}}",
+            "TypeScript & JavaScript stdio language server (tsserver / vtsls)",
+        ),
+        -- 5. C / C++
+        make_preset(
+            "clangd",
+            "C / C++",
+            [cand("clangd", ["--background-index"])],
+            ["c", "cpp", ".c", ".h", ".cpp", ".hpp", ".cc"],
+            [".c", ".h", ".cpp", ".hpp", ".cc"],
+            ["compile_commands.json", ".clangd", "CMakeLists.txt", "Makefile"],
+            "pacman -S clang  # or: apt install clangd",
+            "{{}}",
+            "LLVM clangd C/C++ language server with background indexing",
+        ),
+        -- 6. Go
+        make_preset(
+            "gopls",
+            "Go",
+            [cand("gopls", List())],
+            ["go", ".go"],
+            [".go"],
+            ["go.mod", "go.work"],
+            "go install golang.org/x/tools/gopls@latest",
+            "{{}}",
+            "Official Go language server (gopls)",
+        ),
+        -- 7. Lua
+        make_preset(
+            "lua_ls",
+            "Lua",
+            [cand("lua-language-server", List())],
+            ["lua", ".lua"],
+            [".lua"],
+            [".luarc.json", "init.lua"],
+            "pacman -S lua-language-server  # or: brew install lua-language-server",
+            "{{}}",
+            "Lua language server (sumneko lua_ls)",
+        ),
+        -- 8. Zig
+        make_preset(
+            "zls",
+            "Zig",
+            [cand("zls", List())],
+            ["zig", ".zig"],
+            [".zig"],
+            ["build.zig", "build.zig.zon"],
+            "pacman -S zls  # or: zig build -Doptimize=ReleaseSafe",
+            "{{}}",
+            "Zig Language Server (zls)",
+        ),
+        -- 9. Bash / Shell
+        make_preset(
+            "bashls",
+            "Bash / Shell",
+            [cand("bash-language-server", ["start"])],
+            ["sh", "bash", "zsh", "shell", ".sh", ".bash", ".zsh"],
+            [".sh", ".bash", ".zsh"],
+            [".bashrc", ".shellcheckrc", ".git"],
+            "npm install -g bash-language-server",
+            "{{}}",
+            "Bash, POSIX sh, and Zsh language server",
+        ),
+        -- 10. JSON
+        make_preset(
+            "jsonls",
+            "JSON",
+            [cand("vscode-json-language-server", ["--stdio"])],
+            ["json", ".json", ".jsonc"],
+            [".json", ".jsonc"],
+            ["package.json", ".git"],
+            "npm install -g vscode-langservers-extracted",
+            "{{}}",
+            "JSON & JSONC schema-aware language server",
+        ),
+        -- 11. TOML
+        make_preset(
+            "taplo",
+            "TOML",
+            [cand("taplo", ["lsp", "stdio"])],
+            ["toml", ".toml"],
+            [".toml"],
+            ["Cargo.toml", "package.toml", "pyproject.toml"],
+            "cargo install taplo-cli --locked --features lsp",
+            "{{}}",
+            "Taplo TOML toolkit & language server",
+        ),
+        -- 12. YAML
+        make_preset(
+            "yamlls",
+            "YAML",
+            [cand("yaml-language-server", ["--stdio"])],
+            ["yaml", ".yaml", ".yml"],
+            [".yaml", ".yml"],
+            [".yamllint", ".github", ".git"],
+            "npm install -g yaml-language-server",
+            "{{}}",
+            "RedHat YAML language server",
+        ),
+        -- 13. Markdown
+        make_preset(
+            "marksman",
+            "Markdown",
+            [cand("marksman", ["server"])],
+            ["markdown", ".md", ".markdown"],
+            [".md", ".markdown"],
+            [".marksman.toml", "README.md", ".git"],
+            "pacman -S marksman  # or: brew install marksman",
+            "{{}}",
+            "Marksman Markdown wiki-link & heading language server",
+        ),
+        -- 14. HTML
+        make_preset(
+            "html",
+            "HTML",
+            [cand("vscode-html-language-server", ["--stdio"])],
+            ["html", ".html", ".htm"],
+            [".html", ".htm"],
+            ["index.html", "package.json"],
+            "npm install -g vscode-langservers-extracted",
+            "{{}}",
+            "HTML language server",
+        ),
+        -- 15. CSS
+        make_preset(
+            "cssls",
+            "CSS",
+            [cand("vscode-css-language-server", ["--stdio"])],
+            ["css", ".css", ".scss"],
+            [".css", ".scss"],
+            ["package.json", ".git"],
+            "npm install -g vscode-langservers-extracted",
+            "{{}}",
+            "CSS & SCSS language server",
+        ),
+        -- 16. Java
+        make_preset(
+            "jdtls",
+            "Java",
+            [cand("jdtls", List())],
+            ["java", ".java"],
+            [".java"],
+            ["pom.xml", "build.gradle", "gradlew"],
+            "pacman -S jdtls  # or: brew install jdtls",
+            "{{}}",
+            "Eclipse JDT Java language server",
+        ),
+        -- 17. Ruby
+        make_preset(
+            "ruby_lsp",
+            "Ruby",
+            [
+                cand("ruby-lsp", List()),
+                cand("solargraph", ["stdio"])
+            ],
+            ["ruby", ".rb"],
+            [".rb"],
+            ["Gemfile", "Rakefile"],
+            "gem install ruby-lsp",
+            "{{}}",
+            "Ruby language server (Shopify ruby-lsp / solargraph)",
+        ),
+        -- 18. Nix
+        make_preset(
+            "nil_ls",
+            "Nix",
+            [
+                cand("nil", List()),
+                cand("nixd", List())
+            ],
+            ["nix", ".nix"],
+            [".nix"],
+            ["flake.nix", "default.nix", "shell.nix"],
+            "nix profile install nixpkgs#nil",
+            "{{}}",
+            "Nix language server (nil / nixd)",
+        )
+    ]
+}
+
+-- ============================================================================
+-- 3. LspConfigRegistry Methods & Synchronization with `LspService`
+-- ============================================================================
+
+impl LspConfigRegistry {
+    pub fn new() -> LspConfigRegistry {
+        let reg = LspConfigRegistry {
+            presets: HashMap.new(),
+            preset_order: List(),
+            auto_attach: true,
+            extra_search_dirs: List(),
+            prev_buf_id: BufferId(1),
+            row_to_server_id: HashMap.new(),
+            detected_presets: Set.new(),
+            all_detected: false,
+        }
+        let builtins = build_builtin_18_presets()
+        for i in 0..builtins.len() {
+            let p = builtins.get(i.as(usize)).as(LspLanguagePreset)
+            reg.preset_order.push(p.server_id)
+            reg.presets.insert(p.server_id, p)
+        }
+        reg
+    }
+
+    pub fn preset_count(self) -> i64 = self.preset_order.len()
+
+    pub fn get_preset(self, server_id: String) -> ?LspLanguagePreset {
+        let raw? = self.presets.get(server_id) else {
+            return null
+        }
+        raw.as(LspLanguagePreset)
+    }
+
+    pub fn prepend_search_path(self, lsp_svc: ?LspService, dir: String) {
+        let trimmed = dir.trim()
+        if trimmed == "" {
+            return
+        }
+        let updated = List()
+        updated.push(trimmed)
+        for i in 0..self.extra_search_dirs.len() {
+            let ex = self.extra_search_dirs.get(i.as(usize)).as(String)
+            if ex != trimmed {
+                updated.push(ex)
+            }
+        }
+        self.extra_search_dirs = updated
+        if lsp_svc != null {
+            lsp_svc.as(LspService).prepend_search_path(trimmed)
+        }
+        self.detected_presets = Set.new()
+        self.all_detected = false
+        self.refresh_path_detection()
+        if lsp_svc != null {
+            self.sync_specs_to_lsp(lsp_svc.as(LspService))
+        }
+    }
+
+    pub fn to_server_spec(self, preset: LspLanguagePreset) -> LspServerSpec {
+        LspServerSpec {
+            name: preset.language_name,
+            server_id: preset.server_id,
+            cmd: preset.active_cmd,
+            args: preset.active_args,
+            filetypes: preset.filetypes,
+            root_markers: preset.root_markers,
+            install_hint: preset.install_hint,
+            settings_json: preset.settings_json,
+            description: preset.description,
+        }
+    }
+
+    private fn detect_preset_candidates(self, p: LspLanguagePreset) {
+        var matched = false
+        for ci in 0..p.candidates.len() {
+            let c = p.candidates.get(ci.as(usize)).as(LspBinaryCandidate)
+            let resolved = scan_executable_in_path(c.cmd, self.extra_search_dirs)
+            if resolved != "" {
+                p.active_cmd = c.cmd
+                p.active_args = c.args
+                p.resolved_path = resolved
+                p.installed = true
+                matched = true
+                break
+            }
+        }
+        if not matched and (not p.candidates.is_empty()) {
+            let first = p.candidates.get(0).as(LspBinaryCandidate)
+            p.active_cmd = first.cmd
+            p.active_args = first.args
+            p.resolved_path = ""
+            p.installed = false
+        }
+    }
+
+    pub fn ensure_preset_detected(self, server_id: String, lsp_svc: ?LspService) {
+        if self.detected_presets.contains(server_id) {
+            return
+        }
+        let p_opt = self.get_preset(server_id)
+        if p_opt == null {
+            return
+        }
+        let p = p_opt.as(LspLanguagePreset)
+        self.detect_preset_candidates(p)
+        self.detected_presets.insert(server_id)
+        if lsp_svc != null {
+            lsp_svc.as(LspService).register_server_spec(self.to_server_spec(p))
+        }
+    }
+
+    pub fn refresh_path_detection(self) {
+        for i in 0..self.preset_order.len() {
+            let sid = self.preset_order.get(i.as(usize)).as(String)
+            let p = self.presets.get(sid).as(LspLanguagePreset)
+            self.detect_preset_candidates(p)
+            self.detected_presets.insert(sid)
+        }
+        self.all_detected = true
+    }
+
+    pub fn sync_specs_to_lsp(self, lsp_svc: LspService) {
+        for i in 0..self.preset_order.len() {
+            let sid = self.preset_order.get(i.as(usize)).as(String)
+            let p = self.presets.get(sid).as(LspLanguagePreset)
+            lsp_svc.register_server_spec(self.to_server_spec(p))
+        }
+    }
+
+    pub fn resolve_preset_for_buffer(self, buf: Buffer) -> ?LspLanguagePreset {
+        if buf.kind == BufferKind.Special or buf.kind == BufferKind.Directory or buf.kind == BufferKind.Results {
+            return null
+        }
+        let fp = if buf.file_path != "" { buf.file_path.to_lower() } else { buf.name.to_lower() }
+        -- 1. Match explicit file extension first (handles `.zig`, `.java`, `.rb`, `.nix`, `.cc`, `.pyi`, `.jsonc`, etc.)
+        for i in 0..self.preset_order.len() {
+            let sid = self.preset_order.get(i.as(usize)).as(String)
+            let p = self.presets.get(sid).as(LspLanguagePreset)
+            for ei in 0..p.extensions.len() {
+                let ext = p.extensions.get(ei.as(usize)).as(String).to_lower()
+                if ext != "" and fp.ends_with(ext) {
+                    return p
+                }
+            }
+        }
+        -- 2. Match `buf.major_mode`
+        let mode = buf.major_mode.to_lower()
+        if mode != "" and mode != "text" and mode != "fundamental" {
+            for i in 0..self.preset_order.len() {
+                let sid = self.preset_order.get(i.as(usize)).as(String)
+                let p = self.presets.get(sid).as(LspLanguagePreset)
+                for fi in 0..p.filetypes.len() {
+                    let ft = p.filetypes.get(fi.as(usize)).as(String).to_lower()
+                    if ft == mode {
+                        return p
+                    }
+                }
+            }
+        }
+        null
+    }
+
+    pub fn resolve_root_for_preset(self, file_path: String, fallback_cwd: String, server_id: String) -> String {
+        let p_opt = self.get_preset(server_id)
+        if p_opt == null {
+            return detect_project_root(file_path, fallback_cwd, [".git"])
+        }
+        let p = p_opt.as(LspLanguagePreset)
+        detect_project_root(file_path, fallback_cwd, p.root_markers)
+    }
+
+    pub fn maybe_auto_attach_buffer(
+        self,
+        kernel: SystemKernel,
+        world: EditorWorld,
+        lsp_svc: LspService,
+        buf: Buffer,
+    ) -> bool {
+        if not self.auto_attach {
+            return false
+        }
+        let preset_opt = self.resolve_preset_for_buffer(buf)
+        if preset_opt == null {
+            return false
+        }
+        let preset = preset_opt.as(LspLanguagePreset)
+        -- Upgrade generic `"text"` mode to canonical language filetype if buffer was opened for `.zig`/`.nix`/`.rb`/`.java`
+        if buf.major_mode == "text" and (not preset.filetypes.is_empty()) {
+            let ft0 = preset.filetypes.get(0).as(String)
+            if not ft0.starts_with(".") {
+                buf.major_mode = ft0
+            }
+        }
+        let existing_att_opt = lsp_svc.buf_attachments.get(buf.id)
+        if existing_att_opt != null {
+            let ex = existing_att_opt.as(BufferLspAttachment)
+            if ex.server_id == preset.server_id {
+                if world.active_buffer_id == buf.id {
+                    lsp_svc.sync_statusline(world, buf)
+                }
+                return ex.binary_found
+            }
+        }
+        if not is_ssh_uri(buf.file_path) {
+            self.ensure_preset_detected(preset.server_id, lsp_svc)
+        }
+        let spec = if is_ssh_uri(buf.file_path) {
+            var chosen_cmd = preset.active_cmd
+            var chosen_args = preset.active_args
+            var remote_matched = false
+            for ci in 0..preset.candidates.len() {
+                let cand = preset.candidates.get(ci.as(usize)).as(LspBinaryCandidate)
+                let rw_res = remote_which(buf.file_path, cand.cmd)
+                var rpath = ""
+                rw_res match {
+                    rp! => {
+                        rpath = rp.trim()
+                    },
+                    error _ => (),
+                }
+                if rpath == "" and (not remote_host_available()) {
+                    rpath = scan_executable_in_path(cand.cmd, self.extra_search_dirs)
+                }
+                if rpath != "" {
+                    chosen_cmd = cand.cmd
+                    chosen_args = cand.args
+                    remote_matched = true
+                    break
+                }
+            }
+            if (not remote_matched) and (not preset.candidates.is_empty()) {
+                let first_c = preset.candidates.get(0).as(LspBinaryCandidate)
+                chosen_cmd = first_c.cmd
+                chosen_args = first_c.args
+            }
+            LspServerSpec {
+                name: preset.language_name,
+                server_id: preset.server_id,
+                cmd: chosen_cmd,
+                args: chosen_args,
+                filetypes: preset.filetypes,
+                root_markers: preset.root_markers,
+                install_hint: preset.install_hint,
+                settings_json: preset.settings_json,
+                description: preset.description,
+            }
+        } else {
+            self.to_server_spec(preset)
+        }
+        lsp_svc.attach_buffer(kernel, world, buf, spec)
+    }
+}
+
+pub fn require_lspconfig_registry(kernel: SystemKernel) -> !String LspConfigRegistry {
+    let raw = kernel.require_service(SERVICE_LSPCONFIG)!
+    raw.as(LspConfigRegistry)
+}
+
+-- ============================================================================
+-- 4. Public `init.ns` Customization API
+-- ============================================================================
+
+pub fn configure_lsp_server(
+    kernel: SystemKernel,
+    server_id: String,
+    cmd: String,
+    args: List,
+    root_markers: List,
+    settings_json: String,
+) -> !String Unit {
+    let reg = require_lspconfig_registry(kernel)!
+    let lsp_svc = require_lsp_service(kernel)!
+    let existing_opt = reg.get_preset(server_id)
+    if existing_opt != null {
+        let p = existing_opt.as(LspLanguagePreset)
+        let custom_cand = LspBinaryCandidate { cmd: cmd, args: args }
+        let new_cands = List()
+        new_cands.push(custom_cand)
+        for i in 0..p.candidates.len() {
+            let old_c = p.candidates.get(i.as(usize)).as(LspBinaryCandidate)
+            if old_c.cmd != cmd {
+                new_cands.push(old_c)
+            }
+        }
+        p.candidates = new_cands
+        p.active_cmd = cmd
+        p.active_args = args
+        if not root_markers.is_empty() {
+            p.root_markers = root_markers
+        }
+        if settings_json != "" {
+            p.settings_json = settings_json
+        }
+        let resolved = scan_executable_in_path(cmd, reg.extra_search_dirs)
+        p.resolved_path = resolved
+        p.installed = resolved != ""
+        reg.detected_presets.insert(server_id)
+        lsp_svc.register_server_spec(reg.to_server_spec(p))
+    } else {
+        let resolved = scan_executable_in_path(cmd, reg.extra_search_dirs)
+        let fresh = LspLanguagePreset {
+            server_id: server_id,
+            language_name: server_id,
+            candidates: [LspBinaryCandidate { cmd: cmd, args: args }],
+            active_cmd: cmd,
+            active_args: args,
+            resolved_path: resolved,
+            installed: resolved != "",
+            filetypes: [server_id],
+            extensions: List(),
+            root_markers: if root_markers.is_empty() { [".git"] } else { root_markers },
+            install_hint: "Install `" ++ cmd ++ "` in $PATH",
+            settings_json: if settings_json == "" { "{{}}" } else { settings_json },
+            description: "User-configured LSP server `" ++ server_id ++ "`",
+        }
+        reg.preset_order.push(server_id)
+        reg.presets.insert(server_id, fresh)
+        reg.detected_presets.insert(server_id)
+        lsp_svc.register_server_spec(reg.to_server_spec(fresh))
+    }
+    ()
+}
+
+pub fn set_lsp_auto_attach(kernel: SystemKernel, enabled: bool) -> !String Unit {
+    let reg = require_lspconfig_registry(kernel)!
+    reg.auto_attach = enabled
+    ()
+}
+
+-- ============================================================================
+-- 5. Interactive `*LspConfig*` / `:Mason` Health & Preset Dashboard
+-- ============================================================================
+
+private fn sync_wm(kernel: SystemKernel, world: EditorWorld) {
+    let wm_opt = kernel.service(SERVICE_WINDOW_MANAGER)
+    if wm_opt != null {
+        wm_opt.as(WindowManager).sync_from_world(world)
+    }
+}
+
+private fn render_lspconfig_dashboard(
+    reg: LspConfigRegistry,
+    lsp_svc: LspService,
+    world: EditorWorld,
+    buf: Buffer,
+) {
+    reg.row_to_server_id = HashMap.new()
+    var installed_count: i64 = 0
+    for i in 0..reg.preset_order.len() {
+        let sid = reg.preset_order.get(i.as(usize)).as(String)
+        if reg.presets.get(sid).as(LspLanguagePreset).installed {
+            installed_count += 1
+        }
+    }
+
+    let prev_opt = world.buffer(reg.prev_buf_id)
+    var prev_status = "(none)"
+    if prev_opt != null {
+        let pb = prev_opt.as(Buffer)
+        let att_opt = lsp_svc.buf_attachments.get(pb.id)
+        if att_opt != null {
+            let att = att_opt.as(BufferLspAttachment)
+            prev_status = pb.name ++ " -> [LSP: " ++ att.server_name ++ "] (root: " ++ att.root_dir ++ ")"
+        } else {
+            prev_status = pb.name ++ " (" ++ pb.major_mode ++ ") -> not attached"
+        }
+    }
+
+    let auto_badge = if reg.auto_attach { "ON" } else { "OFF" }
+    let lines = List()
+    lines.push("================================================================================")
+    lines.push(
+        " Lava LSP Preset & Mason Health Dashboard (*LspConfig*)   ["
+        ++ installed_count.to_string() ++ "/" ++ reg.preset_order.len().to_string()
+        ++ " installed | auto_attach=" ++ auto_badge ++ "]"
+    )
+    lines.push(" Keys: [RET] start/attach on buffer  [i] copy install hint  [r] refresh $PATH  [q] close")
+    lines.push(" Active Buffer Status: " ++ prev_status)
+    lines.push("================================================================================")
+
+    let highlight_rows = List()
+    for i in 0..reg.preset_order.len() {
+        let sid = reg.preset_order.get(i.as(usize)).as(String)
+        let p = reg.presets.get(sid).as(LspLanguagePreset)
+        let num_str = if i + 1 < 10 { " " ++ (i + 1).to_string() } else { (i + 1).to_string() }
+        let badge = if p.installed { "[INSTALLED ✓]" } else { "[MISSING ○]  " }
+        let args_str = if p.active_args.is_empty() { "" } else { " " ++ p.active_args.join(" ") }
+
+        let header_row = lines.len()
+        lines.push(
+            " " ++ num_str ++ ". " ++ badge ++ " " ++ p.language_name
+            ++ " (" ++ p.server_id ++ ") -> `" ++ p.active_cmd ++ args_str ++ "`"
+        )
+        reg.row_to_server_id.insert(header_row, sid)
+        highlight_rows.push((header_row, p.installed))
+
+        let detail_row = lines.len()
+        if p.installed {
+            lines.push(
+                "       Binary : " ++ p.resolved_path
+                ++ " | Root markers: " ++ p.root_markers.join(", ")
+                ++ " | Filetypes: " ++ p.filetypes.join(", ")
+            )
+        } else {
+            lines.push(
+                "       Install: " ++ p.install_hint
+                ++ " | Root markers: " ++ p.root_markers.join(", ")
+            )
+        }
+        reg.row_to_server_id.insert(detail_row, sid)
+    }
+
+    buf.read_only = false
+    buf.major_mode = MODE_LSPCONFIG
+    buf.set_lines(lines, record_undo = false)
+    buf.modified = false
+    buf.read_only = true
+    buf.clear_owner_decors(OWNER_LSPCONFIG)
+
+    for i in 0..highlight_rows.len() {
+        let (r, is_inst) = highlight_rows.get(i.as(usize)).as((i64, bool))
+        let col_fg = if is_inst { rgb(166, 227, 161) } else { rgb(249, 226, 175) }
+        let sign_ch = if is_inst { "✓" } else { "○" }
+        buf.add_sign(OWNER_LSPCONFIG, r, sign_ch, col_fg, priority = 40)
+        buf.add_inline_decor(
+            OWNER_LSPCONFIG,
+            r,
+            5,
+            18,
+            bg_rgba = 0,
+            fg_rgba = col_fg,
+            underline = false,
+            replace_label = "",
+        )
+    }
+}
+
+private fn preset_under_dashboard_cursor(reg: LspConfigRegistry, buf: Buffer) -> ?LspLanguagePreset {
+    let sid_opt = reg.row_to_server_id.get(buf.point.row)
+    if sid_opt != null {
+        return reg.get_preset(sid_opt.as(String))
+    }
+    if not reg.preset_order.is_empty() {
+        return reg.get_preset(reg.preset_order.get(0).as(String))
+    }
+    null
+}
+
+-- ============================================================================
+-- 6. Extension Registration (`lava.org/ext_lspconfig`)
+-- ============================================================================
+
+pub fn register_lspconfig_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_lspconfig_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_lspconfig",
+        "0.1.0",
+        "18-language out-of-the-box LSP preset registry, $PATH binary scanner, auto-attach hooks, and *LspConfig* / :Mason dashboard.",
+        [ext_document_id(), ext_window_id(), ext_vim_id(), ext_lsp_id()],
+        |k: SystemKernel| -> !String Unit {
+            let reg = LspConfigRegistry.new()
+            let lsp_svc = require_lsp_service(k)!
+            reg.sync_specs_to_lsp(lsp_svc)
+            k.publish_service(SERVICE_LSPCONFIG, ext_id, reg)
+
+            -- Auto-attach any already-open file buffers at activation time
+            let w_init_opt = k.service("lava.document.world")
+            if w_init_opt != null {
+                let w_init = w_init_opt.as(EditorWorld)
+                for i in 0..w_init.buffer_order.len() {
+                    let bid = w_init.buffer_order.get(i.as(usize)).as(BufferId)
+                    let b = w_init.buffers.get(bid).as(Buffer)
+                    if b.file_path != "" {
+                        let _ = reg.maybe_auto_attach_buffer(k, w_init, lsp_svc, b)
+                    }
+                }
+            }
+
+            let on_buf_enter = |kern: SystemKernel, _payload: Any| -> Unit {
+                let w_opt = kern.service("lava.document.world")
+                let l_opt = kern.service("lava.lsp.service")
+                if w_opt != null and l_opt != null {
+                    let w = w_opt.as(EditorWorld)
+                    let ls = l_opt.as(LspService)
+                    let _ = reg.maybe_auto_attach_buffer(kern, w, ls, w.active_buffer())
+                }
+            }
+            k.add_hook("buffer-opened", ext_id, on_buf_enter, priority = 35)
+            k.add_hook("buffer-switched", ext_id, on_buf_enter, priority = 35)
+
+            let open_dashboard = |kern: SystemKernel| -> #InteractiveEffects !String Any {
+                let w = require_editor_world(kern)!
+                let ls = require_lsp_service(kern)!
+                let cur = w.active_buffer()
+                if cur.name != LSPCONFIG_BUF_NAME {
+                    reg.prev_buf_id = cur.id
+                }
+                reg.refresh_path_detection()
+                reg.sync_specs_to_lsp(ls)
+                let dbuf = w.ensure_special_buffer(LSPCONFIG_BUF_NAME, MODE_LSPCONFIG, [""], read_only = true)
+                render_lspconfig_dashboard(reg, ls, w, dbuf)
+                dbuf.point = Pos.new(5, 0)
+                w.active_buffer_id = dbuf.id
+                sync_wm(kern, w)
+                status_emit("*LspConfig* — 18 language server presets (`i` copy install hint, `RET` attach, `r` refresh, `q` close)")#
+                ()
+            }
+
+            k.register_command(
+                "lsp-config",
+                ext_id,
+                "Open *LspConfig* 18-language server preset & health dashboard (`<Space>cL` / `:LspConfig`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    open_dashboard(kern)#
+                },
+            )
+            k.register_command(
+                "lsp-mason",
+                ext_id,
+                "Open *LspConfig* / Mason language server health & install dashboard (`<Space>cm` / `:Mason`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    open_dashboard(kern)#
+                },
+            )
+            k.register_command(
+                "lsp-check",
+                ext_id,
+                "Check $PATH installation status for all 18 language servers (`:LspCheck`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    open_dashboard(kern)#
+                },
+            )
+            k.register_command(
+                "ex:LspConfig",
+                ext_id,
+                ":LspConfig — open LSP preset & health dashboard.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    kern.dispatch_command("lsp-config", args)#!
+                },
+            )
+            k.register_command(
+                "ex:LspCheck",
+                ext_id,
+                ":LspCheck — open LSP health check dashboard.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    kern.dispatch_command("lsp-check", args)#!
+                },
+            )
+            k.register_command(
+                "ex:Mason",
+                ext_id,
+                ":Mason — open LSP server installation & health dashboard.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    kern.dispatch_command("lsp-mason", args)#!
+                },
+            )
+
+            -- Interactive dashboard buffer commands (`RET`, `i`, `r`, `q`)
+            k.register_command(
+                "lspconfig-attach-at-point",
+                ext_id,
+                "Attach/start the language server preset under cursor on the previous editing buffer.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let ls = require_lsp_service(kern)!
+                    let dbuf = w.active_buffer()
+                    let preset_opt = preset_under_dashboard_cursor(reg, dbuf)
+                    if preset_opt == null {
+                        return ()
+                    }
+                    let preset = preset_opt.as(LspLanguagePreset)
+                    let target_opt = w.buffer(reg.prev_buf_id)
+                    if target_opt == null {
+                        status_emit("No target editing buffer to attach `" ++ preset.server_id ++ "`")#
+                        return ()
+                    }
+                    let target_buf = target_opt.as(Buffer)
+                    reg.ensure_preset_detected(preset.server_id, ls)
+                    let found = ls.attach_buffer(kern, w, target_buf, reg.to_server_spec(preset))
+                    render_lspconfig_dashboard(reg, ls, w, dbuf)
+                    if found {
+                        status_emit("Attached `" ++ preset.active_cmd ++ "` to " ++ target_buf.name)#
+                    } else {
+                        status_emit("Attached builtin-index for `" ++ preset.language_name ++ "` to " ++ target_buf.name)#
+                    }
+                    ()
+                },
+                interactive = false,
+            )
+
+            k.register_command(
+                "lspconfig-copy-install-hint",
+                ext_id,
+                "Copy the install command hint for the preset under cursor to clipboard (`i`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let dbuf = w.active_buffer()
+                    let preset_opt = preset_under_dashboard_cursor(reg, dbuf)
+                    if preset_opt == null {
+                        return ()
+                    }
+                    let preset = preset_opt.as(LspLanguagePreset)
+                    clipboard_set(preset.install_hint)#
+                    status_emit("Copied install command for " ++ preset.language_name ++ ": " ++ preset.install_hint)#
+                    ()
+                },
+                interactive = false,
+            )
+
+            k.register_command(
+                "lspconfig-refresh",
+                ext_id,
+                "Re-scan $PATH for all 18 language server presets (`r`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let ls = require_lsp_service(kern)!
+                    let dbuf = w.active_buffer()
+                    let saved_pt = dbuf.point
+                    reg.refresh_path_detection()
+                    reg.sync_specs_to_lsp(ls)
+                    if dbuf.name == LSPCONFIG_BUF_NAME {
+                        render_lspconfig_dashboard(reg, ls, w, dbuf)
+                        dbuf.point = dbuf.clamp_pos(saved_pt, insert_mode = false)
+                    }
+                    status_emit("Refreshed $PATH scan for " ++ reg.preset_count().to_string() ++ " LSP presets")#
+                    ()
+                },
+                interactive = false,
+            )
+
+            k.register_command(
+                "lspconfig-close",
+                ext_id,
+                "Close *LspConfig* dashboard and return to previous buffer (`q`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    if w.buffers.contains_key(reg.prev_buf_id) {
+                        w.active_buffer_id = reg.prev_buf_id
+                    } else {
+                        let _ = w.cycle_buffer(-1)
+                    }
+                    sync_wm(kern, w)
+                    ls_sync_after_close(kern, w)
+                    ()
+                },
+                interactive = false,
+            )
+
+            let mode_km = k.ensure_keymap("mode:" ++ MODE_LSPCONFIG)
+            mode_km.bind("<Return>", "lspconfig-attach-at-point", ext_id, description = "Attach server to buffer")
+            mode_km.bind("i", "lspconfig-copy-install-hint", ext_id, description = "Copy install command")
+            mode_km.bind("r", "lspconfig-refresh", ext_id, description = "Refresh $PATH scan")
+            mode_km.bind("q", "lspconfig-close", ext_id, description = "Close *LspConfig*")
+            mode_km.bind("<Escape>", "lspconfig-close", ext_id, description = "Close *LspConfig*")
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> c L", "lsp-config", ext_id, description = "LSP Preset & Health Dashboard")
+            leader_km.bind("<Space> c m", "lsp-mason", ext_id, description = "Mason LSP Server Dashboard")
+
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                w_opt.as(EditorWorld).clear_owner_ui(OWNER_LSPCONFIG)
+            }
+            ()
+        },
+    )
+}
+
+private fn ls_sync_after_close(kernel: SystemKernel, world: EditorWorld) {
+    let l_opt = kernel.service("lava.lsp.service")
+    if l_opt != null {
+        l_opt.as(LspService).sync_statusline(world, world.active_buffer())
+    }
+}

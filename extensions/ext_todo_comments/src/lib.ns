@@ -1,0 +1,777 @@
+-- ext_todo_comments: Semantic TODO / FIXME / NOTE / PERF / HACK / WARN / BUG Annotations & Workspace Picker.
+-- Inspired by `todo-comments.nvim` and Emacs `hl-todo`.
+-- Publishes service `"lava.todo_comments.state"` (`TodoCommentsService`), live pill badges, gutter signs,
+-- `]t` / `[t` buffer navigation, and `*Todos*` workspace quickfix picker (`<Space> s t`, `:TodoQuickfix`, `:TodoTrouble`).
+
+use std.collections.{HashMap, Set}
+use @lava_sys.rgb
+use @lava_core.{
+    ExtId, InteractiveEffects, KeyBindingEntry, Keymap, SystemKernel, status_emit
+}
+use @lava_accel.{TodoItem, accel_doc_scan_todos, accel_scan_workspace_todos}
+use @ext_document.{
+    Buffer, BufferId, BufferKind, EditorWorld, Pos, QuickfixEntry, ext_document_id,
+    require_editor_world
+}
+use @ext_vim.{
+    KEYMAP_VIM_LEADER, KEYMAP_VIM_NORMAL, VimMode, VimState, ext_vim_id, require_vim_state,
+    sync_world_from_vim
+}
+
+pub const SERVICE_TODO_COMMENTS: String = "lava.todo_comments.state"
+pub const OWNER_TODO_COMMENTS: String = "ext_todo_comments"
+pub const TODOS_BUF_NAME: String = "*Todos*"
+pub const SIGN_PRIORITY_TODO: i64 = 22
+
+pub fn ext_todo_comments_id() -> ExtId = ExtId("lava.org/ext_todo_comments")
+
+-- ============================================================================
+-- 1. Service State & Semantic Tag Palette
+-- ============================================================================
+
+pub struct TodoCommentsService {
+    pub enabled: bool,
+    pub tag_filter: String,
+    pub items_by_buf: HashMap,
+    pub last_ver_by_buf: HashMap,
+    pub last_win_by_buf: HashMap,
+    pub workspace_items: List,
+    pub panel_row_map: HashMap,
+    pub source_buf_id: BufferId,
+}
+
+impl TodoCommentsService {
+    pub fn new() -> TodoCommentsService {
+        TodoCommentsService {
+            enabled: true,
+            tag_filter: "ALL",
+            items_by_buf: HashMap.new(),
+            last_ver_by_buf: HashMap.new(),
+            last_win_by_buf: HashMap.new(),
+            workspace_items: List(),
+            panel_row_map: HashMap.new(),
+            source_buf_id: BufferId(1),
+        }
+    }
+
+    pub fn buffer_todos(self, buf_id: BufferId) -> List {
+        let entry? = self.items_by_buf.get(buf_id) else {
+            return List()
+        }
+        entry.as(List)
+    }
+
+    pub fn count_tag(self, items: List, wanted_tag: String) -> i64 {
+        var count: i64 = 0
+        for i in 0..items.len() {
+            let item = items.get(i.as(usize)).as(TodoItem)
+            if item.tag == wanted_tag {
+                count += 1
+            }
+        }
+        count
+    }
+}
+
+pub fn require_todo_comments_service(kernel: SystemKernel) -> !String TodoCommentsService {
+    let raw = kernel.require_service(SERVICE_TODO_COMMENTS)!
+    raw.as(TodoCommentsService)
+}
+
+fn todo_tag_style(tag: String) -> (i64, String) {
+    let upper = tag.to_upper()
+    when {
+        upper == "FIXME" or upper == "BUG" => (rgb(243, 139, 168), "!"),
+        upper == "TODO" => (rgb(137, 180, 250), "T"),
+        upper == "HACK" or upper == "WARN" => (rgb(249, 226, 175), "W"),
+        upper == "PERF" => (rgb(250, 179, 135), "P"),
+        upper == "NOTE" => (rgb(166, 227, 161), "N"),
+        else => (rgb(137, 180, 250), "T"),
+    }
+}
+
+fn next_filter_tag(current: String) -> String {
+    let cur = current.to_upper()
+    when {
+        cur == "ALL" => "TODO",
+        cur == "TODO" => "FIXME",
+        cur == "FIXME" => "NOTE",
+        cur == "NOTE" => "PERF",
+        cur == "PERF" => "HACK",
+        cur == "HACK" => "WARN",
+        cur == "WARN" => "BUG",
+        else => "ALL",
+    }
+}
+
+-- ============================================================================
+-- 2. Native Document Scan & Viewport-Scoped Live Buffer Decoration
+-- ============================================================================
+
+fn is_decoratable_buffer(buf: Buffer) -> bool {
+    if buf.name == TODOS_BUF_NAME or buf.name == "*Messages*" or buf.name == "*Trouble*" {
+        return false
+    }
+    buf.kind != BufferKind.Special and buf.kind != BufferKind.Directory
+}
+
+fn compute_todo_window(world: ?EditorWorld, lcount: i64) -> (i64, i64) {
+    if lcount <= 400 {
+        return (0, lcount)
+    }
+    if world == null {
+        return (0, 480)
+    }
+    let w = world.as(EditorWorld)
+    let vrows = if w.viewport_rows > 0 { w.viewport_rows } else { 36 }
+    let raw_start = w.viewport_top_row - 30
+    let win_start = if raw_start > 0 { raw_start } else { 0 }
+    let raw_end = w.viewport_top_row + vrows + 50
+    let win_end = if raw_end < lcount { raw_end } else { lcount }
+    (win_start, win_end)
+}
+
+fn viewport_escaped_todo_window(
+    world: EditorWorld,
+    lcount: i64,
+    win_start: i64,
+    win_end: i64,
+) -> bool {
+    if lcount <= 400 {
+        return false
+    }
+    let top_r = if world.viewport_top_row > 0 { world.viewport_top_row } else { 0 }
+    let vrows = if world.viewport_rows > 0 { world.viewport_rows } else { 36 }
+    let bot_r = if top_r + vrows < lcount { top_r + vrows } else { lcount }
+    (win_start > 0 and top_r < win_start + 10)
+        or (win_end < lcount and bot_r > win_end - 10)
+}
+
+fn collect_buffer_todos(buf: Buffer) -> List {
+    buf.sync_external_lines()
+    accel_doc_scan_todos(buf.doc_id, buf.file_path, 2000)
+}
+
+fn apply_todo_decorations(buf: Buffer, items: List, win_start: i64, win_end: i64) {
+    buf.clear_owner_decors(OWNER_TODO_COMMENTS)
+    let pill_fg = rgb(24, 24, 37)
+    for i in 0..items.len() {
+        let item = items.get(i.as(usize)).as(TodoItem)
+        if item.row < win_start or item.row >= win_end {
+            continue
+        }
+        let (badge_bg, sign_txt) = todo_tag_style(item.tag)
+        let line = buf.line_at(item.row)
+        let llen = line.char_len()
+        let tag_end = item.col + item.tag.char_len()
+        if item.col >= 0 and tag_end <= llen {
+            buf.add_sign(OWNER_TODO_COMMENTS, item.row, sign_txt, badge_bg, priority = SIGN_PRIORITY_TODO)
+            buf.add_inline_decor(
+                OWNER_TODO_COMMENTS,
+                item.row,
+                item.col,
+                tag_end,
+                bg_rgba = badge_bg,
+                fg_rgba = pill_fg,
+                underline = false,
+            )
+            if tag_end < llen {
+                buf.add_inline_decor(
+                    OWNER_TODO_COMMENTS,
+                    item.row,
+                    tag_end,
+                    llen,
+                    bg_rgba = 0,
+                    fg_rgba = badge_bg,
+                    underline = false,
+                )
+            }
+        }
+    }
+}
+
+fn sync_buffer_todos(
+    world: ?EditorWorld,
+    service: TodoCommentsService,
+    buf: Buffer,
+    force: bool,
+) -> List {
+    if not is_decoratable_buffer(buf) {
+        buf.clear_owner_decors(OWNER_TODO_COMMENTS)
+        let _ = service.items_by_buf.remove(buf.id)
+        let _ = service.last_ver_by_buf.remove(buf.id)
+        let _ = service.last_win_by_buf.remove(buf.id)
+        return List()
+    }
+
+    buf.sync_external_lines()
+    let lcount = buf.line_count()
+
+    if not force {
+        let ver_opt = service.last_ver_by_buf.get(buf.id)
+        if ver_opt != null and ver_opt.as(i64) == buf.edit_version {
+            let cached_items = service.buffer_todos(buf.id)
+            if not service.enabled {
+                return cached_items
+            }
+            if world != null {
+                let w = world.as(EditorWorld)
+                let win_opt = service.last_win_by_buf.get(buf.id)
+                if win_opt != null {
+                    let (ws, we) = win_opt.as((i64, i64))
+                    if not viewport_escaped_todo_window(w, lcount, ws, we) {
+                        return cached_items
+                    }
+                }
+                let (nws, nwe) = compute_todo_window(w, lcount)
+                apply_todo_decorations(buf, cached_items, nws, nwe)
+                service.last_win_by_buf.insert(buf.id, (nws, nwe))
+            }
+            return cached_items
+        }
+    }
+
+    let items = collect_buffer_todos(buf)
+    service.items_by_buf.insert(buf.id, items)
+    service.last_ver_by_buf.insert(buf.id, buf.edit_version)
+
+    if not service.enabled {
+        buf.clear_owner_decors(OWNER_TODO_COMMENTS)
+        let _ = service.last_win_by_buf.remove(buf.id)
+        return items
+    }
+
+    let (win_start, win_end) = compute_todo_window(world, lcount)
+    apply_todo_decorations(buf, items, win_start, win_end)
+    service.last_win_by_buf.insert(buf.id, (win_start, win_end))
+    items
+}
+
+pub fn refresh_buffer_todos(service: TodoCommentsService, buf: Buffer) -> List {
+    sync_buffer_todos(null, service, buf, true)
+}
+
+-- ============================================================================
+-- 3. Buffer Navigation (`]t` / `[t`) & Workspace `*Todos*` Picker
+-- ============================================================================
+
+fn jump_todo_in_buffer(kernel: SystemKernel, forward: bool) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let service = require_todo_comments_service(kernel)!
+    let buf = world.active_buffer()
+
+    let items = sync_buffer_todos(world, service, buf, false)
+    let total = items.len()
+    if total == 0 {
+        status_emit("No TODO comments in " ++ buf.name)#
+        return ()
+    }
+
+    let step = vim.effective_count()
+    var cur = buf.point
+    var chosen_idx: i64 = 0
+
+    for _ in 0..step {
+        if forward {
+            var found: i64 = -1
+            for i in 0..total {
+                let item = items.get(i.as(usize)).as(TodoItem)
+                let ip = Pos.new(item.row, item.col)
+                if ip > cur {
+                    found = i
+                    break
+                }
+            }
+            chosen_idx = if found >= 0 { found } else { 0 }
+        } else {
+            var found: i64 = -1
+            var i = total - 1
+            while i >= 0 {
+                let item = items.get(i.as(usize)).as(TodoItem)
+                let ip = Pos.new(item.row, item.col)
+                if ip < cur {
+                    found = i
+                    break
+                }
+                i -= 1
+            }
+            chosen_idx = if found >= 0 { found } else { total - 1 }
+        }
+        let picked = items.get(chosen_idx.as(usize)).as(TodoItem)
+        cur = Pos.new(picked.row, picked.col)
+    }
+
+    let target = items.get(chosen_idx.as(usize)).as(TodoItem)
+    world.jumps.record(buf.id, buf.file_path, buf.point)
+    buf.point = buf.clamp_pos(Pos.new(target.row, target.col), insert_mode = false)
+    buf.preferred_col = buf.point.col
+    vim.mode = VimMode.Normal
+    vim.clear_transient()
+    sync_world_from_vim(world, vim)
+    kernel.emit_hook("cursor-moved", buf.id)
+    status_emit(
+        "[" ++ (chosen_idx + 1).to_string() ++ "/" ++ total.to_string() ++ "] "
+        ++ target.tag ++ ": " ++ target.text
+    )#
+    ()
+}
+
+fn scan_and_populate_workspace_todos(world: EditorWorld, service: TodoCommentsService) -> List {
+    let scanned = accel_scan_workspace_todos(world.cwd)
+    service.workspace_items = scanned
+
+    let qf_list = List()
+    for i in 0..scanned.len() {
+        let item = scanned.get(i.as(usize)).as(TodoItem)
+        if service.tag_filter == "ALL" or item.tag == service.tag_filter {
+            qf_list.push(QuickfixEntry {
+                file_path: item.file_path,
+                row: item.row,
+                col: item.col,
+                text: "[" ++ item.tag ++ "] " ++ item.text,
+            })
+        }
+    }
+    world.quickfix = qf_list
+    world.quickfix_idx = 0
+    world.quickfix_title = "Workspace TODOs"
+    scanned
+}
+
+fn render_todos_panel(world: EditorWorld, service: TodoCommentsService) -> (Buffer, i64) {
+    service.panel_row_map = HashMap.new()
+    let all_items = service.workspace_items
+
+    let fixme_n = service.count_tag(all_items, "FIXME")
+    let bug_n = service.count_tag(all_items, "BUG")
+    let todo_n = service.count_tag(all_items, "TODO")
+    let note_n = service.count_tag(all_items, "NOTE")
+    let perf_n = service.count_tag(all_items, "PERF")
+    let warn_n = service.count_tag(all_items, "WARN")
+    let hack_n = service.count_tag(all_items, "HACK")
+
+    let summary = "FIXME: " ++ fixme_n.to_string()
+        ++ ", TODO: " ++ todo_n.to_string()
+        ++ ", NOTE: " ++ note_n.to_string()
+        ++ ", PERF: " ++ perf_n.to_string()
+        ++ ", WARN: " ++ warn_n.to_string()
+        ++ ", HACK: " ++ hack_n.to_string()
+        ++ ", BUG: " ++ bug_n.to_string()
+
+    let lines = List()
+    lines.push(
+        "Workspace TODOs [Filter: " ++ service.tag_filter ++ "] (" ++ all_items.len().to_string()
+        ++ " total) — " ++ summary
+    )
+    lines.push("Keys: <Return> jump to item  |  f cycle tag filter  |  r refresh  |  q close")
+    lines.push("----------------------------------------------------------------------------")
+
+    let filtered = List()
+    for i in 0..all_items.len() {
+        let item = all_items.get(i.as(usize)).as(TodoItem)
+        if service.tag_filter == "ALL" or item.tag == service.tag_filter {
+            filtered.push(item)
+        }
+    }
+
+    -- Keep `world.quickfix` synchronized with the active filter
+    let qf_list = List()
+    for i in 0..filtered.len() {
+        let item = filtered.get(i.as(usize)).as(TodoItem)
+        qf_list.push(QuickfixEntry {
+            file_path: item.file_path,
+            row: item.row,
+            col: item.col,
+            text: "[" ++ item.tag ++ "] " ++ item.text,
+        })
+    }
+    world.quickfix = qf_list
+    world.quickfix_idx = 0
+    world.quickfix_title = "Workspace TODOs"
+
+    var first_item_row: i64 = -1
+    let row_badges = List()
+
+    if filtered.is_empty() {
+        lines.push("  (No matching TODO comments for filter '" ++ service.tag_filter ++ "')")
+    } else {
+        for i in 0..filtered.len() {
+            let item = filtered.get(i.as(usize)).as(TodoItem)
+            let row_idx = lines.len()
+            if first_item_row < 0 {
+                first_item_row = row_idx
+            }
+            let badge_prefix = "  [" ++ item.tag ++ "] "
+            let loc = item.file_path ++ ":" ++ (item.row + 1).to_string() ++ ":" ++ (item.col + 1).to_string()
+            lines.push(badge_prefix ++ loc.pad_end(26, " ") ++ "  " ++ item.text)
+            service.panel_row_map.insert(row_idx, item)
+            row_badges.push((row_idx, 3, 3 + item.tag.char_len(), item.tag))
+        }
+    }
+
+    let tbuf = world.ensure_special_buffer(TODOS_BUF_NAME, "todos", lines, read_only = true)
+    tbuf.clear_owner_decors(OWNER_TODO_COMMENTS)
+    let pill_fg = rgb(24, 24, 37)
+    for bi in 0..row_badges.len() {
+        let (r_idx, sc, ec, btag) = row_badges.get(bi.as(usize)).as((i64, i64, i64, String))
+        let (bg, sign_txt) = todo_tag_style(btag)
+        tbuf.add_sign(OWNER_TODO_COMMENTS, r_idx, sign_txt, bg, priority = SIGN_PRIORITY_TODO)
+        tbuf.add_inline_decor(
+            OWNER_TODO_COMMENTS,
+            r_idx,
+            sc,
+            ec,
+            bg_rgba = bg,
+            fg_rgba = pill_fg,
+            underline = false,
+        )
+    }
+
+    let target_row = if first_item_row >= 0 { first_item_row } else { 0 }
+    (tbuf, target_row)
+}
+
+fn open_todos_panel(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    vim: VimState,
+    service: TodoCommentsService,
+    filter_override: String,
+) -> #InteractiveEffects Unit {
+    let cur = world.active_buffer()
+    if cur.name != TODOS_BUF_NAME {
+        service.source_buf_id = cur.id
+    }
+    if filter_override != "" {
+        service.tag_filter = filter_override.to_upper()
+    } else {
+        service.tag_filter = "ALL"
+    }
+    let _ = scan_and_populate_workspace_todos(world, service)
+    let (tbuf, first_row) = render_todos_panel(world, service)
+    tbuf.point = tbuf.clamp_pos(Pos.new(first_row, 0), insert_mode = false)
+    tbuf.preferred_col = 0
+    let _ = world.switch_to_buffer(tbuf.id)
+    vim.mode = VimMode.Normal
+    vim.clear_transient()
+    sync_world_from_vim(world, vim)
+    kernel.emit_hook("buffer-switched", tbuf.id)
+    status_emit(
+        "Workspace TODOs: " ++ world.quickfix.len().to_string()
+        ++ " item(s) [" ++ service.tag_filter ++ "]"
+    )#
+}
+
+fn close_todos_panel(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    vim: VimState,
+    service: TodoCommentsService,
+) -> #InteractiveEffects Unit {
+    var dest_id = service.source_buf_id
+    if (not world.buffers.contains_key(dest_id))
+        or world.buffers.get(dest_id).as(Buffer).name == TODOS_BUF_NAME {
+        dest_id = world.scratch_id
+        for i in 0..world.buffer_order.len() {
+            let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+            let b = world.buffers.get(bid).as(Buffer)
+            if b.name != TODOS_BUF_NAME and b.id != world.messages_id {
+                dest_id = bid
+                break
+            }
+        }
+    }
+    let _ = world.switch_to_buffer(dest_id)
+    vim.mode = VimMode.Normal
+    vim.clear_transient()
+    sync_world_from_vim(world, vim)
+    kernel.emit_hook("buffer-switched", dest_id)
+    kernel.emit_hook("cursor-moved", dest_id)
+    status_emit("Todos closed")#
+}
+
+fn find_todo_near_panel_row(service: TodoCommentsService, row: i64, max_rows: i64) -> ?TodoItem {
+    let exact_opt = service.panel_row_map.get(row)
+    if exact_opt != null {
+        return exact_opt.as(TodoItem)
+    }
+    for r in (row + 1)..max_rows {
+        let fwd_opt = service.panel_row_map.get(r)
+        if fwd_opt != null {
+            return fwd_opt.as(TodoItem)
+        }
+    }
+    var b = row - 1
+    while b >= 0 {
+        let back_opt = service.panel_row_map.get(b)
+        if back_opt != null {
+            return back_opt.as(TodoItem)
+        }
+        b -= 1
+    }
+    null
+}
+
+-- ============================================================================
+-- 4. Hooks & Extension Registration (`lava.org/ext_todo_comments`)
+-- ============================================================================
+
+fn resolve_todo_hook_buf(world: EditorWorld, payload: Any) -> Buffer {
+    if payload matches _: BufferId {
+        let b_opt = world.buffer(payload.as(BufferId))
+        if b_opt != null {
+            return b_opt.as(Buffer)
+        }
+    }
+    world.active_buffer()
+}
+
+fn on_todo_buffer_hook(kern: SystemKernel, payload: Any) {
+    let w_opt = kern.service("lava.document.world")
+    let s_opt = kern.service(SERVICE_TODO_COMMENTS)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let service = s_opt.as(TodoCommentsService)
+    let buf = resolve_todo_hook_buf(world, payload)
+    let _ = sync_buffer_todos(world, service, buf, false)
+}
+
+fn on_todo_insert_hook(kern: SystemKernel, payload: Any) {
+    let w_opt = kern.service("lava.document.world")
+    let s_opt = kern.service(SERVICE_TODO_COMMENTS)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let service = s_opt.as(TodoCommentsService)
+    let buf = resolve_todo_hook_buf(world, payload)
+    if buf.line_count() > 2000 {
+        return
+    }
+    let _ = sync_buffer_todos(world, service, buf, false)
+}
+
+fn unbind_owner_from_keymaps(kernel: SystemKernel, owner: ExtId) {
+    for km_key in kernel.keymaps.keys() {
+        let km_name = km_key.as(String)
+        let km = kernel.keymaps.get(km_name).as(Keymap)
+        let to_remove = List()
+        for chord_key in km.bindings.keys() {
+            let chord = chord_key.as(String)
+            let entry = km.bindings.get(chord).as(KeyBindingEntry)
+            if entry.owner == owner {
+                to_remove.push(chord)
+            }
+        }
+        for i in 0..to_remove.len() {
+            let _ = km.bindings.remove(to_remove.get(i.as(usize)).as(String))
+        }
+    }
+}
+
+pub fn register_todo_comments_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_todo_comments_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_todo_comments",
+        "0.1.0",
+        "Semantic TODO/FIXME/NOTE/PERF/HACK/WARN/BUG pill badges, gutter signs, ]t/[t jumps, and *Todos* workspace picker.",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let service = TodoCommentsService.new()
+            k.publish_service(SERVICE_TODO_COMMENTS, ext_id, service)
+
+            let norm_km = k.ensure_keymap(KEYMAP_VIM_NORMAL)
+            norm_km.bind("] t", "todo-next", ext_id, description = "Next TODO comment")
+            norm_km.bind("[ t", "todo-prev", ext_id, description = "Previous TODO comment")
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> s t", "todo-quickfix", ext_id, description = "Search workspace TODOs")
+
+            let todos_km = k.ensure_keymap("mode:todos")
+            todos_km.bind("<Return>", "todo-panel-jump", ext_id, description = "Jump to TODO location")
+            todos_km.bind("f", "todo-cycle-filter", ext_id, description = "Cycle TODO tag filter")
+            todos_km.bind("r", "todo-panel-refresh", ext_id, description = "Refresh workspace TODOs")
+            todos_km.bind("q", "todo-panel-close", ext_id, description = "Close *Todos* buffer")
+
+            k.register_command(
+                "todo-next",
+                ext_id,
+                "Jump to next TODO comment in active buffer (`]t`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    jump_todo_in_buffer(kern, true)#
+                },
+            )
+
+            k.register_command(
+                "todo-prev",
+                ext_id,
+                "Jump to previous TODO comment in active buffer (`[t`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    jump_todo_in_buffer(kern, false)#
+                },
+            )
+
+            k.register_command(
+                "todo-quickfix",
+                ext_id,
+                "Scan workspace TODOs into quickfix and open interactive *Todos* buffer (`:TodoQuickfix`, `<Space> s t`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let vim = require_vim_state(kern)!
+                    let svc = require_todo_comments_service(kern)!
+                    let filt = if args.is_empty() { "" } else { args.get(0).as(String).trim() }
+                    open_todos_panel(kern, world, vim, svc, filt)#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "todo-trouble",
+                ext_id,
+                "Scan workspace TODOs and open interactive *Todos* panel (`:TodoTrouble`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let vim = require_vim_state(kern)!
+                    let svc = require_todo_comments_service(kern)!
+                    let filt = if args.is_empty() { "" } else { args.get(0).as(String).trim() }
+                    open_todos_panel(kern, world, vim, svc, filt)#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "todo-comments-toggle",
+                ext_id,
+                "Toggle live TODO comment decorations (`:TodoCommentsToggle`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let svc = require_todo_comments_service(kern)!
+                    svc.enabled = not svc.enabled
+                    if not svc.enabled {
+                        world.clear_owner_ui(OWNER_TODO_COMMENTS)
+                        status_emit("TodoComments: OFF")#
+                    } else {
+                        for i in 0..world.buffer_order.len() {
+                            let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+                            let b = world.buffers.get(bid).as(Buffer)
+                            let _ = sync_buffer_todos(world, svc, b, true)
+                        }
+                        status_emit("TodoComments: ON")#
+                    }
+                    ()
+                },
+            )
+
+            k.register_command(
+                "todo-panel-jump",
+                ext_id,
+                "Jump from *Todos* row to target file and `(row, col)` (`<Return>`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let vim = require_vim_state(kern)!
+                    let svc = require_todo_comments_service(kern)!
+                    let cur = world.active_buffer()
+                    if cur.name != TODOS_BUF_NAME {
+                        return ()
+                    }
+                    let item? = find_todo_near_panel_row(svc, cur.point.row, cur.line_count()) else {
+                        status_emit("No TODO item on selected line")#
+                        return ()
+                    }
+                    world.jumps.record(cur.id, cur.file_path, cur.point)
+                    let target_buf = world.open_file(item.file_path)#!
+                    target_buf.point = target_buf.clamp_pos(Pos.new(item.row, item.col), insert_mode = false)
+                    target_buf.preferred_col = target_buf.point.col
+                    vim.mode = VimMode.Normal
+                    vim.clear_transient()
+                    sync_world_from_vim(world, vim)
+                    let _ = sync_buffer_todos(world, svc, target_buf, false)
+                    kern.emit_hook("buffer-switched", target_buf.id)
+                    kern.emit_hook("cursor-moved", target_buf.id)
+                    status_emit("[" ++ item.tag ++ "] " ++ item.text)#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "todo-cycle-filter",
+                ext_id,
+                "Cycle tag filter in *Todos* (`ALL` -> `TODO` -> `FIXME` -> `NOTE` ...).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let svc = require_todo_comments_service(kern)!
+                    svc.tag_filter = next_filter_tag(svc.tag_filter)
+                    let (tbuf, first_row) = render_todos_panel(world, svc)
+                    tbuf.point = tbuf.clamp_pos(Pos.new(first_row, 0), insert_mode = false)
+                    tbuf.preferred_col = 0
+                    status_emit(
+                        "Todo filter: " ++ svc.tag_filter
+                        ++ " (" ++ world.quickfix.len().to_string() ++ " items)"
+                    )#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "todo-panel-refresh",
+                ext_id,
+                "Rescan workspace TODOs and refresh *Todos* panel (`r`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let svc = require_todo_comments_service(kern)!
+                    let _ = scan_and_populate_workspace_todos(world, svc)
+                    let (tbuf, first_row) = render_todos_panel(world, svc)
+                    tbuf.point = tbuf.clamp_pos(Pos.new(first_row, 0), insert_mode = false)
+                    tbuf.preferred_col = 0
+                    status_emit("Workspace TODOs refreshed (" ++ svc.workspace_items.len().to_string() ++ ")")#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "todo-panel-close",
+                ext_id,
+                "Close *Todos* buffer and return to previous buffer (`q`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let vim = require_vim_state(kern)!
+                    let svc = require_todo_comments_service(kern)!
+                    close_todos_panel(kern, world, vim, svc)#
+                    ()
+                },
+            )
+
+            k.add_hook("buffer-opened", ext_id, on_todo_buffer_hook)
+            k.add_hook("buffer-switched", ext_id, on_todo_buffer_hook)
+            k.add_hook("buffer-modified", ext_id, on_todo_buffer_hook)
+            k.add_hook("buffer-saved", ext_id, on_todo_buffer_hook)
+            k.add_hook("cursor-moved", ext_id, on_todo_buffer_hook)
+            k.add_hook("mode-changed", ext_id, on_todo_buffer_hook)
+            k.add_hook("after-insert-stroke", ext_id, on_todo_insert_hook)
+
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                let w = w_opt.as(EditorWorld)
+                for i in 0..w.buffer_order.len() {
+                    let bid = w.buffer_order.get(i.as(usize)).as(BufferId)
+                    let b = w.buffers.get(bid).as(Buffer)
+                    let _ = sync_buffer_todos(w, service, b, true)
+                }
+            }
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                w_opt.as(EditorWorld).clear_owner_ui(OWNER_TODO_COMMENTS)
+            }
+            unbind_owner_from_keymaps(k, ext_id)
+            ()
+        },
+    )
+}

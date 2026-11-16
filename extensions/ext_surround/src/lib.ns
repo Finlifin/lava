@@ -1,0 +1,1111 @@
+-- ext_surround: Evil-Vim / Neovim Surround Extension (`lava.org/ext_surround`) for Lava.
+-- Implements `ys<motion_or_textobj><delim>`, `yss<delim>`, `ds<target>`, `cs<old><new>`,
+-- Visual `S<delim>`, HTML/XML `<tag ...>...</tag>` wrapping/stripping/changing (`t`),
+-- and scriptable Ex / M-x commands (`surround-line`, `surround-delete`, `surround-change`).
+
+use @lava_core.{
+    ExtId, InteractiveEffects, KeyBindingEntry, KeyStroke, Keymap, PromptRequest, ServiceEffects,
+    SystemKernel, ask_prompt, status_emit
+}
+use @ext_document.{
+    Buffer, EditorWorld, Pos, Span, ext_document_id, require_editor_world
+}
+use @ext_vim.{
+    KEYMAP_VIM_NORMAL, KEYMAP_VIM_VISUAL, ModalInterceptor, SERVICE_VIM, VimMode, VimState,
+    ext_vim_id, require_vim_state, sync_world_from_vim
+}
+use @ext_vim.motions.{
+    MotionShape, is_blank_line, last_non_blank_col, motion_find_char_in_line, motion_word_backward,
+    motion_word_end, motion_word_forward
+}
+use @ext_vim.text_objects.{TextObjectRange, resolve_text_object}
+
+pub fn ext_surround_id() -> ExtId = ExtId("lava.org/ext_surround")
+
+-- ============================================================================
+-- 1. Delimiter Pairs & HTML/XML Tag Matching
+-- ============================================================================
+
+struct DelimPair {
+    left: String,
+    right: String,
+}
+
+struct EnclosingPair {
+    open_span: Span,
+    close_span: Span,
+}
+
+struct TagMatch {
+    open_start: Pos,
+    open_end: Pos,
+    close_start: Pos,
+    close_end: Pos,
+    tag_name: String,
+}
+
+struct OpenTagEntry {
+    open_start: Pos,
+    open_end: Pos,
+    tag_name: String,
+}
+
+fn stroke_char(stroke: KeyStroke) -> String {
+    if stroke.ctrl or stroke.alt or stroke.super_mod {
+        return ""
+    }
+    if stroke.key == "Space" {
+        return " "
+    }
+    if stroke.text != "" and stroke.text.char_len() == 1 {
+        return stroke.text
+    }
+    if stroke.key.char_len() == 1 {
+        return stroke.key
+    }
+    ""
+}
+
+fn is_cancel_stroke(stroke: KeyStroke) -> bool {
+    stroke.key == "Escape"
+        or (stroke.ctrl and (stroke.key == "[" or stroke.key == "g" or stroke.key == "c"))
+}
+
+fn resolve_wrap_pair(delim: String) -> ?DelimPair {
+    if delim == "" {
+        return null
+    }
+    when {
+        delim == "(" => DelimPair { left: "( ", right: " )" },
+        delim == ")" or delim == "b" => DelimPair { left: "(", right: ")" },
+        delim == "[" => DelimPair { left: "[ ", right: " ]" },
+        delim == "]" => DelimPair { left: "[", right: "]" },
+        delim == "{{" => DelimPair { left: "{{ ", right: " }}" },
+        delim == "}}" or delim == "B" => DelimPair { left: "{{", right: "}}" },
+        delim == "<" => DelimPair { left: "< ", right: " >" },
+        delim == ">" => DelimPair { left: "<", right: ">" },
+        delim == "\"" => DelimPair { left: "\"", right: "\"" },
+        delim == "'" => DelimPair { left: "'", right: "'" },
+        delim == "`" => DelimPair { left: "`", right: "`" },
+        delim.char_len() == 1 => DelimPair { left: delim, right: delim },
+        else => null,
+    }
+}
+
+fn take_tag_identifier(s: String) -> String {
+    let n = s.char_len()
+    var i: i64 = 0
+    while i < n {
+        let ch = s.slice(i, i + 1)
+        if ch.is_ascii_alphanumeric() or ch == "-" or ch == "_" or ch == ":" or ch == "." {
+            i += 1
+        } else {
+            break
+        }
+    }
+    s.slice(0, i)
+}
+
+fn build_tag_pair(raw_tag: String) -> ?DelimPair {
+    var clean = raw_tag.trim()
+    if clean.starts_with("<") {
+        clean = clean.drop(1)
+    }
+    if clean.ends_with(">") {
+        clean = clean.slice(0, clean.char_len() - 1)
+    }
+    if clean.ends_with("/") {
+        clean = clean.slice(0, clean.char_len() - 1).trim_end()
+    }
+    clean = clean.trim()
+    if clean == "" {
+        return null
+    }
+    let tag_name = take_tag_identifier(clean)
+    if tag_name == "" {
+        return null
+    }
+    DelimPair {
+        left: "<" ++ clean ++ ">",
+        right: "</" ++ tag_name ++ ">",
+    }
+}
+
+fn find_enclosing_tag(buf: Buffer, pos: Pos) -> ?TagMatch {
+    let min_r = buf.min_row()
+    let max_r = buf.max_row()
+    let stack = List()
+    let tag_matches = List()
+
+    for r in min_r..(max_r + 1) {
+        let line = buf.line_at(r)
+        let llen = line.char_len()
+        var c: i64 = 0
+        while c < llen {
+            if line.slice(c, c + 1) != "<" {
+                c += 1
+                continue
+            }
+            -- Skip HTML comments `<!-- ... -->`
+            if c + 3 < llen and line.slice(c, c + 4) == "<!--" {
+                var end_cmt = c + 4
+                var closed_cmt = false
+                while end_cmt + 2 < llen {
+                    if line.slice(end_cmt, end_cmt + 3) == "-->" {
+                        c = end_cmt + 3
+                        closed_cmt = true
+                        break
+                    }
+                    end_cmt += 1
+                }
+                if not closed_cmt {
+                    break
+                }
+                continue
+            }
+            if c + 1 >= llen {
+                break
+            }
+            let next_ch = line.slice(c + 1, c + 2)
+            let is_closing = next_ch == "/"
+            let first_name_idx = if is_closing { c + 2 } else { c + 1 }
+            if first_name_idx >= llen or (not line.slice(first_name_idx, first_name_idx + 1).is_ascii_alphabetic()) {
+                c += 1
+                continue
+            }
+            -- Scan until matching `>` on this line (respecting quoted attribute values)
+            var gt_col: i64 = -1
+            var j = first_name_idx
+            var in_quote = ""
+            while j < llen {
+                let jc = line.slice(j, j + 1)
+                if in_quote != "" {
+                    if jc == in_quote {
+                        in_quote = ""
+                    }
+                } else if jc == "\"" or jc == "'" {
+                    in_quote = jc
+                } else if jc == ">" {
+                    gt_col = j
+                    break
+                }
+                j += 1
+            }
+            if gt_col < 0 {
+                c += 1
+                continue
+            }
+            let raw_inside = line.slice(c + 1, gt_col).trim()
+            let self_closing = (not is_closing) and raw_inside.ends_with("/")
+            if not self_closing {
+                if is_closing {
+                    let cname = take_tag_identifier(raw_inside.drop(1).trim_start())
+                    if cname != "" {
+                        var si = stack.len() - 1
+                        while si >= 0 {
+                            let top = stack.get(si.as(usize)).as(OpenTagEntry)
+                            if top.tag_name.to_lower() == cname.to_lower() {
+                                while stack.len() > si {
+                                    let _ = stack.pop()
+                                }
+                                tag_matches.push(TagMatch {
+                                    open_start: top.open_start,
+                                    open_end: top.open_end,
+                                    close_start: Pos.new(r, c),
+                                    close_end: Pos.new(r, gt_col + 1),
+                                    tag_name: top.tag_name,
+                                })
+                                break
+                            }
+                            si -= 1
+                        }
+                    }
+                } else {
+                    let oname = take_tag_identifier(raw_inside)
+                    if oname != "" {
+                        stack.push(OpenTagEntry {
+                            open_start: Pos.new(r, c),
+                            open_end: Pos.new(r, gt_col + 1),
+                            tag_name: oname,
+                        })
+                    }
+                }
+            }
+            c = gt_col + 1
+        }
+    }
+
+    -- Prefer innermost tag enclosing `pos`
+    var best_enclosing: ?TagMatch = null
+    for i in 0..tag_matches.len() {
+        let tm = tag_matches.get(i.as(usize)).as(TagMatch)
+        if pos >= tm.open_start and pos < tm.close_end {
+            if best_enclosing == null or tm.open_start > best_enclosing.as(TagMatch).open_start {
+                best_enclosing = tm
+            }
+        }
+    }
+    if best_enclosing != null {
+        return best_enclosing
+    }
+
+    -- Fallback: next tag forward on the same line
+    var best_forward: ?TagMatch = null
+    for i in 0..tag_matches.len() {
+        let tm = tag_matches.get(i.as(usize)).as(TagMatch)
+        if tm.open_start.row == pos.row and tm.open_start.col >= pos.col {
+            if best_forward == null or tm.open_start.col < best_forward.as(TagMatch).open_start.col {
+                best_forward = tm
+            }
+        }
+    }
+    best_forward
+}
+
+fn find_symmetric_delim_on_line(buf: Buffer, pos: Pos, delim: String) -> ?EnclosingPair {
+    let line = buf.line_at(pos.row)
+    let llen = line.char_len()
+    let cols = List()
+    for i in 0..llen {
+        if line.slice(i, i + 1) == delim {
+            cols.push(i)
+        }
+    }
+    let n = cols.len()
+    if n < 2 {
+        return null
+    }
+    var k: i64 = 0
+    while k + 1 < n {
+        let c1 = cols.get(k.as(usize)).as(i64)
+        let c2 = cols.get((k + 1).as(usize)).as(i64)
+        if pos.col <= c2 {
+            return (EnclosingPair {
+                open_span: Span.normalized(Pos.new(pos.row, c1), Pos.new(pos.row, c1 + 1)),
+                close_span: Span.normalized(Pos.new(pos.row, c2), Pos.new(pos.row, c2 + 1)),
+            })
+        }
+        k += 2
+    }
+    null
+}
+
+fn locate_enclosing_pair(buf: Buffer, pos: Pos, target: String) -> ?EnclosingPair {
+    if target == "t" or target == "T" {
+        let tm? = find_enclosing_tag(buf, pos) else {
+            return null
+        }
+        return (EnclosingPair {
+            open_span: Span.normalized(tm.open_start, tm.open_end),
+            close_span: Span.normalized(tm.close_start, tm.close_end),
+        })
+    }
+
+    if target == "\"" or target == "'" or target == "`" {
+        let tr? = resolve_text_object(buf, pos, true, target, 1) else {
+            return null
+        }
+        let s = tr.span.start
+        let e = tr.span.end
+        if e.col <= 0 {
+            return null
+        }
+        let close_col = e.col - 1
+        if s.row == e.row and close_col <= s.col {
+            return null
+        }
+        return (EnclosingPair {
+            open_span: Span.normalized(s, Pos.new(s.row, s.col + 1)),
+            close_span: Span.normalized(Pos.new(e.row, close_col), e),
+        })
+    }
+
+    var bracket_key = ""
+    var trim_inner_space = false
+    when {
+        target == "(" => { bracket_key = "("; trim_inner_space = true },
+        target == ")" or target == "b" => { bracket_key = "("; trim_inner_space = false },
+        target == "[" => { bracket_key = "["; trim_inner_space = true },
+        target == "]" => { bracket_key = "["; trim_inner_space = false },
+        target == "{{" => { bracket_key = "{{"; trim_inner_space = true },
+        target == "}}" or target == "B" => { bracket_key = "{{"; trim_inner_space = false },
+        target == "<" => { bracket_key = "<"; trim_inner_space = true },
+        target == ">" => { bracket_key = "<"; trim_inner_space = false },
+        else => (),
+    }
+
+    if bracket_key != "" {
+        let tr? = resolve_text_object(buf, pos, true, bracket_key, 1) else {
+            return null
+        }
+        let open_pos = tr.span.start
+        let after_close = tr.span.end
+        if after_close.col <= 0 {
+            return null
+        }
+        let close_pos = Pos.new(after_close.row, after_close.col - 1)
+        var open_end_col = open_pos.col + 1
+        var close_start_col = close_pos.col
+        if trim_inner_space {
+            let open_line = buf.line_at(open_pos.row)
+            if open_pos.col + 1 < open_line.char_len()
+                and open_line.slice(open_pos.col + 1, open_pos.col + 2) == " "
+                and Pos.new(open_pos.row, open_pos.col + 1) < close_pos {
+                open_end_col = open_pos.col + 2
+            }
+            let close_line = buf.line_at(close_pos.row)
+            if close_pos.col > 0
+                and close_line.slice(close_pos.col - 1, close_pos.col) == " "
+                and Pos.new(close_pos.row, close_pos.col - 1) >= Pos.new(open_pos.row, open_end_col) {
+                close_start_col = close_pos.col - 1
+            }
+        }
+        return (EnclosingPair {
+            open_span: Span.normalized(open_pos, Pos.new(open_pos.row, open_end_col)),
+            close_span: Span.normalized(Pos.new(close_pos.row, close_start_col), after_close),
+        })
+    }
+
+    if target.char_len() == 1 {
+        return find_symmetric_delim_on_line(buf, pos, target)
+    }
+    null
+}
+
+-- ============================================================================
+-- 2. Buffer Surround Mutations (Single Undo Checkpoint Each)
+-- ============================================================================
+
+fn line_non_blank_span(buf: Buffer, start_row: i64, end_row: i64) -> Span {
+    let r1 = if start_row <= end_row { start_row } else { end_row }
+    let r2 = if start_row <= end_row { end_row } else { start_row }
+    let clamped_r1 = if r1 < buf.min_row() { buf.min_row() } else if r1 > buf.max_row() { buf.max_row() } else { r1 }
+    let clamped_r2 = if r2 < clamped_r1 { clamped_r1 } else if r2 > buf.max_row() { buf.max_row() } else { r2 }
+    if clamped_r1 == clamped_r2 and is_blank_line(buf, clamped_r1) {
+        let len = buf.line_char_len(clamped_r1)
+        return Span.normalized(Pos.new(clamped_r1, len), Pos.new(clamped_r1, len))
+    }
+    let sc = buf.first_non_blank_col(clamped_r1)
+    let ec = if is_blank_line(buf, clamped_r2) {
+        buf.line_char_len(clamped_r2)
+    } else {
+        last_non_blank_col(buf, clamped_r2) + 1
+    }
+    Span.normalized(Pos.new(clamped_r1, sc), Pos.new(clamped_r2, ec))
+}
+
+fn apply_surround_wrap_span(
+    buf: Buffer,
+    vim: VimState,
+    span: Span,
+    pair: DelimPair,
+    checkpoint_label: String,
+) -> !String Unit {
+    buf.ensure_writable()!
+    let norm = Span.normalized(
+        buf.clamp_pos(span.start, insert_mode = true),
+        buf.clamp_pos(span.end, insert_mode = true),
+    )
+    let _ = buf.insert_text(norm.end, pair.right)!
+    let _ = buf.insert_text(norm.start, pair.left)!
+    buf.point = buf.clamp_pos(norm.start, insert_mode = false)
+    buf.preferred_col = buf.point.col
+    buf.named_marks.insert(".", buf.point)
+    buf.checkpoint(buf.point, checkpoint_label)
+    vim.mode = VimMode.Normal
+    vim.clear_transient()
+    vim.clear_interceptor()
+    ()
+}
+
+fn apply_surround_wrap_lines(
+    buf: Buffer,
+    vim: VimState,
+    r1: i64,
+    r2: i64,
+    pair: DelimPair,
+    checkpoint_label: String,
+) -> !String Unit {
+    buf.ensure_writable()!
+    let lo = if r1 <= r2 { r1 } else { r2 }
+    let hi = if r1 <= r2 { r2 } else { r1 }
+    var min_indent: i64 = -1
+    for r in lo..(hi + 1) {
+        if not is_blank_line(buf, r) {
+            let fnb = buf.first_non_blank_col(r)
+            if min_indent < 0 or fnb < min_indent {
+                min_indent = fnb
+            }
+        }
+    }
+    let indent_str = if min_indent > 0 { " ".repeat(min_indent) } else { "" }
+    let _ = buf.insert_lines_below(hi, [indent_str ++ pair.right.trim()])!
+    let _ = buf.insert_lines_above(lo, [indent_str ++ pair.left.trim()])!
+    buf.point = buf.clamp_pos(Pos.new(lo, indent_str.char_len()), insert_mode = false)
+    buf.preferred_col = buf.point.col
+    buf.named_marks.insert(".", buf.point)
+    buf.checkpoint(buf.point, checkpoint_label)
+    vim.mode = VimMode.Normal
+    vim.clear_transient()
+    vim.clear_interceptor()
+    ()
+}
+
+fn apply_surround_delete(
+    buf: Buffer,
+    vim: VimState,
+    target: String,
+) -> #ServiceEffects !String bool {
+    let enc? = locate_enclosing_pair(buf, buf.point, target) else {
+        status_emit("Surround delimiter not found: " ++ target)#
+        vim.mode = VimMode.Normal
+        vim.clear_transient()
+        vim.clear_interceptor()
+        return false
+    }
+    buf.ensure_writable()!
+    let _ = buf.delete_span(enc.close_span)!
+    let _ = buf.delete_span(enc.open_span)!
+    buf.point = buf.clamp_pos(enc.open_span.start, insert_mode = false)
+    buf.preferred_col = buf.point.col
+    buf.named_marks.insert(".", buf.point)
+    buf.checkpoint(buf.point, "surround-delete")
+    vim.mode = VimMode.Normal
+    vim.clear_transient()
+    vim.clear_interceptor()
+    true
+}
+
+fn apply_surround_change(
+    buf: Buffer,
+    vim: VimState,
+    old_target: String,
+    new_pair: DelimPair,
+) -> #ServiceEffects !String bool {
+    let enc? = locate_enclosing_pair(buf, buf.point, old_target) else {
+        status_emit("Surround delimiter not found: " ++ old_target)#
+        vim.mode = VimMode.Normal
+        vim.clear_transient()
+        vim.clear_interceptor()
+        return false
+    }
+    buf.ensure_writable()!
+    let _ = buf.replace_span(enc.close_span, new_pair.right)!
+    let _ = buf.replace_span(enc.open_span, new_pair.left)!
+    buf.point = buf.clamp_pos(enc.open_span.start, insert_mode = false)
+    buf.preferred_col = buf.point.col
+    buf.named_marks.insert(".", buf.point)
+    buf.checkpoint(buf.point, "surround-change")
+    vim.mode = VimMode.Normal
+    vim.clear_transient()
+    vim.clear_interceptor()
+    true
+}
+
+-- ============================================================================
+-- 3. Stateful Modal Interceptor (`ys`, `yss`, `ds`, `cs`, Visual `S`, Tag `t`)
+-- ============================================================================
+
+enum SurroundPhase {
+    AddAwaitMotion,
+    AddAwaitTextObj,
+    AddAwaitFindChar,
+    AddAwaitDelim,
+    DeleteAwaitTarget,
+    ChangeAwaitOld,
+    ChangeAwaitNew,
+    VisualAwaitDelim,
+    ReadTag,
+}
+derive Eq, PartialEq for SurroundPhase
+
+enum TagCommitKind {
+    WrapSpan,
+    WrapLines,
+    ChangeExisting,
+}
+derive Eq, PartialEq for TagCommitKind
+
+struct SurroundSession {
+    phase: SurroundPhase,
+    count: i64,
+    around: bool,
+    find_kind: String,
+    target_span: Span,
+    visual_linewise: bool,
+    visual_r1: i64,
+    visual_r2: i64,
+    old_delim: String,
+    checkpoint_label: String,
+    tag_commit: TagCommitKind,
+    tag_buf: String,
+}
+
+impl SurroundSession {
+    fn new(phase: SurroundPhase, checkpoint_label: String) -> SurroundSession {
+        SurroundSession {
+            phase: phase,
+            count: 0,
+            around: false,
+            find_kind: "",
+            target_span: Span.normalized(Pos.zero(), Pos.zero()),
+            visual_linewise: false,
+            visual_r1: 0,
+            visual_r2: 0,
+            old_delim: "",
+            checkpoint_label: checkpoint_label,
+            tag_commit: TagCommitKind.WrapSpan,
+            tag_buf: "",
+        }
+    }
+
+    fn eff_count(self) -> i64 {
+        if self.count > 0 { self.count } else { 1 }
+    }
+}
+
+fn finish_with_delim(
+    session: SurroundSession,
+    buf: Buffer,
+    vim: VimState,
+    delim: String,
+) -> #ServiceEffects !String bool {
+    if delim == "t" or delim == "T" {
+        session.tag_buf = ""
+        if session.phase == SurroundPhase.ChangeAwaitNew {
+            session.tag_commit = TagCommitKind.ChangeExisting
+        } else if session.phase == SurroundPhase.VisualAwaitDelim and session.visual_linewise {
+            session.tag_commit = TagCommitKind.WrapLines
+        } else {
+            session.tag_commit = TagCommitKind.WrapSpan
+        }
+        session.phase = SurroundPhase.ReadTag
+        status_emit("Tag name: <")#
+        return true
+    }
+
+    let pair? = resolve_wrap_pair(delim) else {
+        vim.clear_interceptor()
+        return true
+    }
+
+    if session.phase == SurroundPhase.ChangeAwaitNew {
+        let _ = apply_surround_change(buf, vim, session.old_delim, pair)#!
+        return true
+    }
+    if session.phase == SurroundPhase.VisualAwaitDelim and session.visual_linewise {
+        apply_surround_wrap_lines(
+            buf,
+            vim,
+            session.visual_r1,
+            session.visual_r2,
+            pair,
+            session.checkpoint_label,
+        )!
+        return true
+    }
+    apply_surround_wrap_span(buf, vim, session.target_span, pair, session.checkpoint_label)!
+    true
+}
+
+fn install_surround_interceptor(vim: VimState, session: SurroundSession) {
+    vim.set_interceptor(
+        "ext_surround",
+        |kern: SystemKernel, stroke: KeyStroke| -> #ServiceEffects !String bool {
+            let world = require_editor_world(kern)!
+            let v = require_vim_state(kern)!
+            let buf = world.active_buffer()
+
+            if is_cancel_stroke(stroke) {
+                v.clear_interceptor()
+                v.mode = VimMode.Normal
+                v.clear_transient()
+                world.pending_keys_display = ""
+                return true
+            }
+
+            -- Tag input state (`ysiwtdiv<Return>`, `ysiwt<div>`, `csttsection<Return>`)
+            if session.phase == SurroundPhase.ReadTag {
+                if stroke.key == "BackSpace" {
+                    let tlen = session.tag_buf.char_len()
+                    if tlen > 0 {
+                        session.tag_buf = session.tag_buf.slice(0, tlen - 1)
+                    }
+                    status_emit("Tag name: <" ++ session.tag_buf)#
+                    return true
+                }
+                let ch = stroke_char(stroke)
+                if stroke.key == "Return" or (stroke.ctrl and stroke.key == "m") or ch == ">" {
+                    let tag_pair? = build_tag_pair(session.tag_buf) else {
+                        status_emit("Surround tag cancelled")#
+                        v.clear_interceptor()
+                        v.mode = VimMode.Normal
+                        v.clear_transient()
+                        return true
+                    }
+                    session.tag_commit match {
+                        TagCommitKind.ChangeExisting => {
+                            let _ = apply_surround_change(buf, v, session.old_delim, tag_pair)#!
+                        },
+                        TagCommitKind.WrapLines => {
+                            apply_surround_wrap_lines(
+                                buf,
+                                v,
+                                session.visual_r1,
+                                session.visual_r2,
+                                tag_pair,
+                                session.checkpoint_label,
+                            )!
+                        },
+                        TagCommitKind.WrapSpan => {
+                            apply_surround_wrap_span(
+                                buf,
+                                v,
+                                session.target_span,
+                                tag_pair,
+                                session.checkpoint_label,
+                            )!
+                        },
+                    }
+                    return true
+                }
+                if ch != "" {
+                    if session.tag_buf == "" and ch == "<" {
+                        return true
+                    }
+                    session.tag_buf = session.tag_buf ++ ch
+                    status_emit("Tag name: <" ++ session.tag_buf ++ ">")#
+                }
+                return true
+            }
+
+            let ch = stroke_char(stroke)
+            if ch == "" {
+                v.clear_interceptor()
+                return true
+            }
+
+            if session.phase == SurroundPhase.DeleteAwaitTarget {
+                let _ = apply_surround_delete(buf, v, ch)#!
+                return true
+            }
+
+            if session.phase == SurroundPhase.ChangeAwaitOld {
+                session.old_delim = ch
+                session.phase = SurroundPhase.ChangeAwaitNew
+                return true
+            }
+
+            if session.phase == SurroundPhase.ChangeAwaitNew
+                or session.phase == SurroundPhase.AddAwaitDelim
+                or session.phase == SurroundPhase.VisualAwaitDelim {
+                return finish_with_delim(session, buf, v, ch)#!
+            }
+
+            if session.phase == SurroundPhase.AddAwaitFindChar {
+                let tgt = motion_find_char_in_line(
+                    buf,
+                    buf.point,
+                    session.find_kind,
+                    ch,
+                    session.eff_count(),
+                    false,
+                )
+                if not tgt.valid {
+                    status_emit("Surround motion target not found")#
+                    v.clear_interceptor()
+                    return true
+                }
+                let sp = if tgt.shape == MotionShape.Exclusive {
+                    Span.normalized(buf.point, tgt.pos)
+                } else {
+                    let lo = if buf.point <= tgt.pos { buf.point } else { tgt.pos }
+                    let hi = if buf.point <= tgt.pos { tgt.pos } else { buf.point }
+                    let hlen = buf.line_char_len(hi.row)
+                    Span.normalized(lo, Pos.new(hi.row, if hi.col < hlen { hi.col + 1 } else { hlen }))
+                }
+                session.target_span = sp
+                session.phase = SurroundPhase.AddAwaitDelim
+                return true
+            }
+
+            if session.phase == SurroundPhase.AddAwaitTextObj {
+                if ch == "t" or ch == "T" {
+                    let tm? = find_enclosing_tag(buf, buf.point) else {
+                        status_emit("Surround tag not found")#
+                        v.clear_interceptor()
+                        return true
+                    }
+                    session.target_span = if session.around {
+                        Span.normalized(tm.open_start, tm.close_end)
+                    } else {
+                        Span.normalized(tm.open_end, tm.close_start)
+                    }
+                    session.phase = SurroundPhase.AddAwaitDelim
+                    return true
+                }
+                let tr? = resolve_text_object(buf, buf.point, session.around, ch, session.eff_count()) else {
+                    status_emit("Surround text object not found")#
+                    v.clear_interceptor()
+                    return true
+                }
+                session.target_span = tr.span
+                session.phase = SurroundPhase.AddAwaitDelim
+                return true
+            }
+
+            -- `AddAwaitMotion`: counts, `s` (`yss`), `i`/`a` text objects, and motions (`$`, `w`, `e`, `b`, `0`, `^`, `f`/`t`)
+            if ch.char_len() == 1 and ch.is_ascii_digit() {
+                let d = ch.parse_i64().as(i64)
+                if d > 0 or session.count > 0 {
+                    session.count = session.count * 10 + d
+                    return true
+                }
+            }
+
+            let eff = session.eff_count()
+            if ch == "s" {
+                let end_r = buf.point.row + eff - 1
+                session.target_span = line_non_blank_span(buf, buf.point.row, end_r)
+                session.phase = SurroundPhase.AddAwaitDelim
+                return true
+            }
+
+            if ch == "i" or ch == "a" {
+                session.around = ch == "a"
+                session.phase = SurroundPhase.AddAwaitTextObj
+                return true
+            }
+
+            if ch == "f" or ch == "F" or ch == "t" or ch == "T" {
+                session.find_kind = ch
+                session.phase = SurroundPhase.AddAwaitFindChar
+                return true
+            }
+
+            if ch == "$" {
+                let tr = if buf.point.row + eff - 1 <= buf.max_row() {
+                    buf.point.row + eff - 1
+                } else {
+                    buf.max_row()
+                }
+                session.target_span = Span.normalized(buf.point, Pos.new(tr, buf.line_char_len(tr)))
+                session.phase = SurroundPhase.AddAwaitDelim
+                return true
+            }
+
+            if ch == "0" {
+                session.target_span = Span.normalized(Pos.new(buf.point.row, 0), buf.point)
+                session.phase = SurroundPhase.AddAwaitDelim
+                return true
+            }
+
+            if ch == "^" {
+                let fnb = buf.first_non_blank_col(buf.point.row)
+                session.target_span = Span.normalized(Pos.new(buf.point.row, fnb), buf.point)
+                session.phase = SurroundPhase.AddAwaitDelim
+                return true
+            }
+
+            if ch == "w" or ch == "W" {
+                let big = ch == "W"
+                let cur_line = buf.line_at(buf.point.row)
+                let on_non_blank = buf.point.col < cur_line.char_len()
+                    and cur_line.slice(buf.point.col, buf.point.col + 1) != " "
+                    and cur_line.slice(buf.point.col, buf.point.col + 1) != "\t"
+                if on_non_blank {
+                    let tgt = motion_word_end(buf, buf.point, eff, big)
+                    let hlen = buf.line_char_len(tgt.pos.row)
+                    let ec = if tgt.pos.col < hlen { tgt.pos.col + 1 } else { hlen }
+                    session.target_span = Span.normalized(buf.point, Pos.new(tgt.pos.row, ec))
+                } else {
+                    let tgt = motion_word_forward(buf, buf.point, eff, big, true)
+                    session.target_span = Span.normalized(buf.point, tgt.pos)
+                }
+                session.phase = SurroundPhase.AddAwaitDelim
+                return true
+            }
+
+            if ch == "e" or ch == "E" {
+                let tgt = motion_word_end(buf, buf.point, eff, ch == "E")
+                let hlen = buf.line_char_len(tgt.pos.row)
+                let ec = if tgt.pos.col < hlen { tgt.pos.col + 1 } else { hlen }
+                session.target_span = Span.normalized(buf.point, Pos.new(tgt.pos.row, ec))
+                session.phase = SurroundPhase.AddAwaitDelim
+                return true
+            }
+
+            if ch == "b" or ch == "B" {
+                let tgt = motion_word_backward(buf, buf.point, eff, ch == "B")
+                session.target_span = Span.normalized(tgt.pos, buf.point)
+                session.phase = SurroundPhase.AddAwaitDelim
+                return true
+            }
+
+            status_emit("Unsupported surround motion: " ++ ch)#
+            v.clear_interceptor()
+            true
+        },
+    )
+}
+
+-- ============================================================================
+-- 4. Command Argument Helpers & Extension Registration
+-- ============================================================================
+
+fn resolve_script_pair(delim_spec: String, tag_arg: String) -> #InteractiveEffects ?DelimPair {
+    if delim_spec == "t" or delim_spec == "T" {
+        let raw_t = if tag_arg != "" {
+            tag_arg
+        } else {
+            let ans? = ask_prompt(PromptRequest.text("Tag name: ", ""))# else {
+                return null
+            }
+            ans
+        }
+        return build_tag_pair(raw_t)
+    }
+    if delim_spec.starts_with("<") and delim_spec.ends_with(">") and delim_spec.char_len() >= 3 {
+        return build_tag_pair(delim_spec)
+    }
+    resolve_wrap_pair(delim_spec)
+}
+
+fn unbind_owner_from_keymaps(kernel: SystemKernel, owner: ExtId) {
+    for km_key in kernel.keymaps.keys() {
+        let km_name = km_key.as(String)
+        let km = kernel.keymaps.get(km_name).as(Keymap)
+        for chord_key in km.bindings.keys() {
+            let chord = chord_key.as(String)
+            let entry = km.bindings.get(chord).as(KeyBindingEntry)
+            if entry.owner == owner {
+                let _ = km.bindings.remove(chord)
+            }
+        }
+    }
+}
+
+pub fn register_surround_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_surround_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_surround",
+        "0.1.0",
+        "Evil-Vim / Neovim surround operations (ys, yss, ds, cs, Visual S, and HTML/XML tags).",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let normal_km = k.ensure_keymap(KEYMAP_VIM_NORMAL)
+            normal_km.bind("y s", "surround-add", ext_id, description = "Surround motion/text-object")
+            normal_km.bind("d s", "surround-delete", ext_id, description = "Delete surrounding delimiter")
+            normal_km.bind("c s", "surround-change", ext_id, description = "Change surrounding delimiter")
+
+            let visual_km = k.ensure_keymap(KEYMAP_VIM_VISUAL)
+            visual_km.bind("S", "surround-visual", ext_id, description = "Surround visual selection")
+
+            k.register_command(
+                "surround-add",
+                ext_id,
+                "Surround motion, text object, or current line (`ys<motion><delim>` / `yss<delim>`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let vim = require_vim_state(kern)!
+                    if not args.is_empty() {
+                        let delim_s = args.get(0).as(String).trim()
+                        let tag_s = if args.len() >= 2 { args.get(1).as(String) } else { "" }
+                        let pair? = resolve_script_pair(delim_s, tag_s)# else {
+                            return ()
+                        }
+                        let buf = world.active_buffer()
+                        let sp = line_non_blank_span(buf, buf.point.row, buf.point.row)
+                        apply_surround_wrap_span(buf, vim, sp, pair, "surround-add")!
+                        sync_world_from_vim(world, vim)
+                        return ()
+                    }
+                    let session = SurroundSession.new(SurroundPhase.AddAwaitMotion, "surround-add")
+                    install_surround_interceptor(vim, session)
+                    sync_world_from_vim(world, vim)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "surround-line",
+                ext_id,
+                "Surround entire current line's non-blank content (`yss<delim>`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let vim = require_vim_state(kern)!
+                    let buf = world.active_buffer()
+                    let sp = line_non_blank_span(buf, buf.point.row, buf.point.row)
+                    if not args.is_empty() {
+                        let first = args.get(0).as(String).trim()
+                        var delim_s = first
+                        var tag_s = if args.len() >= 2 { args.get(1).as(String).trim() } else { "" }
+                        if tag_s == "" and first.contains(" ") {
+                            let sp_pair? = first.split_once(" ") else {
+                                return ()
+                            }
+                            let (d_part, t_part) = sp_pair
+                            delim_s = d_part.trim()
+                            tag_s = t_part.trim()
+                        }
+                        let pair? = resolve_script_pair(delim_s, tag_s)# else {
+                            return ()
+                        }
+                        apply_surround_wrap_span(buf, vim, sp, pair, "surround-add")!
+                        sync_world_from_vim(world, vim)
+                        return ()
+                    }
+                    let session = SurroundSession.new(SurroundPhase.AddAwaitDelim, "surround-add")
+                    session.target_span = sp
+                    install_surround_interceptor(vim, session)
+                    sync_world_from_vim(world, vim)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "surround-delete",
+                ext_id,
+                "Delete enclosing delimiter pair or HTML/XML tag (`ds<target>`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let vim = require_vim_state(kern)!
+                    let buf = world.active_buffer()
+                    if not args.is_empty() {
+                        let target = args.get(0).as(String).trim()
+                        if target != "" {
+                            let _ = apply_surround_delete(buf, vim, target)#!
+                            sync_world_from_vim(world, vim)
+                        }
+                        return ()
+                    }
+                    let session = SurroundSession.new(SurroundPhase.DeleteAwaitTarget, "surround-delete")
+                    install_surround_interceptor(vim, session)
+                    sync_world_from_vim(world, vim)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "surround-change",
+                ext_id,
+                "Change enclosing delimiter pair (`cs<old><new>`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let vim = require_vim_state(kern)!
+                    let buf = world.active_buffer()
+                    if not args.is_empty() {
+                        var old_d = ""
+                        var new_d = ""
+                        var tag_s = ""
+                        if args.len() >= 2 {
+                            old_d = args.get(0).as(String).trim()
+                            new_d = args.get(1).as(String).trim()
+                            if args.len() >= 3 {
+                                tag_s = args.get(2).as(String).trim()
+                            }
+                        } else {
+                            let raw = args.get(0).as(String).trim()
+                            let toks = raw.split_whitespace()
+                            if toks.len() >= 2 {
+                                old_d = toks.get(0).as(String)
+                                new_d = toks.get(1).as(String)
+                                if toks.len() >= 3 {
+                                    tag_s = toks.get(2).as(String)
+                                }
+                            } else if raw.char_len() == 2 {
+                                old_d = raw.slice(0, 1)
+                                new_d = raw.slice(1, 2)
+                            }
+                        }
+                        if old_d != "" and new_d != "" {
+                            let pair? = resolve_script_pair(new_d, tag_s)# else {
+                                return ()
+                            }
+                            let _ = apply_surround_change(buf, vim, old_d, pair)#!
+                            sync_world_from_vim(world, vim)
+                        }
+                        return ()
+                    }
+                    let session = SurroundSession.new(SurroundPhase.ChangeAwaitOld, "surround-change")
+                    install_surround_interceptor(vim, session)
+                    sync_world_from_vim(world, vim)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "surround-visual",
+                ext_id,
+                "Surround active Visual selection (`S<delim>`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let vim = require_vim_state(kern)!
+                    let buf = world.active_buffer()
+
+                    let a = vim.visual_anchor
+                    let b = buf.point
+                    let norm_marks = Span.normalized(a, b)
+                    buf.named_marks.insert("<", norm_marks.start)
+                    buf.named_marks.insert(">", norm_marks.end)
+
+                    let linewise = vim.mode == VimMode.VisualLine
+                    let r1 = if a.row <= b.row { a.row } else { b.row }
+                    let r2 = if a.row <= b.row { b.row } else { a.row }
+                    let lo = if a <= b { a } else { b }
+                    let hi = if a <= b { b } else { a }
+                    let hlen = buf.line_char_len(hi.row)
+                    let end_c = if hi.col < hlen { hi.col + 1 } else { hlen }
+                    let char_span = Span.normalized(lo, Pos.new(hi.row, end_c))
+
+                    vim.mode = VimMode.Normal
+                    vim.visual_dollar = false
+                    vim.recording_change = false
+                    vim.tentative_visual_change = false
+                    vim.change_strokes = List()
+                    vim.clear_transient()
+
+                    if not args.is_empty() {
+                        let delim_s = args.get(0).as(String).trim()
+                        let tag_s = if args.len() >= 2 { args.get(1).as(String).trim() } else { "" }
+                        let pair? = resolve_script_pair(delim_s, tag_s)# else {
+                            sync_world_from_vim(world, vim)
+                            return ()
+                        }
+                        if linewise {
+                            apply_surround_wrap_lines(buf, vim, r1, r2, pair, "surround-visual")!
+                        } else {
+                            apply_surround_wrap_span(buf, vim, char_span, pair, "surround-visual")!
+                        }
+                        sync_world_from_vim(world, vim)
+                        return ()
+                    }
+
+                    let session = SurroundSession.new(SurroundPhase.VisualAwaitDelim, "surround-visual")
+                    session.visual_linewise = linewise
+                    session.visual_r1 = r1
+                    session.visual_r2 = r2
+                    session.target_span = char_span
+                    install_surround_interceptor(vim, session)
+                    sync_world_from_vim(world, vim)
+                    ()
+                },
+            )
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            unbind_owner_from_keymaps(k, ext_id)
+            let vim_opt = k.service(SERVICE_VIM)
+            if vim_opt != null {
+                let vim = vim_opt.as(VimState)
+                if vim.modal_interceptor != null
+                    and vim.modal_interceptor.as(ModalInterceptor).owner == "ext_surround" {
+                    vim.clear_interceptor()
+                }
+            }
+            ()
+        },
+    )
+}

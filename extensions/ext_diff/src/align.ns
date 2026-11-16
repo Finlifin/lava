@@ -1,0 +1,970 @@
+-- align.ns: Diff Hunk Computation, Intra-Line Word Spans, Side-by-Side & Unified Rendering,
+-- and Standard Unified `.patch` Generation for `ext_diff`.
+
+use @lava_sys.rgba
+use @lava_accel.{DiffHunk, accel_diff_lines}
+use @ext_document.Buffer
+use pipeline.{TrackedDiffLine, format_pipeline_badge, has_any_active_mapper}
+
+pub const OWNER_DIFF: String = "ext_diff"
+pub const DIFF_HEADER_ROWS: i64 = 2
+
+pub fn rgba_hex(hex_rgb: i64, alpha: i64) -> i64 {
+    let r = (hex_rgb / 65536) % 256
+    let g = (hex_rgb / 256) % 256
+    let b = hex_rgb % 256
+    rgba(r, g, b, alpha)
+}
+
+pub fn max_i64(a: i64, b: i64) -> i64 {
+    if a >= b { a } else { b }
+}
+
+pub fn min_i64(a: i64, b: i64) -> i64 {
+    if a <= b { a } else { b }
+}
+
+-- ============================================================================
+-- 1. Metadata Structs for Hunks, Side-by-Side Rows & Unified Rows
+-- ============================================================================
+
+pub struct SessionHunk {
+    pub index: i64,
+    pub hunk: DiffHunk,
+    pub raw_left_start: i64,
+    pub raw_left_end: i64,
+    pub raw_right_start: i64,
+    pub raw_right_end: i64,
+    pub sbs_row: i64,
+    pub unified_row: i64,
+}
+
+pub struct SbsRowMeta {
+    pub buf_row: i64,
+    pub hunk_idx: i64,
+    pub left_orig_row: i64,
+    pub right_orig_row: i64,
+    pub left_kind: String,
+    pub right_kind: String,
+}
+
+pub struct UnifiedRowMeta {
+    pub buf_row: i64,
+    pub hunk_idx: i64,
+    pub left_orig_row: i64,
+    pub right_orig_row: i64,
+    pub kind: String,
+}
+
+struct TokenSpan {
+    text: String,
+    start_col: i64,
+    end_col: i64,
+}
+
+struct HunkGroup {
+    first_idx: i64,
+    last_idx: i64,
+    old_ctx_start: i64,
+    old_ctx_end: i64,
+    new_ctx_start: i64,
+    new_ctx_end: i64,
+}
+
+-- ============================================================================
+-- 2. Whitespace Normalization & Tracked Hunk Builder
+-- ============================================================================
+
+pub fn normalize_ws_for_cmp(s: String) -> String {
+    let n = s.char_len()
+    if n == 0 {
+        return ""
+    }
+    let parts = List()
+    var in_ws = true
+    var pending_space = false
+    for i in 0..n {
+        let ch = s.slice(i, i + 1)
+        if ch == " " or ch == "\t" {
+            if not in_ws {
+                pending_space = true
+                in_ws = true
+            }
+        } else {
+            if pending_space {
+                parts.push(" ")
+                pending_space = false
+            }
+            parts.push(ch)
+            in_ws = false
+        }
+    }
+    parts.join("")
+}
+
+pub fn compute_tracked_diff_hunks(
+    left_tracked: List,
+    right_tracked: List,
+    ignore_whitespace: bool,
+) -> List {
+    let l_cmp = List()
+    for i in 0..left_tracked.len() {
+        let s = left_tracked.get(i.as(usize)).as(TrackedDiffLine).mapped_text
+        l_cmp.push(if ignore_whitespace { normalize_ws_for_cmp(s) } else { s })
+    }
+    let r_cmp = List()
+    for j in 0..right_tracked.len() {
+        let s = right_tracked.get(j.as(usize)).as(TrackedDiffLine).mapped_text
+        r_cmp.push(if ignore_whitespace { normalize_ws_for_cmp(s) } else { s })
+    }
+    accel_diff_lines(l_cmp, r_cmp)
+}
+
+fn resolve_raw_bounds(tracked: List, raw_len: i64, start: i64, count: i64) -> (i64, i64) {
+    let k = tracked.len()
+    if k == 0 {
+        return (0, 0)
+    }
+    if count > 0 {
+        let first_idx = min_i64(max_i64(0, start), k - 1)
+        let last_idx = min_i64(max_i64(0, start + count - 1), k - 1)
+        let r0 = tracked.get(first_idx.as(usize)).as(TrackedDiffLine).orig_row
+        let r1 = tracked.get(last_idx.as(usize)).as(TrackedDiffLine).orig_row + 1
+        let clamped_0 = min_i64(max_i64(0, r0), raw_len)
+        let clamped_1 = min_i64(max_i64(clamped_0, r1), raw_len)
+        return (clamped_0, clamped_1)
+    }
+    if start < k {
+        let pos = tracked.get(max_i64(0, start).as(usize)).as(TrackedDiffLine).orig_row
+        let cpos = min_i64(max_i64(0, pos), raw_len)
+        return (cpos, cpos)
+    }
+    let after_last = tracked.get((k - 1).as(usize)).as(TrackedDiffLine).orig_row + 1
+    let cpos = min_i64(max_i64(0, after_last), raw_len)
+    (cpos, cpos)
+}
+
+pub fn build_session_hunks(
+    raw_hunks: List,
+    left_tracked: List,
+    right_tracked: List,
+    left_raw_len: i64,
+    right_raw_len: i64,
+) -> (List, i64, i64, i64) {
+    let out = List()
+    var added: i64 = 0
+    var deleted: i64 = 0
+    var changed: i64 = 0
+    for i in 0..raw_hunks.len() {
+        let h = raw_hunks.get(i.as(usize)).as(DiffHunk)
+        if h.kind == "add" {
+            added += h.new_count
+        } else if h.kind == "delete" {
+            deleted += h.old_count
+        } else {
+            changed += max_i64(h.old_count, h.new_count)
+        }
+        let (ls, le) = resolve_raw_bounds(left_tracked, left_raw_len, h.old_start, h.old_count)
+        let (rs, re) = resolve_raw_bounds(right_tracked, right_raw_len, h.new_start, h.new_count)
+        out.push(SessionHunk {
+            index: i,
+            hunk: h,
+            raw_left_start: ls,
+            raw_left_end: le,
+            raw_right_start: rs,
+            raw_right_end: re,
+            sbs_row: DIFF_HEADER_ROWS,
+            unified_row: DIFF_HEADER_ROWS,
+        })
+    }
+    (out, added, deleted, changed)
+}
+
+-- ============================================================================
+-- 3. Intra-Line Token/Word Diff Spans
+-- ============================================================================
+
+fn char_token_cat(ch: String) -> i64 {
+    if ch == " " or ch == "\t" {
+        return 1
+    }
+    if ch.is_alphanumeric() or ch == "_" {
+        return 2
+    }
+    3
+}
+
+fn tokenize_for_intraline(line: String) -> List {
+    let toks = List()
+    let n = line.char_len()
+    var i: i64 = 0
+    while i < n {
+        let ch = line.slice(i, i + 1)
+        let cat = char_token_cat(ch)
+        if cat == 3 {
+            toks.push(TokenSpan {
+                text: ch,
+                start_col: i,
+                end_col: i + 1,
+            })
+            i += 1
+        } else {
+            var j = i + 1
+            while j < n and char_token_cat(line.slice(j, j + 1)) == cat {
+                j += 1
+            }
+            toks.push(TokenSpan {
+                text: line.slice(i, j),
+                start_col: i,
+                end_col: j,
+            })
+            i = j
+        }
+    }
+    toks
+}
+
+fn merge_adjacent_spans(spans: List) -> List {
+    if spans.len() <= 1 {
+        return spans
+    }
+    let out = List()
+    var (cur_s, cur_e) = spans.get(0).as((i64, i64))
+    for i in 1..spans.len() {
+        let (ns, ne) = spans.get(i.as(usize)).as((i64, i64))
+        if ns <= cur_e {
+            cur_e = max_i64(cur_e, ne)
+        } else {
+            out.push((cur_s, cur_e))
+            cur_s = ns
+            cur_e = ne
+        }
+    }
+    out.push((cur_s, cur_e))
+    out
+}
+
+-- Compute `(left_spans, right_spans)` where each span is `(start_char_col, end_char_col)`
+-- relative to `left_str` and `right_str` (`0..char_len`).
+pub fn compute_intraline_spans(left_str: String, right_str: String) -> (List, List) {
+    if left_str == right_str {
+        return (List(), List())
+    }
+    let llen = left_str.char_len()
+    let rlen = right_str.char_len()
+    if llen == 0 and rlen == 0 {
+        return (List(), List())
+    }
+    if llen == 0 {
+        return (List(), [(0, rlen)])
+    }
+    if rlen == 0 {
+        return ([(0, llen)], List())
+    }
+
+    let ltoks = tokenize_for_intraline(left_str)
+    let rtoks = tokenize_for_intraline(right_str)
+    if ltoks.len() * rtoks.len() <= 3600 {
+        let lstrs = List()
+        for i in 0..ltoks.len() {
+            lstrs.push(ltoks.get(i.as(usize)).as(TokenSpan).text)
+        }
+        let rstrs = List()
+        for j in 0..rtoks.len() {
+            rstrs.push(rtoks.get(j.as(usize)).as(TokenSpan).text)
+        }
+        let thunks = accel_diff_lines(lstrs, rstrs)
+        let lspans = List()
+        let rspans = List()
+        for hi in 0..thunks.len() {
+            let th = thunks.get(hi.as(usize)).as(DiffHunk)
+            if th.old_count > 0 {
+                let sc = ltoks.get(th.old_start.as(usize)).as(TokenSpan).start_col
+                let ec = ltoks.get((th.old_start + th.old_count - 1).as(usize)).as(TokenSpan).end_col
+                if ec > sc {
+                    lspans.push((sc, ec))
+                }
+            }
+            if th.new_count > 0 {
+                let sc = rtoks.get(th.new_start.as(usize)).as(TokenSpan).start_col
+                let ec = rtoks.get((th.new_start + th.new_count - 1).as(usize)).as(TokenSpan).end_col
+                if ec > sc {
+                    rspans.push((sc, ec))
+                }
+            }
+        }
+        return (merge_adjacent_spans(lspans), merge_adjacent_spans(rspans))
+    }
+
+    -- Fallback character prefix/suffix scan for ultra-long lines
+    var pfx: i64 = 0
+    let min_l = min_i64(llen, rlen)
+    while pfx < min_l and left_str.slice(pfx, pfx + 1) == right_str.slice(pfx, pfx + 1) {
+        pfx += 1
+    }
+    var sfx: i64 = 0
+    while (pfx + sfx < min_l)
+        and left_str.slice(llen - 1 - sfx, llen - sfx) == right_str.slice(rlen - 1 - sfx, rlen - sfx) {
+        sfx += 1
+    }
+    let ls = if llen - sfx > pfx { [(pfx, llen - sfx)] } else { List() }
+    let rs = if rlen - sfx > pfx { [(pfx, rlen - sfx)] } else { List() }
+    (ls, rs)
+}
+
+-- ============================================================================
+-- 4. Line Number Formatting & Banner Construction
+-- ============================================================================
+
+fn digits_width(max_line_1based: i64) -> i64 {
+    var w: i64 = 1
+    var v = if max_line_1based > 1 { max_line_1based } else { 1 }
+    while v >= 10 {
+        w += 1
+        v = v / 10
+    }
+    if w < 4 { 4 } else { w }
+}
+
+fn pad_left(s: String, width: i64) -> String {
+    let slen = s.char_len()
+    if slen >= width {
+        s
+    } else {
+        " ".repeat(width - slen) ++ s
+    }
+}
+
+fn format_sbs_prefix(orig_row: i64, marker: String, ln_w: i64) -> String {
+    let num_txt = if orig_row >= 0 { (orig_row + 1).to_string() } else { "·" }
+    pad_left(num_txt, ln_w) ++ " " ++ marker ++ " "
+}
+
+fn format_unified_prefix(left_orig: i64, right_orig: i64, marker: String, ln_w: i64) -> String {
+    let l_txt = if left_orig >= 0 { (left_orig + 1).to_string() } else { "" }
+    let r_txt = if right_orig >= 0 { (right_orig + 1).to_string() } else { "" }
+    pad_left(l_txt, ln_w) ++ " " ++ pad_left(r_txt, ln_w) ++ " " ++ marker ++ " "
+}
+
+fn format_status_badges(stages: List, show_mapped_text: bool, ignore_whitespace: bool) -> String {
+    let pipe_badge = format_pipeline_badge(stages)
+    let has_mapper = has_any_active_mapper(stages)
+    let view_badge = if has_mapper and show_mapped_text {
+        "[VIEW: MAPPED]"
+    } else {
+        "[VIEW: ORIGINAL]"
+    }
+    let ws_badge = if ignore_whitespace { "[WS: IGNORE]" } else { "[WS: EXACT]" }
+    pipe_badge ++ " " ++ view_badge ++ " " ++ ws_badge
+}
+
+fn decorate_header_rows(buf: Buffer) {
+    let hdr_bg_0 = rgba_hex(0x282C42, 235)
+    let hdr_fg_0 = rgba_hex(0xCDD6F4, 255)
+    let hdr_bg_1 = rgba_hex(0x212437, 225)
+    let hdr_fg_1 = rgba_hex(0x89B4FA, 255)
+    if buf.line_count() >= 1 {
+        let len0 = max_i64(1, buf.line_char_len(0))
+        buf.add_inline_decor(OWNER_DIFF, 0, 0, len0, bg_rgba = hdr_bg_0, fg_rgba = hdr_fg_0)
+    }
+    if buf.line_count() >= 2 {
+        let len1 = max_i64(1, buf.line_char_len(1))
+        buf.add_inline_decor(OWNER_DIFF, 1, 0, len1, bg_rgba = hdr_bg_1, fg_rgba = hdr_fg_1)
+    }
+}
+
+-- ============================================================================
+-- 5. Side-by-Side Synchronized Buffer Renderer (`*Diff Left*` | `*Diff Right*`)
+-- ============================================================================
+
+pub fn render_side_by_side_buffers(
+    left_buf: Buffer,
+    right_buf: Buffer,
+    left_title: String,
+    right_title: String,
+    left_tracked: List,
+    right_tracked: List,
+    session_hunks: List,
+    stages: List,
+    show_mapped_text: bool,
+    ignore_whitespace: bool,
+    added: i64,
+    deleted: i64,
+    changed: i64,
+    max_orig_line_1: i64,
+) -> List {
+    let use_mapped = show_mapped_text and has_any_active_mapper(stages)
+    let ln_w = digits_width(max_orig_line_1)
+    let stats_txt = "+" ++ added.to_string()
+        ++ " -" ++ deleted.to_string()
+        ++ " ~" ++ changed.to_string()
+        ++ " (" ++ session_hunks.len().to_string() ++ " hunks)"
+    let badges = format_status_badges(stages, show_mapped_text, ignore_whitespace)
+    let hints = "  │  ]c/[c hunk  do/dp patch  f filter  m map  P preset  v view  t layout  RET source  q quit"
+
+    let left_lines = List()
+    let right_lines = List()
+    let row_metas = List()
+
+    -- Header rows 0 and 1
+    left_lines.push(" ◀ LEFT: " ++ left_title ++ "  │  " ++ stats_txt)
+    left_lines.push(" " ++ badges ++ hints)
+    right_lines.push(" ▶ RIGHT: " ++ right_title ++ "  │  " ++ stats_txt)
+    right_lines.push(" " ++ badges ++ hints)
+
+    for hr in 0..DIFF_HEADER_ROWS {
+        row_metas.push(SbsRowMeta {
+            buf_row: hr,
+            hunk_idx: -1,
+            left_orig_row: -1,
+            right_orig_row: -1,
+            left_kind: "header",
+            right_kind: "header",
+        })
+    }
+
+    -- Deferred decoration records: `(row, kind, prefix_len, intraline_spans)`
+    let left_decors = List()
+    let right_decors = List()
+
+    let k_l = left_tracked.len()
+    let k_r = right_tracked.len()
+    var li: i64 = 0
+    var ri: i64 = 0
+
+    let filler_bar = "┄".repeat(28)
+
+    if k_l == 0 and k_r == 0 {
+        let pfx = format_sbs_prefix(-1, "│", ln_w)
+        left_lines.push(pfx ++ "(0 surviving lines)")
+        right_lines.push(pfx ++ "(0 surviving lines)")
+        row_metas.push(SbsRowMeta {
+            buf_row: DIFF_HEADER_ROWS,
+            hunk_idx: -1,
+            left_orig_row: -1,
+            right_orig_row: -1,
+            left_kind: "empty",
+            right_kind: "empty",
+        })
+    } else {
+        for hi in 0..session_hunks.len() {
+            let sh = session_hunks.get(hi.as(usize)).as(SessionHunk)
+            let h = sh.hunk
+
+            -- Equal rows preceding this hunk
+            while li < h.old_start and ri < h.new_start and li < k_l and ri < k_r {
+                let lt = left_tracked.get(li.as(usize)).as(TrackedDiffLine)
+                let rt = right_tracked.get(ri.as(usize)).as(TrackedDiffLine)
+                let cur_r = left_lines.len()
+                left_lines.push(format_sbs_prefix(lt.orig_row, "│", ln_w) ++ lt.display_text(use_mapped))
+                right_lines.push(format_sbs_prefix(rt.orig_row, "│", ln_w) ++ rt.display_text(use_mapped))
+                row_metas.push(SbsRowMeta {
+                    buf_row: cur_r,
+                    hunk_idx: -1,
+                    left_orig_row: lt.orig_row,
+                    right_orig_row: rt.orig_row,
+                    left_kind: "equal",
+                    right_kind: "equal",
+                })
+                li += 1
+                ri += 1
+            }
+
+            -- Record display row of this hunk
+            sh.sbs_row = left_lines.len()
+
+            let span_rows = max_i64(h.old_count, h.new_count)
+            for off in 0..span_rows {
+                let has_l = off < h.old_count and (h.old_start + off) < k_l
+                let has_r = off < h.new_count and (h.new_start + off) < k_r
+                let cur_r = left_lines.len()
+
+                if has_l and has_r {
+                    let lt = left_tracked.get((h.old_start + off).as(usize)).as(TrackedDiffLine)
+                    let rt = right_tracked.get((h.new_start + off).as(usize)).as(TrackedDiffLine)
+                    let l_txt = lt.display_text(use_mapped)
+                    let r_txt = rt.display_text(use_mapped)
+                    let l_pfx = format_sbs_prefix(lt.orig_row, "~", ln_w)
+                    let r_pfx = format_sbs_prefix(rt.orig_row, "~", ln_w)
+                    left_lines.push(l_pfx ++ l_txt)
+                    right_lines.push(r_pfx ++ r_txt)
+
+                    let (lspans, rspans) = compute_intraline_spans(l_txt, r_txt)
+                    left_decors.push((cur_r, "change_del", l_pfx.char_len(), lspans))
+                    right_decors.push((cur_r, "change_add", r_pfx.char_len(), rspans))
+
+                    row_metas.push(SbsRowMeta {
+                        buf_row: cur_r,
+                        hunk_idx: hi,
+                        left_orig_row: lt.orig_row,
+                        right_orig_row: rt.orig_row,
+                        left_kind: "change",
+                        right_kind: "change",
+                    })
+                } else if has_l {
+                    let lt = left_tracked.get((h.old_start + off).as(usize)).as(TrackedDiffLine)
+                    let l_txt = lt.display_text(use_mapped)
+                    let l_pfx = format_sbs_prefix(lt.orig_row, "-", ln_w)
+                    let r_pfx = format_sbs_prefix(-1, "·", ln_w)
+                    left_lines.push(l_pfx ++ l_txt)
+                    right_lines.push(r_pfx ++ filler_bar)
+
+                    left_decors.push((cur_r, "delete", l_pfx.char_len(), List()))
+                    right_decors.push((cur_r, "filler", r_pfx.char_len(), List()))
+
+                    row_metas.push(SbsRowMeta {
+                        buf_row: cur_r,
+                        hunk_idx: hi,
+                        left_orig_row: lt.orig_row,
+                        right_orig_row: -1,
+                        left_kind: "delete",
+                        right_kind: "filler",
+                    })
+                } else if has_r {
+                    let rt = right_tracked.get((h.new_start + off).as(usize)).as(TrackedDiffLine)
+                    let r_txt = rt.display_text(use_mapped)
+                    let l_pfx = format_sbs_prefix(-1, "·", ln_w)
+                    let r_pfx = format_sbs_prefix(rt.orig_row, "+", ln_w)
+                    left_lines.push(l_pfx ++ filler_bar)
+                    right_lines.push(r_pfx ++ r_txt)
+
+                    left_decors.push((cur_r, "filler", l_pfx.char_len(), List()))
+                    right_decors.push((cur_r, "add", r_pfx.char_len(), List()))
+
+                    row_metas.push(SbsRowMeta {
+                        buf_row: cur_r,
+                        hunk_idx: hi,
+                        left_orig_row: -1,
+                        right_orig_row: rt.orig_row,
+                        left_kind: "filler",
+                        right_kind: "add",
+                    })
+                }
+            }
+
+            li = h.old_start + h.old_count
+            ri = h.new_start + h.new_count
+        }
+
+        -- Trailing equal rows
+        while li < k_l and ri < k_r {
+            let lt = left_tracked.get(li.as(usize)).as(TrackedDiffLine)
+            let rt = right_tracked.get(ri.as(usize)).as(TrackedDiffLine)
+            let cur_r = left_lines.len()
+            left_lines.push(format_sbs_prefix(lt.orig_row, "│", ln_w) ++ lt.display_text(use_mapped))
+            right_lines.push(format_sbs_prefix(rt.orig_row, "│", ln_w) ++ rt.display_text(use_mapped))
+            row_metas.push(SbsRowMeta {
+                buf_row: cur_r,
+                hunk_idx: -1,
+                left_orig_row: lt.orig_row,
+                right_orig_row: rt.orig_row,
+                left_kind: "equal",
+                right_kind: "equal",
+            })
+            li += 1
+            ri += 1
+        }
+    }
+
+    -- Commit lines into both read-only diff buffers
+    left_buf.read_only = false
+    left_buf.major_mode = "diff"
+    left_buf.set_lines(left_lines, record_undo = false)
+    left_buf.modified = false
+    left_buf.read_only = true
+    left_buf.clear_owner_decors(OWNER_DIFF)
+
+    right_buf.read_only = false
+    right_buf.major_mode = "diff"
+    right_buf.set_lines(right_lines, record_undo = false)
+    right_buf.modified = false
+    right_buf.read_only = true
+    right_buf.clear_owner_decors(OWNER_DIFF)
+
+    decorate_header_rows(left_buf)
+    decorate_header_rows(right_buf)
+    apply_diff_row_decors(left_buf, left_decors)
+    apply_diff_row_decors(right_buf, right_decors)
+
+    row_metas
+}
+
+fn apply_diff_row_decors(buf: Buffer, decors: List) {
+    let add_sign_fg = rgba_hex(0xA6E3A1, 255)
+    let del_sign_fg = rgba_hex(0xF38BA8, 255)
+    let chg_sign_fg = rgba_hex(0x89B4FA, 255)
+
+    let add_row_bg = rgba_hex(0x1E3A2F, 145)
+    let del_row_bg = rgba_hex(0x3D222E, 145)
+    let chg_del_bg = rgba_hex(0x362436, 145)
+    let chg_add_bg = rgba_hex(0x1F363B, 145)
+    let filler_bg = rgba_hex(0x181825, 165)
+    let filler_fg = rgba_hex(0x585B70, 220)
+
+    let intra_del_bg = rgba_hex(0x7A2E46, 225)
+    let intra_del_fg = rgba_hex(0xFFD6E0, 255)
+    let intra_add_bg = rgba_hex(0x28664B, 225)
+    let intra_add_fg = rgba_hex(0xD8FFE8, 255)
+
+    for i in 0..decors.len() {
+        let (row, kind, pfx_len, spans) = decors.get(i.as(usize)).as((i64, String, i64, List))
+        let row_len = max_i64(1, buf.line_char_len(row))
+        if kind == "add" {
+            buf.add_sign(OWNER_DIFF, row, "▍", add_sign_fg, priority = 20)
+            buf.add_inline_decor(OWNER_DIFF, row, 0, row_len, bg_rgba = add_row_bg)
+        } else if kind == "delete" {
+            buf.add_sign(OWNER_DIFF, row, "▍", del_sign_fg, priority = 20)
+            buf.add_inline_decor(OWNER_DIFF, row, 0, row_len, bg_rgba = del_row_bg)
+        } else if kind == "change_del" {
+            buf.add_sign(OWNER_DIFF, row, "▍", chg_sign_fg, priority = 20)
+            buf.add_inline_decor(OWNER_DIFF, row, 0, row_len, bg_rgba = chg_del_bg)
+            for si in 0..spans.len() {
+                let (sc, ec) = spans.get(si.as(usize)).as((i64, i64))
+                if ec > sc {
+                    buf.add_inline_decor(
+                        OWNER_DIFF,
+                        row,
+                        pfx_len + sc,
+                        pfx_len + ec,
+                        bg_rgba = intra_del_bg,
+                        fg_rgba = intra_del_fg,
+                    )
+                }
+            }
+        } else if kind == "change_add" {
+            buf.add_sign(OWNER_DIFF, row, "▍", chg_sign_fg, priority = 20)
+            buf.add_inline_decor(OWNER_DIFF, row, 0, row_len, bg_rgba = chg_add_bg)
+            for si in 0..spans.len() {
+                let (sc, ec) = spans.get(si.as(usize)).as((i64, i64))
+                if ec > sc {
+                    buf.add_inline_decor(
+                        OWNER_DIFF,
+                        row,
+                        pfx_len + sc,
+                        pfx_len + ec,
+                        bg_rgba = intra_add_bg,
+                        fg_rgba = intra_add_fg,
+                    )
+                }
+            }
+        } else if kind == "filler" {
+            buf.add_inline_decor(OWNER_DIFF, row, 0, row_len, bg_rgba = filler_bg, fg_rgba = filler_fg)
+        } else if kind == "hunk_hdr" {
+            buf.add_inline_decor(
+                OWNER_DIFF,
+                row,
+                0,
+                row_len,
+                bg_rgba = rgba_hex(0x2A2E48, 210),
+                fg_rgba = rgba_hex(0xCBA6F7, 255),
+            )
+        }
+    }
+}
+
+-- ============================================================================
+-- 6. Unified Patch View Renderer (`*Diff*`) & Standard `.patch` Exporter
+-- ============================================================================
+
+fn group_hunks_with_context(
+    session_hunks: List,
+    left_len: i64,
+    right_len: i64,
+    context_lines: i64,
+) -> List {
+    let groups = List()
+    if session_hunks.is_empty() {
+        return groups
+    }
+    let ctx = max_i64(0, context_lines)
+    var i: i64 = 0
+    let total = session_hunks.len()
+    while i < total {
+        let h0 = session_hunks.get(i.as(usize)).as(SessionHunk).hunk
+        var old_s = max_i64(0, h0.old_start - ctx)
+        var old_e = min_i64(left_len, h0.old_start + h0.old_count + ctx)
+        var new_s = max_i64(0, h0.new_start - ctx)
+        var new_e = min_i64(right_len, h0.new_start + h0.new_count + ctx)
+        var last_i = i
+
+        while last_i + 1 < total {
+            let h_next = session_hunks.get((last_i + 1).as(usize)).as(SessionHunk).hunk
+            let next_old_s = max_i64(0, h_next.old_start - ctx)
+            if next_old_s <= old_e {
+                old_e = min_i64(left_len, h_next.old_start + h_next.old_count + ctx)
+                new_e = min_i64(right_len, h_next.new_start + h_next.new_count + ctx)
+                last_i += 1
+            } else {
+                break
+            }
+        }
+
+        groups.push(HunkGroup {
+            first_idx: i,
+            last_idx: last_i,
+            old_ctx_start: old_s,
+            old_ctx_end: old_e,
+            new_ctx_start: new_s,
+            new_ctx_end: new_e,
+        })
+        i = last_i + 1
+    }
+    groups
+}
+
+fn format_unified_hunk_header(
+    left_tracked: List,
+    right_tracked: List,
+    grp: HunkGroup,
+) -> String {
+    let old_cnt = grp.old_ctx_end - grp.old_ctx_start
+    let new_cnt = grp.new_ctx_end - grp.new_ctx_start
+    let old_1 = if old_cnt > 0 and grp.old_ctx_start < left_tracked.len() {
+        left_tracked.get(grp.old_ctx_start.as(usize)).as(TrackedDiffLine).orig_row + 1
+    } else if grp.old_ctx_start > 0 and grp.old_ctx_start - 1 < left_tracked.len() {
+        left_tracked.get((grp.old_ctx_start - 1).as(usize)).as(TrackedDiffLine).orig_row + 1
+    } else {
+        grp.old_ctx_start
+    }
+    let new_1 = if new_cnt > 0 and grp.new_ctx_start < right_tracked.len() {
+        right_tracked.get(grp.new_ctx_start.as(usize)).as(TrackedDiffLine).orig_row + 1
+    } else if grp.new_ctx_start > 0 and grp.new_ctx_start - 1 < right_tracked.len() {
+        right_tracked.get((grp.new_ctx_start - 1).as(usize)).as(TrackedDiffLine).orig_row + 1
+    } else {
+        grp.new_ctx_start
+    }
+    "@@ -" ++ old_1.to_string() ++ "," ++ old_cnt.to_string()
+        ++ " +" ++ new_1.to_string() ++ "," ++ new_cnt.to_string() ++ " @@"
+}
+
+pub fn render_unified_buffer(
+    unified_buf: Buffer,
+    left_title: String,
+    right_title: String,
+    left_tracked: List,
+    right_tracked: List,
+    session_hunks: List,
+    stages: List,
+    show_mapped_text: bool,
+    ignore_whitespace: bool,
+    context_lines: i64,
+    added: i64,
+    deleted: i64,
+    changed: i64,
+    max_orig_line_1: i64,
+) -> List {
+    let use_mapped = show_mapped_text and has_any_active_mapper(stages)
+    let ln_w = digits_width(max_orig_line_1)
+    let stats_txt = "+" ++ added.to_string()
+        ++ " -" ++ deleted.to_string()
+        ++ " ~" ++ changed.to_string()
+        ++ " (" ++ session_hunks.len().to_string() ++ " hunks, ctx=" ++ context_lines.to_string() ++ ")"
+    let badges = format_status_badges(stages, show_mapped_text, ignore_whitespace)
+    let hints = "  │  ]c/[c hunk  do/dp patch  c/C ctx  f/m/P pipe  v view  t split  W export  q quit"
+
+    let lines = List()
+    let metas = List()
+    let decors = List()
+
+    lines.push(" ⇄ UNIFIED DIFF: " ++ left_title ++ " ↔ " ++ right_title ++ "  │  " ++ stats_txt)
+    lines.push(" " ++ badges ++ hints)
+    for hr in 0..DIFF_HEADER_ROWS {
+        metas.push(UnifiedRowMeta {
+            buf_row: hr,
+            hunk_idx: -1,
+            left_orig_row: -1,
+            right_orig_row: -1,
+            kind: "header",
+        })
+    }
+
+    if session_hunks.is_empty() {
+        let cur_r = lines.len()
+        lines.push("   (No differences — 0 hunks)")
+        metas.push(UnifiedRowMeta {
+            buf_row: cur_r,
+            hunk_idx: -1,
+            left_orig_row: if not left_tracked.is_empty() { left_tracked.get(0).as(TrackedDiffLine).orig_row } else { -1 },
+            right_orig_row: if not right_tracked.is_empty() { right_tracked.get(0).as(TrackedDiffLine).orig_row } else { -1 },
+            kind: "equal",
+        })
+    } else {
+        let groups = group_hunks_with_context(session_hunks, left_tracked.len(), right_tracked.len(), context_lines)
+        for gi in 0..groups.len() {
+            let grp = groups.get(gi.as(usize)).as(HunkGroup)
+            let hdr_row = lines.len()
+            lines.push(format_unified_hunk_header(left_tracked, right_tracked, grp))
+            decors.push((hdr_row, "hunk_hdr", 0, List()))
+            metas.push(UnifiedRowMeta {
+                buf_row: hdr_row,
+                hunk_idx: grp.first_idx,
+                left_orig_row: -1,
+                right_orig_row: -1,
+                kind: "hunk_hdr",
+            })
+
+            var li = grp.old_ctx_start
+            var ri = grp.new_ctx_start
+
+            for hi in grp.first_idx..(grp.last_idx + 1) {
+                let sh = session_hunks.get(hi.as(usize)).as(SessionHunk)
+                let h = sh.hunk
+
+                -- Leading context before hunk `hi`
+                while li < h.old_start and ri < h.new_start {
+                    let lt = left_tracked.get(li.as(usize)).as(TrackedDiffLine)
+                    let rt = right_tracked.get(ri.as(usize)).as(TrackedDiffLine)
+                    let cur_r = lines.len()
+                    lines.push(format_unified_prefix(lt.orig_row, rt.orig_row, " ", ln_w) ++ rt.display_text(use_mapped))
+                    metas.push(UnifiedRowMeta {
+                        buf_row: cur_r,
+                        hunk_idx: -1,
+                        left_orig_row: lt.orig_row,
+                        right_orig_row: rt.orig_row,
+                        kind: "context",
+                    })
+                    li += 1
+                    ri += 1
+                }
+
+                sh.unified_row = lines.len()
+                let paired_n = min_i64(h.old_count, h.new_count)
+                let precomputed_lspans = List()
+                let precomputed_rspans = List()
+                for pi in 0..paired_n {
+                    let lt = left_tracked.get((h.old_start + pi).as(usize)).as(TrackedDiffLine)
+                    let rt = right_tracked.get((h.new_start + pi).as(usize)).as(TrackedDiffLine)
+                    let (ls, rs) = compute_intraline_spans(lt.display_text(use_mapped), rt.display_text(use_mapped))
+                    precomputed_lspans.push(ls)
+                    precomputed_rspans.push(rs)
+                }
+
+                -- Deleted (`-`) lines of hunk `hi`
+                for di in 0..h.old_count {
+                    let lt = left_tracked.get((h.old_start + di).as(usize)).as(TrackedDiffLine)
+                    let cur_r = lines.len()
+                    let pfx = format_unified_prefix(lt.orig_row, -1, "-", ln_w)
+                    lines.push(pfx ++ lt.display_text(use_mapped))
+                    if di < paired_n {
+                        let ls = precomputed_lspans.get(di.as(usize)).as(List)
+                        decors.push((cur_r, "change_del", pfx.char_len(), ls))
+                    } else {
+                        decors.push((cur_r, "delete", pfx.char_len(), List()))
+                    }
+                    metas.push(UnifiedRowMeta {
+                        buf_row: cur_r,
+                        hunk_idx: hi,
+                        left_orig_row: lt.orig_row,
+                        right_orig_row: -1,
+                        kind: "delete",
+                    })
+                }
+
+                -- Added (`+`) lines of hunk `hi`
+                for ai in 0..h.new_count {
+                    let rt = right_tracked.get((h.new_start + ai).as(usize)).as(TrackedDiffLine)
+                    let cur_r = lines.len()
+                    let pfx = format_unified_prefix(-1, rt.orig_row, "+", ln_w)
+                    lines.push(pfx ++ rt.display_text(use_mapped))
+                    if ai < paired_n {
+                        let rs = precomputed_rspans.get(ai.as(usize)).as(List)
+                        decors.push((cur_r, "change_add", pfx.char_len(), rs))
+                    } else {
+                        decors.push((cur_r, "add", pfx.char_len(), List()))
+                    }
+                    metas.push(UnifiedRowMeta {
+                        buf_row: cur_r,
+                        hunk_idx: hi,
+                        left_orig_row: -1,
+                        right_orig_row: rt.orig_row,
+                        kind: "add",
+                    })
+                }
+
+                li = h.old_start + h.old_count
+                ri = h.new_start + h.new_count
+            }
+
+            -- Trailing context after last hunk in group
+            while li < grp.old_ctx_end and ri < grp.new_ctx_end {
+                let lt = left_tracked.get(li.as(usize)).as(TrackedDiffLine)
+                let rt = right_tracked.get(ri.as(usize)).as(TrackedDiffLine)
+                let cur_r = lines.len()
+                lines.push(format_unified_prefix(lt.orig_row, rt.orig_row, " ", ln_w) ++ rt.display_text(use_mapped))
+                metas.push(UnifiedRowMeta {
+                    buf_row: cur_r,
+                    hunk_idx: -1,
+                    left_orig_row: lt.orig_row,
+                    right_orig_row: rt.orig_row,
+                    kind: "context",
+                })
+                li += 1
+                ri += 1
+            }
+        }
+    }
+
+    unified_buf.read_only = false
+    unified_buf.major_mode = "diff"
+    unified_buf.set_lines(lines, record_undo = false)
+    unified_buf.modified = false
+    unified_buf.read_only = true
+    unified_buf.clear_owner_decors(OWNER_DIFF)
+
+    decorate_header_rows(unified_buf)
+    apply_diff_row_decors(unified_buf, decors)
+
+    metas
+}
+
+pub fn format_standard_unified_patch(
+    left_label: String,
+    right_label: String,
+    left_tracked: List,
+    right_tracked: List,
+    session_hunks: List,
+    stages: List,
+    show_mapped_text: bool,
+    context_lines: i64,
+) -> List {
+    let use_mapped = show_mapped_text and has_any_active_mapper(stages)
+    let out = List()
+    out.push("--- a/" ++ left_label)
+    out.push("+++ b/" ++ right_label)
+    if session_hunks.is_empty() {
+        return out
+    }
+    let groups = group_hunks_with_context(session_hunks, left_tracked.len(), right_tracked.len(), context_lines)
+    for gi in 0..groups.len() {
+        let grp = groups.get(gi.as(usize)).as(HunkGroup)
+        out.push(format_unified_hunk_header(left_tracked, right_tracked, grp))
+        var li = grp.old_ctx_start
+        var ri = grp.new_ctx_start
+        for hi in grp.first_idx..(grp.last_idx + 1) {
+            let h = session_hunks.get(hi.as(usize)).as(SessionHunk).hunk
+            while li < h.old_start and ri < h.new_start {
+                let rt = right_tracked.get(ri.as(usize)).as(TrackedDiffLine)
+                out.push(" " ++ rt.display_text(use_mapped))
+                li += 1
+                ri += 1
+            }
+            for di in 0..h.old_count {
+                let lt = left_tracked.get((h.old_start + di).as(usize)).as(TrackedDiffLine)
+                out.push("-" ++ lt.display_text(use_mapped))
+            }
+            for ai in 0..h.new_count {
+                let rt = right_tracked.get((h.new_start + ai).as(usize)).as(TrackedDiffLine)
+                out.push("+" ++ rt.display_text(use_mapped))
+            }
+            li = h.old_start + h.old_count
+            ri = h.new_start + h.new_count
+        }
+        while li < grp.old_ctx_end and ri < grp.new_ctx_end {
+            let rt = right_tracked.get(ri.as(usize)).as(TrackedDiffLine)
+            out.push(" " ++ rt.display_text(use_mapped))
+            li += 1
+            ri += 1
+        }
+    }
+    out
+}

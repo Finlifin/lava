@@ -1,0 +1,592 @@
+-- Standalone Integration & Scene Verification Suite for `ext_window` and `ext_render`.
+
+use std.io
+use @lava_sys.{CaretShape, DrawCmd, host_commit_frame, mock_enable, mock_frame_generation}
+use @lava_core.{
+    HostClipboardCap, KeyBindingEntry, LogCollectorCap, PromptTurn, StatusCollectorCap,
+    SystemKernel, clipboard_get, clipboard_set, log_event, status_emit
+}
+use @ext_document.{
+    ActiveBgJob, BufferKind, EditorWorld, MinibufferView, Pos, VisualKind, VisualSelection,
+    ext_document_id, register_document_extension, require_editor_world
+}
+use @ext_window.{
+    SERVICE_WINDOW_MANAGER, SplitAxis, TAB_BAR_HEIGHT, WinId, WindowManager, WindowPane,
+    char_col_to_visual_col, compute_gutter_width, ext_window_id, register_window_extension,
+    require_window_manager
+}
+use @ext_render.{
+    SERVICE_RENDERER, ThemePalette, builtin_theme_names, catppuccin_mocha_theme, compose_frame,
+    ext_render_id, gruvbox_dark_theme, one_dark_theme, register_render_extension,
+    require_renderer, solarized_light_theme, theme_by_name, tokenize_line
+}
+
+fn assert_true(cond: bool, msg: String) {
+    if not cond {
+        panic("ASSERTION FAILED: " ++ msg)
+    }
+}
+
+fn assert_eq_i64(actual: i64, expected: i64, msg: String) {
+    if actual != expected {
+        panic(
+            "ASSERTION FAILED (" ++ msg ++ "): expected "
+            ++ expected.to_string() ++ ", got " ++ actual.to_string()
+        )
+    }
+}
+
+fn assert_eq_str(actual: String, expected: String, msg: String) {
+    if actual != expected {
+        panic(
+            "ASSERTION FAILED (" ++ msg ++ "): expected \""
+            ++ expected ++ "\", got \"" ++ actual ++ "\""
+        )
+    }
+}
+
+fn run_cmd(
+    kernel: SystemKernel,
+    name: String,
+    args: List,
+    logs: LogCollectorCap,
+    statuses: StatusCollectorCap,
+    clip: HostClipboardCap,
+) -> PromptTurn {
+    handles(log_event)(lvl: String, src: String, msg: String) -> Unit {
+        logs.record(lvl, src, msg)
+    }
+    handles(status_emit)(msg: String) -> Unit {
+        statuses.emit(msg)
+    }
+    handles(clipboard_get)() -> String {
+        clip.read_clip()
+    }
+    handles(clipboard_set)(txt: String) -> Unit {
+        clip.write_clip(txt)
+    }
+    let res = kernel.dispatch_command(name, args)# ! {
+        err => panic("dispatch_command(" ++ name ++ ") failed: " ++ err),
+    }
+    res
+}
+
+fn submit_prompt(
+    kernel: SystemKernel,
+    answer: ?String,
+    logs: LogCollectorCap,
+    statuses: StatusCollectorCap,
+    clip: HostClipboardCap,
+) -> PromptTurn {
+    handles(log_event)(lvl: String, src: String, msg: String) -> Unit {
+        logs.record(lvl, src, msg)
+    }
+    handles(status_emit)(msg: String) -> Unit {
+        statuses.emit(msg)
+    }
+    handles(clipboard_get)() -> String {
+        clip.read_clip()
+    }
+    handles(clipboard_set)(txt: String) -> Unit {
+        clip.write_clip(txt)
+    }
+    let res = kernel.submit_prompt_answer(answer)# ! {
+        err => panic("submit_prompt_answer failed: " ++ err),
+    }
+    res
+}
+
+-- Verify that `tokenize_line` produces strictly contiguous runs whose concatenation equals `line`.
+fn verify_contiguous_runs(line: String, runs: List, label: String) {
+    if line == "" {
+        assert_eq_i64(runs.len(), 0, label ++ " empty line")
+        return
+    }
+    assert_true(not runs.is_empty(), label ++ " non-empty runs")
+    var expected_col: i64 = 0
+    let rebuilt = List()
+    for i in 0..runs.len() {
+        let (scol, text, _, _, _) = runs.get(i.as(usize)).as((i64, String, i64, bool, bool))
+        assert_eq_i64(scol, expected_col, label ++ " contiguous start_col at run " ++ i.to_string())
+        assert_true(text != "", label ++ " non-empty run text")
+        expected_col += text.char_len()
+        rebuilt.push(text)
+    }
+    assert_eq_str(rebuilt.join(""), line, label ++ " reconstructed line")
+}
+
+fn find_run_color(runs: List, needle: String) -> ?(i64, bool, bool) {
+    for i in 0..runs.len() {
+        let (_, text, color, bold, italic) =
+            runs.get(i.as(usize)).as((i64, String, i64, bool, bool))
+        if text.contains(needle) {
+            return (color, bold, italic)
+        }
+    }
+    null
+}
+
+fn require_run_color(runs: List, needle: String) -> (i64, bool, bool) {
+    let hit? = find_run_color(runs, needle) else {
+        panic("missing syntax token containing: " ++ needle)
+    }
+    hit
+}
+fn audit_draw_cmds(cmds: List, label: String) -> (i64, i64, i64, i64, i64, List) {
+    assert_true(not cmds.is_empty(), label ++ " DrawCmd list non-empty")
+    var clip_depth: i64 = 0
+    var clip_pushes: i64 = 0
+    var fill_rects: i64 = 0
+    var stroke_rects: i64 = 0
+    var lines_cnt: i64 = 0
+    var carets_cnt: i64 = 0
+    let text_blobs = List()
+
+    for i in 0..cmds.len() {
+        let cmd = cmds.get(i.as(usize)).as(DrawCmd)
+        let wire = cmd.to_wire()
+        assert_true(not wire.is_empty(), label ++ " wire cmd non-empty")
+        cmd match {
+            DrawCmd.ClipPush(_, _, w, h) => {
+                assert_true(w > 0.0 and h > 0.0, label ++ " positive clip bounds")
+                clip_depth += 1
+                clip_pushes += 1
+            },
+            DrawCmd.ClipPop => {
+                clip_depth -= 1
+                assert_true(clip_depth >= 0, label ++ " ClipPop never underflows")
+            },
+            DrawCmd.FillRect(_, _, _, _, _, _) => {
+                fill_rects += 1
+            },
+            DrawCmd.StrokeRect(_, _, _, _, _, _, _) => {
+                stroke_rects += 1
+            },
+            DrawCmd.Line(_, _, _, _, _, _) => {
+                lines_cnt += 1
+            },
+            DrawCmd.TextRun(_, _, txt, _, _, _, _, _, _) => {
+                text_blobs.push(txt)
+            },
+            DrawCmd.CursorCaret(_, _, _, _, _, _) => {
+                carets_cnt += 1
+            },
+        }
+    }
+    assert_eq_i64(clip_depth, 0, label ++ " ClipPush/ClipPop balanced")
+    assert_true(clip_pushes >= 2, label ++ " has pane and echo-bar clips")
+    (clip_pushes, fill_rects, stroke_rects, lines_cnt, carets_cnt, text_blobs)
+}
+
+fn any_text_contains(texts: List, needle: String) -> bool {
+    for i in 0..texts.len() {
+        if texts.get(i.as(usize)).as(String).contains(needle) {
+            return true
+        }
+    }
+    false
+}
+
+fn count_caret_shape(cmds: List, target_shape: CaretShape) -> i64 {
+    var cnt: i64 = 0
+    for i in 0..cmds.len() {
+        let cmd = cmds.get(i.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.CursorCaret(_, _, _, _, shape, _) => {
+                if shape == target_shape {
+                    cnt += 1
+                }
+            },
+            _ => (),
+        }
+    }
+    cnt
+}
+
+fn count_fill_color(cmds: List, target_color: i64) -> i64 {
+    var cnt: i64 = 0
+    for i in 0..cmds.len() {
+        let cmd = cmds.get(i.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.FillRect(_, _, _, _, color, _) => {
+                if color == target_color {
+                    cnt += 1
+                }
+            },
+            _ => (),
+        }
+    }
+    cnt
+}
+
+fn main() {
+    mock_enable(true)
+
+    let kernel = SystemKernel.new()
+    let logs = LogCollectorCap.new()
+    let statuses = StatusCollectorCap.new()
+    let clip = HostClipboardCap {}
+
+    -- 1. Register & topologically activate `ext_document`, `ext_window`, `ext_render`
+    let _ = register_document_extension(kernel) ! { e => panic(e) }
+    let _ = register_window_extension(kernel) ! { e => panic(e) }
+    let _ = register_render_extension(kernel) ! { e => panic(e) }
+    let _ = kernel.activate_all() ! { e => panic(e) }
+
+    assert_true(kernel.is_extension_active(ext_document_id()), "ext_document active")
+    assert_true(kernel.is_extension_active(ext_window_id()), "ext_window active")
+    assert_true(kernel.is_extension_active(ext_render_id()), "ext_render active")
+    assert_true(kernel.service(SERVICE_WINDOW_MANAGER) != null, "window manager service published")
+    assert_true(kernel.service(SERVICE_RENDERER) != null, "renderer service published")
+
+    let world = require_editor_world(kernel) ! { e => panic(e) }
+    let wm = require_window_manager(kernel) ! { e => panic(e) }
+    let renderer = require_renderer(kernel) ! { e => panic(e) }
+
+    -- Populate two buffers for multi-pane & multi-tab tests
+    let code_lines = [
+        "use @lava_core.SystemKernel",
+        "pub fn compute(world: EditorWorld) -> #status_emit !String ?Pos {{",
+        "\tlet answer = 42 -- inline comment",
+        "\tlet greeting = \"hello lava\"",
+        "\treturn null",
+        "}}",
+        "-- extra line 7",
+        "-- extra line 8",
+    ]
+    let code_buf = world.create_buffer(
+        "demo.ns",
+        BufferKind.File,
+        file_path = "/tmp/demo.ns",
+        major_mode = "nessa",
+        initial_lines = code_lines,
+    )
+    code_buf.modified = true
+    let _ = world.switch_to_buffer(code_buf.id)
+    kernel.emit_hook("buffer-switched", code_buf.id)
+    assert_true(wm.active_pane().buffer_id == code_buf.id, "buffer-switched hook updated active pane")
+
+    let org_buf = world.create_buffer(
+        "roadmap.org",
+        BufferKind.File,
+        file_path = "/tmp/roadmap.org",
+        major_mode = "org",
+        initial_lines = [
+            "* TODO Build `compose_frame` compositor",
+            "  Hidden folded detail row under heading 1",
+            "* DONE Verify 4 color themes",
+            "  Visible detail row under heading 2",
+        ],
+    )
+
+    -- 2. Split Horizontal + Vertical -> 3 Panes, Cycle Focus, Directional Focus, Hit-Test, Resize, Only
+    let win1 = wm.active_pane().id
+    assert_eq_i64(wm.visible_panes().len(), 1, "starts with 1 pane")
+    let _ = run_cmd(kernel, "split-window-below", [], logs, statuses, clip)
+    let win2 = wm.active_pane().id
+    assert_true(win2 != win1, "horizontal split created win2")
+    assert_eq_i64(wm.visible_panes().len(), 2, "2 panes after split-window-below")
+
+    let _ = run_cmd(kernel, "split-window-right", [], logs, statuses, clip)
+    let win3 = wm.active_pane().id
+    assert_true(win3 != win2 and win3 != win1, "vertical split created win3")
+    assert_eq_i64(wm.visible_panes().len(), 3, "3 panes after split-window-right")
+
+    -- Verify DFS order: [win1 (top), win2 (bottom-left), win3 (bottom-right)]
+    let vis3 = wm.visible_panes()
+    let p_top = vis3.get(0).as(WindowPane)
+    let p_bl = vis3.get(1).as(WindowPane)
+    let p_br = vis3.get(2).as(WindowPane)
+    assert_true(p_top.id == win1 and p_bl.id == win2 and p_br.id == win3, "DFS pane order")
+    assert_true(p_top.rect.y == 0.0, "top pane starts at y=0 when horizontal tab bar is closed by default")
+    assert_true(p_bl.rect.y > p_top.rect.y and p_br.rect.x > p_bl.rect.x, "bottom-left and bottom-right rects")
+
+    -- Assign `org_buf` to bottom-right pane `win3`
+    let _ = world.switch_to_buffer(org_buf.id)
+    kernel.emit_hook("buffer-switched", org_buf.id)
+    assert_true(wm.active_pane().buffer_id == org_buf.id, "win3 holds org_buf")
+
+    -- Geometric directional focus (`left` -> win2, `up` -> win1, `down` -> win2/win3, `right` -> win3)
+    let _ = run_cmd(kernel, "window-focus-left", [], logs, statuses, clip)
+    assert_true(wm.active_pane().id == win2, "focus left win3 -> win2")
+    assert_true(world.active_buffer_id == code_buf.id, "focus win2 synced world.active_buffer_id")
+
+    let _ = run_cmd(kernel, "window-focus-right", [], logs, statuses, clip)
+    assert_true(wm.active_pane().id == win3, "focus right win2 -> win3")
+    assert_true(world.active_buffer_id == org_buf.id, "focus win3 synced org_buf")
+
+    let _ = run_cmd(kernel, "window-focus-up", [], logs, statuses, clip)
+    assert_true(wm.active_pane().id == win1, "focus up win3 -> win1")
+
+    let _ = run_cmd(kernel, "window-focus-down", [], logs, statuses, clip)
+    assert_true(wm.active_pane().id == win2 or wm.active_pane().id == win3, "focus down from win1")
+
+    -- Cycle focus across all 3 windows via `other-window`
+    let start_cycle_id = wm.active_pane().id
+    let _ = run_cmd(kernel, "other-window", [], logs, statuses, clip)
+    let _ = run_cmd(kernel, "other-window", [], logs, statuses, clip)
+    let _ = run_cmd(kernel, "other-window", [], logs, statuses, clip)
+    assert_true(wm.active_pane().id == start_cycle_id, "3x other-window wraps around")
+
+    -- Hit-testing: tab bar -> null, top pane row 2 (`\tlet answer = 42`) accounting for gutter & tabstop!
+    assert_true(wm.hit_test(100.0, 5.0, world) != null, "hit_test at y=5 hits top pane when tab bar is closed")
+    world.options.show_tab_bar = true
+    wm.sync_from_world(world)
+    assert_true(wm.hit_test(100.0, 5.0, world) == null, "hit_test in tab bar returns null when show_tab_bar=true")
+    world.options.show_tab_bar = false
+    wm.sync_from_world(world)
+    assert_true(wm.hit_test(100.0, 795.0, world) == null, "hit_test in echo bar returns null")
+
+    let gw_code = compute_gutter_width(code_buf, world.options, wm.metrics)
+    -- Row 2 starts with `\t` (4 visual cols) then `l` at visual col 4 -> char col 1!
+    let click_x = p_top.rect.x + gw_code + 4.5 * wm.metrics.cell_width
+    let click_y = p_top.rect.y + 2.5 * wm.metrics.cell_height
+    let hit_opt = wm.hit_test(click_x, click_y, world)
+    let hit_pair? = hit_opt else {
+        panic("hit_test inside top pane returned null")
+    }
+    let (hit_wid, hit_pos) = hit_pair
+    assert_true(hit_wid == win1, "hit_test resolved top pane WinId")
+    assert_eq_i64(hit_pos.row, 2, "hit_test resolved row 2")
+    assert_eq_i64(hit_pos.col, 1, "hit_test mapped visual col 4 after tab to char col 1")
+    assert_eq_i64(char_col_to_visual_col("\tlet", 1, 4), 4, "tab visual col helper")
+
+    -- Split ratio resize & balance + viewport resize + scroll (`zt`, `zz`, `zb`)
+    let focus_w_before = wm.active_pane().rect.w
+    let focus_h_before = wm.active_pane().rect.h
+    let _ = run_cmd(kernel, "enlarge-window", [], logs, statuses, clip)
+    let after_enlarge = wm.active_pane().rect
+    assert_true(
+        after_enlarge.w > focus_w_before or after_enlarge.h > focus_h_before,
+        "enlarge-window grew active pane",
+    )
+    let _ = run_cmd(kernel, "balance-windows", [], logs, statuses, clip)
+    wm.resize_viewport(1440, 900, world)
+    assert_eq_i64(wm.pixel_width, 1440, "viewport width updated")
+    assert_eq_i64(wm.pixel_height, 900, "viewport height updated")
+
+    -- Test scroll-top (`zt`), scroll-center (`zz`), scroll-bottom (`zb`)
+    let _ = wm.focus_direction("up", world)
+    code_buf.point = Pos.new(5, 2)
+    let _ = run_cmd(kernel, "scroll-top", [], logs, statuses, clip)
+    assert_eq_i64(wm.active_pane().top_row, 5, "scroll-top set top_row = cursor.row")
+    let _ = run_cmd(kernel, "scroll-center", [], logs, statuses, clip)
+    assert_eq_i64(wm.active_pane().top_row, 0, "scroll-center clamped to min_row")
+    let _ = run_cmd(kernel, "scroll-bottom", [], logs, statuses, clip)
+    assert_eq_i64(wm.active_pane().top_row, 0, "scroll-bottom clamped to min_row")
+
+    -- Tabs (`tab-new`, `tab-previous`, `tab-next`, `tab_Switch`, `tab-close`)
+    let _ = run_cmd(kernel, "tab-new", [], logs, statuses, clip)
+    assert_eq_i64(wm.tabs.len(), 2, "2 tabs after tab-new")
+    assert_eq_i64(wm.active_tab_idx, 1, "switched to new tab 2")
+    assert_eq_i64(wm.visible_panes().len(), 1, "new tab starts with 1 pane")
+
+    let _ = run_cmd(kernel, "tab-previous", [], logs, statuses, clip)
+    assert_eq_i64(wm.active_tab_idx, 0, "tab-previous back to tab 1")
+    assert_eq_i64(wm.visible_panes().len(), 3, "tab 1 preserved its 3 split panes")
+
+    wm.tab_Switch(1, world)
+    assert_eq_i64(wm.active_tab_idx, 1, "tab_Switch alias switched to tab 2")
+    let _ = run_cmd(kernel, "tab-close", [], logs, statuses, clip)
+    assert_eq_i64(wm.tabs.len(), 1, "tab-close returned to 1 tab")
+    assert_eq_i64(wm.visible_panes().len(), 3, "tab 1 active again with 3 panes")
+
+    -- 3. Verify all 4 Built-in Color Themes + `cycle-theme` + interactive `set-theme`
+    let tnames = builtin_theme_names()
+    assert_eq_i64(tnames.len(), 4, "4 built-in themes")
+    let t_cat = catppuccin_mocha_theme()
+    let t_gruv = gruvbox_dark_theme()
+    let t_one = one_dark_theme()
+    let t_sol = solarized_light_theme()
+    assert_true(t_cat.bg != t_gruv.bg and t_gruv.bg != t_one.bg and t_one.bg != t_sol.bg, "distinct theme backgrounds")
+    assert_true(theme_by_name("solarized-light") == t_sol, "theme_by_name solarized-light")
+
+    let _ = run_cmd(kernel, "cycle-theme", [], logs, statuses, clip)
+    assert_eq_str(world.options.theme_name, "gruvbox-dark", "cycle 1 -> gruvbox-dark")
+    let _ = run_cmd(kernel, "cycle-theme", [], logs, statuses, clip)
+    assert_eq_str(world.options.theme_name, "one-dark", "cycle 2 -> one-dark")
+    let _ = run_cmd(kernel, "cycle-theme", [], logs, statuses, clip)
+    assert_eq_str(world.options.theme_name, "solarized-light", "cycle 3 -> solarized-light")
+    let _ = run_cmd(kernel, "cycle-theme", [], logs, statuses, clip)
+    assert_eq_str(world.options.theme_name, "catppuccin-mocha", "cycle 4 -> catppuccin-mocha")
+
+    -- Interactive continuation prompt on `set-theme` with no args
+    let suspended_turn = run_cmd(kernel, "set-theme", [], logs, statuses, clip)
+    assert_true(suspended_turn matches PromptTurn.Suspended(_, _), "set-theme suspends when no arg")
+    let resumed_turn = submit_prompt(kernel, "one-dark", logs, statuses, clip)
+    assert_true(resumed_turn matches PromptTurn.Completed(_), "set-theme resumed cleanly")
+    assert_eq_str(world.options.theme_name, "one-dark", "set-theme applied one-dark")
+    assert_eq_str(renderer.active_theme_name, "one-dark", "renderer tracks one-dark")
+
+    -- Direct `set-theme` back to `catppuccin-mocha`
+    let _ = run_cmd(kernel, "set-theme", ["catppuccin-mocha"], logs, statuses, clip)
+    assert_eq_str(world.options.theme_name, "catppuccin-mocha", "direct set-theme catppuccin-mocha")
+
+    -- 4. Multi-Language Lexical Syntax Highlighter Verification
+    let pal: ThemePalette = catppuccin_mocha_theme()
+
+    let ns_line = "pub fn compute(w: EditorWorld) -> #status_emit !String ?Pos {{ let x = 42 -- note"
+    let ns_runs = tokenize_line(ns_line, "nessa", pal)
+    verify_contiguous_runs(ns_line, ns_runs, "nessa line")
+    assert_true(require_run_color(ns_runs, "pub") == (pal.syn_keyword, true, false), "nessa keyword color & bold")
+    assert_true(require_run_color(ns_runs, "compute") == (pal.syn_fn, false, false), "nessa fn color")
+    assert_true(require_run_color(ns_runs, "EditorWorld") == (pal.syn_type, false, false), "nessa Capitalized type color")
+    assert_true(require_run_color(ns_runs, "#") == (pal.syn_operator, false, false), "nessa # effect operator color")
+    assert_true(require_run_color(ns_runs, "42") == (pal.syn_number, false, false), "nessa number color")
+    assert_true(require_run_color(ns_runs, "-- note") == (pal.syn_comment, false, true), "nessa comment italic")
+
+    let org_todo = "* TODO Ship `ext_render` compositor"
+    let org_runs = tokenize_line(org_todo, "org", pal)
+    verify_contiguous_runs(org_todo, org_runs, "org todo heading")
+    assert_true(require_run_color(org_runs, "* ") == (pal.accent, true, false), "org heading stars bold accent")
+    assert_true(require_run_color(org_runs, "TODO") == (pal.diag_err, true, false), "org TODO diag_err")
+    assert_true(require_run_color(org_runs, "`ext_render`") == (pal.syn_string, false, false), "org inline code")
+
+    let org_done = "** DONE All 4 palettes ready"
+    let org_done_runs = tokenize_line(org_done, "org", pal)
+    verify_contiguous_runs(org_done, org_done_runs, "org done heading")
+    assert_true(require_run_color(org_done_runs, "DONE") == (pal.diag_ok, true, false), "org DONE diag_ok")
+
+    let dired_dir = "  drwxr-xr-x  5 fin fin 4096 extensions/"
+    let dired_del = "D -rw-r--r--  1 fin fin  128 scratch.bak"
+    let dired_mrk = "* -rw-r--r--  1 fin fin  512 main.ns"
+    let r_dir = tokenize_line(dired_dir, "dired", pal)
+    let r_del = tokenize_line(dired_del, "dired", pal)
+    let r_mrk = tokenize_line(dired_mrk, "dired", pal)
+    verify_contiguous_runs(dired_dir, r_dir, "dired dir")
+    verify_contiguous_runs(dired_del, r_del, "dired delete mark")
+    verify_contiguous_runs(dired_mrk, r_mrk, "dired star mark")
+    assert_true(require_run_color(r_dir, "extensions/") == (pal.accent, true, false), "dired dir bold accent")
+    assert_true(require_run_color(r_del, "D -rw") == (pal.diag_err, true, false), "dired D highlighted")
+    assert_true(require_run_color(r_mrk, "* -rw") == (pal.diag_warn, true, false), "dired * highlighted")
+
+    let grep_ln = "extensions/ext_render/src/lib.ns:88:12: error: type mismatch"
+    let r_grep = tokenize_line(grep_ln, "grep", pal)
+    verify_contiguous_runs(grep_ln, r_grep, "grep line")
+    assert_true(require_run_color(r_grep, "extensions/ext_render/src/lib.ns") == (pal.accent, true, false), "grep file accented")
+    assert_true(require_run_color(r_grep, "88") == (pal.syn_number, true, false), "grep line number colored")
+    assert_true(require_run_color(r_grep, "error") == (pal.diag_err, true, false), "grep error colored")
+
+    -- Also check Rust, Python, C, TOML, Diff contiguous runs
+    verify_contiguous_runs("pub async fn serve() -> Result<(), io::Error> {{ println!(\"ok\"); // hi", tokenize_line("pub async fn serve() -> Result<(), io::Error> {{ println!(\"ok\"); // hi", "rust", pal), "rust")
+    verify_contiguous_runs("@dataclass\ndef run(x: Path) -> bool: # py", tokenize_line("@dataclass\ndef run(x: Path) -> bool: # py", "python", pal), "python")
+    verify_contiguous_runs("static uint64_t count = 0x10; /* c comment */", tokenize_line("static uint64_t count = 0x10; /* c comment */", "c", pal), "c")
+    verify_contiguous_runs("name = \"ext_render\" # pkg", tokenize_line("name = \"ext_render\" # pkg", "toml", pal), "toml")
+    verify_contiguous_runs("+added new compositor line", tokenize_line("+added new compositor line", "diff", pal), "diff")
+
+    -- 5. Full 2D Scene Compositor Verification (`compose_frame`)
+    -- Scene A: 3 split panes + Visual-Block selection + Search highlights + Folded Org heading + Macro REC + Jobs + Which-Key overlay
+    let _ = wm.focus_direction("up", world)
+    assert_true(wm.active_pane().id == win1, "win1 focused for Scene A")
+    code_buf.point = Pos.new(3, 6)
+    world.mode_name = "V-BLOCK"
+    world.caret_shape = CaretShape.Block
+    world.visual = VisualSelection {
+        kind: VisualKind.Block,
+        anchor: Pos.new(1, 4),
+        cursor: Pos.new(3, 10),
+    }
+    world.last_search = "let"
+    world.search_highlight_active = true
+    org_buf.folded_rows.insert(0)
+    kernel.macros.start("q")
+    world.active_jobs.push(ActiveBgJob {
+        job_id: 7,
+        title: "rg compose_frame",
+        target_buffer: "*Grep*",
+    })
+    world.pending_keys_display = "<Space> w"
+    world.which_key_items = [
+        KeyBindingEntry {
+            chord: "<Space> w v",
+            command_name: "split-window-right",
+            owner: ext_window_id(),
+            description: "Split right",
+        },
+        KeyBindingEntry {
+            chord: "<Space> w s",
+            command_name: "split-window-below",
+            owner: ext_window_id(),
+            description: "Split below",
+        },
+        KeyBindingEntry {
+            chord: "<Space> w o",
+            command_name: "delete-other-windows",
+            owner: ext_window_id(),
+            description: "Only window",
+        },
+    ]
+
+    let (spec_a, cmds_a) = compose_frame(kernel, world, wm)
+    assert_eq_i64(spec_a.width, 1440, "Scene A WindowSpec width")
+    assert_eq_i64(spec_a.height, 900, "Scene A WindowSpec height")
+    let (clips_a, fills_a, strokes_a, lines_a, carets_a, texts_a) = audit_draw_cmds(cmds_a, "Scene A")
+    assert_true(clips_a == 5, "Scene A clips: 3 panes + which-key + echo-bar")
+    assert_true(strokes_a >= 1, "Scene A has Which-Key popup border StrokeRect")
+    assert_true(lines_a >= 4, "Scene A has split divider lines and mode-line borders")
+    assert_true(carets_a == 3, "Scene A has 1 focused Block caret + 2 unfocused HollowBlock carets")
+    assert_eq_i64(count_caret_shape(cmds_a, CaretShape.Block), 1, "Scene A 1 Block caret")
+    assert_eq_i64(count_caret_shape(cmds_a, CaretShape.HollowBlock), 2, "Scene A 2 HollowBlock carets")
+    assert_true(count_fill_color(cmds_a, pal.bg_selection) >= 3, "Scene A 3-row visual-block selection rects")
+    assert_true(count_fill_color(cmds_a, pal.bg_search) >= 2, "Scene A search match highlight rects")
+    assert_true(any_text_contains(texts_a, "V-BLOCK"), "Scene A mode pill V-BLOCK")
+    assert_true(any_text_contains(texts_a, "[REC @q]"), "Scene A macro recording badge")
+    assert_true(any_text_contains(texts_a, "[Jobs: 1]"), "Scene A active jobs badge")
+    assert_true(any_text_contains(texts_a, "Which-Key"), "Scene A Which-Key header")
+    assert_true(any_text_contains(texts_a, "split-window-right"), "Scene A Which-Key binding")
+    assert_true(any_text_contains(texts_a, "▸"), "Scene A folded gutter indicator")
+    assert_true(any_text_contains(texts_a, " [...]"), "Scene A folded heading suffix")
+    assert_true(not any_text_contains(texts_a, "Hidden folded detail row"), "Scene A hid folded Org body line")
+    assert_true(any_text_contains(texts_a, "Visible detail row"), "Scene A kept unfolded Org body line")
+
+    let frame_gen = host_commit_frame(spec_a, cmds_a)
+    assert_eq_i64(frame_gen, 1, "mock host_commit_frame committed generation 1")
+    assert_eq_i64(mock_frame_generation(), 1, "mock_frame_generation == 1")
+
+    -- Scene B: Active Minibuffer + 12 Completion Candidates (windowed to 8 around `selected_idx = 6`) + Narrowed Emacs mark region
+    let _ = kernel.macros.stop()
+    world.visual = VisualSelection.none()
+    code_buf.narrow_to_region(1, 5)
+    code_buf.set_mark(Pos.new(1, 0), activate = true)
+    code_buf.point = Pos.new(2, 8)
+    let candidates = List()
+    for ci in 0..12 {
+        candidates.push((
+            "window-command-" ++ ci.to_string(),
+            "Summary detail #" ++ ci.to_string(),
+        ))
+    }
+    world.minibuffer_view = MinibufferView {
+        active: true,
+        prompt_label: "M-x ",
+        input_text: "command",
+        cursor_col: 7,
+        items: candidates,
+        selected_idx: 6,
+        total_matches: 12,
+    }
+
+    let (_, cmds_b) = compose_frame(kernel, world, wm)
+    let (clips_b, _, strokes_b, _, _, texts_b) = audit_draw_cmds(cmds_b, "Scene B")
+    -- When minibuffer is active, which-key hides and completion popup appears!
+    assert_eq_i64(clips_b, 5, "Scene B clips: 3 panes + echo-bar + completion-popup")
+    assert_true(strokes_b >= 1, "Scene B completion popup border")
+    assert_true(not any_text_contains(texts_b, "Which-Key"), "Scene B hides Which-Key while minibuffer active")
+    assert_true(any_text_contains(texts_b, "M-x "), "Scene B minibuffer prompt")
+    assert_true(any_text_contains(texts_b, "Completions (7/12)"), "Scene B completion header")
+    assert_true(any_text_contains(texts_b, "Summary detail #6"), "Scene B right-aligned candidate detail")
+    assert_true(any_text_contains(texts_b, "[Narrow L2-L6]"), "Scene B narrow badge in mode-line")
+    assert_eq_i64(count_caret_shape(cmds_b, CaretShape.Beam), 1, "Scene B Beam caret in minibuffer")
+    assert_eq_i64(count_caret_shape(cmds_b, CaretShape.HollowBlock), 3, "Scene B all 3 panes show HollowBlock while minibuffer focused")
+
+    -- Finally verify `delete-other-windows` (`C-x 1` / `only`) and `delete-window` on sole window
+    world.minibuffer_view = MinibufferView.inactive()
+    let _ = run_cmd(kernel, "delete-other-windows", [], logs, statuses, clip)
+    assert_eq_i64(wm.visible_panes().len(), 1, "delete-other-windows collapsed to 1 pane")
+    assert_true(not wm.close_active(world), "close_active returns false on sole pane")
+
+    let (_, cmds_c) = compose_frame(kernel, world, wm)
+    let _ = audit_draw_cmds(cmds_c, "Scene C single-pane")
+
+    io.println("PASS: test_window_render — all window split-tree, tab, hit-test, 4 themes, multi-language syntax, and 2D DrawCmd compositor checks succeeded!")
+}

@@ -1,0 +1,627 @@
+-- End-to-end integration test suite for `lava.org/ext_dirvish`:
+--   Emacs Dirvish 3-Pane Miller-Columns File Manager + Full Ranger Keybindings
+--   Exercising real keystrokes through `ext_vim` + `ext_emacs` + `SystemKernel`.
+
+use std.fs
+use std.io.File
+use std.path
+use std.process
+use std.time
+use @lava_sys.{DrawCmd, mock_enable, mock_last_frame_cmds}
+use @lava_core.{SystemKernel, clipboard_get, clipboard_set, log_event, status_emit}
+use @ext_document.{Buffer, EditorWorld, require_editor_world}
+use @ext_window.{WindowManager, WindowPane, require_window_manager}
+use @ext_app.{AppHostCap, app_commit_frame, app_feed_keys, register_default_extensions}
+use @ext_dirvish.{
+    DIRVISH_BUF_NAME, DIRVISH_PARENT_BUF_NAME, DIRVISH_PREVIEW_BUF_NAME, DirvishEntry,
+    DirvishState, ext_dirvish_id, register_dirvish_extension, require_dirvish_state
+}
+use @ext_oil.{ext_oil_id, register_oil_extension}
+
+fn check_eq_str(actual: String, expected: String, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual='" ++ actual ++ "' expected='" ++ expected ++ "'")
+    }
+}
+
+fn check_eq_i64(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual=" ++ actual.to_string() ++ " expected=" ++ expected.to_string())
+    }
+}
+
+fn check_true(cond: bool, label: String) {
+    if not cond {
+        panic("FAILED: " ++ label)
+    }
+}
+
+fn join_lines(lines: List) -> String {
+    var out = ""
+    for i in 0..lines.len() {
+        if i > 0 {
+            out = out ++ "\n"
+        }
+        out = out ++ lines.get(i.as(usize)).as(String)
+    }
+    out
+}
+
+fn entry_names(state: DirvishState) -> List {
+    let out = List()
+    for i in 0..state.entries.len() {
+        out.push(state.entries.get(i.as(usize)).as(DirvishEntry).name)
+    }
+    out
+}
+
+fn find_entry_row(state: DirvishState, name: String) -> i64 {
+    for i in 0..state.entries.len() {
+        if state.entries.get(i.as(usize)).as(DirvishEntry).name == name {
+            return i + 1
+        }
+    }
+    -1
+}
+
+fn cursor_entry_name(state: DirvishState, world: EditorWorld) -> String {
+    let idx = world.active_buffer().point.row - 1
+    if idx < 0 or idx >= state.entries.len() {
+        return ""
+    }
+    state.entries.get(idx.as(usize)).as(DirvishEntry).name
+}
+
+fn feed(kernel: SystemKernel, keys: String) -> #[log_event, status_emit, clipboard_get, clipboard_set] Unit {
+    app_feed_keys(kernel, keys)# ! { e => panic("app_feed_keys('" ++ keys ++ "') failed: " ++ e) }
+}
+
+fn focus_entry_via_keys(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    state: DirvishState,
+    target_name: String,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] Unit {
+    let target_row = find_entry_row(state, target_name)
+    check_true(target_row >= 1, "target '" ++ target_name ++ "' exists in Dirvish listing")
+    feed(kernel, "gg")#
+    var steps = target_row - 1
+    while steps > 0 {
+        feed(kernel, "j")#
+        steps -= 1
+    }
+    check_eq_str(cursor_entry_name(state, world), target_name, "focused entry via j/gg")
+}
+
+fn boot_with_dirvish_and_oil() -> SystemKernel {
+    mock_enable(true)
+    let kernel = SystemKernel.new()
+    register_default_extensions(kernel) ! {
+        e => panic("register_default_extensions failed: " ++ e)
+    }
+    -- Register `ext_dirvish` BEFORE `ext_oil` so `-` binds to `dirvish-jump` while `<Space>fo` opens Oil!
+    register_dirvish_extension(kernel) ! {
+        e => panic("register_dirvish_extension failed: " ++ e)
+    }
+    register_oil_extension(kernel) ! {
+        e => panic("register_oil_extension failed: " ++ e)
+    }
+    kernel.activate_all() ! {
+        e => panic("activate_all failed: " ++ e)
+    }
+    check_true(kernel.is_extension_active(ext_dirvish_id()), "ext_dirvish active")
+    check_true(kernel.is_extension_active(ext_oil_id()), "ext_oil active")
+    kernel
+}
+
+fn setup_fixture_tree() -> String {
+    let stamp = time.unix_millis().to_string()
+    let root = "/tmp/lava_test_dirvish_ranger_" ++ stamp
+    let src_dir = path.join(root, "src")
+    let nested_dir = path.join(src_dir, "nested")
+    let deep_dir = path.join(nested_dir, "deep")
+    let backup_dir = path.join(root, "backup")
+
+    let _ = fs.create_dir_all(deep_dir) ! { e => panic("mkdir deep: " ++ e.to_string()) }
+    let _ = fs.create_dir_all(backup_dir) ! { e => panic("mkdir backup: " ++ e.to_string()) }
+
+    let _ = fs.write_string(
+        path.join(root, "README.md"),
+        "# Test Workspace\nDirvish + Ranger integration fixture.\n",
+    ) ! { e => panic("write README: " ++ e.to_string()) }
+
+    let _ = fs.write_string(
+        path.join(src_dir, ".env_secret"),
+        "API_TOKEN=secret_123\n",
+    ) ! { e => panic("write .env_secret: " ++ e.to_string()) }
+
+    let _ = fs.write_string(
+        path.join(src_dir, "main.ns"),
+        "-- Entry module\npub fn main() {{\n    println(\"hello dirvish\")\n}}\n",
+    ) ! { e => panic("write main.ns: " ++ e.to_string()) }
+
+    let _ = fs.write_string(
+        path.join(src_dir, "util.rs"),
+        "pub fn compute_sum(a: i64, b: i64) -> i64 {{\n    a + b + 1000\n}}\n// extra padding so util.rs has distinct size from main.ns and tiny.txt\n",
+    ) ! { e => panic("write util.rs: " ++ e.to_string()) }
+
+    let _ = fs.write_string(
+        path.join(src_dir, "tiny.txt"),
+        "hi\n",
+    ) ! { e => panic("write tiny.txt: " ++ e.to_string()) }
+
+    let _ = fs.write_string(
+        path.join(src_dir, "run.sh"),
+        "#!/bin/sh\necho ok\n",
+    ) ! { e => panic("write run.sh: " ++ e.to_string()) }
+
+    -- Binary file containing `\0` null bytes
+    let bin_path = path.join(src_dir, "blob.dat")
+    let bf: File = (File.open(bin_path, mode = "wb") ! { e => panic("open blob.dat: " ++ e.to_string()) }).as(File)
+    let _ = bf.write_bytes([137, 80, 78, 71, 0, 1, 2, 0, 255]) ! {
+        e => panic("write blob.dat: " ++ e.to_string())
+    }
+    let _ = bf.close()
+
+    let _ = fs.write_string(
+        path.join(nested_dir, "helper.py"),
+        "def greet():\n    return 'hi'\n",
+    ) ! { e => panic("write helper.py: " ++ e.to_string()) }
+
+    let _ = fs.write_string(
+        path.join(deep_dir, "leaf.txt"),
+        "deep leaf content\n",
+    ) ! { e => panic("write leaf.txt: " ++ e.to_string()) }
+
+    -- Optional git repo in fixture so Dirvish Git column (`A` / `?`) is exercised end-to-end
+    let git_ok: bool = (process.exec("git", args = ["init", "-q"], cwd = root) ! { _ => error "no-git" }) match {
+        !_ => false,
+        _ => true,
+    }
+    if git_ok {
+        let _ = process.exec("git", args = ["add", "src/main.ns"], cwd = root) ! { _ => error "ignore" }
+    }
+
+    root
+}
+
+fn run_dirvish_ranger_suite(root: String) {
+    let kernel: SystemKernel = boot_with_dirvish_and_oil()
+    let world: EditorWorld = (require_editor_world(kernel) ! { e => panic(e) }).as(EditorWorld)
+    let wm: WindowManager = (require_window_manager(kernel) ! { e => panic(e) }).as(WindowManager)
+    let state: DirvishState = (require_dirvish_state(kernel) ! { e => panic(e) }).as(DirvishState)
+
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let _cap = AppHostCap.new(world)
+
+    world.cwd = root
+    let main_ns_path = path.join(path.join(root, "src"), "main.ns")
+    let main_buf: Buffer = (world.open_file(main_ns_path)# ! { e => panic("open main.ns: " ++ e) }).as(Buffer)
+    wm.sync_from_world(world)
+    check_eq_i64(wm.visible_panes().len(), 1, "starts with 1 editor pane")
+    check_eq_str(world.active_buffer().name, "main.ns", "main.ns initially active")
+
+    -- ====================================================================
+    -- 1. `-` (`dirvish-jump`): 3-Pane Miller Columns + Focus on `main.ns`
+    -- ====================================================================
+    println("  [1] dirvish-jump")
+    feed(kernel, "-")#
+    let gen = app_commit_frame(kernel) ! { e => panic(e) }
+    check_true(gen >= 1, "3-pane Dirvish frame committed")
+
+    check_eq_str(world.active_buffer().name, DIRVISH_BUF_NAME, "- opens *dirvish* center pane")
+    check_eq_str(world.active_buffer().major_mode, "dirvish", "center major_mode is dirvish")
+    check_eq_str(state.current_dir, path.join(root, "src"), "current_dir is src")
+    let orig_saved? = state.origin_buf_id else {
+        panic("origin_buf_id should be set")
+    }
+    check_true(orig_saved == main_buf.id, "origin_buf_id saved as main.ns")
+
+    let vis3 = wm.visible_panes()
+    check_eq_i64(vis3.len(), 1, "single-window Yazi Dirvish pane (no 3-window split)")
+    let p_single = vis3.get(0).as(WindowPane)
+
+    let parent_buf? = world.find_buffer_by_name(DIRVISH_PARENT_BUF_NAME) else {
+        panic("missing *dirvish-parent*")
+    }
+    let center_buf? = world.find_buffer_by_name(DIRVISH_BUF_NAME) else {
+        panic("missing *dirvish*")
+    }
+    let preview_buf? = world.find_buffer_by_name(DIRVISH_PREVIEW_BUF_NAME) else {
+        panic("missing *dirvish-preview*")
+    }
+    check_true(p_single.buffer_id == center_buf.id, "single pane shows *dirvish*")
+
+    -- Cursor in center pane is directly on `main.ns`
+    check_eq_str(cursor_entry_name(state, world), "main.ns", "dirvish-jump places cursor on main.ns")
+    check_true(
+        center_buf.line_at(0).contains("▸ ") and center_buf.line_at(0).contains("sort:"),
+        "center header shows Yazi-style path & sort status",
+    )
+    check_true(center_buf.inline_decors.len() >= 6, "center buffer has column span decors")
+
+    -- Left parent pane highlights `src/` and positions cursor on `src/`
+    let parent_cur_line = parent_buf.line_at(parent_buf.point.row)
+    check_true(parent_cur_line.contains("src/"), "parent pane cursor positioned on src/")
+    check_true(parent_buf.inline_decors.len() >= 2, "parent pane has highlight span decors")
+
+    -- Right preview pane renders `main.ns` with `major_mode == "nessa"`!
+    check_eq_str(preview_buf.major_mode, "nessa", "preview pane sets major_mode = nessa for .ns")
+    check_true(join_lines(preview_buf.lines).contains("hello dirvish"), "preview pane shows main.ns source")
+    let fcmds = mock_last_frame_cmds()
+    check_true(fcmds.len() > 10, "3-pane frame rendered cleanly through ext_render")
+
+    -- Regression check: NO two `DrawCmd.TextRun`s inside the center Dirvish pane content area
+    -- may ever overlap horizontally on the same row `y` (prevents double-drawn filename text!).
+    let parent_w = (p_single.rect.w * 0.16).floor()
+    let center_w = (p_single.rect.w * 0.40).floor()
+    let mid_left = p_single.rect.x + parent_w
+    let mid_right = mid_left + center_w - 2.0
+    let mid_bottom = p_single.rect.y + p_single.rect.h - wm.metrics.cell_height - 4.0
+    let cw = wm.metrics.cell_width
+    let center_runs = List()
+    for ci in 0..fcmds.len() {
+        fcmds.get(ci.as(usize)).as(DrawCmd) match {
+            DrawCmd.TextRun(tx, ty, tstr, _, _, _, _, _, _) => {
+                if tx >= mid_left and tx < mid_right and ty >= p_single.rect.y and ty < mid_bottom {
+                    center_runs.push((ty, tx, tx + tstr.char_len().as(f64) * cw, tstr))
+                }
+            },
+            _ => (),
+        }
+    }
+    check_true(center_runs.len() >= 10, "center Dirvish pane emitted segmented TextRuns")
+    for a_idx in 0..center_runs.len() {
+        let (ay, ax0, ax1, astr) = center_runs.get(a_idx.as(usize)).as((f64, f64, f64, String))
+        for b_idx in (a_idx + 1)..center_runs.len() {
+            let (by, bx0, bx1, bstr) = center_runs.get(b_idx.as(usize)).as((f64, f64, f64, String))
+            if (ay - by).abs() < 0.5 {
+                let overlap = (if ax1 < bx1 { ax1 } else { bx1 }) - (if ax0 > bx0 { ax0 } else { bx0 })
+                if overlap > 0.5 {
+                    panic(
+                        "Overlapping TextRun on Dirvish row y=" ++ ay.to_string()
+                            ++ ": '" ++ astr ++ "' [" ++ ax0.to_string() ++ ".." ++ ax1.to_string()
+                            ++ "] overlaps '" ++ bstr ++ "' [" ++ bx0.to_string() ++ ".." ++ bx1.to_string() ++ "]"
+                    )
+                }
+            }
+        }
+    }
+
+    -- ====================================================================
+    -- 2. Live Preview Updates (`j`, `k`, `gg`, `G`) for Dir, Code & Binary
+    -- ====================================================================
+    println("  [2] live preview")
+    -- `gg` jumps to row 1 (`nested/`, since directories are always grouped first!)
+    feed(kernel, "gg")#
+    check_eq_str(cursor_entry_name(state, world), "nested", "gg focuses first entry (directory nested/)")
+    check_eq_str(preview_buf.major_mode, "dirvish-preview", "directory preview mode")
+    let nested_prev = join_lines(preview_buf.lines)
+    check_true(nested_prev.contains("2 items"), "directory preview shows item count header")
+    check_true(nested_prev.contains("deep/") and nested_prev.contains("helper.py"), "directory preview lists child entries")
+
+    -- Move to `blob.dat` -> binary file detection (`\0`)
+    focus_entry_via_keys(kernel, world, state, "blob.dat")#
+    check_true(
+        join_lines(preview_buf.lines).contains("[Binary file —"),
+        "binary file with null byte renders [Binary file — ...] summary",
+    )
+
+    -- Move to `util.rs` via `G` / `k` -> Rust syntax preview
+    feed(kernel, "G")#
+    check_eq_str(cursor_entry_name(state, world), "util.rs", "G jumps to last entry util.rs")
+    check_eq_str(preview_buf.major_mode, "rust", "preview pane sets major_mode = rust for .rs")
+    check_true(join_lines(preview_buf.lines).contains("compute_sum"), "preview pane shows util.rs content")
+
+    feed(kernel, "k")#
+    check_eq_str(cursor_entry_name(state, world), "tiny.txt", "k moves up to tiny.txt")
+    check_true(join_lines(preview_buf.lines).contains("hi"), "preview updates immediately on k")
+
+    -- ====================================================================
+    -- 3. `h` / `l` / `H` / `L` / `gr` / `gp` / `gn` Navigation & History
+    -- ====================================================================
+    println("  [3] navigation & history")
+    feed(kernel, "h")#
+    check_eq_str(state.current_dir, root, "h ascends to parent workspace root")
+    check_eq_str(cursor_entry_name(state, world), "src", "h places cursor on child subdir src we came from")
+
+    feed(kernel, "l")#
+    check_eq_str(state.current_dir, path.join(root, "src"), "l enters subdir src/")
+
+    -- Enter `nested/` as well, then test `H` (back) and `L` (forward)
+    feed(kernel, "ggl")#
+    check_eq_str(state.current_dir, path.join(path.join(root, "src"), "nested"), "entered nested/")
+    feed(kernel, "H")#
+    check_eq_str(state.current_dir, path.join(root, "src"), "H navigates back in history to src/")
+    feed(kernel, "H")#
+    check_eq_str(state.current_dir, root, "second H navigates back to root")
+    feed(kernel, "L")#
+    check_eq_str(state.current_dir, path.join(root, "src"), "L navigates forward in history to src/")
+
+    -- `gr` goes to `/` (`[root /]` in parent pane), `gp` returns to project `world.cwd`, then `l` into `src/`
+    feed(kernel, "gr")#
+    check_eq_str(state.current_dir, "/", "gr jumps to filesystem root /")
+    check_true(join_lines(parent_buf.lines).contains("[root /]"), "parent pane shows [root /] at /")
+    feed(kernel, "gp")#
+    check_eq_str(state.current_dir, root, "gp jumps back to project cwd")
+    focus_entry_via_keys(kernel, world, state, "src")#
+    feed(kernel, "l")#
+    check_eq_str(state.current_dir, path.join(root, "src"), "back inside src/")
+
+    -- `gn` opens a new tab in Dirvish at current directory, then close extra tab
+    check_eq_i64(wm.tabs.len(), 1, "1 tab before gn")
+    feed(kernel, "gn")#
+    check_eq_i64(wm.tabs.len(), 2, "gn creates 2nd tab in Dirvish")
+    check_eq_i64(wm.visible_panes().len(), 1, "new tab also uses single-window Yazi Dirvish pane")
+    check_true(state.miller_mode, "new tab keeps miller_mode enabled")
+    let _ = wm.tab_close(world)
+    check_eq_i64(wm.tabs.len(), 1, "closed extra tab back to tab 1")
+
+    -- ====================================================================
+    -- 4. Hidden (`zh`/`.`), Sort (`os`/`oe`/`on`/`or`), Filter (`zf`/`zi`),
+    --    and Preview Toggle (`zp`/`<Tab>`)
+    -- ====================================================================
+    println("  [4] hidden, sort, filter, zp")
+    check_eq_i64(find_entry_row(state, ".env_secret"), -1, "dotfiles hidden initially")
+    feed(kernel, "zh")#
+    check_true(find_entry_row(state, ".env_secret") >= 1, "zh reveals .env_secret")
+    feed(kernel, ".")#
+    check_eq_i64(find_entry_row(state, ".env_secret"), -1, ". hides .env_secret again")
+
+    -- Sort by size (`os`): directories (`nested`) still first, `tiny.txt` (3B) before `util.rs`
+    feed(kernel, "os")#
+    let size_order = entry_names(state)
+    check_eq_str(size_order.get(0).as(String), "nested", "os keeps directory nested/ first")
+    check_eq_str(size_order.get(1).as(String), "tiny.txt", "os places smallest file tiny.txt first among files")
+    check_eq_str(
+        size_order.get((size_order.len() - 1).as(usize)).as(String),
+        "util.rs",
+        "os places largest file util.rs last",
+    )
+
+    -- Reverse sort (`or`): `nested` STILL first, `util.rs` now first among files!
+    feed(kernel, "or")#
+    let rev_order = entry_names(state)
+    check_eq_str(rev_order.get(0).as(String), "nested", "or still keeps directories grouped first")
+    check_eq_str(rev_order.get(1).as(String), "util.rs", "or puts largest file util.rs first among files")
+
+    -- Sort by extension (`oe`) then restore ascending name sort (`or` + `on`)
+    feed(kernel, "oroe")#
+    let ext_order = entry_names(state)
+    check_eq_str(ext_order.get(0).as(String), "nested", "oe keeps directory first")
+    check_eq_str(ext_order.get(1).as(String), "blob.dat", ".dat comes first alphabetically by ext")
+    feed(kernel, "on")#
+    check_eq_str(state.sort_by, "name", "on restores name sort")
+    check_true(not state.sort_reverse, "sort_reverse is false")
+
+    -- Filter (`zf`) + Clear Filter (`zi`)
+    feed(kernel, "zfutil<Return>")#
+    check_eq_i64(state.entries.len(), 1, "zf 'util' narrows to 1 entry")
+    check_eq_str(cursor_entry_name(state, world), "util.rs", "filtered entry is util.rs")
+    feed(kernel, "zi")#
+    check_true(state.entries.len() >= 6, "zi clears filter and restores all entries")
+
+    -- Miller 3-column <-> Single-column toggle (`zp` and `<Tab>`) inside 1 WindowPane
+    check_eq_i64(wm.visible_panes().len(), 1, "single pane before zp")
+    check_true(state.miller_mode, "3-column miller_mode enabled before zp")
+    feed(kernel, "zp")#
+    check_eq_i64(wm.visible_panes().len(), 1, "zp stays single-pane Dirvish")
+    check_true(not state.miller_mode, "zp disables 3-column miller_mode")
+    feed(kernel, "<Tab>")#
+    check_eq_i64(wm.visible_panes().len(), 1, "<Tab> stays single-pane Dirvish")
+    check_true(state.miller_mode, "<Tab> restores 3-column miller_mode")
+
+    -- ====================================================================
+    -- 5. Visual Marking (`<Space>`, `mm`, `v`, `uv`) + Yank/Cut/Paste/Delete
+    -- ====================================================================
+    println("  [5] marking, yank, cut, paste, delete")
+    let total_in_src = state.entries.len()
+    feed(kernel, "gg")#
+    let row_before_mark = center_buf.point.row
+    feed(kernel, "<Space>")#
+    check_eq_i64(state.marked_paths.len(), 1, "<Space> marks 1st entry")
+    check_eq_i64(center_buf.point.row, row_before_mark + 1, "<Space> advances cursor down 1 row")
+    check_true(center_buf.line_at(1).starts_with("● "), "marked row displays ● badge")
+
+    feed(kernel, "mm")#
+    check_eq_i64(state.marked_paths.len(), 2, "mm alias marks 2nd entry")
+
+    feed(kernel, "v")#
+    check_eq_i64(state.marked_paths.len(), total_in_src - 2, "v inverts marks across visible entries")
+
+    feed(kernel, "uv")#
+    check_eq_i64(state.marked_paths.len(), 0, "uv clears all marks")
+
+    -- Copy (`yy`) + Paste (`pp`) in same dir -> safe `<stem>_copy<ext>` disambiguation!
+    focus_entry_via_keys(kernel, world, state, "tiny.txt")#
+    feed(kernel, "yypp")#
+    let copy1_path = path.join(path.join(root, "src"), "tiny_copy.txt")
+    check_true(fs.exists(copy1_path), "yy + pp in same dir auto-disambiguates as tiny_copy.txt")
+    feed(kernel, "pp")#
+    let copy2_path = path.join(path.join(root, "src"), "tiny_copy2.txt")
+    check_true(fs.exists(copy2_path), "second pp auto-disambiguates as tiny_copy2.txt")
+
+    -- Test `ya` (yank append) + `uy` (clear ring) + `po` (paste overwrite into `backup/`)
+    focus_entry_via_keys(kernel, world, state, "main.ns")#
+    feed(kernel, "ya")#
+    check_eq_i64(state.yank_ring.len(), 2, "ya appends second entry to yank ring")
+    feed(kernel, "uy")#
+    check_eq_i64(state.yank_ring.len(), 0, "uy clears yank ring")
+
+    let backup_tiny = path.join(path.join(root, "backup"), "tiny.txt")
+    let _ = fs.write_string(backup_tiny, "OLD_STALE_DATA")
+    focus_entry_via_keys(kernel, world, state, "tiny.txt")#
+    feed(kernel, "yyh")#
+    focus_entry_via_keys(kernel, world, state, "backup")#
+    feed(kernel, "lpo")#
+    let overwritten_txt = fs.read_to_string(backup_tiny) ! { _ => "" }
+    check_eq_str(overwritten_txt, "hi\n", "po overwrites existing target file in destination")
+    focus_entry_via_keys(kernel, world, state, "tiny.txt")#
+    feed(kernel, "dDy")#
+    feed(kernel, "h")#
+    focus_entry_via_keys(kernel, world, state, "src")#
+    feed(kernel, "l")#
+
+    -- Recursive directory copy (`yy` on `nested/` -> `h` -> `backup/` -> `pp`)
+    focus_entry_via_keys(kernel, world, state, "nested")#
+    feed(kernel, "yyh")#
+    focus_entry_via_keys(kernel, world, state, "backup")#
+    feed(kernel, "lpp")#
+    check_true(
+        fs.exists(path.join(path.join(path.join(root, "backup"), "nested"), "helper.py")),
+        "pp recursively copied nested/helper.py",
+    )
+    check_true(
+        fs.exists(path.join(path.join(path.join(path.join(root, "backup"), "nested"), "deep"), "leaf.txt")),
+        "pp recursively copied nested/deep/leaf.txt",
+    )
+
+    -- Cut (`dd`) + Paste (`pp`) moves file & clears ring
+    feed(kernel, "h")#
+    focus_entry_via_keys(kernel, world, state, "src")#
+    feed(kernel, "l")#
+    focus_entry_via_keys(kernel, world, state, "tiny_copy2.txt")#
+    feed(kernel, "ddh")#
+    focus_entry_via_keys(kernel, world, state, "backup")#
+    feed(kernel, "lpp")#
+    let moved_dst = path.join(path.join(root, "backup"), "tiny_copy2.txt")
+    check_true(not fs.exists(copy2_path), "dd + pp removed source tiny_copy2.txt")
+    check_true(fs.exists(moved_dst), "dd + pp moved tiny_copy2.txt into backup/")
+    check_eq_i64(state.yank_ring.len(), 0, "cut ring cleared after move")
+
+    -- Delete (`dD`) with Confirm prompt (`n` cancels, `y` deletes)
+    focus_entry_via_keys(kernel, world, state, "tiny_copy2.txt")#
+    feed(kernel, "dDn")#
+    check_true(fs.exists(moved_dst), "dD + n cancels deletion")
+    feed(kernel, "dDy")#
+    check_true(not fs.exists(moved_dst), "dD + y deletes file")
+
+    -- Also delete recursive directory `backup/nested` via `Dy`
+    focus_entry_via_keys(kernel, world, state, "nested")#
+    feed(kernel, "Dy")#
+    check_true(
+        not fs.exists(path.join(path.join(root, "backup"), "nested")),
+        "D + y recursively deletes directory",
+    )
+
+    -- ====================================================================
+    -- 6. Rename (`cw`, `a`, `I`, `A`) & Create (`cf`, `mk`) + Buffer Sync
+    -- ====================================================================
+    println("  [6] rename & create")
+    feed(kernel, "h")#
+    focus_entry_via_keys(kernel, world, state, "src")#
+    feed(kernel, "l")#
+
+    -- `cf` creates new file & focuses it
+    feed(kernel, "cfextra_mod.ns<Return>")#
+    let extra_mod_path = path.join(path.join(root, "src"), "extra_mod.ns")
+    check_true(fs.is_file(extra_mod_path), "cf created extra_mod.ns")
+    check_eq_str(cursor_entry_name(state, world), "extra_mod.ns", "cf focused extra_mod.ns")
+
+    -- Write content to `extra_mod.ns` so we verify syntax preview
+    let _ = fs.write_string(extra_mod_path, "pub const ANSWER: i64 = 42\n")
+
+    -- `mk` creates new directory & focuses it
+    feed(kernel, "mksub_pkg<Return>")#
+    let sub_pkg_path = path.join(path.join(root, "src"), "sub_pkg")
+    check_true(fs.is_dir(sub_pkg_path), "mk created sub_pkg/")
+    check_eq_str(cursor_entry_name(state, world), "sub_pkg", "mk focused sub_pkg")
+
+    -- `cw` renames `main.ns` (which is open in `main_buf`!) and updates `main_buf.file_path`
+    focus_entry_via_keys(kernel, world, state, "main.ns")#
+    feed(kernel, "cwrenamed_main.ns<Return>")#
+    let renamed1 = path.join(path.join(root, "src"), "renamed_main.ns")
+    check_true(fs.exists(renamed1) and (not fs.exists(main_ns_path)), "cw renamed file on disk")
+    check_eq_str(main_buf.file_path, renamed1, "cw updated open EditorWorld buffer file_path")
+    check_eq_str(main_buf.name, "renamed_main.ns", "cw updated open buffer name")
+
+    -- `a` renames stem preserving `.ns` extension (`a` pre-fills `"renamed_main"`, `<C-u>` clears line -> `"core"`)
+    focus_entry_via_keys(kernel, world, state, "renamed_main.ns")#
+    feed(kernel, "a<C-u>core<Return>")#
+    let core_ns = path.join(path.join(root, "src"), "core.ns")
+    check_true(fs.exists(core_ns), "a renamed stem preserving .ns extension -> core.ns")
+    check_eq_str(main_buf.file_path, core_ns, "open buffer synced to core.ns")
+
+    -- `I` prepends prefix (`app_core.ns`), `A` appends suffix (`app_core.ns.bak`), then `cw` back to `main.ns`
+    feed(kernel, "Iapp_<Return>")#
+    let app_core = path.join(path.join(root, "src"), "app_core.ns")
+    check_true(fs.exists(app_core), "I prepended app_ -> app_core.ns")
+
+    feed(kernel, "A.bak<Return>")#
+    let app_core_bak = path.join(path.join(root, "src"), "app_core.ns.bak")
+    check_true(fs.exists(app_core_bak), "A appended .bak -> app_core.ns.bak")
+
+    feed(kernel, "cwmain.ns<Return>")#
+    check_true(fs.exists(main_ns_path), "cw restored main.ns")
+    check_eq_str(main_buf.file_path, main_ns_path, "open buffer synced back to main.ns")
+
+    -- ====================================================================
+    -- 7. Path Yank (`yp`, `yd`, `yn`) + File Open Collapse + `q` Restore
+    -- ====================================================================
+    println("  [7] yank path, open file, quit, coexistence")
+    focus_entry_via_keys(kernel, world, state, "main.ns")#
+    feed(kernel, "yp")#
+    check_eq_str(clipboard_get()#, main_ns_path, "yp yanks full path to clipboard")
+    feed(kernel, "yd")#
+    check_eq_str(clipboard_get()#, path.join(root, "src"), "yd yanks directory path to clipboard")
+    feed(kernel, "yn")#
+    check_eq_str(clipboard_get()#, "main.ns", "yn yanks filename to clipboard")
+
+    -- `S` sets shell `world.cwd` to `state.current_dir`
+    feed(kernel, "S")#
+    check_eq_str(world.cwd, path.join(root, "src"), "S updates world.cwd to current Dirvish dir")
+    world.cwd = root
+
+    -- Pressing `<Return>` on `extra_mod.ns` collapses helper splits and opens `.ns` buffer!
+    focus_entry_via_keys(kernel, world, state, "extra_mod.ns")#
+    feed(kernel, "<Return>")#
+    check_eq_i64(wm.visible_panes().len(), 1, "opening file collapses *dirvish-parent* & *dirvish-preview* to 1 pane")
+    check_eq_str(world.active_buffer().name, "extra_mod.ns", "opened extra_mod.ns buffer")
+    check_eq_str(world.active_buffer().major_mode, "nessa", "extra_mod.ns has major_mode = nessa")
+
+    -- Press `-` to jump back into Dirvish, then `q` to quit and restore `extra_mod.ns` cleanly!
+    feed(kernel, "-")#
+    check_eq_i64(wm.visible_panes().len(), 1, "- re-opens single-window Yazi Dirvish")
+    check_eq_str(cursor_entry_name(state, world), "extra_mod.ns", "- focuses extra_mod.ns")
+
+    feed(kernel, "q")#
+    check_eq_i64(wm.visible_panes().len(), 1, "q keeps 1 pane")
+    check_eq_str(world.active_buffer().name, "extra_mod.ns", "q restores previous buffer extra_mod.ns")
+
+    -- Verify `:Ranger`, `:Dirvish`, `<Space>fd`, `<Space>R`, `gR`, `<C-x> d`, AND `<Space>fo` (Oil coexistence!)
+    feed(kernel, ":Ranger<Return>")#
+    check_eq_str(world.active_buffer().name, DIRVISH_BUF_NAME, ":Ranger opens Dirvish")
+    check_eq_i64(wm.visible_panes().len(), 1, ":Ranger uses single-window Yazi pane")
+    feed(kernel, "gR")#
+    check_eq_str(world.active_buffer().name, DIRVISH_BUF_NAME, "gR refreshes Dirvish")
+    feed(kernel, "q")#
+    check_eq_i64(wm.visible_panes().len(), 1, "q closes :Ranger cleanly")
+
+    feed(kernel, ":Dirvish<Return>")#
+    check_eq_str(world.active_buffer().name, DIRVISH_BUF_NAME, ":Dirvish opens Dirvish")
+    feed(kernel, "q")#
+
+    feed(kernel, "<Space> f d")#
+    check_eq_str(world.active_buffer().name, DIRVISH_BUF_NAME, "<Space>fd opens Dirvish")
+    feed(kernel, "q")#
+
+    feed(kernel, "<Space> R")#
+    check_eq_str(world.active_buffer().name, DIRVISH_BUF_NAME, "<Space>R opens Dirvish")
+    feed(kernel, "q")#
+
+    feed(kernel, "<C-x> d")#
+    check_eq_str(world.active_buffer().name, DIRVISH_BUF_NAME, "C-x d opens Dirvish")
+    feed(kernel, "q")#
+    check_eq_str(world.active_buffer().name, "extra_mod.ns", "q restores extra_mod.ns after C-x d")
+
+    -- `<Space>fo` opens Oil while `-` opens Dirvish!
+    feed(kernel, "<Space> f o")#
+    check_eq_str(world.active_buffer().major_mode, "oil", "<Space>fo still opens Oil cleanly alongside Dirvish")
+}
+
+fn main() {
+    println("=== test_dirvish_ranger ===")
+    let root = setup_fixture_tree()
+    run_dirvish_ranger_suite(root)
+    let _ = fs.remove_dir_all(root) ! { _ => () }
+    println("test_dirvish_ranger: ALL PASSED")
+}

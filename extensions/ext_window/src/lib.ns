@@ -1,0 +1,1564 @@
+-- ext_window: Independent Binary Split-Tree Window & Tab Workspace Manager Extension.
+-- Publishes service `"lava.window.manager"` (`WindowManager`) and canonical window/tab/scroll
+-- commands onto `SystemKernel` so both `ext_vim` and `ext_emacs` share identical split semantics.
+
+use std.collections.{HashMap, Set}
+use @lava_sys.FontMetrics
+use @lava_core.{ExtId, InteractiveEffects, SystemKernel, log_event, status_emit}
+use @ext_document.{
+    Buffer, BufferId, EditorOptions, EditorWorld, Pos, ext_document_id, require_editor_world
+}
+
+pub const SERVICE_WINDOW_MANAGER: String = "lava.window.manager"
+
+pub const TAB_BAR_HEIGHT: f64 = 26.0
+pub const ECHO_BAR_HEIGHT: f64 = 24.0
+
+pub fn ext_window_id() -> ExtId = ExtId("lava.org/ext_window")
+
+-- ============================================================================
+-- 1. Nominal Window IDs, Geometry, Layout Tree & Visual Column Helpers
+-- ============================================================================
+
+pub newtype WinId = i64
+derive Eq, PartialEq, Ord, PartialOrd, Display, Hash for WinId
+
+impl WinId {
+    pub fn raw(self) -> i64 {
+        let WinId(n) = self
+        n
+    }
+}
+
+pub struct Rect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+derive PartialEq for Rect
+
+impl Rect {
+    pub fn zero() -> Rect {
+        Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }
+    }
+
+    pub fn new(x: f64, y: f64, w: f64, h: f64) -> Rect {
+        Rect { x: x, y: y, w: w, h: h }
+    }
+
+    pub fn contains(self, px: f64, py: f64) -> bool {
+        px >= self.x and px < self.x + self.w and py >= self.y and py < self.y + self.h
+    }
+
+    pub fn center_x(self) -> f64 = self.x + self.w * 0.5
+
+    pub fn center_y(self) -> f64 = self.y + self.h * 0.5
+}
+
+pub enum SplitAxis {
+    pub Horizontal,
+    pub Vertical,
+}
+derive Eq, PartialEq, Display for SplitAxis
+
+pub struct WindowPane {
+    pub id: WinId,
+    pub buffer_id: BufferId,
+    pub cursor: Pos,
+    pub prev_cursor: Pos,
+    pub explicit_scroll: bool,
+    pub top_row: i64,
+    pub left_col: i64,
+    pub rect: Rect,
+}
+
+impl WindowPane {
+    pub fn new(id: WinId, buffer_id: BufferId, cursor: Pos) -> WindowPane {
+        WindowPane {
+            id: id,
+            buffer_id: buffer_id,
+            cursor: cursor,
+            prev_cursor: cursor,
+            explicit_scroll: false,
+            top_row: 0,
+            left_col: 0,
+            rect: Rect.zero(),
+        }
+    }
+}
+
+pub enum LayoutNode {
+    pub Leaf(win_id: WinId),
+    pub Split(axis: SplitAxis, ratio: f64, first: LayoutNode, second: LayoutNode),
+}
+
+pub struct TabWorkspace {
+    pub id: i64,
+    pub title: String,
+    pub root: LayoutNode,
+    pub active_win_id: WinId,
+}
+
+pub fn mode_line_height(metrics: FontMetrics) -> f64 {
+    metrics.cell_height + 4.0
+}
+
+pub fn compute_gutter_cols(buf: Buffer, options: EditorOptions) -> i64 {
+    let m = buf.major_mode.to_lower()
+    if m == "dirvish" or m == "dirvish-parent" or m == "dirvish-preview" {
+        return 0
+    }
+    if options.number or options.relativenumber {
+        var digits: i64 = 1
+        var n = buf.line_count()
+        while n >= 10 {
+            digits += 1
+            n = n / 10
+        }
+        if digits < 3 {
+            digits = 3
+        }
+        -- 1 col for narrow/fold marker + digits + 2 trailing space cols
+        return digits + 3
+    }
+    if buf.is_narrowed() or (not buf.folded_rows.is_empty()) or options.signcolumn or (not buf.signs.is_empty()) {
+        return 2
+    }
+    1
+}
+
+pub fn compute_gutter_width(buf: Buffer, options: EditorOptions, metrics: FontMetrics) -> f64 {
+    compute_gutter_cols(buf, options).as(f64) * metrics.cell_width
+}
+
+pub fn safe_tabstop(options: EditorOptions) -> i64 {
+    if options.tabstop > 0 {
+        options.tabstop
+    } else {
+        4
+    }
+}
+
+pub fn codepoint_display_width(cp: i64) -> i64 {
+    if cp < 0x0300 {
+        return 1
+    }
+    if (cp >= 0x0300 and cp <= 0x036F)
+        or (cp >= 0x200B and cp <= 0x200D)
+        or (cp >= 0xFE00 and cp <= 0xFE0F) {
+        return 0
+    }
+    if cp < 0x1100 {
+        return 1
+    }
+    if (cp >= 0x1100 and cp <= 0x115F)
+        or (cp >= 0x2329 and cp <= 0x232A)
+        or (cp >= 0x2E80 and cp <= 0x303E)
+        or (cp >= 0x3040 and cp <= 0x33FF)
+        or (cp >= 0x3400 and cp <= 0x4DBF)
+        or (cp >= 0x4E00 and cp <= 0xA4CF)
+        or (cp >= 0xA960 and cp <= 0xA97F)
+        or (cp >= 0xAC00 and cp <= 0xD7A3)
+        or (cp >= 0xF900 and cp <= 0xFAFF)
+        or (cp >= 0xFE10 and cp <= 0xFE19)
+        or (cp >= 0xFE30 and cp <= 0xFE6F)
+        or (cp >= 0xFF01 and cp <= 0xFF60)
+        or (cp >= 0xFFE0 and cp <= 0xFFE6)
+        or (cp >= 0x1F300 and cp <= 0x1FAFF)
+        or (cp >= 0x20000 and cp <= 0x3FFFD) {
+        return 2
+    }
+    1
+}
+
+fn decode_utf8_at(s: String, pos: i64, blen: i64) -> (i64, i64) {
+    let b0 = s.byte_at(pos)
+    if b0 < 0x80 {
+        return (b0, 1)
+    }
+    if b0 >= 0xC0 and b0 < 0xE0 and pos + 1 < blen {
+        let cp = (b0 - 0xC0) * 64 + (s.byte_at(pos + 1) - 0x80)
+        return (cp, 2)
+    }
+    if b0 >= 0xE0 and b0 < 0xF0 and pos + 2 < blen {
+        let cp = (b0 - 0xE0) * 4096 + (s.byte_at(pos + 1) - 0x80) * 64 + (s.byte_at(pos + 2) - 0x80)
+        return (cp, 3)
+    }
+    if b0 >= 0xF0 and pos + 3 < blen {
+        let p0 = (b0 - 0xF0) * 262144 + (s.byte_at(pos + 1) - 0x80) * 4096
+        let p1 = (s.byte_at(pos + 2) - 0x80) * 64 + (s.byte_at(pos + 3) - 0x80)
+        return (p0 + p1, 4)
+    }
+    (0xFFFD, 1)
+}
+
+-- Monospace cell width of a single Unicode scalar `ch` (`0`, `1`, or `2` for East Asian Wide / Fullwidth).
+pub fn char_display_width(ch: String) -> i64 {
+    let blen = ch.len()
+    if blen == 0 {
+        return 0
+    }
+    if blen == 1 {
+        return 1
+    }
+    let bs = ch.bytes()
+    let b0 = bs.get(0).as(i64)
+    if b0 < 0x80 {
+        return 1
+    }
+    var cp: i64 = 0xFFFD
+    if b0 >= 0xC0 and b0 < 0xE0 and bs.len() >= 2 {
+        cp = (b0 - 0xC0) * 64 + (bs.get(1).as(i64) - 0x80)
+    } else if b0 >= 0xE0 and b0 < 0xF0 and bs.len() >= 3 {
+        cp = (b0 - 0xE0) * 4096 + (bs.get(1).as(i64) - 0x80) * 64 + (bs.get(2).as(i64) - 0x80)
+    } else if b0 >= 0xF0 and bs.len() >= 4 {
+        let hi = (b0 - 0xF0) * 262144 + (bs.get(1).as(i64) - 0x80) * 4096
+        let lo = (bs.get(2).as(i64) - 0x80) * 64 + (bs.get(3).as(i64) - 0x80)
+        cp = hi + lo
+    }
+    codepoint_display_width(cp)
+}
+
+-- Total monospace cell width of `s` (ASCII fast path + UTF-8 East Asian Wide / Fullwidth decoding).
+pub fn str_display_width(s: String) -> i64 {
+    let blen = s.len()
+    if blen == 0 {
+        return 0
+    }
+    if s.is_ascii() {
+        return blen
+    }
+    var pos: i64 = 0
+    var width: i64 = 0
+    while pos < blen {
+        let (cp, step) = decode_utf8_at(s, pos, blen)
+        width += if step == 1 { 1 } else { codepoint_display_width(cp) }
+        pos += step
+    }
+    width
+}
+
+pub fn expand_tabs_from_col(text: String, start_vcol: i64, tabstop: i64) -> (String, i64) {
+    let ts = if tabstop > 0 { tabstop } else { 4 }
+    if not text.contains("\t") {
+        return (text, start_vcol + str_display_width(text))
+    }
+    let parts = List()
+    var vcol = start_vcol
+    let n = text.char_len()
+    for i in 0..n {
+        let ch = text.slice(i, i + 1)
+        if ch == "\t" {
+            let pad = ts - (vcol % ts)
+            parts.push(" ".repeat(pad))
+            vcol += pad
+        } else {
+            parts.push(ch)
+            vcol += char_display_width(ch)
+        }
+    }
+    (parts.join(""), vcol)
+}
+
+pub fn char_col_to_visual_col(line: String, char_col: i64, tabstop: i64) -> i64 {
+    if char_col <= 0 {
+        return 0
+    }
+    let ts = if tabstop > 0 { tabstop } else { 4 }
+    if line.is_ascii() and (not line.contains("\t")) {
+        return char_col
+    }
+    let blen = line.len()
+    var bpos: i64 = 0
+    var cidx: i64 = 0
+    var vcol: i64 = 0
+    while bpos < blen and cidx < char_col {
+        let (cp, step) = decode_utf8_at(line, bpos, blen)
+        if cp == 9 {
+            vcol += ts - (vcol % ts)
+        } else if step == 1 {
+            vcol += 1
+        } else {
+            vcol += codepoint_display_width(cp)
+        }
+        bpos += step
+        cidx += 1
+    }
+    if char_col > cidx {
+        vcol += char_col - cidx
+    }
+    vcol
+}
+
+pub fn visual_col_to_char_col(line: String, target_vcol: i64, tabstop: i64) -> i64 {
+    if target_vcol <= 0 {
+        return 0
+    }
+    let ts = if tabstop > 0 { tabstop } else { 4 }
+    let blen = line.len()
+    if line.is_ascii() and (not line.contains("\t")) {
+        return if target_vcol > blen { blen } else { target_vcol }
+    }
+    var bpos: i64 = 0
+    var cidx: i64 = 0
+    var vcol: i64 = 0
+    while bpos < blen {
+        let (cp, step) = decode_utf8_at(line, bpos, blen)
+        let cw = if cp == 9 {
+            ts - (vcol % ts)
+        } else if step == 1 {
+            1
+        } else {
+            codepoint_display_width(cp)
+        }
+        let next_vcol = vcol + cw
+        if target_vcol < next_vcol {
+            return cidx
+        }
+        vcol = next_vcol
+        bpos += step
+        cidx += 1
+    }
+    cidx
+}
+
+-- Compute heading level for Org (`* ...`) or Markdown (`# ...`) folding. Returns 0 if not a heading.
+pub fn heading_fold_level(line: String, major_mode: String) -> i64 {
+    if major_mode == "org" {
+        let n = line.char_len()
+        var stars: i64 = 0
+        while stars < n and line.slice(stars, stars + 1) == "*" {
+            stars += 1
+        }
+        if stars > 0 and stars < n and line.slice(stars, stars + 1) == " " {
+            return stars
+        }
+        return 0
+    }
+    if major_mode == "markdown" {
+        let n = line.char_len()
+        var hashes: i64 = 0
+        while hashes < n and line.slice(hashes, hashes + 1) == "#" {
+            hashes += 1
+        }
+        if hashes > 0 and hashes < n and line.slice(hashes, hashes + 1) == " " {
+            return hashes
+        }
+        return 0
+    }
+    0
+}
+
+-- Collect up to `max_rows` visible buffer row numbers starting from `start_row`,
+-- honoring buffer narrowing (`min_row`..`max_row`) and folded Org/Markdown subtrees.
+pub fn visible_buffer_rows(buf: Buffer, start_row: i64, max_rows: i64) -> List {
+    let out = List()
+    if max_rows <= 0 {
+        return out
+    }
+    let lo = buf.min_row()
+    let hi = buf.max_row()
+    var r = if start_row < lo {
+        lo
+    } else if start_row > hi {
+        hi
+    } else {
+        start_row
+    }
+    while r <= hi and out.len() < max_rows {
+        if buf.folded_rows.contains(r) {
+            let lvl = heading_fold_level(buf.line_at(r), buf.major_mode)
+            let body_row_marked = r + 1 <= hi and buf.folded_rows.contains(r + 1)
+            if lvl > 0 and (not body_row_marked) {
+                out.push(r)
+                var next_r = r + 1
+                while next_r <= hi {
+                    let next_lvl = heading_fold_level(buf.line_at(next_r), buf.major_mode)
+                    if next_lvl > 0 and next_lvl <= lvl {
+                        break
+                    }
+                    next_r += 1
+                }
+                r = next_r
+                continue
+            }
+            -- Hidden subtree row (`ext_tools` `org-cycle` body-row set): skip directly!
+            r += 1
+            continue
+        }
+        out.push(r)
+        r += 1
+    }
+    out
+}
+
+-- ============================================================================
+-- 2. LayoutNode Pure Recursive Operations
+-- ============================================================================
+
+fn collect_leaf_ids(node: LayoutNode, out: List) {
+    node match {
+        LayoutNode.Leaf(wid) => out.push(wid),
+        LayoutNode.Split(_, _, first, second) => {
+            collect_leaf_ids(first, out)
+            collect_leaf_ids(second, out)
+        },
+    }
+}
+
+fn node_contains_win(node: LayoutNode, target: WinId) -> bool {
+    node match {
+        LayoutNode.Leaf(wid) => wid == target,
+        LayoutNode.Split(_, _, first, second) => {
+            node_contains_win(first, target) or node_contains_win(second, target)
+        },
+    }
+}
+
+fn first_leaf_id(node: LayoutNode) -> WinId {
+    node match {
+        LayoutNode.Leaf(wid) => wid,
+        LayoutNode.Split(_, _, first, _) => first_leaf_id(first),
+    }
+}
+
+fn split_leaf_in_tree(node: LayoutNode, target: WinId, axis: SplitAxis, new_id: WinId) -> LayoutNode {
+    node match {
+        LayoutNode.Leaf(wid) => {
+            if wid == target {
+                LayoutNode.Split(axis, 0.5, LayoutNode.Leaf(wid), LayoutNode.Leaf(new_id))
+            } else {
+                node
+            }
+        },
+        LayoutNode.Split(ax, ratio, first, second) => {
+            LayoutNode.Split(
+                ax,
+                ratio,
+                split_leaf_in_tree(first, target, axis, new_id),
+                split_leaf_in_tree(second, target, axis, new_id),
+            )
+        },
+    }
+}
+
+-- Remove `target` leaf from tree. Returns `(updated_subtree_or_null, replacement_focus_win_opt)`.
+fn remove_leaf_from_tree(node: LayoutNode, target: WinId) -> (?LayoutNode, ?WinId) {
+    node match {
+        LayoutNode.Leaf(wid) => {
+            if wid == target {
+                (null, null)
+            } else {
+                (node, null)
+            }
+        },
+        LayoutNode.Split(ax, ratio, first, second) => {
+            if node_contains_win(first, target) {
+                let (new_first_opt, focus_opt) = remove_leaf_from_tree(first, target)
+                if new_first_opt == null {
+                    let focus = first_leaf_id(second)
+                    return (second, focus)
+                }
+                return (
+                    LayoutNode.Split(ax, ratio, new_first_opt.as(LayoutNode), second),
+                    focus_opt,
+                )
+            }
+            if node_contains_win(second, target) {
+                let (new_second_opt, focus_opt) = remove_leaf_from_tree(second, target)
+                if new_second_opt == null {
+                    let focus = first_leaf_id(first)
+                    return (first, focus)
+                }
+                return (
+                    LayoutNode.Split(ax, ratio, first, new_second_opt.as(LayoutNode)),
+                    focus_opt,
+                )
+            }
+            (node, null)
+        },
+    }
+}
+
+fn clamp_ratio(r: f64) -> f64 {
+    if r < 0.15 {
+        0.15
+    } else if r > 0.85 {
+        0.85
+    } else {
+        r
+    }
+}
+
+-- Adjust the nearest enclosing `Split` around `target` so `target`'s share changes by `delta`.
+fn adjust_ratio_in_tree(node: LayoutNode, target: WinId, delta: f64) -> (LayoutNode, bool) {
+    node match {
+        LayoutNode.Leaf(_) => (node, false),
+        LayoutNode.Split(ax, ratio, first, second) => {
+            if node_contains_win(first, target) {
+                let (updated_first, handled) = adjust_ratio_in_tree(first, target, delta)
+                if handled {
+                    return (LayoutNode.Split(ax, ratio, updated_first, second), true)
+                }
+                return (LayoutNode.Split(ax, clamp_ratio(ratio + delta), first, second), true)
+            }
+            if node_contains_win(second, target) {
+                let (updated_second, handled) = adjust_ratio_in_tree(second, target, delta)
+                if handled {
+                    return (LayoutNode.Split(ax, ratio, first, updated_second), true)
+                }
+                return (LayoutNode.Split(ax, clamp_ratio(ratio - delta), first, second), true)
+            }
+            (node, false)
+        },
+    }
+}
+
+fn balance_tree(node: LayoutNode) -> LayoutNode {
+    node match {
+        LayoutNode.Leaf(wid) => LayoutNode.Leaf(wid),
+        LayoutNode.Split(ax, _, first, second) => {
+            LayoutNode.Split(ax, 0.5, balance_tree(first), balance_tree(second))
+        },
+    }
+}
+
+fn compute_node_rects(node: LayoutNode, area: Rect, panes: HashMap) {
+    node match {
+        LayoutNode.Leaf(wid) => {
+            let p_opt = panes.get(wid)
+            if p_opt != null {
+                let pane = p_opt.as(WindowPane)
+                pane.rect = area
+            }
+        },
+        LayoutNode.Split(ax, ratio, first, second) => {
+            let r = clamp_ratio(ratio)
+            ax match {
+                SplitAxis.Horizontal => {
+                    let h1 = (area.h * r).floor()
+                    let h2 = if area.h - h1 > 0.0 { area.h - h1 } else { 0.0 }
+                    compute_node_rects(first, Rect.new(area.x, area.y, area.w, h1), panes)
+                    compute_node_rects(second, Rect.new(area.x, area.y + h1, area.w, h2), panes)
+                },
+                SplitAxis.Vertical => {
+                    let w1 = (area.w * r).floor()
+                    let w2 = if area.w - w1 > 0.0 { area.w - w1 } else { 0.0 }
+                    compute_node_rects(first, Rect.new(area.x, area.y, w1, area.h), panes)
+                    compute_node_rects(second, Rect.new(area.x + w1, area.y, w2, area.h), panes)
+                },
+            }
+        },
+    }
+}
+
+-- ============================================================================
+-- 3. WindowManager Service
+-- ============================================================================
+
+pub struct WindowManager {
+    pub panes: HashMap,
+    pub tabs: List,
+    pub active_tab_idx: i64,
+    pub next_win_num: i64,
+    pub next_tab_num: i64,
+    pub pixel_width: i64,
+    pub pixel_height: i64,
+    pub metrics: FontMetrics,
+    pub active_area: Rect,
+    pub show_tab_bar: bool,
+}
+
+impl WindowManager {
+    pub fn new(initial_buf: BufferId) -> WindowManager {
+        let panes = HashMap.new()
+        let first_win_id = WinId(1)
+        let first_pane = WindowPane.new(first_win_id, initial_buf, Pos.zero())
+        panes.insert(first_win_id, first_pane)
+
+        let tab = TabWorkspace {
+            id: 1,
+            title: "Tab 1",
+            root: LayoutNode.Leaf(first_win_id),
+            active_win_id: first_win_id,
+        }
+        let tabs = List()
+        tabs.push(tab)
+
+        let wm = WindowManager {
+            panes: panes,
+            tabs: tabs,
+            active_tab_idx: 0,
+            next_win_num: 2,
+            next_tab_num: 2,
+            pixel_width: 1280,
+            pixel_height: 800,
+            metrics: FontMetrics.default_mono(),
+            active_area: Rect.zero(),
+            show_tab_bar: false,
+        }
+        wm.active_area = wm.workspace_rect()
+        wm.layout_all()
+        wm
+    }
+
+    pub fn top_tab_bar_height(self) -> f64 {
+        if self.show_tab_bar { TAB_BAR_HEIGHT } else { 0.0 }
+    }
+
+    pub fn workspace_rect(self) -> Rect {
+        let w = if self.pixel_width > 80 { self.pixel_width.as(f64) } else { 80.0 }
+        let top_h = self.top_tab_bar_height()
+        let raw_h = self.pixel_height.as(f64) - top_h - ECHO_BAR_HEIGHT
+        let h = if raw_h > 40.0 { raw_h } else { 40.0 }
+        Rect.new(0.0, top_h, w, h)
+    }
+
+    pub fn workspace_rect_for_world(self, world: EditorWorld) -> Rect {
+        let base = self.workspace_rect()
+        let cw = if self.metrics.cell_width > 1.0 { self.metrics.cell_width } else { 8.4 }
+        var x = base.x
+        var w = base.w
+        if world.left_sidebar.visible {
+            let lw = (world.left_sidebar.width_cols.as(f64) * cw + 12.0).floor()
+            if w - lw > 120.0 {
+                x += lw
+                w -= lw
+            }
+        }
+        if world.right_sidebar.visible {
+            let rw = (world.right_sidebar.width_cols.as(f64) * cw + 12.0).floor()
+            if w - rw > 120.0 {
+                w -= rw
+            }
+        }
+        if world.options.zen_mode {
+            let zw_cols = if world.options.zen_width > 40 { world.options.zen_width } else { 92 }
+            let target_w = (zw_cols.as(f64) * cw).floor()
+            if target_w < w - 32.0 {
+                x = x + ((w - target_w) * 0.5).floor()
+                w = target_w
+            }
+        }
+        Rect.new(x, base.y, w, base.h)
+    }
+
+    pub fn layout_all(self) {
+        if self.tabs.is_empty() {
+            return
+        }
+        let area = if self.active_area.w > 1.0 and self.active_area.h > 1.0 {
+            self.active_area
+        } else {
+            self.workspace_rect()
+        }
+        let tab = self.active_tab()
+        compute_node_rects(tab.root, area, self.panes)
+    }
+
+    pub fn active_tab(self) -> TabWorkspace {
+        var idx = self.active_tab_idx
+        if idx < 0 or idx >= self.tabs.len() {
+            idx = 0
+            self.active_tab_idx = 0
+        }
+        self.tabs.get(idx.as(usize)).as(TabWorkspace)
+    }
+
+    pub fn active_pane(self) -> WindowPane {
+        let tab = self.active_tab()
+        let p_opt = self.panes.get(tab.active_win_id)
+        if p_opt != null {
+            return p_opt.as(WindowPane)
+        }
+        let fallback_id = first_leaf_id(tab.root)
+        tab.active_win_id = fallback_id
+        self.panes.get(fallback_id).as(WindowPane)
+    }
+
+    pub fn visible_panes(self) -> List {
+        self.layout_all()
+        let ids = List()
+        collect_leaf_ids(self.active_tab().root, ids)
+        let out = List()
+        let n = ids.len()
+        for i in 0..n {
+            let wid = ids.get(i.as(usize)).as(WinId)
+            let p_opt = self.panes.get(wid)
+            if p_opt != null {
+                out.push(p_opt.as(WindowPane))
+            }
+        }
+        out
+    }
+
+    pub fn pane_rows(self, pane: WindowPane) -> i64 {
+        let content_h = pane.rect.h - mode_line_height(self.metrics)
+        let ch = if self.metrics.cell_height > 1.0 { self.metrics.cell_height } else { 19.0 }
+        let rows = (content_h / ch).floor().as(i64)
+        if rows < 1 {
+            1
+        } else {
+            rows
+        }
+    }
+
+    pub fn pane_cols(self, pane: WindowPane, buf: Buffer, options: EditorOptions) -> i64 {
+        let gw = compute_gutter_width(buf, options, self.metrics)
+        let content_w = pane.rect.w - gw
+        let cw = if self.metrics.cell_width > 1.0 { self.metrics.cell_width } else { 8.4 }
+        let cols = (content_w / cw).floor().as(i64)
+        if cols < 1 {
+            1
+        } else {
+            cols
+        }
+    }
+
+    pub fn ensure_cursor_visible(self, pane: WindowPane, buf: Buffer, options: EditorOptions) {
+        let lo = buf.min_row()
+        let hi = buf.max_row()
+        pane.cursor = buf.clamp_pos(pane.cursor, insert_mode = true)
+        if pane.cursor != pane.prev_cursor {
+            pane.explicit_scroll = false
+            pane.prev_cursor = pane.cursor
+        }
+
+        if pane.top_row < lo {
+            pane.top_row = lo
+        } else if pane.top_row > hi {
+            pane.top_row = hi
+        }
+
+        let rows = self.pane_rows(pane)
+        let raw_so = if pane.explicit_scroll or options.scrolloff < 0 { 0 } else { options.scrolloff }
+        let so = if rows <= 1 {
+            0
+        } else if raw_so * 2 >= rows {
+            (rows - 1) / 2
+        } else {
+            raw_so
+        }
+
+        if pane.cursor.row < pane.top_row + so {
+            let target_top = pane.cursor.row - so
+            pane.top_row = if target_top < lo { lo } else { target_top }
+        } else {
+            let vis = visible_buffer_rows(buf, pane.top_row, rows)
+            var found_idx: i64 = -1
+            for i in 0..vis.len() {
+                if vis.get(i.as(usize)).as(i64) == pane.cursor.row {
+                    found_idx = i
+                    break
+                }
+            }
+            if found_idx < 0 or (so > 0 and found_idx > rows - 1 - so) {
+                let candidate = pane.cursor.row - (rows - 1 - so)
+                pane.top_row = if candidate < lo {
+                    lo
+                } else if candidate > hi {
+                    hi
+                } else {
+                    candidate
+                }
+            }
+        }
+
+        -- Horizontal scroll (`left_col` in visual columns) with `sidescrolloff`
+        let cols = self.pane_cols(pane, buf, options)
+        let raw_sso = if options.sidescrolloff > 0 { options.sidescrolloff } else { 0 }
+        let sso = if cols <= 2 {
+            0
+        } else if raw_sso * 2 >= cols {
+            (cols - 1) / 2
+        } else {
+            raw_sso
+        }
+        let ts = safe_tabstop(options)
+        let line = buf.line_at(pane.cursor.row)
+        let cur_vcol = char_col_to_visual_col(line, pane.cursor.col, ts)
+        let line_n = line.char_len()
+        let cur_cw = if pane.cursor.col >= 0 and pane.cursor.col < line_n {
+            let ch_s = line.slice(pane.cursor.col, pane.cursor.col + 1)
+            if ch_s == "\t" {
+                1
+            } else {
+                let w = char_display_width(ch_s)
+                if w > 0 { w } else { 1 }
+            }
+        } else {
+            1
+        }
+        if pane.left_col < 0 {
+            pane.left_col = 0
+        }
+        if cur_vcol < pane.left_col + sso {
+            let next_lc = cur_vcol - sso
+            pane.left_col = if next_lc < 0 { 0 } else { next_lc }
+        } else if cur_vcol + cur_cw > pane.left_col + cols - sso {
+            let next_lc = cur_vcol + cur_cw - cols + sso
+            pane.left_col = if next_lc < 0 { 0 } else { next_lc }
+        }
+    }
+
+    pub fn sync_from_world(self, world: EditorWorld) {
+        self.show_tab_bar = world.options.show_tab_bar
+        self.active_area = self.workspace_rect_for_world(world)
+        self.layout_all()
+
+        -- Repair any stale buffer references across all panes
+        for k in self.panes.keys() {
+            let wid = k.as(WinId)
+            let p = self.panes.get(wid).as(WindowPane)
+            if not world.buffers.contains_key(p.buffer_id) {
+                p.buffer_id = world.active_buffer_id
+                p.cursor = Pos.zero()
+                p.prev_cursor = Pos.zero()
+                p.explicit_scroll = false
+                p.top_row = 0
+                p.left_col = 0
+            }
+        }
+
+        let ap = self.active_pane()
+        if ap.buffer_id != world.active_buffer_id {
+            ap.buffer_id = world.active_buffer_id
+            ap.explicit_scroll = false
+        }
+        let abuf = world.active_buffer()
+        ap.cursor = abuf.point
+
+        let vis = self.visible_panes()
+        for i in 0..vis.len() {
+            let p = vis.get(i.as(usize)).as(WindowPane)
+            let b_opt = world.buffer(p.buffer_id)
+            if b_opt != null {
+                self.ensure_cursor_visible(p, b_opt.as(Buffer), world.options)
+            }
+        }
+
+        world.viewport_rows = self.pane_rows(ap)
+        world.viewport_cols = self.pane_cols(ap, abuf, world.options)
+        world.viewport_top_row = ap.top_row
+    }
+
+    pub fn sync_to_world(self, world: EditorWorld) {
+        self.active_area = self.workspace_rect_for_world(world)
+        self.layout_all()
+        let ap = self.active_pane()
+        if not world.buffers.contains_key(ap.buffer_id) {
+            ap.buffer_id = world.scratch_id
+        }
+        world.active_buffer_id = ap.buffer_id
+        let abuf = world.active_buffer()
+        ap.cursor = abuf.clamp_pos(ap.cursor, insert_mode = true)
+        abuf.point = ap.cursor
+
+        let vis = self.visible_panes()
+        for i in 0..vis.len() {
+            let p = vis.get(i.as(usize)).as(WindowPane)
+            let b_opt = world.buffer(p.buffer_id)
+            if b_opt != null {
+                self.ensure_cursor_visible(p, b_opt.as(Buffer), world.options)
+            }
+        }
+
+        world.viewport_rows = self.pane_rows(ap)
+        world.viewport_cols = self.pane_cols(ap, abuf, world.options)
+        world.viewport_top_row = ap.top_row
+    }
+
+    pub fn resize_viewport(self, width: i64, height: i64, world: EditorWorld) {
+        self.pixel_width = if width > 80 { width } else { 80 }
+        self.pixel_height = if height > 80 { height } else { 80 }
+        self.active_area = self.workspace_rect_for_world(world)
+        self.sync_from_world(world)
+    }
+
+    pub fn scroll_cursor_center(self, world: EditorWorld) {
+        self.sync_from_world(world)
+        let ap = self.active_pane()
+        let buf = world.active_buffer()
+        let rows = self.pane_rows(ap)
+        let lo = buf.min_row()
+        let hi = buf.max_row()
+        let target = ap.cursor.row - (rows / 2)
+        ap.top_row = if target < lo {
+            lo
+        } else if target > hi {
+            hi
+        } else {
+            target
+        }
+        ap.explicit_scroll = true
+        ap.prev_cursor = ap.cursor
+        world.viewport_top_row = ap.top_row
+    }
+
+    pub fn scroll_cursor_top(self, world: EditorWorld) {
+        self.sync_from_world(world)
+        let ap = self.active_pane()
+        let buf = world.active_buffer()
+        let lo = buf.min_row()
+        let hi = buf.max_row()
+        ap.top_row = if ap.cursor.row < lo {
+            lo
+        } else if ap.cursor.row > hi {
+            hi
+        } else {
+            ap.cursor.row
+        }
+        ap.explicit_scroll = true
+        ap.prev_cursor = ap.cursor
+        world.viewport_top_row = ap.top_row
+    }
+
+    pub fn scroll_cursor_bottom(self, world: EditorWorld) {
+        self.sync_from_world(world)
+        let ap = self.active_pane()
+        let buf = world.active_buffer()
+        let rows = self.pane_rows(ap)
+        let lo = buf.min_row()
+        let hi = buf.max_row()
+        let target = ap.cursor.row - (rows - 1)
+        ap.top_row = if target < lo {
+            lo
+        } else if target > hi {
+            hi
+        } else {
+            target
+        }
+        ap.explicit_scroll = true
+        ap.prev_cursor = ap.cursor
+        world.viewport_top_row = ap.top_row
+    }
+
+    pub fn split_active(self, axis: SplitAxis, world: EditorWorld) -> WinId {
+        self.sync_from_world(world)
+        let cur = self.active_pane()
+        let new_id = WinId(self.next_win_num)
+        self.next_win_num += 1
+
+        let new_pane = WindowPane {
+            id: new_id,
+            buffer_id: cur.buffer_id,
+            cursor: cur.cursor,
+            prev_cursor: cur.cursor,
+            explicit_scroll: false,
+            top_row: cur.top_row,
+            left_col: cur.left_col,
+            rect: Rect.zero(),
+        }
+        self.panes.insert(new_id, new_pane)
+
+        let tab = self.active_tab()
+        tab.root = split_leaf_in_tree(tab.root, cur.id, axis, new_id)
+        tab.active_win_id = new_id
+        self.sync_to_world(world)
+        new_id
+    }
+
+    pub fn close_active(self, world: EditorWorld) -> bool {
+        self.sync_from_world(world)
+        let tab = self.active_tab()
+        tab.root match {
+            LayoutNode.Leaf(_) => {
+                return false
+            },
+            _ => (),
+        }
+        let target_id = tab.active_win_id
+        let (updated_opt, next_focus_opt) = remove_leaf_from_tree(tab.root, target_id)
+        let updated_root? = updated_opt else {
+            return false
+        }
+        let _ = self.panes.remove(target_id)
+        tab.root = updated_root
+        let nf? = next_focus_opt else {
+            tab.active_win_id = first_leaf_id(updated_root)
+            self.sync_to_world(world)
+            return true
+        }
+        tab.active_win_id = nf
+        self.sync_to_world(world)
+        true
+    }
+
+    pub fn close_others(self, world: EditorWorld) {
+        self.sync_from_world(world)
+        let tab = self.active_tab()
+        let keep_id = tab.active_win_id
+        let leaf_ids = List()
+        collect_leaf_ids(tab.root, leaf_ids)
+        for i in 0..leaf_ids.len() {
+            let wid = leaf_ids.get(i.as(usize)).as(WinId)
+            if wid != keep_id {
+                let _ = self.panes.remove(wid)
+            }
+        }
+        tab.root = LayoutNode.Leaf(keep_id)
+        self.sync_to_world(world)
+    }
+
+    pub fn cycle_window(self, delta: i64, world: EditorWorld) -> WinId {
+        self.sync_from_world(world)
+        let vis = self.visible_panes()
+        let n = vis.len()
+        if n <= 1 {
+            return self.active_pane().id
+        }
+        let tab = self.active_tab()
+        var cur_idx: i64 = 0
+        for i in 0..n {
+            if vis.get(i.as(usize)).as(WindowPane).id == tab.active_win_id {
+                cur_idx = i
+                break
+            }
+        }
+        var next_idx = (cur_idx + delta) % n
+        if next_idx < 0 {
+            next_idx += n
+        }
+        let next_pane = vis.get(next_idx.as(usize)).as(WindowPane)
+        tab.active_win_id = next_pane.id
+        self.sync_to_world(world)
+        next_pane.id
+    }
+
+    pub fn focus_direction(self, dir: String, world: EditorWorld) -> WinId {
+        self.sync_from_world(world)
+        let vis = self.visible_panes()
+        if vis.len() <= 1 {
+            return self.active_pane().id
+        }
+        let cur = self.active_pane()
+        let cr = cur.rect
+        let cx = cr.center_x()
+        let cy = cr.center_y()
+
+        var best_id: ?WinId = null
+        var best_score: f64 = 1000000000.0
+
+        for i in 0..vis.len() {
+            let cand = vis.get(i.as(usize)).as(WindowPane)
+            if cand.id == cur.id {
+                continue
+            }
+            let r = cand.rect
+            let px = r.center_x()
+            let py = r.center_y()
+
+            var eligible = false
+            var primary_dist: f64 = 0.0
+            var perp_dist: f64 = 0.0
+
+            if dir == "left" {
+                if px < cx - 1.0 and r.x + r.w <= cr.x + 2.0 {
+                    eligible = true
+                    primary_dist = (cr.x - (r.x + r.w)).abs()
+                    if cy < r.y {
+                        perp_dist = r.y - cy
+                    } else if cy > r.y + r.h {
+                        perp_dist = cy - (r.y + r.h)
+                    }
+                }
+            } else if dir == "right" {
+                if px > cx + 1.0 and r.x >= cr.x + cr.w - 2.0 {
+                    eligible = true
+                    primary_dist = (r.x - (cr.x + cr.w)).abs()
+                    if cy < r.y {
+                        perp_dist = r.y - cy
+                    } else if cy > r.y + r.h {
+                        perp_dist = cy - (r.y + r.h)
+                    }
+                }
+            } else if dir == "up" {
+                if py < cy - 1.0 and r.y + r.h <= cr.y + 2.0 {
+                    eligible = true
+                    primary_dist = (cr.y - (r.y + r.h)).abs()
+                    if cx < r.x {
+                        perp_dist = r.x - cx
+                    } else if cx > r.x + r.w {
+                        perp_dist = cx - (r.x + r.w)
+                    }
+                }
+            } else if dir == "down" {
+                if py > cy + 1.0 and r.y >= cr.y + cr.h - 2.0 {
+                    eligible = true
+                    primary_dist = (r.y - (cr.y + cr.h)).abs()
+                    if cx < r.x {
+                        perp_dist = r.x - cx
+                    } else if cx > r.x + r.w {
+                        perp_dist = cx - (r.x + r.w)
+                    }
+                }
+            }
+
+            if eligible {
+                let score = primary_dist + perp_dist * 4.0 + ((px - cx).abs() + (py - cy).abs()) * 0.01
+                if score < best_score {
+                    best_score = score
+                    best_id = cand.id
+                }
+            }
+        }
+
+        let target_id? = best_id else {
+            return cur.id
+        }
+        self.active_tab().active_win_id = target_id
+        self.sync_to_world(world)
+        target_id
+    }
+
+    pub fn adjust_split_ratio(self, delta: f64) {
+        let tab = self.active_tab()
+        let (updated, _) = adjust_ratio_in_tree(tab.root, tab.active_win_id, delta)
+        tab.root = updated
+        self.layout_all()
+    }
+
+    pub fn balance_splits(self) {
+        let tab = self.active_tab()
+        tab.root = balance_tree(tab.root)
+        self.layout_all()
+    }
+
+    pub fn tab_new(self, buf_id: BufferId) {
+        let win_id = WinId(self.next_win_num)
+        self.next_win_num += 1
+        let tab_num = self.next_tab_num
+        self.next_tab_num += 1
+
+        let pane = WindowPane.new(win_id, buf_id, Pos.zero())
+        self.panes.insert(win_id, pane)
+
+        let tab = TabWorkspace {
+            id: tab_num,
+            title: "Tab " ++ tab_num.to_string(),
+            root: LayoutNode.Leaf(win_id),
+            active_win_id: win_id,
+        }
+        self.tabs.push(tab)
+        self.active_tab_idx = self.tabs.len() - 1
+        self.layout_all()
+    }
+
+    pub fn tab_switch(self, delta: i64, world: EditorWorld) {
+        let n = self.tabs.len()
+        if n <= 1 {
+            self.sync_to_world(world)
+            return
+        }
+        self.sync_from_world(world)
+        var next_idx = (self.active_tab_idx + delta) % n
+        if next_idx < 0 {
+            next_idx += n
+        }
+        self.active_tab_idx = next_idx
+        self.sync_to_world(world)
+    }
+
+    -- Alias matching exact capitalized spelling in specification (`tab_Switch`).
+    pub fn tab_Switch(self, delta: i64, world: EditorWorld) {
+        self.tab_switch(delta, world)
+    }
+
+    pub fn tab_close(self, world: EditorWorld) -> bool {
+        let n = self.tabs.len()
+        if n <= 1 {
+            return false
+        }
+        let closing = self.active_tab()
+        let leaf_ids = List()
+        collect_leaf_ids(closing.root, leaf_ids)
+        for i in 0..leaf_ids.len() {
+            let wid = leaf_ids.get(i.as(usize)).as(WinId)
+            let _ = self.panes.remove(wid)
+        }
+        let _ = self.tabs.remove(self.active_tab_idx.as(usize))
+        if self.active_tab_idx >= self.tabs.len() {
+            self.active_tab_idx = self.tabs.len() - 1
+        }
+        self.sync_to_world(world)
+        true
+    }
+
+    pub fn hit_test(self, px: f64, py: f64, world: EditorWorld) -> ?(WinId, Pos) {
+        self.show_tab_bar = world.options.show_tab_bar
+        self.layout_all()
+        if py < self.top_tab_bar_height() or py >= self.pixel_height.as(f64) - ECHO_BAR_HEIGHT {
+            return null
+        }
+        let vis = self.visible_panes()
+        var hit_pane_opt: ?WindowPane = null
+        for i in 0..vis.len() {
+            let p = vis.get(i.as(usize)).as(WindowPane)
+            if p.rect.contains(px, py) {
+                hit_pane_opt = p
+                break
+            }
+        }
+        let pane? = hit_pane_opt else {
+            return null
+        }
+        let buf = if world.buffer(pane.buffer_id) != null {
+            world.buffer(pane.buffer_id).as(Buffer)
+        } else {
+            world.active_buffer()
+        }
+
+        let ml_y = pane.rect.y + pane.rect.h - mode_line_height(self.metrics)
+        let insert_clamp = (not world.options.evil_mode) or world.mode_name == "INSERT"
+        if py >= ml_y {
+            return (pane.id, buf.clamp_pos(pane.cursor, insert_mode = insert_clamp))
+        }
+
+        let max_rows = self.pane_rows(pane)
+        let vis_rows = visible_buffer_rows(buf, pane.top_row, max_rows)
+        let ch = if self.metrics.cell_height > 1.0 { self.metrics.cell_height } else { 19.0 }
+        let line_idx = ((py - pane.rect.y) / ch).floor().as(i64)
+
+        let target_row = if vis_rows.is_empty() {
+            buf.min_row()
+        } else if line_idx <= 0 {
+            vis_rows.get(0).as(i64)
+        } else if line_idx >= vis_rows.len() {
+            vis_rows.get((vis_rows.len() - 1).as(usize)).as(i64)
+        } else {
+            vis_rows.get(line_idx.as(usize)).as(i64)
+        }
+
+        let gw = compute_gutter_width(buf, world.options, self.metrics)
+        let text_x = px - (pane.rect.x + gw)
+        let cw = if self.metrics.cell_width > 1.0 { self.metrics.cell_width } else { 8.4 }
+        let ts = safe_tabstop(world.options)
+        let line = buf.line_at(target_row)
+
+        let char_col = if text_x <= 0.0 {
+            visual_col_to_char_col(line, pane.left_col, ts)
+        } else {
+            let vcol = pane.left_col + (text_x / cw).floor().as(i64)
+            visual_col_to_char_col(line, vcol, ts)
+        }
+
+        let clamped = buf.clamp_pos(Pos.new(target_row, char_col), insert_mode = insert_clamp)
+        (pane.id, clamped)
+    }
+}
+
+-- ============================================================================
+-- 4. Extension Registration & Service Lookup
+-- ============================================================================
+
+pub fn require_window_manager(kernel: SystemKernel) -> !String WindowManager {
+    let raw = kernel.require_service(SERVICE_WINDOW_MANAGER)!
+    raw.as(WindowManager)
+}
+
+pub fn register_window_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_window_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_window",
+        "0.1.0",
+        "Binary split-tree window panes, tab workspaces, geometric directional focus, viewport scrolling, and mouse hit-testing.",
+        [ext_document_id()],
+        |k: SystemKernel| -> !String Unit {
+            let world = require_editor_world(k)!
+            let wm = WindowManager.new(world.active_buffer_id)
+            wm.sync_to_world(world)
+            k.publish_service(SERVICE_WINDOW_MANAGER, ext_id, wm)
+
+            k.add_hook(
+                "buffer-switched",
+                ext_id,
+                |kern: SystemKernel, payload: Any| {
+                    let w_opt = kern.service("lava.document.world")
+                    let wm_opt = kern.service(SERVICE_WINDOW_MANAGER)
+                    if w_opt != null and wm_opt != null {
+                        let w = w_opt.as(EditorWorld)
+                        let mgr = wm_opt.as(WindowManager)
+                        let ap = mgr.active_pane()
+                        if payload matches _: BufferId {
+                            let bid = payload.as(BufferId)
+                            if w.buffers.contains_key(bid) {
+                                ap.buffer_id = bid
+                                w.active_buffer_id = bid
+                            }
+                        } else {
+                            ap.buffer_id = w.active_buffer_id
+                        }
+                        ap.cursor = w.active_buffer().point
+                        mgr.sync_from_world(w)
+                    }
+                },
+            )
+
+            k.register_command(
+                "split-window-below",
+                ext_id,
+                "Split active window horizontally into top and bottom panes (`C-x 2` / `:sp`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let mgr = require_window_manager(kern)!
+                    let wid = mgr.split_active(SplitAxis.Horizontal, w)
+                    log_event("info", "ext_window", "Split horizontal -> " ++ wid.to_string())#
+                    status_emit("Split window below (" ++ mgr.visible_panes().len().to_string() ++ " windows)")#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "split-window-right",
+                ext_id,
+                "Split active window vertically into left and right panes (`C-x 3` / `:vsp`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let mgr = require_window_manager(kern)!
+                    let wid = mgr.split_active(SplitAxis.Vertical, w)
+                    log_event("info", "ext_window", "Split vertical -> " ++ wid.to_string())#
+                    status_emit("Split window right (" ++ mgr.visible_panes().len().to_string() ++ " windows)")#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "delete-window",
+                ext_id,
+                "Close active split window (`C-x 0` / `<C-w> c`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let mgr = require_window_manager(kern)!
+                    if not mgr.close_active(w) {
+                        status_emit("Cannot delete sole window")#
+                        return ()
+                    }
+                    status_emit("Closed window (" ++ mgr.visible_panes().len().to_string() ++ " remaining)")#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "delete-other-windows",
+                ext_id,
+                "Close all other split windows in active tab (`C-x 1` / `:only`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let mgr = require_window_manager(kern)!
+                    mgr.close_others(w)
+                    status_emit("Closed other windows")#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "other-window",
+                ext_id,
+                "Cycle focus to next visible window (`C-x o` / `<C-w> w`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let mgr = require_window_manager(kern)!
+                    let delta = if (not args.is_empty()) and (args.get(0) matches _: i64) {
+                        args.get(0).as(i64)
+                    } else {
+                        1
+                    }
+                    let wid = mgr.cycle_window(delta, w)
+                    kern.emit_hook("window-focused", wid)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "window-focus-left",
+                ext_id,
+                "Move focus to window on the left (`<C-w> h`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let mgr = require_window_manager(kern)!
+                    let wid = mgr.focus_direction("left", w)
+                    kern.emit_hook("window-focused", wid)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "window-focus-down",
+                ext_id,
+                "Move focus to window below (`<C-w> j`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let mgr = require_window_manager(kern)!
+                    let wid = mgr.focus_direction("down", w)
+                    kern.emit_hook("window-focused", wid)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "window-focus-up",
+                ext_id,
+                "Move focus to window above (`<C-w> k`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let mgr = require_window_manager(kern)!
+                    let wid = mgr.focus_direction("up", w)
+                    kern.emit_hook("window-focused", wid)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "window-focus-right",
+                ext_id,
+                "Move focus to window on the right (`<C-w> l`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let mgr = require_window_manager(kern)!
+                    let wid = mgr.focus_direction("right", w)
+                    kern.emit_hook("window-focused", wid)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "balance-windows",
+                ext_id,
+                "Equalize split ratios across all windows in active tab (`<C-w> =`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let mgr = require_window_manager(kern)!
+                    mgr.balance_splits()
+                    mgr.sync_to_world(w)
+                    status_emit("Balanced windows")#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "enlarge-window",
+                ext_id,
+                "Increase active split window size.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let mgr = require_window_manager(kern)!
+                    mgr.adjust_split_ratio(0.08)
+                    mgr.sync_to_world(w)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "shrink-window",
+                ext_id,
+                "Decrease active split window size.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let mgr = require_window_manager(kern)!
+                    mgr.adjust_split_ratio(-0.08)
+                    mgr.sync_to_world(w)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "scroll-center",
+                ext_id,
+                "Center active window viewport around cursor (`zz` / `C-l`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let mgr = require_window_manager(kern)!
+                    mgr.scroll_cursor_center(w)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "scroll-top",
+                ext_id,
+                "Scroll active window so cursor row is at top (`zt`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let mgr = require_window_manager(kern)!
+                    mgr.scroll_cursor_top(w)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "scroll-bottom",
+                ext_id,
+                "Scroll active window so cursor row is at bottom (`zb`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let mgr = require_window_manager(kern)!
+                    mgr.scroll_cursor_bottom(w)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "tab-new",
+                ext_id,
+                "Open a new tab workspace showing the current buffer (`:tabnew`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let mgr = require_window_manager(kern)!
+                    mgr.sync_from_world(w)
+                    mgr.tab_new(w.active_buffer_id)
+                    mgr.sync_to_world(w)
+                    status_emit("Opened " ++ mgr.active_tab().title)#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "tab-next",
+                ext_id,
+                "Switch to next tab workspace (`gt`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let mgr = require_window_manager(kern)!
+                    mgr.tab_switch(1, w)
+                    status_emit("Switched to " ++ mgr.active_tab().title)#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "tab-previous",
+                ext_id,
+                "Switch to previous tab workspace (`gT`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let mgr = require_window_manager(kern)!
+                    mgr.tab_switch(-1, w)
+                    status_emit("Switched to " ++ mgr.active_tab().title)#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "tab-close",
+                ext_id,
+                "Close active tab workspace (`:tabclose`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let mgr = require_window_manager(kern)!
+                    if not mgr.tab_close(w) {
+                        status_emit("Cannot close last tab")#
+                        return ()
+                    }
+                    status_emit("Closed tab (" ++ mgr.tabs.len().to_string() ++ " remaining)")#
+                    ()
+                },
+            )
+
+            ()
+        },
+        |_k: SystemKernel| -> !String Unit { () },
+    )
+}

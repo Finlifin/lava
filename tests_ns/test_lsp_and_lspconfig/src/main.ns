@@ -1,0 +1,656 @@
+-- Comprehensive end-to-end integration test suite for `lava.org/ext_lsp` & `lava.org/ext_lspconfig`:
+--   1. 18-language preset registry, root marker detection (`Cargo.toml`, `package.toml`, `pyproject.toml`),
+--      `$PATH` executable scanning with mock LSP binary, `configure_lsp_server`, and `set_lsp_auto_attach`.
+--   2. `:Mason` / `:LspConfig` (`*LspConfig*`) dashboard rendering, `[INSTALLED ✓]` / `[MISSING ○]` badges,
+--      `i` clipboard install hint copy, `r` refresh, `<Return>` attach, `q` close, and `<Space> l` Lazy non-collision.
+--   3. `:LspInfo` (`<Space> c l`) `*LspInfo*` inspection and statusline `[LSP: ...]` indicator.
+--   4. End-to-end code intelligence: `gd` + `<C-o>`, `gI`, `gy`, `gr` (`world.quickfix` + `*LSP References*`),
+--      `:LspHover` (`*lsp-hover*` FloatingWindow), `<Space>rn` / `:LspRename`, `:LspCodeAction` / `<Space>ca`,
+--      `:LspSymbols` / `<Space>cS`, diagnostics (`]e` / `[e` / `<Space>cd`, no-bold decors), and `ext_cmp` `"lsp"` source.
+--   5. `K` Hover Harmony with `ext_help` (`K` -> `*Help*` when no external live LSP hover; `:LspHover` -> `*lsp-hover*`).
+
+use std.fs
+use std.path
+use std.process
+use std.time
+use @lava_sys.{host_clipboard_get, host_clipboard_set, mock_enable}
+use @lava_core.{
+    KeyStroke, PromptRequest, ServiceEffects, SystemKernel, clipboard_get, clipboard_set,
+    log_event, parse_key_sequence, status_emit
+}
+use @lava_lsp.LspDiag
+use @ext_document.{
+    Buffer, CompletionItem, EditorWorld, FloatingWindow, InlineSpanDecor, MinibufferView, Pos,
+    register_document_extension, require_editor_world
+}
+use @ext_window.{WindowManager, register_window_extension, require_window_manager}
+use @ext_render.register_render_extension
+use @ext_minibuffer.{minibuffer_handle_key, open_prompt_view, register_minibuffer_extension}
+use @ext_vim.{VimMode, VimState, register_vim_extension, vim_handle_key}
+use @ext_emacs.{EmacsState, emacs_handle_key, register_emacs_extension}
+use @ext_tools.{ToolsManager, register_tools_extension, tools_handle_key}
+use @ext_snippets.register_snippets_extension
+use @ext_cmp.{SERVICE_CMP, collect_candidates, register_cmp_extension}
+use @ext_lazy.register_lazy_extension
+use @ext_help.{HELP_BUF_NAME, register_help_extension, require_help_state}
+use @ext_lsp.{
+    LSP_HOVER_FLOAT_ID, LSP_INFO_BUF_NAME, LSP_LOG_BUF_NAME, LSP_REFS_BUF_NAME,
+    LspService, SERVICE_LSP, ext_lsp_id, register_lsp_extension, require_lsp_service
+}
+use @ext_lspconfig.{
+    LSPCONFIG_BUF_NAME, LspConfigRegistry, LspLanguagePreset, SERVICE_LSPCONFIG,
+    configure_lsp_server, ext_lspconfig_id, register_lspconfig_extension,
+    require_lspconfig_registry, set_lsp_auto_attach
+}
+
+fn check_true(cond: bool, label: String) {
+    if not cond {
+        panic("ASSERTION FAILED: " ++ label)
+    }
+}
+
+fn check_eq_str(actual: String, expected: String, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual='" ++ actual ++ "' expected='" ++ expected ++ "'")
+    }
+}
+
+fn check_eq_i64(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual=" ++ actual.to_string() ++ " expected=" ++ expected.to_string())
+    }
+}
+
+fn check_eq_bool(actual: bool, expected: bool, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual=" ++ actual.to_string() ++ " expected=" ++ expected.to_string())
+    }
+}
+
+struct TestHostCap {
+    pub world: EditorWorld,
+}
+
+impl TestHostCap {
+    pub fn new(world: EditorWorld) -> TestHostCap {
+        TestHostCap { world: world }
+    }
+
+    pub fn on_log(self, level: String, source: String, message: String) -> Unit handles(log_event) {
+        self.world.append_message("[" ++ level ++ "] " ++ source ++ ": " ++ message)
+    }
+
+    pub fn on_status(self, message: String) -> Unit handles(status_emit) {
+        self.world.status_message = message
+        if message != "" {
+            self.world.append_message(message)
+        }
+    }
+
+    pub fn on_clip_get(self) -> String handles(clipboard_get) {
+        host_clipboard_get()
+    }
+
+    pub fn on_clip_set(self, text: String) -> Unit handles(clipboard_set) {
+        host_clipboard_set(text)
+    }
+}
+
+fn sync_prompt_view_local(kernel: SystemKernel, world: EditorWorld) {
+    if kernel.active_prompt != null {
+        if not world.minibuffer_view.active {
+            let (req, _) = kernel.active_prompt.as((PromptRequest, Continuation))
+            open_prompt_view(kernel, req)
+        }
+    } else if world.minibuffer_view.active {
+        world.minibuffer_view = MinibufferView.inactive()
+    }
+}
+
+fn route_stroke_local(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    stroke: KeyStroke,
+) -> #ServiceEffects !String bool {
+    if kernel.active_prompt != null {
+        sync_prompt_view_local(kernel, world)
+        return minibuffer_handle_key(kernel, stroke)#!
+    }
+    let emacs_opt = kernel.service("lava.emacs.state")
+    if emacs_opt != null {
+        let es = emacs_opt.as(EmacsState)
+        if (not es.pending_strokes.is_empty()) or es.universal_active {
+            return emacs_handle_key(kernel, stroke)#!
+        }
+    }
+    let vim_opt = kernel.service("lava.vim.state")
+    let tools_opt = kernel.service("lava.tools.manager")
+    if tools_opt != null {
+        let mgr = tools_opt.as(ToolsManager)
+        let try_tools = if mgr.pending_prefix != "" or (not world.options.evil_mode) or vim_opt == null {
+            true
+        } else {
+            let vs = vim_opt.as(VimState)
+            vs.mode == VimMode.Normal
+                and vs.pending_prefix == ""
+                and vs.leader_strokes.is_empty()
+                and (not kernel.macros.is_recording())
+        }
+        if try_tools {
+            let th = tools_handle_key(kernel, stroke)#!
+            if th {
+                return true
+            }
+        }
+    }
+    let vh = vim_handle_key(kernel, stroke)#!
+    if vh {
+        return true
+    }
+    emacs_handle_key(kernel, stroke)#!
+}
+
+fn feed(
+    kernel: SystemKernel,
+    keys: String,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] Unit {
+    let strokes = parse_key_sequence(keys)
+    for i in 0..strokes.len() {
+        let stroke = strokes.get(i.as(usize)).as(KeyStroke)
+        let world = require_editor_world(kernel) ! { e => panic(e) }
+        let outcome = route_stroke_local(kernel, world, stroke)#
+        outcome match {
+            _! => (),
+            error err_msg => panic("feed('" ++ keys ++ "') failed: " ++ err_msg),
+        }
+        sync_prompt_view_local(kernel, world)
+        let wm_opt = kernel.service("lava.window.manager")
+        if wm_opt != null {
+            wm_opt.as(WindowManager).sync_from_world(world)
+        }
+        if world.quit_requested {
+            break
+        }
+    }
+}
+
+fn find_line_with(buf: Buffer, needle: String) -> i64 {
+    for r in 0..buf.line_count() {
+        if buf.line_at(r).contains(needle) {
+            return r
+        }
+    }
+    -1
+}
+
+fn boot_full_lsp_kernel(with_help: bool) -> SystemKernel {
+    mock_enable(true)
+    let kernel = SystemKernel.new()
+    register_document_extension(kernel) ! { e => panic("register_document_extension: " ++ e) }
+    register_window_extension(kernel) ! { e => panic("register_window_extension: " ++ e) }
+    register_render_extension(kernel) ! { e => panic("register_render_extension: " ++ e) }
+    register_minibuffer_extension(kernel) ! { e => panic("register_minibuffer_extension: " ++ e) }
+    register_vim_extension(kernel) ! { e => panic("register_vim_extension: " ++ e) }
+    register_emacs_extension(kernel) ! { e => panic("register_emacs_extension: " ++ e) }
+    register_tools_extension(kernel) ! { e => panic("register_tools_extension: " ++ e) }
+    register_snippets_extension(kernel) ! { e => panic("register_snippets_extension: " ++ e) }
+    register_cmp_extension(kernel) ! { e => panic("register_cmp_extension: " ++ e) }
+    register_lazy_extension(kernel) ! { e => panic("register_lazy_extension: " ++ e) }
+    if with_help {
+        register_help_extension(kernel) ! { e => panic("register_help_extension: " ++ e) }
+    }
+    register_lsp_extension(kernel) ! { e => panic("register_lsp_extension: " ++ e) }
+    register_lspconfig_extension(kernel) ! { e => panic("register_lspconfig_extension: " ++ e) }
+    kernel.activate_all() ! { e => panic("activate_all: " ++ e) }
+    check_true(kernel.is_extension_active(ext_lsp_id()), "ext_lsp active")
+    check_true(kernel.is_extension_active(ext_lspconfig_id()), "ext_lspconfig active")
+    check_true(kernel.service(SERVICE_LSP) != null, "SERVICE_LSP published")
+    check_true(kernel.service(SERVICE_LSPCONFIG) != null, "SERVICE_LSPCONFIG published")
+    kernel
+}
+
+fn setup_temp_projects() -> (String, String, String, String, String, String) {
+    let stamp = time.unix_millis().to_string()
+    let base = "/tmp/lava_test_lsp_suite_" ++ stamp
+    let bin_dir = path.join(base, "mock_bin")
+    let rust_root = path.join(base, "rust_proj")
+    let rust_src = path.join(rust_root, "src")
+    let nessa_root = path.join(base, "nessa_proj")
+    let nessa_src = path.join(nessa_root, "src")
+    let py_root = path.join(base, "py_proj")
+    let py_sub = path.join(path.join(py_root, "pkg"), "sub")
+
+    let _ = fs.create_dir_all(bin_dir) ! { e => panic("mkdir bin: " ++ e.to_string()) }
+    let _ = fs.create_dir_all(rust_src) ! { e => panic("mkdir rust_src: " ++ e.to_string()) }
+    let _ = fs.create_dir_all(nessa_src) ! { e => panic("mkdir nessa_src: " ++ e.to_string()) }
+    let _ = fs.create_dir_all(py_sub) ! { e => panic("mkdir py_sub: " ++ e.to_string()) }
+
+    -- Create mock executable LSP binary script in `bin_dir`
+    let mock_ra = path.join(bin_dir, "mock-rust-lsp")
+    let _ = fs.write_string(mock_ra, "#!/bin/sh\nexit 0\n") ! { e => panic("write mock-rust-lsp: " ++ e.to_string()) }
+    let _ = process.shell("chmod +x " ++ mock_ra) ! { e => panic("chmod: " ++ e.to_string()) }
+
+    -- Rust project with Cargo.toml + multi-function src/lib.rs & src/engine.rs
+    let _ = fs.write_string(
+        path.join(rust_root, "Cargo.toml"),
+        "[package]\nname = \"demo_crate\"\nversion = \"0.1.0\"\n",
+    ) ! { e => panic("write Cargo.toml: " ++ e.to_string()) }
+
+    let rs_content = [
+        "use std::fmt::Display;",
+        "use std::collections::HashMap;",
+        "use std::cmp::Ordering;",
+        "",
+        "/// EngineConfig holds runtime scoring parameters.",
+        "pub struct EngineConfig {{",
+        "    pub scale: i64,",
+        "}}",
+        "",
+        "impl EngineConfig {{",
+        "    pub fn new_default() -> EngineConfig {{",
+        "        EngineConfig {{ scale: 3 }}",
+        "    }}",
+        "}}",
+        "",
+        "/// Computes calibrated velocity from `EngineConfig` and base delta.",
+        "/// Used across telemetry pipelines.",
+        "pub fn compute_velocity(cfg: EngineConfig, delta_val: i64) -> i64 {{",
+        "    let unused_counter = delta_val + 1;   ",
+        "    cfg.scale * delta_val + compute_velocity_helper(unused_counter)",
+        "}}",
+        "",
+        "fn compute_velocity_helper(step_v: i64) -> i64 {{",
+        "    step_v * 2",
+        "}}",
+        "",
+        "pub fn run_pipeline() -> i64 {{",
+        "    let cfg: EngineConfig = EngineConfig::new_default();",
+        "    let first = compute_velocity(cfg, 10);",
+        "    first",
+        "}}",
+    ].join("\n") ++ "\n"
+    let rs_file = path.join(rust_src, "lib.rs")
+    let _ = fs.write_string(rs_file, rs_content) ! { e => panic("write lib.rs: " ++ e.to_string()) }
+
+    -- Nessa project with package.toml + src/lib.ns
+    let _ = fs.write_string(
+        path.join(nessa_root, "package.toml"),
+        "[package]\nname = \"demo_ns\"\nversion = \"0.1.0\"\ntype = \"lib\"\n",
+    ) ! { e => panic("write package.toml: " ++ e.to_string()) }
+
+    let ns_content = [
+        "-- Evaluates orbital harmonic score for Nessa simulations.",
+        "pub fn orbital_score(seed: i64) -> i64 {{",
+        "    seed * 7 + 1",
+        "}}",
+        "",
+        "pub fn launch_probe() -> i64 {{",
+        "    let res = orbital_score(6)",
+        "    res",
+        "}}",
+    ].join("\n") ++ "\n"
+    let ns_file = path.join(nessa_src, "lib.ns")
+    let _ = fs.write_string(ns_file, ns_content) ! { e => panic("write lib.ns: " ++ e.to_string()) }
+
+    -- Python project with pyproject.toml + nested pkg/sub/worker.py
+    let _ = fs.write_string(
+        path.join(py_root, "pyproject.toml"),
+        "[project]\nname = \"demo_py\"\n",
+    ) ! { e => panic("write pyproject.toml: " ++ e.to_string()) }
+    let py_file = path.join(py_sub, "worker.py")
+    let _ = fs.write_string(py_file, "def run_task(x):\n    return x + 1\n") ! { e => panic("write worker.py: " ++ e.to_string()) }
+
+    (base, bin_dir, rust_root, rs_file, nessa_root, ns_file)
+}
+
+fn main() {
+    let (base_dir, bin_dir, rust_root, rs_file, nessa_root, ns_file) = setup_temp_projects()
+    let py_root = path.join(base_dir, "py_proj")
+    let py_file = path.join(path.join(path.join(py_root, "pkg"), "sub"), "worker.py")
+
+    -- ========================================================================
+    -- SUITE A: 18 Presets, Root Marker Detection, `$PATH` Scan & Dashboard UI
+    -- ========================================================================
+    let kernel = boot_full_lsp_kernel(false)
+    let world = require_editor_world(kernel) ! { e => panic(e) }
+    let wm = require_window_manager(kernel) ! { e => panic(e) }
+    let lsp_svc = require_lsp_service(kernel) ! { e => panic(e) }
+    let reg = require_lspconfig_registry(kernel) ! { e => panic(e) }
+
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let _cap = TestHostCap.new(world)
+
+    -- 1. Verify all 18 language presets are registered out-of-the-box
+    check_eq_i64(reg.preset_count(), 18, "all 18 built-in language server presets registered")
+    let expected_ids = [
+        "nessa", "rust", "python", "ts_ls", "clangd", "gopls",
+        "lua_ls", "zls", "bashls", "jsonls", "taplo", "yamlls",
+        "marksman", "html", "cssls", "jdtls", "ruby_lsp", "nil_ls"
+    ]
+    for i in 0..expected_ids.len() {
+        let sid = expected_ids.get(i.as(usize)).as(String)
+        check_true(reg.get_preset(sid) != null, "preset exists: " ++ sid)
+        check_true(lsp_svc.get_server_spec(sid) != null, "LspService spec synced: " ++ sid)
+    }
+
+    -- Verify project root marker walking (`Cargo.toml`, `package.toml`, `pyproject.toml`)
+    check_eq_str(
+        reg.resolve_root_for_preset(rs_file, "/tmp", "rust"),
+        path.normalize(rust_root),
+        "Cargo.toml root marker resolved from nested src/lib.rs",
+    )
+    check_eq_str(
+        reg.resolve_root_for_preset(ns_file, "/tmp", "nessa"),
+        path.normalize(nessa_root),
+        "package.toml root marker resolved from nested src/lib.ns",
+    )
+    check_eq_str(
+        reg.resolve_root_for_preset(py_file, "/tmp", "python"),
+        path.normalize(py_root),
+        "pyproject.toml root marker resolved from nested pkg/sub/worker.py",
+    )
+
+    -- Deterministic `$PATH` scanning + `configure_lsp_server` with mock executable in `bin_dir`
+    reg.prepend_search_path(lsp_svc, bin_dir)
+    configure_lsp_server(
+        kernel,
+        "rust",
+        "mock-rust-lsp",
+        ["--stdio"],
+        ["Cargo.toml", "rust-project.json"],
+        "{{\"checkOnSave\":true}}",
+    ) ! { e => panic("configure_lsp_server: " ++ e) }
+
+    let rust_preset = reg.get_preset("rust").as(LspLanguagePreset)
+    check_eq_bool(rust_preset.installed, true, "mock-rust-lsp detected as installed in search path")
+    check_eq_str(
+        rust_preset.resolved_path,
+        path.join(bin_dir, "mock-rust-lsp"),
+        "resolved executable path matches mock binary",
+    )
+
+    -- Verify `set_lsp_auto_attach` toggle
+    set_lsp_auto_attach(kernel, false) ! { e => panic(e) }
+    check_eq_bool(reg.auto_attach, false, "auto_attach disabled")
+    set_lsp_auto_attach(kernel, true) ! { e => panic(e) }
+    check_eq_bool(reg.auto_attach, true, "auto_attach re-enabled")
+
+    -- Open Rust file buffer and verify auto-attach + statusline badge
+    world.cwd = rust_root
+    let rbuf = world.open_file(rs_file)# ! { e => panic("open lib.rs: " ++ e) }
+    kernel.emit_hook("buffer-opened", rbuf.id)
+    wm.sync_from_world(world)
+    check_eq_str(world.active_buffer().name, "lib.rs", "active buffer is lib.rs")
+    check_true(
+        world.statusline_right_extra.contains("[LSP: mock-rust-lsp]"),
+        "statusline shows attached [LSP: mock-rust-lsp], got: " ++ world.statusline_right_extra,
+    )
+    check_eq_i64(lsp_svc.active_clients_for_buffer(rbuf.id).len(), 1, "active client attached to lib.rs")
+
+    -- 2. `:Mason` / `:LspConfig` (`<Space> c m`) dashboard + interactive `i`, `r`, `<Return>`, `q`
+    feed(kernel, ":Mason<Return>")#
+    check_eq_str(world.active_buffer().name, LSPCONFIG_BUF_NAME, ":Mason opens *LspConfig*")
+    let dash_buf = world.active_buffer()
+    let dash_txt = dash_buf.to_text()
+    check_true(dash_txt.contains("18 installed") or dash_txt.contains("/18 installed"), "dashboard header shows /18 presets")
+    check_true(dash_txt.contains("[INSTALLED ✓]"), "dashboard shows [INSTALLED ✓] for mock-rust-lsp")
+    check_true(dash_txt.contains("[MISSING ○]"), "dashboard shows [MISSING ○] for uninstalled servers")
+    check_true(dash_txt.contains("Nessa (nessa)"), "dashboard lists Nessa")
+    check_true(dash_txt.contains("Nix (nil_ls)"), "dashboard lists 18th preset Nix")
+
+    -- Move to Nessa row (row 5) and press `i` to copy install hint to clipboard
+    dash_buf.point = Pos.new(5, 0)
+    feed(kernel, "i")#
+    let copied_hint = host_clipboard_get()
+    check_true(copied_hint.contains("nessa-lsp"), "`i` copied Nessa install hint to clipboard: " ++ copied_hint)
+
+    -- Press `r` to refresh `$PATH` detection and `<Return>` to attach, then `q` to close
+    feed(kernel, "r")#
+    check_true(world.status_message.contains("Refreshed $PATH"), "`r` refreshed $PATH scan")
+    let rust_row = find_line_with(dash_buf, "Rust (rust)")
+    check_true(rust_row >= 0, "found Rust row in *LspConfig*")
+    dash_buf.point = Pos.new(rust_row, 0)
+    feed(kernel, "<Return>")#
+    feed(kernel, "q")#
+    check_eq_str(world.active_buffer().name, "lib.rs", "`q` closes *LspConfig* back to lib.rs")
+
+    -- Verify `<Space> l` STILL triggers `ext_lazy` (`*Lazy*`) with zero keymap collision!
+    feed(kernel, "<Space>l")#
+    check_eq_str(world.active_buffer().name, "*Lazy*", "<Space> l still opens *Lazy* without collision")
+    feed(kernel, "q")#
+    check_eq_str(world.active_buffer().name, "lib.rs", "closed *Lazy* back to lib.rs")
+
+    -- Verify `<Space> c L` opens `*LspConfig*` via leader chord
+    feed(kernel, "<Space>cL")#
+    check_eq_str(world.active_buffer().name, LSPCONFIG_BUF_NAME, "<Space> c L opens *LspConfig*")
+    feed(kernel, "q")#
+    check_eq_str(world.active_buffer().name, "lib.rs", "back to lib.rs")
+
+    -- ========================================================================
+    -- 3. `:LspInfo` (`<Space> c l`) & `:LspLog` Inspection
+    -- ========================================================================
+    feed(kernel, "<Space>cl")#
+    check_eq_str(world.active_buffer().name, LSP_INFO_BUF_NAME, "<Space> c l opens *LspInfo*")
+    let info_txt = world.active_buffer().to_text()
+    check_true(info_txt.contains(path.normalize(rust_root)), "*LspInfo* shows detected Cargo.toml root_dir")
+    check_true(info_txt.contains("mock-rust-lsp"), "*LspInfo* shows attached server name")
+    feed(kernel, "q")#
+    check_eq_str(world.active_buffer().name, "lib.rs", "`q` closes *LspInfo* back to lib.rs")
+
+    feed(kernel, ":LspLog<Return>")#
+    check_eq_str(world.active_buffer().name, LSP_LOG_BUF_NAME, ":LspLog opens *LspLog*")
+    feed(kernel, "q")#
+    check_eq_str(world.active_buffer().name, "lib.rs", "`q` closes *LspLog* back to lib.rs")
+
+    -- ========================================================================
+    -- 4. End-to-End Code Intelligence (`gd`, `<C-o>`, `gI`, `gy`, `gr`,
+    --    `:LspHover`, `<Space>rn`, `<Space>ca`, `<Space>cS`, `]e`/`[e`, `cmp`)
+    -- ========================================================================
+    -- 4a. `gd` (`lsp-definition`) on `compute_velocity(cfg, 10)` at line 28 -> jumps to `pub fn compute_velocity` (line 17)
+    let call_row = find_line_with(rbuf, "let first = compute_velocity(")
+    check_true(call_row >= 0, "found call_row in lib.rs")
+    let call_col = rbuf.line_at(call_row).find_indices("compute_velocity").get(0).as(i64)
+    rbuf.point = Pos.new(call_row, call_col)
+    wm.sync_from_world(world)
+
+    feed(kernel, "gd")#
+    let def_row = find_line_with(rbuf, "pub fn compute_velocity(")
+    check_eq_i64(rbuf.point.row, def_row, "`gd` jumped to `pub fn compute_velocity` definition")
+
+    -- `<C-o>` jumps right back to the call site!
+    feed(kernel, "<C-o>")#
+    check_eq_i64(rbuf.point.row, call_row, "`<C-o>` returned from definition to call site")
+
+    -- 4b. `gy` (`lsp-type-definition`) on `cfg` in `let cfg: EngineConfig = ...` -> jumps to `pub struct EngineConfig`
+    let cfg_row = find_line_with(rbuf, "let cfg: EngineConfig")
+    let cfg_col = rbuf.line_at(cfg_row).find_indices("cfg").get(0).as(i64)
+    rbuf.point = Pos.new(cfg_row, cfg_col)
+    feed(kernel, "gy")#
+    let struct_row = find_line_with(rbuf, "pub struct EngineConfig")
+    check_eq_i64(rbuf.point.row, struct_row, "`gy` jumped to `pub struct EngineConfig`")
+
+    -- 4c. `gI` (uppercase `I`, `lsp-implementation`) on `EngineConfig` -> jumps to `impl EngineConfig`
+    let impl_row = find_line_with(rbuf, "impl EngineConfig")
+    let ec_col = rbuf.line_at(struct_row).find_indices("EngineConfig").get(0).as(i64)
+    rbuf.point = Pos.new(struct_row, ec_col)
+    feed(kernel, "gI")#
+    check_eq_i64(rbuf.point.row, impl_row, "`gI` jumped to `impl EngineConfig`")
+
+    -- 4d. `gr` (`lsp-references`) on `compute_velocity` -> populates `world.quickfix` & `*LSP References*`
+    rbuf.point = Pos.new(def_row, rbuf.line_at(def_row).find_indices("compute_velocity").get(0).as(i64))
+    feed(kernel, "gr")#
+    check_eq_str(world.active_buffer().name, LSP_REFS_BUF_NAME, "`gr` opens *LSP References*")
+    -- Note whole-word boundary: `compute_velocity_helper` is NOT counted as `compute_velocity`!
+    check_eq_i64(world.quickfix.len(), 2, "`gr` found exact 2 whole-word references to `compute_velocity`")
+    feed(kernel, "q")#
+    check_eq_str(world.active_buffer().name, "lib.rs", "`q` closes *LSP References*")
+
+    -- 4e. `:LspHover` (and standalone `K` without `ext_help`) -> opens `*lsp-hover*` FloatingWindow with signature + docs
+    rbuf.point = Pos.new(call_row, call_col)
+    feed(kernel, "K")#
+    let fw_opt = world.get_floating_window(LSP_HOVER_FLOAT_ID)
+    check_true(fw_opt != null, "standalone `K` opens `*lsp-hover*` FloatingWindow")
+    let fw = fw_opt.as(FloatingWindow)
+    let fw_text = fw.lines.join("\n")
+    check_true(fw_text.contains("pub fn compute_velocity"), "`*lsp-hover*` shows function signature")
+    check_true(fw_text.contains("Computes calibrated velocity"), "`*lsp-hover*` shows doc comment")
+    -- Dismiss on `<Escape>`
+    feed(kernel, "<Escape>")#
+    check_true(world.get_floating_window(LSP_HOVER_FLOAT_ID) == null, "`<Escape>` dismisses `*lsp-hover*`")
+
+    -- 4f. `<Space> r n` / `:LspRename` renames `compute_velocity` -> `calc_velocity` whole-word ONLY!
+    rbuf.point = Pos.new(call_row, call_col)
+    feed(kernel, "<Space>rn")#
+    check_true(kernel.active_prompt != null, "`<Space> r n` opened minibuffer rename prompt")
+    feed(kernel, "<C-u>calc_velocity<Return>")#
+    let renamed_txt = rbuf.to_text()
+    check_true(renamed_txt.contains("pub fn calc_velocity("), "definition renamed to `calc_velocity`")
+    check_true(renamed_txt.contains("let first = calc_velocity(cfg, 10);"), "call site renamed to `calc_velocity`")
+    check_true(
+        renamed_txt.contains("fn compute_velocity_helper("),
+        "whole-word rename preserved `compute_velocity_helper` intact!",
+    )
+
+    -- 4g. `:LspCodeAction` / `<Space> c a` applies quick-fixes (prefix `_`, trim trailing spaces, sort `use` lines)
+    let unused_row = find_line_with(rbuf, "let unused_counter")
+    let unused_col = rbuf.line_at(unused_row).find_indices("unused_counter").get(0).as(i64)
+    rbuf.point = Pos.new(unused_row, unused_col)
+    feed(kernel, "<Space>ca")#
+    check_true(kernel.active_prompt != null, "`<Space> c a` opened Code Action picker")
+    feed(kernel, "Prefix<Return>")#
+    check_true(
+        rbuf.line_at(unused_row).contains("let _unused_counter"),
+        "code action prefixed `unused_counter` with `_`",
+    )
+    feed(kernel, ":LspCodeAction<Space>trim_line_ws<Return>")#
+    check_true(
+        not rbuf.line_at(unused_row).ends_with(" "),
+        "code action trimmed trailing whitespace on line",
+    )
+    feed(kernel, ":LspCodeAction<Space>sort_imports<Return>")#
+    check_eq_str(rbuf.line_at(0), "use std::cmp::Ordering;", "organize imports sorted 1st `use`")
+    check_eq_str(rbuf.line_at(1), "use std::collections::HashMap;", "organize imports sorted 2nd `use`")
+    check_eq_str(rbuf.line_at(2), "use std::fmt::Display;", "organize imports sorted 3rd `use`")
+
+    -- 4h. `:LspSymbols` / `<Space> c S` lists document symbols and jumps to selected symbol
+    rbuf.point = Pos.zero()
+    feed(kernel, "<Space>cS")#
+    check_true(kernel.active_prompt != null, "`<Space> c S` opened Document Symbols picker")
+    feed(kernel, "run_pipeline<Return>")#
+    let pipe_row = find_line_with(rbuf, "pub fn run_pipeline()")
+    check_eq_i64(rbuf.point.row, pipe_row, "Document Symbols jumped to `run_pipeline`")
+
+    -- 4i. Diagnostics decorations (no-bold rule!), statusline counts, and `]e` / `[e` / `<Space>cd`
+    lsp_svc.apply_buffer_diagnostics(
+        world,
+        rbuf,
+        [
+            LspDiag {
+                row: 5,
+                col: 4,
+                end_row: 5,
+                end_col: 16,
+                severity: "ERROR",
+                source: "rustc",
+                code: "E0412",
+                message: "cannot find type `MissingWidget`",
+            },
+            LspDiag {
+                row: 18,
+                col: 8,
+                end_row: 18,
+                end_col: 23,
+                severity: "WARN",
+                source: "clippy",
+                code: "unused_variables",
+                message: "unused variable `_unused_counter`",
+            }
+        ],
+    )
+    check_true(
+        world.statusline_right_extra.contains("E:1 W:1"),
+        "statusline shows E:1 W:1 diagnostic counts: " ++ world.statusline_right_extra,
+    )
+    check_eq_i64(rbuf.signs.len(), 2, "2 gutter diagnostic signs added")
+    for di in 0..rbuf.inline_decors.len() {
+        let dec = rbuf.inline_decors.get(di.as(usize)).as(InlineSpanDecor)
+        check_true(dec.replace_label != "bold", "no bold replace_label on LSP inline decor")
+        check_true(not dec.owner.contains("bold"), "no bold in LSP decor owner")
+    }
+    rbuf.point = Pos.zero()
+    feed(kernel, "]e")#
+    check_eq_i64(rbuf.point.row, 5, "`]e` jumped to first diagnostic at row 5")
+    feed(kernel, "]e")#
+    check_eq_i64(rbuf.point.row, 18, "second `]e` jumped to diagnostic at row 18")
+    feed(kernel, "[e")#
+    check_eq_i64(rbuf.point.row, 5, "`[e` jumped back to diagnostic at row 5")
+    feed(kernel, "<Space>cd")#
+    check_true(world.get_floating_window(LSP_HOVER_FLOAT_ID) != null, "`<Space>cd` opened line diagnostics float")
+    feed(kernel, "<Escape>")#
+
+    -- 4j. Verify `"lsp"` completion source registered with `ext_cmp` (`SERVICE_CMP`)
+    check_true(kernel.service(SERVICE_CMP) != null, "SERVICE_CMP active")
+    let cmp_items = collect_candidates(kernel, world, rbuf, "calc_vel")
+    var found_cmp = false
+    for ci in 0..cmp_items.len() {
+        let item = cmp_items.get(ci.as(usize)).as(CompletionItem)
+        if item.label == "calc_velocity" {
+            found_cmp = true
+        }
+    }
+    check_true(found_cmp, "`ext_cmp` returns `calc_velocity` from LSP/buffer completion source")
+
+    -- ========================================================================
+    -- 5. Harmony Check: `ext_help` + `ext_lsp` + `ext_lspconfig` Together!
+    --    Pressing `K` on `.ns` buffer with no external LSP process opens `*Help*`,
+    --    while `:LspHover` opens `*lsp-hover*` FloatingWindow!
+    -- ========================================================================
+    let kernel2 = boot_full_lsp_kernel(true)
+    let world2 = require_editor_world(kernel2) ! { e => panic(e) }
+    let wm2 = require_window_manager(kernel2) ! { e => panic(e) }
+    let help_state = require_help_state(kernel2) ! { e => panic(e) }
+    help_state.override_code_roots = [path.join(nessa_root, "src")]
+
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let _cap2 = TestHostCap.new(world2)
+
+    world2.cwd = nessa_root
+    let nbuf = world2.open_file(ns_file)# ! { e => panic("open lib.ns: " ++ e) }
+    kernel2.emit_hook("buffer-opened", nbuf.id)
+    wm2.sync_from_world(world2)
+    check_true(
+        world2.statusline_right_extra.contains("[LSP: "),
+        "Nessa buffer auto-attached LSP statusline badge: " ++ world2.statusline_right_extra,
+    )
+
+    let ns_call_row = find_line_with(nbuf, "let res = orbital_score(6)")
+    let ns_call_col = nbuf.line_at(ns_call_row).find_indices("orbital_score").get(0).as(i64)
+    nbuf.point = Pos.new(ns_call_row, ns_call_col)
+    wm2.sync_from_world(world2)
+
+    -- Press `K`: since no external live LSP server hover is running, delegates cleanly to `helpful-at-point` -> `*Help*`!
+    feed(kernel2, "K")#
+    check_eq_str(
+        world2.active_buffer().name,
+        HELP_BUF_NAME,
+        "Harmony: `K` opens `*Help*` (`helpful-at-point`) when `ext_help` is active and no external LSP server is running",
+    )
+    check_true(
+        world2.active_buffer().to_text().contains("orbital_score"),
+        "`*Help*` buffer introspected `orbital_score`",
+    )
+    feed(kernel2, "q")#
+    check_eq_str(world2.active_buffer().name, "lib.ns", "closed `*Help*` back to lib.ns")
+
+    -- Invoke `:LspHover`: explicitly opens `*lsp-hover*` FloatingWindow even with `ext_help` active!
+    nbuf.point = Pos.new(ns_call_row, ns_call_col)
+    feed(kernel2, ":LspHover<Return>")#
+    let ns_fw_opt = world2.get_floating_window(LSP_HOVER_FLOAT_ID)
+    check_true(ns_fw_opt != null, "`:LspHover` opens `*lsp-hover*` FloatingWindow alongside `ext_help`")
+    let ns_fw_txt = ns_fw_opt.as(FloatingWindow).lines.join("\n")
+    check_true(ns_fw_txt.contains("pub fn orbital_score"), "`*lsp-hover*` shows Nessa signature")
+    check_true(ns_fw_txt.contains("Evaluates orbital harmonic score"), "`*lsp-hover*` shows Nessa `--` doc comment")
+
+    -- Clean up temp fixture directory
+    let _ = fs.remove_dir_all(base_dir) ! { _ => () }
+
+    println("PASS: test_lsp_and_lspconfig — all 18 presets, $PATH scanner, *LspConfig*/*LspInfo*, gd/gI/gy/gr/Hover/Rename/CodeAction/Symbols/Diagnostics/Cmp & K-Help harmony verified!")
+}

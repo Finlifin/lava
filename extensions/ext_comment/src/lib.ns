@@ -1,0 +1,495 @@
+-- ext_comment: Language-Aware Line & Block Commenting Extension (`lava.org/ext_comment`) for Lava.
+-- Implements `gcc` / `<Space> /` (`comment-toggle-line`), Visual `gc` (`comment-toggle-visual`),
+-- and `gbc` (`comment-toggle-block`) with shared minimum-indentation alignment and single-step undo.
+
+use @lava_core.{
+    ExtId, InteractiveEffects, KeyBindingEntry, Keymap, SystemKernel
+}
+use @ext_document.{
+    Buffer, Pos, Span, ext_document_id, require_editor_world
+}
+use @ext_vim.{
+    KEYMAP_VIM_LEADER, KEYMAP_VIM_NORMAL, KEYMAP_VIM_VISUAL, VimMode, ext_vim_id,
+    require_vim_state, sync_world_from_vim
+}
+
+pub fn ext_comment_id() -> ExtId = ExtId("lava.org/ext_comment")
+
+-- ============================================================================
+-- 1. Major-Mode Comment Syntax Table
+-- ============================================================================
+
+pub struct CommentSyntax {
+    pub line_prefix: String,
+    pub line_suffix: String,
+    pub block_open: String,
+    pub block_close: String,
+}
+
+pub fn comment_syntax_for_mode(major_mode: String) -> CommentSyntax {
+    let m = major_mode.to_lower()
+    if m == "nessa" or m == "lua" or m == "sql" or m == "haskell" {
+        return (CommentSyntax {
+            line_prefix: "-- ",
+            line_suffix: "",
+            block_open: "--[[ ",
+            block_close: " ]]",
+        })
+    }
+    if m == "rust"
+        or m == "c"
+        or m == "cpp"
+        or m == "go"
+        or m == "javascript"
+        or m == "typescript"
+        or m == "java" {
+        return (CommentSyntax {
+            line_prefix: "// ",
+            line_suffix: "",
+            block_open: "/* ",
+            block_close: " */",
+        })
+    }
+    if m == "python"
+        or m == "sh"
+        or m == "shell"
+        or m == "toml"
+        or m == "yaml"
+        or m == "makefile"
+        or m == "conf" {
+        return (CommentSyntax {
+            line_prefix: "# ",
+            line_suffix: "",
+            block_open: "# ",
+            block_close: "",
+        })
+    }
+    if m == "lisp" or m == "elisp" or m == "scheme" {
+        return (CommentSyntax {
+            line_prefix: ";; ",
+            line_suffix: "",
+            block_open: "#| ",
+            block_close: " |#",
+        })
+    }
+    if m == "html" or m == "xml" or m == "markdown" {
+        return (CommentSyntax {
+            line_prefix: "<!-- ",
+            line_suffix: " -->",
+            block_open: "<!-- ",
+            block_close: " -->",
+        })
+    }
+    if m == "css" {
+        return (CommentSyntax {
+            line_prefix: "/* ",
+            line_suffix: " */",
+            block_open: "/* ",
+            block_close: " */",
+        })
+    }
+    CommentSyntax {
+        line_prefix: "# ",
+        line_suffix: "",
+        block_open: "# ",
+        block_close: "",
+    }
+}
+
+-- ============================================================================
+-- 2. Line Comment Toggle (`gcc`, `<Space> /`, Visual `gc`)
+-- ============================================================================
+
+fn is_line_commented(line: String, fnb: i64, bare_prefix: String, bare_suffix: String) -> bool {
+    let rest = line.slice(fnb, line.char_len())
+    if not rest.starts_with(bare_prefix) {
+        return false
+    }
+    if bare_suffix == "" {
+        return true
+    }
+    let trimmed = rest.trim_end()
+    trimmed.char_len() >= bare_prefix.char_len() + bare_suffix.char_len()
+        and trimmed.ends_with(bare_suffix)
+}
+
+fn uncomment_single_line(line: String, fnb: i64, syn: CommentSyntax) -> String {
+    let bare_prefix = syn.line_prefix.trim_end()
+    let bare_suffix = syn.line_suffix.trim_start()
+    let indent = line.slice(0, fnb)
+    var body = line.slice(fnb, line.char_len())
+
+    if body.starts_with(syn.line_prefix) {
+        body = body.drop(syn.line_prefix.char_len())
+    } else if body.starts_with(bare_prefix) {
+        body = body.drop(bare_prefix.char_len())
+    }
+
+    if bare_suffix != "" {
+        let trimmed = body.trim_end()
+        let trail_ws = body.slice(trimmed.char_len(), body.char_len())
+        var core = trimmed
+        if syn.line_suffix != "" and core.ends_with(syn.line_suffix) {
+            core = core.slice(0, core.char_len() - syn.line_suffix.char_len())
+        } else if core.ends_with(bare_suffix) {
+            core = core.slice(0, core.char_len() - bare_suffix.char_len())
+        }
+        body = core ++ trail_ws
+    }
+
+    indent ++ body
+}
+
+fn comment_single_line_at_col(line: String, indent_col: i64, syn: CommentSyntax) -> String {
+    let llen = line.char_len()
+    let safe_col = if indent_col <= llen { indent_col } else { llen }
+    let prefix_indent = line.slice(0, safe_col)
+    let after_indent = line.slice(safe_col, llen)
+    if syn.line_suffix == "" {
+        return prefix_indent ++ syn.line_prefix ++ after_indent
+    }
+    let trimmed_after = after_indent.trim_end()
+    let trail_ws = after_indent.slice(trimmed_after.char_len(), after_indent.char_len())
+    prefix_indent ++ syn.line_prefix ++ trimmed_after ++ syn.line_suffix ++ trail_ws
+}
+
+pub fn toggle_line_comments_range(
+    buf: Buffer,
+    start_row: i64,
+    end_row: i64,
+    checkpoint_label: String,
+) -> !String Unit {
+    buf.ensure_writable()!
+    let lo_bound = buf.min_row()
+    let hi_bound = buf.max_row()
+    let raw_lo = if start_row <= end_row { start_row } else { end_row }
+    let raw_hi = if start_row <= end_row { end_row } else { start_row }
+    let lo = if raw_lo < lo_bound { lo_bound } else if raw_lo > hi_bound { hi_bound } else { raw_lo }
+    let hi = if raw_hi < lo { lo } else if raw_hi > hi_bound { hi_bound } else { raw_hi }
+
+    let syn = comment_syntax_for_mode(buf.major_mode)
+    let bare_prefix = syn.line_prefix.trim_end()
+    let bare_suffix = syn.line_suffix.trim_start()
+
+    let non_blank_rows = List()
+    for r in lo..(hi + 1) {
+        if buf.line_at(r).trim() != "" {
+            non_blank_rows.push(r)
+        }
+    }
+
+    if non_blank_rows.is_empty() {
+        let cur_line = buf.line_at(lo)
+        let inserted = cur_line ++ syn.line_prefix ++ syn.line_suffix
+        buf.set_line_at(lo, inserted)
+        buf.modified = true
+        buf.point = buf.clamp_pos(Pos.new(lo, cur_line.char_len() + syn.line_prefix.char_len()), insert_mode = false)
+        buf.preferred_col = buf.point.col
+        buf.named_marks.insert(".", buf.point)
+        buf.checkpoint(buf.point, checkpoint_label)
+        return ()
+    }
+
+    var all_commented = true
+    var min_indent: i64 = -1
+    for i in 0..non_blank_rows.len() {
+        let r = non_blank_rows.get(i.as(usize)).as(i64)
+        let line = buf.line_at(r)
+        let fnb = buf.first_non_blank_col(r)
+        if min_indent < 0 or fnb < min_indent {
+            min_indent = fnb
+        }
+        if not is_line_commented(line, fnb, bare_prefix, bare_suffix) {
+            all_commented = false
+        }
+    }
+
+    let shared_col = if min_indent >= 0 { min_indent } else { 0 }
+    if all_commented {
+        for i in 0..non_blank_rows.len() {
+            let r = non_blank_rows.get(i.as(usize)).as(i64)
+            let line = buf.line_at(r)
+            let fnb = buf.first_non_blank_col(r)
+            buf.set_line_at(r, uncomment_single_line(line, fnb, syn))
+        }
+    } else {
+        for i in 0..non_blank_rows.len() {
+            let r = non_blank_rows.get(i.as(usize)).as(i64)
+            let line = buf.line_at(r)
+            buf.set_line_at(r, comment_single_line_at_col(line, shared_col, syn))
+        }
+    }
+
+    buf.modified = true
+    let dest_row = if buf.point.row < lo or buf.point.row > hi { lo } else { buf.point.row }
+    buf.point = buf.clamp_pos(Pos.new(dest_row, buf.first_non_blank_col(dest_row)), insert_mode = false)
+    buf.preferred_col = buf.point.col
+    buf.named_marks.insert(".", buf.point)
+    buf.checkpoint(buf.point, checkpoint_label)
+    ()
+}
+
+-- ============================================================================
+-- 3. Block Comment Toggle (`gbc`, Visual `gb`)
+-- ============================================================================
+
+pub fn toggle_block_comment_line(buf: Buffer, row: i64) -> !String Unit {
+    let syn = comment_syntax_for_mode(buf.major_mode)
+    if syn.block_close == "" {
+        return toggle_line_comments_range(buf, row, row, "comment-toggle-block")
+    }
+
+    buf.ensure_writable()!
+    let r = if row < buf.min_row() {
+        buf.min_row()
+    } else if row > buf.max_row() {
+        buf.max_row()
+    } else {
+        row
+    }
+    let line = buf.line_at(r)
+    if line.trim() == "" {
+        let updated = line ++ syn.block_open ++ syn.block_close
+        buf.set_line_at(r, updated)
+        buf.modified = true
+        buf.point = buf.clamp_pos(Pos.new(r, line.char_len() + syn.block_open.char_len()), insert_mode = false)
+        buf.preferred_col = buf.point.col
+        buf.named_marks.insert(".", buf.point)
+        buf.checkpoint(buf.point, "comment-toggle-block")
+        return ()
+    }
+
+    let fnb = buf.first_non_blank_col(r)
+    let indent = line.slice(0, fnb)
+    let rest = line.slice(fnb, line.char_len())
+    let trimmed = rest.trim_end()
+    let trail_ws = rest.slice(trimmed.char_len(), rest.char_len())
+
+    let bare_open = syn.block_open.trim_end()
+    let bare_close = syn.block_close.trim_start()
+    let already_wrapped = trimmed.char_len() >= bare_open.char_len() + bare_close.char_len()
+        and trimmed.starts_with(bare_open)
+        and trimmed.ends_with(bare_close)
+
+    if already_wrapped {
+        var inner = if trimmed.starts_with(syn.block_open) {
+            trimmed.drop(syn.block_open.char_len())
+        } else {
+            trimmed.drop(bare_open.char_len())
+        }
+        if inner.ends_with(syn.block_close) {
+            inner = inner.slice(0, inner.char_len() - syn.block_close.char_len())
+        } else if inner.ends_with(bare_close) {
+            inner = inner.slice(0, inner.char_len() - bare_close.char_len())
+        }
+        buf.set_line_at(r, indent ++ inner ++ trail_ws)
+    } else {
+        buf.set_line_at(r, indent ++ syn.block_open ++ trimmed ++ syn.block_close ++ trail_ws)
+    }
+
+    buf.modified = true
+    buf.point = buf.clamp_pos(Pos.new(r, buf.first_non_blank_col(r)), insert_mode = false)
+    buf.preferred_col = buf.point.col
+    buf.named_marks.insert(".", buf.point)
+    buf.checkpoint(buf.point, "comment-toggle-block")
+    ()
+}
+
+fn toggle_block_comment_span(buf: Buffer, span: Span) -> !String Unit {
+    let syn = comment_syntax_for_mode(buf.major_mode)
+    if syn.block_close == "" {
+        return toggle_line_comments_range(buf, span.start.row, span.end.row, "comment-toggle-block")
+    }
+    buf.ensure_writable()!
+    let norm = Span.normalized(
+        buf.clamp_pos(span.start, insert_mode = true),
+        buf.clamp_pos(span.end, insert_mode = true),
+    )
+    let selected = buf.extract_span(norm)
+    let bare_open = syn.block_open.trim_end()
+    let bare_close = syn.block_close.trim_start()
+    if selected.char_len() >= bare_open.char_len() + bare_close.char_len()
+        and selected.starts_with(bare_open)
+        and selected.ends_with(bare_close) {
+        var inner = if selected.starts_with(syn.block_open) {
+            selected.drop(syn.block_open.char_len())
+        } else {
+            selected.drop(bare_open.char_len())
+        }
+        if inner.ends_with(syn.block_close) {
+            inner = inner.slice(0, inner.char_len() - syn.block_close.char_len())
+        } else if inner.ends_with(bare_close) {
+            inner = inner.slice(0, inner.char_len() - bare_close.char_len())
+        }
+        let _ = buf.replace_span(norm, inner)!
+    } else {
+        let _ = buf.insert_text(norm.end, syn.block_close)!
+        let _ = buf.insert_text(norm.start, syn.block_open)!
+    }
+    buf.point = buf.clamp_pos(norm.start, insert_mode = false)
+    buf.preferred_col = buf.point.col
+    buf.named_marks.insert(".", buf.point)
+    buf.checkpoint(buf.point, "comment-toggle-block")
+    ()
+}
+
+-- ============================================================================
+-- 4. Extension Registration (`lava.org/ext_comment`)
+-- ============================================================================
+
+fn unbind_owner_from_keymaps(kernel: SystemKernel, owner: ExtId) {
+    for km_key in kernel.keymaps.keys() {
+        let km_name = km_key.as(String)
+        let km = kernel.keymaps.get(km_name).as(Keymap)
+        for chord_key in km.bindings.keys() {
+            let chord = chord_key.as(String)
+            let entry = km.bindings.get(chord).as(KeyBindingEntry)
+            if entry.owner == owner {
+                let _ = km.bindings.remove(chord)
+            }
+        }
+    }
+}
+
+pub fn register_comment_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_comment_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_comment",
+        "0.1.0",
+        "Language-aware line and block comment toggling (gcc, gc, gbc, <Space>/).",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let normal_km = k.ensure_keymap(KEYMAP_VIM_NORMAL)
+            normal_km.bind("g c c", "comment-toggle-line", ext_id, description = "Toggle line comment")
+            normal_km.bind("g b c", "comment-toggle-block", ext_id, description = "Toggle block comment")
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> /", "comment-toggle-line", ext_id, description = "Toggle line comment")
+
+            let visual_km = k.ensure_keymap(KEYMAP_VIM_VISUAL)
+            visual_km.bind("g c", "comment-toggle-visual", ext_id, description = "Toggle line comments on selection")
+            visual_km.bind("g b", "comment-toggle-block-visual", ext_id, description = "Toggle block comment on selection")
+
+            k.register_command(
+                "comment-toggle-line",
+                ext_id,
+                "Toggle line comment on current line(s) preserving shared minimum indentation.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let vim = require_vim_state(kern)!
+                    let buf = world.active_buffer()
+                    var count = vim.effective_count()
+                    if not args.is_empty() {
+                        let parsed = args.get(0).as(String).trim().parse_i64()
+                        if parsed != null and parsed.as(i64) > 0 {
+                            count = parsed.as(i64)
+                        }
+                    }
+                    let start_r = buf.point.row
+                    let end_r = start_r + count - 1
+                    toggle_line_comments_range(buf, start_r, end_r, "comment-toggle-line")!
+                    vim.mode = VimMode.Normal
+                    vim.clear_transient()
+                    sync_world_from_vim(world, vim)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "comment-toggle-visual",
+                ext_id,
+                "Toggle line comments across active Visual selection (`gc`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let vim = require_vim_state(kern)!
+                    let buf = world.active_buffer()
+
+                    let a = vim.visual_anchor
+                    let b = buf.point
+                    let norm_marks = Span.normalized(a, b)
+                    buf.named_marks.insert("<", norm_marks.start)
+                    buf.named_marks.insert(">", norm_marks.end)
+
+                    let r1 = if a.row <= b.row { a.row } else { b.row }
+                    let r2 = if a.row <= b.row { b.row } else { a.row }
+
+                    vim.mode = VimMode.Normal
+                    vim.visual_dollar = false
+                    vim.recording_change = false
+                    vim.tentative_visual_change = false
+                    vim.change_strokes = List()
+                    vim.clear_transient()
+
+                    toggle_line_comments_range(buf, r1, r2, "comment-toggle-visual")!
+                    sync_world_from_vim(world, vim)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "comment-toggle-block",
+                ext_id,
+                "Toggle block comment wrapper around current line's non-blank span (`gbc`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let vim = require_vim_state(kern)!
+                    let buf = world.active_buffer()
+                    toggle_block_comment_line(buf, buf.point.row)!
+                    vim.mode = VimMode.Normal
+                    vim.clear_transient()
+                    sync_world_from_vim(world, vim)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "comment-toggle-block-visual",
+                ext_id,
+                "Toggle block comment wrapper around active Visual selection (`gb`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let vim = require_vim_state(kern)!
+                    let buf = world.active_buffer()
+
+                    let a = vim.visual_anchor
+                    let b = buf.point
+                    let norm_marks = Span.normalized(a, b)
+                    buf.named_marks.insert("<", norm_marks.start)
+                    buf.named_marks.insert(">", norm_marks.end)
+
+                    let sp = if vim.mode == VimMode.VisualLine {
+                        let r1 = if a.row <= b.row { a.row } else { b.row }
+                        let r2 = if a.row <= b.row { b.row } else { a.row }
+                        Span.normalized(
+                            Pos.new(r1, buf.first_non_blank_col(r1)),
+                            Pos.new(r2, buf.line_char_len(r2)),
+                        )
+                    } else {
+                        let lo = if a <= b { a } else { b }
+                        let hi = if a <= b { b } else { a }
+                        let hlen = buf.line_char_len(hi.row)
+                        Span.normalized(lo, Pos.new(hi.row, if hi.col < hlen { hi.col + 1 } else { hlen }))
+                    }
+
+                    vim.mode = VimMode.Normal
+                    vim.visual_dollar = false
+                    vim.recording_change = false
+                    vim.tentative_visual_change = false
+                    vim.change_strokes = List()
+                    vim.clear_transient()
+
+                    toggle_block_comment_span(buf, sp)!
+                    sync_world_from_vim(world, vim)
+                    ()
+                },
+            )
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            unbind_owner_from_keymaps(k, ext_id)
+            ()
+        },
+    )
+}

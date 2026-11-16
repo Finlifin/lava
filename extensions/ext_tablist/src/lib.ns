@@ -1,0 +1,348 @@
+-- ext_tablist: Vertical Tab & Buffer List Sidebar (`lava.org/ext_tablist`).
+-- Renders workspace tabs and open buffers vertically in `world.left_sidebar`.
+-- Closed by default (`visible = false`); toggle with `tablist-toggle` (`<Space> b t` / `<Space> t l` / `:tablist`).
+
+use @lava_core.{ExtId, InteractiveEffects, SystemKernel, status_emit}
+use @ext_document.{Buffer, BufferId, EditorWorld, SidebarPanel, ext_document_id, require_editor_world}
+use @ext_window.{
+    TabWorkspace, WindowManager, WindowPane, ext_window_id, require_window_manager
+}
+use @ext_vim.{KEYMAP_VIM_LEADER, ext_vim_id}
+
+pub const SERVICE_TABLIST: String = "lava.tablist.state"
+pub const OWNER_TABLIST: String = "ext_tablist"
+pub const TABLIST_SIDEBAR_TITLE: String = "Tablist"
+pub const TABLIST_SIDEBAR_WIDTH: i64 = 28
+
+pub fn ext_tablist_id() -> ExtId = ExtId("lava.org/ext_tablist")
+
+pub struct TablistEntry {
+    pub kind: String,
+    pub tab_idx: i64,
+    pub buffer_id: BufferId,
+}
+
+pub struct TablistService {
+    pub entries: List,
+    pub width_cols: i64,
+}
+
+impl TablistService {
+    pub fn new() -> TablistService {
+        TablistService {
+            entries: List(),
+            width_cols: TABLIST_SIDEBAR_WIDTH,
+        }
+    }
+}
+
+pub fn require_tablist_service(kernel: SystemKernel) -> !String TablistService {
+    let s_opt? = kernel.service(SERVICE_TABLIST) else {
+        return error ("Service '" ++ SERVICE_TABLIST ++ "' is not registered")
+    }
+    s_opt.as(TablistService)
+}
+
+pub fn is_tablist_open(world: EditorWorld) -> bool {
+    world.left_sidebar.visible and world.left_sidebar.owner == OWNER_TABLIST
+}
+
+pub fn refresh_tablist(world: EditorWorld, wm: WindowManager, svc: TablistService) {
+    if not is_tablist_open(world) {
+        return
+    }
+
+    let lines = List()
+    let entries = List()
+    var active_row: i64 = 0
+    var found_active = false
+
+    let tcount = wm.tabs.len()
+    if tcount > 1 {
+        lines.push("▾ TABS (" ++ tcount.to_string() ++ ")")
+        entries.push(TablistEntry {
+            kind: "header",
+            tab_idx: -1,
+            buffer_id: world.active_buffer_id,
+        })
+        for i in 0..tcount {
+            let tab = wm.tabs.get(i.as(usize)).as(TabWorkspace)
+            let is_active = i == wm.active_tab_idx
+            let pane_opt = wm.panes.get(tab.active_win_id)
+            var label = tab.title
+            var tab_buf_id = world.active_buffer_id
+            if pane_opt != null {
+                let p = pane_opt.as(WindowPane)
+                tab_buf_id = p.buffer_id
+                let b_opt = world.buffer(p.buffer_id)
+                if b_opt != null {
+                    let b = b_opt.as(Buffer)
+                    label = b.name ++ (if b.modified { " [+]" } else { "" })
+                }
+            }
+            let prefix = if is_active { "● " } else { "  " }
+            if is_active and (not found_active) {
+                active_row = lines.len()
+                found_active = true
+            }
+            lines.push(prefix ++ (i + 1).to_string() ++ ": " ++ label)
+            entries.push(TablistEntry {
+                kind: "tab",
+                tab_idx: i,
+                buffer_id: tab_buf_id,
+            })
+        }
+    }
+
+    let bcount = world.buffer_order.len()
+    lines.push("▾ BUFFERS (" ++ bcount.to_string() ++ ")")
+    entries.push(TablistEntry {
+        kind: "header",
+        tab_idx: -1,
+        buffer_id: world.active_buffer_id,
+    })
+    for i in 0..bcount {
+        let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+        let b_opt = world.buffer(bid)
+        if b_opt == null {
+            continue
+        }
+        let b = b_opt.as(Buffer)
+        let is_active = bid == world.active_buffer_id
+        let prefix = if is_active { "● " } else { "  " }
+        let mod_tag = if b.modified { " [+]" } else { "" }
+        if is_active and (not found_active) {
+            active_row = lines.len()
+            found_active = true
+        }
+        lines.push(prefix ++ (i + 1).to_string() ++ ": " ++ b.name ++ mod_tag)
+        entries.push(TablistEntry {
+            kind: "buffer",
+            tab_idx: -1,
+            buffer_id: bid,
+        })
+    }
+
+    svc.entries = entries
+    world.left_sidebar.lines = lines
+    world.left_sidebar.selected_row = active_row
+}
+
+pub fn open_tablist(world: EditorWorld, wm: WindowManager, svc: TablistService) {
+    let w = if world.left_sidebar.owner == OWNER_TABLIST and world.left_sidebar.width_cols >= 16 {
+        world.left_sidebar.width_cols
+    } else {
+        svc.width_cols
+    }
+    world.left_sidebar = SidebarPanel {
+        visible: true,
+        side: "left",
+        title: TABLIST_SIDEBAR_TITLE,
+        width_cols: w,
+        lines: List(),
+        selected_row: 0,
+        owner: OWNER_TABLIST,
+    }
+    refresh_tablist(world, wm, svc)
+    wm.sync_from_world(world)
+}
+
+pub fn close_tablist(world: EditorWorld, wm: WindowManager, svc: TablistService) {
+    if world.left_sidebar.owner == OWNER_TABLIST {
+        world.left_sidebar.visible = false
+        world.left_sidebar.owner = ""
+        world.left_sidebar.lines = List()
+    }
+    svc.entries = List()
+    wm.sync_from_world(world)
+}
+
+fn activate_tablist_row(
+    kern: SystemKernel,
+    world: EditorWorld,
+    wm: WindowManager,
+    svc: TablistService,
+    row_idx: i64,
+) -> bool {
+    if row_idx < 0 or row_idx >= svc.entries.len() {
+        return false
+    }
+    let entry = svc.entries.get(row_idx.as(usize)).as(TablistEntry)
+    if entry.kind == "tab" {
+        if entry.tab_idx >= 0 and entry.tab_idx < wm.tabs.len() {
+            wm.active_tab_idx = entry.tab_idx
+            wm.relayout(world)
+            wm.sync_to_world(world)
+            refresh_tablist(world, wm, svc)
+            kern.emit_hook("buffer-switched", world.active_buffer_id)
+            return true
+        }
+        return false
+    }
+    if entry.kind == "buffer" {
+        if world.switch_to_buffer(entry.buffer_id) {
+            wm.sync_from_world(world)
+            refresh_tablist(world, wm, svc)
+            kern.emit_hook("buffer-switched", world.active_buffer_id)
+            return true
+        }
+        return false
+    }
+    false
+}
+
+fn on_tablist_refresh_hook(k: SystemKernel, _payload: Any) {
+    let w_opt = k.service("lava.document.world")
+    let wm_opt = k.service("lava.window.manager")
+    let s_opt = k.service(SERVICE_TABLIST)
+    if w_opt == null or wm_opt == null or s_opt == null {
+        return
+    }
+    refresh_tablist(w_opt.as(EditorWorld), wm_opt.as(WindowManager), s_opt.as(TablistService))
+}
+
+fn on_tablist_sidebar_clicked(k: SystemKernel, payload: Any) {
+    let w_opt = k.service("lava.document.world")
+    let wm_opt = k.service("lava.window.manager")
+    let s_opt = k.service(SERVICE_TABLIST)
+    if w_opt == null or wm_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let wm = wm_opt.as(WindowManager)
+    let svc = s_opt.as(TablistService)
+    if not is_tablist_open(world) {
+        return
+    }
+    let (owner, row_idx) = payload.as((String, i64))
+    if owner != OWNER_TABLIST {
+        return
+    }
+    let _ = activate_tablist_row(k, world, wm, svc, row_idx)
+}
+
+pub fn register_tablist_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_tablist_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_tablist",
+        "0.1.0",
+        "Vertical Tab & Buffer list sidebar (closed by default).",
+        [ext_document_id(), ext_window_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let svc = TablistService.new()
+            k.publish_service(SERVICE_TABLIST, ext_id, svc)
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> b t", "tablist-toggle", ext_id, description = "Toggle vertical Tablist")
+            leader_km.bind("<Space> t l", "tablist-toggle", ext_id, description = "Toggle vertical Tablist")
+
+            k.register_command(
+                "tablist-toggle",
+                ext_id,
+                "Toggle vertical Tablist sidebar (closed by default).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let wm = require_window_manager(kern)!
+                    let s = require_tablist_service(kern)!
+                    if is_tablist_open(world) {
+                        close_tablist(world, wm, s)
+                        status_emit("Tablist closed")#
+                    } else {
+                        open_tablist(world, wm, s)
+                        status_emit("Tablist opened (" ++ s.entries.len().to_string() ++ " rows)")#
+                    }
+                    ()
+                },
+            )
+
+            k.register_command(
+                "tablist-open",
+                ext_id,
+                "Open vertical Tablist sidebar.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let wm = require_window_manager(kern)!
+                    let s = require_tablist_service(kern)!
+                    open_tablist(world, wm, s)
+                    status_emit("Tablist opened")#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "tablist-close",
+                ext_id,
+                "Close vertical Tablist sidebar.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let wm = require_window_manager(kern)!
+                    let s = require_tablist_service(kern)!
+                    close_tablist(world, wm, s)
+                    status_emit("Tablist closed")#
+                    ()
+                },
+            )
+
+            k.register_command(
+                "tablist",
+                ext_id,
+                "Control vertical Tablist sidebar (`:tablist [toggle|open|close]`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let wm = require_window_manager(kern)!
+                    let s = require_tablist_service(kern)!
+                    let sub = if args.is_empty() {
+                        "toggle"
+                    } else {
+                        args.get(0).as(String).trim().to_lower()
+                    }
+                    if sub == "close" {
+                        close_tablist(world, wm, s)
+                        status_emit("Tablist closed")#
+                        return ()
+                    }
+                    if sub == "open" or (not is_tablist_open(world)) {
+                        open_tablist(world, wm, s)
+                        status_emit("Tablist opened")#
+                    } else {
+                        close_tablist(world, wm, s)
+                        status_emit("Tablist closed")#
+                    }
+                    ()
+                },
+            )
+
+            k.register_command(
+                "tablist-refresh",
+                ext_id,
+                "Refresh vertical Tablist entries.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let world = require_editor_world(kern)!
+                    let wm = require_window_manager(kern)!
+                    let s = require_tablist_service(kern)!
+                    refresh_tablist(world, wm, s)
+                    ()
+                },
+            )
+
+            k.add_hook("sidebar-clicked", ext_id, on_tablist_sidebar_clicked)
+            k.add_hook("buffer-switched", ext_id, on_tablist_refresh_hook)
+            k.add_hook("buffer-opened", ext_id, on_tablist_refresh_hook)
+            k.add_hook("buffer-closed", ext_id, on_tablist_refresh_hook)
+            k.add_hook("buffer-saved", ext_id, on_tablist_refresh_hook)
+            k.add_hook("window-layout-changed", ext_id, on_tablist_refresh_hook)
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                let w = w_opt.as(EditorWorld)
+                w.clear_owner_ui(OWNER_TABLIST)
+            }
+            ()
+        },
+    )!
+    ()
+}

@@ -1,0 +1,1013 @@
+-- lava_core: Application-Model-Agnostic Programmable Runtime Kernel (Principles 1, 3, 4, 5, 6, 7).
+-- Provides Extension identity & topological lifecycle, Service Registry, Command & Hook buses,
+-- Algebraic Effect & Delimited-Continuation Prompt suspension/resumption, Async Effect contracts,
+-- Capability providers, canonical KeyStroke/Chord parsing, hierarchical Keymap tries, and Macro recording.
+
+use std.collections.{HashMap, Set}
+use std.string
+use @lava_sys.{
+    MOD_ALT, MOD_CTRL, MOD_SHIFT, MOD_SUPER, RawUiEvent, host_clipboard_get, host_clipboard_set,
+    host_spawn_job, host_wait_events
+}
+
+-- ============================================================================
+-- 1. Extension Identity & Lifecycle
+-- ============================================================================
+
+pub newtype ExtId = String
+derive Eq, PartialEq, Ord, PartialOrd, Display, Hash for ExtId
+
+impl ExtId {
+    pub fn raw(self) -> String {
+        let ExtId(s) = self
+        s
+    }
+}
+
+pub enum ExtState {
+    pub Registered,
+    pub Active,
+    pub Disabled,
+    pub Failed(reason: String),
+}
+derive Eq, PartialEq, Display for ExtState
+
+-- ============================================================================
+-- 2. Algebraic Effects, Continuation Prompts & Async Background Services
+-- ============================================================================
+
+pub enum PromptKind {
+    pub FreeText,
+    pub CommandName,
+    pub FilePath,
+    pub BufferName,
+    pub Choice,
+    pub Confirm,
+    pub SearchForward,
+    pub SearchBackward,
+    pub ExCommand,
+}
+derive Eq, PartialEq, Display for PromptKind
+
+pub struct PromptRequest {
+    pub label: String,
+    pub initial: String,
+    pub kind: PromptKind,
+    pub candidates: List,
+}
+
+impl PromptRequest {
+    pub fn text(label: String, initial: String) -> PromptRequest {
+        PromptRequest {
+            label: label,
+            initial: initial,
+            kind: PromptKind.FreeText,
+            candidates: List(),
+        }
+    }
+
+    pub fn with_candidates(label: String, initial: String, kind: PromptKind, candidates: List) -> PromptRequest {
+        PromptRequest {
+            label: label,
+            initial: initial,
+            kind: kind,
+            candidates: candidates,
+        }
+    }
+}
+
+pub struct BgJobSpec {
+    pub command: String,
+    pub cwd: String,
+    pub stdin_text: String,
+}
+
+pub struct BgJobResult {
+    pub job_id: i64,
+    pub ok: bool,
+    pub exit_code: i64,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+-- Synchronous & Continuation-capturing Effects
+pub effect log_event(level: String, source: String, message: String) -> Unit
+pub effect status_emit(message: String) -> Unit
+pub effect clipboard_get() -> String
+pub effect clipboard_set(text: String) -> Unit
+pub effect ask_prompt(req: PromptRequest, catch k) -> ?String
+
+-- Asynchronous Structured-Concurrency Effects (`Future(T)` + `.await`)
+pub async effect spawn_bg_job(req: BgJobSpec) -> BgJobResult
+pub async effect sleep_ticks(delay_ms: i64) -> i64
+
+pub const ServiceEffects = [log_event, status_emit, clipboard_get, clipboard_set]
+pub const InteractiveEffects = [log_event, status_emit, clipboard_get, clipboard_set, ask_prompt]
+
+pub enum PromptTurn {
+    pub Completed(value: Any),
+    pub Suspended(request: PromptRequest, cont: Continuation),
+}
+
+-- Execute an interactive computation that may suspend via `ask_prompt(req)#` one or more times!
+pub fn start_interactive_turn(thunk: fn() -> #ask_prompt Any) -> PromptTurn {
+    (PromptTurn.Completed(thunk()#)) # {
+        ask_prompt(req, k) => PromptTurn.Suspended(req, k),
+    }
+}
+
+-- Resume a previously suspended continuation with `?String` (`null` on `<C-g>` / `<Escape>` cancel).
+pub fn resume_interactive_turn(cont: Continuation, answer: ?String) -> PromptTurn {
+    cont(answer).as(PromptTurn)
+}
+
+-- Capability Providers using Nessa's first-class `handles(...)` methods
+pub struct HostClipboardCap {}
+
+impl HostClipboardCap {
+    pub fn read_clip(self) -> String handles(clipboard_get) {
+        host_clipboard_get()
+    }
+
+    pub fn write_clip(self, text: String) -> Unit handles(clipboard_set) {
+        host_clipboard_set(text)
+    }
+}
+
+pub struct LogRecord {
+    pub level: String,
+    pub source: String,
+    pub message: String,
+}
+
+pub struct LogCollectorCap {
+    pub entries: List,
+}
+
+impl LogCollectorCap {
+    pub fn new() -> LogCollectorCap {
+        LogCollectorCap { entries: List() }
+    }
+
+    pub fn record(self, level: String, source: String, message: String) -> Unit handles(log_event) {
+        self.entries.push(LogRecord {
+            level: level,
+            source: source,
+            message: message,
+        })
+    }
+}
+
+pub struct StatusCollectorCap {
+    pub latest: String,
+    pub history: List,
+}
+
+impl StatusCollectorCap {
+    pub fn new() -> StatusCollectorCap {
+        StatusCollectorCap {
+            latest: "",
+            history: List(),
+        }
+    }
+
+    pub fn emit(self, message: String) -> Unit handles(status_emit) {
+        self.latest = message
+        if message != "" {
+            self.history.push(message)
+        }
+    }
+}
+
+-- ============================================================================
+-- 3. Canonical KeyStrokes, Chords, Hierarchical Keymap Tries & Macro Recorder
+-- ============================================================================
+
+pub struct KeyStroke {
+    pub key: String,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift_mod: bool,
+    pub super_mod: bool,
+    pub text: String,
+}
+derive Eq, PartialEq, Hash for KeyStroke
+
+impl KeyStroke {
+    pub fn plain(ch: String) -> KeyStroke {
+        KeyStroke {
+            key: ch,
+            ctrl: false,
+            alt: false,
+            shift_mod: false,
+            super_mod: false,
+            text: if ch.len() == 1 { ch } else { "" },
+        }
+    }
+
+    pub fn from_raw_event(key: String, modifiers: i64, text: String) -> KeyStroke {
+        let ctrl = (modifiers / MOD_CTRL) % 2 == 1
+        let alt = (modifiers / MOD_ALT) % 2 == 1
+        var shift_mod = (modifiers / MOD_SHIFT) % 2 == 1
+        let super_mod = (modifiers / MOD_SUPER) % 2 == 1
+        var norm_key = key
+        if norm_key == " " {
+            norm_key = "Space"
+        }
+        -- Printable single ASCII uppercase or shifted punctuation already encodes shift in `key`.
+        if (not ctrl) and (not alt) and (not super_mod) and norm_key.char_len() == 1 {
+            shift_mod = false
+        }
+        KeyStroke {
+            key: norm_key,
+            ctrl: ctrl,
+            alt: alt,
+            shift_mod: shift_mod,
+            super_mod: super_mod,
+            text: text,
+        }
+    }
+
+    pub fn notation(self) -> String {
+        if (not self.ctrl) and (not self.alt) and (not self.shift_mod) and (not self.super_mod) {
+            if self.key.char_len() == 1 and self.key != "<" and self.key != ">" and self.key != " " {
+                return self.key
+            }
+            if self.key == "<" {
+                return "<lt>"
+            }
+            if self.key == ">" {
+                return "<gt>"
+            }
+            return "<" ++ self.key ++ ">"
+        }
+        var prefix = ""
+        if self.ctrl {
+            prefix = prefix ++ "C-"
+        }
+        if self.alt {
+            prefix = prefix ++ "M-"
+        }
+        if self.shift_mod {
+            prefix = prefix ++ "S-"
+        }
+        if self.super_mod {
+            prefix = prefix ++ "D-"
+        }
+        "<" ++ prefix ++ self.key ++ ">"
+    }
+}
+
+impl Display for KeyStroke {
+    pub fn to_string(self) -> String = self.notation()
+}
+
+-- Parse human-readable key specs such as:
+-- `"j"`, `"gg"`, `"ciw"`, `"<C-x> <C-f>"`, `"<M-x>"`, `"<Space> f f"`, `"<Escape>"`
+pub fn parse_key_sequence(spec: String) -> List {
+    let strokes = List()
+    let trimmed = spec.trim()
+    if trimmed == "" {
+        return strokes
+    }
+    let n = trimmed.char_len()
+    var i: i64 = 0
+    while i < n {
+        let ch = trimmed.slice(i, i + 1)
+        if ch == " " {
+            i += 1
+            continue
+        }
+        if ch == "<" {
+            var close_idx: i64 = -1
+            var j = i + 1
+            while j < n {
+                if trimmed.slice(j, j + 1) == ">" {
+                    close_idx = j
+                    break
+                }
+                j += 1
+            }
+            if close_idx > i + 1 {
+                let body = trimmed.slice(i + 1, close_idx)
+                strokes.push(parse_bracketed_stroke(body))
+                i = close_idx + 1
+                continue
+            }
+        }
+        strokes.push(KeyStroke.plain(ch))
+        i += 1
+    }
+    strokes
+}
+
+private fn parse_bracketed_stroke(body: String) -> KeyStroke {
+    if body == "lt" {
+        return KeyStroke.plain("<")
+    }
+    if body == "gt" {
+        return KeyStroke.plain(">")
+    }
+    if body == "Space" or body == "SPC" {
+        let sp = KeyStroke {
+            key: "Space",
+            ctrl: false,
+            alt: false,
+            shift_mod: false,
+            super_mod: false,
+            text: " ",
+        }
+        return sp
+    }
+    var rest = body
+    var ctrl = false
+    var alt = false
+    var shift_mod = false
+    var super_mod = false
+    while rest.char_len() >= 3 and rest.slice(1, 2) == "-" {
+        let p = rest.slice(0, 1)
+        let rlen = rest.char_len()
+        if p == "C" or p == "c" {
+            ctrl = true
+            rest = rest.slice(2, rlen)
+        } else if p == "M" or p == "m" or p == "A" or p == "a" {
+            alt = true
+            rest = rest.slice(2, rlen)
+        } else if p == "S" or p == "s" {
+            shift_mod = true
+            rest = rest.slice(2, rlen)
+        } else if p == "D" or p == "d" {
+            super_mod = true
+            rest = rest.slice(2, rlen)
+        } else {
+            break
+        }
+    }
+    if rest == "SPC" {
+        rest = "Space"
+    } else if rest == "RET" or rest == "CR" or rest == "Enter" {
+        rest = "Return"
+    } else if rest == "ESC" {
+        rest = "Escape"
+    } else if rest == "BS" {
+        rest = "BackSpace"
+    } else if rest == "TAB" {
+        rest = "Tab"
+    }
+    KeyStroke {
+        key: rest,
+        ctrl: ctrl,
+        alt: alt,
+        shift_mod: shift_mod,
+        super_mod: super_mod,
+        text: if (not ctrl) and (not alt) and (not super_mod) and rest == "Space" {
+            " "
+        } else {
+            ""
+        },
+    }
+}
+
+pub fn format_chord(strokes: List) -> String {
+    let n = strokes.len()
+    if n == 0 {
+        return ""
+    }
+    if n == 1 {
+        return strokes.get(0).as(KeyStroke).notation()
+    }
+    let parts = List()
+    for i in 0..n {
+        parts.push(strokes.get(i.as(usize)).as(KeyStroke).notation())
+    }
+    parts.join(" ")
+}
+
+private fn canonicalize_key_spec(spec: String) -> String {
+    if spec.char_len() == 1
+        and spec != " "
+        and spec != "<"
+        and spec != ">"
+        and spec != "\t"
+        and spec != "\n"
+        and spec != "\r" {
+        return spec
+    }
+    let seq = parse_key_sequence(spec)
+    if seq.is_empty() {
+        return ""
+    }
+    format_chord(seq)
+}
+
+pub struct KeyBindingEntry {
+    pub chord: String,
+    pub command_name: String,
+    pub owner: ExtId,
+    pub description: String,
+}
+
+pub enum KeyLookup {
+    pub Exact(command_name: String, owner: ExtId),
+    pub Prefix(hints: List),
+    pub Unbound,
+}
+
+pub struct Keymap {
+    pub name: String,
+    pub bindings: HashMap,
+    pub prefixes: HashMap,
+    pub parent: ?Keymap,
+}
+
+impl Keymap {
+    pub fn new(name: String, .parent: ?Keymap = null) -> Keymap {
+        Keymap {
+            name: name,
+            bindings: HashMap.new(),
+            prefixes: HashMap.new(),
+            parent: parent,
+        }
+    }
+
+    pub fn bind(self, spec: String, command_name: String, owner: ExtId, .description: String = "") {
+        let canon = canonicalize_key_spec(spec)
+        if canon == "" {
+            return
+        }
+        let entry = KeyBindingEntry {
+            chord: canon,
+            command_name: command_name,
+            owner: owner,
+            description: description,
+        }
+        self.bindings.insert(canon, entry)
+        if canon.contains(" ") {
+            let spaces = canon.find_indices(" ")
+            for i in 0..spaces.len() {
+                let idx = spaces.get(i.as(usize)).as(i64)
+                if idx > 0 {
+                    let pfx = canon.slice(0, idx)
+                    let sub_opt = self.prefixes.get(pfx)
+                    let sub_map = if sub_opt != null {
+                        sub_opt.as(HashMap)
+                    } else {
+                        let m = HashMap.new()
+                        self.prefixes.insert(pfx, m)
+                        m
+                    }
+                    sub_map.insert(canon, entry)
+                }
+            }
+        }
+    }
+
+    pub fn unbind(self, spec: String) -> bool {
+        let canon = canonicalize_key_spec(spec)
+        if canon == "" {
+            return false
+        }
+        let removed = self.bindings.remove(canon) != null
+        if removed and canon.contains(" ") {
+            let spaces = canon.find_indices(" ")
+            for i in 0..spaces.len() {
+                let idx = spaces.get(i.as(usize)).as(i64)
+                if idx > 0 {
+                    let pfx = canon.slice(0, idx)
+                    let sub_opt = self.prefixes.get(pfx)
+                    if sub_opt != null {
+                        let sub_map = sub_opt.as(HashMap)
+                        let _ = sub_map.remove(canon)
+                        if sub_map.is_empty() {
+                            let _ = self.prefixes.remove(pfx)
+                        }
+                    }
+                }
+            }
+        }
+        removed
+    }
+
+    pub fn lookup(self, strokes: List) -> KeyLookup {
+        if strokes.is_empty() {
+            return KeyLookup.Unbound
+        }
+        let canon = format_chord(strokes)
+        let exact_opt = self.bindings.get(canon)
+        if exact_opt != null {
+            let entry = exact_opt.as(KeyBindingEntry)
+            return KeyLookup.Exact(entry.command_name, entry.owner)
+        }
+        let pfx_opt = self.prefixes.get(canon)
+        if pfx_opt != null {
+            let sub_map = pfx_opt.as(HashMap)
+            let hints = List()
+            for k in sub_map.keys() {
+                let ks = k.as(String)
+                hints.push(sub_map.get(ks).as(KeyBindingEntry))
+            }
+            if not hints.is_empty() {
+                return KeyLookup.Prefix(hints)
+            }
+        }
+        let p? = self.parent else {
+            return KeyLookup.Unbound
+        }
+        p.lookup(strokes)
+    }
+
+    pub fn all_entries(self) -> List {
+        let out = List()
+        let seen = Set.new()
+        var cur: ?Keymap = self
+        while cur != null {
+            let km = cur.as(Keymap)
+            for k in km.bindings.keys() {
+                let ks = k.as(String)
+                if not seen.contains(ks) {
+                    seen.insert(ks)
+                    out.push(km.bindings.get(ks).as(KeyBindingEntry))
+                }
+            }
+            cur = km.parent
+        }
+        out
+    }
+}
+
+-- Keyboard Macro Recorder (`q<reg>`..`q`, `@<reg>`, `@@`, Emacs `C-x (`/`C-x )`/`C-x e`)
+pub struct MacroRecorder {
+    pub recording_reg: ?String,
+    pub buffer_strokes: List,
+    pub macros: HashMap,
+    pub last_played: ?String,
+}
+
+impl MacroRecorder {
+    pub fn new() -> MacroRecorder {
+        MacroRecorder {
+            recording_reg: null,
+            buffer_strokes: List(),
+            macros: HashMap.new(),
+            last_played: null,
+        }
+    }
+
+    pub fn is_recording(self) -> bool = self.recording_reg != null
+
+    pub fn start(self, reg_name: String) {
+        self.recording_reg = reg_name
+        self.buffer_strokes = List()
+    }
+
+    pub fn record_stroke(self, stroke: KeyStroke) {
+        if self.recording_reg != null {
+            self.buffer_strokes.push(stroke)
+        }
+    }
+
+    pub fn stop(self) -> ?String {
+        let reg? = self.recording_reg else {
+            return null
+        }
+        self.recording_reg = null
+        self.macros.insert(reg, self.buffer_strokes)
+        self.buffer_strokes = List()
+        reg
+    }
+
+    pub fn get_macro(self, reg_name: String) -> ?List {
+        let target = if reg_name == "@" {
+            let prev? = self.last_played else {
+                return null
+            }
+            prev
+        } else {
+            reg_name
+        }
+        let seq_any? = self.macros.get(target) else {
+            return null
+        }
+        self.last_played = target
+        seq_any.as(List)
+    }
+}
+
+-- ============================================================================
+-- 4. Services, Commands, Hooks & SystemKernel (Extension Composition Runtime)
+-- ============================================================================
+
+pub struct ServiceEntry {
+    pub name: String,
+    pub owner: ExtId,
+    pub provider: Any,
+}
+
+pub struct CommandSpec {
+    pub name: String,
+    pub owner: ExtId,
+    pub summary: String,
+    pub interactive: bool,
+    pub action: fn(SystemKernel, List) -> #InteractiveEffects !String Any,
+}
+
+pub struct HookListener {
+    pub owner: ExtId,
+    pub priority: i64,
+    pub callback: fn(SystemKernel, Any) -> Unit,
+}
+
+pub struct ExtensionRecord {
+    pub id: ExtId,
+    pub domain: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub dependencies: List,
+    pub state: ExtState,
+    pub on_activate: fn(SystemKernel) -> !String Unit,
+    pub on_deactivate: fn(SystemKernel) -> !String Unit,
+}
+
+private enum TurnEnvelope {
+    OkTurn(turn: PromptTurn),
+    ErrTurn(msg: String),
+}
+
+private fn run_action_envelope(
+    act: fn(SystemKernel, List) -> #InteractiveEffects !String Any,
+    kernel: SystemKernel,
+    args: List,
+) -> #InteractiveEffects TurnEnvelope {
+    let val = act(kernel, args)# ! {
+        err => return TurnEnvelope.ErrTurn(err),
+    }
+    TurnEnvelope.OkTurn(PromptTurn.Completed(val))
+}
+
+pub struct SystemKernel {
+    pub extensions: HashMap,
+    pub ext_order: List,
+    pub services: HashMap,
+    pub commands: HashMap,
+    pub hooks: HashMap,
+    pub keymaps: HashMap,
+    pub macros: MacroRecorder,
+    pub active_prompt: ?(PromptRequest, Continuation),
+    pub batch_activating: bool,
+}
+
+impl SystemKernel {
+    pub fn new() -> SystemKernel {
+        SystemKernel {
+            extensions: HashMap.new(),
+            ext_order: List(),
+            services: HashMap.new(),
+            commands: HashMap.new(),
+            hooks: HashMap.new(),
+            keymaps: HashMap.new(),
+            macros: MacroRecorder.new(),
+            active_prompt: null,
+            batch_activating: false,
+        }
+    }
+
+    -- Register an independent Extension entity with explicit identity and dependencies.
+    pub fn register_extension(
+        self,
+        id: ExtId,
+        domain: String,
+        name: String,
+        version: String,
+        description: String,
+        dependencies: List,
+        on_activate: fn(SystemKernel) -> !String Unit,
+        on_deactivate: fn(SystemKernel) -> !String Unit,
+    ) -> !String Unit {
+        if self.extensions.contains_key(id) {
+            return error ("duplicate extension id: " ++ id.to_string())
+        }
+        let rec = ExtensionRecord {
+            id: id,
+            domain: domain,
+            name: name,
+            version: version,
+            description: description,
+            dependencies: dependencies,
+            state: ExtState.Registered,
+            on_activate: on_activate,
+            on_deactivate: on_deactivate,
+        }
+        self.extensions.insert(id, rec)
+        self.ext_order.push(id)
+        ()
+    }
+
+    -- Topologically validate and activate an Extension and all its dependencies.
+    pub fn activate_extension(self, id: ExtId) -> !String Unit {
+        let visiting = Set.new()
+        self.activate_dfs(id, visiting)
+    }
+
+    private fn activate_dfs(self, id: ExtId, visiting: Set) -> !String Unit {
+        let rec_any? = self.extensions.get(id) else {
+            return error ("unknown extension dependency: " ++ id.to_string())
+        }
+        let rec = rec_any.as(ExtensionRecord)
+        if rec.state == ExtState.Active {
+            return ()
+        }
+        if visiting.contains(id) {
+            return error ("cyclic extension dependency involving: " ++ id.to_string())
+        }
+        visiting.insert(id)
+        let dep_count = rec.dependencies.len()
+        for i in 0..dep_count {
+            let dep_id = rec.dependencies.get(i.as(usize)).as(ExtId)
+            self.activate_dfs(dep_id, visiting)!
+        }
+        let _ = visiting.remove(id)
+        let activate_fn = rec.on_activate
+        activate_fn(self) ! {
+            err => {
+                rec.state = ExtState.Failed(err)
+                return error ("extension " ++ id.to_string() ++ " failed to activate: " ++ err)
+            },
+        }
+        rec.state = ExtState.Active
+        if not self.batch_activating {
+            self.emit_hook("extension-activated", id)
+        }
+        ()
+    }
+
+    pub fn activate_all(self) -> !String Unit {
+        let n = self.ext_order.len()
+        self.batch_activating = true
+        for i in 0..n {
+            let id = self.ext_order.get(i.as(usize)).as(ExtId)
+            let rec = self.extensions.get(id).as(ExtensionRecord)
+            if rec.state == ExtState.Registered {
+                self.activate_extension(id) ! {
+                    err => {
+                        self.batch_activating = false
+                        return error err
+                    },
+                }
+            }
+        }
+        self.batch_activating = false
+        if n > 0 {
+            let last_id = self.ext_order.get((n - 1).as(usize)).as(ExtId)
+            self.emit_hook("extension-activated", last_id)
+        }
+        ()
+    }
+
+    pub fn deactivate_extension(self, id: ExtId) -> !String Unit {
+        let rec_any? = self.extensions.get(id) else {
+            return error ("unknown extension: " ++ id.to_string())
+        }
+        let rec = rec_any.as(ExtensionRecord)
+        if rec.state != ExtState.Active {
+            return ()
+        }
+        -- Ensure no active extension still depends on `id`
+        let n = self.ext_order.len()
+        for i in 0..n {
+            let other_id = self.ext_order.get(i.as(usize)).as(ExtId)
+            if other_id == id {
+                continue
+            }
+            let other = self.extensions.get(other_id).as(ExtensionRecord)
+            if other.state == ExtState.Active {
+                let dc = other.dependencies.len()
+                for j in 0..dc {
+                    if other.dependencies.get(j.as(usize)).as(ExtId) == id {
+                        return error (
+                            "cannot deactivate " ++ id.to_string()
+                            ++ ": active extension " ++ other_id.to_string() ++ " depends on it"
+                        )
+                    }
+                }
+            }
+        }
+        let deactivate_fn = rec.on_deactivate
+        deactivate_fn(self)!
+        -- Clean up services & commands owned by `id`
+        for svc_key in self.services.keys() {
+            let sk = svc_key.as(String)
+            let entry = self.services.get(sk).as(ServiceEntry)
+            if entry.owner == id {
+                let _ = self.services.remove(sk)
+            }
+        }
+        for cmd_key in self.commands.keys() {
+            let ck = cmd_key.as(String)
+            let cspec = self.commands.get(ck).as(CommandSpec)
+            if cspec.owner == id {
+                let _ = self.commands.remove(ck)
+            }
+        }
+        rec.state = ExtState.Disabled
+        self.emit_hook("extension-deactivated", id)
+        ()
+    }
+
+    pub fn is_extension_active(self, id: ExtId) -> bool {
+        let rec_any? = self.extensions.get(id) else {
+            return false
+        }
+        rec_any.as(ExtensionRecord).state == ExtState.Active
+    }
+
+    pub fn list_extensions(self) -> List {
+        let out = List()
+        let n = self.ext_order.len()
+        for i in 0..n {
+            let id = self.ext_order.get(i.as(usize)).as(ExtId)
+            let rec_opt = self.extensions.get(id)
+            if rec_opt != null {
+                out.push(rec_opt.as(ExtensionRecord))
+            }
+        }
+        out
+    }
+
+    -- Services
+    pub fn publish_service(self, name: String, owner: ExtId, provider: Any) {
+        self.services.insert(
+            name,
+            ServiceEntry {
+                name: name,
+                owner: owner,
+                provider: provider,
+            },
+        )
+    }
+
+    pub fn service(self, name: String) -> ?Any {
+        let entry_any? = self.services.get(name) else {
+            return null
+        }
+        entry_any.as(ServiceEntry).provider
+    }
+
+    pub fn require_service(self, name: String) -> !String Any {
+        let svc? = self.service(name) else {
+            return error ("required service not available: " ++ name)
+        }
+        svc
+    }
+
+    -- Commands
+    pub fn register_command(
+        self,
+        name: String,
+        owner: ExtId,
+        summary: String,
+        action: fn(SystemKernel, List) -> #InteractiveEffects !String Any,
+        .interactive: bool = true,
+    ) {
+        self.commands.insert(
+            name,
+            CommandSpec {
+                name: name,
+                owner: owner,
+                summary: summary,
+                interactive: interactive,
+                action: action,
+            },
+        )
+    }
+
+    pub fn get_command(self, name: String) -> ?CommandSpec {
+        let c? = self.commands.get(name) else {
+            return null
+        }
+        c.as(CommandSpec)
+    }
+
+    pub fn list_commands(self, .interactive_only: bool = false) -> List {
+        let names = self.commands.keys()
+        names.sort()
+        let out = List()
+        let n = names.len()
+        for i in 0..n {
+            let k = names.get(i.as(usize)).as(String)
+            let spec = self.commands.get(k).as(CommandSpec)
+            if (not interactive_only) or spec.interactive {
+                out.push(spec)
+            }
+        }
+        out
+    }
+
+    -- Execute a registered command inside the continuation-aware prompt boundary!
+    pub fn dispatch_command(
+        self,
+        name: String,
+        args: List,
+    ) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String PromptTurn {
+        let spec? = self.get_command(name) else {
+            return error ("unknown command: " ++ name)
+        }
+        let kernel = self
+        let act = spec.action
+        let env_any = (run_action_envelope(act, kernel, args)#) # {
+            ask_prompt(req, k) => TurnEnvelope.OkTurn(PromptTurn.Suspended(req, k)),
+        }
+        let turn = env_any.as(TurnEnvelope) match {
+            TurnEnvelope.OkTurn(t) => t,
+            TurnEnvelope.ErrTurn(msg) => return error msg,
+        }
+        turn match {
+            PromptTurn.Suspended(req, k) => {
+                self.active_prompt = (req, k)
+                PromptTurn.Suspended(req, k)
+            },
+            PromptTurn.Completed(v) => {
+                self.active_prompt = null
+                PromptTurn.Completed(v)
+            },
+        }
+    }
+
+    pub fn submit_prompt_answer(
+        self,
+        answer: ?String,
+    ) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String PromptTurn {
+        let pending? = self.active_prompt else {
+            return PromptTurn.Completed(())
+        }
+        let (_, k) = pending
+        self.active_prompt = null
+        let env_any = k(answer)
+        let turn = env_any.as(TurnEnvelope) match {
+            TurnEnvelope.OkTurn(t) => t,
+            TurnEnvelope.ErrTurn(msg) => return error msg,
+        }
+        turn match {
+            PromptTurn.Suspended(next_req, next_k) => {
+                self.active_prompt = (next_req, next_k)
+                PromptTurn.Suspended(next_req, next_k)
+            },
+            PromptTurn.Completed(v) => {
+                self.active_prompt = null
+                PromptTurn.Completed(v)
+            },
+        }
+    }
+
+    -- Keymaps
+    pub fn ensure_keymap(self, name: String, .parent: ?Keymap = null) -> Keymap {
+        let existing? = self.keymaps.get(name) else {
+            let km = Keymap.new(name, parent = parent)
+            self.keymaps.insert(name, km)
+            return km
+        }
+        existing.as(Keymap)
+    }
+
+    -- Hooks
+    pub fn add_hook(
+        self,
+        topic: String,
+        owner: ExtId,
+        callback: fn(SystemKernel, Any) -> Unit,
+        .priority: i64 = 0,
+    ) {
+        let listeners = if self.hooks.contains_key(topic) {
+            self.hooks.get(topic).as(List)
+        } else {
+            let fresh = List()
+            self.hooks.insert(topic, fresh)
+            fresh
+        }
+        listeners.push(HookListener {
+            owner: owner,
+            priority: priority,
+            callback: callback,
+        })
+        listeners.sort_by(|a: Any, b: Any| {
+            let pa = a.as(HookListener).priority
+            let pb = b.as(HookListener).priority
+            pa.cmp(pb)
+        })
+    }
+
+    pub fn emit_hook(self, topic: String, payload: Any) {
+        let list_any? = self.hooks.get(topic) else {
+            return
+        }
+        let listeners = list_any.as(List)
+        let n = listeners.len()
+        for i in 0..n {
+            let item = listeners.get(i.as(usize)).as(HookListener)
+            if self.is_extension_active(item.owner) {
+                let cb = item.callback
+                cb(self, payload)
+            }
+        }
+    }
+}

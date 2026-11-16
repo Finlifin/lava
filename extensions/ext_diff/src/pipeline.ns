@@ -1,0 +1,489 @@
+-- pipeline.ns: Stdio `Filter` & `Mapper` Pipeline Engine (`sed`, `awk`, `rg`) for `ext_diff`.
+-- Preserves original 0-based source line numbers (`orig_row`) and unmasked `raw_text` across
+-- arbitrary chains of line-dropping `Filter` stages and text-transforming `Mapper` stages.
+
+use std.fs
+use std.process
+use @lava_accel.{DiffHunk, accel_diff_lines}
+
+pub enum DiffStageKind {
+    pub Filter,
+    pub Mapper,
+}
+derive Eq, PartialEq, Display for DiffStageKind
+
+impl DiffStageKind {
+    pub fn badge(self) -> String {
+        self match {
+            DiffStageKind.Filter => "F",
+            DiffStageKind.Mapper => "M",
+        }
+    }
+
+    pub fn name(self) -> String {
+        self match {
+            DiffStageKind.Filter => "Filter",
+            DiffStageKind.Mapper => "Mapper",
+        }
+    }
+}
+
+pub struct DiffPipelineStage {
+    pub stage_id: i64,
+    pub kind: DiffStageKind,
+    pub command: String,
+    pub side: String,
+    pub enabled: bool,
+    pub label: String,
+}
+
+pub struct DiffPreset {
+    pub name: String,
+    pub kind: DiffStageKind,
+    pub command: String,
+    pub description: String,
+}
+
+pub struct TrackedDiffLine {
+    pub orig_row: i64,
+    pub raw_text: String,
+    pub mapped_text: String,
+}
+derive Eq, PartialEq, Display for TrackedDiffLine
+
+impl TrackedDiffLine {
+    pub fn display_text(self, show_mapped: bool) -> String {
+        if show_mapped {
+            self.mapped_text
+        } else {
+            self.raw_text
+        }
+    }
+}
+
+pub fn clone_tracked_lines(src: List) -> List {
+    let out = List()
+    for i in 0..src.len() {
+        let item = src.get(i.as(usize)).as(TrackedDiffLine)
+        out.push(TrackedDiffLine {
+            orig_row: item.orig_row,
+            raw_text: item.raw_text,
+            mapped_text: item.mapped_text,
+        })
+    }
+    out
+}
+
+pub fn make_initial_tracked_lines(lines: List) -> List {
+    let out = List()
+    for i in 0..lines.len() {
+        let s = lines.get(i.as(usize)).as(String)
+        out.push(TrackedDiffLine {
+            orig_row: i,
+            raw_text: s,
+            mapped_text: s,
+        })
+    }
+    out
+}
+
+-- Parse optional `--left `, `--right `, or `--both ` prefix from a shell command spec.
+pub fn parse_stage_command_spec(raw: String) -> (String, String) {
+    let trimmed = raw.trim()
+    if trimmed.starts_with("--left ") {
+        return ("left", trimmed.drop(7).trim())
+    }
+    if trimmed.starts_with("--right ") {
+        return ("right", trimmed.drop(8).trim())
+    }
+    if trimmed.starts_with("--both ") {
+        return ("both", trimmed.drop(7).trim())
+    }
+    ("both", trimmed)
+}
+
+pub fn summarize_stage_label(cmd: String) -> String {
+    let clean = cmd.trim()
+    if clean.char_len() <= 28 {
+        clean
+    } else {
+        clean.take(25) ++ "..."
+    }
+}
+
+pub fn has_any_active_mapper(stages: List) -> bool {
+    for i in 0..stages.len() {
+        let st = stages.get(i.as(usize)).as(DiffPipelineStage)
+        if st.enabled and st.kind == DiffStageKind.Mapper {
+            return true
+        }
+    }
+    false
+}
+
+pub fn active_stage_count(stages: List) -> i64 {
+    var cnt: i64 = 0
+    for i in 0..stages.len() {
+        let st = stages.get(i.as(usize)).as(DiffPipelineStage)
+        if st.enabled {
+            cnt += 1
+        }
+    }
+    cnt
+}
+
+pub fn format_pipeline_badge(stages: List) -> String {
+    if stages.is_empty() {
+        return "[PIPELINE: RAW]"
+    }
+    let parts = List()
+    for i in 0..stages.len() {
+        let st = stages.get(i.as(usize)).as(DiffPipelineStage)
+        let side_pfx = if st.side == "left" {
+            "L:"
+        } else if st.side == "right" {
+            "R:"
+        } else {
+            ""
+        }
+        let state_pfx = if st.enabled { "" } else { "off:" }
+        let short_lbl = if st.label != "" { st.label } else { summarize_stage_label(st.command) }
+        parts.push(state_pfx ++ side_pfx ++ st.kind.badge() ++ ":" ++ short_lbl)
+    }
+    "[PIPELINE: " ++ parts.join(" | ") ++ "]"
+}
+
+-- Split stdout from a stdio command into individual lines without artificial prefixes.
+-- Empty stdout (`""`) produces `0` lines (`[]`); `"\n"` produces `1` empty line (`[""]`).
+pub fn split_stdio_output_lines(stdout: String) -> List {
+    let norm = stdout.replace("\r\n", "\n")
+    if norm == "" {
+        return List()
+    }
+    let parts = norm.split("\n")
+    if (not parts.is_empty()) and norm.ends_with("\n") {
+        let _ = parts.pop()
+    }
+    parts
+}
+
+fn clamp_index(idx: i64, len: i64) -> i64 {
+    if len <= 0 {
+        return 0
+    }
+    if idx < 0 {
+        0
+    } else if idx >= len {
+        len - 1
+    } else {
+        idx
+    }
+}
+
+-- Best-effort Myers/LCS alignment via `accel_diff_lines` when a stage both alters text and changes line count.
+fn align_via_diff_hunks(in_tracked: List, out_lines: List) -> List {
+    let k = in_tracked.len()
+    let m = out_lines.len()
+    if m == 0 or k == 0 {
+        return List()
+    }
+    let in_mapped = List()
+    for i in 0..k {
+        in_mapped.push(in_tracked.get(i.as(usize)).as(TrackedDiffLine).mapped_text)
+    }
+    let hunks = accel_diff_lines(in_mapped, out_lines)
+    let aligned = List()
+    var oi: i64 = 0
+    var ni: i64 = 0
+
+    for hi in 0..hunks.len() {
+        let h = hunks.get(hi.as(usize)).as(DiffHunk)
+        -- Equal run preceding this hunk
+        while ni < h.new_start and oi < h.old_start and ni < m and oi < k {
+            let src = in_tracked.get(oi.as(usize)).as(TrackedDiffLine)
+            let out_s = out_lines.get(ni.as(usize)).as(String)
+            aligned.push(TrackedDiffLine {
+                orig_row: src.orig_row,
+                raw_text: src.raw_text,
+                mapped_text: out_s,
+            })
+            oi += 1
+            ni += 1
+        }
+        -- Changed/inserted lines within this hunk: map proportionally into `old_start..old_start+old_count`
+        for t in 0..h.new_count {
+            let out_idx = h.new_start + t
+            if out_idx >= 0 and out_idx < m {
+                let mapped_old = if h.old_count > 0 {
+                    clamp_index(h.old_start + (t * h.old_count) / h.new_count, k)
+                } else {
+                    clamp_index(h.old_start, k)
+                }
+                let src = in_tracked.get(mapped_old.as(usize)).as(TrackedDiffLine)
+                let out_s = out_lines.get(out_idx.as(usize)).as(String)
+                aligned.push(TrackedDiffLine {
+                    orig_row: src.orig_row,
+                    raw_text: src.raw_text,
+                    mapped_text: out_s,
+                })
+            }
+        }
+        oi = h.old_start + h.old_count
+        ni = h.new_start + h.new_count
+    }
+
+    -- Trailing equal run after last hunk
+    while ni < m {
+        let safe_oi = clamp_index(oi, k)
+        let src = in_tracked.get(safe_oi.as(usize)).as(TrackedDiffLine)
+        let out_s = out_lines.get(ni.as(usize)).as(String)
+        aligned.push(TrackedDiffLine {
+            orig_row: src.orig_row,
+            raw_text: src.raw_text,
+            mapped_text: out_s,
+        })
+        oi += 1
+        ni += 1
+    }
+
+    aligned
+}
+
+-- Recover original 0-based `orig_row` for surviving lines after a `Filter` stage:
+-- 1. Fast O(K) monotonic greedy subsequence scan when `out[j] == in[i].mapped_text`.
+-- 2. Trimmed monotonic subsequence scan if filter slightly stripped whitespace.
+-- 3. Full Myers/LCS hunk fallback via `accel_diff_lines` so every surviving line always maps cleanly.
+pub fn align_filtered_lines(in_tracked: List, out_lines: List) -> List {
+    let k = in_tracked.len()
+    let m = out_lines.len()
+    if m == 0 or k == 0 {
+        return List()
+    }
+
+    -- 1. Exact monotonic subsequence scan
+    if m <= k {
+        let exact = List()
+        var i: i64 = 0
+        var all_matched = true
+        for j in 0..m {
+            let target = out_lines.get(j.as(usize)).as(String)
+            var found = false
+            while i < k {
+                let cand = in_tracked.get(i.as(usize)).as(TrackedDiffLine)
+                i += 1
+                if cand.mapped_text == target {
+                    exact.push(TrackedDiffLine {
+                        orig_row: cand.orig_row,
+                        raw_text: cand.raw_text,
+                        mapped_text: target,
+                    })
+                    found = true
+                    break
+                }
+            }
+            if not found {
+                all_matched = false
+                break
+            }
+        }
+        if all_matched and exact.len() == m {
+            return exact
+        }
+
+        -- 2. Whitespace-trimmed monotonic subsequence scan
+        let trimmed_out = List()
+        var ti: i64 = 0
+        var trim_matched = true
+        for j in 0..m {
+            let target_raw = out_lines.get(j.as(usize)).as(String)
+            let target_trim = target_raw.trim()
+            var found = false
+            while ti < k {
+                let cand = in_tracked.get(ti.as(usize)).as(TrackedDiffLine)
+                ti += 1
+                if cand.mapped_text.trim() == target_trim {
+                    trimmed_out.push(TrackedDiffLine {
+                        orig_row: cand.orig_row,
+                        raw_text: cand.raw_text,
+                        mapped_text: target_raw,
+                    })
+                    found = true
+                    break
+                }
+            }
+            if not found {
+                trim_matched = false
+                break
+            }
+        }
+        if trim_matched and trimmed_out.len() == m {
+            return trimmed_out
+        }
+    }
+
+    -- 3. General LCS/hunk alignment fallback
+    align_via_diff_hunks(in_tracked, out_lines)
+}
+
+-- Align transformed lines after a `Mapper` stage:
+-- 1. Standard 1-to-1 line pairing when `out_lines.len() == in_tracked.len()`.
+-- 2. Myers/LCS hunk alignment if the mapper command split or dropped lines.
+pub fn align_mapped_lines(in_tracked: List, out_lines: List) -> List {
+    let k = in_tracked.len()
+    let m = out_lines.len()
+    if m == 0 or k == 0 {
+        return List()
+    }
+    if m == k {
+        let paired = List()
+        for i in 0..k {
+            let src = in_tracked.get(i.as(usize)).as(TrackedDiffLine)
+            let mapped = out_lines.get(i.as(usize)).as(String)
+            paired.push(TrackedDiffLine {
+                orig_row: src.orig_row,
+                raw_text: src.raw_text,
+                mapped_text: mapped,
+            })
+        }
+        return paired
+    }
+    align_via_diff_hunks(in_tracked, out_lines)
+}
+
+pub fn run_single_stage(
+    tracked: List,
+    stage: DiffPipelineStage,
+    side: String,
+    cwd: String,
+) -> !String List {
+    if not stage.enabled {
+        return tracked
+    }
+    if stage.side != "both" and stage.side != side {
+        return tracked
+    }
+    let cmd = stage.command.trim()
+    if cmd == "" {
+        return error "Pipeline stage command cannot be empty"
+    }
+    if tracked.is_empty() {
+        return List()
+    }
+
+    let in_strs = List()
+    for i in 0..tracked.len() {
+        in_strs.push(tracked.get(i.as(usize)).as(TrackedDiffLine).mapped_text)
+    }
+    let payload = in_strs.join("\n") ++ "\n"
+    let eff_cwd: ?String = if cwd != "" and fs.is_dir(cwd) { cwd } else { null }
+
+    var spawn_err = ""
+    let out = process.shell(cmd, stdin_data = payload, cwd = eff_cwd) ! {
+        io_err => {
+            spawn_err = "Failed to spawn shell for " ++ stage.kind.name() ++ ": " ++ io_err.to_string()
+            process.CommandOutput { status: -1, stdout: "", stderr: "" }
+        },
+    }
+    if spawn_err != "" {
+        return error spawn_err
+    }
+
+    let err_trim = out.stderr.trim()
+    stage.kind match {
+        DiffStageKind.Filter => {
+            if out.status == 0 {
+                let out_lines = split_stdio_output_lines(out.stdout)
+                return align_filtered_lines(tracked, out_lines)
+            }
+            -- `rg` / `grep` exit code 1 with empty stderr means 0 matching lines (valid empty output!)
+            if out.status == 1 and err_trim == "" {
+                return List()
+            }
+            let detail = if err_trim != "" { err_trim } else { "command exited with status " ++ out.status.to_string() }
+            return error ("Filter error (`" ++ cmd ++ "`, exit " ++ out.status.to_string() ++ "): " ++ detail)
+        },
+        DiffStageKind.Mapper => {
+            if out.status != 0 {
+                let detail = if err_trim != "" { err_trim } else { "command exited with status " ++ out.status.to_string() }
+                return error ("Mapper error (`" ++ cmd ++ "`, exit " ++ out.status.to_string() ++ "): " ++ detail)
+            }
+            let out_lines = split_stdio_output_lines(out.stdout)
+            return align_mapped_lines(tracked, out_lines)
+        },
+    }
+}
+
+-- Public pipeline runner: transforms raw `lines: List` (of `String`) through `stages` for `side` (`"left"` or `"right"`),
+-- returning `List` of `TrackedDiffLine` preserving original 0-based `orig_row` and `raw_text`.
+pub fn run_diff_pipeline_on_lines(
+    lines: List,
+    stages: List,
+    side: String,
+    cwd: String,
+) -> !String List {
+    var cur = make_initial_tracked_lines(lines)
+    for i in 0..stages.len() {
+        let st = stages.get(i.as(usize)).as(DiffPipelineStage)
+        cur = run_single_stage(cur, st, side, cwd)!
+    }
+    cur
+}
+
+pub fn default_diff_presets() -> List {
+    [
+        DiffPreset {
+            name: "strip-timestamps",
+            kind: DiffStageKind.Mapper,
+            command: "sed -E 's/[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}[T ][0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}}(\\.[0-9]+)?(Z|[+-][0-9:]+)?/<TIMESTAMP>/g'",
+            description: "Mask ISO-8601 / log timestamps as <TIMESTAMP>",
+        },
+        DiffPreset {
+            name: "strip-hex-addr",
+            kind: DiffStageKind.Mapper,
+            command: "sed -E 's/0x[0-9a-fA-F]+/0xADDR/g'",
+            description: "Mask hexadecimal memory addresses (0x...) as 0xADDR",
+        },
+        DiffPreset {
+            name: "strip-uuid",
+            kind: DiffStageKind.Mapper,
+            command: "sed -E 's/[0-9a-fA-F]{{8}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{12}}/<UUID>/g'",
+            description: "Mask standard 8-4-4-4-12 UUIDs as <UUID>",
+        },
+        DiffPreset {
+            name: "strip-numbers",
+            kind: DiffStageKind.Mapper,
+            command: "sed -E 's/[0-9]+/<NUM>/g'",
+            description: "Mask integer numbers as <NUM>",
+        },
+        DiffPreset {
+            name: "normalize-ws",
+            kind: DiffStageKind.Mapper,
+            command: "awk '{{$1=$1; print}}'",
+            description: "Collapse runs of whitespace into single spaces via awk",
+        },
+        DiffPreset {
+            name: "strip-ansi",
+            kind: DiffStageKind.Mapper,
+            command: "sed -E 's/\\x1b\\[[0-9;]*[a-zA-Z]//g'",
+            description: "Strip ANSI SGR terminal color escape sequences",
+        },
+        DiffPreset {
+            name: "drop-blank",
+            kind: DiffStageKind.Filter,
+            command: "rg '\\S'",
+            description: "Drop blank / whitespace-only lines via ripgrep",
+        },
+        DiffPreset {
+            name: "drop-comments",
+            kind: DiffStageKind.Filter,
+            command: "rg -v '^\\s*(#|//|--)'",
+            description: "Drop #, //, and -- comment lines via ripgrep",
+        },
+        DiffPreset {
+            name: "only-errors",
+            kind: DiffStageKind.Filter,
+            command: "rg 'ERROR|WARN|FATAL|panic'",
+            description: "Retain only ERROR / WARN / FATAL / panic lines",
+        },
+    ]
+}

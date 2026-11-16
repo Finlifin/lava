@@ -1,0 +1,9 @@
+[package]
+name = "server_core"
+domain = "lava.server"
+version = "0.1.0"
+type = "lib"
+description = "Headless extension kernel, service registry, and JSON-RPC 2.0 router for Lava Server."
+
+[dependencies]
+"lava.server/server_sys" = { path = "../server_sys" }

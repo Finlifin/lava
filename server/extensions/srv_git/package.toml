@@ -1,0 +1,10 @@
+[package]
+name = "srv_git"
+domain = "lava.server"
+version = "0.1.0"
+type = "lib"
+description = "Server-side Git porcelain status, HEAD blob lines, diff, blame, and commit log RPCs."
+
+[dependencies]
+"lava.server/server_sys" = { path = "../../packages/server_sys" }
+"lava.server/server_core" = { path = "../../packages/server_core" }

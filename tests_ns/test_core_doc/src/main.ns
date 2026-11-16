@@ -1,0 +1,219 @@
+-- Standalone verification suite for `lava_sys`, `lava_core`, and `ext_document`.
+
+use std.process.{assert, assert_eq}
+use @lava_sys.{mock_enable}
+use @lava_core.{
+    ExtId, ExtState, HostClipboardCap, InteractiveEffects, KeyLookup, KeyStroke,
+    LogCollectorCap, PromptKind, PromptRequest, PromptTurn, StatusCollectorCap, SystemKernel,
+    ask_prompt, clipboard_get, clipboard_set, format_chord, log_event, parse_key_sequence,
+    status_emit
+}
+use @ext_document.{
+    BufferId, BufferKind, Pos, QuickfixEntry, RegisterValue, Span, ext_document_id,
+    parse_quickfix_line, register_document_extension, require_editor_world
+}
+
+fn test_extension_dag_and_lifecycle() {
+    let k = SystemKernel.new()
+    let order_seen = List()
+    let id_a = ExtId("test/a")
+    let id_b = ExtId("test/b")
+    let id_c = ExtId("test/c")
+
+    -- Register C depending on B, B depending on A (reverse registration order!)
+    let _ = k.register_extension(
+        id_c, "test", "c", "0.1.0", "C", [id_b],
+        |kern: SystemKernel| -> !String Unit {
+            order_seen.push("C")
+            kern.publish_service("svc.c", id_c, 99)
+            ()
+        },
+        |_kern: SystemKernel| -> !String Unit { () },
+    ) ! { e => panic(e) }
+
+    let _ = k.register_extension(
+        id_b, "test", "b", "0.1.0", "B", [id_a],
+        |_kern: SystemKernel| -> !String Unit {
+            order_seen.push("B")
+            ()
+        },
+        |_kern: SystemKernel| -> !String Unit { () },
+    ) ! { e => panic(e) }
+
+    let _ = k.register_extension(
+        id_a, "test", "a", "0.1.0", "A", [],
+        |_kern: SystemKernel| -> !String Unit {
+            order_seen.push("A")
+            ()
+        },
+        |_kern: SystemKernel| -> !String Unit { () },
+    ) ! { e => panic(e) }
+
+    let _ = k.activate_all() ! { e => panic(e) }
+    assert_eq(order_seen, ["A", "B", "C"])
+    assert(k.is_extension_active(id_c))
+    assert_eq(k.service("svc.c"), 99)
+
+    -- Deactivating B while C is active must be rejected!
+    let bad = k.deactivate_extension(id_b) ! { _ => error "blocked" } ! { e => e }
+    assert_eq(bad, "blocked")
+
+    -- Deactivating C cleans up its services and allows deactivating B
+    let _ = k.deactivate_extension(id_c) ! { e => panic(e) }
+    assert_eq(k.service("svc.c"), null)
+    let _ = k.deactivate_extension(id_b) ! { e => panic(e) }
+    assert(not k.is_extension_active(id_b))
+
+    -- Cycle detection
+    let k2 = SystemKernel.new()
+    let x = ExtId("cyc/x")
+    let y = ExtId("cyc/y")
+    let _ = k2.register_extension(x, "cyc", "x", "0.1.0", "", [y], |_| (), |_| ()) ! { e => panic(e) }
+    let _ = k2.register_extension(y, "cyc", "y", "0.1.0", "", [x], |_| (), |_| ()) ! { e => panic(e) }
+    let cyc_res = k2.activate_all() ! { _ => error "cycle_caught" } ! { e => e }
+    assert_eq(cyc_res, "cycle_caught")
+}
+
+fn test_continuation_prompts_and_capabilities() {
+    mock_enable(true)
+    let k = SystemKernel.new()
+    let _ = register_document_extension(k) ! { e => panic(e) }
+    let _ = k.activate_all() ! { e => panic(e) }
+
+    let ext_id = ext_document_id()
+    -- Register a two-prompt interactive command using delimited continuations
+    k.register_command(
+        "rename-pair",
+        ext_id,
+        "Ask two questions sequentially via delimited continuations.",
+        |_kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let first? = ask_prompt(PromptRequest.text("First: ", ""))# else {
+                status_emit("Cancelled at 1")#
+                return "abort1"
+            }
+            let second? = ask_prompt(PromptRequest {
+                label: "Second (" ++ first ++ "): ",
+                initial: "",
+                kind: PromptKind.FreeText,
+                candidates: List(),
+            })# else {
+                status_emit("Cancelled at 2")#
+                return "abort2"
+            }
+            status_emit("Joined: " ++ first ++ "->" ++ second)#
+            first ++ ":" ++ second
+        },
+    )
+
+    handles(log_event) let logger = LogCollectorCap.new()
+    handles(status_emit) let status = StatusCollectorCap.new()
+    handles(clipboard_get) handles(clipboard_set) let clip = HostClipboardCap {}
+
+    let t1 = k.dispatch_command("rename-pair", [])# ! { e => panic(e) }
+    t1 match {
+        PromptTurn.Suspended(req1, _) => assert_eq(req1.label, "First: "),
+        _ => panic("expected first suspension"),
+    }
+
+    let t2 = k.submit_prompt_answer("alpha")# ! { e => panic(e) }
+    t2 match {
+        PromptTurn.Suspended(req2, _) => assert_eq(req2.label, "Second (alpha): "),
+        _ => panic("expected second suspension"),
+    }
+
+    let t3 = k.submit_prompt_answer("omega")# ! { e => panic(e) }
+    t3 match {
+        PromptTurn.Completed(val) => assert_eq(val.as(String), "alpha:omega"),
+        _ => panic("expected completion"),
+    }
+    assert_eq(status.latest, "Joined: alpha->omega")
+
+    -- Also verify synchronous non-suspending `dispatch_command` (`next-buffer`, `undo`) and error propagation!
+    let sync_turn = k.dispatch_command("next-buffer", [])# ! { e => panic(e) }
+    assert(sync_turn matches PromptTurn.Completed(_))
+    let err_res = k.dispatch_command("nonexistent-cmd", [])# ! { _ => error "missing_caught" } ! { e => e }
+    assert_eq(err_res, "missing_caught")
+    let _ = logger
+    let _ = clip
+}
+
+fn test_buffer_undo_tree_narrowing_and_registers() {
+    mock_enable(true)
+    let k = SystemKernel.new()
+    let _ = register_document_extension(k) ! { e => panic(e) }
+    let _ = k.activate_all() ! { e => panic(e) }
+    let world = require_editor_world(k) ! { e => panic(e) }
+
+    let buf = world.create_buffer(
+        "demo.ns",
+        BufferKind.File,
+        major_mode = "nessa",
+        initial_lines = ["fn alpha() {{", "    let x = 1", "}}"],
+    )
+    let _ = buf.insert_text(Pos.new(1, 13), "0") ! { e => panic(e) }
+    buf.checkpoint(buf.point, "edit-10")
+    assert_eq(buf.line_at(1), "    let x = 10")
+
+    -- Undo back to initial, then make an alternate edit to create a second undo-tree branch!
+    let _ = buf.undo() ! { e => panic(e) }
+    assert_eq(buf.line_at(1), "    let x = 1")
+    let _ = buf.insert_text(Pos.new(1, 13), "99") ! { e => panic(e) }
+    buf.checkpoint(buf.point, "edit-199")
+    assert_eq(buf.line_at(1), "    let x = 199")
+    assert_eq(buf.undo_tree.branch_count_at_parent(), 2)
+
+    -- Switch to sibling undo-tree branch!
+    let _ = buf.undo_switch_branch(-1) ! { e => panic(e) }
+    assert_eq(buf.line_at(1), "    let x = 10")
+    let tree_lines = buf.undo_tree.render_tree_lines()
+    assert(tree_lines.len() >= 5)
+
+    -- Narrowing
+    buf.narrow_to_region(1, 1)
+    assert(buf.is_narrowed())
+    assert_eq(buf.min_row(), 1)
+    assert_eq(buf.max_row(), 1)
+    assert_eq(buf.clamp_pos(Pos.new(0, 0)).row, 1)
+    buf.widen()
+    assert(not buf.is_narrowed())
+
+    -- Span extraction & replacement with Unicode
+    let _ = buf.replace_span(Span.normalized(Pos.new(1, 8), Pos.new(1, 9)), "λ_val") ! { e => panic(e) }
+    assert_eq(buf.line_at(1), "    let λ_val = 10")
+
+    -- Kill-ring & Registers with clipboard capability
+    handles(clipboard_get) handles(clipboard_set) let clip = HostClipboardCap {}
+    world.registers.delete_store(RegisterValue.chars("killed-1"), world.kill_ring)#
+    world.registers.delete_store(RegisterValue.chars("-appended"), world.kill_ring, append_kill = true)#
+    assert_eq(world.kill_ring.current().as(RegisterValue).text, "killed-1-appended")
+
+    world.registers.set_reg("+", RegisterValue.chars("system-clip-text"))#
+    assert_eq(world.registers.get_reg("+")#.as(RegisterValue).text, "system-clip-text")
+    world.registers.set_reg("a", RegisterValue.chars("hello"))#
+    world.registers.set_reg("A", RegisterValue.chars(" world"))#
+    assert_eq(world.registers.get_reg("a")#.as(RegisterValue).text, "hello world")
+    let _ = clip
+
+    -- Keymap & Quickfix parsing
+    let seq = parse_key_sequence("<C-x> <C-f>")
+    assert_eq(format_chord(seq), "<C-x> <C-f>")
+    let km = k.ensure_keymap("global")
+    km.bind("<C-x> <C-f>", "find-file", ext_document_id())
+    let pfx = km.lookup([seq.get(0).as(KeyStroke)])
+    assert(pfx matches KeyLookup.Prefix(_))
+    let exact = km.lookup(seq)
+    assert(exact matches KeyLookup.Exact(_, _))
+
+    let qf = parse_quickfix_line("src/main.ns:12:5: undefined symbol").as(QuickfixEntry)
+    assert_eq(qf.file_path, "src/main.ns")
+    assert_eq(qf.row, 11)
+    assert_eq(qf.col, 4)
+}
+
+fn main() -> i64 {
+    test_extension_dag_and_lifecycle()
+    test_continuation_prompts_and_capabilities()
+    test_buffer_undo_tree_narrowing_and_registers()
+    println("test_core_doc: ALL PASSED")
+    0
+}

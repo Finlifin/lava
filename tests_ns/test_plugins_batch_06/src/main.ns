@@ -1,0 +1,551 @@
+-- End-to-end integration test suite for Lava Batch 06 Plugins (16–18):
+--   16. `ext_snippets` (`LuaSnip`/`YASnippet`: mode-aware snippets, `$1`/`$2`/`${1:default}`/`$0`,
+--       indentation preservation, dynamic tabstop column adjustment, `<C-k>`/`<C-j>`, `:Snippets`)
+--   17. `ext_cmp` (`nvim-cmp`/`blink.cmp`/`Corfu`: multi-source fuzzy completion across Snippets,
+--       Buffer Identifiers, Keywords, File Paths, Custom Sources, `<C-n>`/`<C-p>`/`<Tab>`/`<C-y>`/`<C-e>`)
+--   18. `ext_spectre` (`nvim-spectre`/`wgrep`: live workspace grep + replacement preview `=>`,
+--       selective `[x]`/`[ ]` toggle, atomic disk + open-buffer sync via `R` and `:w`)
+
+use std.fs
+use std.path
+use std.time
+use @lava_sys.{RawUiEvent, mock_enable}
+use @lava_core.{ServiceEffects, SystemKernel, clipboard_get, clipboard_set, log_event, status_emit}
+use @ext_document.{
+    Buffer, BufferKind, CompletionItem, EditorWorld, Pos, require_editor_world
+}
+use @ext_app.{AppHostCap, app_commit_frame, app_feed_keys, app_step_event, boot_kernel}
+use @ext_snippets.{
+    SNIPPETS_BUF_NAME, SnippetService, ext_snippets_id, register_snippets_extension,
+    require_snippet_service
+}
+use @ext_cmp.{
+    CmpService, OWNER_CMP, ext_cmp_id, register_cmp_extension, require_cmp_service
+}
+use @ext_spectre.{
+    SPECTRE_BUF_NAME, SpectreMatch, SpectreService, ext_spectre_id, register_spectre_extension,
+    require_spectre_service
+}
+
+fn check_true(cond: bool, label: String) {
+    if not cond {
+        panic("FAILED: " ++ label)
+    }
+}
+
+fn check_eq_str(actual: String, expected: String, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual='" ++ actual ++ "' expected='" ++ expected ++ "'")
+    }
+}
+
+fn check_eq_i64(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual=" ++ actual.to_string() ++ " expected=" ++ expected.to_string())
+    }
+}
+
+fn boot_batch06_kernel() -> SystemKernel {
+    let kernel: SystemKernel = (boot_kernel() ! { e => panic(e) }).as(SystemKernel)
+    let _ = register_snippets_extension(kernel) ! { e => panic(e) }
+    let _ = register_cmp_extension(kernel) ! { e => panic(e) }
+    let _ = register_spectre_extension(kernel) ! { e => panic(e) }
+    let _ = kernel.activate_all() ! { e => panic(e) }
+    kernel
+}
+
+fn buffer_contains_substr(buf: Buffer, needle: String) -> bool {
+    for i in 0..buf.line_count() {
+        if buf.line_at(i).contains(needle) {
+            return true
+        }
+    }
+    false
+}
+
+fn find_row_containing(buf: Buffer, needle: String) -> i64 {
+    for i in 0..buf.line_count() {
+        if buf.line_at(i).contains(needle) {
+            return i
+        }
+    }
+    -1
+}
+
+fn popup_find_item_idx(world: EditorWorld, label: String, kind: String) -> i64 {
+    let items = world.completion_popup.items
+    for i in 0..items.len() {
+        let it = items.get(i.as(usize)).as(CompletionItem)
+        if it.label == label and (kind == "" or it.kind == kind) {
+            return i
+        }
+    }
+    -1
+}
+
+fn select_popup_idx_via_keys(kernel: SystemKernel, world: EditorWorld, target_idx: i64) -> #ServiceEffects Unit {
+    var guard: i64 = 0
+    while world.completion_popup.selected_idx != target_idx and guard < 32 {
+        app_feed_keys(kernel, "<C-n>")# ! { e => panic(e) }
+        guard += 1
+    }
+    check_eq_i64(world.completion_popup.selected_idx, target_idx, "selected target completion idx")
+}
+
+fn test_batch_06_plugins() {
+    mock_enable(true)
+
+    let tmp_dir = "/tmp/lava_batch06_" ++ time.unix_millis().to_string()
+    let _ = fs.create_dir_all(tmp_dir) ! { e => panic(e.to_string()) }
+
+    let kernel = boot_batch06_kernel()
+    check_eq_str(ext_snippets_id().raw(), "lava.org/ext_snippets", "ext_snippets_id")
+    check_eq_str(ext_cmp_id().raw(), "lava.org/ext_cmp", "ext_cmp_id")
+    check_eq_str(ext_spectre_id().raw(), "lava.org/ext_spectre", "ext_spectre_id")
+    check_eq_i64(kernel.list_extensions().len(), 11, "11 active extensions (8 core + 3 batch06)")
+
+    let world: EditorWorld = (require_editor_world(kernel) ! { e => panic(e) }).as(EditorWorld)
+    world.cwd = tmp_dir
+    let snip_svc: SnippetService = (require_snippet_service(kernel) ! { e => panic(e) }).as(SnippetService)
+    let cmp_svc: CmpService = (require_cmp_service(kernel) ! { e => panic(e) }).as(CmpService)
+    let spec_svc: SpectreService = (require_spectre_service(kernel) ! { e => panic(e) }).as(SpectreService)
+
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
+    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+
+    -- ========================================================================
+    -- PART A: Plugin 16 — `ext_snippets`
+    -- ========================================================================
+    println("PART A: testing ext_snippets...")
+    check_true(snip_svc.snippets_for_mode("nessa").len() >= 12, "nessa + all snippets populated")
+    check_true(snip_svc.snippets_for_mode("rust").len() >= 11, "rust + all snippets populated")
+    check_true(snip_svc.snippets_for_mode("python").len() >= 7, "python + all snippets populated")
+    check_true(snip_svc.snippets_for_mode("typescript").len() >= 7, "typescript + all snippets populated")
+    check_true(snip_svc.snippets_for_mode("markdown").len() >= 5, "markdown + all snippets populated")
+
+    -- A1: Indented multi-line `fn` expansion + `<C-k>` tabstop traversal preserving defaults
+    let sbuf1 = world.create_buffer(
+        "snip_indent.ns",
+        BufferKind.File,
+        major_mode = "nessa",
+        initial_lines = ["    "],
+    )
+    let _ = world.switch_to_buffer(sbuf1.id)
+    kernel.emit_hook("buffer-switched", sbuf1.id)
+
+    -- Move to end of 4-space indent in Insert mode (`A`), type `fn`, expand via `<C-k>`
+    app_feed_keys(kernel, "Afn<C-k>")# ! { e => panic(e) }
+    check_eq_str(sbuf1.line_at(0), "    fn name(args) -> Unit {{", "indented fn header expanded")
+    check_eq_str(sbuf1.line_at(1), "        ", "indented fn body line")
+    check_eq_str(sbuf1.line_at(2), "    }}", "indented fn closing brace")
+    check_true(snip_svc.has_active_session(sbuf1.id), "active snippet session after fn expand")
+    check_eq_i64(sbuf1.point.row, 0, "$1 row")
+    check_eq_i64(sbuf1.point.col, 7, "$1 col at 'name'")
+
+    -- Jump `$1 -> $2 -> $3 -> $0` without editing defaults
+    app_feed_keys(kernel, "<C-k>")# ! { e => panic(e) }
+    check_eq_i64(sbuf1.point.row, 0, "$2 row")
+    check_eq_i64(sbuf1.point.col, 12, "$2 col at 'args'")
+
+    app_feed_keys(kernel, "<C-k>")# ! { e => panic(e) }
+    check_eq_i64(sbuf1.point.row, 0, "$3 row")
+    check_eq_i64(sbuf1.point.col, 21, "$3 col at 'Unit'")
+
+    app_feed_keys(kernel, "<C-k>")# ! { e => panic(e) }
+    check_eq_i64(sbuf1.point.row, 1, "$0 body row")
+    check_eq_i64(sbuf1.point.col, 8, "$0 body col")
+    check_true(not snip_svc.has_active_session(sbuf1.id), "session finished on reaching $0")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    -- A2: Typing over armed placeholders, dynamic same-row column shift, `<C-j>` prev jump, undo
+    let sbuf2 = world.create_buffer(
+        "snip_edit.ns",
+        BufferKind.File,
+        major_mode = "nessa",
+        initial_lines = [""],
+    )
+    let _ = world.switch_to_buffer(sbuf2.id)
+    kernel.emit_hook("buffer-switched", sbuf2.id)
+
+    app_feed_keys(kernel, "ifn<C-k>")# ! { e => panic(e) }
+    check_eq_str(sbuf2.line_at(0), "fn name(args) -> Unit {{", "unindented fn expanded")
+
+    -- Type `compute_sum` at `$1`: replaces default `name` cleanly and shifts `$2` & `$3`!
+    app_feed_keys(kernel, "compute_sum")# ! { e => panic(e) }
+    check_eq_str(sbuf2.line_at(0), "fn compute_sum(args) -> Unit {{", "$1 replaced default 'name'")
+
+    -- Jump `<C-k>` to `$2` (`args` shifted to col 15) and type `x: i64, y: i64`
+    app_feed_keys(kernel, "<C-k>")# ! { e => panic(e) }
+    check_eq_i64(sbuf2.point.col, 15, "$2 shifted col after longer $1")
+    app_feed_keys(kernel, "x:<Space>i64,<Space>y:<Space>i64")# ! { e => panic(e) }
+    check_eq_str(
+        sbuf2.line_at(0),
+        "fn compute_sum(x: i64, y: i64) -> Unit {{",
+        "$2 replaced default 'args'",
+    )
+
+    -- Test `<C-j>` jumps backward to `$1`, then `<C-k><C-k>` jumps forward to `$3` (`Unit`)
+    app_feed_keys(kernel, "<C-j>")# ! { e => panic(e) }
+    check_eq_i64(sbuf2.point.col, 3, "<C-j> jumped back to $1 start_col")
+    app_feed_keys(kernel, "<C-k><C-k>")# ! { e => panic(e) }
+    check_eq_i64(sbuf2.point.col, 34, "$3 shifted col after longer $2")
+    app_feed_keys(kernel, "i64<C-k>x<Space>+<Space>y<Escape>")# ! { e => panic(e) }
+
+    check_eq_str(sbuf2.line_at(0), "fn compute_sum(x: i64, y: i64) -> i64 {{", "completed fn signature")
+    check_eq_str(sbuf2.line_at(1), "    x + y", "completed fn body at $0")
+    check_eq_str(sbuf2.line_at(2), "}}", "completed fn closing brace")
+
+    -- A3: Custom snippet registration + single-step undo of snippet expansion
+    snip_svc.register_snippet("nessa", "ceq", "check_eq(${{1:lhs}}, ${{2:rhs}})", "Custom equality check")
+    let sbuf3 = world.create_buffer(
+        "snip_undo.ns",
+        BufferKind.File,
+        major_mode = "nessa",
+        initial_lines = [""],
+    )
+    let _ = world.switch_to_buffer(sbuf3.id)
+    kernel.emit_hook("buffer-switched", sbuf3.id)
+    app_feed_keys(kernel, "iceq<C-k><Escape>")# ! { e => panic(e) }
+    check_eq_str(sbuf3.line_at(0), "check_eq(lhs, rhs)", "custom snippet expanded")
+    app_feed_keys(kernel, "u")# ! { e => panic(e) }
+    check_eq_str(sbuf3.line_at(0), "ceq", "single undo reverted snippet expansion cleanly")
+
+    -- A4: `:Snippets` command opens `*Snippets*` viewer, renders frame, and `q` closes it
+    app_feed_keys(kernel, ":Snippets<Return>")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, SNIPPETS_BUF_NAME, ":Snippets opened *Snippets*")
+    check_true(buffer_contains_substr(world.active_buffer(), "pubfn"), "*Snippets* lists pubfn")
+    check_true(buffer_contains_substr(world.active_buffer(), "ceq"), "*Snippets* lists custom ceq")
+    let gen_snip = app_commit_frame(kernel) ! { e => panic(e) }
+    check_true(gen_snip > 0, "*Snippets* frame committed")
+    app_feed_keys(kernel, "q")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, "snip_undo.ns", "q closed *Snippets*")
+
+    -- ========================================================================
+    -- PART B: Plugin 17 — `ext_cmp`
+    -- ========================================================================
+    println("PART B: testing ext_cmp...")
+
+    -- Create path-completion fixtures in `tmp_dir`
+    let cmp_dir = path.join(tmp_dir, "cmp_ws")
+    let _ = fs.create_dir_all(path.join(cmp_dir, "subpkg")) ! { e => panic(e.to_string()) }
+    let _ = fs.write_string(path.join(cmp_dir, "config_dev.toml"), "port = 8080\n") ! {
+        e => panic(e.to_string())
+    }
+
+    -- Open a background buffer to verify cross-buffer identifier completion
+    let _bg_buf = world.create_buffer(
+        "helpers.ns",
+        BufferKind.File,
+        major_mode = "nessa",
+        initial_lines = ["let pub_cross_buffer_token = 99"],
+    )
+
+    let cbuf = world.create_buffer(
+        "cmp_target.ns",
+        BufferKind.File,
+        file_path = path.join(cmp_dir, "cmp_target.ns"),
+        major_mode = "nessa",
+        initial_lines = [
+            "let pub_alpha_metric = 10",
+            "let pub_beta_counter = 20",
+            "",
+        ],
+    )
+    world.cwd = cmp_dir
+    let _ = world.switch_to_buffer(cbuf.id)
+    kernel.emit_hook("buffer-switched", cbuf.id)
+
+    -- B1: Multi-source live popup on typing `pu` (Snippets + Keywords + Active & Cross-Buffer Identifiers)
+    app_feed_keys(kernel, "G0ipu")# ! { e => panic(e) }
+    check_true(world.completion_popup.active, "popup opened after typing 'pu'")
+    check_eq_str(world.completion_popup.owner, OWNER_CMP, "popup owned by ext_cmp")
+    check_true(popup_find_item_idx(world, "pub", "Keyword") >= 0, "Keyword 'pub' present")
+    check_true(popup_find_item_idx(world, "pubfn", "Snippet") >= 0, "Snippet 'pubfn' present")
+    check_true(
+        popup_find_item_idx(world, "pub_alpha_metric", "Identifier") >= 0,
+        "Active-buffer Identifier 'pub_alpha_metric' present",
+    )
+    check_true(
+        popup_find_item_idx(world, "pub_cross_buffer_token", "Identifier") >= 0,
+        "Cross-buffer Identifier 'pub_cross_buffer_token' present",
+    )
+
+    -- Commit a 2D frame while completion popup is open
+    let gen_cmp = app_commit_frame(kernel) ! { e => panic(e) }
+    check_true(gen_cmp > gen_snip, "frame committed with active completion popup")
+
+    -- Test `<C-p>` wrap-around from 0 -> len-1 and `<C-n>` wrap-around back to 0
+    check_eq_i64(world.completion_popup.selected_idx, 0, "initial selected_idx == 0")
+    let popup_len = world.completion_popup.items.len()
+    app_feed_keys(kernel, "<C-p>")# ! { e => panic(e) }
+    check_eq_i64(world.completion_popup.selected_idx, popup_len - 1, "<C-p> wrapped to last item")
+    app_feed_keys(kernel, "<C-n>")# ! { e => panic(e) }
+    check_eq_i64(world.completion_popup.selected_idx, 0, "<C-n> wrapped back to 0")
+
+    -- Select `pub_alpha_metric` via `<C-n>` and accept with `<Tab>`
+    let alpha_idx = popup_find_item_idx(world, "pub_alpha_metric", "Identifier")
+    select_popup_idx_via_keys(kernel, world, alpha_idx)#
+    app_feed_keys(kernel, "<Tab>")# ! { e => panic(e) }
+    check_true(not world.completion_popup.active, "popup closed after <Tab> accept")
+    check_eq_str(cbuf.line_at(2), "pub_alpha_metric", "<Tab> accepted 'pub_alpha_metric'")
+
+    -- B2: `<C-e>` dismissal + `<C-Space>` manual trigger + `<C-y>` accept
+    app_feed_keys(kernel, "<Space>+<Space>pu")# ! { e => panic(e) }
+    check_true(world.completion_popup.active, "popup re-opened on second 'pu'")
+    app_feed_keys(kernel, "<C-e>")# ! { e => panic(e) }
+    check_true(not world.completion_popup.active, "<C-e> dismissed popup")
+    check_eq_str(cbuf.line_at(2), "pub_alpha_metric + pu", "<C-e> preserved typed prefix")
+
+    app_feed_keys(kernel, "<C-Space>")# ! { e => panic(e) }
+    check_true(world.completion_popup.active, "<C-Space> manually triggered popup")
+    let beta_idx = popup_find_item_idx(world, "pub_beta_counter", "Identifier")
+    select_popup_idx_via_keys(kernel, world, beta_idx)#
+    app_feed_keys(kernel, "<C-y><Escape>")# ! { e => panic(e) }
+    check_eq_str(
+        cbuf.line_at(2),
+        "pub_alpha_metric + pub_beta_counter",
+        "<C-y> accepted 'pub_beta_counter'",
+    )
+
+    -- B3: Accepting a `"Snippet"` candidate (`pubfn`) from `ext_cmp` expands tabstops via `ext_snippets`!
+    app_feed_keys(kernel, "opubf")# ! { e => panic(e) }
+    check_true(world.completion_popup.active, "popup opened on 'pubf'")
+    let pubfn_idx = popup_find_item_idx(world, "pubfn", "Snippet")
+    check_true(pubfn_idx >= 0, "found pubfn Snippet candidate")
+    select_popup_idx_via_keys(kernel, world, pubfn_idx)#
+    app_feed_keys(kernel, "<Tab>")# ! { e => panic(e) }
+    check_true(not world.completion_popup.active, "popup closed after snippet accept")
+    check_true(snip_svc.has_active_session(cbuf.id), "SnippetService session active after cmp accept")
+    app_feed_keys(kernel, "hello<C-k><C-k>String<C-k>\"ok\"<Escape>")# ! { e => panic(e) }
+    check_eq_str(cbuf.line_at(3), "pub fn hello(args) -> String {{", "cmp snippet expanded header")
+    check_eq_str(cbuf.line_at(4), "    \"ok\"", "cmp snippet expanded body at $0")
+    check_eq_str(cbuf.line_at(5), "}}", "cmp snippet closing brace")
+
+    -- B4: File Path completion (`./` via `std.fs.read_dir_entries`)
+    app_feed_keys(kernel, "Go./co")# ! { e => panic(e) }
+    check_true(world.completion_popup.active, "path popup opened on './co'")
+    let cfg_idx = popup_find_item_idx(world, "config_dev.toml", "Path")
+    check_true(cfg_idx >= 0, "found Path candidate 'config_dev.toml'")
+    select_popup_idx_via_keys(kernel, world, cfg_idx)#
+    app_feed_keys(kernel, "<Tab><Escape>")# ! { e => panic(e) }
+    check_eq_str(cbuf.line_at(6), "./config_dev.toml", "completed relative file path")
+
+    app_feed_keys(kernel, "o./su")# ! { e => panic(e) }
+    check_true(world.completion_popup.active, "path popup opened on './su'")
+    let sub_idx = popup_find_item_idx(world, "subpkg/", "Path")
+    check_true(sub_idx >= 0, "found directory Path candidate 'subpkg/'")
+
+    -- Leaving Insert mode (`<Escape>`) automatically hides popup
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+    check_true(not world.completion_popup.active, "leaving Insert mode hid completion popup")
+
+    -- B5: Custom source registration + `<Down>`/`<Up>` navigation + `:CmpToggle`
+    cmp_svc.register_source(
+        "test-custom",
+        |_b: Buffer, _pref: String| -> List {
+            [
+                CompletionItem {
+                    label: "custom_magic_api",
+                    insert_text: "custom_magic_api()",
+                    kind: "Function",
+                    detail: "[Custom]",
+                },
+            ]
+        },
+    )
+    app_feed_keys(kernel, "Gocust")# ! { e => panic(e) }
+    check_true(world.completion_popup.active, "custom source popup opened on 'cust'")
+    check_true(
+        popup_find_item_idx(world, "custom_magic_api", "Function") >= 0,
+        "custom source item ranked in popup",
+    )
+    app_feed_keys(kernel, "<Down><Up><Tab><Escape>")# ! { e => panic(e) }
+    check_eq_str(cbuf.line_at(cbuf.line_count() - 1), "custom_magic_api()", "custom source item accepted")
+    cmp_svc.unregister_source("test-custom")
+
+    app_feed_keys(kernel, ":CmpToggle<Return>")# ! { e => panic(e) }
+    check_true(not cmp_svc.enabled, ":CmpToggle disabled cmp")
+    app_feed_keys(kernel, "opu")# ! { e => panic(e) }
+    check_true(not world.completion_popup.active, "no auto-popup while cmp disabled")
+    app_feed_keys(kernel, "<Escape>:CmpToggle<Return>")# ! { e => panic(e) }
+    check_true(cmp_svc.enabled, ":CmpToggle re-enabled cmp")
+
+    -- ========================================================================
+    -- PART C: Plugin 18 — `ext_spectre`
+    -- ========================================================================
+    println("PART C: testing ext_spectre...")
+
+    let proj_dir = path.join(tmp_dir, "spectre_proj")
+    let _ = fs.create_dir_all(proj_dir) ! { e => panic(e.to_string()) }
+    let alpha_path = path.join(proj_dir, "alpha.ns")
+    let beta_path = path.join(proj_dir, "beta.ns")
+    let notes_path = path.join(proj_dir, "notes.md")
+
+    let _ = fs.write_string(
+        alpha_path,
+        [
+            "fn legacy_calc(x: i64) -> i64 {{",
+            "    let base = legacy_calc(0)",
+            "    x + base",
+            "}}",
+        ].join("\n") ++ "\n",
+    ) ! { e => panic(e.to_string()) }
+    let _ = fs.write_string(
+        beta_path,
+        [
+            "pub fn run() -> i64 {{",
+            "    legacy_calc(42)",
+            "}}",
+        ].join("\n") ++ "\n",
+    ) ! { e => panic(e.to_string()) }
+    let _ = fs.write_string(
+        notes_path,
+        "Design notes for legacy_calc behavior\n",
+    ) ! { e => panic(e.to_string()) }
+
+    world.cwd = proj_dir
+
+    -- Open `alpha.ns` in `world.buffers` BEFORE running Spectre so we verify live open-buffer sync!
+    app_feed_keys(kernel, ":e<Space>" ++ alpha_path ++ "<Return>")# ! { e => panic(e) }
+    let alpha_buf = world.active_buffer()
+    check_eq_str(alpha_buf.name, "alpha.ns", "opened alpha.ns before Spectre")
+
+    -- Open `*Spectre*` via `<Space> s R`
+    app_feed_keys(kernel, "gg0<Space>sR")# ! { e => panic(e) }
+    let sbuf = world.active_buffer()
+    check_eq_str(sbuf.name, SPECTRE_BUF_NAME, "<Space>sR opened *Spectre*")
+    check_eq_str(sbuf.major_mode, "spectre", "*Spectre* major_mode == spectre")
+
+    -- Configure search (`s`), file filter (`f` -> `*.ns`), and replacement (`r`) via prompts
+    app_feed_keys(kernel, "slegacy_calc<Return>")# ! { e => panic(e) }
+    check_eq_i64(spec_svc.items.len(), 4, "unfiltered search found 4 hits across .ns + .md")
+
+    app_feed_keys(kernel, "f*.ns<Return>")# ! { e => panic(e) }
+    check_eq_i64(spec_svc.items.len(), 3, "*.ns filter narrowed hits to 3 across alpha.ns + beta.ns")
+
+    app_feed_keys(kernel, "rmodern_compute<Return>")# ! { e => panic(e) }
+    check_eq_str(spec_svc.replace_text, "modern_compute", "replace_text set to modern_compute")
+    check_true(
+        buffer_contains_substr(sbuf, "=>  fn modern_compute(x: i64) -> i64"),
+        "*Spectre* shows live => replacement preview",
+    )
+
+    -- Move cursor to the second match in `alpha.ns` (`alpha.ns:2:`) and toggle it OFF (`[ ]`)!
+    let second_hit_row = find_row_containing(sbuf, "alpha.ns:2:")
+    check_true(second_hit_row > 0, "located alpha.ns:2: row in *Spectre*")
+    app_feed_keys(kernel, (second_hit_row + 1).to_string() ++ "G")# ! { e => panic(e) }
+
+    -- Verify `<Space>` toggles off, `<Space>` toggles back on, and `t` toggles off (`[ ]`)
+    app_feed_keys(kernel, "<Space>")# ! { e => panic(e) }
+    check_true(sbuf.line_at(second_hit_row).starts_with("  [ ]"), "<Space> toggled match off")
+    app_feed_keys(kernel, "<Space>")# ! { e => panic(e) }
+    check_true(sbuf.line_at(second_hit_row).starts_with("  [x]"), "<Space> toggled match back on")
+    app_feed_keys(kernel, "t")# ! { e => panic(e) }
+    check_true(sbuf.line_at(second_hit_row).starts_with("  [ ]"), "t toggled match off")
+
+    let notif_before = world.notifications.len()
+
+    -- Apply enabled `[x]` replacements via `R` (`spectre-apply`)!
+    app_feed_keys(kernel, "R")# ! { e => panic(e) }
+
+    -- 1. Verify disk contents of `alpha.ns`: line 0 replaced, line 1 (`[ ]`) untouched!
+    let alpha_disk_1 = fs.read_to_string(alpha_path) ! { e => panic(e.to_string()) }
+    let alpha_lines_1 = alpha_disk_1.lines()
+    check_eq_str(
+        alpha_lines_1.get(0).as(String),
+        "fn modern_compute(x: i64) -> i64 {{",
+        "alpha.ns line 0 replaced on disk",
+    )
+    check_eq_str(
+        alpha_lines_1.get(1).as(String),
+        "    let base = legacy_calc(0)",
+        "disabled [ ] match in alpha.ns line 1 untouched on disk",
+    )
+
+    -- 2. Verify disk contents of `beta.ns`: replaced!
+    let beta_disk_1 = fs.read_to_string(beta_path) ! { e => panic(e.to_string()) }
+    check_eq_str(
+        beta_disk_1.lines().get(1).as(String),
+        "    modern_compute(42)",
+        "beta.ns line 1 replaced on disk",
+    )
+
+    -- 3. Verify `notes.md` untouched (excluded by `*.ns` filter)!
+    let notes_disk_1 = fs.read_to_string(notes_path) ! { e => panic(e.to_string()) }
+    check_true(notes_disk_1.contains("legacy_calc"), "notes.md untouched due to *.ns filter")
+
+    -- 4. Verify already-open `alpha_buf` in `world.buffers` updated immediately in memory!
+    check_eq_str(
+        alpha_buf.line_at(0),
+        "fn modern_compute(x: i64) -> i64 {{",
+        "open alpha_buf line 0 synced in memory",
+    )
+    check_eq_str(
+        alpha_buf.line_at(1),
+        "    let base = legacy_calc(0)",
+        "open alpha_buf line 1 preserved disabled match",
+    )
+    check_true(not alpha_buf.modified, "open alpha_buf marked unmodified after disk+memory sync")
+    check_true(world.notifications.len() > notif_before, "Spectre pushed toast notification")
+
+    -- 5. Verify remaining disabled match stayed preserved in `*Spectre*` as `[ ]`;
+    --    now re-enable it with `<Space>` and apply via `:w<Return>` (`write-buffer-mode:spectre`)!
+    check_eq_i64(spec_svc.items.len(), 1, "1 remaining legacy_calc match after partial apply")
+    let rem_item = spec_svc.items.get(0).as(SpectreMatch)
+    check_true(not rem_item.enabled, "remaining match preserved its disabled [ ] state")
+
+    let rem_row = find_row_containing(sbuf, "alpha.ns:2:")
+    check_true(rem_row > 0, "found remaining alpha.ns:2: row")
+    app_feed_keys(kernel, (rem_row + 1).to_string() ++ "G<Space>:w<Return>")# ! { e => panic(e) }
+
+    let alpha_disk_2 = fs.read_to_string(alpha_path) ! { e => panic(e.to_string()) }
+    check_eq_str(
+        alpha_disk_2.lines().get(1).as(String),
+        "    let base = modern_compute(0)",
+        ":w in *Spectre* applied remaining replacement on disk",
+    )
+    check_eq_str(
+        alpha_buf.line_at(1),
+        "    let base = modern_compute(0)",
+        ":w in *Spectre* synced open alpha_buf line 1",
+    )
+    check_eq_i64(spec_svc.items.len(), 0, "0 legacy_calc matches left after :w")
+
+    -- 6. Test `:Spectre modern_compute`, `I` case toggle, `<Return>` jump to file, and `q` close!
+    app_feed_keys(kernel, ":Spectre<Space>modern_compute<Return>")# ! { e => panic(e) }
+    check_eq_i64(spec_svc.items.len(), 3, ":Spectre modern_compute found all 3 updated occurrences")
+
+    let prev_case = spec_svc.case_sensitive
+    app_feed_keys(kernel, "I")# ! { e => panic(e) }
+    check_true(spec_svc.case_sensitive != prev_case, "I toggled case_sensitive")
+
+    -- Test `x` key on file group header (`▾ [x] alpha.ns`) toggles all matches in that file!
+    let alpha_hdr_row = find_row_containing(sbuf, "▾ [x] alpha.ns")
+    check_true(alpha_hdr_row > 0, "found alpha.ns file group header")
+    app_feed_keys(kernel, (alpha_hdr_row + 1).to_string() ++ "Gx")# ! { e => panic(e) }
+    check_eq_i64(spec_svc.enabled_count(), 1, "file header toggle disabled both alpha.ns matches")
+    app_feed_keys(kernel, "x")# ! { e => panic(e) }
+    check_eq_i64(spec_svc.enabled_count(), 3, "file header toggle re-enabled both alpha.ns matches")
+
+    let jump_row = find_row_containing(sbuf, "beta.ns:2:")
+    check_true(jump_row > 0, "located beta.ns:2: row for <Return> jump")
+    app_feed_keys(kernel, (jump_row + 1).to_string() ++ "G<Return>")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, "beta.ns", "<Return> jumped to beta.ns")
+    check_eq_i64(world.active_buffer().point.row, 1, "<Return> placed cursor on row 1 of beta.ns")
+
+    -- Re-open `*Spectre*` and test `q` closes it back to previous buffer
+    app_feed_keys(kernel, "<Space>sR")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, SPECTRE_BUF_NAME, "re-opened *Spectre*")
+    let gen_spec = app_commit_frame(kernel) ! { e => panic(e) }
+    check_true(gen_spec > gen_cmp, "*Spectre* frame committed cleanly")
+    app_feed_keys(kernel, "q")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, "beta.ns", "q closed *Spectre* back to beta.ns")
+
+    let _ = cap
+    let _ = fs.remove_dir_all(tmp_dir) ! { _ => () }
+}
+
+fn main() {
+    test_batch_06_plugins()
+    println("test_plugins_batch_06: ALL PASSED")
+}

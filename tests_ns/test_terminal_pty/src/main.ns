@@ -1,0 +1,376 @@
+-- Integration test suite for Deliverable 3:
+--   Real Interactive POSIX PTY + VT100/ANSI & Fallback Terminal (`ext_toggleterm` + `:term` / `:vterm`):
+--     1. Full-buffer `:term` / `:vterm` / `<Space>tt` interactive `TERM-INSERT` keystroke loop
+--        (`echo`, `<BackSpace>`, `<C-c>` interrupt, persistent `cd` & `pwd`, live prompt cursor).
+--     2. Authentic `TERM-INSERT` <-> `TERM-NORMAL` modal switching (`<C-\><C-n>` -> Vim scrollback
+--        motions `k`, `/search`, `yy` yank into register -> `i` re-entering `TERM-INSERT`).
+--     3. Directory-rooted `"terminal-here"` (`Dirvish` `S` integration), `<M-2>` multi-session
+--        switching, and `:vterm <cmd>` command execution.
+--     4. All 4 layout views:
+--          - `"float"`      (`<Space>tf` / `<C-\>`: `FloatingWindow` + `floating_window_spans` + `floating_window_cursor` + cleanup)
+--          - `"horizontal"` (`<Space>th` / `:TermSplit`: top/bottom split geometry + toggle close)
+--          - `"vertical"`   (`<Space>tv` / `:TermVSplit`: left/right split geometry)
+--          - `"buffer"`     (`:term` / `:vterm` / `terminal-here`)
+--     5. `<Space>ts` (`terminal-send-line`) from Normal & Visual modes + `PTY_WAKE_TIMER_ID` tick + `app_commit_frame`.
+
+use std.fs
+use std.path
+use std.time
+use @lava_sys.{RawUiEvent, host_clipboard_get, mock_enable, mock_last_frame_cmds}
+use @lava_core.{SystemKernel, clipboard_get, clipboard_set, log_event, status_emit}
+use @lava_term.{PTY_WAKE_TIMER_ID, pty_available}
+use @ext_document.{
+    Buffer, EditorWorld, FloatingWindow, InlineSpanDecor, Pos, RegisterValue, require_editor_world
+}
+use @ext_window.{WindowManager, WindowPane, require_window_manager}
+use @ext_vim.{VimMode, VimState, require_vim_state}
+use @ext_app.{AppHostCap, app_commit_frame, app_feed_keys, app_step_event, boot_kernel}
+use @ext_toggleterm.{
+    FLOAT_ID_TOGGLETERM, TerminalSession, ToggleTermState, ext_toggleterm_id,
+    register_toggleterm_extension, require_toggleterm_state, toggleterm_exec
+}
+
+fn check_true(cond: bool, label: String) {
+    if not cond {
+        panic("FAILED: " ++ label)
+    }
+}
+
+fn check_eq_str(actual: String, expected: String, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual='" ++ actual ++ "' expected='" ++ expected ++ "'")
+    }
+}
+
+fn check_eq_i64(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual=" ++ actual.to_string() ++ " expected=" ++ expected.to_string())
+    }
+}
+
+fn find_row_containing(buf: Buffer, needle: String) -> i64 {
+    for i in 0..buf.line_count() {
+        if buf.line_at(i).contains(needle) {
+            return i
+        }
+    }
+    -1
+}
+
+fn list_contains_substr(lines: List, needle: String) -> bool {
+    for i in 0..lines.len() {
+        if lines.get(i.as(usize)).as(String).contains(needle) {
+            return true
+        }
+    }
+    false
+}
+
+fn boot_terminal_kernel() -> SystemKernel {
+    let kernel: SystemKernel = (boot_kernel() ! { e => panic(e) }).as(SystemKernel)
+    let _ = register_toggleterm_extension(kernel) ! { e => panic(e) }
+    let _ = kernel.activate_extension(ext_toggleterm_id()) ! { e => panic(e) }
+    let _ = kernel.activate_all() ! { e => panic(e) }
+    kernel
+}
+
+fn test_terminal_pty_suite() {
+    mock_enable(true)
+    check_true(not pty_available(), "standalone nessa run reports pty_available() == false")
+
+    let raw_tmp = "/tmp/lava_term_pty_" ++ time.unix_millis().to_string()
+    let _ = fs.create_dir_all(raw_tmp) ! { e => panic(e.to_string()) }
+    let tmp_dir = fs.canonicalize(raw_tmp) ! { _ => raw_tmp }
+    let sub_a = path.join(tmp_dir, "sub_a")
+    let dirvish_target = path.join(path.join(tmp_dir, "nested"), "project_dir")
+    let _ = fs.create_dir_all(sub_a) ! { e => panic(e.to_string()) }
+    let _ = fs.create_dir_all(dirvish_target) ! { e => panic(e.to_string()) }
+
+    let kernel = boot_terminal_kernel()
+    let world: EditorWorld = (require_editor_world(kernel) ! { e => panic(e) }).as(EditorWorld)
+    let wm: WindowManager = (require_window_manager(kernel) ! { e => panic(e) }).as(WindowManager)
+    let vim: VimState = (require_vim_state(kernel) ! { e => panic(e) }).as(VimState)
+    let term_state: ToggleTermState = (require_toggleterm_state(kernel) ! { e => panic(e) }).as(ToggleTermState)
+    world.cwd = tmp_dir
+
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
+    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+
+    let code_file = path.join(tmp_dir, "script.sh")
+    let _ = fs.write_string(
+        code_file,
+        "echo sent_line_one\necho sent_line_two\necho sent_line_three\n",
+    ) ! { e => panic(e.to_string()) }
+    app_feed_keys(kernel, ":e<Space>" ++ code_file ++ "<Return>")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, "script.sh", "opened script.sh")
+
+    -- ========================================================================
+    -- STEP 1: `:term` Full-Buffer Interactive `TERM-INSERT` Loop
+    -- ========================================================================
+    println("STEP 1: testing :term interactive TERM-INSERT loop")
+    app_feed_keys(kernel, ":term<Return>")# ! { e => panic(e) }
+
+    let tbuf1 = world.active_buffer()
+    check_eq_str(tbuf1.name, "*terminal-1*", ":term opened *terminal-1*")
+    check_eq_str(tbuf1.major_mode, "terminal", ":term sets major_mode == terminal")
+    check_true(term_state.term_insert_mode, ":term starts in TERM-INSERT mode")
+    check_true(world.statusline_left_extra.contains("TERM-INSERT"), "statusline badge shows TERM-INSERT")
+
+    -- Note: keys like `j`, `k`, `i`, `:` must NOT trigger Vim motions/Ex while in TERM-INSERT!
+    app_feed_keys(kernel, "echo<Space>hello_jik_term<Return>")# ! { e => panic(e) }
+    let sess1: TerminalSession = term_state.active_session(world.cwd)
+    check_true(find_row_containing(world.active_buffer(), "hello_jik_term") >= 0, "echo output rendered in *terminal-1*")
+    check_true(list_contains_substr(sess1.scrollback, "hello_jik_term"), "scrollback recorded hello_jik_term")
+
+    -- Edit partial input with `<BackSpace>` and interrupt with `<C-c>`
+    app_feed_keys(kernel, "wrong_xxx<BackSpace><BackSpace><BackSpace>cmd<C-c>")# ! { e => panic(e) }
+    check_eq_str(term_state.input_line, "", "<C-c> cleared live input_line")
+    check_true(
+        find_row_containing(world.active_buffer(), "$ wrong_cmd^C") >= 0,
+        "<C-c> appended interrupted prompt line with ^C",
+    )
+
+    -- Stateful `cd sub_a` + `pwd` + `cd ..` + `pwd`
+    app_feed_keys(kernel, "cd<Space>sub_a<Return>")# ! { e => panic(e) }
+    check_eq_str(sess1.cwd, sub_a, "cd sub_a updated session #1 cwd")
+    app_feed_keys(kernel, "pwd<Return>")# ! { e => panic(e) }
+    check_true(find_row_containing(world.active_buffer(), sub_a) >= 0, "pwd printed sub_a")
+    app_feed_keys(kernel, "cd<Space>..<Return>pwd<Return>")# ! { e => panic(e) }
+    check_eq_str(sess1.cwd, tmp_dir, "cd .. returned session #1 to tmp_dir")
+
+    -- Check live prompt cursor position & inline prompt span decoration
+    let cur_tbuf = world.active_buffer()
+    check_eq_str(cur_tbuf.line_at(cur_tbuf.line_count() - 1), "$ ", "bottom row is live prompt '$ '")
+    check_eq_i64(cur_tbuf.point.row, cur_tbuf.line_count() - 1, "cursor row on live prompt")
+    check_eq_i64(cur_tbuf.point.col, 2, "cursor col after '$ '")
+    check_true(not cur_tbuf.inline_decors.is_empty(), "terminal buffer has prompt InlineSpanDecor")
+
+    -- ========================================================================
+    -- STEP 2: `<C-\><C-n>` -> `TERM-NORMAL` Scrollback Search/Yank -> `i` `TERM-INSERT`
+    -- ========================================================================
+    println("STEP 2: testing <C-\\><C-n> TERM-NORMAL scrollback navigation & yank")
+    app_feed_keys(kernel, "<C-\\><C-n>")# ! { e => panic(e) }
+    check_true(not term_state.term_insert_mode, "<C-\\><C-n> switched to TERM-NORMAL")
+    check_true(vim.mode == VimMode.Normal, "Vim mode is Normal in TERM-NORMAL")
+    check_true(world.statusline_left_extra.contains("TERM-NORMAL"), "statusline badge shows TERM-NORMAL")
+
+    -- Navigate scrollback with `gg` + `j` + `/hello_jik_term<Return>` and yank output line with `yy`
+    app_feed_keys(kernel, "ggjyy")# ! { e => panic(e) }
+    let yanked = world.registers.named.get("\"").as(RegisterValue).text
+    check_true(yanked.contains("hello_jik_term"), "yy in TERM-NORMAL yanked terminal output line into register")
+    app_feed_keys(kernel, "G/hello_jik_term<Return>yy")# ! { e => panic(e) }
+    let searched_yank = world.registers.named.get("\"").as(RegisterValue).text
+    check_true(searched_yank.contains("hello_jik_term"), "/ search + yy in TERM-NORMAL yanked matching line")
+
+    -- Press `i` on `*terminal-1*` to re-enter `TERM-INSERT` cleanly
+    app_feed_keys(kernel, "i")# ! { e => panic(e) }
+    check_true(term_state.term_insert_mode, "pressing i in TERM-NORMAL re-entered TERM-INSERT")
+    app_feed_keys(kernel, "echo<Space>resumed_insert_ok<Return>")# ! { e => panic(e) }
+    check_true(
+        find_row_containing(world.active_buffer(), "resumed_insert_ok") >= 0,
+        "typing after re-entering TERM-INSERT executed command",
+    )
+
+    -- ========================================================================
+    -- STEP 3: `"terminal-here"` (`Dirvish` `S`) + `<M-2>` Session #2 + `:vterm <cmd>`
+    -- ========================================================================
+    println("STEP 3: testing terminal-here, multi-session <M-2>, and :vterm <cmd>")
+    let _ = kernel.dispatch_command("terminal-here", [dirvish_target])# ! { e => panic(e) }
+    check_eq_str(sess1.cwd, dirvish_target, "terminal-here updated session #1 cwd to dirvish_target")
+    check_true(term_state.term_insert_mode, "terminal-here enters TERM-INSERT")
+
+    -- Switch to Terminal #2 via `<M-2>`, then exit to `TERM-NORMAL` and run `:vterm echo vterm_arg_ok`
+    app_feed_keys(kernel, "<M-2>")# ! { e => panic(e) }
+    check_eq_i64(term_state.current_id, 2, "<M-2> switched to session #2")
+    check_eq_str(world.active_buffer().name, "*terminal-2*", "active buffer switched to *terminal-2*")
+    let sess2 = term_state.active_session(world.cwd)
+    check_eq_str(sess2.cwd, tmp_dir, "session #2 has independent workspace cwd")
+
+    app_feed_keys(kernel, "<C-\\><C-n>:vterm<Space>echo<Space>vterm_arg_ok<Return>")# ! { e => panic(e) }
+    check_true(
+        find_row_containing(world.active_buffer(), "vterm_arg_ok") >= 0,
+        ":vterm <cmd> executed command and synced *terminal-2*",
+    )
+    let code_direct = toggleterm_exec(sess2, "echo direct_exec_helper")
+    check_eq_i64(code_direct, 0, "toggleterm_exec returned exit code 0")
+    check_true(list_contains_substr(sess2.scrollback, "direct_exec_helper"), "toggleterm_exec appended output")
+
+    -- Hide `*terminal-2*` via `<C-\><C-n>q` back to `script.sh`
+    app_feed_keys(kernel, "<C-\\><C-n>q")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, "script.sh", "q in TERM-NORMAL returned to script.sh")
+
+    -- ========================================================================
+    -- STEP 4: All 4 Layout Views (`float`, `horizontal`, `vertical`, `buffer`)
+    -- ========================================================================
+    println("STEP 4: testing float, horizontal split, vertical split, and send-line")
+
+    -- 4a. Floating terminal (`<Space>tf`) + `floating_window_spans` + `floating_window_cursor`
+    app_feed_keys(kernel, "<Space>tf")# ! { e => panic(e) }
+    check_true(term_state.float_visible, "<Space>tf opened floating terminal")
+    check_eq_str(FLOAT_ID_TOGGLETERM, "toggleterm", "FLOAT_ID_TOGGLETERM is 'toggleterm'")
+    let fw_opt = world.get_floating_window("toggleterm")
+    check_true(fw_opt != null, "FloatingWindow('toggleterm') registered")
+    check_true(world.floating_window_spans.contains_key("toggleterm"), "floating_window_spans populated for toggleterm")
+    check_true(world.floating_window_cursor.contains_key("toggleterm"), "floating_window_cursor populated for toggleterm")
+    let fw_spans = world.floating_window_spans.get("toggleterm").as(List)
+    check_true(not fw_spans.is_empty(), "floating_window_spans has InlineSpanDecor entries")
+    let _ = fw_spans.get(0).as(InlineSpanDecor)
+    let fw_cur = world.floating_window_cursor.get("toggleterm").as(Pos)
+    check_eq_i64(fw_cur.row, 21, "floating cursor sits on bottom prompt row")
+
+    app_commit_frame(kernel)
+    check_true(not mock_last_frame_cmds().is_empty(), "app_commit_frame rendered floating terminal scene")
+
+    -- `<C-\>` hides float and cleans up `floating_window_spans` & `floating_window_cursor`
+    app_feed_keys(kernel, "<C-\\>")# ! { e => panic(e) }
+    check_true(not term_state.float_visible, "<C-\\> hid floating terminal")
+    check_true(not world.floating_window_spans.contains_key("toggleterm"), "floating_window_spans cleared on hide")
+    check_true(not world.floating_window_cursor.contains_key("toggleterm"), "floating_window_cursor cleared on hide")
+
+    -- 4b. Horizontal Bottom Split (`<Space>th`) + `<Space>ts` send line & Visual selection
+    check_eq_i64(wm.visible_panes().len(), 1, "starts with 1 pane before horizontal split")
+    app_feed_keys(kernel, "<Space>th")# ! { e => panic(e) }
+    let h_panes = wm.visible_panes()
+    check_eq_i64(h_panes.len(), 2, "<Space>th created 2 visible panes")
+    let top_pane = h_panes.get(0).as(WindowPane)
+    let bot_pane = h_panes.get(1).as(WindowPane)
+    check_true(bot_pane.rect.y > top_pane.rect.y, "horizontal split stacked bottom terminal below top editor")
+    check_true(wm.active_tab().active_win_id == bot_pane.id, "bottom split terminal pane is focused")
+    check_eq_str(world.active_buffer().name, "*terminal-2*", "bottom split shows *terminal-2*")
+    check_true(term_state.term_insert_mode, "bottom split starts in TERM-INSERT")
+
+    -- Jump back to top pane (`<C-\><C-n><C-w>w`), send line 1 & visual lines 2..3 via `<Space>ts`
+    app_feed_keys(kernel, "<C-\\><C-n><C-w>w")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, "script.sh", "<C-w>w focused top editor pane script.sh")
+    app_feed_keys(kernel, "gg0<Space>ts")# ! { e => panic(e) }
+    check_true(list_contains_substr(sess2.scrollback, "sent_line_one"), "<Space>ts sent current line to terminal")
+    app_feed_keys(kernel, "jVj<Space>ts")# ! { e => panic(e) }
+    check_true(list_contains_substr(sess2.scrollback, "sent_line_two"), "Visual <Space>ts sent line two")
+    check_true(list_contains_substr(sess2.scrollback, "sent_line_three"), "Visual <Space>ts sent line three")
+    let synced_tbuf2 = world.find_buffer_by_name("*terminal-2*").as(Buffer)
+    check_true(find_row_containing(synced_tbuf2, "sent_line_three") >= 0, "visible split terminal buffer updated live")
+
+    -- Focus split terminal via `<Space>th`, then press `<C-\><C-n>` and `<Space>th` again to toggle close
+    app_feed_keys(kernel, "<Space>th")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, "*terminal-2*", "<Space>th focused existing split terminal")
+    app_feed_keys(kernel, "<C-\\><C-n><Space>th")# ! { e => panic(e) }
+    check_eq_i64(wm.visible_panes().len(), 1, "second <Space>th toggled horizontal split closed")
+
+    -- 4c. Vertical Right Split (`<Space>tv`) + `"timer-tick"` (`PTY_WAKE_TIMER_ID`) + `app_commit_frame`
+    app_feed_keys(kernel, "<Space>tv")# ! { e => panic(e) }
+    let v_panes = wm.visible_panes()
+    check_eq_i64(v_panes.len(), 2, "<Space>tv created 2 visible panes")
+    let left_pane = v_panes.get(0).as(WindowPane)
+    let right_pane = v_panes.get(1).as(WindowPane)
+    check_true(right_pane.rect.x > left_pane.rect.x, "vertical split placed terminal pane on the right")
+    check_true(wm.active_tab().active_win_id == right_pane.id, "right split terminal pane is focused")
+    check_eq_str(world.active_buffer().name, "*terminal-2*", "right split shows *terminal-2*")
+
+    kernel.emit_hook("timer-tick", PTY_WAKE_TIMER_ID)
+    app_commit_frame(kernel)
+    check_true(not mock_last_frame_cmds().is_empty(), "app_commit_frame rendered vertical split terminal scene")
+
+    -- ========================================================================
+    -- STEP 5: `<C-d>` EOF Closes Split Terminal & Floating Terminal
+    -- ========================================================================
+    println("STEP 5: testing <C-d> EOF auto-close in split and floating terminals")
+    app_feed_keys(kernel, "<C-d>")# ! { e => panic(e) }
+    check_eq_i64(wm.visible_panes().len(), 1, "<C-d> EOF closed vertical split terminal")
+    check_eq_str(world.active_buffer().name, "script.sh", "<C-d> EOF returned focus to script.sh")
+
+    -- ========================================================================
+    -- STEP 6: Floating Terminal Mouse Text Selection (No Background Leak!) + `<C-d>` EOF
+    -- ========================================================================
+    println("STEP 6: testing mouse text selection inside floating terminal + clipboard yank")
+    app_feed_keys(kernel, "gg0")# ! { e => panic(e) }
+    let bg_buf = world.active_buffer()
+    let bg_orig_pos = bg_buf.point
+
+    app_feed_keys(kernel, "<C-\\>")# ! { e => panic(e) }
+    check_true(term_state.float_visible, "<C-\\> reopened fresh floating terminal")
+    app_feed_keys(kernel, "echo<Space>FLOAT_SELECT_TARGET_OK<Return>")# ! { e => panic(e) }
+
+    let fw = world.get_floating_window("toggleterm").as(FloatingWindow)
+    var target_float_row: i64 = -1
+    var target_float_col: i64 = -1
+    let needle = "FLOAT_SELECT_TARGET_OK"
+    for r in 0..fw.lines.len() {
+        let ln = fw.lines.get(r.as(usize)).as(String)
+        if (not ln.contains("$ echo")) and ln.contains(needle) {
+            target_float_row = r
+            for c in 0..(ln.char_len() - needle.char_len() + 1) {
+                if ln.slice(c, c + needle.char_len()) == needle {
+                    target_float_col = c
+                    break
+                }
+            }
+            break
+        }
+    }
+    check_true(target_float_row >= 0 and target_float_col >= 0, "located FLOAT_SELECT_TARGET_OK in floating window")
+
+    -- Compute exact pixel coordinates matching `compose_frame` / `hit_test_floating_window`
+    let cw = wm.metrics.cell_width
+    let ch = wm.metrics.cell_height
+    let win_w = wm.pixel_width.as(f64)
+    let win_h = wm.pixel_height.as(f64)
+    let echo_y = win_h - 24.0
+    let raw_w = (fw.width_cols.as(f64) * cw + 20.0).floor()
+    let raw_h = ((fw.height_rows + 1).as(f64) * ch + 14.0).floor()
+    let box_w = if raw_w > win_w - 24.0 { win_w - 24.0 } else if raw_w < 160.0 { 160.0 } else { raw_w }
+    let max_avail_h = echo_y - 26.0 - 16.0
+    let box_h = if raw_h > max_avail_h { max_avail_h } else if raw_h < ch * 3.0 { ch * 3.0 } else { raw_h }
+    let box_x = ((win_w - box_w) * 0.5).floor()
+    let box_y = ((win_h - box_h) * 0.45).floor()
+
+    let px_start = box_x + 10.0 + (target_float_col.as(f64) + 0.3) * cw
+    let px_end = box_x + 10.0 + ((target_float_col + needle.char_len() - 1).as(f64) + 0.3) * cw
+    let py_row = box_y + ch + 9.0 + (target_float_row.as(f64) + 0.5) * ch
+
+    let _ = app_step_event(kernel, RawUiEvent.MouseButton(true, 1, px_start, py_row, 0, 1))# ! { e => panic(e) }
+    let _ = app_step_event(kernel, RawUiEvent.MouseMove(px_end, py_row, 0))# ! { e => panic(e) }
+    let _ = app_step_event(kernel, RawUiEvent.MouseButton(false, 1, px_end, py_row, 0, 1))# ! { e => panic(e) }
+
+    check_true(bg_buf.point == bg_orig_pos, "mouse drag in floating terminal did NOT move background buffer cursor")
+    check_true(vim.mode == VimMode.Normal, "mouse drag in floating terminal did NOT put background buffer into Visual")
+    check_true(term_state.float_sel_anchor != null and term_state.float_sel_cursor != null, "floating selection active")
+    check_eq_str(host_clipboard_get(), needle, "floating mouse drag yanked exact text to system clipboard")
+    check_eq_str(
+        world.registers.named.get("\"").as(RegisterValue).text,
+        needle,
+        "floating mouse drag yanked exact text to unnamed register",
+    )
+
+    -- `<C-d>` EOF closes floating terminal cleanly!
+    app_feed_keys(kernel, "<C-d>")# ! { e => panic(e) }
+    check_true(not term_state.float_visible, "<C-d> EOF closed floating terminal")
+    check_true(world.get_floating_window("toggleterm") == null, "FloatingWindow('toggleterm') removed on <C-d> EOF")
+
+    -- ========================================================================
+    -- STEP 7: Minibuffer `<C-d>` Forward-Delete vs EOF Close
+    -- ========================================================================
+    println("STEP 7: testing Minibuffer <C-d> forward-delete and EOF close")
+    app_feed_keys(kernel, ":")# ! { e => panic(e) }
+    check_true(world.minibuffer_view.active, "':' opened Minibuffer")
+    app_feed_keys(kernel, "<C-d>")# ! { e => panic(e) }
+    check_true(not world.minibuffer_view.active, "<C-d> on empty ':' sent EOF and closed Minibuffer")
+
+    app_feed_keys(kernel, ":abc<C-a><C-d>")# ! { e => panic(e) }
+    check_true(world.minibuffer_view.active, "<C-d> before EOL kept Minibuffer open")
+    check_eq_str(world.minibuffer_view.input_text, "bc", "<C-d> before EOL deleted char forward")
+    app_feed_keys(kernel, "<C-e><C-d>")# ! { e => panic(e) }
+    check_true(not world.minibuffer_view.active, "<C-d> at EOL sent EOF and closed Minibuffer")
+
+    app_feed_keys(kernel, "<C-x><C-f>")# ! { e => panic(e) }
+    check_true(world.minibuffer_view.active, "C-x C-f opened find-file Minibuffer")
+    app_feed_keys(kernel, "<C-d>")# ! { e => panic(e) }
+    check_true(not world.minibuffer_view.active, "<C-d> at EOL of C-x C-f sent EOF and closed Minibuffer")
+
+    let _ = fs.remove_dir_all(tmp_dir) ! { _ => () }
+    let _ = cap
+}
+
+fn main() {
+    test_terminal_pty_suite()
+    println("ALL TERMINAL PTY & MULTI-LAYOUT TESTS PASSED!")
+}

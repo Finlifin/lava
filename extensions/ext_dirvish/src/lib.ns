@@ -1,0 +1,2667 @@
+-- ext_dirvish: Emacs Dirvish 3-Pane Miller-Columns File Manager with Full Ranger Keybindings
+-- (`lava.org/ext_dirvish`).
+--
+-- Provides:
+--   - Service `"lava.dirvish.state"` (`DirvishState`)
+--   - 3-Pane Miller-Columns layout (`*dirvish-parent*` 20% | `*dirvish*` 38% | `*dirvish-preview*` 42%)
+--     with single-pane toggle (`zp` / `<Tab>`) and automatic helper-split cleanup on file open / quit
+--   - Live syntax-highlighted file preview (`8 KiB` / `120` lines cap, binary `\0` detection) and
+--     directory child listing preview on every cursor motion
+--   - Full Ranger modal keymap (`mode:dirvish`): `j`/`k`/`h`/`l`/`-`/`gg`/`G`/`H`/`L`/`gh`/`gr`/`gp`/`gn`,
+--     visual marking (`<Space>`/`mm`/`t`, `v`, `uv`/`U`), yank/cut/paste/overwrite/delete file ring
+--     (`yy`/`ya`/`dd`/`da`/`uy`/`pp`/`po`/`dD`/`D`), rename & create (`cw`/`R`/`A`/`I`/`a`/`cf`/`%`/`mk`/`+`),
+--     view/sort/filter/yank-path/shell (`zh`/`.`/`zp`/`<Tab>`/`zf`/`/`/`zi`/`on`/`os`/`oe`/`or`/`yp`/`yd`/`yn`/`S`/`gR`/`r`/`q`).
+
+use std.collections.{HashMap, Set}
+use std.env
+use std.fs
+use std.fs.DirEntry
+use std.io.File
+use std.path
+use @lava_sys.{rgb, rgba}
+use @lava_core.{
+    ExtId, InteractiveEffects, PromptKind, PromptRequest, SystemKernel, ask_prompt, clipboard_set,
+    log_event, status_emit
+}
+use @lava_accel.{GitFileEntry, accel_git_status}
+use @ext_document.{
+    Buffer, BufferId, BufferKind, EditorWorld, Pos, RegisterValue, detect_major_mode,
+    ext_document_id, require_editor_world
+}
+use @ext_window.{
+    LayoutNode, SplitAxis, WinId, WindowManager, WindowPane, ext_window_id, require_window_manager
+}
+use @ext_render.ext_render_id
+use @ext_vim.{
+    KEYMAP_VIM_NORMAL, VimMode, VimState, ext_vim_id, require_vim_state, sync_world_from_vim
+}
+
+pub const SERVICE_DIRVISH: String = "lava.dirvish.state"
+
+pub const DIRVISH_BUF_NAME: String = "*dirvish*"
+pub const DIRVISH_PARENT_BUF_NAME: String = "*dirvish-parent*"
+pub const DIRVISH_PREVIEW_BUF_NAME: String = "*dirvish-preview*"
+pub const DIRVISH_DECOR_OWNER: String = "ext_dirvish"
+pub const DIRVISH_NAME_COL: i64 = 6
+
+pub fn ext_dirvish_id() -> ExtId = ExtId("lava.org/ext_dirvish")
+
+-- ============================================================================
+-- 1. Domain Model & Service State
+-- ============================================================================
+
+pub struct DirvishEntry {
+    pub name: String,
+    pub full_path: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub is_exec: bool,
+    pub size: i64,
+    pub modified_unix_secs: i64,
+    pub symlink_target: String,
+    pub git_badge: String,
+    pub perms: String,
+}
+derive Eq, PartialEq for DirvishEntry
+
+pub struct DirvishState {
+    pub current_dir: String,
+    pub origin_buf_id: ?BufferId,
+    pub miller_mode: bool,
+    pub show_hidden: bool,
+    pub filter_query: String,
+    pub sort_by: String,
+    pub sort_reverse: bool,
+    pub marked_paths: Set,
+    pub yank_ring: List,
+    pub yank_mode: String,
+    pub history: List,
+    pub history_idx: i64,
+    pub entries: List,
+    pub parent_entries: List,
+    pub cursor_by_dir: HashMap,
+}
+
+impl DirvishState {
+    pub fn new() -> DirvishState {
+        DirvishState {
+            current_dir: "",
+            origin_buf_id: null,
+            miller_mode: true,
+            show_hidden: false,
+            filter_query: "",
+            sort_by: "name",
+            sort_reverse: false,
+            marked_paths: Set.new(),
+            yank_ring: List(),
+            yank_mode: "",
+            history: List(),
+            history_idx: -1,
+            entries: List(),
+            parent_entries: List(),
+            cursor_by_dir: HashMap.new(),
+        }
+    }
+
+    pub fn record_history(self, dir_path: String) {
+        if dir_path == "" {
+            return
+        }
+        if self.history_idx >= 0 and self.history_idx < self.history.len() {
+            let cur = self.history.get(self.history_idx.as(usize)).as(String)
+            if cur == dir_path {
+                return
+            }
+        }
+        while self.history.len() > self.history_idx + 1 {
+            let _ = self.history.pop()
+        }
+        self.history.push(dir_path)
+        if self.history.len() > 100 {
+            let _ = self.history.remove(0)
+        }
+        self.history_idx = self.history.len() - 1
+    }
+}
+
+pub fn require_dirvish_state(kernel: SystemKernel) -> !String DirvishState {
+    let raw = kernel.require_service(SERVICE_DIRVISH)!
+    raw.as(DirvishState)
+}
+
+-- ============================================================================
+-- 2. Path, Formatting, Sorting & Filesystem Inspection Helpers
+-- ============================================================================
+
+fn clean_dir_path(raw_dir: String, fallback_cwd: String) -> String {
+    let base = if raw_dir.trim() == "" {
+        if fallback_cwd.trim() == "" { "." } else { fallback_cwd.trim() }
+    } else {
+        raw_dir.trim()
+    }
+    let abs_p = if path.is_absolute(base) {
+        path.normalize(base)
+    } else {
+        let cwd_clean = if fallback_cwd.trim() == "" { "." } else { fallback_cwd.trim() }
+        path.normalize(path.join(cwd_clean, base))
+    }
+    if abs_p == "" {
+        return "/"
+    }
+    if abs_p.char_len() > 1 and abs_p.ends_with("/") {
+        return abs_p.slice(0, abs_p.char_len() - 1)
+    }
+    abs_p
+}
+
+fn home_directory() -> String {
+    let h_opt = env.get("HOME")
+    if h_opt != null {
+        let h = h_opt.as(String).trim()
+        if h != "" {
+            return clean_dir_path(h, "/")
+        }
+    }
+    "/"
+}
+
+fn abbreviate_path(dir_path: String) -> String {
+    let home = home_directory()
+    if home != "/" and home != "" {
+        if dir_path == home {
+            return "~"
+        }
+        if dir_path.starts_with(home ++ "/") {
+            return "~" ++ dir_path.slice(home.char_len(), dir_path.char_len())
+        }
+    }
+    dir_path
+}
+
+fn pad_left(s: String, width: i64) -> String {
+    let n = s.char_len()
+    if n >= width {
+        return s.take(width)
+    }
+    " ".repeat(width - n) ++ s
+}
+
+fn pad_right(s: String, width: i64) -> String {
+    let n = s.char_len()
+    if n >= width {
+        return s.take(width)
+    }
+    s ++ " ".repeat(width - n)
+}
+
+fn format_human_size(bytes: i64) -> String {
+    if bytes < 0 {
+        return "    0B"
+    }
+    if bytes < 1024 {
+        return pad_left(bytes.to_string() ++ "B", 6)
+    }
+    if bytes < 1024 * 1024 {
+        let tenths = (bytes * 10) / 1024
+        let whole = tenths / 10
+        let frac = tenths % 10
+        let txt = if whole >= 100 {
+            whole.to_string() ++ "K"
+        } else {
+            whole.to_string() ++ "." ++ frac.to_string() ++ "K"
+        }
+        return pad_left(txt, 6)
+    }
+    if bytes < 1024 * 1024 * 1024 {
+        let tenths = (bytes * 10) / (1024 * 1024)
+        let whole = tenths / 10
+        let frac = tenths % 10
+        let txt = if whole >= 100 {
+            whole.to_string() ++ "M"
+        } else {
+            whole.to_string() ++ "." ++ frac.to_string() ++ "M"
+        }
+        return pad_left(txt, 6)
+    }
+    let tenths = (bytes * 10) / (1024 * 1024 * 1024)
+    let whole = tenths / 10
+    let frac = tenths % 10
+    pad_left(whole.to_string() ++ "." ++ frac.to_string() ++ "G", 6)
+}
+
+fn split_stem_and_ext(filename: String) -> (String, String) {
+    if filename == "" or filename == "." or filename == ".." {
+        return (filename, "")
+    }
+    let n = filename.char_len()
+    var dot_idx: i64 = -1
+    var i = n - 1
+    while i > 0 {
+        if filename.slice(i, i + 1) == "." {
+            dot_idx = i
+            break
+        }
+        i -= 1
+    }
+    if dot_idx <= 0 {
+        return (filename, "")
+    }
+    (filename.slice(0, dot_idx), filename.slice(dot_idx, n))
+}
+
+fn entry_extension_lower(name: String) -> String {
+    let (_, ext) = split_stem_and_ext(name)
+    if ext.starts_with(".") {
+        return ext.slice(1, ext.char_len()).to_lower()
+    }
+    ext.to_lower()
+}
+
+fn looks_executable_file(full_path: String, name: String, size: i64) -> bool {
+    let low = name.to_lower()
+    if (
+        low.ends_with(".sh")
+        or low.ends_with(".bash")
+        or low.ends_with(".zsh")
+        or low.ends_with(".bin")
+        or low.ends_with(".out")
+        or low.ends_with(".appimage")
+    ) {
+        return true
+    }
+    if size < 2 {
+        return false
+    }
+    let f_maybe: ?File = File.open(full_path, mode = "rb") ! { _ => null }
+    let f_opt? = f_maybe else {
+        return false
+    }
+    let hdr = f_opt.read_bytes(max_bytes = 4) ! { _ => List() }
+    let _ = f_opt.close()
+    if hdr.len() >= 2 {
+        let b0 = hdr.get(0).as(i64)
+        let b1 = hdr.get(1).as(i64)
+        -- `#!` script shebang
+        if b0 == 35 and b1 == 33 {
+            return true
+        }
+    }
+    if hdr.len() >= 4 {
+        let b0 = hdr.get(0).as(i64)
+        let b1 = hdr.get(1).as(i64)
+        let b2 = hdr.get(2).as(i64)
+        let b3 = hdr.get(3).as(i64)
+        -- `\x7fELF` binary header
+        if b0 == 127 and b1 == 69 and b2 == 76 and b3 == 70 {
+            return true
+        }
+    }
+    false
+}
+
+fn find_git_repo_root(dir_path: String) -> ?String {
+    var cur = dir_path
+    var depth: i64 = 0
+    while cur != "" and depth < 32 {
+        let git_marker = path.join(cur, ".git")
+        if fs.exists(git_marker) {
+            return cur
+        }
+        if cur == "/" {
+            break
+        }
+        let p_opt = path.parent(cur)
+        if p_opt == null {
+            break
+        }
+        let next_dir = p_opt.as(String)
+        if next_dir == "" or next_dir == cur {
+            break
+        }
+        cur = next_dir
+        depth += 1
+    }
+    null
+}
+
+fn normalize_git_badge(idx_st: String, wt_st: String) -> String {
+    if idx_st == "?" or wt_st == "?" {
+        return "?"
+    }
+    if idx_st == "D" or wt_st == "D" {
+        return "D"
+    }
+    if idx_st == "A" or wt_st == "A" {
+        return "A"
+    }
+    if idx_st == "M" or wt_st == "M" or idx_st == "R" or wt_st == "R" or idx_st == "C" {
+        return "M"
+    }
+    if idx_st.trim() != "" {
+        return idx_st.trim().take(1)
+    }
+    if wt_st.trim() != "" {
+        return wt_st.trim().take(1)
+    }
+    " "
+}
+
+fn collect_dir_git_badges(dir_path: String) -> HashMap {
+    let badges = HashMap.new()
+    let repo_opt = find_git_repo_root(dir_path)
+    if repo_opt == null {
+        return badges
+    }
+    let summary = accel_git_status(dir_path)
+    if not summary.is_repo {
+        return badges
+    }
+    let repo_root = clean_dir_path(
+        if summary.root != "" { summary.root } else { repo_opt.as(String) },
+        "/",
+    )
+    let dir_clean = clean_dir_path(dir_path, "/")
+    var rel_prefix = ""
+    if dir_clean == repo_root {
+        rel_prefix = ""
+    } else if repo_root == "/" and dir_clean.starts_with("/") {
+        rel_prefix = dir_clean.slice(1, dir_clean.char_len()) ++ "/"
+    } else if dir_clean.starts_with(repo_root ++ "/") {
+        rel_prefix = dir_clean.slice(repo_root.char_len() + 1, dir_clean.char_len()) ++ "/"
+    } else {
+        return badges
+    }
+
+    for i in 0..summary.entries.len() {
+        let ge = summary.entries.get(i.as(usize)).as(GitFileEntry)
+        let rp = ge.rel_path
+        if rel_prefix == "" or rp.starts_with(rel_prefix) {
+            let sub = if rel_prefix == "" {
+                rp
+            } else {
+                rp.slice(rel_prefix.char_len(), rp.char_len())
+            }
+            if sub != "" {
+                let sp_opt = sub.split_once("/")
+                let child_name = if sp_opt != null {
+                    let (head, _) = sp_opt.as((String, String))
+                    head
+                } else {
+                    sub
+                }
+                if child_name != "" {
+                    let badge = normalize_git_badge(ge.index_status, ge.worktree_status)
+                    if badge != " " {
+                        -- Prefer `M` / `D` / `A` over `?` on directories with mixed changes
+                        let existing_opt = badges.get(child_name)
+                        if existing_opt == null or existing_opt.as(String) == "?" {
+                            badges.insert(child_name, badge)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    badges
+}
+
+fn compare_entries(a: DirvishEntry, b: DirvishEntry, sort_by: String, sort_reverse: bool) -> bool {
+    -- Directories ALWAYS grouped first (like Ranger & Emacs Dirvish)
+    if a.is_dir and (not b.is_dir) {
+        return false
+    }
+    if (not a.is_dir) and b.is_dir {
+        return true
+    }
+
+    let al = a.name.to_lower()
+    let bl = b.name.to_lower()
+
+    var raw_greater = false
+    if sort_by == "size" and (not a.is_dir) and (not b.is_dir) {
+        if a.size != b.size {
+            -- Larger or smaller: ascending size puts smaller first, `or` reverses
+            raw_greater = a.size > b.size
+        } else {
+            raw_greater = if al != bl { al > bl } else { a.name > b.name }
+        }
+    } else if sort_by == "ext" and (not a.is_dir) and (not b.is_dir) {
+        let ae = entry_extension_lower(a.name)
+        let be = entry_extension_lower(b.name)
+        if ae != be {
+            raw_greater = ae > be
+        } else {
+            raw_greater = if al != bl { al > bl } else { a.name > b.name }
+        }
+    } else {
+        raw_greater = if al != bl { al > bl } else { a.name > b.name }
+    }
+
+    if sort_reverse {
+        return not raw_greater and (a.name != b.name or a.size != b.size)
+    }
+    raw_greater
+}
+
+fn sort_dirvish_entries(entries: List, sort_by: String, sort_reverse: bool) {
+    let n = entries.len()
+    for i in 1..n {
+        let cur = entries.get(i.as(usize)).as(DirvishEntry)
+        var j = i - 1
+        while j >= 0 {
+            let prev = entries.get(j.as(usize)).as(DirvishEntry)
+            if compare_entries(prev, cur, sort_by, sort_reverse) {
+                entries.set((j + 1).as(usize), prev)
+                j -= 1
+            } else {
+                break
+            }
+        }
+        entries.set((j + 1).as(usize), cur)
+    }
+}
+
+fn scan_directory_entries(
+    dir_path: String,
+    show_hidden: bool,
+    filter_query: String,
+    sort_by: String,
+    sort_reverse: bool,
+    include_git: bool,
+) -> !String List {
+    let raw = (fs.read_dir_entries(dir_path) ! {
+        err => error ("Cannot read directory '" ++ dir_path ++ "': " ++ err.to_string())
+    })!
+    let git_badges = if include_git {
+        collect_dir_git_badges(dir_path)
+    } else {
+        HashMap.new()
+    }
+    let q_low = filter_query.trim().to_lower()
+    let out = List()
+
+    for i in 0..raw.len() {
+        let de = raw.get(i.as(usize)).as(DirEntry)
+        if de.name == "." or de.name == ".." {
+            continue
+        }
+        if (not show_hidden) and de.name.starts_with(".") {
+            continue
+        }
+        if q_low != "" and (not de.name.to_lower().contains(q_low)) {
+            continue
+        }
+        let full_p = clean_dir_path(path.join(dir_path, de.name), dir_path)
+        let is_dir_real = de.is_dir or (de.is_symlink and fs.is_dir(full_p))
+        let is_exec = if (not is_dir_real) and (not de.is_symlink) {
+            looks_executable_file(full_p, de.name, de.size)
+        } else {
+            false
+        }
+        let perms = if de.is_symlink {
+            "lrwxrwxrwx"
+        } else if is_dir_real {
+            "drwxr-xr-x"
+        } else if is_exec {
+            "-rwxr-xr-x"
+        } else {
+            "-rw-r--r--"
+        }
+        var sym_target = ""
+        if de.is_symlink {
+            let canon_opt = fs.canonicalize(full_p) ! { _ => "" }
+            sym_target = canon_opt
+        }
+        let badge_opt = git_badges.get(de.name)
+        let git_badge = if badge_opt != null { badge_opt.as(String) } else { " " }
+
+        out.push(DirvishEntry {
+            name: de.name,
+            full_path: full_p,
+            is_dir: is_dir_real,
+            is_symlink: de.is_symlink,
+            is_exec: is_exec,
+            size: de.size,
+            modified_unix_secs: de.modified_unix_secs,
+            symlink_target: sym_target,
+            git_badge: git_badge,
+            perms: perms,
+        })
+    }
+
+    sort_dirvish_entries(out, sort_by, sort_reverse)
+    out
+}
+
+-- ============================================================================
+-- 3. Buffer Construction, Column Highlighting & Live Preview Rendering
+-- ============================================================================
+
+fn ensure_dirvish_buffer(
+    world: EditorWorld,
+    exact_name: String,
+    kind: BufferKind,
+    major_mode: String,
+    dir_path: String,
+) -> Buffer {
+    let existing? = world.find_buffer_by_name(exact_name) else {
+        let b = world.create_buffer(
+            exact_name,
+            kind,
+            file_path = dir_path,
+            major_mode = major_mode,
+            initial_lines = [""],
+        )
+        b.read_only = true
+        b.modified = false
+        return b
+    }
+    existing.kind = kind
+    existing.major_mode = major_mode
+    existing.file_path = dir_path
+    existing.read_only = true
+    existing.modified = false
+    existing
+}
+
+fn color_header_bg() -> i64 = rgba(49, 50, 68, 190)
+fn color_accent_blue() -> i64 = rgb(137, 180, 250)
+fn color_active_parent_bg() -> i64 = rgba(137, 180, 250, 52)
+fn color_mark_yellow() -> i64 = rgb(249, 226, 175)
+fn color_mark_row_bg() -> i64 = rgba(249, 226, 175, 32)
+fn color_exec_green() -> i64 = rgb(166, 227, 161)
+fn color_symlink_cyan() -> i64 = rgb(148, 226, 213)
+fn color_muted_gray() -> i64 = rgb(127, 132, 156)
+fn color_git_untracked() -> i64 = rgb(250, 179, 135)
+fn color_git_deleted() -> i64 = rgb(243, 139, 168)
+fn color_file_icon() -> i64 = rgb(180, 190, 254)
+fn color_file_fg() -> i64 = rgb(205, 214, 244)
+
+fn git_badge_color(badge: String) -> i64 {
+    when {
+        badge == "M" => color_mark_yellow(),
+        badge == "A" => color_exec_green(),
+        badge == "?" => color_git_untracked(),
+        badge == "D" => color_git_deleted(),
+        else => color_muted_gray(),
+    }
+}
+
+fn render_parent_buffer(world: EditorWorld, state: DirvishState) -> Buffer {
+    let parent_buf = ensure_dirvish_buffer(
+        world,
+        DIRVISH_PARENT_BUF_NAME,
+        BufferKind.Directory,
+        "dirvish-parent",
+        "",
+    )
+    parent_buf.read_only = false
+    parent_buf.clear_owner_decors(DIRVISH_DECOR_OWNER)
+
+    if state.current_dir == "/" {
+        state.parent_entries = List()
+        parent_buf.file_path = ""
+        let root_line = "  [root /]"
+        parent_buf.set_lines([root_line], record_undo = false)
+        parent_buf.add_inline_decor(
+            DIRVISH_DECOR_OWNER,
+            0,
+            0,
+            root_line.char_len(),
+            bg_rgba = color_active_parent_bg(),
+            fg_rgba = color_accent_blue(),
+        )
+        parent_buf.point = Pos.new(0, 2)
+        parent_buf.modified = false
+        parent_buf.read_only = true
+        return parent_buf
+    }
+
+    let p_opt = path.parent(state.current_dir)
+    let parent_dir = if p_opt != null and p_opt.as(String) != "" {
+        clean_dir_path(p_opt.as(String), "/")
+    } else {
+        "/"
+    }
+    parent_buf.file_path = ""
+
+    let cur_base_opt = path.file_name(state.current_dir)
+    let cur_base = if cur_base_opt != null { cur_base_opt.as(String) } else { "" }
+
+    -- Always include `cur_base` even if it starts with `.` and `show_hidden` is false
+    let show_dots = state.show_hidden or cur_base.starts_with(".")
+    let p_entries = scan_directory_entries(
+        parent_dir,
+        show_dots,
+        "",
+        "name",
+        false,
+        false,
+    ) ! { _ => List() }
+    state.parent_entries = p_entries
+
+    let lines = List()
+    let hdr = " " ++ abbreviate_path(parent_dir)
+    lines.push(hdr)
+
+    var active_row: i64 = 0
+    for i in 0..p_entries.len() {
+        let pe = p_entries.get(i.as(usize)).as(DirvishEntry)
+        let icon = if pe.is_dir { "▸ " } else { "◫ " }
+        let suffix = if pe.is_dir { "/" } else { "" }
+        let ln = " " ++ icon ++ pe.name ++ suffix
+        lines.push(ln)
+        if pe.name == cur_base {
+            active_row = i + 1
+        }
+    }
+
+    parent_buf.set_lines(lines, record_undo = false)
+    parent_buf.add_inline_decor(
+        DIRVISH_DECOR_OWNER,
+        0,
+        0,
+        hdr.char_len(),
+        bg_rgba = color_header_bg(),
+        fg_rgba = color_muted_gray(),
+    )
+
+    for i in 0..p_entries.len() {
+        let row = i + 1
+        let pe = p_entries.get(i.as(usize)).as(DirvishEntry)
+        let llen = parent_buf.line_char_len(row)
+        if row == active_row {
+            parent_buf.add_inline_decor(
+                DIRVISH_DECOR_OWNER,
+                row,
+                0,
+                llen,
+                bg_rgba = color_active_parent_bg(),
+                fg_rgba = color_accent_blue(),
+            )
+        } else if pe.is_dir {
+            parent_buf.add_inline_decor(
+                DIRVISH_DECOR_OWNER,
+                row,
+                0,
+                llen,
+                fg_rgba = color_accent_blue(),
+            )
+        } else {
+            parent_buf.add_inline_decor(
+                DIRVISH_DECOR_OWNER,
+                row,
+                0,
+                llen,
+                fg_rgba = color_muted_gray(),
+            )
+        }
+    }
+
+    parent_buf.point = Pos.new(active_row, if active_row > 0 { 3 } else { 1 })
+    parent_buf.modified = false
+    parent_buf.read_only = true
+    parent_buf
+}
+
+fn entry_icon(ent: DirvishEntry) -> String {
+    if ent.is_dir {
+        return "▸"
+    }
+    if ent.is_symlink {
+        return "◈"
+    }
+    if ent.is_exec {
+        return "▶"
+    }
+    let ext = entry_extension_lower(ent.name)
+    if ext == "toml" or ext == "json" or ext == "yaml" or ext == "yml" or ext == "lock" or ext == "ini" or ext == "conf" {
+        return "⚙"
+    }
+    if ext == "md" or ext == "txt" or ext == "org" or ext == "rst" {
+        return "▤"
+    }
+    if ext == "ns" or ext == "rs" or ext == "py" or ext == "ts" or ext == "tsx" or ext == "js" or ext == "jsx" or ext == "go" or ext == "c" or ext == "cpp" or ext == "h" or ext == "sh" or ext == "lua" or ext == "zig" {
+        return "≡"
+    }
+    "◫"
+}
+
+fn format_center_header(state: DirvishState) -> String {
+    let sort_arrow = if state.sort_reverse { "↓" } else { "↑" }
+    let count_tag = "[" ++ state.entries.len().to_string() ++ "]"
+    let sort_tag = "sort:" ++ state.sort_by ++ " " ++ sort_arrow
+    let hidden_tag = if state.show_hidden { "  ·hidden" } else { "" }
+    let filter_tag = if state.filter_query != "" {
+        "  filter:" ++ state.filter_query
+    } else {
+        ""
+    }
+    let ring_tag = if not state.yank_ring.is_empty() {
+        "  " ++ state.yank_mode ++ ":" ++ state.yank_ring.len().to_string()
+    } else {
+        ""
+    }
+    "  ▸ " ++ abbreviate_path(state.current_dir) ++ "  " ++ count_tag ++ "  " ++ sort_tag ++ hidden_tag ++ filter_tag ++ ring_tag
+}
+
+fn render_center_buffer(
+    world: EditorWorld,
+    state: DirvishState,
+    focus_name: String,
+    preferred_row: i64,
+) -> Buffer {
+    let buf = ensure_dirvish_buffer(
+        world,
+        DIRVISH_BUF_NAME,
+        BufferKind.Directory,
+        "dirvish",
+        state.current_dir,
+    )
+    buf.read_only = false
+    buf.clear_owner_decors(DIRVISH_DECOR_OWNER)
+
+    let lines = List()
+    let header = format_center_header(state)
+    lines.push(header)
+
+    if state.entries.is_empty() {
+        let empty_msg = if state.filter_query != "" {
+            "    (no entries matching filter '" ++ state.filter_query ++ "')"
+        } else {
+            "    (empty directory)"
+        }
+        lines.push(empty_msg)
+        buf.set_lines(lines, record_undo = false)
+        buf.add_inline_decor(
+            DIRVISH_DECOR_OWNER,
+            0,
+            0,
+            header.char_len(),
+            bg_rgba = color_header_bg(),
+            fg_rgba = color_accent_blue(),
+        )
+        buf.add_inline_decor(
+            DIRVISH_DECOR_OWNER,
+            1,
+            0,
+            empty_msg.char_len(),
+            fg_rgba = color_muted_gray(),
+        )
+        buf.point = Pos.new(1, 4)
+        buf.modified = false
+        buf.read_only = true
+        return buf
+    }
+
+    var target_row: i64 = -1
+    let remembered_opt = state.cursor_by_dir.get(state.current_dir)
+    let effective_focus = if focus_name != "" {
+        focus_name
+    } else if remembered_opt != null and preferred_row < 1 {
+        remembered_opt.as(String)
+    } else {
+        ""
+    }
+
+    let name_col_ends = List()
+    for i in 0..state.entries.len() {
+        let ent = state.entries.get(i.as(usize)).as(DirvishEntry)
+        let is_marked = state.marked_paths.contains(ent.full_path)
+        var in_ring = false
+        for ri in 0..state.yank_ring.len() {
+            if state.yank_ring.get(ri.as(usize)).as(String) == ent.full_path {
+                in_ring = true
+                break
+            }
+        }
+        let mark_col = if is_marked {
+            "●"
+        } else if in_ring and state.yank_mode == "cut" {
+            "-"
+        } else if in_ring {
+            "+"
+        } else {
+            " "
+        }
+        let git_col = if ent.git_badge != "" { ent.git_badge.take(1) } else { " " }
+        let size_col = if ent.is_dir {
+            "dir"
+        } else {
+            format_human_size(ent.size).trim()
+        }
+        let icon_col = entry_icon(ent)
+        let suffix = if ent.is_dir { "/" } else { "" }
+        let sym_info = if ent.is_symlink and ent.symlink_target != "" {
+            " -> " ++ ent.symlink_target
+        } else {
+            ""
+        }
+        let raw_name = ent.name ++ suffix ++ sym_info
+        let padded_name = pad_right(raw_name, 30)
+        let name_end = 6 + padded_name.char_len()
+        name_col_ends.push(name_end)
+        let line = mark_col ++ " " ++ git_col ++ " " ++ icon_col ++ " " ++ padded_name ++ "  " ++ size_col
+        lines.push(line)
+
+        if effective_focus != "" and ent.name == effective_focus {
+            target_row = i + 1
+        }
+    }
+
+    buf.set_lines(lines, record_undo = false)
+    buf.add_inline_decor(
+        DIRVISH_DECOR_OWNER,
+        0,
+        0,
+        header.char_len(),
+        bg_rgba = color_header_bg(),
+        fg_rgba = color_accent_blue(),
+    )
+
+    for i in 0..state.entries.len() {
+        let row = i + 1
+        let ent = state.entries.get(i.as(usize)).as(DirvishEntry)
+        let llen = buf.line_char_len(row)
+        let name_end = name_col_ends.get(i.as(usize)).as(i64)
+        let is_marked = state.marked_paths.contains(ent.full_path)
+        let row_bg = if is_marked { color_mark_row_bg() } else { 0 }
+
+        if is_marked {
+            buf.add_inline_decor(
+                DIRVISH_DECOR_OWNER,
+                row,
+                0,
+                2,
+                bg_rgba = row_bg,
+                fg_rgba = color_mark_yellow(),
+            )
+        }
+
+        if ent.git_badge != " " and ent.git_badge != "" {
+            buf.add_inline_decor(
+                DIRVISH_DECOR_OWNER,
+                row,
+                2,
+                4,
+                bg_rgba = row_bg,
+                fg_rgba = git_badge_color(ent.git_badge),
+            )
+        } else if is_marked {
+            buf.add_inline_decor(DIRVISH_DECOR_OWNER, row, 2, 4, bg_rgba = row_bg)
+        }
+
+        -- Icon (`4..6`) + entry name (`6..name_end`) + muted size (`name_end..llen`)
+        if ent.is_dir {
+            buf.add_inline_decor(
+                DIRVISH_DECOR_OWNER,
+                row,
+                4,
+                name_end,
+                bg_rgba = row_bg,
+                fg_rgba = color_accent_blue(),
+            )
+        } else if ent.is_symlink {
+            buf.add_inline_decor(
+                DIRVISH_DECOR_OWNER,
+                row,
+                4,
+                name_end,
+                bg_rgba = row_bg,
+                fg_rgba = color_symlink_cyan(),
+            )
+        } else if ent.is_exec {
+            buf.add_inline_decor(
+                DIRVISH_DECOR_OWNER,
+                row,
+                4,
+                name_end,
+                bg_rgba = row_bg,
+                fg_rgba = color_exec_green(),
+            )
+        } else {
+            buf.add_inline_decor(
+                DIRVISH_DECOR_OWNER,
+                row,
+                4,
+                6,
+                bg_rgba = row_bg,
+                fg_rgba = color_file_icon(),
+            )
+            let name_fg = if is_marked { color_mark_yellow() } else { color_file_fg() }
+            buf.add_inline_decor(
+                DIRVISH_DECOR_OWNER,
+                row,
+                6,
+                name_end,
+                bg_rgba = row_bg,
+                fg_rgba = name_fg,
+            )
+        }
+        if name_end < llen {
+            buf.add_inline_decor(
+                DIRVISH_DECOR_OWNER,
+                row,
+                name_end,
+                llen,
+                bg_rgba = row_bg,
+                fg_rgba = color_muted_gray(),
+            )
+        }
+    }
+
+    let max_entry_row = state.entries.len()
+    let final_row = if target_row >= 1 and target_row <= max_entry_row {
+        target_row
+    } else if preferred_row >= 1 and preferred_row <= max_entry_row {
+        preferred_row
+    } else if preferred_row > max_entry_row {
+        max_entry_row
+    } else {
+        1
+    }
+    let selected_ent = state.entries.get((final_row - 1).as(usize)).as(DirvishEntry)
+    state.cursor_by_dir.insert(state.current_dir, selected_ent.name)
+
+    buf.point = Pos.new(final_row, DIRVISH_NAME_COL)
+    buf.modified = false
+    buf.read_only = true
+    buf
+}
+
+fn entry_at_cursor(state: DirvishState, center_buf: Buffer) -> ?DirvishEntry {
+    if state.entries.is_empty() {
+        return null
+    }
+    let idx = center_buf.point.row - 1
+    if idx < 0 or idx >= state.entries.len() {
+        return null
+    }
+    state.entries.get(idx.as(usize)).as(DirvishEntry)
+}
+
+fn render_preview_buffer(world: EditorWorld, state: DirvishState, center_buf: Buffer) -> Buffer {
+    let preview_buf = ensure_dirvish_buffer(
+        world,
+        DIRVISH_PREVIEW_BUF_NAME,
+        BufferKind.Special,
+        "dirvish-preview",
+        "",
+    )
+    preview_buf.read_only = false
+    preview_buf.clear_owner_decors(DIRVISH_DECOR_OWNER)
+
+    let ent_opt = entry_at_cursor(state, center_buf)
+    if ent_opt == null {
+        preview_buf.major_mode = "dirvish-preview"
+        preview_buf.file_path = ""
+        let msg = "  [No entry selected]"
+        preview_buf.set_lines([msg], record_undo = false)
+        preview_buf.add_inline_decor(
+            DIRVISH_DECOR_OWNER,
+            0,
+            0,
+            msg.char_len(),
+            fg_rgba = color_muted_gray(),
+        )
+        preview_buf.point = Pos.zero()
+        preview_buf.modified = false
+        preview_buf.read_only = true
+        return preview_buf
+    }
+
+    let ent = ent_opt.as(DirvishEntry)
+    preview_buf.file_path = ""
+
+    if ent.is_dir {
+        preview_buf.major_mode = "dirvish-preview"
+        let children_maybe: ?List = scan_directory_entries(
+            ent.full_path,
+            state.show_hidden,
+            "",
+            "name",
+            false,
+            false,
+        ) ! { _ => null }
+        let children? = children_maybe else {
+            preview_buf.set_lines(["  [Directory unreadable]"], record_undo = false)
+            preview_buf.point = Pos.zero()
+            preview_buf.modified = false
+            preview_buf.read_only = true
+            return preview_buf
+        }
+        let total = children.len()
+        let hdr = "  ▸ " ++ ent.name ++ "/  (" ++ total.to_string() ++ " items)"
+        let lines = List()
+        lines.push(hdr)
+        let limit = if total > 80 { 80 } else { total }
+        if total == 0 {
+            lines.push("    (empty directory)")
+        } else {
+            for i in 0..limit {
+                let ch = children.get(i.as(usize)).as(DirvishEntry)
+                if ch.is_dir {
+                    lines.push("  ▸ " ++ ch.name ++ "/")
+                } else {
+                    let disp_name = if ch.name.char_len() > 26 {
+                        ch.name.take(23) ++ "..."
+                    } else {
+                        ch.name
+                    }
+                    let cicon = entry_icon(ch)
+                    lines.push("  " ++ cicon ++ " " ++ pad_right(disp_name, 26) ++ "  " ++ format_human_size(ch.size))
+                }
+            }
+            if total > limit {
+                lines.push("    ... (" ++ (total - limit).to_string() ++ " more items)")
+            }
+        }
+        preview_buf.set_lines(lines, record_undo = false)
+        preview_buf.add_inline_decor(
+            DIRVISH_DECOR_OWNER,
+            0,
+            0,
+            hdr.char_len(),
+            bg_rgba = color_header_bg(),
+            fg_rgba = color_accent_blue(),
+        )
+        for i in 0..limit {
+            let row = i + 1
+            let ch = children.get(i.as(usize)).as(DirvishEntry)
+            let llen = preview_buf.line_char_len(row)
+            if ch.is_dir {
+                preview_buf.add_inline_decor(
+                    DIRVISH_DECOR_OWNER,
+                    row,
+                    0,
+                    llen,
+                    fg_rgba = color_accent_blue(),
+                )
+            } else if llen >= 8 {
+                preview_buf.add_inline_decor(
+                    DIRVISH_DECOR_OWNER,
+                    row,
+                    llen - 6,
+                    llen,
+                    fg_rgba = color_muted_gray(),
+                )
+            }
+        }
+        preview_buf.point = Pos.zero()
+        preview_buf.modified = false
+        preview_buf.read_only = true
+        return preview_buf
+    }
+
+    -- Regular file / symlink preview: inspect up to 8 KiB (`8192` bytes) and `120` lines
+    let mode_oct = if ent.is_symlink {
+        "120777"
+    } else if ent.is_exec {
+        "100755"
+    } else {
+        "100644"
+    }
+
+    let rb_maybe: ?File = File.open(ent.full_path, mode = "rb") ! { _ => null }
+    let rb_file_opt? = rb_maybe else {
+        preview_buf.major_mode = "text"
+        preview_buf.set_lines(["[Unable to read file]"], record_undo = false)
+        preview_buf.point = Pos.zero()
+        preview_buf.modified = false
+        preview_buf.read_only = true
+        return preview_buf
+    }
+    let sample_bytes = rb_file_opt.read_bytes(max_bytes = 8192) ! { _ => List() }
+    let _ = rb_file_opt.close()
+
+    var has_null_byte = false
+    for i in 0..sample_bytes.len() {
+        if sample_bytes.get(i.as(usize)).as(i64) == 0 {
+            has_null_byte = true
+            break
+        }
+    }
+    if has_null_byte {
+        preview_buf.major_mode = "text"
+        let bin_msg = "[Binary file — " ++ format_human_size(ent.size).trim() ++ ", mode " ++ mode_oct ++ "]"
+        preview_buf.set_lines([bin_msg], record_undo = false)
+        preview_buf.add_inline_decor(
+            DIRVISH_DECOR_OWNER,
+            0,
+            0,
+            bin_msg.char_len(),
+            fg_rgba = color_mark_yellow(),
+        )
+        preview_buf.point = Pos.zero()
+        preview_buf.modified = false
+        preview_buf.read_only = true
+        return preview_buf
+    }
+
+    let txt_maybe: ?File = File.open(ent.full_path, mode = "r") ! { _ => null }
+    let txt_file_opt? = txt_maybe else {
+        preview_buf.major_mode = "text"
+        preview_buf.set_lines(
+            ["[Binary file — " ++ format_human_size(ent.size).trim() ++ ", mode " ++ mode_oct ++ "]"],
+            record_undo = false,
+        )
+        preview_buf.point = Pos.zero()
+        preview_buf.modified = false
+        preview_buf.read_only = true
+        return preview_buf
+    }
+    var utf8_failed = false
+    let chunk_opt: ?String = txt_file_opt.read_chars(8192) ! {
+        _ => {
+            utf8_failed = true
+            null
+        }
+    }
+    let _ = txt_file_opt.close()
+    if utf8_failed {
+        preview_buf.major_mode = "text"
+        preview_buf.set_lines(
+            ["[Binary file — " ++ format_human_size(ent.size).trim() ++ ", mode " ++ mode_oct ++ "]"],
+            record_undo = false,
+        )
+        preview_buf.point = Pos.zero()
+        preview_buf.modified = false
+        preview_buf.read_only = true
+        return preview_buf
+    }
+
+    let raw_text = if chunk_opt != null { chunk_opt.as(String) } else { "" }
+    let normalized = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+    let raw_lines = if normalized == "" {
+        [""]
+    } else {
+        normalized.split("\n")
+    }
+    if raw_lines.len() > 1 and normalized.ends_with("\n") {
+        let _ = raw_lines.pop()
+    }
+
+    let capped = List()
+    let max_lines = if raw_lines.len() > 120 { 120 } else { raw_lines.len() }
+    for i in 0..max_lines {
+        capped.push(raw_lines.get(i.as(usize)).as(String))
+    }
+    if capped.is_empty() {
+        capped.push("")
+    }
+
+    -- Set language `major_mode` so `ext_render` performs full lexical syntax highlighting!
+    preview_buf.major_mode = detect_major_mode(ent.full_path)
+    preview_buf.set_lines(capped, record_undo = false)
+    preview_buf.point = Pos.zero()
+    preview_buf.modified = false
+    preview_buf.read_only = true
+    preview_buf
+}
+
+-- ============================================================================
+-- 4. 3-Pane Miller-Columns Window Layout & Clean Collapse
+-- ============================================================================
+
+fn collect_tree_leaves(node: LayoutNode, out: List) {
+    node match {
+        LayoutNode.Leaf(wid) => out.push(wid),
+        LayoutNode.Split(_, _, first, second) => {
+            collect_tree_leaves(first, out)
+            collect_tree_leaves(second, out)
+        },
+    }
+}
+
+fn tree_contains_leaf(node: LayoutNode, target: WinId) -> bool {
+    node match {
+        LayoutNode.Leaf(wid) => wid == target,
+        LayoutNode.Split(_, _, first, second) => {
+            tree_contains_leaf(first, target) or tree_contains_leaf(second, target)
+        },
+    }
+}
+
+fn leftmost_leaf(node: LayoutNode) -> WinId {
+    node match {
+        LayoutNode.Leaf(wid) => wid,
+        LayoutNode.Split(_, _, first, _) => leftmost_leaf(first),
+    }
+}
+
+fn prune_leaf_from_layout(node: LayoutNode, target: WinId) -> ?LayoutNode {
+    node match {
+        LayoutNode.Leaf(wid) => {
+            if wid == target {
+                null
+            } else {
+                node
+            }
+        },
+        LayoutNode.Split(ax, ratio, first, second) => {
+            if tree_contains_leaf(first, target) {
+                let next_first = prune_leaf_from_layout(first, target)
+                let nf? = next_first else {
+                    return second
+                }
+                return LayoutNode.Split(ax, ratio, nf, second)
+            }
+            if tree_contains_leaf(second, target) {
+                let next_second = prune_leaf_from_layout(second, target)
+                let ns? = next_second else {
+                    return first
+                }
+                return LayoutNode.Split(ax, ratio, first, ns)
+            }
+            node
+        },
+    }
+}
+
+fn replace_leaf_in_layout(node: LayoutNode, target: WinId, replacement: LayoutNode) -> LayoutNode {
+    node match {
+        LayoutNode.Leaf(wid) => {
+            if wid == target {
+                replacement
+            } else {
+                node
+            }
+        },
+        LayoutNode.Split(ax, ratio, first, second) => {
+            LayoutNode.Split(
+                ax,
+                ratio,
+                replace_leaf_in_layout(first, target, replacement),
+                replace_leaf_in_layout(second, target, replacement),
+            )
+        },
+    }
+}
+
+fn is_helper_buffer_id(world: EditorWorld, bid: BufferId) -> bool {
+    let b? = world.buffer(bid) else {
+        return false
+    }
+    b.name == DIRVISH_PARENT_BUF_NAME or b.name == DIRVISH_PREVIEW_BUF_NAME
+}
+
+pub fn collapse_dirvish_splits(world: EditorWorld, wm: WindowManager) {
+    let tab = wm.active_tab()
+    let leaves = List()
+    collect_tree_leaves(tab.root, leaves)
+
+    -- First ensure `active_win_id` is NOT one of the helper splits if another pane exists
+    for i in 0..leaves.len() {
+        let wid = leaves.get(i.as(usize)).as(WinId)
+        let p_any? = wm.panes.get(wid) else {
+            continue
+        }
+        let p = p_any.as(WindowPane)
+        if not is_helper_buffer_id(world, p.buffer_id) {
+            if is_helper_buffer_id(world, wm.active_pane().buffer_id) {
+                tab.active_win_id = wid
+            }
+        }
+    }
+
+    for i in 0..leaves.len() {
+        let wid = leaves.get(i.as(usize)).as(WinId)
+        let p_any? = wm.panes.get(wid) else {
+            continue
+        }
+        let p = p_any.as(WindowPane)
+        if is_helper_buffer_id(world, p.buffer_id) {
+            let pruned? = prune_leaf_from_layout(tab.root, wid) else {
+                continue
+            }
+            tab.root = pruned
+            let _ = wm.panes.remove(wid)
+        }
+    }
+
+    if not tree_contains_leaf(tab.root, tab.active_win_id) {
+        tab.active_win_id = leftmost_leaf(tab.root)
+    }
+    let ap = wm.active_pane()
+    ap.buffer_id = world.active_buffer_id
+    ap.cursor = world.active_buffer().point
+    wm.sync_from_world(world)
+}
+
+fn find_win_id_for_buffer_in_tab(wm: WindowManager, target_buf_id: BufferId) -> ?WinId {
+    let leaves = List()
+    collect_tree_leaves(wm.active_tab().root, leaves)
+    for i in 0..leaves.len() {
+        let wid = leaves.get(i.as(usize)).as(WinId)
+        let p_any? = wm.panes.get(wid) else {
+            continue
+        }
+        let p = p_any.as(WindowPane)
+        if p.buffer_id == target_buf_id {
+            return wid
+        }
+    }
+    null
+}
+
+fn sync_dirvish_layout(
+    world: EditorWorld,
+    wm: WindowManager,
+    state: DirvishState,
+    parent_buf: Buffer,
+    center_buf: Buffer,
+    preview_buf: Buffer,
+) {
+    -- Single-window Yazi layout: never split `WindowManager` into 3 separate editor windows.
+    -- `ext_render` draws the 3 Yazi columns (parent | current | preview) inside the single `*dirvish*` pane.
+    collapse_dirvish_splits(world, wm)
+    world.active_buffer_id = center_buf.id
+    let ap = wm.active_pane()
+    ap.buffer_id = center_buf.id
+    ap.cursor = center_buf.point
+    if not state.miller_mode {
+        parent_buf.major_mode = "dirvish-parent-hidden"
+        preview_buf.major_mode = "dirvish-preview-hidden"
+    } else {
+        parent_buf.major_mode = "dirvish-parent"
+        if preview_buf.major_mode == "dirvish-preview-hidden" {
+            preview_buf.major_mode = "dirvish-preview"
+        }
+    }
+    wm.sync_from_world(world)
+}
+
+fn ensure_vim_normal(kernel: SystemKernel, world: EditorWorld) {
+    let vim_maybe: ?VimState = require_vim_state(kernel) ! { _ => null }
+    let vim_res? = vim_maybe else {
+        return
+    }
+    vim_res.mode = VimMode.Normal
+    vim_res.count1 = 0
+    vim_res.count2 = 0
+    vim_res.active_reg = ""
+    vim_res.pending_prefix = ""
+    vim_res.leader_strokes = List()
+    vim_res.plugin_strokes = List()
+    sync_world_from_vim(world, vim_res)
+}
+
+fn refresh_dirvish_all(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    wm: WindowManager,
+    state: DirvishState,
+    .focus_name: String = "",
+    .preferred_row: i64 = 0,
+) -> #[log_event, status_emit] !String Unit {
+    let entries = scan_directory_entries(
+        state.current_dir,
+        state.show_hidden,
+        state.filter_query,
+        state.sort_by,
+        state.sort_reverse,
+        true,
+    )!
+    state.entries = entries
+
+    let parent_buf = render_parent_buffer(world, state)
+    let center_buf = render_center_buffer(world, state, focus_name, preferred_row)
+    let preview_buf = render_preview_buffer(world, state, center_buf)
+    sync_dirvish_layout(world, wm, state, parent_buf, center_buf, preview_buf)
+    ensure_vim_normal(kernel, world)
+    ()
+}
+
+fn refresh_preview_for_cursor(world: EditorWorld, wm: WindowManager, state: DirvishState, center_buf: Buffer) {
+    let ent_opt = entry_at_cursor(state, center_buf)
+    if ent_opt != null {
+        state.cursor_by_dir.insert(state.current_dir, ent_opt.as(DirvishEntry).name)
+    }
+    let preview_buf = render_preview_buffer(world, state, center_buf)
+    if state.miller_mode {
+        let pvid_opt = find_win_id_for_buffer_in_tab(wm, preview_buf.id)
+        if pvid_opt != null {
+            let pvid? = pvid_opt else { return }
+            let pvp = wm.panes.get(pvid).as(WindowPane)
+            pvp.cursor = Pos.zero()
+            pvp.top_row = 0
+            pvp.left_col = 0
+        }
+    }
+    wm.sync_from_world(world)
+}
+
+fn open_dirvish_at(
+    kernel: SystemKernel,
+    raw_dir: String,
+    focus_name: String,
+    record_hist: bool,
+) -> #[log_event, status_emit] !String Unit {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+
+    let cur_buf = world.active_buffer()
+    if (
+        cur_buf.name != DIRVISH_BUF_NAME
+        and cur_buf.name != DIRVISH_PARENT_BUF_NAME
+        and cur_buf.name != DIRVISH_PREVIEW_BUF_NAME
+    ) {
+        state.origin_buf_id = cur_buf.id
+    }
+
+    let target_dir = clean_dir_path(raw_dir, world.cwd)
+    if not fs.is_dir(target_dir) {
+        return error ("Dirvish target is not a directory: " ++ target_dir)
+    }
+
+    state.current_dir = target_dir
+    if record_hist {
+        state.record_history(target_dir)
+    }
+
+    refresh_dirvish_all(kernel, world, wm, state, focus_name = focus_name)#!
+    status_emit("Dirvish: " ++ abbreviate_path(target_dir) ++ " (" ++ state.entries.len().to_string() ++ " items)")#
+    ()
+}
+
+-- ============================================================================
+-- 5. Recursive File Operations (Copy, Move, Delete, Disambiguate, Buffer Sync)
+-- ============================================================================
+
+fn disambiguate_dest_path(dest_dir: String, orig_name: String) -> String {
+    let direct = path.join(dest_dir, orig_name)
+    if not fs.exists(direct) {
+        return direct
+    }
+    let (stem, ext) = split_stem_and_ext(orig_name)
+    let first_copy = path.join(dest_dir, stem ++ "_copy" ++ ext)
+    if not fs.exists(first_copy) {
+        return first_copy
+    }
+    var n: i64 = 2
+    while true {
+        let candidate = path.join(dest_dir, stem ++ "_copy" ++ n.to_string() ++ ext)
+        if not fs.exists(candidate) {
+            return candidate
+        }
+        n += 1
+    }
+    first_copy
+}
+
+fn remove_path_any(target: String) -> !String Unit {
+    if not fs.exists(target) {
+        return ()
+    }
+    let meta_opt: ?fs.FileMetadata = fs.metadata(target) ! { _ => null }
+    if meta_opt != null and meta_opt.as(fs.FileMetadata).is_symlink {
+        (fs.remove_file(target) ! {
+            err => error ("Failed removing symlink '" ++ target ++ "': " ++ err.to_string())
+        })!
+        return ()
+    }
+    if fs.is_dir(target) {
+        (fs.remove_dir_all(target) ! {
+            err => error ("Failed removing directory '" ++ target ++ "': " ++ err.to_string())
+        })!
+    } else {
+        (fs.remove_file(target) ! {
+            err => error ("Failed removing file '" ++ target ++ "': " ++ err.to_string())
+        })!
+    }
+    ()
+}
+
+fn copy_recursive(src: String, dst: String) -> !String Unit {
+    if fs.is_dir(src) {
+        let clean_src = clean_dir_path(src, "/")
+        let clean_dst = clean_dir_path(dst, "/")
+        if clean_dst == clean_src or clean_dst.starts_with(clean_src ++ "/") {
+            return error ("Cannot copy directory into itself: " ++ src)
+        }
+        (fs.create_dir_all(dst) ! {
+            err => error ("Cannot create directory '" ++ dst ++ "': " ++ err.to_string())
+        })!
+        let children = (fs.read_dir_entries(src) ! {
+            err => error ("Cannot read directory '" ++ src ++ "': " ++ err.to_string())
+        })!
+        for i in 0..children.len() {
+            let ch = children.get(i.as(usize)).as(DirEntry)
+            if ch.name == "." or ch.name == ".." {
+                continue
+            }
+            let ch_src = path.join(src, ch.name)
+            let ch_dst = path.join(dst, ch.name)
+            copy_recursive(ch_src, ch_dst)!
+        }
+        return ()
+    }
+    let p_opt = path.parent(dst)
+    if p_opt != null and p_opt.as(String) != "" {
+        let _ = fs.create_dir_all(p_opt.as(String)) ! { _ => () }
+    }
+    let _ = (fs.copy(src, dst) ! {
+        err => error ("Cannot copy '" ++ src ++ "' -> '" ++ dst ++ "': " ++ err.to_string())
+    })!
+    ()
+}
+
+fn move_entry(src: String, dst: String) -> !String Unit {
+    if clean_dir_path(src, "/") == clean_dir_path(dst, "/") {
+        return ()
+    }
+    let renamed_ok = (fs.rename(src, dst) ! { _ => error "fallback" }) match {
+        !_ => false,
+        _ => true,
+    }
+    if renamed_ok {
+        return ()
+    }
+    copy_recursive(src, dst)!
+    remove_path_any(src)!
+    ()
+}
+
+fn sync_renamed_buffers(world: EditorWorld, old_path: String, new_path: String) {
+    let old_clean = clean_dir_path(old_path, world.cwd)
+    let new_clean = clean_dir_path(new_path, world.cwd)
+    let n = world.buffer_order.len()
+    for i in 0..n {
+        let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+        let b = world.buffers.get(bid).as(Buffer)
+        if b.kind != BufferKind.File {
+            continue
+        }
+        if b.file_path == old_clean {
+            b.file_path = new_clean
+            let fn_opt = path.file_name(new_clean)
+            if fn_opt != null {
+                b.name = fn_opt.as(String)
+            }
+            b.major_mode = detect_major_mode(new_clean)
+        } else if b.file_path.starts_with(old_clean ++ "/") {
+            let rel = b.file_path.slice(old_clean.char_len(), b.file_path.char_len())
+            b.file_path = new_clean ++ rel
+        }
+    }
+}
+
+fn purge_deleted_buffers(world: EditorWorld, deleted_path: String) {
+    let del_clean = clean_dir_path(deleted_path, world.cwd)
+    let to_kill = List()
+    for i in 0..world.buffer_order.len() {
+        let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+        let b = world.buffers.get(bid).as(Buffer)
+        if (
+            b.kind == BufferKind.File
+            and (b.file_path == del_clean or b.file_path.starts_with(del_clean ++ "/"))
+        ) {
+            to_kill.push(bid)
+        }
+    }
+    for i in 0..to_kill.len() {
+        let bid = to_kill.get(i.as(usize)).as(BufferId)
+        let _ = world.kill_buffer(bid, force = true) ! { _ => BufferId(0) }
+    }
+}
+
+fn target_paths_for_action(state: DirvishState, center_buf: Buffer) -> List {
+    let out = List()
+    -- Collect marked entries in visible order first, then any marked paths in other dirs if needed
+    for i in 0..state.entries.len() {
+        let ent = state.entries.get(i.as(usize)).as(DirvishEntry)
+        if state.marked_paths.contains(ent.full_path) {
+            out.push(ent.full_path)
+        }
+    }
+    if not out.is_empty() {
+        return out
+    }
+    let cur_opt = entry_at_cursor(state, center_buf)
+    if cur_opt != null {
+        out.push(cur_opt.as(DirvishEntry).full_path)
+    }
+    out
+}
+
+-- ============================================================================
+-- 6. Entry & Navigation Commands
+-- ============================================================================
+
+fn cmd_dirvish(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let cur_buf = world.active_buffer()
+    var target_dir = world.cwd
+    if not args.is_empty() {
+        let raw_arg = args.get(0).as(String).trim()
+        if raw_arg != "" {
+            target_dir = world.resolve_path(raw_arg)
+        }
+    } else if cur_buf.name == DIRVISH_BUF_NAME and cur_buf.file_path != "" {
+        target_dir = cur_buf.file_path
+    } else if cur_buf.file_path != "" {
+        if fs.is_dir(cur_buf.file_path) {
+            target_dir = cur_buf.file_path
+        } else {
+            let p_opt = path.parent(cur_buf.file_path)
+            if p_opt != null and p_opt.as(String) != "" {
+                target_dir = p_opt.as(String)
+            }
+        }
+    }
+    open_dirvish_at(kernel, target_dir, "", true)#!
+}
+
+fn cmd_dirvish_jump(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let cur_buf = world.active_buffer()
+
+    if cur_buf.name == DIRVISH_BUF_NAME {
+        return cmd_dirvish_up_dir(kernel, List())#!
+    }
+
+    var target_dir = world.cwd
+    var focus_name = ""
+    if cur_buf.file_path != "" {
+        if fs.is_dir(cur_buf.file_path) {
+            let clean_cur = clean_dir_path(cur_buf.file_path, world.cwd)
+            if clean_cur != "/" {
+                let p_opt = path.parent(clean_cur)
+                if p_opt != null and p_opt.as(String) != "" {
+                    target_dir = p_opt.as(String)
+                }
+                let b_opt = path.file_name(clean_cur)
+                if b_opt != null {
+                    focus_name = b_opt.as(String)
+                }
+            } else {
+                target_dir = "/"
+            }
+        } else {
+            let p_opt = path.parent(cur_buf.file_path)
+            if p_opt != null and p_opt.as(String) != "" {
+                target_dir = p_opt.as(String)
+            }
+            let b_opt = path.file_name(cur_buf.file_path)
+            if b_opt != null {
+                focus_name = b_opt.as(String)
+            }
+        }
+    }
+    if focus_name.starts_with(".") {
+        state.show_hidden = true
+    }
+    open_dirvish_at(kernel, target_dir, focus_name, true)#!
+}
+
+fn move_dirvish_cursor(kernel: SystemKernel, delta: i64, absolute_row: i64) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let buf = world.active_buffer()
+    if buf.name != DIRVISH_BUF_NAME {
+        return ()
+    }
+    if state.entries.is_empty() {
+        buf.point = Pos.new(1, 4)
+        wm.sync_from_world(world)
+        return ()
+    }
+    let max_row = state.entries.len()
+    var next_row = if absolute_row >= 1 {
+        absolute_row
+    } else {
+        buf.point.row + delta
+    }
+    if next_row < 1 {
+        next_row = 1
+    } else if next_row > max_row {
+        next_row = max_row
+    }
+    buf.point = Pos.new(next_row, DIRVISH_NAME_COL)
+    refresh_preview_for_cursor(world, wm, state, buf)
+    ()
+}
+
+fn cmd_dirvish_next_line(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    move_dirvish_cursor(kernel, 1, 0)#!
+}
+
+fn cmd_dirvish_prev_line(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    move_dirvish_cursor(kernel, -1, 0)#!
+}
+
+fn cmd_dirvish_goto_top(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    move_dirvish_cursor(kernel, 0, 1)#!
+}
+
+fn cmd_dirvish_goto_bottom(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let state = require_dirvish_state(kernel)!
+    let bottom = if state.entries.is_empty() { 1 } else { state.entries.len() }
+    move_dirvish_cursor(kernel, 0, bottom)#!
+}
+
+fn cmd_dirvish_up_dir(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let state = require_dirvish_state(kernel)!
+    if state.current_dir == "" or state.current_dir == "/" {
+        status_emit("Already at filesystem root '/'")#
+        return ()
+    }
+    let child_opt = path.file_name(state.current_dir)
+    let child_name = if child_opt != null { child_opt.as(String) } else { "" }
+    let p_opt = path.parent(state.current_dir)
+    let parent_dir = if p_opt != null and p_opt.as(String) != "" {
+        clean_dir_path(p_opt.as(String), "/")
+    } else {
+        "/"
+    }
+    if child_name.starts_with(".") {
+        state.show_hidden = true
+    }
+    open_dirvish_at(kernel, parent_dir, child_name, true)#!
+}
+
+fn cmd_dirvish_enter(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let center_buf = world.active_buffer()
+    let ent? = entry_at_cursor(state, center_buf) else {
+        status_emit("No entry under cursor")#
+        return ()
+    }
+    if ent.is_dir {
+        open_dirvish_at(kernel, ent.full_path, "", true)#!
+        return ()
+    }
+
+    -- File under cursor: collapse helper splits cleanly and open file in active pane!
+    collapse_dirvish_splits(world, wm)
+    let opened = world.open_file(ent.full_path)#!
+    state.origin_buf_id = opened.id
+    let ap = wm.active_pane()
+    ap.buffer_id = opened.id
+    ap.cursor = opened.point
+    wm.sync_from_world(world)
+    ensure_vim_normal(kernel, world)
+    ()
+}
+
+fn cmd_dirvish_history_back(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let state = require_dirvish_state(kernel)!
+    if state.history_idx <= 0 or state.history.is_empty() {
+        status_emit("Dirvish: oldest directory in history")#
+        return ()
+    }
+    state.history_idx -= 1
+    let target = state.history.get(state.history_idx.as(usize)).as(String)
+    open_dirvish_at(kernel, target, "", false)#!
+}
+
+fn cmd_dirvish_history_forward(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let state = require_dirvish_state(kernel)!
+    if state.history_idx + 1 >= state.history.len() {
+        status_emit("Dirvish: newest directory in history")#
+        return ()
+    }
+    state.history_idx += 1
+    let target = state.history.get(state.history_idx.as(usize)).as(String)
+    open_dirvish_at(kernel, target, "", false)#!
+}
+
+fn cmd_dirvish_go_home(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    open_dirvish_at(kernel, home_directory(), "", true)#!
+}
+
+fn cmd_dirvish_go_root(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    open_dirvish_at(kernel, "/", "", true)#!
+}
+
+fn cmd_dirvish_go_project(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    open_dirvish_at(kernel, world.cwd, "", true)#!
+}
+
+fn cmd_dirvish_new_tab(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let dir_target = if state.current_dir != "" { state.current_dir } else { world.cwd }
+    wm.tab_new(world.active_buffer_id)
+    open_dirvish_at(kernel, dir_target, "", false)#!
+    status_emit("Dirvish opened in new tab: " ++ abbreviate_path(dir_target))#
+    ()
+}
+
+-- ============================================================================
+-- 7. Marking, Yank / Cut / Paste / Overwrite / Delete Ring Commands
+-- ============================================================================
+
+fn cmd_dirvish_toggle_mark(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let center_buf = world.active_buffer()
+    let ent? = entry_at_cursor(state, center_buf) else {
+        return ()
+    }
+    if state.marked_paths.contains(ent.full_path) {
+        let _ = state.marked_paths.remove(ent.full_path)
+    } else {
+        let _ = state.marked_paths.insert(ent.full_path)
+    }
+    let cur_row = center_buf.point.row
+    let next_row = if cur_row + 1 <= state.entries.len() { cur_row + 1 } else { cur_row }
+    let parent_buf = render_parent_buffer(world, state)
+    let updated_center = render_center_buffer(world, state, "", next_row)
+    let preview_buf = render_preview_buffer(world, state, updated_center)
+    sync_dirvish_layout(world, wm, state, parent_buf, updated_center, preview_buf)
+    status_emit("Marked: " ++ state.marked_paths.len().to_string() ++ " item(s)")#
+    ()
+}
+
+fn cmd_dirvish_invert_marks(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let cur_row = world.active_buffer().point.row
+    for i in 0..state.entries.len() {
+        let ent = state.entries.get(i.as(usize)).as(DirvishEntry)
+        if state.marked_paths.contains(ent.full_path) {
+            let _ = state.marked_paths.remove(ent.full_path)
+        } else {
+            let _ = state.marked_paths.insert(ent.full_path)
+        }
+    }
+    refresh_dirvish_all(kernel, world, wm, state, preferred_row = cur_row)#!
+    status_emit("Inverted marks (" ++ state.marked_paths.len().to_string() ++ " marked)")#
+    ()
+}
+
+fn cmd_dirvish_unmark_all(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let cur_row = world.active_buffer().point.row
+    state.marked_paths.clear()
+    refresh_dirvish_all(kernel, world, wm, state, preferred_row = cur_row)#!
+    status_emit("Cleared all marks")#
+    ()
+}
+
+fn populate_ring(
+    kernel: SystemKernel,
+    mode: String,
+    append: bool,
+) -> #[log_event, status_emit] !String Unit {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let center_buf = world.active_buffer()
+    let cur_row = center_buf.point.row
+    let targets = target_paths_for_action(state, center_buf)
+    if targets.is_empty() {
+        status_emit("Dirvish: no entries to " ++ mode)#
+        return ()
+    }
+    if (not append) or state.yank_mode != mode {
+        state.yank_ring = List()
+    }
+    state.yank_mode = mode
+    for i in 0..targets.len() {
+        let p = targets.get(i.as(usize)).as(String)
+        var exists_in_ring = false
+        for j in 0..state.yank_ring.len() {
+            if state.yank_ring.get(j.as(usize)).as(String) == p {
+                exists_in_ring = true
+                break
+            }
+        }
+        if not exists_in_ring {
+            state.yank_ring.push(p)
+        }
+    }
+    state.marked_paths.clear()
+    refresh_dirvish_all(kernel, world, wm, state, preferred_row = cur_row)#!
+    let verb = if mode == "cut" { "Cut" } else { "Yanked" }
+    status_emit(verb ++ " " ++ state.yank_ring.len().to_string() ++ " item(s) into file ring")#
+    ()
+}
+
+fn cmd_dirvish_yank(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    populate_ring(kernel, "copy", false)#!
+}
+
+fn cmd_dirvish_yank_append(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    populate_ring(kernel, "copy", true)#!
+}
+
+fn cmd_dirvish_cut(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    populate_ring(kernel, "cut", false)#!
+}
+
+fn cmd_dirvish_cut_append(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    populate_ring(kernel, "cut", true)#!
+}
+
+fn cmd_dirvish_clear_ring(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let cur_row = world.active_buffer().point.row
+    state.yank_ring = List()
+    state.yank_mode = ""
+    refresh_dirvish_all(kernel, world, wm, state, preferred_row = cur_row)#!
+    status_emit("Cleared Dirvish yank/cut ring")#
+    ()
+}
+
+fn execute_paste(kernel: SystemKernel, overwrite: bool) -> #[log_event, status_emit] !String Unit {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+    if state.yank_ring.is_empty() or state.yank_mode == "" {
+        status_emit("Dirvish yank/cut ring is empty")#
+        return ()
+    }
+
+    let is_cut = state.yank_mode == "cut"
+    var processed: i64 = 0
+    var last_created_name = ""
+
+    for i in 0..state.yank_ring.len() {
+        let src = state.yank_ring.get(i.as(usize)).as(String)
+        if not fs.exists(src) {
+            continue
+        }
+        let base_opt = path.file_name(src)
+        let orig_name = if base_opt != null { base_opt.as(String) } else { continue }
+        let direct_dst = path.join(state.current_dir, orig_name)
+
+        if is_cut and clean_dir_path(src, "/") == clean_dir_path(direct_dst, "/") {
+            last_created_name = orig_name
+            processed += 1
+            continue
+        }
+
+        var dst = direct_dst
+        if overwrite {
+            if fs.exists(dst) and clean_dir_path(src, "/") != clean_dir_path(dst, "/") {
+                remove_path_any(dst)!
+            }
+        } else if fs.exists(dst) {
+            dst = disambiguate_dest_path(state.current_dir, orig_name)
+        }
+
+        if is_cut {
+            move_entry(src, dst)!
+            sync_renamed_buffers(world, src, dst)
+        } else {
+            copy_recursive(src, dst)!
+        }
+
+        let dst_name_opt = path.file_name(dst)
+        if dst_name_opt != null {
+            last_created_name = dst_name_opt.as(String)
+        }
+        processed += 1
+    }
+
+    if is_cut {
+        state.yank_ring = List()
+        state.yank_mode = ""
+    }
+
+    refresh_dirvish_all(kernel, world, wm, state, focus_name = last_created_name)#!
+    let action_lbl = if is_cut { "Moved " } else { "Pasted " }
+    status_emit(action_lbl ++ processed.to_string() ++ " item(s)")#
+    ()
+}
+
+fn cmd_dirvish_paste(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    execute_paste(kernel, false)#!
+}
+
+fn cmd_dirvish_paste_overwrite(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    execute_paste(kernel, true)#!
+}
+
+fn cmd_dirvish_delete(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let center_buf = world.active_buffer()
+    let cur_row = center_buf.point.row
+    let targets = target_paths_for_action(state, center_buf)
+    if targets.is_empty() {
+        status_emit("No entries to delete")#
+        return ()
+    }
+
+    let req = PromptRequest.with_candidates(
+        "Delete " ++ targets.len().to_string() ++ " item(s)? (y/n): ",
+        "",
+        PromptKind.Confirm,
+        ["y", "n"],
+    )
+    let ans_opt = ask_prompt(req)#
+    let ans? = ans_opt else {
+        status_emit("Delete cancelled")#
+        return ()
+    }
+    let low = ans.trim().to_lower()
+    if low != "y" and low != "yes" {
+        status_emit("Delete cancelled")#
+        return ()
+    }
+
+    for i in 0..targets.len() {
+        let p = targets.get(i.as(usize)).as(String)
+        remove_path_any(p)!
+        let _ = state.marked_paths.remove(p)
+        purge_deleted_buffers(world, p)
+    }
+
+    refresh_dirvish_all(kernel, world, wm, state, preferred_row = cur_row)#!
+    status_emit("Deleted " ++ targets.len().to_string() ++ " item(s)")#
+    ()
+}
+
+-- ============================================================================
+-- 8. Rename & Create Commands (`cw`/`R`, `A`, `I`, `a`, `cf`/`%`, `mk`/`+`)
+-- ============================================================================
+
+fn apply_entry_rename(
+    kernel: SystemKernel,
+    ent: DirvishEntry,
+    new_rel_name: String,
+) -> #[log_event, status_emit] !String Unit {
+    let trimmed = new_rel_name.trim()
+    if trimmed == "" or trimmed == ent.name {
+        status_emit("Rename unchanged")#
+        return ()
+    }
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+
+    let dst = if path.is_absolute(trimmed) {
+        path.normalize(trimmed)
+    } else {
+        path.normalize(path.join(state.current_dir, trimmed))
+    }
+    if fs.exists(dst) and clean_dir_path(dst, "/") != clean_dir_path(ent.full_path, "/") {
+        return error ("Rename target already exists: " ++ dst)
+    }
+    let p_opt = path.parent(dst)
+    if p_opt != null and p_opt.as(String) != "" {
+        let _ = fs.create_dir_all(p_opt.as(String)) ! { _ => () }
+    }
+    move_entry(ent.full_path, dst)!
+    sync_renamed_buffers(world, ent.full_path, dst)
+    if state.marked_paths.contains(ent.full_path) {
+        let _ = state.marked_paths.remove(ent.full_path)
+        let _ = state.marked_paths.insert(dst)
+    }
+
+    let focus_opt = path.file_name(dst)
+    let focus = if focus_opt != null { focus_opt.as(String) } else { "" }
+    refresh_dirvish_all(kernel, world, wm, state, focus_name = focus)#!
+    status_emit("Renamed '" ++ ent.name ++ "' -> '" ++ focus ++ "'")#
+    ()
+}
+
+fn cmd_dirvish_rename(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let ent? = entry_at_cursor(state, world.active_buffer()) else {
+        return ()
+    }
+    let ans_opt = ask_prompt(PromptRequest.text("Rename " ++ ent.name ++ " to: ", ""))#
+    let ans? = ans_opt else {
+        return ()
+    }
+    apply_entry_rename(kernel, ent, ans)#!
+}
+
+fn cmd_dirvish_rename_append(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let ent? = entry_at_cursor(state, world.active_buffer()) else {
+        return ()
+    }
+    let ans_opt = ask_prompt(PromptRequest.text("Rename: ", ent.name))#
+    let ans? = ans_opt else {
+        return ()
+    }
+    apply_entry_rename(kernel, ent, ans)#!
+}
+
+fn cmd_dirvish_rename_prepend(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let ent? = entry_at_cursor(state, world.active_buffer()) else {
+        return ()
+    }
+    let ans_opt = ask_prompt(PromptRequest.text("Prepend to " ++ ent.name ++ ": ", ""))#
+    let ans? = ans_opt else {
+        return ()
+    }
+    if ans == "" {
+        return ()
+    }
+    apply_entry_rename(kernel, ent, ans ++ ent.name)#!
+}
+
+fn cmd_dirvish_rename_stem(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let ent? = entry_at_cursor(state, world.active_buffer()) else {
+        return ()
+    }
+    let (stem, ext) = split_stem_and_ext(ent.name)
+    let label = if ext != "" {
+        "Rename stem (" ++ ext ++ "): "
+    } else {
+        "Rename: "
+    }
+    let ans_opt = ask_prompt(PromptRequest.text(label, stem))#
+    let ans? = ans_opt else {
+        return ()
+    }
+    let trimmed = ans.trim()
+    if trimmed == "" {
+        return ()
+    }
+    let final_name = if ext != "" and (not trimmed.ends_with(ext)) {
+        trimmed ++ ext
+    } else {
+        trimmed
+    }
+    apply_entry_rename(kernel, ent, final_name)#!
+}
+
+fn cmd_dirvish_create_file(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let ans_opt = ask_prompt(PromptRequest.text("New file: ", ""))#
+    let ans? = ans_opt else {
+        return ()
+    }
+    let rel = ans.trim()
+    if rel == "" {
+        return ()
+    }
+    let target = if path.is_absolute(rel) {
+        path.normalize(rel)
+    } else {
+        path.normalize(path.join(state.current_dir, rel))
+    }
+    let p_opt = path.parent(target)
+    if p_opt != null and p_opt.as(String) != "" {
+        (fs.create_dir_all(p_opt.as(String)) ! {
+            err => error ("Failed creating parent directories: " ++ err.to_string())
+        })!
+    }
+    if not fs.exists(target) {
+        (fs.write_string(target, "") ! {
+            err => error ("Failed creating file '" ++ target ++ "': " ++ err.to_string())
+        })!
+    }
+
+    -- Focus newly created file (or its top-level parent child inside `current_dir`)
+    var focus_item = rel
+    if rel.contains("/") {
+        let (head, _) = rel.split_once("/").as((String, String))
+        focus_item = head
+    }
+    if focus_item.starts_with(".") {
+        state.show_hidden = true
+    }
+    refresh_dirvish_all(kernel, world, wm, state, focus_name = focus_item)#!
+    status_emit("Created file: " ++ rel)#
+    ()
+}
+
+fn cmd_dirvish_mkdir(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let ans_opt = ask_prompt(PromptRequest.text("New directory: ", ""))#
+    let ans? = ans_opt else {
+        return ()
+    }
+    let rel = ans.trim()
+    if rel == "" {
+        return ()
+    }
+    let clean_rel = if rel.char_len() > 1 and rel.ends_with("/") {
+        rel.slice(0, rel.char_len() - 1)
+    } else {
+        rel
+    }
+    let target = if path.is_absolute(clean_rel) {
+        path.normalize(clean_rel)
+    } else {
+        path.normalize(path.join(state.current_dir, clean_rel))
+    }
+    (fs.create_dir_all(target) ! {
+        err => error ("Failed creating directory '" ++ target ++ "': " ++ err.to_string())
+    })!
+
+    var focus_item = clean_rel
+    if clean_rel.contains("/") {
+        let (head, _) = clean_rel.split_once("/").as((String, String))
+        focus_item = head
+    }
+    if focus_item.starts_with(".") {
+        state.show_hidden = true
+    }
+    refresh_dirvish_all(kernel, world, wm, state, focus_name = focus_item)#!
+    status_emit("Created directory: " ++ clean_rel)#
+    ()
+}
+
+-- ============================================================================
+-- 9. View, Sort, Filter, Path Yank, Shell, Refresh & Quit Commands
+-- ============================================================================
+
+fn cmd_dirvish_toggle_hidden(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let cur_opt = entry_at_cursor(state, world.active_buffer())
+    let keep_name = if cur_opt != null { cur_opt.as(DirvishEntry).name } else { "" }
+    state.show_hidden = not state.show_hidden
+    refresh_dirvish_all(kernel, world, wm, state, focus_name = keep_name)#!
+    status_emit("Dirvish hidden files: " ++ (if state.show_hidden { "ON" } else { "OFF" }))#
+    ()
+}
+
+fn cmd_dirvish_toggle_preview(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let cur_row = world.active_buffer().point.row
+    state.miller_mode = not state.miller_mode
+    refresh_dirvish_all(kernel, world, wm, state, preferred_row = cur_row)#!
+    status_emit(
+        "Dirvish layout: " ++ (if state.miller_mode { "3-pane Miller columns" } else { "single-pane" }),
+    )#
+    ()
+}
+
+fn cmd_dirvish_filter(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let ans_opt = ask_prompt(PromptRequest.text("Filter entries: ", state.filter_query))#
+    let ans? = ans_opt else {
+        return ()
+    }
+    state.filter_query = ans.trim()
+    refresh_dirvish_all(kernel, world, wm, state)#!
+    if state.filter_query == "" {
+        status_emit("Dirvish filter cleared")#
+    } else {
+        status_emit("Dirvish filter: '" ++ state.filter_query ++ "' (" ++ state.entries.len().to_string() ++ " matches)")#
+    }
+    ()
+}
+
+fn cmd_dirvish_clear_filter(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+    state.filter_query = ""
+    refresh_dirvish_all(kernel, world, wm, state)#!
+    status_emit("Dirvish filter cleared")#
+    ()
+}
+
+fn set_sort_mode(kernel: SystemKernel, mode: String) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let cur_opt = entry_at_cursor(state, world.active_buffer())
+    let keep_name = if cur_opt != null { cur_opt.as(DirvishEntry).name } else { "" }
+    state.sort_by = mode
+    refresh_dirvish_all(kernel, world, wm, state, focus_name = keep_name)#!
+    status_emit("Dirvish sorted by " ++ mode)#
+    ()
+}
+
+fn cmd_dirvish_sort_name(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    set_sort_mode(kernel, "name")#!
+}
+
+fn cmd_dirvish_sort_size(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    set_sort_mode(kernel, "size")#!
+}
+
+fn cmd_dirvish_sort_ext(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    set_sort_mode(kernel, "ext")#!
+}
+
+fn cmd_dirvish_sort_reverse(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let cur_opt = entry_at_cursor(state, world.active_buffer())
+    let keep_name = if cur_opt != null { cur_opt.as(DirvishEntry).name } else { "" }
+    state.sort_reverse = not state.sort_reverse
+    refresh_dirvish_all(kernel, world, wm, state, focus_name = keep_name)#!
+    status_emit("Dirvish sort order: " ++ (if state.sort_reverse { "descending" } else { "ascending" }))#
+    ()
+}
+
+fn store_text_to_clipboard_and_registers(world: EditorWorld, text: String) -> #clipboard_set Unit {
+    let val = RegisterValue {
+        text: text,
+        linewise: false,
+        blockwise: false,
+    }
+    world.registers.yank_store(val)#
+    world.registers.set_reg("+", val)#
+    clipboard_set(text)#
+}
+
+fn cmd_dirvish_yank_path(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let ent_opt = entry_at_cursor(state, world.active_buffer())
+    let target = if ent_opt != null {
+        ent_opt.as(DirvishEntry).full_path
+    } else {
+        state.current_dir
+    }
+    store_text_to_clipboard_and_registers(world, target)#
+    status_emit("Yanked path: " ++ target)#
+    ()
+}
+
+fn cmd_dirvish_yank_dir(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_dirvish_state(kernel)!
+    store_text_to_clipboard_and_registers(world, state.current_dir)#
+    status_emit("Yanked directory: " ++ state.current_dir)#
+    ()
+}
+
+fn cmd_dirvish_yank_name(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let ent? = entry_at_cursor(state, world.active_buffer()) else {
+        status_emit("No entry under cursor")#
+        return ()
+    }
+    store_text_to_clipboard_and_registers(world, ent.name)#
+    status_emit("Yanked filename: " ++ ent.name)#
+    ()
+}
+
+fn has_registered_cmd(kernel: SystemKernel, name: String) -> bool {
+    let _? = kernel.get_command(name) else {
+        return false
+    }
+    true
+}
+
+fn cmd_dirvish_open_shell(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+    if state.current_dir != "" {
+        world.cwd = state.current_dir
+    }
+    if has_registered_cmd(kernel, "terminal-here") {
+        collapse_dirvish_splits(world, wm)
+        let _ = kernel.dispatch_command("terminal-here", [state.current_dir])#!
+        return ()
+    }
+    if has_registered_cmd(kernel, "toggleterm") {
+        let _ = kernel.dispatch_command("toggleterm", [state.current_dir])#!
+        return ()
+    }
+    status_emit("Shell cwd set to " ++ state.current_dir)#
+    ()
+}
+
+fn cmd_dirvish_refresh(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let cur_opt = entry_at_cursor(state, world.active_buffer())
+    let keep_name = if cur_opt != null { cur_opt.as(DirvishEntry).name } else { "" }
+    refresh_dirvish_all(kernel, world, wm, state, focus_name = keep_name)#!
+    status_emit("Dirvish refreshed: " ++ abbreviate_path(state.current_dir))#
+    ()
+}
+
+fn fallback_non_dirvish_buffer_id(world: EditorWorld) -> BufferId {
+    var i = world.buffer_order.len() - 1
+    while i >= 0 {
+        let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+        let b = world.buffers.get(bid).as(Buffer)
+        if (
+            b.name != DIRVISH_BUF_NAME
+            and b.name != DIRVISH_PARENT_BUF_NAME
+            and b.name != DIRVISH_PREVIEW_BUF_NAME
+            and bid != world.messages_id
+        ) {
+            return bid
+        }
+        i -= 1
+    }
+    world.scratch_id
+}
+
+fn resolve_quit_buffer_id(world: EditorWorld, state: DirvishState) -> BufferId {
+    let orig? = state.origin_buf_id else {
+        return fallback_non_dirvish_buffer_id(world)
+    }
+    let ob? = world.buffer(orig) else {
+        return fallback_non_dirvish_buffer_id(world)
+    }
+    if (
+        ob.name != DIRVISH_BUF_NAME
+        and ob.name != DIRVISH_PARENT_BUF_NAME
+        and ob.name != DIRVISH_PREVIEW_BUF_NAME
+    ) {
+        return orig
+    }
+    fallback_non_dirvish_buffer_id(world)
+}
+
+fn cmd_dirvish_quit(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+
+    collapse_dirvish_splits(world, wm)
+
+    let restored_id = resolve_quit_buffer_id(world, state)
+
+    world.active_buffer_id = restored_id
+    let ap = wm.active_pane()
+    ap.buffer_id = restored_id
+    ap.cursor = world.active_buffer().point
+    wm.sync_from_world(world)
+    ensure_vim_normal(kernel, world)
+    status_emit("Restored buffer " ++ world.active_buffer().name)#
+    ()
+}
+
+-- ============================================================================
+-- 10. Extension Registration & Full Ranger Keymap Wiring
+-- ============================================================================
+
+pub fn register_dirvish_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_dirvish_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_dirvish",
+        "0.1.0",
+        "Emacs Dirvish 3-pane Miller-columns file manager with live syntax preview and full Ranger keybindings.",
+        [ext_document_id(), ext_window_id(), ext_render_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let state = DirvishState.new()
+            k.publish_service(SERVICE_DIRVISH, ext_id, state)
+
+            -- Entry & Ex commands
+            k.register_command("dirvish", ext_id, "Open Emacs Dirvish 3-pane Miller file manager.", cmd_dirvish)
+            k.register_command("dirvish-jump", ext_id, "Open Dirvish in active file's parent directory (`-`).", cmd_dirvish_jump)
+            k.register_command("ranger", ext_id, "Open Dirvish with Ranger keybindings.", cmd_dirvish)
+            k.register_command("ex:Dirvish", ext_id, "Open Dirvish (`:Dirvish [dir]`).", cmd_dirvish, interactive = false)
+            k.register_command("ex:Ranger", ext_id, "Open Dirvish (`:Ranger [dir]`).", cmd_dirvish, interactive = false)
+
+            -- Navigation commands
+            k.register_command("dirvish-next-line", ext_id, "Move down to next Dirvish entry and update preview (`j`).", cmd_dirvish_next_line)
+            k.register_command("dirvish-prev-line", ext_id, "Move up to previous Dirvish entry and update preview (`k`).", cmd_dirvish_prev_line)
+            k.register_command("dirvish-up-dir", ext_id, "Ascend to parent directory and focus previous child (`h`/`-`).", cmd_dirvish_up_dir)
+            k.register_command("dirvish-enter", ext_id, "Enter directory or open file under cursor (`l`/`<Return>`).", cmd_dirvish_enter)
+            k.register_command("dirvish-goto-top", ext_id, "Jump to first Dirvish entry (`gg`).", cmd_dirvish_goto_top)
+            k.register_command("dirvish-goto-bottom", ext_id, "Jump to last Dirvish entry (`G`).", cmd_dirvish_goto_bottom)
+            k.register_command("dirvish-history-back", ext_id, "Navigate back in Dirvish directory history (`H`).", cmd_dirvish_history_back)
+            k.register_command("dirvish-history-forward", ext_id, "Navigate forward in Dirvish directory history (`L`).", cmd_dirvish_history_forward)
+            k.register_command("dirvish-go-home", ext_id, "Go to `$HOME` in Dirvish (`gh`).", cmd_dirvish_go_home)
+            k.register_command("dirvish-go-root", ext_id, "Go to `/` in Dirvish (`gr`).", cmd_dirvish_go_root)
+            k.register_command("dirvish-go-project", ext_id, "Go to project `cwd` in Dirvish (`gp`).", cmd_dirvish_go_project)
+            k.register_command("dirvish-new-tab", ext_id, "Open new tab in Dirvish at current directory (`gn`).", cmd_dirvish_new_tab)
+
+            -- Marking commands
+            k.register_command("dirvish-toggle-mark", ext_id, "Toggle mark on entry under cursor and advance (`<Space>`).", cmd_dirvish_toggle_mark)
+            k.register_command("dirvish-invert-marks", ext_id, "Invert marks on all visible entries (`v`).", cmd_dirvish_invert_marks)
+            k.register_command("dirvish-unmark-all", ext_id, "Unmark all entries (`uv`/`U`).", cmd_dirvish_unmark_all)
+
+            -- Yank / Cut / Paste / Delete ring commands
+            k.register_command("dirvish-yank", ext_id, "Copy marked/current entries into Dirvish file ring (`yy`).", cmd_dirvish_yank)
+            k.register_command("dirvish-yank-append", ext_id, "Append marked/current entries to copy ring (`ya`).", cmd_dirvish_yank_append)
+            k.register_command("dirvish-cut", ext_id, "Cut marked/current entries into Dirvish file ring (`dd`).", cmd_dirvish_cut)
+            k.register_command("dirvish-cut-append", ext_id, "Append marked/current entries to cut ring (`da`).", cmd_dirvish_cut_append)
+            k.register_command("dirvish-clear-ring", ext_id, "Clear Dirvish yank/cut ring (`uy`).", cmd_dirvish_clear_ring)
+            k.register_command("dirvish-paste", ext_id, "Paste yanked/cut entries with safe auto-disambiguation (`pp`).", cmd_dirvish_paste)
+            k.register_command("dirvish-paste-overwrite", ext_id, "Paste yanked/cut entries overwriting existing targets (`po`).", cmd_dirvish_paste_overwrite)
+            k.register_command("dirvish-delete", ext_id, "Confirm and recursively delete marked/current entries (`dD`/`D`).", cmd_dirvish_delete)
+
+            -- Rename & Create commands
+            k.register_command("dirvish-rename", ext_id, "Rename entry under cursor (`cw`/`R`).", cmd_dirvish_rename)
+            k.register_command("dirvish-rename-append", ext_id, "Rename entry starting at end of full name (`A`).", cmd_dirvish_rename_append)
+            k.register_command("dirvish-rename-prepend", ext_id, "Prepend prefix to entry name (`I`).", cmd_dirvish_rename_prepend)
+            k.register_command("dirvish-rename-stem", ext_id, "Rename file stem preserving extension (`a`).", cmd_dirvish_rename_stem)
+            k.register_command("dirvish-create-file", ext_id, "Create new file (`cf`/`%`).", cmd_dirvish_create_file)
+            k.register_command("dirvish-mkdir", ext_id, "Create new directory (`mk`/`+`).", cmd_dirvish_mkdir)
+
+            -- View, Sort, Filter, Path Yank, Shell, Refresh & Quit commands
+            k.register_command("dirvish-toggle-hidden", ext_id, "Toggle hidden dotfiles (`zh`/`.`).", cmd_dirvish_toggle_hidden)
+            k.register_command("dirvish-toggle-preview", ext_id, "Toggle 3-pane Miller columns vs single-pane (`zp`/`<Tab>`).", cmd_dirvish_toggle_preview)
+            k.register_command("dirvish-filter", ext_id, "Filter visible entries (`zf`/`/`).", cmd_dirvish_filter)
+            k.register_command("dirvish-clear-filter", ext_id, "Clear entry filter (`zi`).", cmd_dirvish_clear_filter)
+            k.register_command("dirvish-sort-name", ext_id, "Sort Dirvish entries by name (`on`).", cmd_dirvish_sort_name)
+            k.register_command("dirvish-sort-size", ext_id, "Sort Dirvish entries by size (`os`).", cmd_dirvish_sort_size)
+            k.register_command("dirvish-sort-ext", ext_id, "Sort Dirvish entries by extension (`oe`).", cmd_dirvish_sort_ext)
+            k.register_command("dirvish-sort-reverse", ext_id, "Reverse Dirvish sort direction (`or`).", cmd_dirvish_sort_reverse)
+            k.register_command("dirvish-yank-path", ext_id, "Copy full entry path to registers & clipboard (`yp`).", cmd_dirvish_yank_path)
+            k.register_command("dirvish-yank-dir", ext_id, "Copy directory path to registers & clipboard (`yd`).", cmd_dirvish_yank_dir)
+            k.register_command("dirvish-yank-name", ext_id, "Copy entry filename to registers & clipboard (`yn`).", cmd_dirvish_yank_name)
+            k.register_command("dirvish-open-shell", ext_id, "Open shell in current Dirvish directory (`S`).", cmd_dirvish_open_shell)
+            k.register_command("dirvish-refresh", ext_id, "Refresh Dirvish directory listing (`gR`/`r`).", cmd_dirvish_refresh)
+            k.register_command("dirvish-quit", ext_id, "Quit Dirvish, collapse helper splits & restore buffer (`q`).", cmd_dirvish_quit)
+
+            -- Global & Leader entry bindings
+            let norm_km = k.ensure_keymap(KEYMAP_VIM_NORMAL)
+            norm_km.bind("-", "dirvish-jump", ext_id, description = "Jump to Dirvish in parent directory")
+            norm_km.bind("<Space>fd", "dirvish", ext_id, description = "Open Dirvish file manager")
+            norm_km.bind("<Space>R", "dirvish", ext_id, description = "Open Ranger / Dirvish")
+
+            let leader_km = k.ensure_keymap("vim-leader")
+            leader_km.bind("<Space> f d", "dirvish", ext_id, description = "Dirvish file manager")
+            leader_km.bind("<Space> R", "dirvish", ext_id, description = "Ranger / Dirvish")
+
+            k.ensure_keymap("emacs-global").bind("<C-x> d", "dirvish", ext_id, description = "Open Dirvish")
+            k.ensure_keymap("global").bind("<C-x> d", "dirvish", ext_id, description = "Open Dirvish")
+
+            -- Authentic Ranger keymap in `mode:dirvish`
+            let km = k.ensure_keymap("mode:dirvish")
+
+            -- 1. Navigation
+            km.bind("j", "dirvish-next-line", ext_id, description = "Next entry")
+            km.bind("<Down>", "dirvish-next-line", ext_id, description = "Next entry")
+            km.bind("k", "dirvish-prev-line", ext_id, description = "Previous entry")
+            km.bind("<Up>", "dirvish-prev-line", ext_id, description = "Previous entry")
+            km.bind("h", "dirvish-up-dir", ext_id, description = "Parent directory")
+            km.bind("-", "dirvish-up-dir", ext_id, description = "Parent directory")
+            km.bind("<Left>", "dirvish-up-dir", ext_id, description = "Parent directory")
+            km.bind("l", "dirvish-enter", ext_id, description = "Enter directory / open file")
+            km.bind("<Right>", "dirvish-enter", ext_id, description = "Enter directory / open file")
+            km.bind("<Return>", "dirvish-enter", ext_id, description = "Enter directory / open file")
+            km.bind("g g", "dirvish-goto-top", ext_id, description = "First entry")
+            km.bind("G", "dirvish-goto-bottom", ext_id, description = "Last entry")
+            km.bind("H", "dirvish-history-back", ext_id, description = "History back")
+            km.bind("L", "dirvish-history-forward", ext_id, description = "History forward")
+            km.bind("g h", "dirvish-go-home", ext_id, description = "Go to $HOME")
+            km.bind("g r", "dirvish-go-root", ext_id, description = "Go to /")
+            km.bind("g p", "dirvish-go-project", ext_id, description = "Go to project cwd")
+            km.bind("g n", "dirvish-new-tab", ext_id, description = "New tab in Dirvish")
+
+            -- 2. Visual Marking
+            km.bind("<Space>", "dirvish-toggle-mark", ext_id, description = "Toggle mark and move down")
+            km.bind("m m", "dirvish-toggle-mark", ext_id, description = "Toggle mark and move down")
+            km.bind("t", "dirvish-toggle-mark", ext_id, description = "Toggle mark and move down")
+            km.bind("v", "dirvish-invert-marks", ext_id, description = "Invert marks in directory")
+            km.bind("u v", "dirvish-unmark-all", ext_id, description = "Unmark all entries")
+            km.bind("U", "dirvish-unmark-all", ext_id, description = "Unmark all entries")
+
+            -- 3. Yank / Cut / Paste / Delete File Ring
+            km.bind("y y", "dirvish-yank", ext_id, description = "Yank entries to copy ring")
+            km.bind("y a", "dirvish-yank-append", ext_id, description = "Append entries to copy ring")
+            km.bind("d d", "dirvish-cut", ext_id, description = "Cut entries to move ring")
+            km.bind("x", "dirvish-cut", ext_id, description = "Cut entries to move ring (Yazi)")
+            km.bind("d a", "dirvish-cut-append", ext_id, description = "Append entries to cut ring")
+            km.bind("u y", "dirvish-clear-ring", ext_id, description = "Clear yank/cut ring")
+            km.bind("p p", "dirvish-paste", ext_id, description = "Paste ring (safe auto-disambiguate)")
+            km.bind("p o", "dirvish-paste-overwrite", ext_id, description = "Paste ring (overwrite)")
+            km.bind("d D", "dirvish-delete", ext_id, description = "Delete marked/current entries")
+            km.bind("D", "dirvish-delete", ext_id, description = "Delete marked/current entries")
+
+            -- 4. Rename & Create
+            km.bind("c w", "dirvish-rename", ext_id, description = "Rename entry")
+            km.bind("R", "dirvish-rename", ext_id, description = "Rename entry")
+            km.bind("A", "dirvish-rename-append", ext_id, description = "Rename (append)")
+            km.bind("I", "dirvish-rename-prepend", ext_id, description = "Rename (prepend)")
+            km.bind("a", "dirvish-rename-stem", ext_id, description = "Rename stem preserving extension")
+            km.bind("c f", "dirvish-create-file", ext_id, description = "Create new file")
+            km.bind("%", "dirvish-create-file", ext_id, description = "Create new file")
+            km.bind("m k", "dirvish-mkdir", ext_id, description = "Create new directory")
+            km.bind("+", "dirvish-mkdir", ext_id, description = "Create new directory")
+
+            -- 5. View, Sort, Filter, Path Yank, Shell, Refresh & Quit
+            km.bind("z h", "dirvish-toggle-hidden", ext_id, description = "Toggle hidden dotfiles")
+            km.bind(".", "dirvish-toggle-hidden", ext_id, description = "Toggle hidden dotfiles")
+            km.bind("z p", "dirvish-toggle-preview", ext_id, description = "Toggle 3-pane Miller preview")
+            km.bind("<Tab>", "dirvish-toggle-preview", ext_id, description = "Toggle 3-pane Miller preview")
+            km.bind("z f", "dirvish-filter", ext_id, description = "Filter visible entries")
+            km.bind("f", "dirvish-filter", ext_id, description = "Filter visible entries (Yazi)")
+            km.bind("/", "dirvish-filter", ext_id, description = "Filter visible entries")
+            km.bind("z i", "dirvish-clear-filter", ext_id, description = "Clear entry filter")
+            km.bind("o n", "dirvish-sort-name", ext_id, description = "Sort by name")
+            km.bind("o s", "dirvish-sort-size", ext_id, description = "Sort by size")
+            km.bind("o e", "dirvish-sort-ext", ext_id, description = "Sort by extension")
+            km.bind("o r", "dirvish-sort-reverse", ext_id, description = "Toggle reverse sort")
+            km.bind("y p", "dirvish-yank-path", ext_id, description = "Copy full path")
+            km.bind("y d", "dirvish-yank-dir", ext_id, description = "Copy directory path")
+            km.bind("y n", "dirvish-yank-name", ext_id, description = "Copy filename")
+            km.bind("S", "dirvish-open-shell", ext_id, description = "Open shell in current dir")
+            km.bind("g R", "dirvish-refresh", ext_id, description = "Refresh Dirvish")
+            km.bind("r", "dirvish-refresh", ext_id, description = "Refresh Dirvish")
+            km.bind("q", "dirvish-quit", ext_id, description = "Quit Dirvish and restore buffer")
+
+            ()
+        },
+        |_k: SystemKernel| -> !String Unit { () },
+    )
+}

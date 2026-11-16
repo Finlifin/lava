@@ -1,0 +1,497 @@
+-- lava_sys: Flat Native Core Bridge for Lava (Principles 2 & 8).
+-- Application-agnostic 2D scene commands, platform input events, font metrics,
+-- clipboard, non-blocking background jobs/timers, and line-streaming file I/O.
+-- Also supports deterministic in-memory mock mode for standalone `nessa run` tests.
+
+use std.fs
+use std.io
+use std.process
+use std.runtime
+use std.time
+
+pub const MOD_CTRL: i64 = 1
+pub const MOD_ALT: i64 = 2
+pub const MOD_SHIFT: i64 = 4
+pub const MOD_SUPER: i64 = 8
+
+pub enum CaretShape {
+    pub Block,
+    pub Beam,
+    pub Underline,
+    pub HollowBlock,
+}
+derive Eq, PartialEq, Display for CaretShape
+
+impl CaretShape {
+    pub fn code(self) -> i64 {
+        self match {
+            CaretShape.Block => 0,
+            CaretShape.Beam => 1,
+            CaretShape.Underline => 2,
+            CaretShape.HollowBlock => 3,
+        }
+    }
+}
+
+pub enum PointerHint {
+    pub Default,
+    pub Text,
+    pub Pointer,
+    pub ResizeHorizontal,
+    pub ResizeVertical,
+}
+derive Eq, PartialEq, Display for PointerHint
+
+impl PointerHint {
+    pub fn code(self) -> i64 {
+        self match {
+            PointerHint.Default => 0,
+            PointerHint.Text => 1,
+            PointerHint.Pointer => 2,
+            PointerHint.ResizeHorizontal => 3,
+            PointerHint.ResizeVertical => 4,
+        }
+    }
+}
+
+private fn clamp_byte(v: i64) -> i64 {
+    if v < 0 {
+        0
+    } else if v > 255 {
+        255
+    } else {
+        v
+    }
+}
+
+pub fn rgba(r: i64, g: i64, b: i64, a: i64) -> i64 {
+    let rc = clamp_byte(r)
+    let gc = clamp_byte(g)
+    let bc = clamp_byte(b)
+    let ac = clamp_byte(a)
+    rc * 16777216 + gc * 65536 + bc * 256 + ac
+}
+
+pub fn rgb(r: i64, g: i64, b: i64) -> i64 = rgba(r, g, b, 255)
+
+pub struct WindowSpec {
+    pub title: String,
+    pub width: i64,
+    pub height: i64,
+    pub bg_rgba: i64,
+    pub pointer: PointerHint,
+}
+
+impl WindowSpec {
+    pub fn default_spec() -> WindowSpec {
+        WindowSpec {
+            title: "Lava",
+            width: 1280,
+            height: 800,
+            bg_rgba: rgb(30, 30, 46),
+            pointer: PointerHint.Default,
+        }
+    }
+}
+
+pub enum DrawCmd {
+    pub ClipPush(x: f64, y: f64, w: f64, h: f64),
+    pub ClipPop,
+    pub FillRect(x: f64, y: f64, w: f64, h: f64, color: i64, radius: f64),
+    pub StrokeRect(x: f64, y: f64, w: f64, h: f64, color: i64, line_width: f64, radius: f64),
+    pub Line(x1: f64, y1: f64, x2: f64, y2: f64, color: i64, line_width: f64),
+    pub TextRun(
+        x: f64,
+        y: f64,
+        text: String,
+        font_family: String,
+        font_size_pt: f64,
+        color: i64,
+        bold: bool,
+        italic: bool,
+        underline: bool
+    ),
+    pub CursorCaret(x: f64, y: f64, w: f64, h: f64, shape: CaretShape, color: i64),
+}
+derive PartialEq for DrawCmd
+
+impl DrawCmd {
+    pub fn to_wire(self) -> List {
+        self match {
+            DrawCmd.ClipPush(x, y, w, h) => [0, x, y, w, h],
+            DrawCmd.ClipPop => [1],
+            DrawCmd.FillRect(x, y, w, h, color, radius) => [2, x, y, w, h, color, radius],
+            DrawCmd.StrokeRect(x, y, w, h, color, lw, radius) => [3, x, y, w, h, color, lw, radius],
+            DrawCmd.Line(x1, y1, x2, y2, color, lw) => [4, x1, y1, x2, y2, color, lw],
+            DrawCmd.TextRun(x, y, text, fam, sz, color, bold, italic, ul) => {
+                [5, x, y, text, fam, sz, color, bold, italic, ul]
+            },
+            DrawCmd.CursorCaret(x, y, w, h, shape, color) => [6, x, y, w, h, shape.code(), color],
+        }
+    }
+}
+
+pub struct FontMetrics {
+    pub cell_width: f64,
+    pub cell_height: f64,
+    pub ascent: f64,
+    pub descent: f64,
+}
+derive PartialEq for FontMetrics
+
+impl FontMetrics {
+    pub fn default_mono() -> FontMetrics {
+        FontMetrics {
+            cell_width: 8.4,
+            cell_height: 19.0,
+            ascent: 15.0,
+            descent: 4.0,
+        }
+    }
+}
+
+pub enum RawUiEvent {
+    pub Key(key: String, modifiers: i64, text: String),
+    pub MouseButton(is_press: bool, button: i64, x: f64, y: f64, modifiers: i64, press_count: i64),
+    pub MouseMove(x: f64, y: f64, modifiers: i64),
+    pub MouseScroll(dx: f64, dy: f64, x: f64, y: f64, modifiers: i64),
+    pub Resize(width: i64, height: i64, scale_factor: i64),
+    pub Focus(focused: bool),
+    pub CloseRequested,
+    pub Tick(timer_id: i64, now_ms: i64),
+    pub AsyncJobDone(job_id: i64, ok: bool, exit_code: i64, stdout: String, stderr: String),
+}
+derive PartialEq for RawUiEvent
+
+pub fn encode_wire_event(ev: RawUiEvent) -> List {
+    ev match {
+        RawUiEvent.Key(key, modifiers, text) => [0, key, modifiers, text],
+        RawUiEvent.MouseButton(is_press, button, x, y, modifiers, press_count) => {
+            [1, is_press, button, x, y, modifiers, press_count]
+        },
+        RawUiEvent.MouseMove(x, y, modifiers) => [2, x, y, modifiers],
+        RawUiEvent.MouseScroll(dx, dy, x, y, modifiers) => [3, dx, dy, x, y, modifiers],
+        RawUiEvent.Resize(width, height, scale_factor) => [4, width, height, scale_factor],
+        RawUiEvent.Focus(focused) => [5, focused],
+        RawUiEvent.CloseRequested => [6],
+        RawUiEvent.Tick(timer_id, now_ms) => [7, timer_id, now_ms],
+        RawUiEvent.AsyncJobDone(job_id, ok, exit_code, stdout, stderr) => {
+            [8, job_id, ok, exit_code, stdout, stderr]
+        },
+    }
+}
+
+pub fn decode_wire_event(item: Any) -> ?RawUiEvent {
+    if not (item matches _: List) {
+        return null
+    }
+    let arr = item.as(List)
+    let len = arr.len()
+    if len < 1 {
+        return null
+    }
+    let tag = arr.get(0).as(i64)
+    when {
+        tag == 0 and len >= 4 => {
+            RawUiEvent.Key(
+                arr.get(1).as(String),
+                arr.get(2).as(i64),
+                arr.get(3).as(String),
+            )
+        },
+        tag == 1 and len >= 7 => {
+            RawUiEvent.MouseButton(
+                arr.get(1).as(bool),
+                arr.get(2).as(i64),
+                arr.get(3).as(f64),
+                arr.get(4).as(f64),
+                arr.get(5).as(i64),
+                arr.get(6).as(i64),
+            )
+        },
+        tag == 2 and len >= 4 => {
+            RawUiEvent.MouseMove(
+                arr.get(1).as(f64),
+                arr.get(2).as(f64),
+                arr.get(3).as(i64),
+            )
+        },
+        tag == 3 and len >= 6 => {
+            RawUiEvent.MouseScroll(
+                arr.get(1).as(f64),
+                arr.get(2).as(f64),
+                arr.get(3).as(f64),
+                arr.get(4).as(f64),
+                arr.get(5).as(i64),
+            )
+        },
+        tag == 4 and len >= 4 => {
+            RawUiEvent.Resize(
+                arr.get(1).as(i64),
+                arr.get(2).as(i64),
+                arr.get(3).as(i64),
+            )
+        },
+        tag == 5 and len >= 2 => RawUiEvent.Focus(arr.get(1).as(bool)),
+        tag == 6 => RawUiEvent.CloseRequested,
+        tag == 7 and len >= 3 => {
+            RawUiEvent.Tick(
+                arr.get(1).as(i64),
+                arr.get(2).as(i64),
+            )
+        },
+        tag == 8 and len >= 6 => {
+            RawUiEvent.AsyncJobDone(
+                arr.get(1).as(i64),
+                arr.get(2).as(bool),
+                arr.get(3).as(i64),
+                arr.get(4).as(String),
+                arr.get(5).as(String),
+            )
+        },
+        else => null,
+    }
+}
+
+-- Deterministic in-memory mock fallback for standalone `nessa run` unit testing.
+private global _mock_enabled: bool = false
+private global _mock_events: List = List()
+private global _mock_clipboard: String = ""
+private global _mock_frame_gen: i64 = 0
+private global _mock_last_cmds: List = List()
+private global _mock_last_title: String = "Lava"
+private global _mock_quit_code: ?i64 = null
+private global _mock_next_id: i64 = 1
+
+pub fn mock_enable(enabled: bool) {
+    _mock_enabled = enabled
+    if enabled {
+        _mock_events = List()
+        _mock_clipboard = ""
+        _mock_frame_gen = 0
+        _mock_last_cmds = List()
+        _mock_last_title = "Lava"
+        _mock_quit_code = null
+        _mock_next_id = 1
+    }
+}
+
+pub fn mock_push_event(ev: RawUiEvent) {
+    _mock_events.push(ev)
+}
+
+pub fn mock_last_frame_cmds() -> List = _mock_last_cmds
+
+pub fn mock_frame_generation() -> i64 = _mock_frame_gen
+
+pub fn mock_last_title() -> String = _mock_last_title
+
+pub fn mock_quit_requested() -> ?i64 = _mock_quit_code
+
+pub fn host_poll_events() -> List {
+    if _mock_enabled {
+        let out = _mock_events
+        _mock_events = List()
+        return out
+    }
+    let raw! = runtime.host_call("ui_poll_events", []) else {
+        return []
+    }
+    let items = raw.as(List)
+    let out = List()
+    for item in items {
+        let ev? = decode_wire_event(item) else {
+            continue
+        }
+        out.push(ev)
+    }
+    out
+}
+
+pub fn host_wait_events(timeout_ms: i64) -> List {
+    if _mock_enabled {
+        let out = _mock_events
+        _mock_events = List()
+        return out
+    }
+    let raw! = runtime.host_call("ui_wait_events", [timeout_ms]) else {
+        return []
+    }
+    let items = raw.as(List)
+    let out = List()
+    for item in items {
+        let ev? = decode_wire_event(item) else {
+            continue
+        }
+        out.push(ev)
+    }
+    out
+}
+
+pub fn host_commit_frame(spec: WindowSpec, cmds: List) -> i64 {
+    if _mock_enabled {
+        _mock_frame_gen += 1
+        _mock_last_cmds = cmds
+        _mock_last_title = spec.title
+        return _mock_frame_gen
+    }
+    let wire = List()
+    for cmd in cmds {
+        wire.push(cmd.as(DrawCmd).to_wire())
+    }
+    let gen! = runtime.host_call(
+        "ui_commit_frame",
+        [spec.title, spec.width, spec.height, spec.bg_rgba, spec.pointer.code(), wire]
+    ) else {
+        _mock_frame_gen += 1
+        _mock_last_cmds = cmds
+        return _mock_frame_gen
+    }
+    gen.as(i64)
+}
+
+pub fn host_measure_font(family: String, size_pt: f64) -> FontMetrics {
+    if _mock_enabled {
+        return FontMetrics.default_mono()
+    }
+    let res! = runtime.host_call("ui_measure_font", [family, size_pt]) else {
+        return FontMetrics.default_mono()
+    }
+    let arr = res.as(List)
+    FontMetrics {
+        cell_width: arr.get(0).as(f64),
+        cell_height: arr.get(1).as(f64),
+        ascent: arr.get(2).as(f64),
+        descent: arr.get(3).as(f64),
+    }
+}
+
+pub fn host_clipboard_get() -> String {
+    if _mock_enabled {
+        return _mock_clipboard
+    }
+    let res! = runtime.host_call("ui_clipboard_get", []) else {
+        return _mock_clipboard
+    }
+    res.as(String)
+}
+
+pub fn host_clipboard_set(text: String) {
+    _mock_clipboard = text
+    if not _mock_enabled {
+        let _ = runtime.host_call("ui_clipboard_set", [text]) ! {
+            _ => (),
+        }
+    }
+}
+
+pub fn host_request_quit(exit_code: i64) {
+    _mock_quit_code = exit_code
+    if not _mock_enabled {
+        let _ = runtime.host_call("ui_request_quit", [exit_code]) ! {
+            _ => (),
+        }
+    }
+}
+
+pub fn host_spawn_job(cmd: String, cwd: String, stdin_data: String) -> i64 {
+    if _mock_enabled {
+        let id = _mock_next_id
+        _mock_next_id += 1
+        let out! = process.shell(cmd) else {
+            _mock_events.push(RawUiEvent.AsyncJobDone(id, false, -1, "", "shell execution failed"))
+            return id
+        }
+        _mock_events.push(RawUiEvent.AsyncJobDone(id, out.status == 0, out.status, out.stdout, out.stderr))
+        return id
+    }
+    let res! = runtime.host_call("sys_spawn_job", [cmd, cwd, stdin_data]) else {
+        let id = _mock_next_id
+        _mock_next_id += 1
+        let out! = process.shell(cmd) else {
+            _mock_events.push(RawUiEvent.AsyncJobDone(id, false, -1, "", "shell execution failed"))
+            return id
+        }
+        _mock_events.push(RawUiEvent.AsyncJobDone(id, out.status == 0, out.status, out.stdout, out.stderr))
+        return id
+    }
+    res.as(i64)
+}
+
+pub fn host_cancel_job(job_id: i64) -> bool {
+    if _mock_enabled {
+        return true
+    }
+    let res! = runtime.host_call("sys_cancel_job", [job_id]) else {
+        return false
+    }
+    res.as(bool)
+}
+
+pub fn host_schedule_timer(delay_ms: i64) -> i64 {
+    if _mock_enabled {
+        let id = _mock_next_id
+        _mock_next_id += 1
+        _mock_events.push(RawUiEvent.Tick(id, time.unix_millis()))
+        return id
+    }
+    let res! = runtime.host_call("sys_schedule_timer", [delay_ms]) else {
+        let id = _mock_next_id
+        _mock_next_id += 1
+        _mock_events.push(RawUiEvent.Tick(id, time.unix_millis()))
+        return id
+    }
+    res.as(i64)
+}
+
+private fn fallback_read_file_lines(path: String) -> !String (List, bool) {
+    let raw! = fs.read_to_string(path) else {
+        return error ("cannot open file: " ++ path)
+    }
+    let has_crlf = raw.contains("\r\n")
+    if raw == "" {
+        return ([""], false)
+    }
+    let norm = raw.replace("\r\n", "\n").replace("\r", "\n")
+    let parts = norm.split("\n")
+    if parts.len() > 1 and norm.ends_with("\n") {
+        let _ = parts.pop()
+    }
+    if parts.is_empty() {
+        parts.push("")
+    }
+    (parts, has_crlf)
+}
+
+private fn fallback_write_file_lines(path: String, lines: List, trailing_newline: bool) -> !String i64 {
+    let body = lines.join("\n") ++ (if trailing_newline { "\n" } else { "" })
+    let _! = fs.write_string(path, body) else {
+        return error ("cannot open file for write: " ++ path)
+    }
+    body.len().as(i64)
+}
+
+pub fn host_read_file_lines(path: String) -> !String (List, bool) {
+    if _mock_enabled {
+        return fallback_read_file_lines(path)
+    }
+    let res! = runtime.host_call("fs_read_lines", [path]) else {
+        return fallback_read_file_lines(path)
+    }
+    let pair = res.as(List)
+    (pair.get(0).as(List), pair.get(1).as(bool))
+}
+
+pub fn host_write_file_lines(path: String, lines: List, trailing_newline: bool) -> !String i64 {
+    if _mock_enabled {
+        return fallback_write_file_lines(path, lines, trailing_newline)
+    }
+    let res! = runtime.host_call("fs_write_lines", [path, lines, trailing_newline]) else {
+        return fallback_write_file_lines(path, lines, trailing_newline)
+    }
+    res.as(i64)
+}
+
+pub fn host_is_dir(path: String) -> bool = fs.is_dir(path)
+
+pub fn host_exists(path: String) -> bool = fs.exists(path)

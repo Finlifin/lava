@@ -1,0 +1,6 @@
+[package]
+name = "server_sys"
+domain = "lava.server"
+version = "0.1.0"
+type = "lib"
+description = "Host RPC framing ABI, workspace accelerators, and LSP bridge for Lava Server."

@@ -1,0 +1,162 @@
+-- End-to-end cross-extension integration test for `lava.org/ext_app`.
+-- Exercises all 8 built-in Extensions, unified Evil-Vim + Emacs + Minibuffer + Tools routing,
+-- multi-turn delimited continuations, window splits + mouse hit-testing, and 2D scene composition.
+
+use std.fs
+use std.path
+use std.process.{assert}
+use std.time
+use @lava_sys.{
+    RawUiEvent, mock_enable, mock_frame_generation, mock_last_frame_cmds, mock_last_title
+}
+use @lava_core.{SystemKernel, clipboard_get, clipboard_set, log_event, status_emit}
+use @ext_document.{BufferKind, EditorWorld, Pos, require_editor_world}
+use @ext_window.{WindowManager, require_window_manager, visible_buffer_rows}
+use @ext_app.{
+    AppHostCap, app_commit_frame, app_feed_keys, app_step_event, boot_kernel, run_session
+}
+
+fn check_eq_str(actual: String, expected: String, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual='" ++ actual ++ "' expected='" ++ expected ++ "'")
+    }
+}
+
+fn check_eq_i64(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual=" ++ actual.to_string() ++ " expected=" ++ expected.to_string())
+    }
+}
+
+fn check_true(cond: bool, label: String) {
+    if not cond {
+        panic("FAILED: " ++ label)
+    }
+}
+
+fn test_unified_evil_emacs_continuations_and_scene() {
+    mock_enable(true)
+    let kernel: SystemKernel = (boot_kernel() ! { e => panic(e) }).as(SystemKernel)
+    let world: EditorWorld = (require_editor_world(kernel) ! { e => panic(e) }).as(EditorWorld)
+    let wm: WindowManager = (require_window_manager(kernel) ! { e => panic(e) }).as(WindowManager)
+
+    -- Verify all 8 built-in extensions are active in the shared VM
+    check_eq_i64(kernel.list_extensions().len(), 8, "ext count")
+
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
+
+    -- Resize viewport via RawUiEvent
+    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+    check_eq_i64(wm.pixel_width, 1280, "wm width")
+    check_eq_i64(wm.pixel_height, 800, "wm height")
+
+    -- Insert `20 + 22` in `*scratch*` and evaluate via Emacs `<C-x> <C-e>` while in Evil Normal mode!
+    app_feed_keys(kernel, "Gi20 + 22<Escape><C-x> <C-e>")# ! { e => panic(e) }
+    check_true(
+        world.active_buffer().line_at(3).contains("42"),
+        "scratch eval line='" ++ world.active_buffer().line_at(3) ++ "' status='" ++ world.status_message ++ "'",
+    )
+
+    -- Create a buffer and test Evil-Vim modal editing + `.` repeat + `<C-v>` block insert
+    let buf = world.create_buffer(
+        "calc.ns",
+        BufferKind.File,
+        major_mode = "nessa",
+        initial_lines = [
+            "let foo = 1",
+            "let foo = 2",
+            "let foo = 3",
+        ],
+    )
+    let _ = world.switch_to_buffer(buf.id)
+    kernel.emit_hook("buffer-switched", buf.id)
+
+    -- Move to `foo` on row 0 (`w`), `ciwbar<Escape>`, then `j.` and `j.`!
+    app_feed_keys(kernel, "0wciwbar<Escape>j.j.")# ! { e => panic(e) }
+    check_eq_str(buf.line_at(0), "let bar = 1", "ciw row 0")
+    check_eq_str(buf.line_at(1), "let bar = 2", "dot row 1")
+    check_eq_str(buf.line_at(2), "let bar = 3", "dot row 2")
+
+    -- Rectangular Visual Block `<C-v>` prepend `pub ` across all 3 lines!
+    app_feed_keys(kernel, "gg0<C-v>2jIpub<Space><Escape>")# ! { e => panic(e) }
+    check_eq_str(buf.line_at(0), "pub let bar = 1", "vblock row 0")
+    check_eq_str(buf.line_at(1), "pub let bar = 2", "vblock row 1")
+    check_eq_str(buf.line_at(2), "pub let bar = 3", "vblock row 2")
+
+    -- Multi-turn delimited continuation `M-%` (`query-replace`): replace `bar` -> `val` with `y`, `n`, `!`
+    app_feed_keys(kernel, "gg0<M-%>bar<Return>val<Return>yn!")# ! { e => panic(e) }
+    check_eq_str(buf.line_at(0), "pub let val = 1", "qreplace row 0")
+    check_eq_str(buf.line_at(1), "pub let bar = 2", "qreplace row 1")
+    check_eq_str(buf.line_at(2), "pub let val = 3", "qreplace row 2")
+
+    -- Continuation-driven `M-x set-theme` with fuzzy minibuffer completion
+    app_feed_keys(kernel, "<M-x>set-theme<Return>gruvbox-dark<Return>")# ! { e => panic(e) }
+    check_eq_str(world.options.theme_name, "gruvbox-dark", "set-theme")
+
+    -- Split window vertically via Emacs `<C-x> 3`, switch buffer in right pane, click left pane with mouse!
+    app_feed_keys(kernel, "<C-x> 3")# ! { e => panic(e) }
+    check_eq_i64(wm.visible_panes().len(), 2, "split panes")
+    app_feed_keys(kernel, "<Space> b b *scratch* <Return>")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, "*scratch*", "leader switch buffer")
+
+    -- Click inside the left pane (`x = 120.0, y = 100.0`) and verify focus returns to `calc.ns`!
+    let _ = app_step_event(kernel, RawUiEvent.MouseButton(true, 1, 120.0, 100.0, 0, 1))# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, "calc.ns", "mouse click focus")
+
+    -- Org-mode `<Tab>` fold & `<C-c> <C-t>` TODO state cycle
+    let org_buf = world.create_buffer(
+        "roadmap.org",
+        BufferKind.File,
+        major_mode = "org",
+        initial_lines = [
+            "* Design Lava Kernel",
+            "  Single VM + Extensions",
+            "* Ship GTK4 Renderer",
+        ],
+    )
+    let _ = world.switch_to_buffer(org_buf.id)
+    kernel.emit_hook("buffer-switched", org_buf.id)
+    app_feed_keys(kernel, "gg0<C-c><C-t><Tab>")# ! { e => panic(e) }
+    check_eq_str(org_buf.line_at(0), "* TODO Design Lava Kernel", "org todo")
+    check_true(org_buf.folded_rows.contains(1), "org fold body row")
+    let vis_org = visible_buffer_rows(org_buf, 0, 10)
+    check_eq_i64(vis_org.len(), 2, "org visible rows after fold (rows 0 and 2)")
+
+    -- Commit 2D RenderFrame and verify non-empty scene DrawCmds + title
+    let gen = app_commit_frame(kernel) ! { e => panic(e) }
+    assert(gen >= 1)
+    check_true(mock_last_frame_cmds().len() > 20, "frame draw cmds")
+    check_true(mock_last_title().contains("roadmap.org"), "frame title")
+
+    let _ = cap
+}
+
+fn test_headless_run_session_file_roundtrip_and_dired() {
+    mock_enable(true)
+    let tmp_dir = "/tmp/lava_app_e2e_" ++ time.unix_millis().to_string()
+    let _ = fs.create_dir_all(tmp_dir) ! { e => panic(e.to_string()) }
+    let sample_file = path.join(tmp_dir, "hello.ns")
+    let _ = fs.write_string(sample_file, "fn greet() -> i64 {{\n    1\n}}\n") ! { e => panic(e.to_string()) }
+
+    let kernel: SystemKernel = (boot_kernel() ! { e => panic(e) }).as(SystemKernel)
+    -- Run headless session: open `hello.ns`, jump to line 2, change `1` to `42`, `:wq`, exit!
+    let code = run_session(
+        kernel,
+        [sample_file],
+        "j0wciw42<Escape>:wq<Return>",
+        true,
+    ) ! { e => panic(e) }
+    check_eq_i64(code, 0, "run_session exit code")
+    check_true(mock_frame_generation() >= 1, "mock_frame_generation")
+
+    let saved = fs.read_to_string(sample_file) ! { e => panic(e.to_string()) }
+    check_true(saved.contains("42"), "saved content=" ++ saved)
+
+    let _ = fs.remove_dir_all(tmp_dir) ! { _ => () }
+}
+
+fn main() {
+    test_unified_evil_emacs_continuations_and_scene()
+    test_headless_run_session_file_roundtrip_and_dired()
+    println("test_app_e2e: ALL PASSED")
+}

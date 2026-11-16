@@ -1,0 +1,2406 @@
+-- ext_emacs: Full Emacs Core Commands, Chord Keymaps, Kill-Ring/Yank-Pop, Narrowing,
+-- Continuation-Driven Isearch & `query-replace`, and Self-Documenting `C-h` Runtime Help.
+-- Publishes service `"lava.emacs.state"` (`EmacsState`) and composes on `SystemKernel`.
+
+use std.collections.{HashMap, Set}
+use std.fs
+use std.path
+use @lava_sys.{CaretShape, host_cancel_job, host_request_quit}
+use @lava_remote.{is_ssh_uri, parent_ssh_uri, remote_stat}
+use @lava_core.{
+    CommandSpec, ExtId, ExtensionRecord, HookListener, InteractiveEffects, KeyBindingEntry,
+    KeyLookup, KeyStroke, Keymap, PromptKind, PromptRequest, PromptTurn, ServiceEntry,
+    SystemKernel, ask_prompt, clipboard_get, clipboard_set, format_chord, log_event,
+    parse_key_sequence, status_emit
+}
+use @ext_document.{
+    ActiveBgJob, Buffer, BufferId, BufferKind, EditorWorld, Pos, RegisterValue,
+    SERVICE_EDITOR_WORLD, Span, VisualSelection, ext_document_id, require_editor_world
+}
+use @ext_minibuffer.{
+    collect_kernel_commands, ext_minibuffer_id, minibuffer_handle_key, open_prompt_view,
+    run_command_with_minibuffer, stroke_printable_text
+}
+
+pub const SERVICE_EMACS: String = "lava.emacs.state"
+pub const KEYMAP_EMACS_GLOBAL: String = "emacs-global"
+pub const KEYMAP_EMACS_INSERT: String = "emacs-insert"
+pub const KEYMAP_EMACS_MODELESS: String = "emacs-modeless"
+
+pub fn ext_emacs_id() -> ExtId = ExtId("lava.org/ext_emacs")
+
+-- ============================================================================
+-- 1. EmacsState Service (Chord Prefix, Universal Argument & Macro Guard)
+-- ============================================================================
+
+pub struct EmacsState {
+    pub pending_strokes: List,
+    pub prefix_arg: ?i64,
+    pub universal_active: bool,
+    pub universal_digits: String,
+    pub last_command: String,
+    pub replaying_macro: bool,
+}
+
+impl EmacsState {
+    pub fn new() -> EmacsState {
+        EmacsState {
+            pending_strokes: List(),
+            prefix_arg: null,
+            universal_active: false,
+            universal_digits: "",
+            last_command: "",
+            replaying_macro: false,
+        }
+    }
+
+    pub fn clear_pending(self, world: EditorWorld) {
+        self.pending_strokes = List()
+        self.universal_active = false
+        self.universal_digits = ""
+        world.pending_keys_display = ""
+        world.which_key_items = List()
+    }
+
+    pub fn consume_count(self, args: List) -> i64 {
+        if not args.is_empty() {
+            let first = args.get(0)
+            if first matches _: i64 {
+                self.prefix_arg = null
+                return first.as(i64)
+            }
+        }
+        let p_opt = self.prefix_arg
+        self.prefix_arg = null
+        if p_opt != null {
+            return p_opt.as(i64)
+        }
+        1
+    }
+}
+
+pub fn require_emacs_state(kernel: SystemKernel) -> !String EmacsState {
+    let raw = kernel.require_service(SERVICE_EMACS)!
+    raw.as(EmacsState)
+}
+
+private fn emit_status(world: EditorWorld, msg: String) -> #status_emit Unit {
+    world.status_message = msg
+    status_emit(msg)#
+}
+
+private fn open_file_safe(w: EditorWorld, raw_path: String) -> #[log_event, status_emit] !String Buffer {
+    w.open_file(raw_path)#!
+}
+
+private fn save_buffer_safe(
+    w: EditorWorld,
+    id: BufferId,
+    .override_path: String = "",
+) -> #[log_event, status_emit] !String Unit {
+    w.save_buffer(id, override_path = override_path)#!
+}
+
+private fn ensure_cursor_visible(world: EditorWorld, row: i64) {
+    let rows = if world.viewport_rows > 2 { world.viewport_rows - 2 } else { 1 }
+    if row < world.viewport_top_row {
+        world.viewport_top_row = row
+    } else if row >= world.viewport_top_row + rows {
+        world.viewport_top_row = row - rows + 1
+    }
+}
+
+-- ============================================================================
+-- 2. Word & Buffer Movement Helpers (Narrowing-Aware)
+-- ============================================================================
+
+private fn is_word_char(ch: String) -> bool {
+    if ch == "_" {
+        return true
+    }
+    ch.is_alphanumeric()
+}
+
+private fn step_forward_char(buf: Buffer, pos: Pos) -> Pos {
+    let p = buf.clamp_pos(pos, insert_mode = true)
+    let llen = buf.line_char_len(p.row)
+    if p.col < llen {
+        return Pos.new(p.row, p.col + 1)
+    }
+    if p.row < buf.max_row() {
+        return Pos.new(p.row + 1, 0)
+    }
+    p
+}
+
+private fn step_backward_char(buf: Buffer, pos: Pos) -> Pos {
+    let p = buf.clamp_pos(pos, insert_mode = true)
+    if p.col > 0 {
+        return Pos.new(p.row, p.col - 1)
+    }
+    if p.row > buf.min_row() {
+        let prev_row = p.row - 1
+        return Pos.new(prev_row, buf.line_char_len(prev_row))
+    }
+    p
+}
+
+private fn forward_word_once(buf: Buffer, pos: Pos) -> Pos {
+    var cur = buf.clamp_pos(pos, insert_mode = true)
+    -- 1. Skip non-word characters (including line breaks)
+    while true {
+        let llen = buf.line_char_len(cur.row)
+        if cur.col < llen {
+            let ch = buf.line_at(cur.row).slice(cur.col, cur.col + 1)
+            if is_word_char(ch) {
+                break
+            }
+            cur = Pos.new(cur.row, cur.col + 1)
+        } else if cur.row < buf.max_row() {
+            cur = Pos.new(cur.row + 1, 0)
+        } else {
+            return cur
+        }
+    }
+    -- 2. Advance through word characters to word end
+    let line = buf.line_at(cur.row)
+    let llen = line.char_len()
+    var c = cur.col
+    while c < llen and is_word_char(line.slice(c, c + 1)) {
+        c += 1
+    }
+    Pos.new(cur.row, c)
+}
+
+private fn backward_word_once(buf: Buffer, pos: Pos) -> Pos {
+    var cur = buf.clamp_pos(pos, insert_mode = true)
+    -- 1. Step back across non-word characters (including line breaks)
+    while true {
+        if cur.col > 0 {
+            let ch = buf.line_at(cur.row).slice(cur.col - 1, cur.col)
+            if is_word_char(ch) {
+                break
+            }
+            cur = Pos.new(cur.row, cur.col - 1)
+        } else if cur.row > buf.min_row() {
+            let prev_row = cur.row - 1
+            cur = Pos.new(prev_row, buf.line_char_len(prev_row))
+        } else {
+            return cur
+        }
+    }
+    -- 2. Step back to beginning of word
+    let line = buf.line_at(cur.row)
+    var c = cur.col
+    while c > 0 and is_word_char(line.slice(c - 1, c)) {
+        c -= 1
+    }
+    Pos.new(cur.row, c)
+}
+
+private fn find_next_from_inclusive(
+    buf: Buffer,
+    needle: String,
+    from_pos: Pos,
+    ignore_case: bool,
+) -> ?Pos {
+    if needle == "" {
+        return null
+    }
+    let lo = buf.min_row()
+    let hi = buf.max_row()
+    let start_r = if from_pos.row < lo { lo } else { from_pos.row }
+    if start_r > hi {
+        return null
+    }
+    let start_col = if from_pos.row < lo { 0 } else { from_pos.col }
+    let first_hits = buf.find_all_in_line(start_r, needle, ignore_case)
+    for i in 0..first_hits.len() {
+        let (sc, _) = first_hits.get(i.as(usize)).as((i64, i64))
+        if sc >= start_col {
+            return Pos.new(start_r, sc)
+        }
+    }
+    for r in (start_r + 1)..(hi + 1) {
+        let row_hits = buf.find_all_in_line(r, needle, ignore_case)
+        if not row_hits.is_empty() {
+            let (sc, _) = row_hits.get(0).as((i64, i64))
+            return Pos.new(r, sc)
+        }
+    }
+    null
+}
+
+private fn find_prev_from_inclusive(
+    buf: Buffer,
+    needle: String,
+    from_pos: Pos,
+    ignore_case: bool,
+) -> ?Pos {
+    if needle == "" {
+        return null
+    }
+    let lo = buf.min_row()
+    let hi = buf.max_row()
+    let start_r = if from_pos.row > hi { hi } else { from_pos.row }
+    if start_r < lo {
+        return null
+    }
+    let start_col = if from_pos.row > hi { buf.line_char_len(hi) } else { from_pos.col }
+    let first_hits = buf.find_all_in_line(start_r, needle, ignore_case)
+    var idx = first_hits.len() - 1
+    while idx >= 0 {
+        let (sc, _) = first_hits.get(idx.as(usize)).as((i64, i64))
+        if sc <= start_col {
+            return Pos.new(start_r, sc)
+        }
+        idx -= 1
+    }
+    var r = start_r - 1
+    while r >= lo {
+        let row_hits = buf.find_all_in_line(r, needle, ignore_case)
+        if not row_hits.is_empty() {
+            let (sc, _) = row_hits.get((row_hits.len() - 1).as(usize)).as((i64, i64))
+            return Pos.new(r, sc)
+        }
+        r -= 1
+    }
+    null
+}
+
+private fn pad_right(s: String, width: i64) -> String {
+    let n = s.char_len()
+    if n >= width {
+        return s
+    }
+    s ++ " ".repeat(width - n)
+}
+
+private fn clear_non_kill_yank_streaks(world: EditorWorld, cmd_name: String) {
+    let is_kill = cmd_name == "kill-line" or
+        cmd_name == "kill-region" or
+        cmd_name == "kill-word" or
+        cmd_name == "backward-kill-word"
+    if not is_kill {
+        world.kill_ring.clear_kill_streak()
+    }
+    if cmd_name != "yank" and cmd_name != "yank-pop" {
+        world.kill_ring.last_yank_span = null
+    }
+}
+
+-- ============================================================================
+-- 3. Self-Documenting Help & Runtime Introspection Formatting (`C-h` Suite)
+-- ============================================================================
+
+private fn pretty_stroke_notation(st: KeyStroke) -> String {
+    if (not st.ctrl) and (not st.alt) and (not st.shift_mod) and (not st.super_mod) {
+        if st.key.char_len() == 1 and st.key != "<" and st.key != ">" and st.key != " " {
+            return st.key
+        }
+        if st.key == "<" {
+            return "<lt>"
+        }
+        if st.key == ">" {
+            return "<gt>"
+        }
+        return "<" ++ st.key ++ ">"
+    }
+    st.notation()
+}
+
+private fn pretty_strokes(strokes: List) -> String {
+    let parts = List()
+    for i in 0..strokes.len() {
+        parts.push(pretty_stroke_notation(strokes.get(i.as(usize)).as(KeyStroke)))
+    }
+    parts.join(" ")
+}
+
+private fn pretty_chord_string(raw_chord: String) -> String {
+    let seq = parse_key_sequence(raw_chord)
+    if seq.is_empty() {
+        return raw_chord
+    }
+    pretty_strokes(seq)
+}
+
+private fn collect_bindings_for_command(kernel: SystemKernel, cmd_name: String) -> List {
+    let out = List()
+    let km_names = kernel.keymaps.keys()
+    km_names.sort()
+    for i in 0..km_names.len() {
+        let kname = km_names.get(i.as(usize)).as(String)
+        let km = kernel.keymaps.get(kname).as(Keymap)
+        let chords = km.bindings.keys()
+        chords.sort()
+        for j in 0..chords.len() {
+            let ch = chords.get(j.as(usize)).as(String)
+            let entry = km.bindings.get(ch).as(KeyBindingEntry)
+            if entry.command_name == cmd_name {
+                out.push((kname, entry))
+            }
+        }
+    }
+    out
+}
+
+private fn open_help_buffer(kernel: SystemKernel, world: EditorWorld, lines: List) {
+    let hb = world.ensure_special_buffer("*Help*", "help", lines, read_only = true)
+    hb.point = Pos.zero()
+    let _ = world.switch_to_buffer(hb.id)
+    world.viewport_top_row = 0
+    kernel.emit_hook("buffer-switched", hb.id)
+}
+
+private fn build_buffers_table_lines(world: EditorWorld) -> List {
+    let lines = List()
+    lines.push("CRM Buffer                  Lines  Mode          File")
+    lines.push("--- ------                  -----  ----          ----")
+    for i in 0..world.buffer_order.len() {
+        let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+        let b = world.buffers.get(bid).as(Buffer)
+        let cur_flag = if bid == world.active_buffer_id { "." } else { " " }
+        let ro_flag = if b.read_only { "%" } else { " " }
+        let mod_flag = if b.modified { "*" } else { " " }
+        let flags = cur_flag ++ ro_flag ++ mod_flag
+        let narrow_tag = if b.is_narrowed() { " [narrowed]" } else { "" }
+        let fpath = if b.file_path != "" { b.file_path } else { "(" ++ b.kind.to_string() ++ ")" }
+        lines.push(
+            flags ++ " " ++
+            pad_right(b.name, 24) ++
+            pad_right(b.line_count().to_string(), 7) ++
+            pad_right(b.major_mode, 14) ++
+            fpath ++ narrow_tag
+        )
+    }
+    lines
+}
+
+-- ============================================================================
+-- 4. Command Suite Registration
+-- ============================================================================
+
+private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
+    -- 4.1 `execute-extended-command` (`M-x`)
+    kernel.register_command(
+        "execute-extended-command",
+        ext_id,
+        "Read an interactive command name with fuzzy completion and invoke it (`M-x`).",
+        |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let ans? = ask_prompt(PromptRequest {
+                label: "M-x ",
+                initial: "",
+                kind: PromptKind.CommandName,
+                candidates: List(),
+            })# else {
+                emit_status(w, "Quit")#
+                return ()
+            }
+            let chosen = ans.trim()
+            if chosen == "" {
+                return ()
+            }
+            let spec? = kern.get_command(chosen) else {
+                emit_status(w, "[No match: " ++ chosen ++ "]")#
+                return ()
+            }
+            clear_non_kill_yank_streaks(w, chosen)
+            let act = spec.action
+            act(kern, args)#!
+        },
+    )
+
+    -- 4.2 `keyboard-quit` (`C-g`) & `universal-argument` (`C-u`) & `toggle-evil-mode` (`C-z`)
+    kernel.register_command(
+        "keyboard-quit",
+        ext_id,
+        "Cancel pending chords, deactivate mark, clear search highlights, and abort background jobs (`C-g`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let st = require_emacs_state(kern)!
+            st.clear_pending(w)
+            st.prefix_arg = null
+            let buf = w.active_buffer()
+            buf.mark_active = false
+            w.visual = VisualSelection.none()
+            w.search_highlight_active = false
+            if kern.macros.is_recording() {
+                let _ = kern.macros.stop()
+            }
+            for i in 0..w.active_jobs.len() {
+                let job = w.active_jobs.get(i.as(usize)).as(ActiveBgJob)
+                let _ = host_cancel_job(job.job_id)
+            }
+            w.active_jobs = List()
+            w.kill_ring.clear_kill_streak()
+            w.kill_ring.last_yank_span = null
+            emit_status(w, "Quit")#
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "universal-argument",
+        ext_id,
+        "Begin or multiply numeric prefix argument (`C-u`: 4, 16, 64, or digits).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let st = require_emacs_state(kern)!
+            if not st.universal_active {
+                st.universal_active = true
+                st.universal_digits = ""
+                st.prefix_arg = 4
+            } else if st.universal_digits == "" {
+                let prev = if st.prefix_arg != null { st.prefix_arg.as(i64) } else { 4 }
+                st.prefix_arg = prev * 4
+            }
+            w.pending_keys_display = "C-u (" ++ st.prefix_arg.as(i64).to_string() ++ ")"
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "toggle-evil-mode",
+        ext_id,
+        "Toggle between Evil-Vim modal editing and pure Emacs modeless editing (`C-z`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let st = require_emacs_state(kern)!
+            st.clear_pending(w)
+            st.prefix_arg = null
+            let buf = w.active_buffer()
+            if w.options.evil_mode {
+                w.options.evil_mode = false
+                w.mode_name = "EMACS"
+                w.caret_shape = CaretShape.Beam
+                w.visual = VisualSelection.none()
+                emit_status(w, "Emacs modeless mode enabled")#
+            } else {
+                w.options.evil_mode = true
+                w.mode_name = "NORMAL"
+                w.caret_shape = CaretShape.Block
+                w.visual = VisualSelection.none()
+                buf.point = buf.clamp_pos(buf.point, insert_mode = false)
+                emit_status(w, "Evil modal mode enabled (NORMAL)")#
+            }
+            kern.emit_hook("mode-changed", w.mode_name)
+            ()
+        },
+    )
+
+    -- 4.3 Files & Buffers (`C-x` suite)
+    kernel.register_command(
+        "find-file",
+        ext_id,
+        "Prompt for a file or directory path and open it (`C-x C-f`).",
+        |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let target_raw = if (not args.is_empty()) and (args.get(0) matches _: String) {
+                args.get(0).as(String)
+            } else {
+                let cur_fp = w.active_buffer().file_path
+                let init_dir = if is_ssh_uri(cur_fp) {
+                    let par = parent_ssh_uri(cur_fp)
+                    if par.ends_with("/") { par } else { par ++ "/" }
+                } else if w.cwd.ends_with("/") {
+                    w.cwd
+                } else {
+                    w.cwd ++ "/"
+                }
+                let ans? = ask_prompt(PromptRequest {
+                    label: "Find file: ",
+                    initial: init_dir,
+                    kind: PromptKind.FilePath,
+                    candidates: List(),
+                })# else {
+                    emit_status(w, "Quit")#
+                    return ()
+                }
+                ans
+            }
+            if target_raw.trim() == "" {
+                return ()
+            }
+            let full_path = w.resolve_path(target_raw)
+            if is_ssh_uri(full_path) {
+                let st_res = remote_stat(full_path)
+                st_res match {
+                    st! => {
+                        if st.exists and st.is_dir {
+                            let rb_spec_opt = kern.get_command("remote-browse")
+                            if rb_spec_opt != null {
+                                let rb_act = rb_spec_opt.as(CommandSpec).action
+                                return rb_act(kern, [full_path])#!
+                            }
+                        }
+                    },
+                    error _ => (),
+                }
+            }
+            if fs.exists(full_path) and fs.is_dir(full_path) {
+                let dirvish_spec_opt = kern.get_command("dirvish")
+                if dirvish_spec_opt != null {
+                    let dv_act = dirvish_spec_opt.as(CommandSpec).action
+                    return dv_act(kern, [full_path])#!
+                }
+                let dired_spec_opt = kern.get_command("dired")
+                if dired_spec_opt != null {
+                    let dact = dired_spec_opt.as(CommandSpec).action
+                    return dact(kern, [full_path])#!
+                }
+                let entries! = fs.read_dir(full_path) else {
+                    return error ("cannot read directory: " ++ full_path)
+                }
+                let lines = List()
+                lines.push("Dired: " ++ full_path)
+                lines.push("----------------------------------------")
+                for i in 0..entries.len() {
+                    let ename = entries.get(i.as(usize)).as(String)
+                    let child = path.join(full_path, ename)
+                    let suffix = if fs.is_dir(child) { "/" } else { "" }
+                    lines.push("  " ++ ename ++ suffix)
+                }
+                let db = w.ensure_special_buffer("*Dired*", "dired", lines, read_only = true)
+                db.file_path = full_path
+                let _ = w.switch_to_buffer(db.id)
+                kern.emit_hook("buffer-switched", db.id)
+                emit_status(w, "Dired " ++ full_path)#
+                return ()
+            }
+            let cur = w.active_buffer()
+            w.jumps.record(cur.id, cur.file_path, cur.point)
+            let opened = open_file_safe(w, full_path)#!
+            w.viewport_top_row = 0
+            kern.emit_hook("buffer-switched", opened.id)
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "save-buffer",
+        ext_id,
+        "Save active buffer to disk, prompting for a path if unnamed (`C-x C-s`).",
+        |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let buf = w.active_buffer()
+            var override_p = if (not args.is_empty()) and (args.get(0) matches _: String) {
+                args.get(0).as(String)
+            } else {
+                ""
+            }
+            if buf.file_path == "" and override_p == "" {
+                let init_dir = if w.cwd.ends_with("/") { w.cwd } else { w.cwd ++ "/" }
+                let ans? = ask_prompt(PromptRequest {
+                    label: "Write file: ",
+                    initial: init_dir,
+                    kind: PromptKind.FilePath,
+                    candidates: List(),
+                })# else {
+                    emit_status(w, "Quit")#
+                    return ()
+                }
+                override_p = ans
+            }
+            save_buffer_safe(w, buf.id, override_path = override_p)#!
+            kern.emit_hook("buffer-saved", buf.id)
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "write-file",
+        ext_id,
+        "Prompt for a destination path and write the active buffer to it (`C-x C-w`).",
+        |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let buf = w.active_buffer()
+            let dest = if (not args.is_empty()) and (args.get(0) matches _: String) {
+                args.get(0).as(String)
+            } else {
+                let init_p = if buf.file_path != "" {
+                    buf.file_path
+                } else if w.cwd.ends_with("/") {
+                    w.cwd
+                } else {
+                    w.cwd ++ "/"
+                }
+                let ans? = ask_prompt(PromptRequest {
+                    label: "Write file: ",
+                    initial: init_p,
+                    kind: PromptKind.FilePath,
+                    candidates: List(),
+                })# else {
+                    emit_status(w, "Quit")#
+                    return ()
+                }
+                ans
+            }
+            if dest.trim() == "" {
+                return ()
+            }
+            save_buffer_safe(w, buf.id, override_path = dest)#!
+            kern.emit_hook("buffer-saved", buf.id)
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "save-some-buffers",
+        ext_id,
+        "Interactively offer to save each modified file buffer (`C-x s`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let unsaved = w.unsaved_file_buffers()
+            if unsaved.is_empty() {
+                emit_status(w, "(No files need saving)")#
+                return ()
+            }
+            var save_all = false
+            var saved_count: i64 = 0
+            for i in 0..unsaved.len() {
+                let b = unsaved.get(i.as(usize)).as(Buffer)
+                if not b.modified {
+                    continue
+                }
+                var ans = "!"
+                if not save_all {
+                    let label_path = if b.file_path != "" { b.file_path } else { b.name }
+                    let reply? = ask_prompt(PromptRequest.with_candidates(
+                        "Save file " ++ label_path ++ "? (y/n/!/q) ",
+                        "",
+                        PromptKind.Confirm,
+                        ["y", "n", "!", "q"],
+                    ))# else {
+                        emit_status(w, "Quit")#
+                        return ()
+                    }
+                    ans = reply
+                }
+                if ans == "q" {
+                    break
+                } else if ans == "!" {
+                    save_all = true
+                    save_buffer_safe(w, b.id)#!
+                    kern.emit_hook("buffer-saved", b.id)
+                    saved_count += 1
+                } else if ans == "y" {
+                    save_buffer_safe(w, b.id)#!
+                    kern.emit_hook("buffer-saved", b.id)
+                    saved_count += 1
+                }
+            }
+            emit_status(w, "Saved " ++ saved_count.to_string() ++ " buffer(s)")#
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "switch-to-buffer",
+        ext_id,
+        "Switch to an existing buffer or create a new scratch buffer by name (`C-x b`).",
+        |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let target_name = if (not args.is_empty()) and (args.get(0) matches _: String) {
+                args.get(0).as(String)
+            } else {
+                let ans? = ask_prompt(PromptRequest {
+                    label: "Switch to buffer: ",
+                    initial: "",
+                    kind: PromptKind.BufferName,
+                    candidates: List(),
+                })# else {
+                    emit_status(w, "Quit")#
+                    return ()
+                }
+                ans
+            }
+            let clean = target_name.trim()
+            if clean == "" {
+                return ()
+            }
+            let cur = w.active_buffer()
+            w.jumps.record(cur.id, cur.file_path, cur.point)
+            let existing_opt = w.find_buffer_by_name(clean)
+            if existing_opt != null {
+                let b = existing_opt.as(Buffer)
+                let _ = w.switch_to_buffer(b.id)
+                ensure_cursor_visible(w, b.point.row)
+                kern.emit_hook("buffer-switched", b.id)
+                emit_status(w, "Switched to buffer " ++ b.name)#
+                return ()
+            }
+            let created = w.create_buffer(clean, BufferKind.Scratch, major_mode = "text")
+            let _ = w.switch_to_buffer(created.id)
+            w.viewport_top_row = 0
+            kern.emit_hook("buffer-switched", created.id)
+            emit_status(w, "New buffer " ++ created.name)#
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "kill-buffer",
+        ext_id,
+        "Kill a buffer by name, confirming if it has unsaved file modifications (`C-x k`).",
+        |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let cur_name = w.active_buffer().name
+            let target_name = if (not args.is_empty()) and (args.get(0) matches _: String) {
+                args.get(0).as(String)
+            } else {
+                let ans? = ask_prompt(PromptRequest {
+                    label: "Kill buffer: ",
+                    initial: cur_name,
+                    kind: PromptKind.BufferName,
+                    candidates: List(),
+                })# else {
+                    emit_status(w, "Quit")#
+                    return ()
+                }
+                ans
+            }
+            let clean = if target_name.trim() == "" { cur_name } else { target_name.trim() }
+            let target? = w.find_buffer_by_name(clean) else {
+                emit_status(w, "No buffer named " ++ clean)#
+                return ()
+            }
+            if target.id == w.messages_id {
+                emit_status(w, "Cannot kill *Messages* buffer")#
+                return ()
+            }
+            if target.modified and target.kind == BufferKind.File {
+                let confirm? = ask_prompt(PromptRequest.with_candidates(
+                    "Buffer " ++ target.name ++ " modified; kill anyway? (y/n) ",
+                    "",
+                    PromptKind.Confirm,
+                    ["y", "n"],
+                ))# else {
+                    emit_status(w, "Quit")#
+                    return ()
+                }
+                if confirm != "y" {
+                    emit_status(w, "Buffer " ++ target.name ++ " not killed")#
+                    return ()
+                }
+            }
+            let killed_name = target.name
+            let next_id = w.kill_buffer(target.id, force = true)!
+            kern.emit_hook("buffer-switched", next_id)
+            emit_status(w, "Killed buffer " ++ killed_name)#
+            ()
+        },
+    )
+
+    let list_buffers_fn = |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+        let w = require_editor_world(kern)!
+        let lines = build_buffers_table_lines(w)
+        let bb = w.ensure_special_buffer("*Buffers*", "buffer-menu", lines, read_only = true)
+        bb.point = Pos.new(if lines.len() > 2 { 2 } else { 0 }, 0)
+        let _ = w.switch_to_buffer(bb.id)
+        w.viewport_top_row = 0
+        kern.emit_hook("buffer-switched", bb.id)
+        emit_status(w, "Buffer list (" ++ w.buffer_order.len().to_string() ++ " buffers)")#
+        ()
+    }
+
+    kernel.register_command(
+        "list-buffers",
+        ext_id,
+        "Display an interactive summary table of open buffers in `*Buffers*` (`C-x C-b`).",
+        list_buffers_fn,
+    )
+
+    kernel.register_command(
+        "ibuffer",
+        ext_id,
+        "Open the interactive `*Buffers*` buffer manager (`C-x C-b`).",
+        list_buffers_fn,
+    )
+
+    kernel.register_command(
+        "save-buffers-kill-terminal",
+        ext_id,
+        "Offer to save unsaved file buffers and request clean editor exit (`C-x C-c`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let unsaved = w.unsaved_file_buffers()
+            var save_all = false
+            for i in 0..unsaved.len() {
+                let b = unsaved.get(i.as(usize)).as(Buffer)
+                if not b.modified {
+                    continue
+                }
+                var ans = "!"
+                if not save_all {
+                    let label_p = if b.file_path != "" { b.file_path } else { b.name }
+                    let reply? = ask_prompt(PromptRequest.with_candidates(
+                        "Save file " ++ label_p ++ "? (y/n/!/q) ",
+                        "",
+                        PromptKind.Confirm,
+                        ["y", "n", "!", "q"],
+                    ))# else {
+                        emit_status(w, "Quit")#
+                        return ()
+                    }
+                    ans = reply
+                }
+                if ans == "q" {
+                    emit_status(w, "Canceled exit")#
+                    return ()
+                } else if ans == "!" {
+                    save_all = true
+                    save_buffer_safe(w, b.id)#!
+                    kern.emit_hook("buffer-saved", b.id)
+                } else if ans == "y" {
+                    save_buffer_safe(w, b.id)#!
+                    kern.emit_hook("buffer-saved", b.id)
+                }
+            }
+            if not w.unsaved_file_buffers().is_empty() {
+                let exit_anyway? = ask_prompt(PromptRequest.with_candidates(
+                    "Modified buffers exist; exit anyway? (y/n) ",
+                    "",
+                    PromptKind.Confirm,
+                    ["y", "n"],
+                ))# else {
+                    emit_status(w, "Quit")#
+                    return ()
+                }
+                if exit_anyway != "y" {
+                    emit_status(w, "Canceled exit")#
+                    return ()
+                }
+            }
+            w.quit_requested = true
+            w.exit_code = 0
+            host_request_quit(0)
+            emit_status(w, "Exiting Lava...")#
+            ()
+        },
+    )
+
+    -- 4.4 Mark, Regions, Kill-Ring, Yank, Yank-Pop & Macros
+    kernel.register_command(
+        "set-mark-command",
+        ext_id,
+        "Set mark at point and activate region (`C-SPC`), or jump to mark ring with `C-u`.",
+        |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let st = require_emacs_state(kern)!
+            let had_prefix = st.prefix_arg != null or (not args.is_empty())
+            let _ = st.consume_count(args)
+            let buf = w.active_buffer()
+            if had_prefix and buf.mark != null {
+                let target = buf.mark.as(Pos)
+                if not buf.mark_ring.is_empty() {
+                    let prev_m = buf.mark_ring.pop().as(Pos)
+                    buf.mark = prev_m
+                }
+                buf.mark_active = false
+                buf.point = buf.clamp_pos(target, insert_mode = true)
+                buf.preferred_col = buf.point.col
+                ensure_cursor_visible(w, buf.point.row)
+                emit_status(w, "Mark popped")#
+                return ()
+            }
+            buf.set_mark(buf.point, activate = true)
+            emit_status(w, "Mark set")#
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "exchange-point-and-mark",
+        ext_id,
+        "Swap point and mark in active buffer (`C-x C-x`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let buf = w.active_buffer()
+            let m? = buf.mark else {
+                emit_status(w, "No mark set in this buffer")#
+                return ()
+            }
+            let old_point = buf.point
+            buf.mark = old_point
+            buf.mark_active = true
+            buf.point = buf.clamp_pos(m, insert_mode = true)
+            buf.preferred_col = buf.point.col
+            ensure_cursor_visible(w, buf.point.row)
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "mark-whole-buffer",
+        ext_id,
+        "Put point at beginning and mark at end of accessible buffer (`C-x h`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let buf = w.active_buffer()
+            let hi = buf.max_row()
+            buf.set_mark(Pos.new(hi, buf.line_char_len(hi)), activate = true)
+            buf.point = Pos.new(buf.min_row(), 0)
+            buf.preferred_col = 0
+            ensure_cursor_visible(w, buf.point.row)
+            emit_status(w, "Mark set (whole buffer)")#
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "kill-line",
+        ext_id,
+        "Kill to end of line (or newline at EOL); consecutive kills append to `KillRing` (`C-k`).",
+        |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let st = require_emacs_state(kern)!
+            let has_explicit_count = st.prefix_arg != null or (not args.is_empty())
+            let count = st.consume_count(args)
+            let buf = w.active_buffer()
+            buf.ensure_writable()!
+
+            let append_flag = w.kill_ring.last_was_kill
+            w.kill_ring.last_yank_span = null
+            let p = buf.clamp_pos(buf.point, insert_mode = true)
+            buf.checkpoint(p, "kill-line-pre")
+
+            if has_explicit_count and count > 1 {
+                var target_row = p.row + count
+                var target_col: i64 = 0
+                if target_row > buf.max_row() {
+                    target_row = buf.max_row()
+                    target_col = buf.line_char_len(target_row)
+                }
+                let span = Span.normalized(p, Pos.new(target_row, target_col))
+                let (_, removed) = buf.delete_span(span)!
+                if removed != "" {
+                    w.registers.delete_store(
+                        RegisterValue.chars(removed),
+                        w.kill_ring,
+                        append_kill = append_flag,
+                    )#
+                    buf.checkpoint(buf.point, "kill-line")
+                }
+                buf.preferred_col = buf.point.col
+                return ()
+            }
+
+            let llen = buf.line_char_len(p.row)
+            if p.col < llen {
+                let span = Span.normalized(p, Pos.new(p.row, llen))
+                let (_, removed) = buf.delete_span(span)!
+                w.registers.delete_store(
+                    RegisterValue.chars(removed),
+                    w.kill_ring,
+                    append_kill = append_flag,
+                )#
+                buf.checkpoint(buf.point, "kill-line")
+            } else if p.row < buf.max_row() {
+                let deleted = buf.delete_char_at(p)!
+                if deleted != "" {
+                    w.registers.delete_store(
+                        RegisterValue.chars(deleted),
+                        w.kill_ring,
+                        append_kill = append_flag,
+                    )#
+                    buf.checkpoint(buf.point, "kill-line")
+                }
+            }
+            buf.preferred_col = buf.point.col
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "kill-region",
+        ext_id,
+        "Kill text between point and mark into `KillRing` (`C-w`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let buf = w.active_buffer()
+            buf.ensure_writable()!
+            let m? = buf.mark else {
+                emit_status(w, "The mark is not set now")#
+                return ()
+            }
+            let append_flag = w.kill_ring.last_was_kill
+            w.kill_ring.last_yank_span = null
+            let span = Span.normalized(m, buf.point)
+            buf.checkpoint(buf.point, "kill-region-pre")
+            let (_, removed) = buf.delete_span(span)!
+            buf.mark_active = false
+            if removed != "" {
+                w.registers.delete_store(
+                    RegisterValue.chars(removed),
+                    w.kill_ring,
+                    append_kill = append_flag,
+                )#
+                buf.checkpoint(buf.point, "kill-region")
+            }
+            buf.preferred_col = buf.point.col
+            ensure_cursor_visible(w, buf.point.row)
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "kill-ring-save",
+        ext_id,
+        "Copy region between point and mark to `KillRing` without deleting (`M-w`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let buf = w.active_buffer()
+            let m? = buf.mark else {
+                emit_status(w, "The mark is not set now")#
+                return ()
+            }
+            let copied = buf.extract_span(Span.normalized(m, buf.point))
+            buf.mark_active = false
+            if copied != "" {
+                w.kill_ring.push(copied, linewise = false, append = false)
+                w.kill_ring.clear_kill_streak()
+                w.kill_ring.last_yank_span = null
+                w.registers.yank_store(RegisterValue.chars(copied))#
+                emit_status(w, "Saved region (" ++ copied.char_len().to_string() ++ " chars)")#
+            }
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "yank",
+        ext_id,
+        "Reinsert most recent kill from `KillRing` at point (`C-y`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let st = require_emacs_state(kern)!
+            let buf = w.active_buffer()
+            buf.ensure_writable()!
+            let rv? = w.kill_ring.current() else {
+                emit_status(w, "Kill ring is empty")#
+                return ()
+            }
+            let start_pos = buf.clamp_pos(buf.point, insert_mode = true)
+            buf.checkpoint(start_pos, "yank-pre")
+            let end_pos = buf.insert_text(start_pos, rv.text)!
+            buf.checkpoint(end_pos, "yank")
+            buf.set_mark(start_pos, activate = false)
+            buf.preferred_col = end_pos.col
+            w.kill_ring.clear_kill_streak()
+            w.kill_ring.last_yank_span = (buf.id, Span.normalized(start_pos, end_pos))
+            st.last_command = "yank"
+            ensure_cursor_visible(w, buf.point.row)
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "yank-pop",
+        ext_id,
+        "Replace just-yanked stretch of killed text with an earlier kill from `KillRing` (`M-y`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let st = require_emacs_state(kern)!
+            let buf = w.active_buffer()
+            buf.ensure_writable()!
+            let yank_info? = w.kill_ring.last_yank_span else {
+                emit_status(w, "Previous command was not a yank")#
+                return ()
+            }
+            let (yank_buf_id, prev_span) = yank_info
+            if yank_buf_id != buf.id {
+                w.kill_ring.last_yank_span = null
+                emit_status(w, "Previous command was not a yank in this buffer")#
+                return ()
+            }
+            let rv? = w.kill_ring.rotate_yank_pop() else {
+                emit_status(w, "Kill ring is empty")#
+                return ()
+            }
+            let (del_pos, _) = buf.delete_span(prev_span)!
+            let end_pos = buf.insert_text(del_pos, rv.text)!
+            buf.checkpoint(end_pos, "yank-pop")
+            buf.set_mark(del_pos, activate = false)
+            buf.preferred_col = end_pos.col
+            w.kill_ring.clear_kill_streak()
+            w.kill_ring.last_yank_span = (buf.id, Span.normalized(del_pos, end_pos))
+            st.last_command = "yank-pop"
+            ensure_cursor_visible(w, buf.point.row)
+            ()
+        },
+    )
+
+    -- Keyboard Macros (`C-x (`, `C-x )`, `C-x e`)
+    kernel.register_command(
+        "kmacro-start-macro",
+        ext_id,
+        "Start recording an Emacs keyboard macro (`C-x (`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            if kern.macros.is_recording() {
+                emit_status(w, "Already defining keyboard macro")#
+                return ()
+            }
+            kern.macros.start("emacs")
+            emit_status(w, "Defining kbd macro...")#
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "kmacro-end-macro",
+        ext_id,
+        "Finish recording the current Emacs keyboard macro (`C-x )`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            if not kern.macros.is_recording() {
+                emit_status(w, "Not defining kbd macro")#
+                return ()
+            }
+            let _ = kern.macros.stop()
+            emit_status(w, "Keyboard macro defined")#
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "kmacro-end-and-call-macro",
+        ext_id,
+        "Finish recording macro (if active) and replay last Emacs keyboard macro (`C-x e`).",
+        |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let st = require_emacs_state(kern)!
+            let reps = st.consume_count(args)
+            if kern.macros.is_recording() {
+                let _ = kern.macros.stop()
+            }
+            let seq? = kern.macros.get_macro("emacs") else {
+                emit_status(w, "No kbd macro has been defined")#
+                return ()
+            }
+            let safe_reps = if reps < 1 { 1 } else { reps }
+            st.replaying_macro = true
+            for _ in 0..safe_reps {
+                for i in 0..seq.len() {
+                    let s = seq.get(i.as(usize)).as(KeyStroke)
+                    let _ = emacs_handle_key(kern, s)#!
+                }
+            }
+            st.replaying_macro = false
+            emit_status(w, "Replayed kbd macro")#
+            ()
+        },
+    )
+
+    -- 4.5 Pure-Emacs Modeless Movement & Editing Commands
+    kernel.register_command(
+        "forward-char",
+        ext_id,
+        "Move point right `N` characters (`C-f`).",
+        |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let st = require_emacs_state(kern)!
+            let n = st.consume_count(args)
+            let buf = w.active_buffer()
+            let steps = if n >= 0 { n } else { -n }
+            for _ in 0..steps {
+                buf.point = if n >= 0 {
+                    step_forward_char(buf, buf.point)
+                } else {
+                    step_backward_char(buf, buf.point)
+                }
+            }
+            buf.preferred_col = buf.point.col
+            ensure_cursor_visible(w, buf.point.row)
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "backward-char",
+        ext_id,
+        "Move point left `N` characters (`C-b`).",
+        |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let st = require_emacs_state(kern)!
+            let n = st.consume_count(args)
+            let buf = w.active_buffer()
+            let steps = if n >= 0 { n } else { -n }
+            for _ in 0..steps {
+                buf.point = if n >= 0 {
+                    step_backward_char(buf, buf.point)
+                } else {
+                    step_forward_char(buf, buf.point)
+                }
+            }
+            buf.preferred_col = buf.point.col
+            ensure_cursor_visible(w, buf.point.row)
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "next-line",
+        ext_id,
+        "Move point vertically down `N` lines preserving target column (`C-n`).",
+        |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let st = require_emacs_state(kern)!
+            let n = st.consume_count(args)
+            let buf = w.active_buffer()
+            var r = buf.point.row + n
+            if r < buf.min_row() {
+                r = buf.min_row()
+            } else if r > buf.max_row() {
+                r = buf.max_row()
+            }
+            buf.point = buf.clamp_pos(Pos.new(r, buf.preferred_col), insert_mode = true)
+            ensure_cursor_visible(w, buf.point.row)
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "previous-line",
+        ext_id,
+        "Move point vertically up `N` lines preserving target column (`C-p`).",
+        |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let st = require_emacs_state(kern)!
+            let n = st.consume_count(args)
+            let buf = w.active_buffer()
+            var r = buf.point.row - n
+            if r < buf.min_row() {
+                r = buf.min_row()
+            } else if r > buf.max_row() {
+                r = buf.max_row()
+            }
+            buf.point = buf.clamp_pos(Pos.new(r, buf.preferred_col), insert_mode = true)
+            ensure_cursor_visible(w, buf.point.row)
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "move-beginning-of-line",
+        ext_id,
+        "Move point to beginning of current line (`C-a`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let buf = w.active_buffer()
+            buf.point = Pos.new(buf.point.row, 0)
+            buf.preferred_col = 0
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "move-end-of-line",
+        ext_id,
+        "Move point to end of current line (`C-e`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let buf = w.active_buffer()
+            let end_c = buf.line_char_len(buf.point.row)
+            buf.point = Pos.new(buf.point.row, end_c)
+            buf.preferred_col = end_c
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "forward-word",
+        ext_id,
+        "Move point forward `N` words (`M-f`).",
+        |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let st = require_emacs_state(kern)!
+            let n = st.consume_count(args)
+            let buf = w.active_buffer()
+            let steps = if n >= 0 { n } else { -n }
+            for _ in 0..steps {
+                buf.point = if n >= 0 {
+                    forward_word_once(buf, buf.point)
+                } else {
+                    backward_word_once(buf, buf.point)
+                }
+            }
+            buf.preferred_col = buf.point.col
+            ensure_cursor_visible(w, buf.point.row)
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "backward-word",
+        ext_id,
+        "Move point backward `N` words (`M-b`).",
+        |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let st = require_emacs_state(kern)!
+            let n = st.consume_count(args)
+            let buf = w.active_buffer()
+            let steps = if n >= 0 { n } else { -n }
+            for _ in 0..steps {
+                buf.point = if n >= 0 {
+                    backward_word_once(buf, buf.point)
+                } else {
+                    forward_word_once(buf, buf.point)
+                }
+            }
+            buf.preferred_col = buf.point.col
+            ensure_cursor_visible(w, buf.point.row)
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "beginning-of-buffer",
+        ext_id,
+        "Push mark and move point to beginning of accessible buffer (`M-<`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let buf = w.active_buffer()
+            buf.set_mark(buf.point, activate = false)
+            buf.point = Pos.new(buf.min_row(), 0)
+            buf.preferred_col = 0
+            ensure_cursor_visible(w, buf.point.row)
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "end-of-buffer",
+        ext_id,
+        "Push mark and move point to end of accessible buffer (`M->`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let buf = w.active_buffer()
+            buf.set_mark(buf.point, activate = false)
+            let hi = buf.max_row()
+            let end_c = buf.line_char_len(hi)
+            buf.point = Pos.new(hi, end_c)
+            buf.preferred_col = end_c
+            ensure_cursor_visible(w, buf.point.row)
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "delete-char",
+        ext_id,
+        "Delete `N` characters forward at point (`C-d`).",
+        |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let st = require_emacs_state(kern)!
+            let n = st.consume_count(args)
+            let buf = w.active_buffer()
+            buf.ensure_writable()!
+            buf.checkpoint(buf.point, "delete-char-pre")
+            let count = if n < 1 { 1 } else { n }
+            for _ in 0..count {
+                let _ = buf.delete_char_at(buf.point)!
+            }
+            buf.checkpoint(buf.point, "delete-char")
+            buf.preferred_col = buf.point.col
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "delete-backward-char",
+        ext_id,
+        "Delete `N` characters backward before point (`BackSpace`).",
+        |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let st = require_emacs_state(kern)!
+            let n = st.consume_count(args)
+            let buf = w.active_buffer()
+            buf.ensure_writable()!
+            buf.checkpoint(buf.point, "delete-backward-pre")
+            let count = if n < 1 { 1 } else { n }
+            for _ in 0..count {
+                let _ = buf.delete_backward(buf.point)!
+            }
+            buf.checkpoint(buf.point, "delete-backward-char")
+            buf.preferred_col = buf.point.col
+            ensure_cursor_visible(w, buf.point.row)
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "newline",
+        ext_id,
+        "Insert newline at point (`RET` / `C-j`).",
+        |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let st = require_emacs_state(kern)!
+            let n = st.consume_count(args)
+            let buf = w.active_buffer()
+            if buf.read_only and buf.name == "*Buffers*" {
+                -- In `*Buffers*`, pressing Return opens the buffer on the current row!
+                let line = buf.line_at(buf.point.row)
+                if buf.point.row >= 2 and line.char_len() > 4 {
+                    let rest = line.drop(4).trim_start()
+                    let parts = rest.split(" ")
+                    if not parts.is_empty() {
+                        let bname = parts.get(0).as(String)
+                        let b_opt = w.find_buffer_by_name(bname)
+                        if b_opt != null {
+                            let target = b_opt.as(Buffer)
+                            let _ = w.switch_to_buffer(target.id)
+                            kern.emit_hook("buffer-switched", target.id)
+                            emit_status(w, "Switched to buffer " ++ target.name)#
+                            return ()
+                        }
+                    }
+                }
+            }
+            buf.ensure_writable()!
+            buf.checkpoint(buf.point, "newline-pre")
+            let count = if n < 1 { 1 } else { n }
+            let _ = buf.insert_text(buf.point, "\n".repeat(count))!
+            buf.checkpoint(buf.point, "newline")
+            buf.preferred_col = buf.point.col
+            ensure_cursor_visible(w, buf.point.row)
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "kill-word",
+        ext_id,
+        "Kill characters forward to the end of the next `N` words (`M-d`).",
+        |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let st = require_emacs_state(kern)!
+            let n = st.consume_count(args)
+            let buf = w.active_buffer()
+            buf.ensure_writable()!
+            let append_flag = w.kill_ring.last_was_kill
+            w.kill_ring.last_yank_span = null
+            let start_p = buf.clamp_pos(buf.point, insert_mode = true)
+            var end_p = start_p
+            let count = if n < 1 { 1 } else { n }
+            for _ in 0..count {
+                end_p = forward_word_once(buf, end_p)
+            }
+            buf.checkpoint(start_p, "kill-word-pre")
+            let (_, removed) = buf.delete_span(Span.normalized(start_p, end_p))!
+            if removed != "" {
+                w.registers.delete_store(
+                    RegisterValue.chars(removed),
+                    w.kill_ring,
+                    append_kill = append_flag,
+                )#
+                buf.checkpoint(buf.point, "kill-word")
+            }
+            buf.preferred_col = buf.point.col
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "backward-kill-word",
+        ext_id,
+        "Kill characters backward to the beginning of the previous `N` words (`M-BackSpace`).",
+        |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let st = require_emacs_state(kern)!
+            let n = st.consume_count(args)
+            let buf = w.active_buffer()
+            buf.ensure_writable()!
+            let append_flag = w.kill_ring.last_was_kill
+            w.kill_ring.last_yank_span = null
+            let end_p = buf.clamp_pos(buf.point, insert_mode = true)
+            var start_p = end_p
+            let count = if n < 1 { 1 } else { n }
+            for _ in 0..count {
+                start_p = backward_word_once(buf, start_p)
+            }
+            buf.checkpoint(end_p, "backward-kill-word-pre")
+            let (_, removed) = buf.delete_span(Span.normalized(start_p, end_p))!
+            if removed != "" {
+                w.registers.delete_store(
+                    RegisterValue.chars(removed),
+                    w.kill_ring,
+                    append_kill = append_flag,
+                )#
+                buf.checkpoint(buf.point, "backward-kill-word")
+            }
+            buf.preferred_col = buf.point.col
+            ()
+        },
+    )
+
+    -- 4.6 Isearch & Continuation-Driven `query-replace` (`C-s`, `C-r`, `M-%`)
+    kernel.register_command(
+        "isearch-forward",
+        ext_id,
+        "Incremental forward search with live match preview (`C-s`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let buf = w.active_buffer()
+            let orig_pos = buf.point
+            let orig_search = w.last_search
+            let orig_hl = w.search_highlight_active
+            let ans? = ask_prompt(PromptRequest {
+                label: "I-search: ",
+                initial: "",
+                kind: PromptKind.SearchForward,
+                candidates: List(),
+            })# else {
+                buf.point = buf.clamp_pos(orig_pos, insert_mode = true)
+                w.last_search = orig_search
+                w.search_highlight_active = orig_hl
+                emit_status(w, "Quit")#
+                return ()
+            }
+            let pat = if ans == "" { orig_search } else { ans }
+            if pat == "" {
+                return ()
+            }
+            w.last_search = pat
+            w.last_search_forward = true
+            w.search_highlight_active = w.options.hlsearch
+            let ic = w.effective_ignore_case(pat)
+            let hit_opt = find_next_from_inclusive(buf, pat, orig_pos, ic)
+            let resolved_opt = if hit_opt != null {
+                hit_opt
+            } else {
+                buf.find_forward(pat, orig_pos, ic, true)
+            }
+            if resolved_opt != null {
+                let hit = resolved_opt.as(Pos)
+                w.jumps.record(buf.id, buf.file_path, orig_pos)
+                buf.set_mark(orig_pos, activate = false)
+                buf.point = buf.clamp_pos(hit, insert_mode = true)
+                buf.preferred_col = buf.point.col
+                ensure_cursor_visible(w, buf.point.row)
+                emit_status(w, "I-search: " ++ pat)#
+            } else {
+                buf.point = buf.clamp_pos(orig_pos, insert_mode = true)
+                emit_status(w, "Failing I-search: " ++ pat)#
+            }
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "isearch-backward",
+        ext_id,
+        "Incremental backward search with live match preview (`C-r`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let buf = w.active_buffer()
+            let orig_pos = buf.point
+            let orig_search = w.last_search
+            let orig_hl = w.search_highlight_active
+            let ans? = ask_prompt(PromptRequest {
+                label: "I-search backward: ",
+                initial: "",
+                kind: PromptKind.SearchBackward,
+                candidates: List(),
+            })# else {
+                buf.point = buf.clamp_pos(orig_pos, insert_mode = true)
+                w.last_search = orig_search
+                w.search_highlight_active = orig_hl
+                emit_status(w, "Quit")#
+                return ()
+            }
+            let pat = if ans == "" { orig_search } else { ans }
+            if pat == "" {
+                return ()
+            }
+            w.last_search = pat
+            w.last_search_forward = false
+            w.search_highlight_active = w.options.hlsearch
+            let ic = w.effective_ignore_case(pat)
+            let hit_opt = find_prev_from_inclusive(buf, pat, orig_pos, ic)
+            let resolved_opt = if hit_opt != null {
+                hit_opt
+            } else {
+                buf.find_backward(pat, orig_pos, ic, true)
+            }
+            if resolved_opt != null {
+                let hit = resolved_opt.as(Pos)
+                w.jumps.record(buf.id, buf.file_path, orig_pos)
+                buf.set_mark(orig_pos, activate = false)
+                buf.point = buf.clamp_pos(hit, insert_mode = true)
+                buf.preferred_col = buf.point.col
+                ensure_cursor_visible(w, buf.point.row)
+                emit_status(w, "I-search backward: " ++ pat)#
+            } else {
+                buf.point = buf.clamp_pos(orig_pos, insert_mode = true)
+                emit_status(w, "Failing I-search backward: " ++ pat)#
+            }
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "query-replace",
+        ext_id,
+        "Multi-turn continuation-driven interactive search and replace (`M-%`: `y`/`n`/`!`/`q`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let buf = w.active_buffer()
+            buf.ensure_writable()!
+
+            -- Step 1: prompt for source string
+            let from_text? = ask_prompt(PromptRequest.text("Query replace: ", ""))# else {
+                emit_status(w, "Quit")#
+                return ()
+            }
+            if from_text == "" {
+                emit_status(w, "Query replace requires a non-empty target")#
+                return ()
+            }
+
+            -- Step 2: prompt for replacement string
+            let to_text? = ask_prompt(
+                PromptRequest.text("Query replace " ++ from_text ++ " with: ", "")
+            )# else {
+                emit_status(w, "Quit")#
+                return ()
+            }
+
+            -- Step 3: loop across matches from `buf.point` through `buf.max_row()`, suspending at each match
+            let from_len = from_text.char_len()
+            let ignore_case = w.effective_ignore_case(from_text)
+            var search_cursor = buf.clamp_pos(buf.point, insert_mode = true)
+            var replace_all = false
+            var replaced_count: i64 = 0
+
+            buf.checkpoint(search_cursor, "query-replace-pre")
+            w.last_search = from_text
+            w.search_highlight_active = true
+
+            while true {
+                let hit_pos? = find_next_from_inclusive(buf, from_text, search_cursor, ignore_case) else {
+                    break
+                }
+                buf.point = hit_pos
+                buf.preferred_col = hit_pos.col
+                ensure_cursor_visible(w, hit_pos.row)
+
+                var decision = "!"
+                if not replace_all {
+                    let ans_opt = ask_prompt(PromptRequest.with_candidates(
+                        "Query replacing " ++ from_text ++ " with " ++ to_text ++ ": (y/n/!/q) ",
+                        "",
+                        PromptKind.Confirm,
+                        ["y", "n", "!", "q"],
+                    ))#
+                    if ans_opt == null {
+                        break
+                    }
+                    decision = ans_opt.as(String)
+                }
+
+                if decision == "q" {
+                    break
+                } else if decision == "n" {
+                    search_cursor = Pos.new(hit_pos.row, hit_pos.col + from_len)
+                } else if decision == "y" or decision == "!" {
+                    if decision == "!" {
+                        replace_all = true
+                    }
+                    let hit_end = Pos.new(hit_pos.row, hit_pos.col + from_len)
+                    let (after_pos, _) = buf.replace_span(Span.normalized(hit_pos, hit_end), to_text)!
+                    replaced_count += 1
+                    search_cursor = after_pos
+                } else {
+                    search_cursor = Pos.new(hit_pos.row, hit_pos.col + from_len)
+                }
+            }
+
+            if replaced_count > 0 {
+                buf.checkpoint(buf.point, "query-replace")
+            }
+            w.search_highlight_active = false
+            let plural = if replaced_count == 1 { "" } else { "s" }
+            emit_status(w, "Replaced " ++ replaced_count.to_string() ++ " occurrence" ++ plural)#
+            ()
+        },
+    )
+
+    -- 4.7 Emacs `C-h` Self-Documenting Help & Live Runtime Introspection
+    let describe_fn_action = |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+        let w = require_editor_world(kern)!
+        let cmd_name = if (not args.is_empty()) and (args.get(0) matches _: String) {
+            args.get(0).as(String)
+        } else {
+            let ans? = ask_prompt(PromptRequest {
+                label: "Describe command: ",
+                initial: "",
+                kind: PromptKind.CommandName,
+                candidates: List(),
+            })# else {
+                emit_status(w, "Quit")#
+                return ()
+            }
+            ans
+        }
+        let clean = cmd_name.trim()
+        if clean == "" {
+            return ()
+        }
+        let spec? = kern.get_command(clean) else {
+            emit_status(w, "Unknown command: " ++ clean)#
+            return ()
+        }
+        let lines = List()
+        let kind_str = if spec.interactive { "an interactive command" } else { "an internal command" }
+        lines.push(spec.name ++ " is " ++ kind_str ++ " defined in extension `" ++ spec.owner.to_string() ++ "`.")
+        lines.push("========================================================================")
+        lines.push("")
+        lines.push("Command:      " ++ spec.name)
+        lines.push("Owner:        " ++ spec.owner.to_string())
+        lines.push("Interactive:  " ++ spec.interactive.to_string())
+        lines.push("")
+        lines.push("Documentation:")
+        lines.push("  " ++ spec.summary)
+        lines.push("")
+        lines.push("Active Keybindings:")
+        let bindings = collect_bindings_for_command(kern, spec.name)
+        if bindings.is_empty() {
+            lines.push("  (unbound — invoke via `M-x " ++ spec.name ++ "`)")
+        } else {
+            for i in 0..bindings.len() {
+                let (kname, entry) = bindings.get(i.as(usize)).as((String, KeyBindingEntry))
+                lines.push("  " ++ pad_right(pretty_chord_string(entry.chord), 20) ++ " in keymap [" ++ kname ++ "]")
+            }
+        }
+        open_help_buffer(kern, w, lines)
+        emit_status(w, "Help: " ++ spec.name)#
+        ()
+    }
+
+    kernel.register_command(
+        "describe-function",
+        ext_id,
+        "Display full documentation, owner extension, and keybindings of a command in `*Help*` (`C-h f`).",
+        describe_fn_action,
+    )
+
+    kernel.register_command(
+        "describe-command",
+        ext_id,
+        "Alias for `describe-function`: inspect a registered command in `*Help*` (`C-h f`).",
+        describe_fn_action,
+    )
+
+    kernel.register_command(
+        "describe-key",
+        ext_id,
+        "Prompt for a key chord and display its bound command and documentation in `*Help*` (`C-h k`).",
+        |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let raw_spec = if (not args.is_empty()) and (args.get(0) matches _: String) {
+                args.get(0).as(String)
+            } else {
+                let ans? = ask_prompt(
+                    PromptRequest.text("Describe key chord (e.g. <C-x> <C-f>, <M-x>): ", "")
+                )# else {
+                    emit_status(w, "Quit")#
+                    return ()
+                }
+                ans
+            }
+            let seq = parse_key_sequence(raw_spec)
+            let canon = if seq.is_empty() { raw_spec.trim() } else { format_chord(seq) }
+            let disp_chord = if seq.is_empty() { raw_spec.trim() } else { pretty_strokes(seq) }
+            if canon == "" {
+                return ()
+            }
+
+            let lines = List()
+            lines.push("Key Documentation for: " ++ disp_chord)
+            lines.push("========================================================================")
+            lines.push("")
+
+            let km_names = kern.keymaps.keys()
+            km_names.sort()
+            var exact_found = false
+            let prefix_entries = List()
+
+            for i in 0..km_names.len() {
+                let kname = km_names.get(i.as(usize)).as(String)
+                let km = kern.keymaps.get(kname).as(Keymap)
+                let exact_opt = km.bindings.get(canon)
+                if exact_opt != null {
+                    exact_found = true
+                    let entry = exact_opt.as(KeyBindingEntry)
+                    lines.push("Keymap [" ++ kname ++ "]: `" ++ disp_chord ++ "` runs command `" ++ entry.command_name ++ "`")
+                    lines.push("  Binding Owner: " ++ entry.owner.to_string())
+                    let spec_opt = kern.get_command(entry.command_name)
+                    if spec_opt != null {
+                        let sp = spec_opt.as(CommandSpec)
+                        lines.push("  Command Owner: " ++ sp.owner.to_string())
+                        lines.push("  Interactive:   " ++ sp.interactive.to_string())
+                        lines.push("  Summary:       " ++ sp.summary)
+                    }
+                    lines.push("")
+                }
+                let pfx = canon ++ " "
+                for k in km.bindings.keys() {
+                    let ks = k.as(String)
+                    if ks.starts_with(pfx) {
+                        let e = km.bindings.get(ks).as(KeyBindingEntry)
+                        prefix_entries.push((kname, e))
+                    }
+                }
+            }
+
+            if not prefix_entries.is_empty() {
+                lines.push("Prefix Sub-Bindings under `" ++ disp_chord ++ "`:")
+                for i in 0..prefix_entries.len() {
+                    let (kname, e) = prefix_entries.get(i.as(usize)).as((String, KeyBindingEntry))
+                    lines.push("  " ++ pad_right(pretty_chord_string(e.chord), 22) ++ " -> " ++ pad_right(e.command_name, 28) ++ " [" ++ kname ++ "]")
+                }
+            } else if not exact_found {
+                lines.push("`" ++ disp_chord ++ "` is undefined in all registered keymaps.")
+            }
+
+            open_help_buffer(kern, w, lines)
+            emit_status(w, "Help for key " ++ disp_chord)#
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "describe-bindings",
+        ext_id,
+        "List all active keymaps and their sorted key -> command bindings in `*Help*` (`C-h b`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let km_names = kern.keymaps.keys()
+            km_names.sort()
+
+            let lines = List()
+            lines.push("Lava Keymap Bindings (" ++ km_names.len().to_string() ++ " keymaps)")
+            lines.push("========================================================================")
+
+            var total_bindings: i64 = 0
+            for i in 0..km_names.len() {
+                let kname = km_names.get(i.as(usize)).as(String)
+                let km = kern.keymaps.get(kname).as(Keymap)
+                let parent_info = if km.parent != null {
+                    " (inherits from: " ++ km.parent.as(Keymap).name ++ ")"
+                } else {
+                    ""
+                }
+                lines.push("")
+                lines.push("Keymap: " ++ kname ++ parent_info)
+                lines.push("  " ++ pad_right("Key Chord", 22) ++ pad_right("Command", 32) ++ "Owner")
+                lines.push("  " ++ "-".repeat(20) ++ "  " ++ "-".repeat(30) ++ "  " ++ "-".repeat(24))
+
+                let chords = km.bindings.keys()
+                chords.sort()
+                for j in 0..chords.len() {
+                    let ch = chords.get(j.as(usize)).as(String)
+                    let entry = km.bindings.get(ch).as(KeyBindingEntry)
+                    total_bindings += 1
+                    lines.push(
+                        "  " ++
+                        pad_right(pretty_chord_string(entry.chord), 22) ++
+                        pad_right(entry.command_name, 32) ++
+                        entry.owner.to_string()
+                    )
+                }
+            }
+            lines.insert(2, "Total Direct Bindings: " ++ total_bindings.to_string())
+            open_help_buffer(kern, w, lines)
+            emit_status(w, "Showing " ++ total_bindings.to_string() ++ " bindings in *Help*")#
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "view-echo-area-messages",
+        ext_id,
+        "Switch to the `*Messages*` log buffer (`C-h e`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let _ = w.switch_to_buffer(w.messages_id)
+            let mb = w.active_buffer()
+            ensure_cursor_visible(w, mb.point.row)
+            kern.emit_hook("buffer-switched", w.messages_id)
+            emit_status(w, "Switched to *Messages*")#
+            ()
+        },
+    )
+
+    kernel.register_command(
+        "describe-extensions",
+        ext_id,
+        "Inspect live `SystemKernel` extensions, published services, commands, and hooks in `*Help*` (`C-h p`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let all_cmds = collect_kernel_commands(kern, false)
+            let interactive_cmds = collect_kernel_commands(kern, true)
+            let svc_names = kern.services.keys()
+            svc_names.sort()
+            let hook_topics = kern.hooks.keys()
+            hook_topics.sort()
+
+            let lines = List()
+            lines.push("Lava SystemKernel Live Runtime Introspection")
+            lines.push("========================================================================")
+            lines.push(
+                "Extensions: " ++ kern.ext_order.len().to_string() ++
+                " | Services: " ++ svc_names.len().to_string() ++
+                " | Commands: " ++ all_cmds.len().to_string() ++
+                " (" ++ interactive_cmds.len().to_string() ++ " interactive)" ++
+                " | Hook Topics: " ++ hook_topics.len().to_string()
+            )
+            lines.push("")
+            lines.push("1. Registered Extensions (Topological Order):")
+            lines.push("------------------------------------------------------------------------")
+
+            for i in 0..kern.ext_order.len() {
+                let eid = kern.ext_order.get(i.as(usize)).as(ExtId)
+                let rec = kern.extensions.get(eid).as(ExtensionRecord)
+                let dep_strs = List()
+                for d in 0..rec.dependencies.len() {
+                    dep_strs.push(rec.dependencies.get(d.as(usize)).as(ExtId).to_string())
+                }
+                let deps_txt = if dep_strs.is_empty() { "(none)" } else { dep_strs.join(", ") }
+                var owned_cmd_count: i64 = 0
+                for c in 0..all_cmds.len() {
+                    if all_cmds.get(c.as(usize)).as(CommandSpec).owner == eid {
+                        owned_cmd_count += 1
+                    }
+                }
+                lines.push(
+                    "  * " ++ rec.id.to_string() ++ " v" ++ rec.version ++
+                    " [" ++ rec.state.to_string() ++ "] (" ++ owned_cmd_count.to_string() ++ " cmds)"
+                )
+                lines.push("    Deps: " ++ deps_txt)
+                lines.push("    Desc: " ++ rec.description)
+            }
+
+            lines.push("")
+            lines.push("2. Published Services:")
+            lines.push("------------------------------------------------------------------------")
+            for i in 0..svc_names.len() {
+                let sname = svc_names.get(i.as(usize)).as(String)
+                let sentry = kern.services.get(sname).as(ServiceEntry)
+                lines.push("  " ++ pad_right(sentry.name, 34) ++ " <- " ++ sentry.owner.to_string())
+            }
+
+            lines.push("")
+            lines.push("3. Hook Topics & Active Listeners:")
+            lines.push("------------------------------------------------------------------------")
+            if hook_topics.is_empty() {
+                lines.push("  (none)")
+            } else {
+                for i in 0..hook_topics.len() {
+                    let topic = hook_topics.get(i.as(usize)).as(String)
+                    let listeners = kern.hooks.get(topic).as(List)
+                    let owners = List()
+                    for j in 0..listeners.len() {
+                        owners.push(listeners.get(j.as(usize)).as(HookListener).owner.to_string())
+                    }
+                    lines.push(
+                        "  " ++ pad_right(topic, 26) ++
+                        " (" ++ listeners.len().to_string() ++ "): " ++ owners.join(", ")
+                    )
+                }
+            }
+
+            open_help_buffer(kern, w, lines)
+            emit_status(w, "Inspected " ++ kern.ext_order.len().to_string() ++ " extensions in *Help*")#
+            ()
+        },
+    )
+}
+
+-- ============================================================================
+-- 5. Keymap Construction (`emacs-global` -> `emacs-insert` -> `emacs-modeless`)
+-- ============================================================================
+
+private fn bind_direct_stroke(
+    km: Keymap,
+    stroke: KeyStroke,
+    command_name: String,
+    owner: ExtId,
+    desc: String,
+) {
+    let canon = stroke.notation()
+    km.bindings.insert(
+        canon,
+        KeyBindingEntry {
+            chord: canon,
+            command_name: command_name,
+            owner: owner,
+            description: desc,
+        },
+    )
+}
+
+private fn setup_emacs_keymaps(kernel: SystemKernel, ext_id: ExtId) {
+    let global_km = kernel.ensure_keymap(KEYMAP_EMACS_GLOBAL)
+
+    -- Universal M-x, C-g, C-u, C-z, Mark, Search, Query-Replace
+    global_km.bind("<M-x>", "execute-extended-command", ext_id, description = "Execute extended command")
+    global_km.bind("<C-g>", "keyboard-quit", ext_id, description = "Keyboard quit")
+    global_km.bind("<C-u>", "universal-argument", ext_id, description = "Universal prefix argument")
+    global_km.bind("<C-z>", "toggle-evil-mode", ext_id, description = "Toggle Evil/Emacs mode")
+    global_km.bind("<C-Space>", "set-mark-command", ext_id, description = "Set mark")
+    global_km.bind("<C-@>", "set-mark-command", ext_id, description = "Set mark")
+    global_km.bind("<M-w>", "kill-ring-save", ext_id, description = "Copy region to kill ring")
+    global_km.bind("<C-s>", "isearch-forward", ext_id, description = "Incremental search forward")
+    global_km.bind("<M-%>", "query-replace", ext_id, description = "Interactive query replace")
+    global_km.bind("<M-S-%>", "query-replace", ext_id, description = "Interactive query replace")
+
+    -- `C-x` File, Buffer, Narrowing, Macro & Window Prefix Suite
+    global_km.bind("<C-x> <C-f>", "find-file", ext_id, description = "Find file or directory")
+    global_km.bind("<C-x> <C-s>", "save-buffer", ext_id, description = "Save active buffer")
+    global_km.bind("<C-x> <C-w>", "write-file", ext_id, description = "Write buffer to path")
+    global_km.bind("<C-x> s", "save-some-buffers", ext_id, description = "Save modified buffers")
+    global_km.bind("<C-x> b", "switch-to-buffer", ext_id, description = "Switch to buffer")
+    global_km.bind("<C-x> k", "kill-buffer", ext_id, description = "Kill buffer")
+    global_km.bind("<C-x> <C-b>", "list-buffers", ext_id, description = "List open buffers")
+    global_km.bind("<C-x> <C-c>", "save-buffers-kill-terminal", ext_id, description = "Save & quit Lava")
+    global_km.bind("<C-x> <C-x>", "exchange-point-and-mark", ext_id, description = "Exchange point and mark")
+    global_km.bind("<C-x> h", "mark-whole-buffer", ext_id, description = "Mark whole buffer")
+    global_km.bind("<C-x> n n", "narrow-to-region", ext_id, description = "Narrow to region")
+    global_km.bind("<C-x> n w", "widen", ext_id, description = "Widen buffer")
+    global_km.bind("<C-x> (", "kmacro-start-macro", ext_id, description = "Start keyboard macro")
+    global_km.bind("<C-x> )", "kmacro-end-macro", ext_id, description = "End keyboard macro")
+    global_km.bind("<C-x> e", "kmacro-end-and-call-macro", ext_id, description = "Call keyboard macro")
+    global_km.bind("<C-x> 2", "split-window-below", ext_id, description = "Split window below")
+    global_km.bind("<C-x> 3", "split-window-right", ext_id, description = "Split window right")
+    global_km.bind("<C-x> 1", "delete-other-windows", ext_id, description = "Delete other windows")
+    global_km.bind("<C-x> 0", "delete-window", ext_id, description = "Delete current window")
+    global_km.bind("<C-x> o", "other-window", ext_id, description = "Select other window")
+    global_km.bind("<C-x> d", "dired", ext_id, description = "Open Dired directory browser")
+
+    -- `C-c` Project/Tool Prefix Bindings
+    global_km.bind("<C-c> g", "grep", ext_id, description = "Run async grep")
+    global_km.bind("<C-c> c", "compile", ext_id, description = "Run async compile")
+
+    -- `C-h` Self-Documenting Help Suite
+    global_km.bind("<C-h> f", "describe-function", ext_id, description = "Describe command")
+    global_km.bind("<C-h> k", "describe-key", ext_id, description = "Describe key binding")
+    global_km.bind("<C-h> b", "describe-bindings", ext_id, description = "List all key bindings")
+    global_km.bind("<C-h> e", "view-echo-area-messages", ext_id, description = "View *Messages*")
+    global_km.bind("<C-h> p", "describe-extensions", ext_id, description = "Inspect extensions & services")
+
+    -- Insert + Emacs shared editing keys
+    let insert_km = kernel.ensure_keymap(KEYMAP_EMACS_INSERT, parent = global_km)
+    insert_km.bind("<C-a>", "move-beginning-of-line", ext_id, description = "Beginning of line")
+    insert_km.bind("<C-e>", "move-end-of-line", ext_id, description = "End of line")
+    insert_km.bind("<C-k>", "kill-line", ext_id, description = "Kill to end of line")
+    insert_km.bind("<C-w>", "kill-region", ext_id, description = "Kill active region")
+    insert_km.bind("<C-y>", "yank", ext_id, description = "Yank from kill ring")
+    insert_km.bind("<M-y>", "yank-pop", ext_id, description = "Cycle previous kills")
+    insert_km.bind("<M-f>", "forward-word", ext_id, description = "Forward word")
+    insert_km.bind("<M-b>", "backward-word", ext_id, description = "Backward word")
+    insert_km.bind("<M-d>", "kill-word", ext_id, description = "Kill word forward")
+    insert_km.bind("<M-BackSpace>", "backward-kill-word", ext_id, description = "Kill word backward")
+
+    -- Pure-Emacs modeless movement & editing keys
+    let modeless_km = kernel.ensure_keymap(KEYMAP_EMACS_MODELESS, parent = insert_km)
+    modeless_km.bind("<C-f>", "forward-char", ext_id, description = "Forward char")
+    modeless_km.bind("<Right>", "forward-char", ext_id, description = "Forward char")
+    modeless_km.bind("<C-b>", "backward-char", ext_id, description = "Backward char")
+    modeless_km.bind("<Left>", "backward-char", ext_id, description = "Backward char")
+    modeless_km.bind("<C-n>", "next-line", ext_id, description = "Next line")
+    modeless_km.bind("<Down>", "next-line", ext_id, description = "Next line")
+    modeless_km.bind("<C-p>", "previous-line", ext_id, description = "Previous line")
+    modeless_km.bind("<Up>", "previous-line", ext_id, description = "Previous line")
+    modeless_km.bind("<Home>", "move-beginning-of-line", ext_id, description = "Beginning of line")
+    modeless_km.bind("<End>", "move-end-of-line", ext_id, description = "End of line")
+    modeless_km.bind("<C-d>", "delete-char", ext_id, description = "Delete char forward")
+    modeless_km.bind("<Delete>", "delete-char", ext_id, description = "Delete char forward")
+    modeless_km.bind("<BackSpace>", "delete-backward-char", ext_id, description = "Delete char backward")
+    modeless_km.bind("<Return>", "newline", ext_id, description = "Insert newline")
+    modeless_km.bind("<C-j>", "newline", ext_id, description = "Insert newline")
+    modeless_km.bind("<C-/>", "undo", ext_id, description = "Undo")
+    modeless_km.bind("<C-_>", "undo", ext_id, description = "Undo")
+    modeless_km.bind("<C-r>", "isearch-backward", ext_id, description = "Incremental search backward")
+    modeless_km.bind("<M-lt>", "beginning-of-buffer", ext_id, description = "Beginning of buffer")
+    modeless_km.bind("<M-gt>", "end-of-buffer", ext_id, description = "End of buffer")
+    bind_direct_stroke(
+        modeless_km,
+        KeyStroke { key: "<", ctrl: false, alt: true, shift_mod: false, super_mod: false, text: "" },
+        "beginning-of-buffer",
+        ext_id,
+        "Beginning of buffer",
+    )
+    bind_direct_stroke(
+        modeless_km,
+        KeyStroke { key: "<", ctrl: false, alt: true, shift_mod: true, super_mod: false, text: "" },
+        "beginning-of-buffer",
+        ext_id,
+        "Beginning of buffer",
+    )
+    bind_direct_stroke(
+        modeless_km,
+        KeyStroke { key: ">", ctrl: false, alt: true, shift_mod: false, super_mod: false, text: "" },
+        "end-of-buffer",
+        ext_id,
+        "End of buffer",
+    )
+    bind_direct_stroke(
+        modeless_km,
+        KeyStroke { key: ">", ctrl: false, alt: true, shift_mod: true, super_mod: false, text: "" },
+        "end-of-buffer",
+        ext_id,
+        "End of buffer",
+    )
+}
+
+-- ============================================================================
+-- 6. Multi-Key Chord & Universal-Argument Dispatcher (`emacs_handle_key`)
+-- ============================================================================
+
+private fn is_ascii_digit_key(s: String) -> bool {
+    s == "0" or s == "1" or s == "2" or s == "3" or s == "4" or
+        s == "5" or s == "6" or s == "7" or s == "8" or s == "9"
+}
+
+private fn active_emacs_keymap(kernel: SystemKernel, world: EditorWorld) -> Keymap {
+    if not world.options.evil_mode {
+        return kernel.ensure_keymap(KEYMAP_EMACS_MODELESS)
+    }
+    if world.mode_name == "INSERT" or world.mode_name == "EMACS" {
+        return kernel.ensure_keymap(KEYMAP_EMACS_INSERT)
+    }
+    kernel.ensure_keymap(KEYMAP_EMACS_GLOBAL)
+}
+
+private fn format_which_key_hints(prefix_canon: String, hints: List) -> List {
+    let pfx = prefix_canon ++ " "
+    let items = List()
+    for i in 0..hints.len() {
+        let entry = hints.get(i.as(usize)).as(KeyBindingEntry)
+        let suffix_raw = if entry.chord.starts_with(pfx) {
+            entry.chord.drop(pfx.char_len())
+        } else {
+            entry.chord
+        }
+        items.push((pretty_chord_string(suffix_raw), entry.command_name))
+    }
+    items.sort_by(|a: Any, b: Any| {
+        let (ka, _) = a.as((String, String))
+        let (kb, _) = b.as((String, String))
+        ka.cmp(kb)
+    })
+    items
+}
+
+private fn trim_macro_tail(kernel: SystemKernel, count: i64) {
+    if not kernel.macros.is_recording() {
+        return
+    }
+    var k: i64 = 0
+    while k < count and (not kernel.macros.buffer_strokes.is_empty()) {
+        let _ = kernel.macros.buffer_strokes.pop()
+        k += 1
+    }
+}
+
+pub fn emacs_handle_key(
+    kernel: SystemKernel,
+    stroke: KeyStroke,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String bool {
+    -- 1. If a continuation prompt is active, route directly into the minibuffer controller
+    if kernel.active_prompt != null {
+        return minibuffer_handle_key(kernel, stroke)#!
+    }
+
+    let world = require_editor_world(kernel)!
+    let state = require_emacs_state(kernel)!
+
+    -- 2. `<C-g>` (`keyboard-quit`) unconditionally cancels chords, universal-arg, mark, and jobs
+    if stroke.ctrl and (not stroke.alt) and stroke.key == "g" {
+        let _ = run_command_with_minibuffer(kernel, "keyboard-quit", List())#!
+        state.last_command = "keyboard-quit"
+        return true
+    }
+
+    -- 3. Universal argument `<C-u>` & digit accumulation before any chord prefix starts
+    if state.pending_strokes.is_empty() {
+        if stroke.ctrl and (not stroke.alt) and stroke.key == "u" {
+            if kernel.macros.is_recording() and (not state.replaying_macro) {
+                kernel.macros.record_stroke(stroke)
+            }
+            let _ = run_command_with_minibuffer(kernel, "universal-argument", List())#!
+            return true
+        }
+        if state.universal_active and (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod) {
+            if stroke.key == "-" and state.universal_digits == "" {
+                if kernel.macros.is_recording() and (not state.replaying_macro) {
+                    kernel.macros.record_stroke(stroke)
+                }
+                state.universal_digits = "-"
+                state.prefix_arg = -1
+                world.pending_keys_display = "C-u -"
+                return true
+            }
+            if is_ascii_digit_key(stroke.key) {
+                if kernel.macros.is_recording() and (not state.replaying_macro) {
+                    kernel.macros.record_stroke(stroke)
+                }
+                state.universal_digits = state.universal_digits ++ stroke.key
+                let parsed_opt = state.universal_digits.parse_i64()
+                if parsed_opt != null {
+                    state.prefix_arg = parsed_opt.as(i64)
+                }
+                world.pending_keys_display = "C-u " ++ state.universal_digits
+                return true
+            }
+        }
+        state.universal_active = false
+    }
+
+    -- 4. Build candidate chord and look up in active Emacs keymap hierarchy
+    let had_pending = not state.pending_strokes.is_empty()
+    let candidate = List()
+    for i in 0..state.pending_strokes.len() {
+        candidate.push(state.pending_strokes.get(i.as(usize)).as(KeyStroke))
+    }
+    candidate.push(stroke)
+
+    let km = active_emacs_keymap(kernel, world)
+    let lookup_res = km.lookup(candidate)
+
+    lookup_res match {
+        KeyLookup.Prefix(hints) => {
+            if kernel.macros.is_recording() and (not state.replaying_macro) {
+                kernel.macros.record_stroke(stroke)
+            }
+            state.pending_strokes = candidate
+            let canon = format_chord(candidate)
+            world.pending_keys_display = pretty_strokes(candidate) ++ "-"
+            world.which_key_items = format_which_key_hints(canon, hints)
+            return true
+        },
+        KeyLookup.Exact(cmd_name, _owner) => {
+            let chord_len = candidate.len()
+            if kernel.macros.is_recording() and (not state.replaying_macro) {
+                kernel.macros.record_stroke(stroke)
+                if cmd_name == "kmacro-end-macro" or cmd_name == "kmacro-end-and-call-macro" {
+                    trim_macro_tail(kernel, chord_len)
+                }
+            }
+            state.clear_pending(world)
+            clear_non_kill_yank_streaks(world, cmd_name)
+
+            let call_args = List()
+            if state.prefix_arg != null {
+                call_args.push(state.prefix_arg.as(i64))
+            }
+
+            if kernel.get_command(cmd_name) == null {
+                state.prefix_arg = null
+                emit_status(world, "Command not available: " ++ cmd_name)#
+                return true
+            }
+
+            let _ = run_command_with_minibuffer(kernel, cmd_name, call_args)#!
+            state.prefix_arg = null
+            state.last_command = cmd_name
+            return true
+        },
+        KeyLookup.Unbound => {
+            if had_pending {
+                if kernel.macros.is_recording() and (not state.replaying_macro) {
+                    kernel.macros.record_stroke(stroke)
+                }
+                let attempted = pretty_strokes(candidate)
+                state.clear_pending(world)
+                state.prefix_arg = null
+                emit_status(world, attempted ++ " is undefined")#
+                return true
+            }
+        },
+    }
+
+    -- 5. Special case: `<C-w>` kills active Emacs mark region even in Evil NORMAL if `mark_active`
+    let buf = world.active_buffer()
+    if world.options.evil_mode and buf.mark_active and stroke.ctrl and (not stroke.alt) and stroke.key == "w" {
+        if kernel.macros.is_recording() and (not state.replaying_macro) {
+            kernel.macros.record_stroke(stroke)
+        }
+        let _ = run_command_with_minibuffer(kernel, "kill-region", List())#!
+        state.prefix_arg = null
+        state.last_command = "kill-region"
+        return true
+    }
+
+    -- 6. Pure-Emacs modeless self-insert when `!world.options.evil_mode`
+    if not world.options.evil_mode {
+        let ch_opt = stroke_printable_text(stroke)
+        if ch_opt != null {
+            let ch = ch_opt.as(String)
+            if kernel.macros.is_recording() and (not state.replaying_macro) {
+                kernel.macros.record_stroke(stroke)
+            }
+            let count = state.consume_count(List())
+            world.pending_keys_display = ""
+            if buf.read_only {
+                if ch == "q" and (buf.name == "*Help*" or buf.name == "*Buffers*" or buf.name == "*undo-tree*") {
+                    let _ = world.cycle_buffer(-1)
+                    kernel.emit_hook("buffer-switched", world.active_buffer_id)
+                    emit_status(world, "Buffer: " ++ world.active_buffer().name)#
+                    return true
+                }
+                emit_status(world, "Buffer is read-only: " ++ buf.name)#
+                return true
+            }
+            let reps = if count < 1 { 1 } else { count }
+            let to_insert = if reps > 1 { ch.repeat(reps) } else { ch }
+            buf.checkpoint(buf.point, "self-insert-pre")
+            let _ = buf.insert_text(buf.point, to_insert)!
+            buf.checkpoint(buf.point, "self-insert")
+            buf.preferred_col = buf.point.col
+            world.kill_ring.clear_kill_streak()
+            world.kill_ring.last_yank_span = null
+            state.last_command = "self-insert-command"
+            ensure_cursor_visible(world, buf.point.row)
+            return true
+        }
+    }
+
+    false
+}
+
+-- ============================================================================
+-- 7. Extension Registration
+-- ============================================================================
+
+pub fn register_emacs_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_emacs_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_emacs",
+        "0.1.0",
+        "Emacs core commands (`M-x`, `C-x`, `C-h`), kill-ring/yank-pop, narrowing, continuation-driven `query-replace`, and runtime help.",
+        [ext_document_id(), ext_minibuffer_id()],
+        |k: SystemKernel| -> !String Unit {
+            let state = EmacsState.new()
+            k.publish_service(SERVICE_EMACS, ext_id, state)
+            register_all_emacs_commands(k, ext_id)
+            setup_emacs_keymaps(k, ext_id)
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service(SERVICE_EDITOR_WORLD)
+            if w_opt != null {
+                let w = w_opt.as(EditorWorld)
+                w.pending_keys_display = ""
+                w.which_key_items = List()
+            }
+            ()
+        },
+    )
+}

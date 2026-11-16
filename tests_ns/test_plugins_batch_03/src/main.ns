@@ -1,0 +1,497 @@
+-- End-to-end integration tests for Batch 03 Plugins (07–09):
+--   07. `lava.org/ext_telescope` (`telescope.nvim` / `fzf-lua`)
+--   08. `lava.org/ext_neotree`   (`neo-tree.nvim` / `nvim-tree`)
+--   09. `lava.org/ext_oil`       (`oil.nvim` — edit filesystem like a Vim buffer)
+
+use std.fs
+use std.path
+use std.process
+use std.time
+use @lava_sys.{RawUiEvent, mock_enable, mock_last_frame_cmds}
+use @lava_core.{SystemKernel, clipboard_get, clipboard_set, log_event, status_emit}
+use @ext_document.{EditorWorld, FloatingWindow, QuickfixEntry, require_editor_world}
+use @ext_window.{WindowManager, require_window_manager}
+use @ext_app.{
+    AppHostCap, app_commit_frame, app_feed_keys, app_step_event, register_default_extensions
+}
+use @ext_telescope.{ext_telescope_id, register_telescope_extension}
+use @ext_neotree.{ext_neotree_id, register_neotree_extension}
+use @ext_oil.{ext_oil_id, register_oil_extension}
+
+fn check_eq_str(actual: String, expected: String, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual='" ++ actual ++ "' expected='" ++ expected ++ "'")
+    }
+}
+
+fn check_eq_i64(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual=" ++ actual.to_string() ++ " expected=" ++ expected.to_string())
+    }
+}
+
+fn check_true(cond: bool, label: String) {
+    if not cond {
+        panic("FAILED: " ++ label)
+    }
+}
+
+fn join_lines(lines: List) -> String {
+    var out = ""
+    for i in 0..lines.len() {
+        if i > 0 {
+            out = out ++ "\n"
+        }
+        out = out ++ lines.get(i.as(usize)).as(String)
+    }
+    out
+}
+
+fn find_line_index_containing(lines: List, needle: String) -> i64 {
+    for i in 0..lines.len() {
+        let ln = lines.get(i.as(usize)).as(String)
+        if ln.contains(needle) {
+            return i
+        }
+    }
+    -1
+}
+
+fn boot_with_batch03() -> SystemKernel {
+    let kernel = SystemKernel.new()
+    register_default_extensions(kernel) ! { e => panic(e) }
+    register_telescope_extension(kernel) ! { e => panic(e) }
+    register_neotree_extension(kernel) ! { e => panic(e) }
+    register_oil_extension(kernel) ! { e => panic(e) }
+    kernel.activate_all() ! { e => panic(e) }
+    kernel
+}
+
+fn setup_workspace(tmp_dir: String) {
+    let src_dir = path.join(tmp_dir, "src")
+    let _ = fs.create_dir_all(src_dir) ! { e => panic(e.to_string()) }
+
+    let _ = fs.write_string(
+        path.join(tmp_dir, ".hidden_env"),
+        "SECRET_TOKEN=batch03\n",
+    ) ! { e => panic(e.to_string()) }
+
+    let _ = fs.write_string(
+        path.join(tmp_dir, "README.md"),
+        "# Batch 03 Sample Workspace\n",
+    ) ! { e => panic(e.to_string()) }
+
+    let _ = fs.write_string(
+        path.join(tmp_dir, "alpha.ns"),
+        "pub struct ServerConfig {{\n    pub port: i64,\n}}\n\npub fn compute_answer() -> i64 {{\n    let magic_needle = 42\n    magic_needle\n}}\n",
+    ) ! { e => panic(e.to_string()) }
+
+    let _ = fs.write_string(
+        path.join(tmp_dir, "obsolete.ns"),
+        "-- file slated for deletion via Oil\nlet old_flag = false\n",
+    ) ! { e => panic(e.to_string()) }
+
+    let _ = fs.write_string(
+        path.join(src_dir, "engine.ns"),
+        "pub fn run_engine() -> String {{\n    let magic_needle = \"running\"\n    magic_needle\n}}\n",
+    ) ! { e => panic(e.to_string()) }
+
+    let _ = fs.write_string(
+        path.join(src_dir, "utils.ns"),
+        "pub fn helper_fn() -> i64 {{\n    7\n}}\n",
+    ) ! { e => panic(e.to_string()) }
+
+    -- Initialize a real Git repo in `tmp_dir` so `@lava_accel.accel_git_status` exercises `[A]` and `[?]` badges!
+    let _ = process.exec("git", args = ["init", "-q"], cwd = tmp_dir) ! { _ => return }
+    let _ = process.exec("git", args = ["add", "README.md"], cwd = tmp_dir) ! { _ => return }
+}
+
+fn test_telescope_plugin(kernel: SystemKernel, world: EditorWorld, tmp_dir: String) {
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
+
+    -- 1. Fuzzy workspace file picker (`<Space> s f`), ranked candidates + live file preview
+    app_feed_keys(kernel, "<Space> s f")# ! { e => panic(e) }
+    let picker_opt = world.get_floating_window("telescope-picker")
+    let preview_opt = world.get_floating_window("telescope-preview")
+    check_true(picker_opt != null, "telescope-picker floating window opened")
+    check_true(preview_opt != null, "telescope-preview floating window opened")
+
+    -- Type fuzzy query `"eng"` -> ranks `src/engine.ns` at top and previews its contents!
+    app_feed_keys(kernel, "eng")# ! { e => panic(e) }
+    let picker_win = world.get_floating_window("telescope-picker").as(FloatingWindow)
+    let preview_win = world.get_floating_window("telescope-preview").as(FloatingWindow)
+    let picker_text = join_lines(picker_win.lines)
+    let preview_text = join_lines(preview_win.lines)
+    check_true(
+        picker_text.contains("src/engine.ns"),
+        "fuzzy ranked candidate includes src/engine.ns: " ++ picker_text,
+    )
+    check_true(
+        preview_text.contains("run_engine"),
+        "live preview shows engine.ns body: " ++ preview_text,
+    )
+
+    -- Verify floating windows render cleanly through `ext_render` / `app_commit_frame`
+    let gen = app_commit_frame(kernel) ! { e => panic(e) }
+    check_true(gen >= 1, "telescope frame committed")
+    check_true(mock_last_frame_cmds().len() > 20, "telescope draw cmds")
+
+    -- Press `<Return>` -> closes both floating windows and opens `src/engine.ns`!
+    app_feed_keys(kernel, "<Return>")# ! { e => panic(e) }
+    check_true(world.get_floating_window("telescope-picker") == null, "picker closed after Return")
+    check_true(world.get_floating_window("telescope-preview") == null, "preview closed after Return")
+    check_eq_str(
+        world.active_buffer().file_path,
+        path.normalize(path.join(tmp_dir, "src/engine.ns")),
+        "telescope Return opened src/engine.ns",
+    )
+
+    -- 2. Live Grep (`:Telescope live_grep`), `<C-n>`/`<C-p>` selection + `<C-q>` -> Quickfix!
+    app_feed_keys(kernel, ":Telescope<Space>live_grep<Return>")# ! { e => panic(e) }
+    check_true(world.get_floating_window("telescope-picker") != null, "live_grep picker opened")
+    app_feed_keys(kernel, "magic_needle")# ! { e => panic(e) }
+    let grep_picker = world.get_floating_window("telescope-picker").as(FloatingWindow)
+    let grep_text = join_lines(grep_picker.lines)
+    check_true(grep_text.contains("alpha.ns"), "live_grep matched alpha.ns: " ++ grep_text)
+    check_true(grep_text.contains("engine.ns"), "live_grep matched engine.ns: " ++ grep_text)
+
+    -- Navigate candidates with `<C-n>` and `<C-p>`, then send all to quickfix with `<C-q>`
+    app_feed_keys(kernel, "<C-n><C-p><C-q>")# ! { e => panic(e) }
+    check_true(world.get_floating_window("telescope-picker") == null, "picker closed after C-q")
+    check_true(world.quickfix.len() >= 2, "world.quickfix populated: len=" ++ world.quickfix.len().to_string())
+    check_eq_str(world.active_buffer().name, "*Quickfix*", "*Quickfix* buffer opened")
+
+    let qf0 = world.quickfix.get(0).as(QuickfixEntry)
+    check_true(qf0.text.contains("magic_needle"), "quickfix entry text=" ++ qf0.text)
+
+    -- Press `<Return>` on row 0 in `*Quickfix*` to jump to exact hit!
+    app_feed_keys(kernel, "<Return>")# ! { e => panic(e) }
+    check_true(
+        world.active_buffer().line_at(world.active_buffer().point.row).contains("magic_needle"),
+        "quickfix <Return> jumped to magic_needle line",
+    )
+
+    -- Also verify direct query argument `:Telescope live_grep helper_fn`
+    app_feed_keys(kernel, ":Telescope<Space>live_grep<Space>helper_fn<Return>")# ! { e => panic(e) }
+    let direct_grep = world.get_floating_window("telescope-picker").as(FloatingWindow)
+    check_true(
+        join_lines(direct_grep.lines).contains("utils.ns"),
+        "direct :Telescope live_grep argument matched utils.ns",
+    )
+    app_feed_keys(kernel, "<Return>")# ! { e => panic(e) }
+    check_eq_str(
+        world.active_buffer().file_path,
+        path.normalize(path.join(tmp_dir, "src/utils.ns")),
+        "direct live_grep Return opened src/utils.ns",
+    )
+
+    -- 3. Document Symbols picker (`<Space> s s`) via `accel_scan_symbols`
+    let alpha_path = path.normalize(path.join(tmp_dir, "alpha.ns"))
+    app_feed_keys(kernel, ":e<Space>" ++ alpha_path ++ "<Return>")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().file_path, alpha_path, "opened alpha.ns")
+
+    app_feed_keys(kernel, "<Space> s s")# ! { e => panic(e) }
+    let sym_picker = world.get_floating_window("telescope-picker").as(FloatingWindow)
+    let sym_text = join_lines(sym_picker.lines)
+    check_true(sym_text.contains("ServerConfig"), "symbols include struct ServerConfig: " ++ sym_text)
+    check_true(sym_text.contains("compute_answer"), "symbols include fn compute_answer: " ++ sym_text)
+
+    app_feed_keys(kernel, "compute<Return>")# ! { e => panic(e) }
+    check_eq_i64(world.active_buffer().point.row, 4, "jumped to compute_answer row 4")
+
+    -- 4. Buffers (`<Space> s b`) & Keymaps (`<Space> s k`) pickers
+    app_feed_keys(kernel, "<Space> s b")# ! { e => panic(e) }
+    app_feed_keys(kernel, "engine<Return>")# ! { e => panic(e) }
+    check_eq_str(
+        world.active_buffer().file_path,
+        path.normalize(path.join(tmp_dir, "src/engine.ns")),
+        "buffer picker switched back to engine.ns",
+    )
+
+    app_feed_keys(kernel, "<Space> s k")# ! { e => panic(e) }
+    app_feed_keys(kernel, "telescope-find-files")# ! { e => panic(e) }
+    let km_picker = world.get_floating_window("telescope-picker").as(FloatingWindow)
+    check_true(
+        join_lines(km_picker.lines).contains("telescope-find-files"),
+        "keymaps picker lists telescope-find-files",
+    )
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+    check_true(world.get_floating_window("telescope-picker") == null, "keymaps picker closed on Escape")
+
+    -- 5. Colorscheme picker (`<Space> s c`): live preview + restore on `<Escape>` + apply on `<Return>`
+    let orig_theme = world.options.theme_name
+    app_feed_keys(kernel, "<Space> s c")# ! { e => panic(e) }
+    app_feed_keys(kernel, "nord")# ! { e => panic(e) }
+    check_eq_str(world.options.theme_name, "nord", "live theme preview applied nord")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+    check_eq_str(world.options.theme_name, orig_theme, "Escape restored original theme")
+
+    app_feed_keys(kernel, ":Telescope<Space>colorscheme<Return>tokyo-night<Return>")# ! { e => panic(e) }
+    check_eq_str(world.options.theme_name, "tokyo-night", "Return persisted tokyo-night theme")
+
+    -- 6. Resume last picker (`<Space> s r`)
+    app_feed_keys(kernel, "<Space> s r")# ! { e => panic(e) }
+    let resumed = world.get_floating_window("telescope-picker").as(FloatingWindow)
+    check_true(
+        join_lines(resumed.lines).contains("tokyo-night"),
+        "telescope resume restored previous query",
+    )
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    let _ = cap
+}
+
+fn test_neotree_plugin(kernel: SystemKernel, world: EditorWorld, tmp_dir: String) {
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
+
+    -- 1. Open `:Neotree` -> verify docked `world.left_sidebar`
+    app_feed_keys(kernel, ":Neotree<Return>")# ! { e => panic(e) }
+    check_true(world.left_sidebar.visible, "Neo-tree left_sidebar visible")
+    check_eq_str(world.left_sidebar.side, "left", "Neo-tree side == left")
+    check_eq_str(world.left_sidebar.title, "EXPLORER", "Neo-tree title == EXPLORER")
+    check_eq_str(world.left_sidebar.owner, "ext_neotree", "Neo-tree owner == ext_neotree")
+
+    let initial_tree = join_lines(world.left_sidebar.lines)
+    check_true(initial_tree.contains("▸ src/"), "collapsed src/ chevron present: " ++ initial_tree)
+    check_true(not initial_tree.contains(".hidden_env"), "dotfiles hidden by default")
+    check_true(initial_tree.contains("[A]"), "Neo-tree displays staged Git badge [A]: " ++ initial_tree)
+    check_true(initial_tree.contains("[?]"), "Neo-tree displays untracked Git badge [?]: " ++ initial_tree)
+
+    -- 2. Select `src/` (row 0) and press `l` to expand subfolder (`▾ src/`)
+    let src_row = find_line_index_containing(world.left_sidebar.lines, "src/")
+    check_true(src_row >= 0, "found src/ row in Neo-tree")
+    world.left_sidebar.selected_row = src_row
+    app_feed_keys(kernel, "l")# ! { e => panic(e) }
+
+    let expanded_tree = join_lines(world.left_sidebar.lines)
+    check_true(expanded_tree.contains("▾ src/"), "expanded src/ chevron: " ++ expanded_tree)
+    check_true(expanded_tree.contains("engine.ns"), "expanded src/ shows engine.ns: " ++ expanded_tree)
+
+    -- 3. Create a new file inside `src/` via `a` prompt (`new_feature.ns<Return>`)
+    app_feed_keys(kernel, "anew_feature.ns<Return>")# ! { e => panic(e) }
+    let created_path = path.join(path.join(tmp_dir, "src"), "new_feature.ns")
+    check_true(fs.exists(created_path), "Neo-tree `a` created src/new_feature.ns on disk")
+    check_true(
+        join_lines(world.left_sidebar.lines).contains("new_feature.ns"),
+        "Neo-tree refreshed with new_feature.ns",
+    )
+
+    -- 4. Rename `new_feature.ns` -> `renamed_feature.ns` via `r` prompt
+    let nf_row = find_line_index_containing(world.left_sidebar.lines, "new_feature.ns")
+    check_true(nf_row >= 0, "new_feature.ns visible in tree")
+    world.left_sidebar.selected_row = nf_row
+    app_feed_keys(kernel, "rrenamed_feature.ns<Return>")# ! { e => panic(e) }
+    let renamed_path = path.join(path.join(tmp_dir, "src"), "renamed_feature.ns")
+    check_true(not fs.exists(created_path), "old new_feature.ns gone after rename")
+    check_true(fs.exists(renamed_path), "new renamed_feature.ns exists on disk")
+
+    -- 5. Toggle hidden dotfiles via `H` (verify `.hidden_env` appears then hides again)
+    app_feed_keys(kernel, "H")# ! { e => panic(e) }
+    check_true(
+        join_lines(world.left_sidebar.lines).contains(".hidden_env"),
+        "Neo-tree `H` revealed .hidden_env",
+    )
+    app_feed_keys(kernel, "H")# ! { e => panic(e) }
+    check_true(
+        not join_lines(world.left_sidebar.lines).contains(".hidden_env"),
+        "Neo-tree second `H` hid .hidden_env",
+    )
+
+    -- 6. Open `renamed_feature.ns` via `<Return>` (returns focus to editor!)
+    let rf_row = find_line_index_containing(world.left_sidebar.lines, "renamed_feature.ns")
+    check_true(rf_row >= 0, "renamed_feature.ns row found")
+    world.left_sidebar.selected_row = rf_row
+    app_feed_keys(kernel, "<Return>")# ! { e => panic(e) }
+    check_eq_str(
+        world.active_buffer().file_path,
+        path.normalize(renamed_path),
+        "Neo-tree <Return> opened renamed_feature.ns and returned focus",
+    )
+
+    -- 7. Delete `renamed_feature.ns` via `:Neotree focus` + `d` + confirm `y`
+    app_feed_keys(kernel, ":Neotree<Space>focus<Return>")# ! { e => panic(e) }
+    let del_row = find_line_index_containing(world.left_sidebar.lines, "renamed_feature.ns")
+    check_true(del_row >= 0, "renamed_feature.ns row for delete")
+    world.left_sidebar.selected_row = del_row
+    app_feed_keys(kernel, "dy")# ! { e => panic(e) }
+    check_true(not fs.exists(renamed_path), "Neo-tree `d` + `y` deleted renamed_feature.ns")
+
+    -- Unfocus with `<Escape>`, then test BOTH `"sidebar-clicked"` hook AND real `RawUiEvent.MouseButton`!
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+    let alpha_row = find_line_index_containing(world.left_sidebar.lines, "alpha.ns")
+    check_true(alpha_row >= 0, "alpha.ns row in sidebar")
+    kernel.emit_hook("sidebar-clicked", ("ext_neotree", alpha_row))
+    check_eq_str(
+        world.active_buffer().file_path,
+        path.normalize(path.join(tmp_dir, "alpha.ns")),
+        "sidebar-clicked opened alpha.ns in active editor window",
+    )
+
+    -- Real mouse click on `README.md` row inside the left sidebar (`px = 40.0, py = ch + row * ch + 4.0`)
+    let wm_local = (require_window_manager(kernel) ! { e => panic(e) }).as(WindowManager)
+    let cell_h = if wm_local.metrics.cell_height > 1.0 { wm_local.metrics.cell_height } else { 19.0 }
+    let readme_row = find_line_index_containing(world.left_sidebar.lines, "README.md")
+    check_true(readme_row >= 0, "README.md row in sidebar")
+    let click_y = cell_h + (readme_row.as(f64)) * cell_h + 4.0
+    let _ = app_step_event(kernel, RawUiEvent.MouseButton(true, 1, 40.0, click_y, 0, 1))# ! { e => panic(e) }
+    check_eq_str(
+        world.active_buffer().file_path,
+        path.normalize(path.join(tmp_dir, "README.md")),
+        "mouse click on docked Neo-tree sidebar opened README.md",
+    )
+
+    -- Close Neo-tree cleanly via `<Space> n t` toggle
+    app_feed_keys(kernel, "<Space> n t")# ! { e => panic(e) }
+    check_true(not world.left_sidebar.visible, "Neo-tree toggled hidden via <Space> n t")
+
+    let _ = cap
+}
+
+fn test_oil_plugin(kernel: SystemKernel, world: EditorWorld, tmp_dir: String) {
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
+
+    -- Ensure active buffer is `alpha.ns` inside `tmp_dir`
+    let alpha_path = path.normalize(path.join(tmp_dir, "alpha.ns"))
+    app_feed_keys(kernel, ":e<Space>" ++ alpha_path ++ "<Return>")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().file_path, alpha_path, "active buffer is alpha.ns")
+
+    -- 1. Press `-` in Normal mode -> opens parent directory as editable `oil` buffer!
+    app_feed_keys(kernel, "-")# ! { e => panic(e) }
+    let oil_buf = world.active_buffer()
+    check_eq_str(oil_buf.major_mode, "oil", "buffer major_mode == oil")
+    let oil_text = join_lines(oil_buf.lines)
+    check_true(oil_text.contains("/001 drwxr-xr-x src/"), "Oil shows /001 drwxr-xr-x src/: " ++ oil_text)
+    check_true(oil_text.contains("alpha.ns"), "Oil lists alpha.ns: " ++ oil_text)
+    check_true(oil_text.contains("obsolete.ns"), "Oil lists obsolete.ns: " ++ oil_text)
+    check_true(oil_text.contains("README.md"), "Oil lists README.md: " ++ oil_text)
+
+    -- Cursor should be focused directly on `alpha.ns` at column 16!
+    check_true(
+        oil_buf.line_at(oil_buf.point.row).contains("alpha.ns"),
+        "Oil cursor focused on alpha.ns row: " ++ oil_buf.line_at(oil_buf.point.row),
+    )
+
+    -- 2. Edit the filesystem buffer using REAL Evil-Vim editing commands:
+    --    a) Rename `alpha.ns` -> `omega.ns` on current line using `02wciwomega<Escape>`
+    --       (`/003` = word 1 (`/` + `003`), `-rw-r--r--`... let's move directly to col 16 via `016lciwomega<Escape>`!)
+    app_feed_keys(kernel, "016lciwomega<Escape>")# ! { e => panic(e) }
+    check_true(
+        oil_buf.line_at(oil_buf.point.row).contains("omega.ns"),
+        "ciw renamed alpha.ns -> omega.ns in buffer: " ++ oil_buf.line_at(oil_buf.point.row),
+    )
+
+    --    b) Find `obsolete.ns` row and delete it with `dd`!
+    let obs_row = find_line_index_containing(oil_buf.lines, "obsolete.ns")
+    check_true(obs_row >= 1, "found obsolete.ns row in oil buffer")
+    let go_obs = (obs_row + 1).to_string() ++ "Gdd"
+    app_feed_keys(kernel, go_obs)# ! { e => panic(e) }
+    check_true(
+        not join_lines(oil_buf.lines).contains("obsolete.ns"),
+        "dd removed obsolete.ns line from oil buffer",
+    )
+
+    --    c) Open new lines at bottom (`Go`) to create nested file `new_mod/helper.ns` and directory `docs/`!
+    app_feed_keys(kernel, "Gonew_mod/helper.ns<Return>docs/<Escape>")# ! { e => panic(e) }
+    check_true(oil_buf.modified, "Oil buffer marked modified before :w")
+
+    -- 3. Execute `:w<Return>` -> triggers `write-buffer-mode:oil`!
+    app_feed_keys(kernel, ":w<Return>")# ! { e => panic(e) }
+
+    -- Verify status summary, clean buffer reload, and real filesystem state on disk!
+    check_true(
+        world.status_message.contains("Oil: created 2, renamed 1, deleted 1"),
+        "Oil status summary: " ++ world.status_message,
+    )
+    check_true(not world.active_buffer().modified, "Oil buffer modified == false after :w")
+
+    let omega_path = path.join(tmp_dir, "omega.ns")
+    let obsolete_path = path.join(tmp_dir, "obsolete.ns")
+    let nested_helper_path = path.join(path.join(tmp_dir, "new_mod"), "helper.ns")
+    let docs_dir_path = path.join(tmp_dir, "docs")
+
+    check_true(not fs.exists(alpha_path), "alpha.ns renamed away on disk")
+    check_true(fs.exists(omega_path), "omega.ns exists on disk after rename")
+    let omega_body = fs.read_to_string(omega_path) ! { e => panic(e.to_string()) }
+    check_true(omega_body.contains("compute_answer"), "omega.ns preserved original file contents")
+
+    check_true(not fs.exists(obsolete_path), "obsolete.ns deleted from disk")
+    check_true(fs.exists(nested_helper_path) and fs.is_file(nested_helper_path), "new_mod/helper.ns created on disk")
+    check_true(fs.exists(docs_dir_path) and fs.is_dir(docs_dir_path), "docs/ directory created on disk")
+
+    -- 4. Test `<Return>` inside Oil buffer to enter `src/` subdirectory, then `-` to ascend back,
+    --    then `<Return>` on `omega.ns` to open the file!
+    let reloaded_oil = world.active_buffer()
+    let src_oil_row = find_line_index_containing(reloaded_oil.lines, "src/")
+    check_true(src_oil_row >= 1, "src/ present in reloaded Oil buffer")
+    app_feed_keys(kernel, (src_oil_row + 1).to_string() ++ "G<Return>")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().major_mode, "oil", "entered src/ in Oil mode")
+    check_true(
+        join_lines(world.active_buffer().lines).contains("engine.ns"),
+        "Oil src/ buffer lists engine.ns",
+    )
+
+    -- Press `-` inside `src/` Oil buffer to ascend back to `tmp_dir`!
+    app_feed_keys(kernel, "-")# ! { e => panic(e) }
+    check_true(
+        join_lines(world.active_buffer().lines).contains("omega.ns"),
+        "Oil `-` ascended back to parent workspace dir",
+    )
+
+    -- Press `<Return>` on `omega.ns` row to open `omega.ns` in editor!
+    let omega_row = find_line_index_containing(world.active_buffer().lines, "omega.ns")
+    check_true(omega_row >= 1, "omega.ns row in parent Oil buffer")
+    app_feed_keys(kernel, (omega_row + 1).to_string() ++ "G<Return>")# ! { e => panic(e) }
+    check_eq_str(
+        world.active_buffer().file_path,
+        path.normalize(omega_path),
+        "Oil <Return> opened omega.ns",
+    )
+
+    -- 5. Also verify `:Oil` command + `yyp` duplicate-ID file copy (`omega.ns` -> `omega_copy.ns`)!
+    app_feed_keys(kernel, ":Oil<Return>")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().major_mode, "oil", ":Oil opened Oil buffer")
+    let om_row2 = find_line_index_containing(world.active_buffer().lines, "omega.ns")
+    check_true(om_row2 >= 1, "omega.ns row for copy")
+    app_feed_keys(kernel, (om_row2 + 1).to_string() ++ "Gyyp016lciwomega_copy<Escape>:w<Return>")# ! { e => panic(e) }
+    let omega_copy_path = path.join(tmp_dir, "omega_copy.ns")
+    check_true(fs.exists(omega_path), "original omega.ns still exists after yyp copy")
+    check_true(fs.exists(omega_copy_path), "omega_copy.ns copied on disk via duplicate /NNN ID")
+    let copy_body = fs.read_to_string(omega_copy_path) ! { e => panic(e.to_string()) }
+    check_true(copy_body.contains("compute_answer"), "omega_copy.ns preserved source file contents")
+
+    let _ = cap
+}
+
+fn main() {
+    mock_enable(true)
+
+    let tmp_dir = "/tmp/lava_batch03_" ++ time.unix_millis().to_string()
+    setup_workspace(tmp_dir)
+
+    let kernel: SystemKernel = boot_with_batch03()
+    check_eq_i64(kernel.list_extensions().len(), 11, "8 default + 3 batch03 extensions active")
+    check_true(kernel.is_extension_active(ext_telescope_id()), "ext_telescope active")
+    check_true(kernel.is_extension_active(ext_neotree_id()), "ext_neotree active")
+    check_true(kernel.is_extension_active(ext_oil_id()), "ext_oil active")
+
+    let world: EditorWorld = (require_editor_world(kernel) ! { e => panic(e) }).as(EditorWorld)
+    let wm: WindowManager = (require_window_manager(kernel) ! { e => panic(e) }).as(WindowManager)
+    world.cwd = path.normalize(tmp_dir)
+
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let boot_cap = AppHostCap.new(world)
+    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+    check_eq_i64(wm.pixel_width, 1280, "viewport width")
+    let _ = boot_cap
+
+    test_telescope_plugin(kernel, world, tmp_dir)
+    println("  [PASS] Plugin 07: ext_telescope")
+
+    test_neotree_plugin(kernel, world, tmp_dir)
+    println("  [PASS] Plugin 08: ext_neotree")
+
+    test_oil_plugin(kernel, world, tmp_dir)
+    println("  [PASS] Plugin 09: ext_oil")
+
+    let _ = fs.remove_dir_all(tmp_dir) ! { _ => () }
+    println("test_plugins_batch_03: ALL PASSED")
+}

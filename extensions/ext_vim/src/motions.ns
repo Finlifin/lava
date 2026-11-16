@@ -1,0 +1,945 @@
+-- motions.ns: Pure and buffer-aware Evil-Vim motion calculations.
+-- Supports counts, word/WORD motions, line/char searches, bracket matching across lines,
+-- paragraph jumps, viewport H/M/L, and exclusive/inclusive/linewise operator shapes.
+
+use @ext_document.{Buffer, EditorWorld, Pos}
+
+pub enum MotionShape {
+    pub Exclusive,
+    pub Inclusive,
+    pub Linewise,
+}
+derive Eq, PartialEq, Display for MotionShape
+
+pub struct MotionTarget {
+    pub pos: Pos,
+    pub shape: MotionShape,
+    pub is_jump: bool,
+    pub valid: bool,
+    pub preserve_pref_col: bool,
+    pub end_of_line_pref: bool,
+}
+
+impl MotionTarget {
+    pub fn invalid() -> MotionTarget {
+        MotionTarget {
+            pos: Pos.zero(),
+            shape: MotionShape.Exclusive,
+            is_jump: false,
+            valid: false,
+            preserve_pref_col: false,
+            end_of_line_pref: false,
+        }
+    }
+
+    pub fn ok(
+        pos: Pos,
+        shape: MotionShape,
+        .is_jump: bool = false,
+        .preserve_pref_col: bool = false,
+        .end_of_line_pref: bool = false,
+    ) -> MotionTarget {
+        MotionTarget {
+            pos: pos,
+            shape: shape,
+            is_jump: is_jump,
+            valid: true,
+            preserve_pref_col: preserve_pref_col,
+            end_of_line_pref: end_of_line_pref,
+        }
+    }
+}
+
+pub fn is_blank_char(ch: String) -> bool {
+    ch == " " or ch == "\t"
+}
+
+pub fn is_word_char(ch: String) -> bool {
+    if ch == "" {
+        return false
+    }
+    ch == "_" or ch.is_alphanumeric()
+}
+
+-- Category: 0 = blank, 1 = word (alnum + '_'), 2 = punctuation/other non-blank.
+-- When `big_word` is true, all non-blank characters have category 1.
+pub fn char_category(ch: String, big_word: bool) -> i64 {
+    if ch == "" or is_blank_char(ch) {
+        return 0
+    }
+    if big_word {
+        return 1
+    }
+    if is_word_char(ch) {
+        1
+    } else {
+        2
+    }
+}
+
+pub fn last_non_blank_col(buf: Buffer, row: i64) -> i64 {
+    let s = buf.line_at(row)
+    var i = s.char_len() - 1
+    while i >= 0 {
+        let ch = s.slice(i, i + 1)
+        if not is_blank_char(ch) {
+            return i
+        }
+        i -= 1
+    }
+    0
+}
+
+pub fn is_blank_line(buf: Buffer, row: i64) -> bool {
+    buf.line_at(row).trim() == ""
+}
+
+pub fn line_indent_cols(line: String, tabstop: i64) -> i64 {
+    let ts = if tabstop > 0 { tabstop } else { 4 }
+    let n = line.char_len()
+    var vcol: i64 = 0
+    for i in 0..n {
+        let ch = line.slice(i, i + 1)
+        if ch == " " {
+            vcol += 1
+        } else if ch == "\t" {
+            vcol += ts - (vcol % ts)
+        } else {
+            break
+        }
+    }
+    vcol
+}
+
+pub fn infer_effective_indent(buf: Buffer, row: i64, tabstop: i64) -> i64 {
+    let ts = if tabstop > 0 { tabstop } else { 4 }
+    if not is_blank_line(buf, row) {
+        return line_indent_cols(buf.line_at(row), ts)
+    }
+    let min_r = buf.min_row()
+    let max_r = buf.max_row()
+    var above_indent: i64 = -1
+    var ur = row - 1
+    while ur >= min_r {
+        if not is_blank_line(buf, ur) {
+            above_indent = line_indent_cols(buf.line_at(ur), ts)
+            break
+        }
+        ur -= 1
+    }
+    var below_indent: i64 = -1
+    var dr = row + 1
+    while dr <= max_r {
+        if not is_blank_line(buf, dr) {
+            below_indent = line_indent_cols(buf.line_at(dr), ts)
+            break
+        }
+        dr += 1
+    }
+    let best = if above_indent >= below_indent { above_indent } else { below_indent }
+    if best > 0 {
+        best
+    } else {
+        0
+    }
+}
+
+-- Forward word (`w` / `W`).
+-- When `for_operator` is true and motion reaches the end of a line/buffer, `col` may equal
+-- `line_char_len(row)` so exclusive spans include the final character cleanly.
+pub fn motion_word_forward(
+    buf: Buffer,
+    from: Pos,
+    count: i64,
+    big_word: bool,
+    for_operator: bool,
+) -> MotionTarget {
+    let steps = if count > 0 { count } else { 1 }
+    let max_r = buf.max_row()
+    var r = from.row
+    var c = from.col
+
+    for step_idx in 0..steps {
+        let line = buf.line_at(r)
+        let llen = line.char_len()
+
+        if llen == 0 {
+            if r >= max_r {
+                return MotionTarget.ok(Pos.new(r, 0), MotionShape.Exclusive)
+            }
+            if for_operator and step_idx == steps - 1 {
+                return MotionTarget.ok(Pos.new(r, 0), MotionShape.Exclusive)
+            }
+            r += 1
+            c = buf.first_non_blank_col(r)
+            continue
+        }
+
+        if c >= llen {
+            if r >= max_r {
+                let end_c = if for_operator { llen } else { llen - 1 }
+                return MotionTarget.ok(Pos.new(r, end_c), MotionShape.Exclusive)
+            }
+            r += 1
+            c = buf.first_non_blank_col(r)
+            continue
+        }
+
+        let start_cat = char_category(line.slice(c, c + 1), big_word)
+        if start_cat != 0 {
+            while c < llen and char_category(line.slice(c, c + 1), big_word) == start_cat {
+                c += 1
+            }
+        }
+        while c < llen and char_category(line.slice(c, c + 1), big_word) == 0 {
+            c += 1
+        }
+
+        if c < llen {
+            continue
+        }
+
+        -- Reached end of row `r`
+        if for_operator {
+            -- In Vim, `dw`/`yw` does not cross newline from mid-line to eat next line's indent
+            if r >= max_r or step_idx == steps - 1 {
+                return MotionTarget.ok(Pos.new(r, llen), MotionShape.Exclusive)
+            }
+        }
+
+        if r >= max_r {
+            let end_c = if for_operator { llen } else if llen > 0 { llen - 1 } else { 0 }
+            return MotionTarget.ok(Pos.new(r, end_c), MotionShape.Exclusive)
+        }
+
+        -- Advance to next line; empty line itself is a word stop in Vim!
+        r += 1
+        while r < max_r and buf.line_char_len(r) > 0 and is_blank_line(buf, r) {
+            r += 1
+        }
+        if buf.line_char_len(r) == 0 {
+            c = 0
+        } else {
+            c = buf.first_non_blank_col(r)
+        }
+    }
+
+    MotionTarget.ok(Pos.new(r, c), MotionShape.Exclusive)
+}
+
+-- Backward word (`b` / `B`).
+pub fn motion_word_backward(buf: Buffer, from: Pos, count: i64, big_word: bool) -> MotionTarget {
+    let steps = if count > 0 { count } else { 1 }
+    let min_r = buf.min_row()
+    var r = from.row
+    var c = from.col
+
+    for _ in 0..steps {
+        -- Step one character left first
+        if c > 0 {
+            c -= 1
+        } else if r > min_r {
+            r -= 1
+            let prev_len = buf.line_char_len(r)
+            if prev_len == 0 {
+                c = 0
+                continue
+            }
+            c = prev_len - 1
+        } else {
+            return MotionTarget.ok(Pos.new(min_r, 0), MotionShape.Exclusive)
+        }
+
+        -- Skip blanks backward across lines, stopping on empty lines
+        var stopped_empty = false
+        while true {
+            let line = buf.line_at(r)
+            let llen = line.char_len()
+            if llen == 0 {
+                c = 0
+                stopped_empty = true
+                break
+            }
+            if c >= llen {
+                c = llen - 1
+            }
+            while c > 0 and is_blank_char(line.slice(c, c + 1)) {
+                c -= 1
+            }
+            if not is_blank_char(line.slice(c, c + 1)) {
+                break
+            }
+            if r <= min_r {
+                c = 0
+                stopped_empty = true
+                break
+            }
+            r -= 1
+            let plen = buf.line_char_len(r)
+            if plen == 0 {
+                c = 0
+                stopped_empty = true
+                break
+            }
+            c = plen - 1
+        }
+
+        if stopped_empty {
+            continue
+        }
+
+        let line = buf.line_at(r)
+        let cat = char_category(line.slice(c, c + 1), big_word)
+        while c > 0 and char_category(line.slice(c - 1, c), big_word) == cat {
+            c -= 1
+        }
+    }
+
+    MotionTarget.ok(Pos.new(r, c), MotionShape.Exclusive)
+}
+
+-- End of word (`e` / `E`) — Inclusive!
+pub fn motion_word_end(buf: Buffer, from: Pos, count: i64, big_word: bool) -> MotionTarget {
+    let steps = if count > 0 { count } else { 1 }
+    let max_r = buf.max_row()
+    var r = from.row
+    var c = from.col
+
+    for _ in 0..steps {
+        let cur_len = buf.line_char_len(r)
+        if c + 1 < cur_len {
+            c += 1
+        } else if r < max_r {
+            r += 1
+            c = 0
+        } else {
+            let end_c = if cur_len > 0 { cur_len - 1 } else { 0 }
+            return MotionTarget.ok(Pos.new(r, end_c), MotionShape.Inclusive)
+        }
+
+        -- Skip blanks across lines
+        var at_end = false
+        while true {
+            let line = buf.line_at(r)
+            let llen = line.char_len()
+            while c < llen and is_blank_char(line.slice(c, c + 1)) {
+                c += 1
+            }
+            if c < llen {
+                break
+            }
+            if r >= max_r {
+                c = if llen > 0 { llen - 1 } else { 0 }
+                at_end = true
+                break
+            }
+            r += 1
+            c = 0
+        }
+
+        if at_end {
+            return MotionTarget.ok(Pos.new(r, c), MotionShape.Inclusive)
+        }
+
+        let line = buf.line_at(r)
+        let llen = line.char_len()
+        let cat = char_category(line.slice(c, c + 1), big_word)
+        while c + 1 < llen and char_category(line.slice(c + 1, c + 2), big_word) == cat {
+            c += 1
+        }
+    }
+
+    MotionTarget.ok(Pos.new(r, c), MotionShape.Inclusive)
+}
+
+-- Backward end of word (`ge`) — Inclusive!
+pub fn motion_word_end_backward(buf: Buffer, from: Pos, count: i64, big_word: bool) -> MotionTarget {
+    let steps = if count > 0 { count } else { 1 }
+    let min_r = buf.min_row()
+    var r = from.row
+    var c = from.col
+
+    for _ in 0..steps {
+        -- If currently inside a non-blank run, step to before its start first
+        let cur_line = buf.line_at(r)
+        let cur_len = cur_line.char_len()
+        if cur_len > 0 and c < cur_len {
+            let cur_cat = char_category(cur_line.slice(c, c + 1), big_word)
+            if cur_cat != 0 {
+                while c > 0 and char_category(cur_line.slice(c - 1, c), big_word) == cur_cat {
+                    c -= 1
+                }
+            }
+        }
+
+        -- Step left one character
+        if c > 0 {
+            c -= 1
+        } else if r > min_r {
+            r -= 1
+            let plen = buf.line_char_len(r)
+            c = if plen > 0 { plen - 1 } else { 0 }
+        } else {
+            return MotionTarget.ok(Pos.new(min_r, 0), MotionShape.Inclusive)
+        }
+
+        -- Skip blanks backward across lines
+        while true {
+            let line = buf.line_at(r)
+            let llen = line.char_len()
+            if llen > 0 {
+                if c >= llen {
+                    c = llen - 1
+                }
+                while c > 0 and is_blank_char(line.slice(c, c + 1)) {
+                    c -= 1
+                }
+                if not is_blank_char(line.slice(c, c + 1)) {
+                    break
+                }
+            }
+            if r <= min_r {
+                return MotionTarget.ok(Pos.new(min_r, 0), MotionShape.Inclusive)
+            }
+            r -= 1
+            let plen = buf.line_char_len(r)
+            c = if plen > 0 { plen - 1 } else { 0 }
+        }
+    }
+
+    MotionTarget.ok(Pos.new(r, c), MotionShape.Inclusive)
+}
+
+-- Single-line character find (`f`, `F`, `t`, `T`).
+pub fn motion_find_char_in_line(
+    buf: Buffer,
+    from: Pos,
+    kind: String,
+    target_ch: String,
+    count: i64,
+    is_repeat: bool,
+) -> MotionTarget {
+    if target_ch == "" {
+        return MotionTarget.invalid()
+    }
+    let steps = if count > 0 { count } else { 1 }
+    let line = buf.line_at(from.row)
+    let llen = line.char_len()
+    if llen == 0 {
+        return MotionTarget.invalid()
+    }
+
+    if kind == "f" or kind == "t" {
+        var idx = from.col + 1
+        if is_repeat and kind == "t" and idx < llen and line.slice(idx, idx + 1) == target_ch {
+            idx += 1
+        }
+        var found_col: i64 = -1
+        var rem = steps
+        while idx < llen {
+            if line.slice(idx, idx + 1) == target_ch {
+                rem -= 1
+                if rem == 0 {
+                    found_col = idx
+                    break
+                }
+            }
+            idx += 1
+        }
+        if found_col < 0 {
+            return MotionTarget.invalid()
+        }
+        let dest_col = if kind == "t" { found_col - 1 } else { found_col }
+        return MotionTarget.ok(Pos.new(from.row, dest_col), MotionShape.Inclusive)
+    }
+
+    if kind == "F" or kind == "T" {
+        var idx = from.col - 1
+        if is_repeat and kind == "T" and idx >= 0 and line.slice(idx, idx + 1) == target_ch {
+            idx -= 1
+        }
+        var found_col: i64 = -1
+        var rem = steps
+        while idx >= 0 {
+            if line.slice(idx, idx + 1) == target_ch {
+                rem -= 1
+                if rem == 0 {
+                    found_col = idx
+                    break
+                }
+            }
+            idx -= 1
+        }
+        if found_col < 0 {
+            return MotionTarget.invalid()
+        }
+        let dest_col = if kind == "T" { found_col + 1 } else { found_col }
+        return MotionTarget.ok(Pos.new(from.row, dest_col), MotionShape.Exclusive)
+    }
+
+    MotionTarget.invalid()
+}
+
+pub fn reverse_char_find_kind(kind: String) -> String {
+    when {
+        kind == "f" => "F",
+        kind == "F" => "f",
+        kind == "t" => "T",
+        kind == "T" => "t",
+        else => kind,
+    }
+}
+
+-- Paragraph motions (`{` backward, `}` forward).
+pub fn motion_paragraph_prev(buf: Buffer, from: Pos, count: i64) -> MotionTarget {
+    let steps = if count > 0 { count } else { 1 }
+    let min_r = buf.min_row()
+    var r = from.row
+    for _ in 0..steps {
+        if r > min_r {
+            r -= 1
+        }
+        while r > min_r and is_blank_line(buf, r) {
+            r -= 1
+        }
+        while r > min_r and not is_blank_line(buf, r) {
+            r -= 1
+        }
+    }
+    MotionTarget.ok(Pos.new(r, 0), MotionShape.Exclusive, is_jump = true)
+}
+
+pub fn motion_paragraph_next(buf: Buffer, from: Pos, count: i64) -> MotionTarget {
+    let steps = if count > 0 { count } else { 1 }
+    let max_r = buf.max_row()
+    var r = from.row
+    for _ in 0..steps {
+        if r < max_r {
+            r += 1
+        }
+        while r < max_r and is_blank_line(buf, r) {
+            r += 1
+        }
+        while r < max_r and not is_blank_line(buf, r) {
+            r += 1
+        }
+    }
+    MotionTarget.ok(Pos.new(r, 0), MotionShape.Exclusive, is_jump = true)
+}
+
+fn bracket_partner(ch: String) -> ?(String, bool) {
+    when {
+        ch == "(" => (")", true),
+        ch == "[" => ("]", true),
+        ch == "{{" => ("}}", true),
+        ch == ")" => ("(", false),
+        ch == "]" => ("[", false),
+        ch == "}}" => ("{{", false),
+        else => null,
+    }
+}
+
+-- Matching bracket jump (`%`) across lines for `()`, `[]`, `{}`.
+pub fn motion_match_bracket(buf: Buffer, from: Pos) -> MotionTarget {
+    let start_line = buf.line_at(from.row)
+    let slen = start_line.char_len()
+    var bcol: i64 = -1
+    var open_ch = ""
+    var partner_ch = ""
+    var go_forward = true
+
+    var c = from.col
+    while c < slen {
+        let ch = start_line.slice(c, c + 1)
+        let info_opt = bracket_partner(ch)
+        if info_opt != null {
+            let (p, fwd) = info_opt.as((String, bool))
+            bcol = c
+            open_ch = ch
+            partner_ch = p
+            go_forward = fwd
+            break
+        }
+        c += 1
+    }
+
+    if bcol < 0 {
+        return MotionTarget.invalid()
+    }
+
+    let min_r = buf.min_row()
+    let max_r = buf.max_row()
+
+    if go_forward {
+        var depth: i64 = 1
+        var r = from.row
+        var col = bcol + 1
+        while r <= max_r {
+            let line = buf.line_at(r)
+            let llen = line.char_len()
+            while col < llen {
+                let ch = line.slice(col, col + 1)
+                if ch == open_ch {
+                    depth += 1
+                } else if ch == partner_ch {
+                    depth -= 1
+                    if depth == 0 {
+                        return MotionTarget.ok(Pos.new(r, col), MotionShape.Inclusive, is_jump = true)
+                    }
+                }
+                col += 1
+            }
+            r += 1
+            col = 0
+        }
+        return MotionTarget.invalid()
+    }
+
+    var depth: i64 = 1
+    var r = from.row
+    var col = bcol - 1
+    while r >= min_r {
+        let line = buf.line_at(r)
+        while col >= 0 {
+            let ch = line.slice(col, col + 1)
+            if ch == open_ch {
+                depth += 1
+            } else if ch == partner_ch {
+                depth -= 1
+                if depth == 0 {
+                    return MotionTarget.ok(Pos.new(r, col), MotionShape.Inclusive, is_jump = true)
+                }
+            }
+            col -= 1
+        }
+        r -= 1
+        if r >= min_r {
+            col = buf.line_char_len(r) - 1
+        }
+    }
+    MotionTarget.invalid()
+}
+
+-- Viewport motions `H`, `M`, `L`.
+pub fn motion_viewport_line(world: EditorWorld, buf: Buffer, which: String, count: i64, has_count: bool) -> MotionTarget {
+    let min_r = buf.min_row()
+    let max_r = buf.max_row()
+    var top = world.viewport_top_row
+    if top < min_r {
+        top = min_r
+    }
+    if top > max_r {
+        top = max_r
+    }
+    let vrows = if world.viewport_rows > 1 { world.viewport_rows } else { 1 }
+    var bot = top + vrows - 1
+    if bot > max_r {
+        bot = max_r
+    }
+
+    var target_r = top
+    if which == "H" {
+        let off = if has_count and count > 1 { count - 1 } else { 0 }
+        target_r = top + off
+        if target_r > bot {
+            target_r = bot
+        }
+    } else if which == "M" {
+        target_r = (top + bot) / 2
+    } else {
+        let off = if has_count and count > 1 { count - 1 } else { 0 }
+        target_r = bot - off
+        if target_r < top {
+            target_r = top
+        }
+    }
+    MotionTarget.ok(
+        Pos.new(target_r, buf.first_non_blank_col(target_r)),
+        MotionShape.Linewise,
+        is_jump = true,
+    )
+}
+
+pub fn word_under_cursor(buf: Buffer, pos: Pos) -> ?String {
+    let line = buf.line_at(pos.row)
+    let llen = line.char_len()
+    if llen == 0 {
+        return null
+    }
+    var c = if pos.col < llen { pos.col } else { llen - 1 }
+    while c < llen and not is_word_char(line.slice(c, c + 1)) {
+        c += 1
+    }
+    if c >= llen {
+        return null
+    }
+    var sc = c
+    while sc > 0 and is_word_char(line.slice(sc - 1, sc)) {
+        sc -= 1
+    }
+    var ec = c + 1
+    while ec < llen and is_word_char(line.slice(ec, ec + 1)) {
+        ec += 1
+    }
+    line.slice(sc, ec)
+}
+
+-- Indent scope boundary motions (`[i` upward, `]i` downward).
+pub fn motion_indent_prev_boundary(
+    buf: Buffer,
+    from: Pos,
+    count: i64,
+    tabstop: i64,
+) -> MotionTarget {
+    let steps = if count > 0 { count } else { 1 }
+    let ts = if tabstop > 0 { tabstop } else { 4 }
+    let min_r = buf.min_row()
+    var r = from.row
+
+    for _ in 0..steps {
+        if r <= min_r {
+            r = min_r
+            break
+        }
+        let base_indent = infer_effective_indent(buf, r, ts)
+        if base_indent > 0 {
+            -- Scan upward to start of contiguous block with indent >= `base_indent` (bridging blanks)
+            var block_start = r
+            var scan = r - 1
+            while scan >= min_r {
+                if is_blank_line(buf, scan) {
+                    var prev_nb = scan - 1
+                    while prev_nb >= min_r and is_blank_line(buf, prev_nb) {
+                        prev_nb -= 1
+                    }
+                    if prev_nb >= min_r and line_indent_cols(buf.line_at(prev_nb), ts) >= base_indent {
+                        block_start = prev_nb
+                        scan = prev_nb - 1
+                        continue
+                    }
+                    break
+                }
+                if line_indent_cols(buf.line_at(scan), ts) >= base_indent {
+                    block_start = scan
+                    scan -= 1
+                } else {
+                    break
+                }
+            }
+            if block_start < r {
+                r = block_start
+            } else {
+                -- Already at block start: jump to enclosing parent header line (`indent < base_indent`)
+                var p = r - 1
+                var found_parent = false
+                while p >= min_r {
+                    if (not is_blank_line(buf, p)) and line_indent_cols(buf.line_at(p), ts) < base_indent {
+                        r = p
+                        found_parent = true
+                        break
+                    }
+                    p -= 1
+                }
+                if not found_parent {
+                    r = min_r
+                }
+            }
+        } else {
+            -- Top-level (`indent == 0`): jump to start of current non-blank block, else previous block start
+            var top_start = r
+            while top_start > min_r and not is_blank_line(buf, top_start - 1) {
+                top_start -= 1
+            }
+            if top_start < r and not is_blank_line(buf, r) {
+                r = top_start
+            } else {
+                var p = r - 1
+                while p > min_r and is_blank_line(buf, p) {
+                    p -= 1
+                }
+                while p > min_r and not is_blank_line(buf, p - 1) {
+                    p -= 1
+                }
+                r = if p >= min_r { p } else { min_r }
+            }
+        }
+    }
+
+    MotionTarget.ok(
+        Pos.new(r, buf.first_non_blank_col(r)),
+        MotionShape.Exclusive,
+        is_jump = true,
+    )
+}
+
+pub fn motion_indent_next_boundary(
+    buf: Buffer,
+    from: Pos,
+    count: i64,
+    tabstop: i64,
+) -> MotionTarget {
+    let steps = if count > 0 { count } else { 1 }
+    let ts = if tabstop > 0 { tabstop } else { 4 }
+    let max_r = buf.max_row()
+    var r = from.row
+
+    for _ in 0..steps {
+        if r >= max_r {
+            r = max_r
+            break
+        }
+        let base_indent = infer_effective_indent(buf, r, ts)
+        if base_indent > 0 {
+            -- Scan downward to end of contiguous block with indent >= `base_indent` (bridging blanks)
+            var block_end = r
+            var scan = r + 1
+            while scan <= max_r {
+                if is_blank_line(buf, scan) {
+                    var next_nb = scan + 1
+                    while next_nb <= max_r and is_blank_line(buf, next_nb) {
+                        next_nb += 1
+                    }
+                    if next_nb <= max_r and line_indent_cols(buf.line_at(next_nb), ts) >= base_indent {
+                        block_end = next_nb
+                        scan = next_nb + 1
+                        continue
+                    }
+                    break
+                }
+                if line_indent_cols(buf.line_at(scan), ts) >= base_indent {
+                    block_end = scan
+                    scan += 1
+                } else {
+                    break
+                }
+            }
+            if block_end > r {
+                r = block_end
+            } else {
+                -- Already at block end: jump to enclosing closer / outer boundary line (`indent < base_indent`)
+                var nx = r + 1
+                var found_closer = false
+                while nx <= max_r {
+                    if (not is_blank_line(buf, nx)) and line_indent_cols(buf.line_at(nx), ts) < base_indent {
+                        r = nx
+                        found_closer = true
+                        break
+                    }
+                    nx += 1
+                }
+                if not found_closer {
+                    r = max_r
+                }
+            }
+        } else {
+            -- Top-level (`indent == 0`): jump to end of current contiguous non-blank block, else next block end
+            var top_end = r
+            while top_end < max_r and not is_blank_line(buf, top_end + 1) {
+                top_end += 1
+            }
+            if top_end > r and not is_blank_line(buf, r) {
+                r = top_end
+            } else {
+                var nx = r + 1
+                while nx < max_r and is_blank_line(buf, nx) {
+                    nx += 1
+                }
+                while nx < max_r and not is_blank_line(buf, nx + 1) {
+                    nx += 1
+                }
+                r = if nx <= max_r { nx } else { max_r }
+            }
+        }
+    }
+
+    MotionTarget.ok(
+        Pos.new(r, buf.first_non_blank_col(r)),
+        MotionShape.Exclusive,
+        is_jump = true,
+    )
+}
+
+fn is_file_path_char(ch: String) -> bool {
+    if ch == "" {
+        return false
+    }
+    ch.is_alphanumeric()
+        or ch == "/"
+        or ch == "."
+        or ch == "_"
+        or ch == "-"
+        or ch == "~"
+        or ch == "+"
+        or ch == ":"
+}
+
+-- Extract `(file_path, line_1based_or_0, col_1based_or_0)` under or forward from cursor on current line (`gf`).
+pub fn file_target_under_cursor(buf: Buffer, pos: Pos) -> ?(String, i64, i64) {
+    let line = buf.line_at(pos.row)
+    let llen = line.char_len()
+    if llen == 0 {
+        return null
+    }
+    var c = if pos.col < llen { pos.col } else { llen - 1 }
+    while c < llen and not is_file_path_char(line.slice(c, c + 1)) {
+        c += 1
+    }
+    if c >= llen {
+        return null
+    }
+    var sc = c
+    while sc > 0 and is_file_path_char(line.slice(sc - 1, sc)) {
+        sc -= 1
+    }
+    var ec = c + 1
+    while ec < llen and is_file_path_char(line.slice(ec, ec + 1)) {
+        ec += 1
+    }
+    var token = line.slice(sc, ec)
+    while token.ends_with(".") or token.ends_with(":") {
+        token = token.slice(0, token.char_len() - 1)
+    }
+    if token == "" {
+        return null
+    }
+
+    -- Parse optional trailing `:line[:col]` suffix
+    var file_part = token
+    var line_num: i64 = 0
+    var col_num: i64 = 0
+
+    let parts = token.split(":")
+    let plen = parts.len()
+    if plen >= 3 {
+        let last_s = parts.get((plen - 1).as(usize)).as(String)
+        let prev_s = parts.get((plen - 2).as(usize)).as(String)
+        let l_opt = prev_s.parse_i64()
+        let c_opt = last_s.parse_i64()
+        if l_opt != null and c_opt != null and l_opt.as(i64) > 0 {
+            line_num = l_opt.as(i64)
+            col_num = if c_opt.as(i64) > 0 { c_opt.as(i64) } else { 1 }
+            let prefix_parts = List()
+            for i in 0..(plen - 2) {
+                prefix_parts.push(parts.get(i.as(usize)).as(String))
+            }
+            file_part = prefix_parts.join(":")
+        }
+    }
+    if line_num == 0 and plen >= 2 {
+        let last_s = parts.get((plen - 1).as(usize)).as(String)
+        let l_opt = last_s.parse_i64()
+        if l_opt != null and l_opt.as(i64) > 0 {
+            line_num = l_opt.as(i64)
+            let prefix_parts = List()
+            for i in 0..(plen - 1) {
+                prefix_parts.push(parts.get(i.as(usize)).as(String))
+            }
+            file_part = prefix_parts.join(":")
+        }
+    }
+
+    if file_part == "" {
+        return null
+    }
+    (file_part, line_num, col_num)
+}

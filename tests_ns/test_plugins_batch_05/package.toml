@@ -1,0 +1,21 @@
+[package]
+name = "test_plugins_batch_05"
+domain = "lava.org"
+version = "0.1.0"
+type = "exe"
+
+[dependencies]
+"lava.org/lava_sys" = { path = "../../packages/lava_sys" }
+"lava.org/lava_core" = { path = "../../packages/lava_core" }
+"lava.org/lava_accel" = { path = "../../packages/lava_accel" }
+"lava.org/ext_document" = { path = "../../extensions/ext_document" }
+"lava.org/ext_window" = { path = "../../extensions/ext_window" }
+"lava.org/ext_render" = { path = "../../extensions/ext_render" }
+"lava.org/ext_minibuffer" = { path = "../../extensions/ext_minibuffer" }
+"lava.org/ext_vim" = { path = "../../extensions/ext_vim" }
+"lava.org/ext_emacs" = { path = "../../extensions/ext_emacs" }
+"lava.org/ext_tools" = { path = "../../extensions/ext_tools" }
+"lava.org/ext_app" = { path = "../../extensions/ext_app" }
+"lava.org/ext_trouble" = { path = "../../extensions/ext_trouble" }
+"lava.org/ext_aerial" = { path = "../../extensions/ext_aerial" }
+"lava.org/ext_conform" = { path = "../../extensions/ext_conform" }

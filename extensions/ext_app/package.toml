@@ -1,0 +1,16 @@
+[package]
+name = "ext_app"
+domain = "lava.org"
+version = "0.1.0"
+type = "lib"
+
+[dependencies]
+"lava.org/lava_sys" = { path = "../../packages/lava_sys" }
+"lava.org/lava_core" = { path = "../../packages/lava_core" }
+"lava.org/ext_document" = { path = "../ext_document" }
+"lava.org/ext_window" = { path = "../ext_window" }
+"lava.org/ext_render" = { path = "../ext_render" }
+"lava.org/ext_minibuffer" = { path = "../ext_minibuffer" }
+"lava.org/ext_vim" = { path = "../ext_vim" }
+"lava.org/ext_emacs" = { path = "../ext_emacs" }
+"lava.org/ext_tools" = { path = "../ext_tools" }

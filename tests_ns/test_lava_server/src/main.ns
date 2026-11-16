@@ -1,0 +1,808 @@
+-- Comprehensive end-to-end test suite for `lava.server/*`:
+--   1. `srv_app.create_server_kernel()` topological activation of all 5 domain extensions,
+--      `server/ping`, `server/capabilities`, service registry, and cycle/dep validation.
+--   2. `srv_fs`: `fs/write` (`create_dirs`, atomic write, LF & CRLF), `fs/read` (LF, CRLF, empty),
+--      `fs/stat`, `fs/readdir` (dirs-first + case-insensitive sort + `show_hidden`),
+--      `fs/mkdir`, `fs/copy`, `fs/rename`, `fs/realpath`, `fs/remove`, and `fs/find_root`
+--      (`compile_commands.json` & `Cargo.toml` upward walk).
+--   3. `srv_search`: `search/files`, `search/grep` (matches + 0-match query!), and `search/symbols`
+--      across temporary C++, Rust, and Nessa source files.
+--   4. `srv_git`: `git/status`, `git/head_lines`, `git/diff`, `git/blame`, and `git/log` on a real
+--      temporary `git init` repository under `/tmp`.
+--   5. `srv_exec` (`exec/run` with multi-line `stdin` piped through `sed` & `awk`, `exec/which`
+--      for `sh`/`clangd`/`rg`/custom tool, `exec/sysinfo`) and `srv_lsp` session lifecycle.
+--   6. Mock JSON-RPC 2.0 stdio loop (`mock_push_rpc_request` -> `boot_and_run_stdio()` ->
+--      `mock_drain_rpc_responses()`) verifying integer/string `id` preservation, notifications,
+--      `-32601` unknown method, `-32602` invalid params, `-32700` parse error, and `server/shutdown`.
+
+use std.fs
+use std.json
+use std.path
+use std.process
+use @server_sys.{mock_drain_rpc_responses, mock_enable, mock_push_rpc_request}
+use @server_core.{
+    RPC_INVALID_PARAMS, RPC_METHOD_NOT_FOUND, RPC_PARSE_ERROR, ServerKernel, SrvExtId
+}
+use @srv_app.{boot_and_run_stdio, create_server_kernel, handle_rpc_json_line}
+
+fn check_true(cond: bool, label: String) {
+    if not cond {
+        panic("ASSERTION FAILED: " ++ label)
+    }
+}
+
+fn check_eq_str(actual: String, expected: String, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual='" ++ actual ++ "' expected='" ++ expected ++ "'")
+    }
+}
+
+fn check_eq_i64(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual=" ++ actual.to_string() ++ " expected=" ++ expected.to_string())
+    }
+}
+
+fn check_eq_bool(actual: bool, expected: bool, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual=" ++ actual.to_string() ++ " expected=" ++ expected.to_string())
+    }
+}
+
+fn call_rpc_ok(kernel: ServerKernel, id: Any, method: String, params: Map) -> Map {
+    let req = Map()
+    req.set("jsonrpc", "2.0")
+    req.set("id", id)
+    req.set("method", method)
+    req.set("params", params)
+    let raw_req = json.stringify(req) match {
+        s! => s,
+        error err => panic("failed to serialize request for " ++ method ++ ": " ++ err.to_string()),
+    }
+    let raw_resp = handle_rpc_json_line(kernel, raw_req)
+    check_true(raw_resp != "", "non-empty response for " ++ method)
+    let parsed = json.parse(raw_resp) match {
+        v! => v.as(Map),
+        error err => panic("invalid JSON response for " ++ method ++ ": " ++ err.to_string() ++ " raw=" ++ raw_resp),
+    }
+    check_eq_str(parsed.get("jsonrpc").as(String), "2.0", method ++ " jsonrpc version")
+    check_true(parsed.get("id") == id, method ++ " response id matches request id")
+    if parsed.contains("error") {
+        let err_obj = parsed.get("error").as(Map)
+        panic(
+            method ++ " returned unexpected RPC error ("
+            ++ err_obj.get("code").as(i64).to_string()
+            ++ "): "
+            ++ err_obj.get("message").as(String)
+        )
+    }
+    check_true(parsed.contains("result"), method ++ " contains result")
+    parsed.get("result").as(Map)
+}
+
+fn call_rpc_err(kernel: ServerKernel, id: Any, method: String, params: Any) -> Map {
+    let req = Map()
+    req.set("jsonrpc", "2.0")
+    req.set("id", id)
+    req.set("method", method)
+    req.set("params", params)
+    let raw_req = json.stringify(req) match {
+        s! => s,
+        error err => panic("failed to serialize error-case request: " ++ err.to_string()),
+    }
+    let raw_resp = handle_rpc_json_line(kernel, raw_req)
+    let parsed = json.parse(raw_resp) match {
+        v! => v.as(Map),
+        error err => panic("invalid JSON error response: " ++ err.to_string()),
+    }
+    check_true(parsed.contains("error"), method ++ " expected error response")
+    parsed.get("error").as(Map)
+}
+
+fn make_temp_test_root() -> String {
+    let dir = "/tmp/lava_server_test_" ++ process.pid().to_string()
+    if fs.exists(dir) {
+        let _ = fs.remove_dir_all(dir)
+    }
+    fs.create_dir_all(dir) match {
+        _! => (),
+        error err => panic("failed to create temp test dir: " ++ err.to_string()),
+    }
+    fs.canonicalize(dir) match {
+        canon! => canon,
+        error _ => dir,
+    }
+}
+
+fn test_1_kernel_and_capabilities(kernel: ServerKernel) {
+    let expected_exts = [
+        "lava.server/srv_fs",
+        "lava.server/srv_search",
+        "lava.server/srv_git",
+        "lava.server/srv_exec",
+        "lava.server/srv_lsp",
+        "lava.server/srv_app",
+    ]
+    for i in 0..expected_exts.len() {
+        let eid = expected_exts.get(i.as(usize)).as(String)
+        check_true(kernel.is_extension_active(SrvExtId(eid)), "extension active: " ++ eid)
+    }
+
+    let ping = call_rpc_ok(kernel, 1, "server/ping", Map())
+    check_eq_bool(ping.get("pong").as(bool), true, "server/ping pong")
+    check_eq_str(ping.get("server").as(String), "lava-server", "server/ping name")
+    check_eq_str(ping.get("version").as(String), "0.1.0", "server/ping version")
+    let ping_exts = ping.get("extensions").as(List)
+    for i in 0..expected_exts.len() {
+        let eid = expected_exts.get(i.as(usize)).as(String)
+        check_true(ping_exts.contains(eid), "server/ping includes " ++ eid)
+    }
+
+    let caps = call_rpc_ok(kernel, "cap-1", "server/capabilities", Map())
+    let methods = caps.get("methods").as(List)
+    let required_methods = [
+        "server/ping",
+        "server/capabilities",
+        "server/shutdown",
+        "fs/stat",
+        "fs/read",
+        "fs/write",
+        "fs/readdir",
+        "fs/mkdir",
+        "fs/remove",
+        "fs/rename",
+        "fs/copy",
+        "fs/realpath",
+        "fs/find_root",
+        "search/files",
+        "search/grep",
+        "search/symbols",
+        "git/status",
+        "git/head_lines",
+        "git/diff",
+        "git/blame",
+        "git/log",
+        "exec/run",
+        "exec/which",
+        "exec/sysinfo",
+        "lsp/which",
+        "lsp/find_root",
+        "lsp/spawn",
+        "lsp/stop",
+        "lsp/status",
+        "lsp/did_open",
+        "lsp/did_change",
+        "lsp/did_save",
+        "lsp/did_close",
+        "lsp/request",
+        "lsp/poll_events",
+    ]
+    for i in 0..required_methods.len() {
+        let m = required_methods.get(i.as(usize)).as(String)
+        check_true(methods.contains(m), "server/capabilities lists method " ++ m)
+    }
+
+    -- Verify cyclic dependency detection on an isolated ServerKernel
+    let cyc_k = ServerKernel.new()
+    let id_a = SrvExtId("lava.server/cyc_a")
+    let id_b = SrvExtId("lava.server/cyc_b")
+    let _ = cyc_k.register_extension(
+        id_a, "lava.server", "cyc_a", "0.1.0", "A", [id_b],
+        |_k: ServerKernel| -> !String Unit { () },
+        |_k: ServerKernel| -> !String Unit { () },
+    )
+    let _ = cyc_k.register_extension(
+        id_b, "lava.server", "cyc_b", "0.1.0", "B", [id_a],
+        |_k: ServerKernel| -> !String Unit { () },
+        |_k: ServerKernel| -> !String Unit { () },
+    )
+    let cyc_failed = cyc_k.activate_all() match {
+        _! => false,
+        error _ => true,
+    }
+    check_true(cyc_failed, "cyclic extension dependency must fail cleanly")
+}
+
+fn test_2_fs_operations(kernel: ServerKernel, tmp_root: String) {
+    let fs_root = path.join(tmp_root, "fs_suite")
+
+    -- Missing file stat & read error
+    let p_missing = Map()
+    p_missing.set("path", path.join(fs_root, "does_not_exist.txt"))
+    let st_missing = call_rpc_ok(kernel, 10, "fs/stat", p_missing)
+    check_eq_bool(st_missing.get("exists").as(bool), false, "missing file exists=false")
+    check_eq_bool(st_missing.get("is_file").as(bool), false, "missing file is_file=false")
+    check_eq_bool(st_missing.get("is_dir").as(bool), false, "missing file is_dir=false")
+    let _ = call_rpc_err(kernel, 11, "fs/read", p_missing)
+
+    -- Atomic LF write with `create_dirs: true` + read roundtrip
+    let lf_path = path.join(fs_root, "nested/sub/lf_notes.txt")
+    let p_write_lf = Map()
+    p_write_lf.set("path", lf_path)
+    p_write_lf.set("lines", ["alpha line", "beta line", "gamma line"])
+    p_write_lf.set("crlf", false)
+    p_write_lf.set("create_dirs", true)
+    let wr_lf = call_rpc_ok(kernel, 12, "fs/write", p_write_lf)
+    check_eq_i64(wr_lf.get("lines").as(i64), 3, "LF write line count")
+    check_true(wr_lf.get("bytes").as(i64) > 0, "LF write byte count > 0")
+
+    let p_read_lf = Map()
+    p_read_lf.set("path", lf_path)
+    let rd_lf = call_rpc_ok(kernel, 13, "fs/read", p_read_lf)
+    check_eq_bool(rd_lf.get("crlf").as(bool), false, "LF file crlf=false")
+    check_true(
+        rd_lf.get("lines").as(List) == ["alpha line", "beta line", "gamma line"],
+        "LF read lines match exact written lines",
+    )
+
+    -- Atomic CRLF write + read preservation
+    let crlf_path = path.join(fs_root, "nested/sub/win_config.ini")
+    let p_write_crlf = Map()
+    p_write_crlf.set("path", crlf_path)
+    p_write_crlf.set("lines", ["[core]", "autocrlf = true"])
+    p_write_crlf.set("crlf", true)
+    p_write_crlf.set("create_dirs", false)
+    let _ = call_rpc_ok(kernel, 14, "fs/write", p_write_crlf)
+
+    let p_read_crlf = Map()
+    p_read_crlf.set("path", crlf_path)
+    let rd_crlf = call_rpc_ok(kernel, 15, "fs/read", p_read_crlf)
+    check_eq_bool(rd_crlf.get("crlf").as(bool), true, "CRLF file crlf=true")
+    check_true(
+        rd_crlf.get("lines").as(List) == ["[core]", "autocrlf = true"],
+        "CRLF read lines stripped \\r\\n cleanly",
+    )
+
+    -- Empty file read -> `[""]`
+    let empty_path = path.join(fs_root, "empty.txt")
+    let _ = fs.write_string(empty_path, "")
+    let p_empty = Map()
+    p_empty.set("path", empty_path)
+    let rd_empty = call_rpc_ok(kernel, 16, "fs/read", p_empty)
+    check_true(rd_empty.get("lines").as(List) == [""], "empty file returns [\"\"]")
+    check_eq_bool(rd_empty.get("crlf").as(bool), false, "empty file crlf=false")
+
+    -- Stat existing file & directory
+    let st_file = call_rpc_ok(kernel, 17, "fs/stat", p_read_lf)
+    check_eq_bool(st_file.get("exists").as(bool), true, "existing file exists=true")
+    check_eq_bool(st_file.get("is_file").as(bool), true, "existing file is_file=true")
+    check_eq_bool(st_file.get("is_dir").as(bool), false, "existing file is_dir=false")
+
+    -- `fs/readdir` sorting (directories-first, then case-insensitive name) + `show_hidden`
+    let sort_dir = path.join(fs_root, "readdir_test")
+    let p_mk1 = Map()
+    p_mk1.set("path", path.join(sort_dir, "zeta_dir"))
+    let _ = call_rpc_ok(kernel, 18, "fs/mkdir", p_mk1)
+    let p_mk2 = Map()
+    p_mk2.set("path", path.join(sort_dir, "Alpha_dir"))
+    let _ = call_rpc_ok(kernel, 19, "fs/mkdir", p_mk2)
+    let _ = fs.write_string(path.join(sort_dir, "Beta.txt"), "b\n")
+    let _ = fs.write_string(path.join(sort_dir, "alpha.txt"), "a\n")
+    let _ = fs.write_string(path.join(sort_dir, ".hidden_env"), "SECRET=1\n")
+
+    let p_ls_vis = Map()
+    p_ls_vis.set("path", sort_dir)
+    p_ls_vis.set("show_hidden", false)
+    let ls_vis = call_rpc_ok(kernel, 20, "fs/readdir", p_ls_vis)
+    let vis_entries = ls_vis.get("entries").as(List)
+    check_eq_i64(vis_entries.len(), 4, "readdir show_hidden=false omits hidden file")
+    check_eq_str(vis_entries.get(0).as(Map).get("name").as(String), "Alpha_dir", "readdir[0] Alpha_dir")
+    check_eq_bool(vis_entries.get(0).as(Map).get("is_dir").as(bool), true, "readdir[0] is_dir")
+    check_eq_str(vis_entries.get(1).as(Map).get("name").as(String), "zeta_dir", "readdir[1] zeta_dir")
+    check_eq_bool(vis_entries.get(1).as(Map).get("is_dir").as(bool), true, "readdir[1] is_dir")
+    check_eq_str(vis_entries.get(2).as(Map).get("name").as(String), "alpha.txt", "readdir[2] alpha.txt")
+    check_eq_str(vis_entries.get(3).as(Map).get("name").as(String), "Beta.txt", "readdir[3] Beta.txt")
+
+    let p_ls_hid = Map()
+    p_ls_hid.set("path", sort_dir)
+    p_ls_hid.set("show_hidden", true)
+    let ls_hid = call_rpc_ok(kernel, 21, "fs/readdir", p_ls_hid)
+    check_eq_i64(ls_hid.get("entries").as(List).len(), 5, "readdir show_hidden=true includes .hidden_env")
+
+    -- `fs/copy`, `fs/rename`, `fs/realpath`, `fs/remove`
+    let copy_dst = path.join(sort_dir, "copied.txt")
+    let p_cp = Map()
+    p_cp.set("src", path.join(sort_dir, "alpha.txt"))
+    p_cp.set("dst", copy_dst)
+    let _ = call_rpc_ok(kernel, 22, "fs/copy", p_cp)
+    check_true(fs.exists(copy_dst), "fs/copy created destination file")
+
+    let renamed_dst = path.join(sort_dir, "moved.txt")
+    let p_mv = Map()
+    p_mv.set("src", copy_dst)
+    p_mv.set("dst", renamed_dst)
+    let _ = call_rpc_ok(kernel, 23, "fs/rename", p_mv)
+    check_true(not fs.exists(copy_dst), "fs/rename removed old path")
+    check_true(fs.exists(renamed_dst), "fs/rename created new path")
+
+    let p_rp = Map()
+    p_rp.set("path", path.join(sort_dir, "../readdir_test/moved.txt"))
+    let rp_res = call_rpc_ok(kernel, 24, "fs/realpath", p_rp)
+    check_eq_str(rp_res.get("path").as(String), renamed_dst, "fs/realpath canonicalizes .. segments")
+
+    let p_rm = Map()
+    p_rm.set("path", renamed_dst)
+    p_rm.set("recursive", false)
+    let _ = call_rpc_ok(kernel, 25, "fs/remove", p_rm)
+    check_true(not fs.exists(renamed_dst), "fs/remove deleted moved.txt")
+
+    -- `fs/find_root` finding `compile_commands.json` and `Cargo.toml`
+    let cpp_proj = path.join(fs_root, "projects/cpp_engine")
+    let cpp_deep = path.join(cpp_proj, "src/render/shader.cpp")
+    let _ = fs.create_dir_all(path.join(cpp_proj, "src/render"))
+    let _ = fs.write_string(path.join(cpp_proj, "compile_commands.json"), "[]\n")
+    let _ = fs.write_string(cpp_deep, "int main() {{ return 0; }}\n")
+
+    let p_root_cpp = Map()
+    p_root_cpp.set("start_path", cpp_deep)
+    p_root_cpp.set("markers", ["compile_commands.json", "Cargo.toml", ".git"])
+    let found_cpp = call_rpc_ok(kernel, 26, "fs/find_root", p_root_cpp)
+    check_eq_str(found_cpp.get("root").as(String), cpp_proj, "fs/find_root located C++ root")
+    check_eq_str(found_cpp.get("matched_marker").as(String), "compile_commands.json", "matched compile_commands.json")
+
+    let rust_proj = path.join(fs_root, "projects/rust_crate")
+    let rust_deep = path.join(rust_proj, "crates/core/src/lib.rs")
+    let _ = fs.create_dir_all(path.join(rust_proj, "crates/core/src"))
+    let _ = fs.write_string(path.join(rust_proj, "Cargo.toml"), "[workspace]\n")
+    let _ = fs.write_string(rust_deep, "pub fn init() {{}}\n")
+
+    let p_root_rs = Map()
+    p_root_rs.set("start_path", rust_deep)
+    p_root_rs.set("markers", ["compile_commands.json", "Cargo.toml", ".git"])
+    let found_rs = call_rpc_ok(kernel, 27, "fs/find_root", p_root_rs)
+    check_eq_str(found_rs.get("root").as(String), rust_proj, "fs/find_root located Cargo.toml root")
+    check_eq_str(found_rs.get("matched_marker").as(String), "Cargo.toml", "matched Cargo.toml")
+}
+
+fn test_3_search_grep_and_symbols(kernel: ServerKernel, tmp_root: String) {
+    let ws = path.join(tmp_root, "search_ws")
+    let _ = fs.create_dir_all(path.join(ws, "cpp"))
+    let _ = fs.create_dir_all(path.join(ws, "rust"))
+    let _ = fs.create_dir_all(path.join(ws, "nessa"))
+
+    let cpp_file = path.join(ws, "cpp/physics_engine.cpp")
+    let _ = fs.write_string(
+        cpp_file,
+        [
+            "namespace physics {{",
+            "class RigidBody {{",
+            "public:",
+            "    double mass;",
+            "}};",
+            "double integrate_step(double dt) {{",
+            "    // UNIQUE_MARKER_OMEGA in C++",
+            "    return dt * 2.0;",
+            "}}",
+            "}}",
+        ].join("\n") ++ "\n",
+    )
+
+    let rs_file = path.join(ws, "rust/matrix_solver.rs")
+    let _ = fs.write_string(
+        rs_file,
+        [
+            "pub struct Matrix2x2 {{",
+            "    pub det: f64,",
+            "}}",
+            "",
+            "impl Matrix2x2 {{",
+            "    pub fn invert_matrix(scale: f64) -> f64 {{",
+            "        // UNIQUE_MARKER_OMEGA in Rust",
+            "        scale",
+            "    }}",
+            "}}",
+        ].join("\n") ++ "\n",
+    )
+
+    let ns_file = path.join(ws, "nessa/pipeline_runner.ns")
+    let _ = fs.write_string(
+        ns_file,
+        [
+            "pub struct StageConfig {{",
+            "    pub retries: i64,",
+            "}}",
+            "",
+            "pub enum StageState {{",
+            "    pub Ready,",
+            "}}",
+            "",
+            "pub fn execute_stage(cfg: StageConfig) -> i64 {{",
+            "    -- UNIQUE_MARKER_OMEGA in Nessa",
+            "    cfg.retries",
+            "}}",
+        ].join("\n") ++ "\n",
+    )
+
+    -- 3a. `search/files`
+    let p_files_all = Map()
+    p_files_all.set("root", ws)
+    p_files_all.set("query", "")
+    p_files_all.set("limit", 50)
+    let all_res = call_rpc_ok(kernel, 30, "search/files", p_files_all)
+    check_eq_i64(all_res.get("files").as(List).len(), 3, "search/files discovered all 3 workspace files")
+
+    let p_files_fuzzy = Map()
+    p_files_fuzzy.set("root", ws)
+    p_files_fuzzy.set("query", "matrix_solv")
+    p_files_fuzzy.set("limit", 5)
+    let fz_res = call_rpc_ok(kernel, 31, "search/files", p_files_fuzzy)
+    let fz_files = fz_res.get("files").as(List)
+    check_true(not fz_files.is_empty(), "fuzzy search/files returned matches")
+    check_eq_str(fz_files.get(0).as(String), "rust/matrix_solver.rs", "top fuzzy file match")
+
+    -- 3b. `search/grep` (multi-file matches + 0-match query!)
+    let p_grep = Map()
+    p_grep.set("root", ws)
+    p_grep.set("pattern", "UNIQUE_MARKER_OMEGA")
+    p_grep.set("limit", 20)
+    p_grep.set("case_sensitive", true)
+    let grep_res = call_rpc_ok(kernel, 32, "search/grep", p_grep)
+    let hits = grep_res.get("hits").as(List)
+    check_eq_i64(hits.len(), 3, "search/grep found marker across C++, Rust, and Nessa files")
+    for i in 0..hits.len() {
+        let h = hits.get(i.as(usize)).as(Map)
+        check_true(h.get("row").as(i64) >= 5, "0-based grep row is valid")
+        check_true(h.get("col").as(i64) >= 4, "0-based grep col is valid")
+        check_true(h.get("line_text").as(String).contains("UNIQUE_MARKER_OMEGA"), "grep line_text contains marker")
+    }
+
+    let p_grep_zero = Map()
+    p_grep_zero.set("root", ws)
+    p_grep_zero.set("pattern", "ABSENT_TOKEN_NEVER_MATCHES_987654")
+    p_grep_zero.set("limit", 20)
+    p_grep_zero.set("case_sensitive", false)
+    let zero_res = call_rpc_ok(kernel, 33, "search/grep", p_grep_zero)
+    check_eq_i64(zero_res.get("hits").as(List).len(), 0, "0-match grep returns empty hits list cleanly")
+
+    -- 3c. `search/symbols` on C++, Rust, and Nessa files
+    let p_sym_cpp = Map()
+    p_sym_cpp.set("path", cpp_file)
+    let cpp_syms = call_rpc_ok(kernel, 34, "search/symbols", p_sym_cpp).get("symbols").as(List)
+    let cpp_names = List()
+    for i in 0..cpp_syms.len() {
+        cpp_names.push(cpp_syms.get(i.as(usize)).as(Map).get("name").as(String))
+    }
+    check_true(cpp_names.contains("RigidBody"), "C++ symbols contain class RigidBody")
+    check_true(cpp_names.contains("integrate_step"), "C++ symbols contain function integrate_step")
+
+    let p_sym_rs = Map()
+    p_sym_rs.set("path", rs_file)
+    let rs_syms = call_rpc_ok(kernel, 35, "search/symbols", p_sym_rs).get("symbols").as(List)
+    let rs_names = List()
+    for i in 0..rs_syms.len() {
+        rs_names.push(rs_syms.get(i.as(usize)).as(Map).get("name").as(String))
+    }
+    check_true(rs_names.contains("Matrix2x2"), "Rust symbols contain struct Matrix2x2")
+    check_true(rs_names.contains("invert_matrix"), "Rust symbols contain fn invert_matrix")
+
+    let p_sym_ns = Map()
+    p_sym_ns.set("path", ns_file)
+    let ns_syms = call_rpc_ok(kernel, 36, "search/symbols", p_sym_ns).get("symbols").as(List)
+    let ns_names = List()
+    for i in 0..ns_syms.len() {
+        ns_names.push(ns_syms.get(i.as(usize)).as(Map).get("name").as(String))
+    }
+    check_true(ns_names.contains("StageConfig"), "Nessa symbols contain struct StageConfig")
+    check_true(ns_names.contains("StageState"), "Nessa symbols contain enum StageState")
+    check_true(ns_names.contains("execute_stage"), "Nessa symbols contain fn execute_stage")
+}
+
+fn run_git_checked(repo_dir: String, args: List) {
+    let out = process.exec("git", args = args, cwd = repo_dir) match {
+        v! => v,
+        error err => panic("git failed to run: " ++ err.to_string()),
+    }
+    if not out.success() {
+        panic("git " ++ args.join(" ") ++ " failed: " ++ out.stderr)
+    }
+}
+
+fn test_4_git_operations(kernel: ServerKernel, tmp_root: String) {
+    let repo = path.join(tmp_root, "git_repo")
+    let _ = fs.create_dir_all(repo)
+
+    run_git_checked(repo, ["init"])
+    run_git_checked(repo, ["config", "user.name", "Lava Bot"])
+    run_git_checked(repo, ["config", "user.email", "bot@lava.dev"])
+
+    let tracked_file = path.join(repo, "main.rs")
+    let _ = fs.write_string(tracked_file, "fn main() {{\n    println!(\"v1\");\n}}\n")
+    run_git_checked(repo, ["add", "main.rs"])
+    run_git_checked(repo, ["commit", "-m", "Initial commit"])
+
+    -- Add a second commit so `git/log` has multiple commits
+    let lib_file = path.join(repo, "lib.rs")
+    let _ = fs.write_string(lib_file, "pub fn add(a: i32, b: i32) -> i32 {{\n    a + b\n}}\n")
+    run_git_checked(repo, ["add", "lib.rs"])
+    run_git_checked(repo, ["commit", "-m", "Add math helper"])
+
+    -- Create staged file, unstaged modification, and untracked file
+    let staged_file = path.join(repo, "staged.txt")
+    let _ = fs.write_string(staged_file, "ready to commit\n")
+    run_git_checked(repo, ["add", "staged.txt"])
+
+    let _ = fs.write_string(tracked_file, "fn main() {{\n    println!(\"v2-modified\");\n}}\n")
+    let untracked_file = path.join(repo, "scratch.tmp")
+    let _ = fs.write_string(untracked_file, "temp notes\n")
+
+    -- 4a. `git/status`
+    let p_st = Map()
+    p_st.set("cwd", repo)
+    let st = call_rpc_ok(kernel, 40, "git/status", p_st)
+    check_eq_bool(st.get("is_repo").as(bool), true, "git/status is_repo=true")
+    check_eq_str(st.get("root").as(String), repo, "git/status root matches repo")
+    check_eq_i64(st.get("staged_count").as(i64), 1, "git/status staged_count=1")
+    check_eq_i64(st.get("modified_count").as(i64), 1, "git/status modified_count=1")
+    check_eq_i64(st.get("untracked_count").as(i64), 1, "git/status untracked_count=1")
+    check_eq_i64(st.get("entries").as(List).len(), 3, "git/status entries len=3")
+
+    -- 4b. `git/head_lines`
+    let p_hl = Map()
+    p_hl.set("cwd", repo)
+    p_hl.set("path", tracked_file)
+    let hl = call_rpc_ok(kernel, 41, "git/head_lines", p_hl)
+    check_eq_bool(hl.get("tracked").as(bool), true, "git/head_lines tracked=true on main.rs")
+    check_true(
+        hl.get("lines").as(List) == ["fn main() {{", "    println!(\"v1\");", "}}"],
+        "git/head_lines returns original HEAD lines before v2 edit",
+    )
+
+    let p_hl_untracked = Map()
+    p_hl_untracked.set("cwd", repo)
+    p_hl_untracked.set("path", untracked_file)
+    let hl_un = call_rpc_ok(kernel, 42, "git/head_lines", p_hl_untracked)
+    check_eq_bool(hl_un.get("tracked").as(bool), false, "git/head_lines tracked=false on untracked")
+
+    -- 4c. `git/diff`
+    let p_diff = Map()
+    p_diff.set("cwd", repo)
+    p_diff.set("path", "main.rs")
+    let diff = call_rpc_ok(kernel, 43, "git/diff", p_diff)
+    let patch = diff.get("patch").as(String)
+    check_true(patch.contains("-    println!(\"v1\");"), "git/diff shows removed v1 line")
+    check_true(patch.contains("+    println!(\"v2-modified\");"), "git/diff shows added v2 line")
+
+    -- 4d. `git/blame`
+    let p_blame = Map()
+    p_blame.set("cwd", repo)
+    p_blame.set("path", "lib.rs")
+    p_blame.set("row", 1)
+    let blame = call_rpc_ok(kernel, 44, "git/blame", p_blame)
+    check_eq_bool(blame.get("found").as(bool), true, "git/blame found=true")
+    check_eq_str(blame.get("author").as(String), "Lava Bot", "git/blame author")
+    check_eq_str(blame.get("summary").as(String), "Add math helper", "git/blame summary")
+    check_eq_i64(blame.get("commit_short").as(String).char_len(), 7, "git/blame 7-char short commit")
+
+    -- 4e. `git/log`
+    let p_log = Map()
+    p_log.set("cwd", repo)
+    p_log.set("limit", 10)
+    let log_res = call_rpc_ok(kernel, 45, "git/log", p_log)
+    let commits = log_res.get("commits").as(List)
+    check_eq_i64(commits.len(), 2, "git/log returns 2 commits")
+    check_eq_str(commits.get(0).as(Map).get("subject").as(String), "Add math helper", "latest commit subject")
+    check_eq_str(commits.get(1).as(Map).get("subject").as(String), "Initial commit", "first commit subject")
+    check_eq_str(commits.get(0).as(Map).get("author").as(String), "Lava Bot", "commit author")
+}
+
+fn test_5_exec_and_lsp(kernel: ServerKernel, tmp_root: String) {
+    -- 5a. `exec/run` piping multi-line stdin through `sed` and `awk`
+    let p_exec = Map()
+    p_exec.set("cmd", "sed 's/apple/ORANGE/g' | awk '{{print NR \":\" $2 \"=\" $1}}'")
+    p_exec.set("cwd", tmp_root)
+    p_exec.set("stdin", "apple 10\nbanana 20\napple 30\n")
+    let exec_res = call_rpc_ok(kernel, 50, "exec/run", p_exec)
+    check_eq_i64(exec_res.get("exit_code").as(i64), 0, "exec/run sed|awk exit_code == 0")
+    check_eq_str(
+        exec_res.get("stdout").as(String),
+        "1:10=ORANGE\n2:20=banana\n3:30=ORANGE\n",
+        "exec/run multi-line stdin transformed by sed | awk",
+    )
+
+    -- 5b. `exec/which` for `sh`, `rg`, `clangd`, custom `extra_dirs` tool, and missing binary
+    let p_which_sh = Map()
+    p_which_sh.set("bin", "sh")
+    let w_sh = call_rpc_ok(kernel, 51, "exec/which", p_which_sh)
+    check_eq_bool(w_sh.get("found").as(bool), true, "exec/which resolves sh")
+    check_true(fs.exists(w_sh.get("path").as(String)), "resolved sh path exists")
+
+    let p_which_rg = Map()
+    p_which_rg.set("bin", "rg")
+    let w_rg = call_rpc_ok(kernel, 52, "exec/which", p_which_rg)
+    if w_rg.get("found").as(bool) {
+        check_true(fs.exists(w_rg.get("path").as(String)), "resolved rg path exists")
+    }
+
+    let p_which_clangd = Map()
+    p_which_clangd.set("bin", "clangd")
+    let w_clangd = call_rpc_ok(kernel, 53, "exec/which", p_which_clangd)
+    if w_clangd.get("found").as(bool) {
+        check_true(fs.exists(w_clangd.get("path").as(String)), "resolved clangd path exists")
+    } else {
+        check_eq_str(w_clangd.get("path").as(String), "", "missing clangd returns empty path")
+    }
+
+    -- Custom executable in `extra_dirs`
+    let bin_dir = path.join(tmp_root, "custom_bins")
+    let _ = fs.create_dir_all(bin_dir)
+    let mock_lsp_bin = path.join(bin_dir, "mock-clangd-srv")
+    let _ = fs.write_string(mock_lsp_bin, "#!/bin/sh\nexit 0\n")
+    let _ = process.exec("chmod", args = ["+x", mock_lsp_bin])
+
+    let p_which_custom = Map()
+    p_which_custom.set("bin", "mock-clangd-srv")
+    p_which_custom.set("extra_dirs", [bin_dir])
+    let w_custom = call_rpc_ok(kernel, 54, "exec/which", p_which_custom)
+    check_eq_bool(w_custom.get("found").as(bool), true, "exec/which found custom tool via extra_dirs")
+    check_eq_str(w_custom.get("path").as(String), mock_lsp_bin, "exec/which custom tool path")
+
+    let p_which_none = Map()
+    p_which_none.set("bin", "definitely_missing_binary_lava_xyz")
+    let w_none = call_rpc_ok(kernel, 55, "exec/which", p_which_none)
+    check_eq_bool(w_none.get("found").as(bool), false, "exec/which missing tool found=false")
+
+    -- 5c. `exec/sysinfo`
+    let sys = call_rpc_ok(kernel, 56, "exec/sysinfo", Map())
+    check_true(sys.get("hostname").as(String) != "", "sysinfo hostname non-empty")
+    check_true(sys.get("os").as(String) != "", "sysinfo os non-empty")
+    check_true(sys.get("arch").as(String) != "", "sysinfo arch non-empty")
+    check_true(sys.get("cwd").as(String) != "", "sysinfo cwd non-empty")
+    check_true(sys.get("user").as(String) != "", "sysinfo user non-empty")
+
+    -- 5d. `srv_lsp` end-to-end session lifecycle
+    let p_lroot = Map()
+    p_lroot.set("start_path", path.join(tmp_root, "fs_suite/projects/cpp_engine/src/render/shader.cpp"))
+    p_lroot.set("markers", ["compile_commands.json", ".git"])
+    let lroot = call_rpc_ok(kernel, 57, "lsp/find_root", p_lroot)
+    check_eq_str(lroot.get("matched_marker").as(String), "compile_commands.json", "lsp/find_root matched_marker")
+
+    let p_spawn = Map()
+    p_spawn.set("cmd", mock_lsp_bin)
+    p_spawn.set("args", ["--background-index"])
+    p_spawn.set("root_dir", tmp_root)
+    let spawned = call_rpc_ok(kernel, 58, "lsp/spawn", p_spawn)
+    let sid = spawned.get("session_id").as(i64)
+    check_true(sid >= 1, "lsp/spawn returned valid session_id")
+
+    let p_status = Map()
+    p_status.set("session_id", sid)
+    let lst = call_rpc_ok(kernel, 59, "lsp/status", p_status)
+    check_eq_bool(lst.get("alive").as(bool), true, "lsp/status alive=true")
+
+    let sample_file = path.join(tmp_root, "sample.ns")
+    let p_open = Map()
+    p_open.set("session_id", sid)
+    p_open.set("file_path", sample_file)
+    p_open.set("language_id", "nessa")
+    p_open.set("version", 1)
+    p_open.set("text", "pub fn compute_answer() -> i64 {{\n    42\n}}\n")
+    let _ = call_rpc_ok(kernel, 60, "lsp/did_open", p_open)
+
+    let p_req = Map()
+    p_req.set("session_id", sid)
+    p_req.set("kind", "symbols")
+    p_req.set("file_path", sample_file)
+    p_req.set("row", 0)
+    p_req.set("col", 7)
+    let req_out = call_rpc_ok(kernel, 61, "lsp/request", p_req)
+    check_true(req_out.get("req_id").as(i64) >= 1, "lsp/request returned positive req_id")
+
+    let polled = call_rpc_ok(kernel, 62, "lsp/poll_events", p_status)
+    check_true(polled.get("events").as(List).len() >= 2, "lsp/poll_events drained session events")
+
+    let p_close = Map()
+    p_close.set("session_id", sid)
+    p_close.set("file_path", sample_file)
+    let _ = call_rpc_ok(kernel, 63, "lsp/did_close", p_close)
+
+    let stopped = call_rpc_ok(kernel, 64, "lsp/stop", p_status)
+    check_eq_bool(stopped.get("stopped").as(bool), true, "lsp/stop stopped session cleanly")
+}
+
+fn test_6_mock_stdio_event_loop(tmp_root: String) {
+    mock_enable(true)
+
+    -- 1. Integer ID request (`server/ping`)
+    mock_push_rpc_request("\x7b\"jsonrpc\":\"2.0\",\"id\":101,\"method\":\"server/ping\",\"params\":\x7b\x7d\x7d")
+
+    -- 2. String ID request (`fs/stat` on `tmp_root`)
+    let stat_req = Map()
+    stat_req.set("jsonrpc", "2.0")
+    stat_req.set("id", "str-id-77")
+    stat_req.set("method", "fs/stat")
+    let stat_p = Map()
+    stat_p.set("path", tmp_root)
+    stat_req.set("params", stat_p)
+    let stat_json = json.stringify(stat_req) match {
+        s! => s,
+        error e => panic(e.to_string()),
+    }
+    mock_push_rpc_request(stat_json)
+
+    -- 3. Notification WITHOUT `id` (must NOT emit any response frame!)
+    mock_push_rpc_request("\x7b\"jsonrpc\":\"2.0\",\"method\":\"server/ping\",\"params\":\x7b\x7d\x7d")
+
+    -- 4. Unknown method (`-32601`)
+    mock_push_rpc_request("\x7b\"jsonrpc\":\"2.0\",\"id\":404,\"method\":\"nonexistent/rpc\",\"params\":\x7b\x7d\x7d")
+
+    -- 5. Invalid params (`-32602`)
+    mock_push_rpc_request("\x7b\"jsonrpc\":\"2.0\",\"id\":422,\"method\":\"fs/read\",\"params\":\x7b\"path\":999\x7d\x7d")
+
+    -- 6. Malformed JSON (`-32700`)
+    mock_push_rpc_request("\x7b\"jsonrpc\":\"2.0\", broken_json!!!")
+
+    -- 7. Graceful `server/shutdown`
+    mock_push_rpc_request("\x7b\"jsonrpc\":\"2.0\",\"id\":\"bye-1\",\"method\":\"server/shutdown\",\"params\":\x7b\x7d\x7d")
+
+    -- 8. Trailing request queued AFTER `server/shutdown` (must NOT be processed!)
+    mock_push_rpc_request("\x7b\"jsonrpc\":\"2.0\",\"id\":999,\"method\":\"server/ping\",\"params\":\x7b\x7d\x7d")
+
+    boot_and_run_stdio() match {
+        _! => (),
+        error err => panic("boot_and_run_stdio failed: " ++ err),
+    }
+
+    let responses = mock_drain_rpc_responses()
+    -- Expect 6 responses (items 1, 2, 4, 5, 6, 7; item 3 is notification, item 8 is post-shutdown)
+    check_eq_i64(responses.len(), 6, "mock stdio loop emitted exact 6 JSON-RPC responses")
+
+    let r0 = json.parse(responses.get(0).as(String)) match { v! => v.as(Map), error e => panic(e.to_string()) }
+    check_eq_i64(r0.get("id").as(i64), 101, "response[0] preserved integer id=101")
+    check_eq_bool(r0.get("result").as(Map).get("pong").as(bool), true, "response[0] pong=true")
+
+    let r1 = json.parse(responses.get(1).as(String)) match { v! => v.as(Map), error e => panic(e.to_string()) }
+    check_eq_str(r1.get("id").as(String), "str-id-77", "response[1] preserved string id='str-id-77'")
+    check_eq_bool(r1.get("result").as(Map).get("is_dir").as(bool), true, "response[1] stat is_dir=true")
+
+    let r2 = json.parse(responses.get(2).as(String)) match { v! => v.as(Map), error e => panic(e.to_string()) }
+    check_eq_i64(r2.get("id").as(i64), 404, "response[2] preserved id=404")
+    check_eq_i64(r2.get("error").as(Map).get("code").as(i64), RPC_METHOD_NOT_FOUND, "response[2] -32601")
+
+    let r3 = json.parse(responses.get(3).as(String)) match { v! => v.as(Map), error e => panic(e.to_string()) }
+    check_eq_i64(r3.get("id").as(i64), 422, "response[3] preserved id=422")
+    check_eq_i64(r3.get("error").as(Map).get("code").as(i64), RPC_INVALID_PARAMS, "response[3] -32602")
+
+    let r4 = json.parse(responses.get(4).as(String)) match { v! => v.as(Map), error e => panic(e.to_string()) }
+    check_true(r4.get("id") == null, "response[4] parse error has id=null")
+    check_eq_i64(r4.get("error").as(Map).get("code").as(i64), RPC_PARSE_ERROR, "response[4] -32700")
+
+    let r5 = json.parse(responses.get(5).as(String)) match { v! => v.as(Map), error e => panic(e.to_string()) }
+    check_eq_str(r5.get("id").as(String), "bye-1", "response[5] shutdown id='bye-1'")
+    check_eq_bool(r5.get("result").as(Map).get("shutting_down").as(bool), true, "response[5] shutting_down=true")
+
+    mock_enable(false)
+}
+
+fn main() {
+    let tmp_root = make_temp_test_root()
+    defer {
+        if fs.exists(tmp_root) {
+            let _ = fs.remove_dir_all(tmp_root)
+        }
+    }
+
+    let kernel = create_server_kernel() match {
+        k! => k,
+        error err => panic("create_server_kernel failed: " ++ err),
+    }
+
+    test_1_kernel_and_capabilities(kernel)
+    println("[PASS] 1/6 ServerKernel activation, server/ping & server/capabilities")
+
+    test_2_fs_operations(kernel, tmp_root)
+    println("[PASS] 2/6 srv_fs: stat, read/write (LF & CRLF), readdir, copy/rename/remove & find_root")
+
+    test_3_search_grep_and_symbols(kernel, tmp_root)
+    println("[PASS] 3/6 srv_search: files, grep (with 0-match query) & C++/Rust/Nessa symbols")
+
+    test_4_git_operations(kernel, tmp_root)
+    println("[PASS] 4/6 srv_git: status, head_lines, diff, blame & log on temporary git repo")
+
+    test_5_exec_and_lsp(kernel, tmp_root)
+    println("[PASS] 5/6 srv_exec (sed|awk stdin pipeline, which, sysinfo) & srv_lsp session lifecycle")
+
+    test_6_mock_stdio_event_loop(tmp_root)
+    println("[PASS] 6/6 Mock JSON-RPC 2.0 stdio loop (IDs, -32601, -32602, -32700 & server/shutdown)")
+
+    println("ALL test_lava_server ASSERTIONS PASSED!")
+}

@@ -1,0 +1,677 @@
+-- ext_flash: Instant 2D Viewport Pattern & Treesitter Node Jump Engine (`lava.org/ext_flash`).
+-- Inspired by `flash.nvim` / `leap.nvim` / Emacs `avy`: incremental case-smart viewport search
+-- with conflict-free next-char-excluded jump labels rendered via `InlineSpanDecor`, plus `gS`
+-- structural node selection into `VisualChar`.
+
+use std.collections.Set
+use @lava_sys.{rgb, rgba}
+use @lava_core.{
+    ExtId, InteractiveEffects, KeyStroke, ServiceEffects, SystemKernel, log_event, status_emit
+}
+use @ext_document.{
+    Buffer, EditorWorld, Pos, ext_document_id, require_editor_world
+}
+use @ext_vim.{
+    KEYMAP_VIM_NORMAL, KEYMAP_VIM_VISUAL, ModalInterceptor, VimMode, VimState, ext_vim_id,
+    require_vim_state, sync_world_from_vim
+}
+
+pub const SERVICE_FLASH: String = "lava.flash.state"
+pub const OWNER_FLASH: String = "ext_flash"
+pub const DEFAULT_FLASH_LABELS: String = "asdfghjklqwertyuiopzxcvbnmASDFGHJKLQWERTYUIOPZXCVBNM"
+
+pub fn ext_flash_id() -> ExtId = ExtId("lava.org/ext_flash")
+
+pub struct FlashTarget {
+    pub label: String,
+    pub pos: Pos,
+    pub end_pos: Pos,
+    pub kind: String,
+    pub select_visual: bool,
+}
+
+pub struct FlashState {
+    pub active: bool,
+    pub treesitter_mode: bool,
+    pub query: String,
+    pub targets: List,
+    pub label_alphabet: String,
+}
+
+impl FlashState {
+    pub fn new() -> FlashState {
+        FlashState {
+            active: false,
+            treesitter_mode: false,
+            query: "",
+            targets: List(),
+            label_alphabet: DEFAULT_FLASH_LABELS,
+        }
+    }
+
+    pub fn clear_state(self) {
+        self.active = false
+        self.treesitter_mode = false
+        self.query = ""
+        self.targets = List()
+    }
+}
+
+pub fn require_flash_state(kernel: SystemKernel) -> !String FlashState {
+    let raw = kernel.require_service(SERVICE_FLASH)!
+    raw.as(FlashState)
+}
+
+fn visible_row_bounds(world: EditorWorld, buf: Buffer) -> (i64, i64) {
+    let min_r = buf.min_row()
+    let max_r = buf.max_row()
+    var start_r = world.viewport_top_row
+    if start_r < min_r {
+        start_r = min_r
+    }
+    if start_r > max_r {
+        start_r = max_r
+    }
+    let span_rows = if world.viewport_rows > 40 { world.viewport_rows } else { 40 }
+    var end_r = start_r + span_rows
+    if end_r > max_r + 1 {
+        end_r = max_r + 1
+    }
+    (start_r, end_r)
+}
+
+fn stroke_printable(stroke: KeyStroke) -> String {
+    if stroke.ctrl or stroke.alt or stroke.super_mod {
+        return ""
+    }
+    if stroke.key == "Space" {
+        return " "
+    }
+    if stroke.text != "" and stroke.text.char_len() == 1 {
+        return stroke.text
+    }
+    if stroke.key.char_len() == 1 {
+        return stroke.key
+    }
+    ""
+}
+
+fn is_ident_char(ch: String) -> bool {
+    if ch == "" {
+        return false
+    }
+    ch == "_" or ch.is_alphanumeric()
+}
+
+fn cancel_flash(world: EditorWorld, vim: VimState, state: FlashState) {
+    state.clear_state()
+    for i in 0..world.buffer_order.len() {
+        let bid = world.buffer_order.get(i.as(usize))
+        let b_opt = world.buffers.get(bid)
+        if b_opt != null {
+            b_opt.as(Buffer).clear_owner_decors(OWNER_FLASH)
+        }
+    }
+    vim.clear_interceptor()
+}
+
+fn recompute_flash_search(world: EditorWorld, buf: Buffer, state: FlashState) {
+    buf.clear_owner_decors(OWNER_FLASH)
+    state.targets = List()
+    if state.query == "" {
+        return
+    }
+
+    let (start_r, end_r) = visible_row_bounds(world, buf)
+    let ignore_case = world.effective_ignore_case(state.query)
+    let raw_matches = List()
+    let excluded = Set.new()
+
+    for r in start_r..end_r {
+        let line = buf.line_at(r)
+        let llen = line.char_len()
+        let row_hits = buf.find_all_in_line(r, state.query, ignore_case)
+        for hi in 0..row_hits.len() {
+            let (sc, ec) = row_hits.get(hi.as(usize)).as((i64, i64))
+            raw_matches.push((r, sc, ec))
+            if ec < llen {
+                let next_ch = line.slice(ec, ec + 1)
+                excluded.insert(next_ch)
+                if ignore_case {
+                    excluded.insert(next_ch.to_lower())
+                    excluded.insert(next_ch.to_upper())
+                }
+            }
+        }
+    }
+
+    let avail_labels = List()
+    let alpha = state.label_alphabet
+    let alpha_len = alpha.char_len()
+    for ai in 0..alpha_len {
+        let ch = alpha.slice(ai, ai + 1)
+        if not excluded.contains(ch) {
+            avail_labels.push(ch)
+        }
+    }
+
+    let match_bg = rgba(137, 180, 250, 115)
+    let match_fg = rgb(249, 226, 175)
+    let label_bg = rgb(243, 139, 168)
+    let label_fg = rgb(17, 17, 27)
+
+    for mi in 0..raw_matches.len() {
+        let (r, sc, ec) = raw_matches.get(mi.as(usize)).as((i64, i64, i64))
+        buf.add_inline_decor(
+            OWNER_FLASH,
+            r,
+            sc,
+            ec,
+            bg_rgba = match_bg,
+            fg_rgba = match_fg,
+            underline = true,
+            replace_label = "",
+        )
+        let lbl = if mi < avail_labels.len() {
+            avail_labels.get(mi.as(usize)).as(String)
+        } else {
+            ""
+        }
+        let end_inc = if ec > sc { ec - 1 } else { sc }
+        state.targets.push(FlashTarget {
+            label: lbl,
+            pos: Pos.new(r, sc),
+            end_pos: Pos.new(r, end_inc),
+            kind: "match",
+            select_visual: false,
+        })
+        if lbl != "" {
+            buf.add_inline_decor(
+                OWNER_FLASH,
+                r,
+                ec,
+                ec + 1,
+                bg_rgba = label_bg,
+                fg_rgba = label_fg,
+                underline = false,
+                replace_label = lbl,
+            )
+        }
+    }
+}
+
+fn push_unique_node(nodes: List, seen: Set, start_p: Pos, end_p: Pos, kind: String) {
+    if end_p < start_p {
+        return
+    }
+    let key = start_p.row.to_string() ++ ":" ++ start_p.col.to_string()
+        ++ "->" ++ end_p.row.to_string() ++ ":" ++ end_p.col.to_string()
+    if seen.contains(key) {
+        return
+    }
+    seen.insert(key)
+    nodes.push((start_p, end_p, kind))
+}
+
+fn collect_treesitter_targets(world: EditorWorld, buf: Buffer, state: FlashState) {
+    buf.clear_owner_decors(OWNER_FLASH)
+    state.targets = List()
+
+    let (start_r, end_r) = visible_row_bounds(world, buf)
+    let cur = buf.point
+    let seen = Set.new()
+    let enclosing = List()
+    let others = List()
+
+    -- 1. Word / symbol under cursor
+    let cur_line = buf.line_at(cur.row)
+    let cur_len = cur_line.char_len()
+    if cur_len > 0 {
+        let c0 = if cur.col < cur_len { cur.col } else { cur_len - 1 }
+        if is_ident_char(cur_line.slice(c0, c0 + 1)) {
+            var ws = c0
+            while ws > 0 and is_ident_char(cur_line.slice(ws - 1, ws)) {
+                ws -= 1
+            }
+            var we = c0
+            while we + 1 < cur_len and is_ident_char(cur_line.slice(we + 1, we + 2)) {
+                we += 1
+            }
+            push_unique_node(enclosing, seen, Pos.new(cur.row, ws), Pos.new(cur.row, we), "identifier")
+        }
+    }
+
+    -- 2. Scan balanced brackets `()`, `[]`, `{}` and strings `"..."` across visible rows
+    let stack = List()
+    for r in start_r..end_r {
+        let ln = buf.line_at(r)
+        let n = ln.char_len()
+        var i: i64 = 0
+        while i < n {
+            let ch = ln.slice(i, i + 1)
+            if ch == "\"" {
+                let q_start = i
+                i += 1
+                while i < n {
+                    let qc = ln.slice(i, i + 1)
+                    if qc == "\\" {
+                        i += 2
+                        continue
+                    }
+                    if qc == "\"" {
+                        break
+                    }
+                    i += 1
+                }
+                if i < n {
+                    let s_pos = Pos.new(r, q_start)
+                    let e_pos = Pos.new(r, i)
+                    if s_pos <= cur and cur <= e_pos {
+                        if q_start + 1 <= i - 1 {
+                            push_unique_node(
+                                enclosing,
+                                seen,
+                                Pos.new(r, q_start + 1),
+                                Pos.new(r, i - 1),
+                                "string_content",
+                            )
+                        }
+                        push_unique_node(enclosing, seen, s_pos, e_pos, "string")
+                    } else {
+                        push_unique_node(others, seen, s_pos, e_pos, "string")
+                    }
+                }
+                i += 1
+                continue
+            }
+            if ch == "(" or ch == "[" or ch == "{{" {
+                stack.push((ch, Pos.new(r, i)))
+            } else if ch == ")" or ch == "]" or ch == "}}" {
+                let want = if ch == ")" {
+                    "("
+                } else if ch == "]" {
+                    "["
+                } else {
+                    "{{"
+                }
+                if not stack.is_empty() {
+                    let top_idx = (stack.len() - 1).as(usize)
+                    let (open_ch, open_pos) = stack.get(top_idx).as((String, Pos))
+                    if open_ch == want {
+                        let _ = stack.pop()
+                        let close_pos = Pos.new(r, i)
+                        let node_kind = if want == "{{" {
+                            "block"
+                        } else if want == "(" {
+                            "paren_expr"
+                        } else {
+                            "bracket_expr"
+                        }
+                        if open_pos <= cur and cur <= close_pos {
+                            push_unique_node(enclosing, seen, open_pos, close_pos, node_kind)
+                        } else {
+                            push_unique_node(others, seen, open_pos, close_pos, node_kind)
+                        }
+                    }
+                }
+            }
+            i += 1
+        }
+    }
+
+    -- 3. Non-blank statement span on current row
+    if cur_len > 0 and cur_line.trim() != "" {
+        let fnb = buf.first_non_blank_col(cur.row)
+        var lnb = cur_len - 1
+        while lnb > fnb {
+            let tc = cur_line.slice(lnb, lnb + 1)
+            if tc != " " and tc != "\t" {
+                break
+            }
+            lnb -= 1
+        }
+        push_unique_node(enclosing, seen, Pos.new(cur.row, fnb), Pos.new(cur.row, lnb), "statement")
+    }
+
+    -- Combine enclosing (innermost first) followed by other visible nodes
+    let all_nodes = List()
+    for ei in 0..enclosing.len() {
+        all_nodes.push(enclosing.get(ei.as(usize)))
+    }
+    for oi in 0..others.len() {
+        all_nodes.push(others.get(oi.as(usize)))
+    }
+
+    let alpha = state.label_alphabet
+    let alpha_len = alpha.char_len()
+    let limit = if all_nodes.len() < alpha_len { all_nodes.len() } else { alpha_len }
+
+    let span_bg = rgba(203, 166, 247, 85)
+    let start_bg = rgb(166, 227, 161)
+    let end_bg = rgb(250, 179, 135)
+    let pill_fg = rgb(17, 17, 27)
+
+    for idx in 0..limit {
+        let (sp, ep, nkind) = all_nodes.get(idx.as(usize)).as((Pos, Pos, String))
+        let lbl = alpha.slice(idx, idx + 1)
+        state.targets.push(FlashTarget {
+            label: lbl,
+            pos: sp,
+            end_pos: ep,
+            kind: nkind,
+            select_visual: true,
+        })
+        if sp.row == ep.row {
+            buf.add_inline_decor(
+                OWNER_FLASH,
+                sp.row,
+                sp.col,
+                ep.col + 1,
+                bg_rgba = span_bg,
+                fg_rgba = 0,
+                underline = false,
+                replace_label = "",
+            )
+        }
+        buf.add_inline_decor(
+            OWNER_FLASH,
+            sp.row,
+            sp.col,
+            sp.col + 1,
+            bg_rgba = start_bg,
+            fg_rgba = pill_fg,
+            underline = false,
+            replace_label = lbl,
+        )
+        if ep != sp {
+            buf.add_inline_decor(
+                OWNER_FLASH,
+                ep.row,
+                ep.col,
+                ep.col + 1,
+                bg_rgba = end_bg,
+                fg_rgba = pill_fg,
+                underline = false,
+                replace_label = lbl,
+            )
+        }
+    }
+}
+
+fn execute_flash_target(
+    world: EditorWorld,
+    buf: Buffer,
+    vim: VimState,
+    state: FlashState,
+    target: FlashTarget,
+) -> #status_emit Unit {
+    let origin = buf.point
+    cancel_flash(world, vim, state)
+
+    vim.last_jump_origin = origin
+    world.jumps.record(buf.id, buf.file_path, origin)
+
+    if target.select_visual {
+        let a_pos = buf.clamp_pos(target.pos, insert_mode = false)
+        let b_pos = buf.clamp_pos(target.end_pos, insert_mode = false)
+        vim.visual_anchor = a_pos
+        vim.visual_dollar = false
+        vim.mode = VimMode.VisualChar
+        buf.point = b_pos
+        buf.preferred_col = b_pos.col
+        sync_world_from_vim(world, vim)
+        status_emit(
+            "Flash Treesitter [" ++ target.kind ++ "]: "
+            ++ a_pos.to_string() ++ ".." ++ b_pos.to_string()
+        )#
+    } else {
+        let dest = buf.clamp_pos(target.pos, insert_mode = false)
+        buf.point = dest
+        buf.preferred_col = dest.col
+        let vrows = if world.viewport_rows > 1 { world.viewport_rows } else { 1 }
+        if dest.row < world.viewport_top_row {
+            world.viewport_top_row = dest.row
+        } else if dest.row >= world.viewport_top_row + vrows {
+            world.viewport_top_row = dest.row - vrows + 1
+        }
+        sync_world_from_vim(world, vim)
+        status_emit("Flash jumped to " ++ dest.to_string())#
+    }
+    ()
+}
+
+fn flash_interceptor_step(
+    kernel: SystemKernel,
+    stroke: KeyStroke,
+) -> #ServiceEffects !String bool {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let state = require_flash_state(kernel)!
+    if not state.active {
+        vim.clear_interceptor()
+        return false
+    }
+    let buf = world.active_buffer()
+
+    let is_cancel = stroke.key == "Escape"
+        or (stroke.ctrl and (stroke.key == "[" or stroke.key == "c" or stroke.key == "g"))
+    if is_cancel {
+        cancel_flash(world, vim, state)
+        status_emit("Flash cancelled")#
+        return true
+    }
+
+    if stroke.key == "Return" or (stroke.ctrl and stroke.key == "m") {
+        if not state.targets.is_empty() {
+            -- Prefer first match at/after cursor in search mode, wrapping to index 0
+            var chosen = state.targets.get(0).as(FlashTarget)
+            if not state.treesitter_mode {
+                for ti in 0..state.targets.len() {
+                    let cand = state.targets.get(ti.as(usize)).as(FlashTarget)
+                    if cand.pos > buf.point {
+                        chosen = cand
+                        break
+                    }
+                }
+            }
+            execute_flash_target(world, buf, vim, state, chosen)#
+        } else {
+            cancel_flash(world, vim, state)
+            status_emit("Flash: no match")#
+        }
+        return true
+    }
+
+    if state.treesitter_mode {
+        let lbl_ch = stroke_printable(stroke)
+        if lbl_ch != "" {
+            for ti in 0..state.targets.len() {
+                let cand = state.targets.get(ti.as(usize)).as(FlashTarget)
+                if cand.label == lbl_ch {
+                    execute_flash_target(world, buf, vim, state, cand)#
+                    return true
+                }
+            }
+        }
+        cancel_flash(world, vim, state)
+        status_emit("Flash Treesitter cancelled")#
+        return true
+    }
+
+    if stroke.key == "BackSpace" or (stroke.ctrl and stroke.key == "h") {
+        if state.query.char_len() > 0 {
+            state.query = state.query.slice(0, state.query.char_len() - 1)
+            recompute_flash_search(world, buf, state)
+            if state.query == "" {
+                status_emit("Flash: ")#
+            } else {
+                status_emit(
+                    "Flash: " ++ state.query ++ " (" ++ state.targets.len().to_string() ++ ")"
+                )#
+            }
+        } else {
+            buf.clear_owner_decors(OWNER_FLASH)
+            state.targets = List()
+            status_emit("Flash: ")#
+        }
+        return true
+    }
+
+    let ch = stroke_printable(stroke)
+    if ch == "" {
+        return true
+    }
+
+    if state.query != "" and (not state.targets.is_empty()) {
+        for ti in 0..state.targets.len() {
+            let cand = state.targets.get(ti.as(usize)).as(FlashTarget)
+            if cand.label != "" and cand.label == ch {
+                execute_flash_target(world, buf, vim, state, cand)#
+                return true
+            }
+        }
+    }
+
+    state.query = state.query ++ ch
+    recompute_flash_search(world, buf, state)
+    status_emit("Flash: " ++ state.query ++ " (" ++ state.targets.len().to_string() ++ ")")#
+    true
+}
+
+fn start_flash_jump(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let state = require_flash_state(kernel)!
+    let buf = world.active_buffer()
+
+    cancel_flash(world, vim, state)
+    state.active = true
+    state.treesitter_mode = false
+    state.query = if not args.is_empty() { args.get(0).as(String) } else { "" }
+    state.targets = List()
+
+    vim.set_interceptor(OWNER_FLASH, flash_interceptor_step)
+    if state.query != "" {
+        recompute_flash_search(world, buf, state)
+        status_emit("Flash: " ++ state.query ++ " (" ++ state.targets.len().to_string() ++ ")")#
+    } else {
+        status_emit("Flash: ")#
+    }
+    log_event("info", OWNER_FLASH, "Activated Flash jump mode")#
+    ()
+}
+
+fn start_flash_treesitter(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let state = require_flash_state(kernel)!
+    let buf = world.active_buffer()
+
+    cancel_flash(world, vim, state)
+    state.active = true
+    state.treesitter_mode = true
+    state.query = ""
+    collect_treesitter_targets(world, buf, state)
+
+    if state.targets.is_empty() {
+        state.clear_state()
+        status_emit("Flash Treesitter: no structural nodes in viewport")#
+        return ()
+    }
+
+    vim.set_interceptor(OWNER_FLASH, flash_interceptor_step)
+    status_emit(
+        "Flash Treesitter: press label (" ++ state.targets.len().to_string() ++ " nodes)"
+    )#
+    log_event("info", OWNER_FLASH, "Activated Flash Treesitter node selector")#
+    ()
+}
+
+pub fn register_flash_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_flash_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_flash",
+        "0.1.0",
+        "Instant 2D viewport search & conflict-free label jump engine (`gs`) and structural node selector (`gS`).",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let state = FlashState.new()
+            k.publish_service(SERVICE_FLASH, ext_id, state)
+
+            let norm_km = k.ensure_keymap(KEYMAP_VIM_NORMAL)
+            norm_km.bind("g s", "flash-jump", ext_id, description = "Flash 2D label jump")
+            norm_km.bind("g S", "flash-treesitter", ext_id, description = "Flash select structural node")
+
+            let vis_km = k.ensure_keymap(KEYMAP_VIM_VISUAL)
+            vis_km.bind("g s", "flash-jump", ext_id, description = "Flash extend visual selection")
+
+            k.register_command(
+                "flash-jump",
+                ext_id,
+                "Start interactive 2D viewport pattern & label jump (`gs`).",
+                start_flash_jump,
+            )
+            k.register_command(
+                "flash",
+                ext_id,
+                "Alias for `flash-jump` (`:Flash`).",
+                start_flash_jump,
+            )
+            k.register_command(
+                "ex:Flash",
+                ext_id,
+                "Ex `:Flash` command entry point.",
+                start_flash_jump,
+                interactive = false,
+            )
+            k.register_command(
+                "flash-treesitter",
+                ext_id,
+                "Label enclosing structural nodes in visible rows and select in VisualChar (`gS`).",
+                start_flash_treesitter,
+            )
+            k.register_command(
+                "ex:FlashTreesitter",
+                ext_id,
+                "Ex `:FlashTreesitter` command entry point.",
+                start_flash_treesitter,
+                interactive = false,
+            )
+
+            k.add_hook(
+                "buffer-switched",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| -> Unit {
+                    let st_opt = kern.service(SERVICE_FLASH)
+                    let w_opt = kern.service("lava.document.world")
+                    let v_opt = kern.service("lava.vim.state")
+                    if st_opt != null and w_opt != null and v_opt != null {
+                        let st = st_opt.as(FlashState)
+                        if st.active {
+                            cancel_flash(w_opt.as(EditorWorld), v_opt.as(VimState), st)
+                        }
+                    }
+                },
+            )
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            let v_opt = k.service("lava.vim.state")
+            if w_opt != null {
+                w_opt.as(EditorWorld).clear_owner_ui(OWNER_FLASH)
+            }
+            if v_opt != null {
+                let vs = v_opt.as(VimState)
+                if vs.modal_interceptor != null {
+                    if vs.modal_interceptor.as(ModalInterceptor).owner == OWNER_FLASH {
+                        vs.clear_interceptor()
+                    }
+                }
+            }
+            ()
+        },
+    )
+}

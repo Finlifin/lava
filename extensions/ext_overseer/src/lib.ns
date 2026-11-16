@@ -1,0 +1,809 @@
+-- ext_overseer: Workspace Task Discovery, Runner & Compiler Quickfix Dashboard (`lava.org/ext_overseer`).
+-- Inspired by `stevearc/overseer.nvim` & VSCode Tasks: discovers Nessa (`package.toml`),
+-- Cargo (`Cargo.toml`), Make (`Makefile`), and npm (`package.json`) workspace tasks, supports
+-- user-registered templates, parses diagnostics into `world.quickfix`, emits toast notifications,
+-- and renders an interactive `*Overseer*` task dashboard (`<Space>rt`, `<Space>rl`, `<Space>ro`).
+
+use std.collections.{HashMap, Set}
+use std.fs
+use std.json
+use std.path
+use std.process
+use @lava_core.{
+    ExtId, InteractiveEffects, PromptKind, PromptRequest, SystemKernel, ask_prompt, log_event,
+    status_emit
+}
+use @ext_document.{
+    Buffer, BufferId, EditorWorld, Pos, QuickfixEntry, ext_document_id, parse_quickfix_line,
+    require_editor_world
+}
+use @ext_vim.{KEYMAP_VIM_LEADER, VimMode, ext_vim_id, require_vim_state, sync_world_from_vim}
+
+pub const SERVICE_OVERSEER: String = "lava.overseer.tasks"
+pub const OWNER_OVERSEER: String = "ext_overseer"
+pub const OVERSEER_BUF_NAME: String = "*Overseer*"
+
+pub fn ext_overseer_id() -> ExtId = ExtId("lava.org/ext_overseer")
+
+-- ============================================================================
+-- 1. Task Templates, Runs & OverseerService
+-- ============================================================================
+
+pub struct TaskTemplate {
+    pub name: String,
+    pub cmd: String,
+    pub cwd: String,
+    pub source: String,
+}
+derive Eq, PartialEq for TaskTemplate
+
+pub struct TaskRun {
+    pub id: i64,
+    pub name: String,
+    pub cmd: String,
+    pub cwd: String,
+    pub status: String,
+    pub exit_code: i64,
+    pub output_lines: List,
+    pub error_count: i64,
+    pub expanded: bool,
+}
+
+pub struct OverseerService {
+    pub custom_templates: List,
+    pub runs: List,
+    pub next_run_id: i64,
+    pub last_task_name: String,
+    pub last_task_cmd: String,
+    pub last_task_cwd: String,
+    pub row_to_run_id: HashMap,
+    pub row_to_qf: HashMap,
+    pub previous_buf_id: ?BufferId,
+}
+
+impl OverseerService {
+    pub fn new() -> OverseerService {
+        OverseerService {
+            custom_templates: List(),
+            runs: List(),
+            next_run_id: 1,
+            last_task_name: "",
+            last_task_cmd: "",
+            last_task_cwd: "",
+            row_to_run_id: HashMap.new(),
+            row_to_qf: HashMap.new(),
+            previous_buf_id: null,
+        }
+    }
+
+    pub fn register_template(self, name: String, cmd: String, cwd: String) {
+        let tpl = TaskTemplate {
+            name: name.trim(),
+            cmd: cmd.trim(),
+            cwd: cwd.trim(),
+            source: "custom",
+        }
+        for i in 0..self.custom_templates.len() {
+            let existing = self.custom_templates.get(i.as(usize)).as(TaskTemplate)
+            if existing.name == tpl.name {
+                self.custom_templates.set(i.as(usize), tpl)
+                return
+            }
+        }
+        self.custom_templates.push(tpl)
+    }
+
+    pub fn templates_for_workspace(self, root: String) -> List {
+        let out = List()
+        let seen = Set.new()
+        -- User-registered templates take priority if they share a name, otherwise append all
+        let discovered = discover_tasks(root)
+        for i in 0..discovered.len() {
+            let d = discovered.get(i.as(usize)).as(TaskTemplate)
+            if not seen.contains(d.name) {
+                seen.insert(d.name)
+                out.push(d)
+            }
+        }
+        for i in 0..self.custom_templates.len() {
+            let c = self.custom_templates.get(i.as(usize)).as(TaskTemplate)
+            if seen.contains(c.name) {
+                for j in 0..out.len() {
+                    if out.get(j.as(usize)).as(TaskTemplate).name == c.name {
+                        out.set(j.as(usize), c)
+                        break
+                    }
+                }
+            } else {
+                seen.insert(c.name)
+                out.push(c)
+            }
+        }
+        out
+    }
+
+    pub fn find_template(self, root: String, name: String) -> ?TaskTemplate {
+        let target = name.trim()
+        let all = self.templates_for_workspace(root)
+        for i in 0..all.len() {
+            let t = all.get(i.as(usize)).as(TaskTemplate)
+            if t.name == target {
+                return t
+            }
+        }
+        null
+    }
+
+    pub fn find_run_by_id(self, run_id: i64) -> ?TaskRun {
+        for i in 0..self.runs.len() {
+            let r = self.runs.get(i.as(usize)).as(TaskRun)
+            if r.id == run_id {
+                return r
+            }
+        }
+        null
+    }
+
+    pub fn latest_run(self) -> ?TaskRun {
+        if self.runs.is_empty() {
+            return null
+        }
+        self.runs.get((self.runs.len() - 1).as(usize)).as(TaskRun)
+    }
+
+    pub fn run_task(self, world: EditorWorld, name: String, cmd: String, cwd: String) -> TaskRun {
+        execute_and_record_task(world, self, name, cmd, cwd)
+    }
+}
+
+pub fn require_overseer_service(kernel: SystemKernel) -> !String OverseerService {
+    let raw = kernel.require_service(SERVICE_OVERSEER)!
+    raw.as(OverseerService)
+}
+
+-- ============================================================================
+-- 2. Workspace Task Discovery (`package.toml`, `Cargo.toml`, `Makefile`, `package.json`)
+-- ============================================================================
+
+fn is_valid_make_target_char(ch: String) -> bool {
+    ch.is_alphanumeric() or ch == "_" or ch == "-" or ch == "/" or ch == "."
+}
+
+fn parse_makefile_targets(makefile_path: String) -> List {
+    let targets = List()
+    let raw! = fs.read_to_string(makefile_path) else {
+        return targets
+    }
+    let seen = Set.new()
+    let lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    for i in 0..lines.len() {
+        let line = lines.get(i.as(usize)).as(String)
+        if line == "" {
+            continue
+        }
+        let first = line.slice(0, 1)
+        -- Real Makefile targets start at column 0 and are not comments or recipe lines
+        if first == " " or first == "\t" or first == "#" {
+            continue
+        }
+        let colon_opt = line.split_once(":")
+        if colon_opt == null {
+            continue
+        }
+        let (lhs, rhs) = colon_opt.as((String, String))
+        -- Exclude `VAR := value` assignments (`rhs` starts with `=` and is not `::` rule)
+        if rhs.starts_with("=") {
+            continue
+        }
+        if lhs.contains("=") or lhs.contains("?") or lhs.contains("+") or lhs.contains("$") {
+            continue
+        }
+        -- Support multiple space-separated targets on one rule line (`build test:`)
+        let raw_names = lhs.trim().split(" ")
+        for j in 0..raw_names.len() {
+            let cand = raw_names.get(j.as(usize)).as(String).trim()
+            if cand == "" {
+                continue
+            }
+            -- Exclude special dot-targets (`.PHONY`, `.DEFAULT`, etc.) and `%` pattern rules
+            if cand.starts_with(".") or cand.contains("%") {
+                continue
+            }
+            var all_valid = true
+            let clen = cand.char_len()
+            for c_idx in 0..clen {
+                if not is_valid_make_target_char(cand.slice(c_idx, c_idx + 1)) {
+                    all_valid = false
+                    break
+                }
+            }
+            if all_valid and (not seen.contains(cand)) {
+                seen.insert(cand)
+                targets.push(cand)
+            }
+        }
+    }
+    targets
+}
+
+fn parse_package_json_scripts(pkg_json_path: String) -> List {
+    let scripts = List()
+    let raw! = fs.read_to_string(pkg_json_path) else {
+        return scripts
+    }
+    let parsed! = json.parse(raw) else {
+        return scripts
+    }
+    parsed match {
+        root_map: Map => {
+            let scripts_any = root_map.get("scripts")
+            if scripts_any != null {
+                scripts_any match {
+                    s_map: Map => {
+                        let keys = s_map.keys()
+                        keys.sort()
+                        for i in 0..keys.len() {
+                            let k = keys.get(i.as(usize)).as(String).trim()
+                            if k != "" {
+                                scripts.push(k)
+                            }
+                        }
+                    },
+                    _ => (),
+                }
+            }
+        },
+        _ => (),
+    }
+    scripts
+}
+
+pub fn discover_tasks(root: String) -> List {
+    let tasks = List()
+    let root_dir = if root.trim() != "" { path.normalize(root.trim()) } else { "." }
+    if not fs.is_dir(root_dir) {
+        return tasks
+    }
+
+    -- 1. Nessa package (`package.toml`)
+    if fs.is_file(path.join(root_dir, "package.toml")) {
+        tasks.push(TaskTemplate {
+            name: "nessa: check",
+            cmd: "nessa check .",
+            cwd: root_dir,
+            source: "nessa",
+        })
+        tasks.push(TaskTemplate {
+            name: "nessa: run",
+            cmd: "nessa run .",
+            cwd: root_dir,
+            source: "nessa",
+        })
+        tasks.push(TaskTemplate {
+            name: "nessa: test",
+            cmd: "nessa test .",
+            cwd: root_dir,
+            source: "nessa",
+        })
+    }
+
+    -- 2. Rust Cargo workspace/crate (`Cargo.toml`)
+    if fs.is_file(path.join(root_dir, "Cargo.toml")) {
+        tasks.push(TaskTemplate {
+            name: "cargo: check",
+            cmd: "cargo check",
+            cwd: root_dir,
+            source: "cargo",
+        })
+        tasks.push(TaskTemplate {
+            name: "cargo: test",
+            cmd: "cargo test",
+            cwd: root_dir,
+            source: "cargo",
+        })
+        tasks.push(TaskTemplate {
+            name: "cargo: clippy",
+            cmd: "cargo clippy",
+            cwd: root_dir,
+            source: "cargo",
+        })
+        tasks.push(TaskTemplate {
+            name: "cargo: build --release",
+            cmd: "cargo build --release",
+            cwd: root_dir,
+            source: "cargo",
+        })
+    }
+
+    -- 3. GNU/BSD Make (`Makefile`)
+    let makefile_path = path.join(root_dir, "Makefile")
+    if fs.is_file(makefile_path) {
+        let targets = parse_makefile_targets(makefile_path)
+        for i in 0..targets.len() {
+            let tgt = targets.get(i.as(usize)).as(String)
+            tasks.push(TaskTemplate {
+                name: "make: " ++ tgt,
+                cmd: "make " ++ tgt,
+                cwd: root_dir,
+                source: "make",
+            })
+        }
+    }
+
+    -- 4. Node/npm (`package.json`)
+    let pkg_json_path = path.join(root_dir, "package.json")
+    if fs.is_file(pkg_json_path) {
+        let scripts = parse_package_json_scripts(pkg_json_path)
+        for i in 0..scripts.len() {
+            let sc = scripts.get(i.as(usize)).as(String)
+            tasks.push(TaskTemplate {
+                name: "npm: " ++ sc,
+                cmd: "npm run " ++ sc,
+                cwd: root_dir,
+                source: "npm",
+            })
+        }
+    }
+
+    tasks
+}
+
+-- ============================================================================
+-- 3. Task Execution & Compiler Quickfix Extraction
+-- ============================================================================
+
+fn append_split_lines(dst: List, text: String) {
+    if text == "" {
+        return
+    }
+    let norm = text.replace("\r\n", "\n").replace("\r", "\n")
+    let parts = norm.split("\n")
+    var limit = parts.len()
+    if limit > 0 and norm.ends_with("\n") {
+        limit -= 1
+    }
+    for i in 0..limit {
+        dst.push(parts.get(i.as(usize)).as(String))
+    }
+}
+
+fn normalize_qf_entry(qf: QuickfixEntry, base_cwd: String) -> ?QuickfixEntry {
+    let raw_fp = qf.file_path.trim()
+    if raw_fp == "" or raw_fp == "http" or raw_fp == "https" or raw_fp.contains(" ") {
+        return null
+    }
+    let resolved_fp = if path.is_absolute(raw_fp) {
+        path.normalize(raw_fp)
+    } else if base_cwd != "" {
+        path.normalize(path.join(base_cwd, raw_fp))
+    } else {
+        path.normalize(raw_fp)
+    }
+    QuickfixEntry {
+        file_path: resolved_fp,
+        row: qf.row,
+        col: qf.col,
+        text: qf.text.trim(),
+    }
+}
+
+pub fn extract_quickfix_entries(output_lines: List, base_cwd: String) -> List {
+    let entries = List()
+    var pending_rust_header = ""
+    for i in 0..output_lines.len() {
+        let raw_line = output_lines.get(i.as(usize)).as(String)
+        let trimmed = raw_line.trim()
+        if trimmed == "" {
+            continue
+        }
+
+        -- Track Rust/Clippy diagnostic headline (`error[E0308]: ...` or `warning: ...`)
+        if trimmed.starts_with("error") or trimmed.starts_with("warning:") {
+            pending_rust_header = trimmed
+        }
+
+        -- 1. Rust compiler location pointer (`--> src/lib.rs:12:5`)
+        if trimmed.starts_with("--> ") {
+            let loc = trimmed.drop(4).trim()
+            let msg = if pending_rust_header != "" {
+                pending_rust_header
+            } else {
+                "compiler diagnostic"
+            }
+            let parsed_rust = parse_quickfix_line(loc ++ ": " ++ msg)
+            if parsed_rust != null {
+                let norm_opt = normalize_qf_entry(parsed_rust.as(QuickfixEntry), base_cwd)
+                if norm_opt != null {
+                    entries.push(norm_opt.as(QuickfixEntry))
+                }
+                pending_rust_header = ""
+                continue
+            }
+        }
+
+        -- 2. Standard `file:line:col: message` or `file:line: message`
+        let parsed_std = parse_quickfix_line(trimmed)
+        if parsed_std != null {
+            let norm_opt = normalize_qf_entry(parsed_std.as(QuickfixEntry), base_cwd)
+            if norm_opt != null {
+                entries.push(norm_opt.as(QuickfixEntry))
+            }
+        }
+    }
+    entries
+}
+
+fn execute_and_record_task(
+    world: EditorWorld,
+    svc: OverseerService,
+    name: String,
+    cmd: String,
+    cwd: String,
+) -> TaskRun {
+    let effective_cwd = if cwd.trim() != "" { path.normalize(cwd.trim()) } else { world.cwd }
+    let task_name = if name.trim() != "" { name.trim() } else { cmd.trim() }
+    let out_lines = List()
+    var exit_code: i64 = 0
+
+    let exec_res = process.shell(cmd, cwd = effective_cwd)
+    exec_res match {
+        out! => {
+            exit_code = out.status
+            append_split_lines(out_lines, out.stdout)
+            append_split_lines(out_lines, out.stderr)
+        },
+        error io_err => {
+            exit_code = 127
+            out_lines.push("Overseer execution error: " ++ io_err.to_string())
+        },
+    }
+
+    let qf_entries = extract_quickfix_entries(out_lines, effective_cwd)
+    if not qf_entries.is_empty() {
+        world.quickfix = qf_entries
+        world.quickfix_idx = 0
+        world.quickfix_title = "Overseer: " ++ task_name
+    }
+
+    let status_label = if exit_code == 0 { "SUCCESS" } else { "FAILED" }
+    let run_id = svc.next_run_id
+    svc.next_run_id += 1
+
+    let run = TaskRun {
+        id: run_id,
+        name: task_name,
+        cmd: cmd,
+        cwd: effective_cwd,
+        status: status_label,
+        exit_code: exit_code,
+        output_lines: out_lines,
+        error_count: qf_entries.len(),
+        expanded: true,
+    }
+    svc.runs.push(run)
+    svc.last_task_name = task_name
+    svc.last_task_cmd = cmd
+    svc.last_task_cwd = effective_cwd
+
+    if exit_code == 0 {
+        let _ = world.push_notification(
+            "info",
+            "Overseer",
+            "[" ++ status_label ++ "] " ++ task_name,
+        )
+    } else {
+        let diag_suffix = if qf_entries.is_empty() {
+            ""
+        } else {
+            " (" ++ qf_entries.len().to_string() ++ " diagnostics)"
+        }
+        let _ = world.push_notification(
+            "error",
+            "Overseer",
+            "[" ++ status_label ++ " exit " ++ exit_code.to_string() ++ "] " ++ task_name ++ diag_suffix,
+        )
+    }
+
+    if world.find_buffer_by_name(OVERSEER_BUF_NAME) != null {
+        let _ = refresh_overseer_buffer(world, svc)
+    }
+
+    run
+}
+
+pub fn run_task(kernel: SystemKernel, name: String, cmd: String, cwd: String) -> !String TaskRun {
+    let world = require_editor_world(kernel)!
+    let svc = require_overseer_service(kernel)!
+    execute_and_record_task(world, svc, name, cmd, cwd)
+}
+
+-- ============================================================================
+-- 4. `*Overseer*` Dashboard Buffer Rendering & Interactive Keys
+-- ============================================================================
+
+pub fn refresh_overseer_buffer(world: EditorWorld, svc: OverseerService) -> Buffer {
+    svc.row_to_run_id = HashMap.new()
+    svc.row_to_qf = HashMap.new()
+
+    let lines = List()
+    lines.push(
+        "=== Overseer Task Runner (" ++ svc.runs.len().to_string()
+        ++ " run(s)) | <Return>: toggle/jump  r: rerun  q: close ==="
+    )
+    lines.push("─".repeat(82))
+
+    if svc.runs.is_empty() {
+        lines.push("  (No tasks executed yet — press <Space>rt or :OverseerRun to launch a task)")
+    } else {
+        -- Render newest runs first so latest status & logs are immediately visible at top
+        var idx = svc.runs.len() - 1
+        while idx >= 0 {
+            let run = svc.runs.get(idx.as(usize)).as(TaskRun)
+            let fold_icon = if run.expanded { "▼" } else { "▶" }
+            let hdr_row = lines.len()
+            lines.push(
+                fold_icon ++ " [#" ++ run.id.to_string() ++ "] [" ++ run.status ++ "] "
+                ++ run.name ++ "  (exit=" ++ run.exit_code.to_string()
+                ++ ", diagnostics=" ++ run.error_count.to_string() ++ ")  $ " ++ run.cmd
+            )
+            svc.row_to_run_id.insert(hdr_row, run.id)
+
+            if run.expanded {
+                if run.output_lines.is_empty() {
+                    let empty_r = lines.len()
+                    lines.push("    (no output)")
+                    svc.row_to_run_id.insert(empty_r, run.id)
+                } else {
+                    for j in 0..run.output_lines.len() {
+                        let out_ln = run.output_lines.get(j.as(usize)).as(String)
+                        let r_num = lines.len()
+                        lines.push("    " ++ out_ln)
+                        svc.row_to_run_id.insert(r_num, run.id)
+                        let qf_opt = parse_quickfix_line(out_ln.trim())
+                        if qf_opt != null {
+                            let norm_opt = normalize_qf_entry(qf_opt.as(QuickfixEntry), run.cwd)
+                            if norm_opt != null {
+                                svc.row_to_qf.insert(r_num, norm_opt.as(QuickfixEntry))
+                            }
+                        }
+                    }
+                }
+            }
+            idx -= 1
+        }
+    }
+
+    let existing_opt = world.find_buffer_by_name(OVERSEER_BUF_NAME)
+    let prev_row = if existing_opt != null { existing_opt.as(Buffer).point.row } else { 2 }
+    let obuf = world.ensure_special_buffer(OVERSEER_BUF_NAME, "overseer", lines, read_only = true)
+    let start_row = if prev_row >= 2 and prev_row < obuf.line_count() {
+        prev_row
+    } else if obuf.line_count() > 2 {
+        2
+    } else {
+        0
+    }
+    obuf.point = obuf.clamp_pos(Pos.new(start_row, 0), insert_mode = false)
+    obuf
+}
+
+-- ============================================================================
+-- 5. Command Handlers
+-- ============================================================================
+
+fn cmd_overseer_run(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_overseer_service(kernel)!
+
+    var chosen = if not args.is_empty() { args.get(0).as(String).trim() } else { "" }
+    let templates = svc.templates_for_workspace(world.cwd)
+
+    if chosen == "" {
+        let candidates = List()
+        for i in 0..templates.len() {
+            candidates.push(templates.get(i.as(usize)).as(TaskTemplate).name)
+        }
+        let ans? = ask_prompt(PromptRequest.with_candidates(
+            "Overseer Run: ",
+            "",
+            PromptKind.Choice,
+            candidates,
+        ))# else {
+            status_emit("Overseer cancelled")#
+            return ()
+        }
+        chosen = ans.trim()
+    }
+
+    if chosen == "" {
+        status_emit("Overseer: empty task command")#
+        return ()
+    }
+
+    let tpl_opt = svc.find_template(world.cwd, chosen)
+    let run = if tpl_opt != null {
+        let tpl = tpl_opt.as(TaskTemplate)
+        execute_and_record_task(world, svc, tpl.name, tpl.cmd, tpl.cwd)
+    } else {
+        execute_and_record_task(world, svc, chosen, chosen, world.cwd)
+    }
+
+    log_event(
+        if run.exit_code == 0 { "info" } else { "warn" },
+        OWNER_OVERSEER,
+        "Task " ++ run.name ++ " finished with status " ++ run.status,
+    )#
+    status_emit(
+        "Overseer [" ++ run.status ++ "] " ++ run.name
+        ++ " (exit " ++ run.exit_code.to_string() ++ ")"
+    )#
+    run
+}
+
+fn cmd_overseer_rerun(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_overseer_service(kernel)!
+
+    if svc.last_task_cmd == "" {
+        status_emit("Overseer: no previous task to re-run")#
+        return ()
+    }
+
+    let run = execute_and_record_task(
+        world,
+        svc,
+        svc.last_task_name,
+        svc.last_task_cmd,
+        svc.last_task_cwd,
+    )
+    status_emit(
+        "Overseer re-ran [" ++ run.status ++ "] " ++ run.name
+        ++ " (exit " ++ run.exit_code.to_string() ++ ")"
+    )#
+    run
+}
+
+fn cmd_overseer_toggle(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_overseer_service(kernel)!
+
+    let cur = world.active_buffer()
+    if cur.name == OVERSEER_BUF_NAME {
+        var restored = false
+        svc.previous_buf_id match {
+            pid? => {
+                if world.buffers.contains_key(pid) {
+                    restored = world.switch_to_buffer(pid)
+                }
+            },
+            _ => (),
+        }
+        if not restored {
+            let _ = world.cycle_buffer(-1)
+        }
+        sync_world_from_vim(world, vim)
+        kernel.emit_hook("buffer-switched", world.active_buffer_id)
+        status_emit("Closed *Overseer*")#
+        return ()
+    }
+
+    svc.previous_buf_id = cur.id
+    let obuf = refresh_overseer_buffer(world, svc)
+    let _ = world.switch_to_buffer(obuf.id)
+    if vim.mode != VimMode.Normal {
+        vim.mode = VimMode.Normal
+    }
+    vim.clear_transient()
+    sync_world_from_vim(world, vim)
+    kernel.emit_hook("buffer-switched", obuf.id)
+    status_emit("Overseer (" ++ svc.runs.len().to_string() ++ " task run(s))")#
+    ()
+}
+
+fn cmd_overseer_select(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_overseer_service(kernel)!
+    let buf = world.active_buffer()
+    if buf.name != OVERSEER_BUF_NAME {
+        return ()
+    }
+    let row = buf.point.row
+
+    -- 1. If cursor is on a quickfix diagnostic line inside task output, jump directly to it!
+    let qf_opt = svc.row_to_qf.get(row)
+    if qf_opt != null {
+        let qf = qf_opt.as(QuickfixEntry)
+        let opened = world.open_file(qf.file_path)#!
+        opened.point = opened.clamp_pos(Pos.new(qf.row, qf.col), insert_mode = false)
+        opened.preferred_col = opened.point.col
+        sync_world_from_vim(world, vim)
+        kernel.emit_hook("buffer-switched", opened.id)
+        status_emit("Jumped to " ++ opened.name ++ ":" ++ (qf.row + 1).to_string())#
+        return ()
+    }
+
+    -- 2. Otherwise toggle expand/collapse of the selected `TaskRun`
+    let run_id_opt = svc.row_to_run_id.get(row)
+    if run_id_opt != null {
+        let r_opt = svc.find_run_by_id(run_id_opt.as(i64))
+        if r_opt != null {
+            let r = r_opt.as(TaskRun)
+            r.expanded = not r.expanded
+            let _ = refresh_overseer_buffer(world, svc)
+            status_emit(
+                (if r.expanded { "Expanded " } else { "Collapsed " }) ++ r.name
+            )#
+        }
+    }
+    ()
+}
+
+fn cmd_overseer_rerun_selected(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_overseer_service(kernel)!
+    let buf = world.active_buffer()
+
+    if buf.name == OVERSEER_BUF_NAME {
+        let run_id_opt = svc.row_to_run_id.get(buf.point.row)
+        if run_id_opt != null {
+            let r_opt = svc.find_run_by_id(run_id_opt.as(i64))
+            if r_opt != null {
+                let prev = r_opt.as(TaskRun)
+                let rerun = execute_and_record_task(world, svc, prev.name, prev.cmd, prev.cwd)
+                status_emit(
+                    "Overseer re-ran [" ++ rerun.status ++ "] " ++ rerun.name
+                )#
+                return rerun
+            }
+        }
+    }
+    cmd_overseer_rerun(kernel, List())#
+}
+
+-- ============================================================================
+-- 6. Extension Registration (`composer.rs` single-line signature contract)
+-- ============================================================================
+
+pub fn register_overseer_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_overseer_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_overseer",
+        "0.1.0",
+        "Workspace task discovery, execution, compiler quickfix parser, and `*Overseer*` dashboard.",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let svc = OverseerService.new()
+            k.publish_service(SERVICE_OVERSEER, ext_id, svc)
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> r t", "overseer-run", ext_id, description = "Overseer run task")
+            leader_km.bind("<Space> r l", "overseer-rerun", ext_id, description = "Overseer rerun last task")
+            leader_km.bind("<Space> r o", "overseer-toggle", ext_id, description = "Overseer toggle dashboard")
+
+            let mode_km = k.ensure_keymap("mode:overseer")
+            mode_km.bind("<Return>", "overseer-select", ext_id, description = "Toggle task log or jump to quickfix")
+            mode_km.bind("r", "overseer-rerun-selected", ext_id, description = "Re-run selected task")
+            mode_km.bind("q", "overseer-toggle", ext_id, description = "Close *Overseer* dashboard")
+
+            k.register_command("overseer-run", ext_id, "Run discovered or custom Overseer workspace task.", cmd_overseer_run)
+            k.register_command("ex:OverseerRun", ext_id, "Ex `:OverseerRun [task_or_cmd]`.", cmd_overseer_run, interactive = false)
+
+            k.register_command("overseer-rerun", ext_id, "Re-run last executed Overseer task.", cmd_overseer_rerun)
+            k.register_command("ex:OverseerRerun", ext_id, "Ex `:OverseerRerun`.", cmd_overseer_rerun, interactive = false)
+
+            k.register_command("overseer-toggle", ext_id, "Toggle `*Overseer*` task dashboard buffer.", cmd_overseer_toggle)
+            k.register_command("overseer", ext_id, "Toggle `*Overseer*` task dashboard buffer.", cmd_overseer_toggle)
+            k.register_command("ex:Overseer", ext_id, "Ex `:Overseer`.", cmd_overseer_toggle, interactive = false)
+            k.register_command("ex:OverseerToggle", ext_id, "Ex `:OverseerToggle`.", cmd_overseer_toggle, interactive = false)
+
+            k.register_command("overseer-select", ext_id, "Expand/collapse task output or jump to quickfix diagnostic.", cmd_overseer_select, interactive = false)
+            k.register_command("overseer-rerun-selected", ext_id, "Re-run task under cursor in `*Overseer*`.", cmd_overseer_rerun_selected, interactive = false)
+            ()
+        },
+        |_k: SystemKernel| -> !String Unit { () },
+    )
+}

@@ -1,0 +1,1110 @@
+-- ext_treesj: Structural Split/Join (`treesj`), Smart Increment/Decrement (`dial.nvim`),
+-- and Structural Line/Visual-Block Mover (`mini.move`) for Lava (`lava.org/ext_treesj`).
+
+use @lava_core.{
+    ExtId, HookListener, InteractiveEffects, KeyBindingEntry, Keymap, SystemKernel, status_emit
+}
+use @ext_document.{
+    Buffer, EditorWorld, Pos, Span, ext_document_id, require_editor_world
+}
+use @ext_vim.{
+    KEYMAP_VIM_LEADER, KEYMAP_VIM_NORMAL, KEYMAP_VIM_VISUAL, VimMode, VimState, ext_vim_id,
+    require_vim_state, sync_world_from_vim
+}
+
+pub const SERVICE_TREESJ: String = "lava.treesj.structural"
+pub const OWNER_TREESJ: String = "ext_treesj"
+
+pub fn ext_treesj_id() -> ExtId = ExtId("lava.org/ext_treesj")
+
+pub struct TreesjService {
+    pub max_join_length: i64,
+    pub toggle_count: i64,
+    pub dial_count: i64,
+    pub move_count: i64,
+}
+
+impl TreesjService {
+    pub fn new() -> TreesjService {
+        TreesjService {
+            max_join_length: 160,
+            toggle_count: 0,
+            dial_count: 0,
+            move_count: 0,
+        }
+    }
+}
+
+pub fn require_treesj_service(kernel: SystemKernel) -> !String TreesjService {
+    let raw = kernel.require_service(SERVICE_TREESJ)!
+    raw.as(TreesjService)
+}
+
+-- ============================================================================
+-- Feature A: `treesj` Structural Bracket Split / Join (`:TSJToggle`, `:TSJSplit`, `:TSJJoin`, `<Space> j`)
+-- ============================================================================
+
+struct BracketOpen {
+    open_ch: String,
+    close_ch: String,
+    pos: Pos,
+}
+
+struct BracketPair {
+    open_ch: String,
+    close_ch: String,
+    open_pos: Pos,
+    close_pos: Pos,
+}
+
+fn matching_close_for_open(ch: String) -> String {
+    when {
+        ch == "(" => ")",
+        ch == "[" => "]",
+        ch == "{{" => "}}",
+        else => "",
+    }
+}
+
+fn is_line_comment_start(mode: String, line: String, idx: i64, llen: i64) -> bool {
+    if idx + 1 >= llen {
+        return false
+    }
+    let two = line.slice(idx, idx + 2)
+    if (mode == "nessa" or mode == "lua") and two == "--" {
+        return true
+    }
+    if (mode == "rust" or mode == "c" or mode == "javascript" or mode == "typescript" or mode == "go")
+        and two == "//" {
+        return true
+    }
+    false
+}
+
+fn collect_bracket_pairs(buf: Buffer, center_row: i64) -> List {
+    let stack = List()
+    let pairs = List()
+    let lo_r = buf.min_row()
+    let hi_r = buf.max_row()
+    let scan_lo = if center_row - 500 > lo_r { center_row - 500 } else { lo_r }
+    let scan_hi = if center_row + 500 < hi_r { center_row + 500 } else { hi_r }
+    let mode = buf.major_mode
+
+    for r in scan_lo..(scan_hi + 1) {
+        let line = buf.line_at(r)
+        let llen = line.char_len()
+        var c: i64 = 0
+        var quote = ""
+        while c < llen {
+            let ch = line.slice(c, c + 1)
+            if quote != "" {
+                if ch == "\\" and c + 1 < llen {
+                    c += 2
+                    continue
+                }
+                if ch == quote {
+                    quote = ""
+                }
+                c += 1
+                continue
+            }
+            if is_line_comment_start(mode, line, c, llen) {
+                break
+            }
+            if ch == "\"" or ch == "'" {
+                quote = ch
+                c += 1
+                continue
+            }
+            let expected_close = matching_close_for_open(ch)
+            if expected_close != "" {
+                stack.push(BracketOpen {
+                    open_ch: ch,
+                    close_ch: expected_close,
+                    pos: Pos.new(r, c),
+                })
+                c += 1
+                continue
+            }
+            if ch == ")" or ch == "]" or ch == "}}" {
+                var si = stack.len() - 1
+                while si >= 0 {
+                    let top = stack.get(si.as(usize)).as(BracketOpen)
+                    if top.close_ch == ch {
+                        while stack.len() > si {
+                            let _ = stack.pop()
+                        }
+                        if pairs.len() < 8000 {
+                            pairs.push(BracketPair {
+                                open_ch: top.open_ch,
+                                close_ch: top.close_ch,
+                                open_pos: top.pos,
+                                close_pos: Pos.new(r, c),
+                            })
+                        }
+                        break
+                    }
+                    si -= 1
+                }
+            }
+            c += 1
+        }
+    }
+    pairs
+}
+
+fn find_target_bracket_pair(buf: Buffer, pos: Pos) -> ?BracketPair {
+    let pairs = collect_bracket_pairs(buf, pos.row)
+    var best_enclosing: ?BracketPair = null
+    for i in 0..pairs.len() {
+        let bp = pairs.get(i.as(usize)).as(BracketPair)
+        if bp.open_pos <= pos and pos <= bp.close_pos {
+            if best_enclosing == null {
+                best_enclosing = bp
+            } else {
+                let prev = best_enclosing.as(BracketPair)
+                if bp.open_pos > prev.open_pos {
+                    best_enclosing = bp
+                }
+            }
+        }
+    }
+    if best_enclosing != null {
+        return best_enclosing
+    }
+
+    -- Fallback 1: first bracket pair opening on the current line at or to the right of `pos.col`
+    var best_forward: ?BracketPair = null
+    for i in 0..pairs.len() {
+        let bp = pairs.get(i.as(usize)).as(BracketPair)
+        if bp.open_pos.row == pos.row and bp.open_pos.col >= pos.col {
+            if best_forward == null or bp.open_pos.col < best_forward.as(BracketPair).open_pos.col {
+                best_forward = bp
+            }
+        }
+    }
+    if best_forward != null {
+        return best_forward
+    }
+
+    -- Fallback 2: bracket pair closing on the current line
+    for i in 0..pairs.len() {
+        let bp = pairs.get(i.as(usize)).as(BracketPair)
+        if bp.close_pos.row == pos.row {
+            return bp
+        }
+    }
+    null
+}
+
+fn has_matching_angle_close(s: String, start_lt: i64) -> bool {
+    let n = s.char_len()
+    var depth: i64 = 0
+    var i = start_lt
+    while i < n {
+        let ch = s.slice(i, i + 1)
+        if ch == "<" {
+            depth += 1
+        } else if ch == ">" {
+            depth -= 1
+            if depth == 0 {
+                return true
+            }
+        } else if ch == ";" or ch == "\n" or ch == "=" {
+            return false
+        }
+        i += 1
+    }
+    false
+}
+
+fn normalize_ws_outside_strings(s: String) -> String {
+    let trimmed = s.trim()
+    let n = trimmed.char_len()
+    var out = ""
+    var i: i64 = 0
+    var quote = ""
+    var prev_space = false
+    while i < n {
+        let ch = trimmed.slice(i, i + 1)
+        if quote != "" {
+            out = out ++ ch
+            if ch == "\\" and i + 1 < n {
+                out = out ++ trimmed.slice(i + 1, i + 2)
+                i += 2
+                continue
+            }
+            if ch == quote {
+                quote = ""
+            }
+            i += 1
+            continue
+        }
+        if ch == "\"" or ch == "'" {
+            quote = ch
+            prev_space = false
+            out = out ++ ch
+            i += 1
+            continue
+        }
+        if ch == " " or ch == "\t" or ch == "\n" or ch == "\r" {
+            if not prev_space {
+                out = out ++ " "
+                prev_space = true
+            }
+        } else {
+            prev_space = false
+            out = out ++ ch
+        }
+        i += 1
+    }
+    out.trim()
+}
+
+struct ParsedElements {
+    items: List,
+    delim: String,
+    had_delim: bool,
+}
+
+fn parse_top_level_elements(inner: String) -> ParsedElements {
+    let n = inner.char_len()
+    var i: i64 = 0
+    var quote = ""
+    var depth_paren: i64 = 0
+    var depth_brack: i64 = 0
+    var depth_brace: i64 = 0
+    var depth_angle: i64 = 0
+    var has_top_comma = false
+    var has_top_semi = false
+
+    while i < n {
+        let ch = inner.slice(i, i + 1)
+        if quote != "" {
+            if ch == "\\" and i + 1 < n {
+                i += 2
+                continue
+            }
+            if ch == quote {
+                quote = ""
+            }
+            i += 1
+            continue
+        }
+        if ch == "\"" or ch == "'" {
+            quote = ch
+            i += 1
+            continue
+        }
+        when {
+            ch == "(" => { depth_paren += 1 },
+            ch == ")" => { if depth_paren > 0 { depth_paren -= 1 } },
+            ch == "[" => { depth_brack += 1 },
+            ch == "]" => { if depth_brack > 0 { depth_brack -= 1 } },
+            ch == "{{" => { depth_brace += 1 },
+            ch == "}}" => { if depth_brace > 0 { depth_brace -= 1 } },
+            ch == "<" => {
+                let prev_ident = i > 0 and (
+                    inner.slice(i - 1, i).is_ascii_alphanumeric() or inner.slice(i - 1, i) == "_"
+                )
+                if prev_ident and has_matching_angle_close(inner, i) {
+                    depth_angle += 1
+                }
+            },
+            ch == ">" => {
+                if depth_angle > 0 {
+                    depth_angle -= 1
+                }
+            },
+            else => (),
+        }
+        if depth_paren == 0 and depth_brack == 0 and depth_brace == 0 and depth_angle == 0 {
+            if ch == "," {
+                has_top_comma = true
+            } else if ch == ";" {
+                has_top_semi = true
+            }
+        }
+        i += 1
+    }
+
+    let delim = if has_top_comma {
+        ","
+    } else if has_top_semi {
+        ";"
+    } else {
+        ","
+    }
+    let had_delim = has_top_comma or has_top_semi
+
+    let items = List()
+    var seg_start: i64 = 0
+    i = 0
+    quote = ""
+    depth_paren = 0
+    depth_brack = 0
+    depth_brace = 0
+    depth_angle = 0
+
+    while i < n {
+        let ch = inner.slice(i, i + 1)
+        if quote != "" {
+            if ch == "\\" and i + 1 < n {
+                i += 2
+                continue
+            }
+            if ch == quote {
+                quote = ""
+            }
+            i += 1
+            continue
+        }
+        if ch == "\"" or ch == "'" {
+            quote = ch
+            i += 1
+            continue
+        }
+        when {
+            ch == "(" => { depth_paren += 1 },
+            ch == ")" => { if depth_paren > 0 { depth_paren -= 1 } },
+            ch == "[" => { depth_brack += 1 },
+            ch == "]" => { if depth_brack > 0 { depth_brack -= 1 } },
+            ch == "{{" => { depth_brace += 1 },
+            ch == "}}" => { if depth_brace > 0 { depth_brace -= 1 } },
+            ch == "<" => {
+                let prev_ident = i > 0 and (
+                    inner.slice(i - 1, i).is_ascii_alphanumeric() or inner.slice(i - 1, i) == "_"
+                )
+                if prev_ident and has_matching_angle_close(inner, i) {
+                    depth_angle += 1
+                }
+            },
+            ch == ">" => {
+                if depth_angle > 0 {
+                    depth_angle -= 1
+                }
+            },
+            else => (),
+        }
+        if depth_paren == 0 and depth_brack == 0 and depth_brace == 0 and depth_angle == 0 and ch == delim {
+            let chunk = normalize_ws_outside_strings(inner.slice(seg_start, i))
+            if chunk != "" {
+                items.push(chunk)
+            }
+            seg_start = i + 1
+        }
+        i += 1
+    }
+
+    let tail = normalize_ws_outside_strings(inner.slice(seg_start, n))
+    if tail != "" {
+        items.push(tail)
+    }
+
+    ParsedElements {
+        items: items,
+        delim: delim,
+        had_delim: had_delim,
+    }
+}
+
+fn is_json_context(buf: Buffer, pair: BracketPair) -> bool {
+    if buf.major_mode == "json" or buf.file_path.to_lower().ends_with(".json") {
+        return true
+    }
+    if buf.major_mode == "python" or buf.major_mode == "javascript" or buf.major_mode == "typescript" {
+        return false
+    }
+    -- Also detect standalone JSON object/array snippets in scratch/text buffers (`{"k": 1, ...}`)
+    let first_non_empty_r = buf.min_row()
+    for r in first_non_empty_r..(buf.max_row() + 1) {
+        let t = buf.line_at(r).trim()
+        if t != "" {
+            if t.starts_with("{{\"") or t == "{{" {
+                let full_line = buf.line_at(pair.open_pos.row).trim()
+                if full_line.starts_with("{{\"") or t.starts_with("{{\"") {
+                    return true
+                }
+            }
+            break
+        }
+    }
+    false
+}
+
+fn should_emit_trailing_comma(buf: Buffer, pair: BracketPair, parsed: ParsedElements, is_json: bool) -> bool {
+    if is_json or parsed.delim == ";" or parsed.items.is_empty() {
+        return false
+    }
+    let mode = buf.major_mode
+    let trailing_lang = mode == "nessa" or mode == "rust" or mode == "python"
+        or mode == "typescript" or mode == "javascript" or mode == "go" or mode == "lua"
+    if not trailing_lang {
+        return false
+    }
+    if pair.open_ch == "(" or pair.open_ch == "[" {
+        return true
+    }
+    -- For `{...}`, add trailing comma when comma-separated or `field: value` struct/map syntax
+    if parsed.had_delim and parsed.delim == "," {
+        return true
+    }
+    if parsed.items.len() == 1 {
+        let only = parsed.items.get(0).as(String)
+        if only.contains(":") and not only.starts_with("return ") and not only.starts_with("let ") {
+            return true
+        }
+    }
+    false
+}
+
+fn treesj_split_pair(world: EditorWorld, buf: Buffer, vim: VimState, pair: BracketPair) -> !String bool {
+    if pair.open_pos.row != pair.close_pos.row {
+        return false
+    }
+    buf.ensure_writable()!
+    let row = pair.open_pos.row
+    let line = buf.line_at(row)
+    let base_indent = line.take(buf.first_non_blank_col(row))
+    let sw = if world.options.shiftwidth > 0 { world.options.shiftwidth } else { 4 }
+    let step_indent = if world.options.expandtab { " ".repeat(sw) } else { "\t" }
+    let child_indent = base_indent ++ step_indent
+
+    let inner = line.slice(pair.open_pos.col + 1, pair.close_pos.col)
+    let parsed = parse_top_level_elements(inner)
+    let is_json = is_json_context(buf, pair)
+    let trailing_comma = should_emit_trailing_comma(buf, pair, parsed, is_json)
+
+    let out_lines = List()
+    out_lines.push(pair.open_ch)
+    let item_count = parsed.items.len()
+    for i in 0..item_count {
+        let item = parsed.items.get(i.as(usize)).as(String)
+        let is_last = i + 1 == item_count
+        let sep_suffix = if parsed.delim == ";" {
+            if not is_last { ";" } else { "" }
+        } else if not is_last {
+            ","
+        } else if trailing_comma {
+            ","
+        } else {
+            ""
+        }
+        out_lines.push(child_indent ++ item ++ sep_suffix)
+    }
+    out_lines.push(base_indent ++ pair.close_ch)
+
+    let replacement = out_lines.join("\n")
+    let orig_cursor = buf.point
+    let target_span = Span.normalized(pair.open_pos, Pos.new(pair.close_pos.row, pair.close_pos.col + 1))
+    let _ = buf.replace_span(target_span, replacement)!
+
+    let landing = if orig_cursor.row == row and orig_cursor.col <= pair.open_pos.col {
+        orig_cursor
+    } else {
+        pair.open_pos
+    }
+    buf.point = buf.clamp_pos(landing, insert_mode = false)
+    buf.preferred_col = buf.point.col
+    buf.named_marks.insert(".", buf.point)
+    buf.checkpoint(buf.point, "treesj-split")
+    sync_world_from_vim(world, vim)
+    true
+}
+
+fn treesj_join_pair(world: EditorWorld, buf: Buffer, vim: VimState, pair: BracketPair) -> !String bool {
+    if pair.open_pos.row >= pair.close_pos.row {
+        return false
+    }
+    buf.ensure_writable()!
+    let inner_span = Span.normalized(
+        Pos.new(pair.open_pos.row, pair.open_pos.col + 1),
+        pair.close_pos,
+    )
+    let raw_inner = buf.extract_span(inner_span)
+    let parsed = parse_top_level_elements(raw_inner)
+    let is_json = is_json_context(buf, pair)
+
+    let join_sep = if parsed.delim == ";" { "; " } else { ", " }
+    let body = parsed.items.join(join_sep)
+    let replacement = if body == "" {
+        pair.open_ch ++ pair.close_ch
+    } else if pair.open_ch == "{{" and (not is_json) {
+        "{{ " ++ body ++ " }}"
+    } else {
+        pair.open_ch ++ body ++ pair.close_ch
+    }
+
+    let orig_cursor = buf.point
+    let full_span = Span.normalized(pair.open_pos, Pos.new(pair.close_pos.row, pair.close_pos.col + 1))
+    let _ = buf.replace_span(full_span, replacement)!
+
+    let landing = if orig_cursor.row == pair.open_pos.row and orig_cursor.col <= pair.open_pos.col {
+        orig_cursor
+    } else {
+        pair.open_pos
+    }
+    buf.point = buf.clamp_pos(landing, insert_mode = false)
+    buf.preferred_col = buf.point.col
+    buf.named_marks.insert(".", buf.point)
+    buf.checkpoint(buf.point, "treesj-join")
+    sync_world_from_vim(world, vim)
+    true
+}
+
+fn run_treesj_mode(kernel: SystemKernel, mode: String) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_treesj_service(kernel)!
+    let buf = world.active_buffer()
+
+    let pair? = find_target_bracket_pair(buf, buf.point) else {
+        status_emit("TSJ: no bracketed node found on or enclosing cursor")#
+        return false
+    }
+
+    let single_line = pair.open_pos.row == pair.close_pos.row
+    if mode == "split" {
+        if not single_line {
+            status_emit("TSJ: node is already multi-line")#
+            return false
+        }
+        let ok = treesj_split_pair(world, buf, vim, pair)!
+        if ok {
+            svc.toggle_count += 1
+            status_emit("TSJ: split node")#
+        }
+        return ok
+    }
+    if mode == "join" {
+        if single_line {
+            status_emit("TSJ: node is already single-line")#
+            return false
+        }
+        let ok = treesj_join_pair(world, buf, vim, pair)!
+        if ok {
+            svc.toggle_count += 1
+            status_emit("TSJ: joined node")#
+        }
+        return ok
+    }
+
+    let ok = if single_line {
+        treesj_split_pair(world, buf, vim, pair)!
+    } else {
+        treesj_join_pair(world, buf, vim, pair)!
+    }
+    if ok {
+        svc.toggle_count += 1
+        status_emit(if single_line { "TSJ: split node" } else { "TSJ: joined node" })#
+    }
+    ok
+}
+
+-- ============================================================================
+-- Feature B: `dial.nvim` Smart Token Increment / Decrement (`<C-a>`, `g <C-x>`, `<Space> +`/`-`)
+-- ============================================================================
+
+struct DialMatch {
+    start_col: i64,
+    end_col: i64,
+    replacement: String,
+    land_on_last_char: bool,
+}
+
+fn is_hex_digit_char(ch: String) -> bool {
+    if ch.char_len() != 1 {
+        return false
+    }
+    ch.is_ascii_digit()
+        or ch == "a" or ch == "b" or ch == "c" or ch == "d" or ch == "e" or ch == "f"
+        or ch == "A" or ch == "B" or ch == "C" or ch == "D" or ch == "E" or ch == "F"
+}
+
+fn hex_char_val(ch: String) -> i64 {
+    when {
+        ch == "0" => 0,
+        ch == "1" => 1,
+        ch == "2" => 2,
+        ch == "3" => 3,
+        ch == "4" => 4,
+        ch == "5" => 5,
+        ch == "6" => 6,
+        ch == "7" => 7,
+        ch == "8" => 8,
+        ch == "9" => 9,
+        ch == "a" or ch == "A" => 10,
+        ch == "b" or ch == "B" => 11,
+        ch == "c" or ch == "C" => 12,
+        ch == "d" or ch == "D" => 13,
+        ch == "e" or ch == "E" => 14,
+        ch == "f" or ch == "F" => 15,
+        else => 0,
+    }
+}
+
+fn parse_hex_digits(digits: String) -> i64 {
+    var acc: i64 = 0
+    for i in 0..digits.char_len() {
+        acc = acc * 16 + hex_char_val(digits.slice(i, i + 1))
+    }
+    acc
+}
+
+fn format_hex_value(val: i64, min_width: i64, upper_hex: bool) -> String {
+    let clamped = if val < 0 { 0 } else { val }
+    let alphabet = if upper_hex { "0123456789ABCDEF" } else { "0123456789abcdef" }
+    var raw = ""
+    var n = clamped
+    if n == 0 {
+        raw = "0"
+    } else {
+        while n > 0 {
+            let rem = n % 16
+            raw = alphabet.slice(rem, rem + 1) ++ raw
+            n = n / 16
+        }
+    }
+    if raw.char_len() < min_width {
+        "0".repeat(min_width - raw.char_len()) ++ raw
+    } else {
+        raw
+    }
+}
+
+fn dial_word_replacement(word: String) -> ?String {
+    when {
+        -- Booleans & toggles (case-preserving)
+        word == "true" => "false",
+        word == "false" => "true",
+        word == "True" => "False",
+        word == "False" => "True",
+        word == "TRUE" => "FALSE",
+        word == "FALSE" => "TRUE",
+        word == "yes" => "no",
+        word == "no" => "yes",
+        word == "Yes" => "No",
+        word == "No" => "Yes",
+        word == "YES" => "NO",
+        word == "NO" => "YES",
+        word == "on" => "off",
+        word == "off" => "on",
+        word == "On" => "Off",
+        word == "Off" => "On",
+        word == "ON" => "OFF",
+        word == "OFF" => "ON",
+        word == "enable" => "disable",
+        word == "disable" => "enable",
+        word == "Enable" => "Disable",
+        word == "Disable" => "Enable",
+        word == "ENABLE" => "DISABLE",
+        word == "DISABLE" => "ENABLE",
+        word == "enabled" => "disabled",
+        word == "disabled" => "enabled",
+        word == "Enabled" => "Disabled",
+        word == "Disabled" => "Enabled",
+        word == "ENABLED" => "DISABLED",
+        word == "DISABLED" => "ENABLED",
+        -- Logical word operators
+        word == "and" => "or",
+        word == "or" => "and",
+        word == "AND" => "OR",
+        word == "OR" => "AND",
+        -- Visibility & mutability keywords
+        word == "pub" => "private",
+        word == "private" => "pub",
+        word == "let" => "var",
+        word == "var" => "let",
+        word == "const" => "let",
+        else => null,
+    }
+}
+
+fn is_ident_char(ch: String) -> bool {
+    ch.is_ascii_alphanumeric() or ch == "_"
+}
+
+fn find_dial_match_on_line(line: String, cursor_col: i64, signed_delta: i64) -> ?DialMatch {
+    let n = line.char_len()
+    var i: i64 = 0
+
+    while i < n {
+        let ch = line.slice(i, i + 1)
+
+        -- 1. Hex literal `0x...` / `0X...`
+        let prev_is_ident = i > 0 and is_ident_char(line.slice(i - 1, i))
+        if (not prev_is_ident) and ch == "0" and i + 2 < n {
+            let xch = line.slice(i + 1, i + 2)
+            if (xch == "x" or xch == "X") and is_hex_digit_char(line.slice(i + 2, i + 3)) {
+                var j = i + 2
+                var has_upper_af = false
+                while j < n and is_hex_digit_char(line.slice(j, j + 1)) {
+                    let hch = line.slice(j, j + 1)
+                    if hch == "A" or hch == "B" or hch == "C" or hch == "D" or hch == "E" or hch == "F" {
+                        has_upper_af = true
+                    }
+                    j += 1
+                }
+                if j > cursor_col {
+                    let hex_body = line.slice(i + 2, j)
+                    let cur_val = parse_hex_digits(hex_body)
+                    let next_val = if cur_val + signed_delta < 0 { 0 } else { cur_val + signed_delta }
+                    let formatted = "0" ++ xch ++ format_hex_value(next_val, hex_body.char_len(), has_upper_af)
+                    return (DialMatch {
+                        start_col: i,
+                        end_col: j,
+                        replacement: formatted,
+                        land_on_last_char: true,
+                    })
+                }
+                i = j
+                continue
+            }
+        }
+
+        -- 2. Identifier / keyword word `[a-zA-Z_][a-zA-Z0-9_]*`
+        if ch.is_ascii_alphabetic() or ch == "_" {
+            var j = i + 1
+            while j < n and is_ident_char(line.slice(j, j + 1)) {
+                j += 1
+            }
+            if j > cursor_col {
+                let word = line.slice(i, j)
+                let rep_opt = dial_word_replacement(word)
+                if rep_opt != null {
+                    return (DialMatch {
+                        start_col: i,
+                        end_col: j,
+                        replacement: rep_opt.as(String),
+                        land_on_last_char: false,
+                    })
+                }
+            }
+            i = j
+            continue
+        }
+
+        -- 3. Multi-character comparison & logical operators (`===`/`!==`, `==`/`!=`, `<=`/`>=`, `&&`/`||`)
+        if i + 3 <= n {
+            let tri = line.slice(i, i + 3)
+            if tri == "===" or tri == "!==" {
+                if i + 3 > cursor_col {
+                    let rep3 = if tri == "===" { "!==" } else { "===" }
+                    return (DialMatch {
+                        start_col: i,
+                        end_col: i + 3,
+                        replacement: rep3,
+                        land_on_last_char: false,
+                    })
+                }
+                i += 3
+                continue
+            }
+        }
+        if i + 2 <= n {
+            let duo = line.slice(i, i + 2)
+            var rep2 = ""
+            when {
+                duo == "==" => { rep2 = "!=" },
+                duo == "!=" => { rep2 = "==" },
+                duo == "<=" => { rep2 = ">=" },
+                duo == ">=" => { rep2 = "<=" },
+                duo == "&&" => { rep2 = "||" },
+                duo == "||" => { rep2 = "&&" },
+                else => (),
+            }
+            if rep2 != "" {
+                if i + 2 > cursor_col {
+                    return (DialMatch {
+                        start_col: i,
+                        end_col: i + 2,
+                        replacement: rep2,
+                        land_on_last_char: false,
+                    })
+                }
+                i += 2
+                continue
+            }
+        }
+
+        -- 4. Signed or unsigned decimal integer (`-42`, `0`, `99`)
+        let is_neg_num = ch == "-"
+            and (i + 1 < n)
+            and line.slice(i + 1, i + 2).is_ascii_digit()
+            and (not prev_is_ident)
+        if is_neg_num or ch.is_ascii_digit() {
+            var j = if is_neg_num { i + 2 } else { i + 1 }
+            while j < n and line.slice(j, j + 1).is_ascii_digit() {
+                j += 1
+            }
+            if j > cursor_col {
+                let num_str = line.slice(i, j)
+                let parsed_opt = num_str.parse_i64()
+                if parsed_opt != null {
+                    let next_num = parsed_opt.as(i64) + signed_delta
+                    return (DialMatch {
+                        start_col: i,
+                        end_col: j,
+                        replacement: next_num.to_string(),
+                        land_on_last_char: true,
+                    })
+                }
+            }
+            i = j
+            continue
+        }
+
+        i += 1
+    }
+
+    null
+}
+
+fn parse_step_arg(args: List) -> i64 {
+    if args.is_empty() {
+        return 1
+    }
+    let first = args.get(0)
+    if first matches _: i64 {
+        let v = first.as(i64)
+        return if v > 0 { v } else { 1 }
+    }
+    let s = first.as(String).trim()
+    let p_opt = s.parse_i64()
+    if p_opt != null and p_opt.as(i64) > 0 {
+        return p_opt.as(i64)
+    }
+    1
+}
+
+pub fn dial_step(kernel: SystemKernel, sign: i64, args: List) -> #InteractiveEffects !String bool {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_treesj_service(kernel)!
+    let buf = world.active_buffer()
+    buf.ensure_writable()!
+
+    let step = parse_step_arg(args)
+    let signed_delta = sign * step
+    let row = buf.point.row
+    let line = buf.line_at(row)
+
+    let m? = find_dial_match_on_line(line, buf.point.col, signed_delta) else {
+        status_emit("Dial: no incrementable/toggleable token on line")#
+        return false
+    }
+
+    let sp = Span.normalized(Pos.new(row, m.start_col), Pos.new(row, m.end_col))
+    let (end_pos, _) = buf.replace_span(sp, m.replacement)!
+    let land_col = if m.land_on_last_char {
+        if end_pos.col > 0 { end_pos.col - 1 } else { 0 }
+    } else {
+        m.start_col
+    }
+    buf.point = buf.clamp_pos(Pos.new(row, land_col), insert_mode = false)
+    buf.preferred_col = buf.point.col
+    buf.named_marks.insert(".", buf.point)
+    buf.checkpoint(buf.point, if sign >= 0 { "dial-increment" } else { "dial-decrement" })
+    svc.dial_count += 1
+    sync_world_from_vim(world, vim)
+    true
+}
+
+-- ============================================================================
+-- Feature C: `mini.move` Structural Line / Visual Block Mover (`<M-j>` / `<M-k>`)
+-- ============================================================================
+
+fn is_vim_visual(mode: VimMode) -> bool {
+    mode == VimMode.VisualChar or mode == VimMode.VisualLine or mode == VimMode.VisualBlock
+}
+
+pub fn move_lines(kernel: SystemKernel, delta: i64) -> #InteractiveEffects !String bool {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_treesj_service(kernel)!
+    let buf = world.active_buffer()
+    buf.ensure_writable()!
+
+    let min_r = buf.min_row()
+    let max_r = buf.max_row()
+
+    if is_vim_visual(vim.mode) {
+        let a = vim.visual_anchor
+        let p = buf.point
+        let r1 = if a.row <= p.row { a.row } else { p.row }
+        let r2 = if a.row <= p.row { p.row } else { a.row }
+
+        if delta > 0 {
+            if r2 + 1 > max_r {
+                return false
+            }
+            let below_line = buf.remove_line_at(r2 + 1)
+            buf.insert_line_at(r1, below_line)
+            vim.visual_anchor = Pos.new(a.row + 1, a.col)
+            buf.point = buf.clamp_pos(Pos.new(p.row + 1, p.col), insert_mode = false)
+        } else {
+            if r1 - 1 < min_r {
+                return false
+            }
+            let above_line = buf.remove_line_at(r1 - 1)
+            buf.insert_line_at(r2, above_line)
+            vim.visual_anchor = Pos.new(a.row - 1, a.col)
+            buf.point = buf.clamp_pos(Pos.new(p.row - 1, p.col), insert_mode = false)
+        }
+
+        buf.modified = true
+        buf.preferred_col = buf.point.col
+        buf.checkpoint(buf.point, if delta > 0 { "move-block-down" } else { "move-block-up" })
+        svc.move_count += 1
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    -- Normal mode: swap current line with adjacent line
+    let r = buf.point.row
+    let c = buf.point.col
+    if delta > 0 {
+        if r + 1 > max_r {
+            return false
+        }
+        let cur_line = buf.line_at(r)
+        let nxt_line = buf.line_at(r + 1)
+        buf.set_line_at(r, nxt_line)
+        buf.set_line_at(r + 1, cur_line)
+        buf.point = buf.clamp_pos(Pos.new(r + 1, c), insert_mode = false)
+    } else {
+        if r - 1 < min_r {
+            return false
+        }
+        let cur_line = buf.line_at(r)
+        let prv_line = buf.line_at(r - 1)
+        buf.set_line_at(r, prv_line)
+        buf.set_line_at(r - 1, cur_line)
+        buf.point = buf.clamp_pos(Pos.new(r - 1, c), insert_mode = false)
+    }
+
+    buf.modified = true
+    buf.preferred_col = buf.point.col
+    buf.named_marks.insert(".", buf.point)
+    buf.checkpoint(buf.point, if delta > 0 { "move-line-down" } else { "move-line-up" })
+    svc.move_count += 1
+    sync_world_from_vim(world, vim)
+    true
+}
+
+-- ============================================================================
+-- Extension Registration (`lava.org/ext_treesj`)
+-- ============================================================================
+
+fn cleanup_treesj_hooks_and_bindings(kernel: SystemKernel, ext_id: ExtId) {
+    for topic_any in kernel.hooks.keys() {
+        let topic = topic_any.as(String)
+        let list_opt = kernel.hooks.get(topic)
+        if list_opt != null {
+            let listeners = list_opt.as(List)
+            let kept = List()
+            for i in 0..listeners.len() {
+                let item = listeners.get(i.as(usize)).as(HookListener)
+                if item.owner != ext_id {
+                    kept.push(item)
+                }
+            }
+            kernel.hooks.insert(topic, kept)
+        }
+    }
+    for km_any in kernel.keymaps.keys() {
+        let km_name = km_any.as(String)
+        let km_opt = kernel.keymaps.get(km_name)
+        if km_opt != null {
+            let km = km_opt.as(Keymap)
+            for chord_any in km.bindings.keys() {
+                let chord = chord_any.as(String)
+                let entry_opt = km.bindings.get(chord)
+                if entry_opt != null and entry_opt.as(KeyBindingEntry).owner == ext_id {
+                    let _ = km.bindings.remove(chord)
+                }
+            }
+        }
+    }
+}
+
+pub fn register_treesj_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_treesj_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_treesj",
+        "0.1.0",
+        "Structural bracket split/join (`<Space>j`), smart token dial (`<C-a>`/`g<C-x>`), and line/block mover (`<M-j>`/`<M-k>`).",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let svc = TreesjService.new()
+            k.publish_service(SERVICE_TREESJ, ext_id, svc)
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> j", "treesj-toggle", ext_id, description = "Split/join bracketed block")
+            leader_km.bind("<Space> +", "dial-increment", ext_id, description = "Smart increment/toggle token")
+            leader_km.bind("<Space> =", "dial-increment", ext_id, description = "Smart increment/toggle token")
+            leader_km.bind("<Space> -", "dial-decrement", ext_id, description = "Smart decrement/toggle token")
+
+            let norm_km = k.ensure_keymap(KEYMAP_VIM_NORMAL)
+            norm_km.bind("<C-a>", "dial-increment", ext_id, description = "Smart increment/toggle token")
+            norm_km.bind("g <C-x>", "dial-decrement", ext_id, description = "Smart decrement/toggle token")
+            norm_km.bind("<M-j>", "move-line-down", ext_id, description = "Move line down")
+            norm_km.bind("<M-k>", "move-line-up", ext_id, description = "Move line up")
+
+            let vis_km = k.ensure_keymap(KEYMAP_VIM_VISUAL)
+            vis_km.bind("<M-j>", "move-line-down", ext_id, description = "Move selected lines down")
+            vis_km.bind("<M-k>", "move-line-up", ext_id, description = "Move selected lines up")
+
+            let toggle_fn = |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any {
+                run_treesj_mode(kern, "toggle")#
+            }
+            let split_fn = |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any {
+                run_treesj_mode(kern, "split")#
+            }
+            let join_fn = |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any {
+                run_treesj_mode(kern, "join")#
+            }
+
+            k.register_command("treesj-toggle", ext_id, "Toggle structural split/join on enclosing brackets (`<Space>j`).", toggle_fn)
+            k.register_command("ex:TSJToggle", ext_id, "Ex `:TSJToggle`.", toggle_fn, interactive = false)
+            k.register_command("treesj-split", ext_id, "Split single-line bracketed block onto indented lines (`:TSJSplit`).", split_fn)
+            k.register_command("ex:TSJSplit", ext_id, "Ex `:TSJSplit`.", split_fn, interactive = false)
+            k.register_command("treesj-join", ext_id, "Join multi-line bracketed block onto a single line (`:TSJJoin`).", join_fn)
+            k.register_command("ex:TSJJoin", ext_id, "Ex `:TSJJoin`.", join_fn, interactive = false)
+
+            let inc_fn = |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                dial_step(kern, 1, args)#
+            }
+            let dec_fn = |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                dial_step(kern, -1, args)#
+            }
+            k.register_command("dial-increment", ext_id, "Smart increment/cycle number, hex, boolean, operator, or keyword (`<C-a>`).", inc_fn)
+            k.register_command("ex:DialIncrement", ext_id, "Ex `:DialIncrement`.", inc_fn, interactive = false)
+            k.register_command("dial-decrement", ext_id, "Smart decrement/cycle number, hex, boolean, operator, or keyword (`g<C-x>`).", dec_fn)
+            k.register_command("ex:DialDecrement", ext_id, "Ex `:DialDecrement`.", dec_fn, interactive = false)
+
+            let down_fn = |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any {
+                move_lines(kern, 1)#
+            }
+            let up_fn = |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any {
+                move_lines(kern, -1)#
+            }
+            k.register_command("move-line-down", ext_id, "Move current line or visual selection down (`<M-j>`).", down_fn)
+            k.register_command("ex:MoveLineDown", ext_id, "Ex `:MoveLineDown`.", down_fn, interactive = false)
+            k.register_command("move-line-up", ext_id, "Move current line or visual selection up (`<M-k>`).", up_fn)
+            k.register_command("ex:MoveLineUp", ext_id, "Ex `:MoveLineUp`.", up_fn, interactive = false)
+
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                w_opt.as(EditorWorld).clear_owner_ui(OWNER_TREESJ)
+            }
+            cleanup_treesj_hooks_and_bindings(k, ext_id)
+            ()
+        },
+    )
+}

@@ -1,0 +1,685 @@
+-- Comprehensive Integration & Scene Test Suite for Deliverable 1:
+-- Rich Vertico + Orderless + Marginalia + Consult Minibuffer, Context-Aware `:` Ex Completion,
+-- 12-Row Rich Popup Rendering, and Floating Window ANSI Spans & Cursor (`ext_minibuffer` + `ext_render`).
+
+use std.env
+use std.fs
+use std.path
+use @lava_sys.{CaretShape, DrawCmd, mock_enable, rgb, rgba}
+use @lava_core.{
+    ExtId, HostClipboardCap, InteractiveEffects, KeyStroke, LogCollectorCap, PromptKind,
+    PromptRequest, StatusCollectorCap, SystemKernel, clipboard_get, clipboard_set, log_event,
+    parse_key_sequence, status_emit
+}
+use @ext_document.{
+    Buffer, BufferKind, EditorWorld, FloatingWindow, InlineSpanDecor, MinibufferRichItem, Pos,
+    register_document_extension, require_editor_world
+}
+use @ext_window.{WindowManager, register_window_extension, require_window_manager}
+use @ext_minibuffer.{
+    MinibufferController, lookup_command_keybinding, minibuffer_handle_key, open_prompt_view,
+    register_minibuffer_extension, require_minibuffer_controller, score_candidate,
+    score_candidate_with_positions
+}
+use @ext_render.{
+    ThemePalette, catppuccin_mocha_theme, compose_frame, register_render_extension
+}
+use @ext_vim.{VimMode, VimState, register_vim_extension, require_vim_state, vim_handle_key}
+use @ext_emacs.{EmacsState, emacs_handle_key, register_emacs_extension}
+
+fn assert_true(cond: bool, msg: String) {
+    if not cond {
+        panic("ASSERTION FAILED: " ++ msg)
+    }
+}
+
+fn assert_eq_str(actual: String, expected: String, label: String) {
+    if actual != expected {
+        panic(
+            "ASSERT_EQ_STR FAILED [" ++ label ++ "]\n  actual:   `" ++ actual ++
+            "`\n  expected: `" ++ expected ++ "`"
+        )
+    }
+}
+
+fn assert_eq_i64(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        panic(
+            "ASSERT_EQ_I64 FAILED [" ++ label ++ "]: actual=" ++ actual.to_string() ++
+            ", expected=" ++ expected.to_string()
+        )
+    }
+}
+
+fn setup_rich_runtime() -> (SystemKernel, EditorWorld, WindowManager, MinibufferController, VimState) {
+    mock_enable(true)
+    let kernel = SystemKernel.new()
+    let _ = register_document_extension(kernel) ! { e => panic("doc reg: " ++ e) }
+    let _ = register_window_extension(kernel) ! { e => panic("win reg: " ++ e) }
+    let _ = register_render_extension(kernel) ! { e => panic("render reg: " ++ e) }
+    let _ = register_minibuffer_extension(kernel) ! { e => panic("mb reg: " ++ e) }
+    let _ = register_vim_extension(kernel) ! { e => panic("vim reg: " ++ e) }
+    let _ = register_emacs_extension(kernel) ! { e => panic("emacs reg: " ++ e) }
+
+    -- Register representative plugin `ex:*` commands & leader keybindings to test discovery
+    let mock_ext = ExtId("lava.org/test_plugins")
+    kernel.register_extension(
+        mock_ext,
+        "lava.org",
+        "test_plugins",
+        "0.1.0",
+        "Mock plugin commands for Ex & keychord discovery.",
+        [],
+        |k: SystemKernel| -> !String Unit {
+            k.register_command(
+                "ex:Telescope",
+                mock_ext,
+                "Open Telescope fuzzy picker",
+                |_kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any { () },
+                interactive = false,
+            )
+            k.register_command(
+                "ex:ToggleTerm",
+                mock_ext,
+                "Toggle floating terminal",
+                |_kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any { () },
+                interactive = false,
+            )
+            k.ensure_keymap("vim:leader").bind("f f", "find-file", mock_ext, description = "Find file")
+            k.ensure_keymap("vim:normal").bind("-", "dired-jump", mock_ext, description = "Open parent dir")
+            ()
+        },
+        |_k: SystemKernel| -> !String Unit { () },
+    )
+
+    let _ = kernel.activate_all() ! { e => panic("activate_all: " ++ e) }
+    let world = require_editor_world(kernel) ! { e => panic(e) }
+    let wm = require_window_manager(kernel) ! { e => panic(e) }
+    let mb = require_minibuffer_controller(kernel) ! { e => panic(e) }
+    let vim = require_vim_state(kernel) ! { e => panic(e) }
+    wm.resize_viewport(1440, 900, world)
+    (kernel, world, wm, mb, vim)
+}
+
+fn sync_prompt_if_needed(kernel: SystemKernel, world: EditorWorld) {
+    let pending? = kernel.active_prompt else {
+        return
+    }
+    if not world.minibuffer_view.active {
+        let (req, _) = pending
+        open_prompt_view(kernel, req)
+    }
+}
+
+fn route_stroke_inner(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    st: KeyStroke,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String bool {
+    if kernel.active_prompt != null {
+        sync_prompt_if_needed(kernel, world)
+        return minibuffer_handle_key(kernel, st)#!
+    }
+    let emacs_opt = kernel.service("lava.emacs.state")
+    if emacs_opt != null {
+        let es = emacs_opt.as(EmacsState)
+        if (not es.pending_strokes.is_empty()) or es.universal_active {
+            let eh = emacs_handle_key(kernel, st)#!
+            sync_prompt_if_needed(kernel, world)
+            return eh
+        }
+    }
+    if world.options.evil_mode {
+        let handled = vim_handle_key(kernel, st)#!
+        sync_prompt_if_needed(kernel, world)
+        if handled {
+            return true
+        }
+    }
+    let eh = emacs_handle_key(kernel, st)#!
+    sync_prompt_if_needed(kernel, world)
+    eh
+}
+
+fn route_one_stroke(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    st: KeyStroke,
+    clip_cap: HostClipboardCap,
+    log_cap: LogCollectorCap,
+    status_cap: StatusCollectorCap,
+) {
+    let step: !String bool = (route_stroke_inner(kernel, world, st)#) # {
+        log_event(lvl, src, msg) => log_cap.record(lvl, src, msg),
+        status_emit(msg) => status_cap.emit(msg),
+        clipboard_get() => clip_cap.read_clip(),
+        clipboard_set(txt) => clip_cap.write_clip(txt),
+    }
+    let _ = step ! {
+        err => panic("route_one_stroke failed on `" ++ st.notation() ++ "`: " ++ err),
+    }
+    sync_prompt_if_needed(kernel, world)
+}
+
+fn send_keys(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    spec: String,
+    clip_cap: HostClipboardCap,
+    log_cap: LogCollectorCap,
+    status_cap: StatusCollectorCap,
+) {
+    let strokes = parse_key_sequence(spec)
+    for i in 0..strokes.len() {
+        let st = strokes.get(i.as(usize)).as(KeyStroke)
+        route_one_stroke(kernel, world, st, clip_cap, log_cap, status_cap)
+    }
+}
+
+fn send_text(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    text: String,
+    clip_cap: HostClipboardCap,
+    log_cap: LogCollectorCap,
+    status_cap: StatusCollectorCap,
+) {
+    let n = text.char_len()
+    for i in 0..n {
+        let ch = text.slice(i, i + 1)
+        let st = if ch == " " {
+            KeyStroke {
+                key: "Space",
+                ctrl: false,
+                alt: false,
+                shift_mod: false,
+                super_mod: false,
+                text: " ",
+            }
+        } else {
+            KeyStroke.plain(ch)
+        }
+        route_one_stroke(kernel, world, st, clip_cap, log_cap, status_cap)
+    }
+}
+
+fn find_rich_by_label(rich_items: List, target: String) -> ?MinibufferRichItem {
+    for i in 0..rich_items.len() {
+        let r = rich_items.get(i.as(usize)).as(MinibufferRichItem)
+        if r.label == target {
+            return r
+        }
+    }
+    null
+}
+
+fn has_cand_starting_with(items: List, prefix: String) -> bool {
+    for i in 0..items.len() {
+        let (c, _) = items.get(i.as(usize)).as((String, String))
+        if c.starts_with(prefix) {
+            return true
+        }
+    }
+    false
+}
+
+-- ============================================================================
+-- 1. Orderless Multi-Token + Acronym Fuzzy Scoring & Exact `match_indices`
+-- ============================================================================
+
+fn test_orderless_and_match_indices() {
+    -- Acronym boundary match: `"ff"` -> `"find-file"` at `[0, 5]`
+    let (sc_ff, pos_ff) = score_candidate_with_positions("ff", "find-file")
+    assert_true(sc_ff >= 500, "ff acronym score on find-file")
+    assert_eq_i64(pos_ff.len(), 2, "ff matched 2 char positions")
+    assert_eq_i64(pos_ff.get(0).as(i64), 0, "ff match index 0 == 0")
+    assert_eq_i64(pos_ff.get(1).as(i64), 5, "ff match index 1 == 5")
+
+    -- Multi-token out-of-order Emacs Orderless: `"file find"` matches `"find-file"`!
+    let (sc_oo, pos_oo) = score_candidate_with_positions("file find", "find-file")
+    assert_true(sc_oo > 0, "Orderless out-of-order 'file find' matches 'find-file'")
+    assert_eq_i64(pos_oo.len(), 8, "'file find' highlights all 8 matched letters in 'find-file'")
+    assert_eq_i64(pos_oo.get(0).as(i64), 0, "sorted index 0")
+    assert_eq_i64(pos_oo.get(4).as(i64), 5, "sorted index 4 (after '-')")
+    assert_eq_i64(score_candidate("file find", "find-buffer"), -1, "'file find' rejects 'find-buffer'")
+
+    -- Negation `!tok`: `"buf !scratch"` matches `"switch-to-buffer"` and rejects `"*scratch*-buf"`
+    assert_true(score_candidate("buf !scratch", "switch-to-buffer") > 0, "negation keeps switch-to-buffer")
+    assert_eq_i64(score_candidate("buf !scratch", "*scratch*-buf"), -1, "negation filters out *scratch*-buf")
+
+    -- Prefix anchor `^tok`: must start candidate or start after `/`
+    assert_true(score_candidate("^write", "write-file") > 0, "^write matches write-file")
+    assert_true(score_candidate("^write", "extensions/write_helper.ns") > 0, "^write matches after '/'")
+    assert_eq_i64(score_candidate("^write", "file-write"), -1, "^write rejects file-write")
+
+    -- Suffix anchor `tok$`: must end candidate
+    let (sc_suf, pos_suf) = score_candidate_with_positions("ns$", "src/lib.ns")
+    assert_true(sc_suf > 0, "ns$ matches src/lib.ns")
+    assert_eq_i64(pos_suf.len(), 2, "ns$ highlights 2 suffix chars")
+    assert_eq_i64(pos_suf.get(0).as(i64), 8, "ns$ index 8")
+    assert_eq_i64(pos_suf.get(1).as(i64), 9, "ns$ index 9")
+    assert_eq_i64(score_candidate("ns$", "src/ns_helper.txt"), -1, "ns$ rejects non-ns suffix")
+
+    -- Literal substring `=tok` (`orderless-literal`: contiguous literal substring, rejecting subsequence-only)
+    assert_true(score_candidate("=gleTe", "ToggleTerm") > 0, "=gleTe literal substring matches ToggleTerm")
+    assert_true(score_candidate("tgl", "ToggleTerm") > 0, "unprefixed tgl matches ToggleTerm via fuzzy subsequence")
+    assert_eq_i64(score_candidate("=tgl", "ToggleTerm"), -1, "=tgl literal substring rejects non-contiguous subsequence")
+
+    -- Multi-tier ordering preserved
+    let s_exact = score_candidate("write", "write")
+    let s_prefix = score_candidate("write", "write-file")
+    let s_sub = score_candidate("write", "over-write-all")
+    let s_subseq = score_candidate("wrt", "write-file")
+    assert_true(s_exact > s_prefix and s_prefix > s_sub and s_sub > s_subseq, "tier hierarchy intact")
+
+    println("[PASS] test_orderless_and_match_indices")
+}
+
+-- ============================================================================
+-- 2. Context-Aware `:` Ex Completion (Stage 1 & Stage 2) + Literal `<Return>` + Consult Previews
+-- ============================================================================
+
+fn test_ex_completion_stages_and_consult_previews() {
+    let (kernel, world, _wm, _mb, vim) = setup_rich_runtime()
+    let clip_cap = HostClipboardCap {}
+    let log_cap = LogCollectorCap.new()
+    let status_cap = StatusCollectorCap.new()
+
+    let tmp_base = fs.temp_file_path(prefix = "lava_mb_rich_") ! { _ => "/tmp/lava_mb_rich_fallback" }
+    let _ = fs.remove(tmp_base) ! { _ => () }
+    let tmp_dir = tmp_base ++ "_ws"
+    let sub_dir = path.join(tmp_dir, "pkg_sub")
+    let save_target = path.join(tmp_dir, "saved_literal.ns")
+    let readme_file = path.join(tmp_dir, "README.md")
+    let inner_file = path.join(sub_dir, "mod.ns")
+
+    let _ = fs.create_dir_all(sub_dir) ! { _ => panic("mkdir sub_dir") }
+    defer {
+        let _ = fs.remove_dir_all(tmp_dir) ! { _ => () }
+    }
+    let _ = fs.write_string(readme_file, "# Lava Rich Minibuffer\nSecond line of docs\n") ! { _ => panic("write readme") }
+    let _ = fs.write_string(inner_file, "pub fn answer() -> i64 = 99\n") ! { _ => panic("write inner") }
+    let _ = fs.write_string(save_target, "alpha one\nalpha two\n") ! { _ => panic("write save_target") }
+
+    world.cwd = tmp_dir
+    let main_buf = (world.open_file(save_target) # {
+        log_event(l, s, m) => log_cap.record(l, s, m),
+        status_emit(m) => status_cap.emit(m),
+        clipboard_get() => clip_cap.read_clip(),
+        clipboard_set(t) => clip_cap.write_clip(t),
+    }) ! { e => panic("open save_target: " ++ e) }
+    kernel.emit_hook("buffer-switched", main_buf.id)
+
+    let other_buf = world.create_buffer(
+        "notes_preview.md",
+        BufferKind.File,
+        file_path = readme_file,
+        major_mode = "markdown",
+        initial_lines = ["# Preview Buffer", "Consult switches live!"],
+    )
+    other_buf.modified = true
+    let _ = world.switch_to_buffer(main_buf.id)
+    assert_true(vim.mode == VimMode.Normal, "starts in Evil Normal mode")
+
+    -- 2a. Open `:` -> Stage 1 lists built-in Ex verbs + `ex:*` plugin commands + mode badge `"EX :"`
+    send_keys(kernel, world, ":", clip_cap, log_cap, status_cap)
+    assert_true(world.minibuffer_view.active, "`:` activates minibuffer")
+    assert_eq_str(world.minibuffer_mode_badge, "EX :", "`:` sets EX : mode badge")
+    assert_true(world.minibuffer_hint_bar.contains("Tab:complete"), "hint bar populated")
+    assert_true(world.minibuffer_view.total_matches >= 45, "Stage 1 Ex has >= 45 verbs & commands")
+    assert_true(find_rich_by_label(world.minibuffer_rich_items, "Telescope") != null, "ex:Telescope stripped to Telescope")
+    assert_true(find_rich_by_label(world.minibuffer_rich_items, "ToggleTerm") != null, "ex:ToggleTerm stripped to ToggleTerm")
+
+    -- 2b. CRITICAL Literal Submission Rule: typing `:w` + `<Return>` WITHOUT `<Tab>` submits `"w"` literally!
+    main_buf.set_lines(["alpha edited", "alpha two"], record_undo = true)
+    assert_true(main_buf.modified, "main_buf marked modified before :w")
+    send_text(kernel, world, "w", clip_cap, log_cap, status_cap)
+    assert_true(world.minibuffer_view.items.len() >= 2, ":w has multiple completions (w, write, wq, wqa)")
+    send_keys(kernel, world, "<Return>", clip_cap, log_cap, status_cap)
+    assert_true(not world.minibuffer_view.active, ":w<Return> closed minibuffer")
+    assert_true(not main_buf.modified, ":w<Return> saved buffer literally without selecting wqa/write")
+    let saved_disk = fs.read_to_string(save_target) ! { _ => "" }
+    assert_true(saved_disk.contains("alpha edited"), ":w wrote edited content to disk")
+
+    -- Also verify literal `:s/alpha/omega/g<Return>` without `<Tab>` runs substitution untouched!
+    send_keys(kernel, world, ":", clip_cap, log_cap, status_cap)
+    send_text(kernel, world, "%s/alpha/omega/g", clip_cap, log_cap, status_cap)
+    send_keys(kernel, world, "<Return>", clip_cap, log_cap, status_cap)
+    assert_eq_str(main_buf.line_at(0), "omega edited", "literal :%s/alpha/omega/g executed untouched")
+    assert_eq_str(main_buf.line_at(1), "omega two", "literal :%s row 1 updated")
+
+    -- 2c. `:Tel` + `<Tab>` -> `"Telescope "` (with trailing space!) -> Stage 2 picker subcommands!
+    send_keys(kernel, world, ":", clip_cap, log_cap, status_cap)
+    send_text(kernel, world, "Tel", clip_cap, log_cap, status_cap)
+    assert_true(has_cand_starting_with(world.minibuffer_view.items, "Telescope"), ":Tel matches Telescope")
+    send_keys(kernel, world, "<Tab>", clip_cap, log_cap, status_cap)
+    assert_eq_str(world.minibuffer_view.input_text, "Telescope ", "<Tab> completed verb 'Telescope ' with space")
+    assert_true(
+        has_cand_starting_with(world.minibuffer_view.items, "Telescope find_files"),
+        "Stage 2 lists Telescope find_files",
+    )
+    assert_true(
+        has_cand_starting_with(world.minibuffer_view.items, "Telescope live_grep"),
+        "Stage 2 lists Telescope live_grep",
+    )
+    send_keys(kernel, world, "<Escape>", clip_cap, log_cap, status_cap)
+
+    -- 2d. `:e` + `<Tab>` -> `"e "` -> Stage 2 file/dir Marginalia (permissions, sizes, badges) + `<Tab>` dir descent!
+    send_keys(kernel, world, ":", clip_cap, log_cap, status_cap)
+    send_text(kernel, world, "e", clip_cap, log_cap, status_cap)
+    send_keys(kernel, world, "<Tab>", clip_cap, log_cap, status_cap)
+    assert_eq_str(world.minibuffer_view.input_text, "e ", "<Tab> on 'e' transitioned to 'e '")
+    assert_eq_i64(world.minibuffer_view.items.len(), 3, "Stage 2 `:e ` lists pkg_sub/, README.md, saved_literal.ns")
+
+    let dir_rich = world.minibuffer_rich_items.get(0).as(MinibufferRichItem)
+    assert_eq_str(dir_rich.kind_badge, "[dir]", "Stage 2 dir badge is [dir]")
+    assert_true(dir_rich.label.ends_with("pkg_sub/"), "directory sorts first in `:e `")
+    assert_true(dir_rich.marginalia.contains("drwxr-xr-x"), "dir marginalia includes drwxr-xr-x")
+
+    let readme_rich_opt = find_rich_by_label(world.minibuffer_rich_items, "e README.md")
+    assert_true(readme_rich_opt != null, "e README.md in rich items")
+    let readme_rich = readme_rich_opt.as(MinibufferRichItem)
+    assert_eq_str(readme_rich.kind_badge, "[md]", "README.md gets [md] badge")
+    assert_true(readme_rich.marginalia.contains("-rw-r--r--"), "file marginalia includes -rw-r--r--")
+    assert_true(readme_rich.marginalia.contains("B"), "file marginalia includes human size")
+
+    -- `<Tab>` on selected `pkg_sub/` descends into `e pkg_sub/` and lists `mod.ns`!
+    send_keys(kernel, world, "<Tab>", clip_cap, log_cap, status_cap)
+    assert_true(world.minibuffer_view.input_text.ends_with("pkg_sub/"), "<Tab> descended into e pkg_sub/")
+    assert_eq_i64(world.minibuffer_view.items.len(), 1, "inside pkg_sub/ lists 1 file (mod.ns)")
+    -- `<M-BackSpace>` pops `pkg_sub/` back up to `e `!
+    send_keys(kernel, world, "<M-BackSpace>", clip_cap, log_cap, status_cap)
+    assert_eq_i64(world.minibuffer_view.items.len(), 3, "<M-BackSpace> in `:e ` popped back to parent dir")
+    send_keys(kernel, world, "<Escape>", clip_cap, log_cap, status_cap)
+
+    -- 2e. `:b ` Stage 2 buffer completion + Consult live buffer preview + `<Escape>` restoration!
+    assert_true(world.active_buffer_id == main_buf.id, "active buffer is main_buf before :b")
+    send_keys(kernel, world, ":", clip_cap, log_cap, status_cap)
+    send_text(kernel, world, "b ", clip_cap, log_cap, status_cap)
+    assert_true(has_cand_starting_with(world.minibuffer_view.items, "b notes_preview.md"), ":b lists notes_preview.md")
+    let notes_rich_opt = find_rich_by_label(world.minibuffer_rich_items, "b notes_preview.md")
+    assert_true(notes_rich_opt != null, "b notes_preview.md rich item present")
+    assert_true(notes_rich_opt.as(MinibufferRichItem).marginalia.contains("[+]"), "modified [+] shown in buffer Marginalia")
+    assert_true(notes_rich_opt.as(MinibufferRichItem).marginalia.contains("markdown"), "major_mode shown in buffer Marginalia")
+
+    -- Type `"notes"` -> Consult previews `other_buf` live in `world.active_buffer_id`!
+    send_text(kernel, world, "notes", clip_cap, log_cap, status_cap)
+    assert_true(world.active_buffer_id == other_buf.id, "Consult live buffer preview switched active_buffer_id")
+    -- Cancel via `<Escape>` -> restores `main_buf.id`!
+    send_keys(kernel, world, "<Escape>", clip_cap, log_cap, status_cap)
+    assert_true(world.active_buffer_id == main_buf.id, "<Escape> restored original active_buffer_id")
+
+    -- 2f. `:colo ` / `:colorscheme ` Consult live theme preview + `<Escape>` restore!
+    assert_eq_str(world.options.theme_name, "catppuccin-mocha", "initial theme is catppuccin-mocha")
+    send_keys(kernel, world, ":", clip_cap, log_cap, status_cap)
+    send_text(kernel, world, "color", clip_cap, log_cap, status_cap)
+    send_keys(kernel, world, "<Tab>", clip_cap, log_cap, status_cap)
+    assert_eq_str(world.minibuffer_view.input_text, "colorscheme ", ":color<Tab> expanded to 'colorscheme '")
+    send_text(kernel, world, "gruv", clip_cap, log_cap, status_cap)
+    assert_eq_str(world.options.theme_name, "gruvbox-dark", "Consult live theme preview set gruvbox-dark")
+    send_keys(kernel, world, "<Escape>", clip_cap, log_cap, status_cap)
+    assert_eq_str(world.options.theme_name, "catppuccin-mocha", "<Escape> restored original theme catppuccin-mocha")
+
+    -- Now `:set ` showing live option values in Marginalia + `:term ` shell completion
+    world.options.tabstop = 2
+    world.options.relativenumber = true
+    send_keys(kernel, world, ":", clip_cap, log_cap, status_cap)
+    send_text(kernel, world, "set rel", clip_cap, log_cap, status_cap)
+    assert_true(world.minibuffer_rich_items.len() >= 1, ":set rel matched relativenumber")
+    let set_rich = world.minibuffer_rich_items.get(0).as(MinibufferRichItem)
+    assert_eq_str(set_rich.kind_badge, "[opt]", ":set uses [opt] badge")
+    assert_true(set_rich.marginalia.contains("relativenumber=true"), ":set relativenumber Marginalia shows live value")
+    send_keys(kernel, world, "<Escape>", clip_cap, log_cap, status_cap)
+
+    send_keys(kernel, world, ":", clip_cap, log_cap, status_cap)
+    send_text(kernel, world, "term ", clip_cap, log_cap, status_cap)
+    assert_true(has_cand_starting_with(world.minibuffer_view.items, "term /bin/bash"), ":term lists /bin/bash")
+    send_keys(kernel, world, "<Escape>", clip_cap, log_cap, status_cap)
+
+    println("[PASS] test_ex_completion_stages_and_consult_previews")
+}
+
+-- ============================================================================
+-- 3. `M-x` Keychord Discovery (`lookup_command_keybinding`), History Boost & Marginalia
+-- ============================================================================
+
+fn test_mx_keybinding_discovery_and_history_boost() {
+    let (kernel, world, _wm, mb, _vim) = setup_rich_runtime()
+    let clip_cap = HostClipboardCap {}
+    let log_cap = LogCollectorCap.new()
+    let status_cap = StatusCollectorCap.new()
+
+    let ff_key = lookup_command_keybinding(kernel, "find-file")
+    assert_true(ff_key == "SPC f f" or ff_key == "C-x C-f", "find-file keybinding pill discovered: " ++ ff_key)
+    let mx_key = lookup_command_keybinding(kernel, "execute-extended-command")
+    assert_eq_str(mx_key, "M-x", "execute-extended-command keybinding pill is M-x")
+    let dj_key = lookup_command_keybinding(kernel, "dired-jump")
+    assert_eq_str(dj_key, "-", "vim:normal '-' keybinding pill discovered")
+
+    -- Record `"undo-tree-visualize"` in CommandName history and verify +250 recency boost puts it #1 on empty M-x!
+    mb.record_history(PromptKind.CommandName, "undo-tree-visualize")
+    send_keys(kernel, world, "<M-x>", clip_cap, log_cap, status_cap)
+    assert_true(world.minibuffer_view.active, "M-x opened CommandName minibuffer")
+    assert_eq_str(world.minibuffer_mode_badge, "M-x", "M-x mode badge")
+    let (top_cmd, _) = world.minibuffer_view.items.get(0).as((String, String))
+    assert_eq_str(top_cmd, "undo-tree-visualize", "history boost ranked undo-tree-visualize #1 on empty M-x")
+
+    let top_rich = world.minibuffer_rich_items.get(0).as(MinibufferRichItem)
+    assert_eq_str(top_rich.kind_badge, "[cmd]", "M-x candidate has [cmd] badge")
+    assert_true(top_rich.marginalia.contains("[recent]"), "recent command carries [recent] Marginalia tag")
+
+    -- Orderless multi-token query in M-x: `"file find"` matches `"find-file"`!
+    send_text(kernel, world, "file find", clip_cap, log_cap, status_cap)
+    let ff_rich_opt = find_rich_by_label(world.minibuffer_rich_items, "find-file")
+    assert_true(ff_rich_opt != null, "Orderless 'file find' matched find-file in M-x")
+    assert_true(ff_rich_opt.as(MinibufferRichItem).key_hint != "", "find-file rich item carries key_hint pill")
+    assert_eq_i64(ff_rich_opt.as(MinibufferRichItem).match_indices.len(), 8, "find-file rich item has 8 match_indices")
+    send_keys(kernel, world, "<Escape>", clip_cap, log_cap, status_cap)
+    assert_eq_str(world.minibuffer_mode_badge, "", "minibuffer_mode_badge cleared on close")
+    assert_eq_str(world.minibuffer_hint_bar, "", "minibuffer_hint_bar cleared on close")
+
+    println("[PASS] test_mx_keybinding_discovery_and_history_boost")
+}
+
+-- ============================================================================
+-- 4. `FilePath` Vertico Navigation (`~`, `<C-l>`, `<M-BS>`), 12-Row Rich Popup & Floating ANSI Spans/Cursor
+-- ============================================================================
+
+fn test_filepath_vertico_and_rich_render_scene() {
+    let (kernel, world, wm, _mb, _vim) = setup_rich_runtime()
+    let clip_cap = HostClipboardCap {}
+    let log_cap = LogCollectorCap.new()
+    let status_cap = StatusCollectorCap.new()
+
+    let tmp_base = fs.temp_file_path(prefix = "lava_vertico_") ! { _ => "/tmp/lava_vertico_fallback" }
+    let _ = fs.remove(tmp_base) ! { _ => () }
+    let root_dir = tmp_base ++ "_root"
+    let level1 = path.join(root_dir, "alpha")
+    let level2 = path.join(level1, "beta")
+    let leaf_ns = path.join(level2, "deep.ns")
+    let _ = fs.create_dir_all(level2) ! { _ => panic("mkdir level2") }
+    defer {
+        let _ = fs.remove_dir_all(root_dir) ! { _ => () }
+    }
+    let _ = fs.write_string(leaf_ns, "let deep = true\n") ! { _ => panic("write leaf_ns") }
+    -- Also create 15 sibling files in root_dir so `FilePath` has > 15 entries (testing 12-row popup + scrollbar!)
+    for idx in 0..15 {
+        let p = path.join(root_dir, "item_" ++ idx.to_string() ++ ".ns")
+        let _ = fs.write_string(p, "-- file " ++ idx.to_string() ++ "\n") ! { _ => panic("write item") }
+    }
+
+    world.cwd = root_dir
+    send_keys(kernel, world, "<C-x> <C-f>", clip_cap, log_cap, status_cap)
+    assert_true(world.minibuffer_view.active, "C-x C-f opened FilePath")
+    assert_eq_str(world.minibuffer_mode_badge, "FILE", "FilePath sets FILE badge")
+    assert_eq_i64(world.minibuffer_view.items.len(), 16, "root_dir has alpha/ + 15 .ns files")
+
+    -- Backwards-compatibility invariant: `world.minibuffer_view.items` keeps `"dir"` detail!
+    let (first_lbl, first_det) = world.minibuffer_view.items.get(0).as((String, String))
+    assert_true(first_lbl.ends_with("alpha/"), "alpha/ directory sorts first")
+    assert_eq_str(first_det, "dir", "world.minibuffer_view.items preserves 'dir' detail")
+
+    -- Render 12-row Vertico + Marginalia popup via `compose_frame`!
+    let pal: ThemePalette = catppuccin_mocha_theme()
+    -- Type `"it"` so match_indices highlights `i`, `t` across all 15 `item_*.ns` candidates!
+    send_text(kernel, world, "it", clip_cap, log_cap, status_cap)
+    assert_eq_i64(world.minibuffer_view.items.len(), 15, "'it' matches all 15 item_*.ns files")
+
+    let (_, cmds_popup) = compose_frame(kernel, world, wm)
+    var saw_file_pill = false
+    var saw_hdr = false
+    var saw_row_12 = false
+    var accent_ul_runs: i64 = 0
+    for ci in 0..cmds_popup.len() {
+        let cmd = cmds_popup.get(ci.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.TextRun(_, _, txt, _, _, col, bold, _, ul) => {
+                if txt == "[FILE]" {
+                    saw_file_pill = true
+                }
+                if txt.contains("[FILE] Completions (1/15)") {
+                    saw_hdr = true
+                }
+                if col == pal.accent and (not bold) and ul {
+                    accent_ul_runs += 1
+                }
+                -- `"item_*"` is split into highlighted `"it"` + unmatched `"em_*.ns"`!
+                if txt.contains("em_") {
+                    saw_row_12 = true
+                }
+            },
+            _ => (),
+        }
+    }
+    -- Count distinct `[ns]` badges rendered in the popup — must be 12 (not 8)!
+    var ns_badges_drawn: i64 = 0
+    for ci in 0..cmds_popup.len() {
+        let cmd = cmds_popup.get(ci.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.TextRun(_, _, txt, _, _, _, _, _, _) => {
+                if txt == "[ns]" {
+                    ns_badges_drawn += 1
+                }
+            },
+            _ => (),
+        }
+    }
+    assert_true(saw_file_pill, "echo bar rendered [FILE] mode pill")
+    assert_true(saw_hdr, "popup header rendered '[FILE] Completions (1/15)'")
+    assert_true(saw_row_12, "popup rendered item labels")
+    assert_eq_i64(ns_badges_drawn, 12, "Vertico popup rendered 12 visible rows")
+    assert_true(accent_ul_runs >= 12, "Orderless match_indices rendered non-bold underlined accent TextRuns")
+
+    -- Clear `"it"` with plain `<BackSpace>` twice (preserving 1-char deletion!), then descend `alpha/` -> `beta/`
+    send_keys(kernel, world, "<BackSpace> <BackSpace>", clip_cap, log_cap, status_cap)
+    assert_eq_i64(world.minibuffer_view.items.len(), 16, "plain BackSpace deleted 2 chars back to root_dir")
+
+    -- Descend via `<Tab>` into `alpha/`, then `<Tab>` into `beta/`
+    send_keys(kernel, world, "<Tab>", clip_cap, log_cap, status_cap)
+    assert_true(world.minibuffer_view.input_text.ends_with("alpha/"), "first Tab entered alpha/")
+    send_keys(kernel, world, "<Tab>", clip_cap, log_cap, status_cap)
+    assert_true(world.minibuffer_view.input_text.ends_with("alpha/beta/"), "second Tab entered alpha/beta/")
+
+    -- `<C-l>` pops one parent directory segment (`alpha/beta/` -> `alpha/`)!
+    send_keys(kernel, world, "<C-l>", clip_cap, log_cap, status_cap)
+    assert_true(world.minibuffer_view.input_text.ends_with("alpha/"), "<C-l> popped beta/ up to alpha/")
+    assert_true(not world.minibuffer_view.input_text.ends_with("beta/"), "<C-l> removed beta/")
+
+    -- `<M-BackSpace>` pops another parent directory segment (`alpha/` -> ``)!
+    send_keys(kernel, world, "<M-BackSpace>", clip_cap, log_cap, status_cap)
+    assert_eq_i64(world.minibuffer_view.items.len(), 16, "<M-BackSpace> popped alpha/ back to root_dir")
+
+    -- Test `~/` expansion when HOME is set (clear current path input with `<C-u>` first)
+    let home_dir = env.get_or("HOME", "")
+    if home_dir != "" and fs.is_dir(home_dir) {
+        send_keys(kernel, world, "<C-u>", clip_cap, log_cap, status_cap)
+        send_text(kernel, world, "~/", clip_cap, log_cap, status_cap)
+        assert_true(world.minibuffer_view.items.len() >= 1, "~/ expanded to $HOME entries")
+    }
+    send_keys(kernel, world, "<Escape>", clip_cap, log_cap, status_cap)
+
+    -- Finally, verify Floating Window ANSI `InlineSpanDecor` spans (`bg_rgba` + `fg_rgba` + bold) & `CursorCaret`!
+    let custom_fg = rgb(166, 227, 161)
+    let custom_bg = rgba(243, 139, 168, 120)
+    world.set_floating_window(FloatingWindow {
+        id: "ansi_term_float",
+        owner: "test_minibuffer_rich",
+        title: "ANSI Terminal Float",
+        anchor: "center",
+        width_cols: 60,
+        height_rows: 8,
+        lines: [
+            "$ cargo check --ok",
+            "PASS colored output line",
+        ],
+        selected_row: 1,
+        border_rgba: custom_fg,
+    })
+    world.floating_window_spans.insert("ansi_term_float", [
+        InlineSpanDecor {
+            owner: "term:bold",
+            row: 0,
+            start_col: 0,
+            end_col: 2,
+            bg_rgba: 0,
+            fg_rgba: custom_fg,
+            underline: false,
+            replace_label: "bold",
+        },
+        InlineSpanDecor {
+            owner: "term",
+            row: 1,
+            start_col: 0,
+            end_col: 4,
+            bg_rgba: custom_bg,
+            fg_rgba: custom_fg,
+            underline: true,
+            replace_label: "",
+        },
+    ])
+    world.floating_window_cursor.insert("ansi_term_float", Pos.new(1, 5))
+
+    let (_, cmds_float) = compose_frame(kernel, world, wm)
+    var saw_span_bg = false
+    var saw_span_fg_nobold = false
+    var saw_span_ul = false
+    var block_carets: i64 = 0
+    for ci in 0..cmds_float.len() {
+        let cmd = cmds_float.get(ci.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.FillRect(_, _, _, _, col, _) => {
+                if col == custom_bg {
+                    saw_span_bg = true
+                }
+            },
+            DrawCmd.TextRun(_, _, txt, _, _, col, bold, _, ul) => {
+                if txt == "$ " and col == custom_fg and (not bold) {
+                    saw_span_fg_nobold = true
+                }
+                if txt == "PASS" and col == custom_fg and (not bold) and ul {
+                    saw_span_ul = true
+                }
+            },
+            DrawCmd.CursorCaret(_, _, _, _, shape, _) => {
+                if shape == CaretShape.Block {
+                    block_carets += 1
+                }
+            },
+            _ => (),
+        }
+    }
+    assert_true(saw_span_bg, "floating window rendered InlineSpanDecor bg_rgba FillRect")
+    assert_true(saw_span_fg_nobold, "floating window rendered InlineSpanDecor fg_rgba + non-bold TextRun")
+    assert_true(saw_span_ul, "floating window rendered underlined ANSI span TextRun")
+    assert_true(block_carets >= 2, "floating window rendered its own Block CursorCaret alongside active pane caret")
+
+    println("[PASS] test_filepath_vertico_and_rich_render_scene")
+}
+
+fn main() {
+    test_orderless_and_match_indices()
+    test_ex_completion_stages_and_consult_previews()
+    test_mx_keybinding_discovery_and_history_boost()
+    test_filepath_vertico_and_rich_render_scene()
+    println("ALL RICH VERTICO + ORDERLESS + MARGINALIA + CONSULT MINIBUFFER TESTS PASSED!")
+}

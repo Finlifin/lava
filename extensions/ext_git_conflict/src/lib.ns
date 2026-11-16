@@ -1,0 +1,840 @@
+-- ext_git_conflict: Git Merge Conflict Detection, Highlighting & Resolution (`git-conflict.nvim`).
+-- Automatically scans buffers for 2-way and diff3 3-way conflict markers (`<<<<<<<`, `|||||||`,
+-- `=======`, `>>>>>>>`), decorates conflict regions with `InlineSpanDecor` + `GutterSign` +
+-- EOL `VirtualTextDecor`, and provides navigation (`]x`/`[x`), resolution (`ours`/`theirs`/
+-- `both`/`none`), and workspace-wide quickfix listing (`:GitConflictListQf`).
+
+use std.collections.{HashMap, Set}
+use std.fs
+use std.path
+use @lava_sys.rgba
+use @lava_core.{ExtId, InteractiveEffects, SystemKernel, status_emit}
+use @lava_accel.{NativeConflictHit, accel_doc_scan_conflicts, accel_workspace_files}
+use @ext_document.{
+    Buffer, BufferId, EditorWorld, Pos, QuickfixEntry, ext_document_id, require_editor_world
+}
+use @ext_vim.{KEYMAP_VIM_LEADER, KEYMAP_VIM_NORMAL, ext_vim_id}
+
+pub const SERVICE_GIT_CONFLICT: String = "lava.git_conflict.state"
+pub const OWNER_GIT_CONFLICT: String = "ext_git_conflict"
+pub const CONFLICT_HINT_TEXT: String = "  [Conflict: co=ours, ct=theirs, cb=both, c0=none]"
+
+pub fn ext_git_conflict_id() -> ExtId = ExtId("lava.org/ext_git_conflict")
+
+fn rgba_hex(hex_rgb: i64, alpha: i64) -> i64 {
+    let r = (hex_rgb / 65536) % 256
+    let g = (hex_rgb / 256) % 256
+    let b = hex_rgb % 256
+    rgba(r, g, b, alpha)
+}
+
+fn max_i64(a: i64, b: i64) -> i64 {
+    if a >= b { a } else { b }
+}
+
+fn min_i64(a: i64, b: i64) -> i64 {
+    if a <= b { a } else { b }
+}
+
+pub struct ConflictBlock {
+    pub start_row: i64,
+    pub base_row: i64,
+    pub sep_row: i64,
+    pub end_row: i64,
+    pub ours_label: String,
+    pub base_label: String,
+    pub theirs_label: String,
+}
+
+impl ConflictBlock {
+    pub fn contains_row(self, row: i64) -> bool {
+        row >= self.start_row and row <= self.end_row
+    }
+
+    pub fn ours_end_row(self) -> i64 {
+        if self.base_row >= 0 { self.base_row } else { self.sep_row }
+    }
+}
+
+pub struct GitConflictState {
+    pub conflicts_by_buf: HashMap,
+    pub last_ver_by_buf: HashMap,
+}
+
+impl GitConflictState {
+    pub fn new() -> GitConflictState {
+        GitConflictState {
+            conflicts_by_buf: HashMap.new(),
+            last_ver_by_buf: HashMap.new(),
+        }
+    }
+
+    pub fn conflicts_for(self, buf_id: BufferId) -> List {
+        let entry? = self.conflicts_by_buf.get(buf_id) else {
+            return List()
+        }
+        entry.as(List)
+    }
+
+    pub fn conflict_count(self, buf_id: BufferId) -> i64 {
+        self.conflicts_for(buf_id).len()
+    }
+}
+
+pub fn require_git_conflict_state(kernel: SystemKernel) -> !String GitConflictState {
+    let raw = kernel.require_service(SERVICE_GIT_CONFLICT)!
+    raw.as(GitConflictState)
+}
+
+fn is_ours_marker(line: String) -> bool {
+    line == "<<<<<<<" or line.starts_with("<<<<<<< ")
+}
+
+fn is_base_marker(line: String) -> bool {
+    line == "|||||||" or line.starts_with("||||||| ")
+}
+
+fn is_sep_marker(line: String) -> bool {
+    line == "=======" or line.starts_with("======= ")
+}
+
+fn is_theirs_marker(line: String) -> bool {
+    line == ">>>>>>>" or line.starts_with(">>>>>>> ")
+}
+
+fn marker_label(line: String, fallback: String) -> String {
+    if line.char_len() <= 7 {
+        return fallback
+    }
+    let rest = line.drop(7).trim()
+    if rest == "" { fallback } else { rest }
+}
+
+pub fn scan_conflict_blocks(lines: List) -> List {
+    let blocks = List()
+    let total = lines.len()
+    var i: i64 = 0
+    while i < total {
+        let line = lines.get(i.as(usize)).as(String)
+        if not is_ours_marker(line) {
+            i += 1
+        } else {
+            var start_row = i
+            var base_row: i64 = -1
+            var sep_row: i64 = -1
+            var end_row: i64 = -1
+            var r = i + 1
+            while r < total {
+                let cur = lines.get(r.as(usize)).as(String)
+                if is_ours_marker(cur) {
+                    -- Restart from the nested/new `<<<<<<<` if previous one had no closing `>>>>>>>`
+                    start_row = r
+                    base_row = -1
+                    sep_row = -1
+                } else if is_base_marker(cur) and sep_row < 0 and base_row < 0 {
+                    base_row = r
+                } else if is_sep_marker(cur) and sep_row < 0 {
+                    sep_row = r
+                } else if is_theirs_marker(cur) and sep_row >= 0 {
+                    end_row = r
+                    break
+                }
+                r += 1
+            }
+            if end_row >= 0 and sep_row > start_row {
+                let start_line = lines.get(start_row.as(usize)).as(String)
+                let base_lbl = if base_row >= 0 {
+                    marker_label(lines.get(base_row.as(usize)).as(String), "base")
+                } else {
+                    ""
+                }
+                let end_line = lines.get(end_row.as(usize)).as(String)
+                blocks.push(ConflictBlock {
+                    start_row: start_row,
+                    base_row: base_row,
+                    sep_row: sep_row,
+                    end_row: end_row,
+                    ours_label: marker_label(start_line, "ours"),
+                    base_label: base_lbl,
+                    theirs_label: marker_label(end_line, "theirs"),
+                })
+                i = end_row + 1
+            } else {
+                i = start_row + 1
+            }
+        }
+    }
+    blocks
+}
+
+fn decorate_conflict_blocks(buf: Buffer, blocks: List) {
+    buf.clear_owner_decors(OWNER_GIT_CONFLICT)
+    buf.vars.insert("git_conflict_count", blocks.len())
+    if blocks.is_empty() {
+        return
+    }
+
+    let ours_hdr_bg = rgba_hex(0x204838, 220)
+    let ours_hdr_fg = rgba_hex(0x9ECE6A, 255)
+    let ours_body_bg = rgba_hex(0x1D362C, 150)
+    let base_hdr_bg = rgba_hex(0x3B3424, 210)
+    let base_hdr_fg = rgba_hex(0xE0AF68, 255)
+    let base_body_bg = rgba_hex(0x2E291D, 140)
+    let sep_bg = rgba_hex(0x34384E, 200)
+    let sep_fg = rgba_hex(0xA9B1D6, 255)
+    let theirs_body_bg = rgba_hex(0x1E2F4D, 150)
+    let theirs_hdr_bg = rgba_hex(0x243E66, 220)
+    let theirs_hdr_fg = rgba_hex(0x7AA2F7, 255)
+    let sign_fg = rgba_hex(0xF7768E, 255)
+    let virt_fg = rgba_hex(0xE0AF68, 235)
+
+    for bi in 0..blocks.len() {
+        let blk = blocks.get(bi.as(usize)).as(ConflictBlock)
+        let ours_end = blk.ours_end_row()
+
+        -- Ours header (`<<<<<<< ...`)
+        let start_span_end = max_i64(1, buf.line_char_len(blk.start_row))
+        buf.add_inline_decor(
+            OWNER_GIT_CONFLICT,
+            blk.start_row,
+            0,
+            start_span_end,
+            bg_rgba = ours_hdr_bg,
+            fg_rgba = ours_hdr_fg,
+        )
+        buf.add_virt_text(
+            OWNER_GIT_CONFLICT,
+            blk.start_row,
+            CONFLICT_HINT_TEXT,
+            virt_fg,
+            italic = true,
+        )
+
+        -- Ours body lines
+        for r in (blk.start_row + 1)..ours_end {
+            let end_col = max_i64(1, buf.line_char_len(r))
+            buf.add_inline_decor(OWNER_GIT_CONFLICT, r, 0, end_col, bg_rgba = ours_body_bg)
+        }
+
+        -- Optional diff3 base header & body (`||||||| ...`)
+        if blk.base_row >= 0 {
+            let base_span_end = max_i64(1, buf.line_char_len(blk.base_row))
+            buf.add_inline_decor(
+                OWNER_GIT_CONFLICT,
+                blk.base_row,
+                0,
+                base_span_end,
+                bg_rgba = base_hdr_bg,
+                fg_rgba = base_hdr_fg,
+            )
+            for r in (blk.base_row + 1)..blk.sep_row {
+                let end_col = max_i64(1, buf.line_char_len(r))
+                buf.add_inline_decor(OWNER_GIT_CONFLICT, r, 0, end_col, bg_rgba = base_body_bg)
+            }
+        }
+
+        -- Separator (`=======`)
+        let sep_span_end = max_i64(1, buf.line_char_len(blk.sep_row))
+        buf.add_inline_decor(
+            OWNER_GIT_CONFLICT,
+            blk.sep_row,
+            0,
+            sep_span_end,
+            bg_rgba = sep_bg,
+            fg_rgba = sep_fg,
+        )
+
+        -- Theirs body lines
+        for r in (blk.sep_row + 1)..blk.end_row {
+            let end_col = max_i64(1, buf.line_char_len(r))
+            buf.add_inline_decor(OWNER_GIT_CONFLICT, r, 0, end_col, bg_rgba = theirs_body_bg)
+        }
+
+        -- Theirs footer (`>>>>>>> ...`)
+        let end_span_end = max_i64(1, buf.line_char_len(blk.end_row))
+        buf.add_inline_decor(
+            OWNER_GIT_CONFLICT,
+            blk.end_row,
+            0,
+            end_span_end,
+            bg_rgba = theirs_hdr_bg,
+            fg_rgba = theirs_hdr_fg,
+        )
+
+        -- Gutter warning sign `"!"` across the conflict block
+        for r in blk.start_row..(blk.end_row + 1) {
+            buf.add_sign(OWNER_GIT_CONFLICT, r, "!", sign_fg, priority = 25)
+        }
+    }
+}
+
+pub fn refresh_buffer_conflicts(state: GitConflictState, buf: Buffer, .force: bool = false) {
+    buf.sync_external_lines()
+    if not force {
+        let prev_ver_opt = state.last_ver_by_buf.get(buf.id)
+        if prev_ver_opt != null and prev_ver_opt.as(i64) == buf.edit_version {
+            return
+        }
+    }
+    state.last_ver_by_buf.insert(buf.id, buf.edit_version)
+    let raw_hits = accel_doc_scan_conflicts(buf.doc_id, 500)
+    let blocks = List()
+    for i in 0..raw_hits.len() {
+        let hit = raw_hits.get(i.as(usize)).as(NativeConflictHit)
+        let base_lbl = if hit.base_row >= 0 {
+            marker_label(buf.line_at(hit.base_row), "base")
+        } else {
+            ""
+        }
+        blocks.push(ConflictBlock {
+            start_row: hit.start_row,
+            base_row: hit.base_row,
+            sep_row: hit.sep_row,
+            end_row: hit.end_row,
+            ours_label: hit.ours_label,
+            base_label: base_lbl,
+            theirs_label: hit.theirs_label,
+        })
+    }
+    state.conflicts_by_buf.insert(buf.id, blocks)
+    decorate_conflict_blocks(buf, blocks)
+}
+
+fn replace_conflict_in_buffer(
+    buf: Buffer,
+    start_row: i64,
+    end_row: i64,
+    chosen: List,
+) -> !String Unit {
+    let old_total = buf.line_count()
+    let del_count = end_row - start_row + 1
+    if start_row <= 0 and del_count >= old_total {
+        let _ = buf.delete_lines(0, old_total - 1)!
+        if not chosen.is_empty() {
+            buf.set_line_at(0, chosen.get(0).as(String))
+            if chosen.len() > 1 {
+                let tail = List()
+                for i in 1..chosen.len() {
+                    tail.push(chosen.get(i.as(usize)).as(String))
+                }
+                let _ = buf.insert_lines_below(0, tail)!
+            }
+        }
+        return ()
+    }
+
+    let del_hi = min_i64(old_total - 1, end_row)
+    let reached_eof = end_row >= old_total - 1
+    let _ = buf.delete_lines(start_row, del_hi)!
+    if not chosen.is_empty() {
+        if reached_eof {
+            let _ = buf.insert_lines_below(start_row - 1, chosen)!
+        } else {
+            let _ = buf.insert_lines_above(start_row, chosen)!
+        }
+    }
+    ()
+}
+
+fn find_conflict_at_row(blocks: List, row: i64) -> ?ConflictBlock {
+    for i in 0..blocks.len() {
+        let blk = blocks.get(i.as(usize)).as(ConflictBlock)
+        if blk.contains_row(row) {
+            return blk
+        }
+    }
+    null
+}
+
+fn resolve_conflict_with_strategy(
+    kernel: SystemKernel,
+    strategy: String,
+) -> #InteractiveEffects !String bool {
+    let world = require_editor_world(kernel)!
+    let state = require_git_conflict_state(kernel)!
+    let buf = world.active_buffer()
+    buf.ensure_writable()!
+
+    refresh_buffer_conflicts(state, buf)
+    let blocks = state.conflicts_for(buf.id)
+    let blk? = find_conflict_at_row(blocks, buf.point.row) else {
+        status_emit("No git conflict under cursor")#
+        return false
+    }
+
+    let ours_end = blk.ours_end_row()
+    let ours_lines = List()
+    for r in (blk.start_row + 1)..ours_end {
+        ours_lines.push(buf.line_at(r))
+    }
+    let theirs_lines = List()
+    for r in (blk.sep_row + 1)..blk.end_row {
+        theirs_lines.push(buf.line_at(r))
+    }
+
+    let chosen = List()
+    if strategy == "ours" or strategy == "both" {
+        for i in 0..ours_lines.len() {
+            chosen.push(ours_lines.get(i.as(usize)).as(String))
+        }
+    }
+    if strategy == "theirs" or strategy == "both" {
+        for i in 0..theirs_lines.len() {
+            chosen.push(theirs_lines.get(i.as(usize)).as(String))
+        }
+    }
+
+    replace_conflict_in_buffer(buf, blk.start_row, blk.end_row, chosen)!
+    buf.modified = true
+    let target_row = if blk.start_row > buf.max_row() { buf.max_row() } else { blk.start_row }
+    buf.point = buf.clamp_pos(Pos.new(target_row, 0), insert_mode = false)
+    buf.checkpoint(buf.point, "git-conflict-" ++ strategy)
+
+    refresh_buffer_conflicts(state, buf, force = true)
+    kernel.emit_hook("buffer-modified", buf.id)
+
+    let remaining = state.conflict_count(buf.id)
+    status_emit(
+        "Conflict resolved (" ++ strategy ++ ") — " ++ remaining.to_string() ++ " remaining",
+    )#
+    true
+}
+
+fn jump_conflict(kernel: SystemKernel, forward: bool) -> #InteractiveEffects !String bool {
+    let world = require_editor_world(kernel)!
+    let state = require_git_conflict_state(kernel)!
+    let buf = world.active_buffer()
+    refresh_buffer_conflicts(state, buf)
+    let blocks = state.conflicts_for(buf.id)
+    let total = blocks.len()
+    if total == 0 {
+        status_emit("No git conflicts in buffer")#
+        return false
+    }
+
+    var chosen_idx: i64 = -1
+    if forward {
+        for i in 0..total {
+            let blk = blocks.get(i.as(usize)).as(ConflictBlock)
+            if blk.start_row > buf.point.row {
+                chosen_idx = i
+                break
+            }
+        }
+        if chosen_idx < 0 {
+            chosen_idx = 0
+        }
+    } else {
+        var i = total - 1
+        while i >= 0 {
+            let blk = blocks.get(i.as(usize)).as(ConflictBlock)
+            if blk.start_row < buf.point.row {
+                chosen_idx = i
+                break
+            }
+            i -= 1
+        }
+        if chosen_idx < 0 {
+            chosen_idx = total - 1
+        }
+    }
+
+    let target_blk = blocks.get(chosen_idx.as(usize)).as(ConflictBlock)
+    world.jumps.record(buf.id, buf.file_path, buf.point)
+    buf.point = buf.clamp_pos(Pos.new(target_blk.start_row, 0), insert_mode = false)
+    kernel.emit_hook("cursor-moved", buf.id)
+    status_emit(
+        "Conflict (" ++ (chosen_idx + 1).to_string() ++ "/" ++ total.to_string() ++ "): "
+        ++ target_blk.ours_label ++ " vs " ++ target_blk.theirs_label,
+    )#
+    true
+}
+
+fn world_buffers(world: EditorWorld) -> List {
+    let out = List()
+    for i in 0..world.buffer_order.len() {
+        let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+        let b_opt = world.buffer(bid)
+        if b_opt != null {
+            out.push(b_opt.as(Buffer))
+        }
+    }
+    out
+}
+
+fn populate_conflicts_quickfix(kernel: SystemKernel) -> #InteractiveEffects !String i64 {
+    let world = require_editor_world(kernel)!
+    let state = require_git_conflict_state(kernel)!
+    let entries = List()
+    let seen_paths = Set.new()
+
+    -- 1. Scan all open buffers first (reflecting unsaved in-memory edits)
+    let open_bufs = world_buffers(world)
+    for bi in 0..open_bufs.len() {
+        let b = open_bufs.get(bi.as(usize)).as(Buffer)
+        refresh_buffer_conflicts(state, b)
+        let blocks = state.conflicts_for(b.id)
+        if b.file_path != "" {
+            seen_paths.insert(path.normalize(b.file_path))
+        }
+        for ci in 0..blocks.len() {
+            let blk = blocks.get(ci.as(usize)).as(ConflictBlock)
+            entries.push(QuickfixEntry {
+                file_path: b.file_path,
+                row: blk.start_row,
+                col: 0,
+                text: "[" ++ b.name ++ "] Conflict: " ++ blk.ours_label ++ " vs " ++ blk.theirs_label,
+            })
+        }
+    }
+
+    -- 2. Scan workspace files on disk not currently open
+    if world.cwd != "" and fs.is_dir(world.cwd) {
+        let rel_files = accel_workspace_files(world.cwd, max_files = 5000, include_hidden = false)
+        for fi in 0..rel_files.len() {
+            let rel = rel_files.get(fi.as(usize)).as(String)
+            let full = path.normalize(path.join(world.cwd, rel))
+            if not seen_paths.contains(full) {
+                seen_paths.insert(full)
+                let content_res = fs.read_to_string(full)
+                content_res match {
+                    raw! => {
+                        if raw.contains("<<<<<<<") and raw.contains(">>>>>>>") {
+                            let file_lines = raw.replace("\r\n", "\n").split("\n")
+                            let blocks = scan_conflict_blocks(file_lines)
+                            for ci in 0..blocks.len() {
+                                let blk = blocks.get(ci.as(usize)).as(ConflictBlock)
+                                entries.push(QuickfixEntry {
+                                    file_path: full,
+                                    row: blk.start_row,
+                                    col: 0,
+                                    text: "[" ++ rel ++ "] Conflict: "
+                                        ++ blk.ours_label ++ " vs " ++ blk.theirs_label,
+                                })
+                            }
+                        }
+                    },
+                    error _ => (),
+                }
+            }
+        }
+    }
+
+    world.quickfix = entries
+    world.quickfix_idx = if entries.is_empty() { -1 } else { 0 }
+    world.quickfix_title = "Git Conflicts"
+    status_emit("Git conflicts quickfix: " ++ entries.len().to_string() ++ " conflict(s)")#
+    entries.len()
+}
+
+fn sync_payload_or_active(kernel: SystemKernel, payload: Any, force: bool) {
+    let world_opt = kernel.service("lava.document.world")
+    let state_opt = kernel.service(SERVICE_GIT_CONFLICT)
+    if world_opt == null or state_opt == null {
+        return
+    }
+    let world = world_opt.as(EditorWorld)
+    let state = state_opt.as(GitConflictState)
+    if payload matches _: BufferId {
+        let bid = payload.as(BufferId)
+        let b_opt = world.buffer(bid)
+        if b_opt != null {
+            refresh_buffer_conflicts(state, b_opt.as(Buffer), force = force)
+            return
+        }
+    }
+    refresh_buffer_conflicts(state, world.active_buffer(), force = force)
+}
+
+pub fn register_git_conflict_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_git_conflict_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_git_conflict",
+        "0.1.0",
+        "Git merge conflict highlighter, hunk jumper, and 1-key ours/theirs/both/none resolver.",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let state = GitConflictState.new()
+            k.publish_service(SERVICE_GIT_CONFLICT, ext_id, state)
+
+            -- Scan any buffers already open at activation time
+            let world_opt = k.service("lava.document.world")
+            if world_opt != null {
+                let world = world_opt.as(EditorWorld)
+                let bufs = world_buffers(world)
+                for i in 0..bufs.len() {
+                    refresh_buffer_conflicts(state, bufs.get(i.as(usize)).as(Buffer), force = true)
+                }
+            }
+
+            -- Lifecycle hooks (including cursor/mode/insert hooks to catch multi-step edits & undos)
+            k.add_hook(
+                "buffer-opened",
+                ext_id,
+                |kern: SystemKernel, payload: Any| {
+                    sync_payload_or_active(kern, payload, true)
+                },
+            )
+            k.add_hook(
+                "buffer-switched",
+                ext_id,
+                |kern: SystemKernel, payload: Any| {
+                    sync_payload_or_active(kern, payload, false)
+                },
+            )
+            k.add_hook(
+                "buffer-modified",
+                ext_id,
+                |kern: SystemKernel, payload: Any| {
+                    sync_payload_or_active(kern, payload, false)
+                },
+            )
+            k.add_hook(
+                "buffer-saved",
+                ext_id,
+                |kern: SystemKernel, payload: Any| {
+                    sync_payload_or_active(kern, payload, false)
+                },
+            )
+            k.add_hook(
+                "cursor-moved",
+                ext_id,
+                |kern: SystemKernel, payload: Any| {
+                    sync_payload_or_active(kern, payload, false)
+                },
+            )
+            k.add_hook(
+                "mode-changed",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| {
+                    sync_payload_or_active(kern, (), false)
+                },
+            )
+            k.add_hook(
+                "after-insert-stroke",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| {
+                    let w_opt = kern.service("lava.document.world")
+                    if w_opt != null and w_opt.as(EditorWorld).active_buffer().line_count() > 2000 {
+                        return
+                    }
+                    sync_payload_or_active(kern, (), false)
+                },
+            )
+            k.add_hook(
+                "vim-yank",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| {
+                    sync_payload_or_active(kern, (), false)
+                },
+            )
+
+            -- Navigation commands
+            k.register_command(
+                "git-conflict-next",
+                ext_id,
+                "Jump to the next git merge conflict block in the active buffer.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    jump_conflict(kern, true)#!
+                },
+            )
+            k.register_command(
+                "git-conflict-prev",
+                ext_id,
+                "Jump to the previous git merge conflict block in the active buffer.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    jump_conflict(kern, false)#!
+                },
+            )
+            k.register_command(
+                "ex:GitConflictNextConflict",
+                ext_id,
+                "Ex command `:GitConflictNextConflict`.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    jump_conflict(kern, true)#!
+                },
+                interactive = false,
+            )
+            k.register_command(
+                "ex:GitConflictPrevConflict",
+                ext_id,
+                "Ex command `:GitConflictPrevConflict`.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    jump_conflict(kern, false)#!
+                },
+                interactive = false,
+            )
+
+            -- Resolution commands (`ours`, `theirs`, `both`, `none`) + Ex command aliases
+            k.register_command(
+                "git-conflict-ours",
+                ext_id,
+                "Resolve git conflict under cursor by keeping OURS (current/HEAD side).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    resolve_conflict_with_strategy(kern, "ours")#!
+                },
+            )
+            k.register_command(
+                "git-conflict-choose-ours",
+                ext_id,
+                "Alias for `git-conflict-ours` (`:GitConflictChooseOurs`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    resolve_conflict_with_strategy(kern, "ours")#!
+                },
+                interactive = false,
+            )
+            k.register_command(
+                "ex:GitConflictChooseOurs",
+                ext_id,
+                "Ex command `:GitConflictChooseOurs`.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    resolve_conflict_with_strategy(kern, "ours")#!
+                },
+                interactive = false,
+            )
+
+            k.register_command(
+                "git-conflict-theirs",
+                ext_id,
+                "Resolve git conflict under cursor by keeping THEIRS (incoming side).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    resolve_conflict_with_strategy(kern, "theirs")#!
+                },
+            )
+            k.register_command(
+                "git-conflict-choose-theirs",
+                ext_id,
+                "Alias for `git-conflict-theirs` (`:GitConflictChooseTheirs`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    resolve_conflict_with_strategy(kern, "theirs")#!
+                },
+                interactive = false,
+            )
+            k.register_command(
+                "ex:GitConflictChooseTheirs",
+                ext_id,
+                "Ex command `:GitConflictChooseTheirs`.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    resolve_conflict_with_strategy(kern, "theirs")#!
+                },
+                interactive = false,
+            )
+
+            k.register_command(
+                "git-conflict-both",
+                ext_id,
+                "Resolve git conflict under cursor by keeping BOTH sides (ours followed by theirs).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    resolve_conflict_with_strategy(kern, "both")#!
+                },
+            )
+            k.register_command(
+                "git-conflict-choose-both",
+                ext_id,
+                "Alias for `git-conflict-both` (`:GitConflictChooseBoth`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    resolve_conflict_with_strategy(kern, "both")#!
+                },
+                interactive = false,
+            )
+            k.register_command(
+                "ex:GitConflictChooseBoth",
+                ext_id,
+                "Ex command `:GitConflictChooseBoth`.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    resolve_conflict_with_strategy(kern, "both")#!
+                },
+                interactive = false,
+            )
+
+            k.register_command(
+                "git-conflict-none",
+                ext_id,
+                "Resolve git conflict under cursor by keeping NONE (removing both sides).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    resolve_conflict_with_strategy(kern, "none")#!
+                },
+            )
+            k.register_command(
+                "git-conflict-choose-none",
+                ext_id,
+                "Alias for `git-conflict-none` (`:GitConflictChooseNone`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    resolve_conflict_with_strategy(kern, "none")#!
+                },
+                interactive = false,
+            )
+            k.register_command(
+                "ex:GitConflictChooseNone",
+                ext_id,
+                "Ex command `:GitConflictChooseNone`.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    resolve_conflict_with_strategy(kern, "none")#!
+                },
+                interactive = false,
+            )
+
+            -- Quickfix list population
+            k.register_command(
+                "git-conflict-qf",
+                ext_id,
+                "Populate the quickfix list with all git merge conflicts across buffers and workspace.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    populate_conflicts_quickfix(kern)#!
+                },
+            )
+            k.register_command(
+                "git-conflict-list-qf",
+                ext_id,
+                "Alias for `git-conflict-qf` (`:GitConflictListQf`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    populate_conflicts_quickfix(kern)#!
+                },
+                interactive = false,
+            )
+            k.register_command(
+                "ex:GitConflictListQf",
+                ext_id,
+                "Ex command `:GitConflictListQf`.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    populate_conflicts_quickfix(kern)#!
+                },
+                interactive = false,
+            )
+
+            -- Normal keymap bindings (`]x` / `[x`, plus `c o` operator-fallback chord;
+            -- NOTE: never bind `ct`, `cb`, `c0` in Normal mode so Vim motions stay intact!)
+            let norm_km = k.ensure_keymap(KEYMAP_VIM_NORMAL)
+            norm_km.bind("] x", "git-conflict-next", ext_id, description = "Next git conflict")
+            norm_km.bind("[ x", "git-conflict-prev", ext_id, description = "Previous git conflict")
+            norm_km.bind("c o", "git-conflict-ours", ext_id, description = "Conflict choose ours")
+
+            -- Leader keybindings (`<Space> c o/t/b/0/q` and `<Space> g o/t/B/0/q`)
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> c o", "git-conflict-ours", ext_id, description = "Conflict choose ours")
+            leader_km.bind("<Space> c t", "git-conflict-theirs", ext_id, description = "Conflict choose theirs")
+            leader_km.bind("<Space> c b", "git-conflict-both", ext_id, description = "Conflict choose both")
+            leader_km.bind("<Space> c 0", "git-conflict-none", ext_id, description = "Conflict choose none")
+            leader_km.bind("<Space> c q", "git-conflict-qf", ext_id, description = "Conflicts to quickfix")
+            leader_km.bind("<Space> g o", "git-conflict-ours", ext_id, description = "Conflict choose ours")
+            leader_km.bind("<Space> g t", "git-conflict-theirs", ext_id, description = "Conflict choose theirs")
+            leader_km.bind("<Space> g B", "git-conflict-both", ext_id, description = "Conflict choose both")
+            leader_km.bind("<Space> g 0", "git-conflict-none", ext_id, description = "Conflict choose none")
+            leader_km.bind("<Space> g q", "git-conflict-qf", ext_id, description = "Conflicts to quickfix")
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let world_opt = k.service("lava.document.world")
+            if world_opt != null {
+                let world = world_opt.as(EditorWorld)
+                let bufs = world_buffers(world)
+                for i in 0..bufs.len() {
+                    bufs.get(i.as(usize)).as(Buffer).clear_owner_decors(OWNER_GIT_CONFLICT)
+                }
+            }
+            ()
+        },
+    )
+}

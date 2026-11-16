@@ -1,0 +1,10 @@
+[package]
+name = "srv_exec"
+domain = "lava.server"
+version = "0.1.0"
+type = "lib"
+description = "Server-side command execution, executable discovery, and host sysinfo RPCs."
+
+[dependencies]
+"lava.server/server_sys" = { path = "../../packages/server_sys" }
+"lava.server/server_core" = { path = "../../packages/server_core" }

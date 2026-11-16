@@ -1,0 +1,10 @@
+[package]
+name = "test_core_doc"
+domain = "lava.org"
+version = "0.1.0"
+type = "exe"
+
+[dependencies]
+"lava.org/lava_sys" = { path = "../../packages/lava_sys" }
+"lava.org/lava_core" = { path = "../../packages/lava_core" }
+"lava.org/ext_document" = { path = "../../extensions/ext_document" }

@@ -1,0 +1,4603 @@
+-- ext_vim: Evil-Vim Modal Editing Extension (`lava.org/ext_vim`) for Lava.
+-- Implements Normal, Insert, Replace, Visual (Char, Line, Rectangular Block), and Operator-Pending modes,
+-- full motions, nested text objects, registers, dot-repeat, macros, `<Space>` leader keymap, and Ex engine.
+
+pub mod motions
+pub mod text_objects
+pub mod ex_cmd
+
+use std.fs
+use @lava_sys.CaretShape
+use @lava_core.{
+    ExtId, InteractiveEffects, KeyBindingEntry, KeyLookup, KeyStroke, Keymap, PromptKind,
+    PromptRequest, ServiceEffects, SystemKernel, ask_prompt, clipboard_get, clipboard_set,
+    format_chord, log_event, parse_key_sequence, status_emit
+}
+use @ext_document.{
+    Buffer, BufferId, EditorWorld, JumpEntry, NarrowRegion, Pos, QuickfixEntry, RegisterValue, Span,
+    VisualKind, VisualSelection, ext_document_id, require_editor_world
+}
+use motions.{
+    MotionShape, MotionTarget, file_target_under_cursor, infer_effective_indent, last_non_blank_col,
+    line_indent_cols, motion_find_char_in_line, motion_indent_next_boundary,
+    motion_indent_prev_boundary, motion_match_bracket, motion_paragraph_next, motion_paragraph_prev,
+    motion_viewport_line, motion_word_backward, motion_word_end, motion_word_end_backward,
+    motion_word_forward, reverse_char_find_kind, word_under_cursor
+}
+use text_objects.{
+    TextObjectRange, enclosing_parent_indent, indent_block_bounds, is_text_object_target,
+    resolve_text_object, same_line_enclosing_spans, text_obj_indent_at_level
+}
+pub use ex_cmd.execute_ex_command
+
+pub const SERVICE_VIM: String = "lava.vim.state"
+pub const KEYMAP_VIM_LEADER: String = "vim-leader"
+pub const KEYMAP_VIM_NORMAL: String = "vim-normal"
+pub const KEYMAP_VIM_VISUAL: String = "vim-visual"
+pub const KEYMAP_VIM_INSERT: String = "vim-insert"
+
+pub fn ext_vim_id() -> ExtId = ExtId("lava.org/ext_vim")
+
+pub enum VimMode {
+    pub Normal,
+    pub Insert,
+    pub Replace,
+    pub VisualChar,
+    pub VisualLine,
+    pub VisualBlock,
+    pub OperatorPending(op: String),
+}
+derive Eq, PartialEq, Display for VimMode
+
+struct ReplaceStep {
+    pos: Pos,
+    overwritten: String,
+    was_append: bool,
+}
+
+struct SavedRegionState {
+    mode: VimMode,
+    anchor: Pos,
+    point: Pos,
+    emacs_mark_active: bool,
+}
+
+struct ExpandCandidate {
+    mode: VimMode,
+    anchor: Pos,
+    point: Pos,
+    cov_start: Pos,
+    cov_end: Pos,
+}
+
+pub struct ModalInterceptor {
+    pub owner: String,
+    pub handler: fn(SystemKernel, KeyStroke) -> #ServiceEffects !String bool,
+}
+
+pub struct InsertInterceptor {
+    pub owner: ExtId,
+    pub handler: fn(SystemKernel, KeyStroke) -> #ServiceEffects !String bool,
+}
+
+pub struct VimState {
+    pub mode: VimMode,
+    pub count1: i64,
+    pub count2: i64,
+    pub active_reg: String,
+    pub pending_prefix: String,
+    pub pending_visual_replace: bool,
+    pub leader_strokes: List,
+    pub plugin_strokes: List,
+    pub modal_interceptor: ?ModalInterceptor,
+    pub insert_interceptors: List,
+    pub last_paste_buf_id: ?BufferId,
+    pub last_paste_span: ?Span,
+    pub last_paste_linewise: bool,
+    pub visual_anchor: Pos,
+    pub visual_dollar: bool,
+    pub has_last_visual: bool,
+    pub last_visual_mode: VimMode,
+    pub last_visual_anchor: Pos,
+    pub last_visual_point: Pos,
+    pub last_char_find: ?(String, String),
+    pub last_jump_origin: ?Pos,
+    pub last_sub_pattern: String,
+    pub last_sub_rep: String,
+    pub last_sub_flags: String,
+    pub replace_stack: List,
+    pub block_insert_active: bool,
+    pub block_insert_pad: bool,
+    pub block_insert_eol: bool,
+    pub block_insert_start_row: i64,
+    pub block_insert_end_row: i64,
+    pub block_insert_col: i64,
+    pub block_insert_text: String,
+    pub recording_change: bool,
+    pub tentative_visual_change: bool,
+    pub change_count: i64,
+    pub change_reg: String,
+    pub change_strokes: List,
+    pub last_change_count: i64,
+    pub last_change_reg: String,
+    pub last_change_strokes: List,
+    pub replaying_dot: bool,
+    pub macro_depth: i64,
+    pub region_stack: List,
+    pub region_origin: Pos,
+    pub last_expand_mode: VimMode,
+    pub last_expand_anchor: Pos,
+    pub last_expand_point: Pos,
+}
+
+impl VimState {
+    pub fn new() -> VimState {
+        VimState {
+            mode: VimMode.Normal,
+            count1: 0,
+            count2: 0,
+            active_reg: "",
+            pending_prefix: "",
+            pending_visual_replace: false,
+            leader_strokes: List(),
+            plugin_strokes: List(),
+            modal_interceptor: null,
+            insert_interceptors: List(),
+            last_paste_buf_id: null,
+            last_paste_span: null,
+            last_paste_linewise: false,
+            visual_anchor: Pos.zero(),
+            visual_dollar: false,
+            has_last_visual: false,
+            last_visual_mode: VimMode.VisualChar,
+            last_visual_anchor: Pos.zero(),
+            last_visual_point: Pos.zero(),
+            last_char_find: null,
+            last_jump_origin: null,
+            last_sub_pattern: "",
+            last_sub_rep: "",
+            last_sub_flags: "",
+            replace_stack: List(),
+            block_insert_active: false,
+            block_insert_pad: false,
+            block_insert_eol: false,
+            block_insert_start_row: 0,
+            block_insert_end_row: 0,
+            block_insert_col: 0,
+            block_insert_text: "",
+            recording_change: false,
+            tentative_visual_change: false,
+            change_count: 0,
+            change_reg: "",
+            change_strokes: List(),
+            last_change_count: 0,
+            last_change_reg: "",
+            last_change_strokes: List(),
+            replaying_dot: false,
+            macro_depth: 0,
+            region_stack: List(),
+            region_origin: Pos.zero(),
+            last_expand_mode: VimMode.Normal,
+            last_expand_anchor: Pos.zero(),
+            last_expand_point: Pos.zero(),
+        }
+    }
+
+    pub fn effective_count(self) -> i64 {
+        let c1 = if self.count1 > 0 { self.count1 } else { 1 }
+        let c2 = if self.count2 > 0 { self.count2 } else { 1 }
+        c1 * c2
+    }
+
+    pub fn has_explicit_count(self) -> bool {
+        self.count1 > 0 or self.count2 > 0
+    }
+
+    pub fn clear_transient(self) {
+        self.count1 = 0
+        self.count2 = 0
+        self.active_reg = ""
+        self.pending_prefix = ""
+        self.pending_visual_replace = false
+        self.leader_strokes = List()
+        self.plugin_strokes = List()
+    }
+
+    pub fn set_interceptor(
+        self,
+        owner: String,
+        handler: fn(SystemKernel, KeyStroke) -> #ServiceEffects !String bool,
+    ) {
+        self.modal_interceptor = ModalInterceptor {
+            owner: owner,
+            handler: handler,
+        }
+    }
+
+    pub fn clear_interceptor(self) {
+        self.modal_interceptor = null
+    }
+
+    pub fn add_insert_interceptor(
+        self,
+        owner: ExtId,
+        handler: fn(SystemKernel, KeyStroke) -> #ServiceEffects !String bool,
+    ) {
+        self.insert_interceptors.push(InsertInterceptor {
+            owner: owner,
+            handler: handler,
+        })
+    }
+
+    pub fn remove_insert_interceptors(self, owner: ExtId) {
+        let kept = List()
+        for i in 0..self.insert_interceptors.len() {
+            let item = self.insert_interceptors.get(i.as(usize)).as(InsertInterceptor)
+            if item.owner != owner {
+                kept.push(item)
+            }
+        }
+        self.insert_interceptors = kept
+    }
+}
+
+pub fn require_vim_state(kernel: SystemKernel) -> !String VimState {
+    let raw = kernel.require_service(SERVICE_VIM)!
+    raw.as(VimState)
+}
+
+fn clone_stroke_list(src: List) -> List {
+    let out = List()
+    for i in 0..src.len() {
+        out.push(src.get(i.as(usize)).as(KeyStroke))
+    }
+    out
+}
+
+fn begin_change(vim: VimState, initial_stroke: KeyStroke, .tentative_visual: bool = false) {
+    if vim.replaying_dot {
+        return
+    }
+    vim.recording_change = true
+    vim.tentative_visual_change = tentative_visual
+    vim.change_count = vim.count1
+    vim.change_reg = vim.active_reg
+    vim.change_strokes = [initial_stroke]
+}
+
+fn record_change_stroke(vim: VimState, stroke: KeyStroke) {
+    if vim.replaying_dot or not vim.recording_change {
+        return
+    }
+    vim.change_strokes.push(stroke)
+}
+
+fn commit_change(vim: VimState) {
+    if vim.replaying_dot {
+        return
+    }
+    if vim.recording_change and not vim.change_strokes.is_empty() {
+        vim.last_change_count = vim.change_count
+        vim.last_change_reg = vim.change_reg
+        vim.last_change_strokes = clone_stroke_list(vim.change_strokes)
+    }
+    vim.recording_change = false
+    vim.tentative_visual_change = false
+    vim.change_strokes = List()
+}
+
+fn abort_change(vim: VimState) {
+    if vim.replaying_dot {
+        return
+    }
+    vim.recording_change = false
+    vim.tentative_visual_change = false
+    vim.change_strokes = List()
+}
+
+pub fn sync_world_from_vim(world: EditorWorld, vim: VimState) {
+    let buf = world.active_buffer()
+    if not world.options.evil_mode {
+        world.mode_name = "EMACS"
+        world.caret_shape = CaretShape.Beam
+        world.visual = VisualSelection.none()
+        world.pending_keys_display = ""
+        world.which_key_items = List()
+        return
+    }
+
+    vim.mode match {
+        VimMode.Normal => {
+            world.mode_name = "NORMAL"
+            world.caret_shape = CaretShape.Block
+            world.visual = VisualSelection.none()
+        },
+        VimMode.Insert => {
+            world.mode_name = if vim.block_insert_active { "V-BLOCK INSERT" } else { "INSERT" }
+            world.caret_shape = CaretShape.Beam
+            world.visual = VisualSelection.none()
+        },
+        VimMode.Replace => {
+            world.mode_name = "REPLACE"
+            world.caret_shape = CaretShape.Underline
+            world.visual = VisualSelection.none()
+        },
+        VimMode.VisualChar => {
+            world.mode_name = "VISUAL"
+            world.caret_shape = CaretShape.Block
+            world.visual = VisualSelection {
+                kind: VisualKind.Char,
+                anchor: vim.visual_anchor,
+                cursor: buf.point,
+            }
+        },
+        VimMode.VisualLine => {
+            world.mode_name = "V-LINE"
+            world.caret_shape = CaretShape.Block
+            world.visual = VisualSelection {
+                kind: VisualKind.Line,
+                anchor: vim.visual_anchor,
+                cursor: buf.point,
+            }
+        },
+        VimMode.VisualBlock => {
+            world.mode_name = "V-BLOCK"
+            world.caret_shape = CaretShape.Block
+            world.visual = VisualSelection {
+                kind: VisualKind.Block,
+                anchor: vim.visual_anchor,
+                cursor: buf.point,
+            }
+        },
+        VimMode.OperatorPending(op) => {
+            world.mode_name = "OP-PENDING(" ++ op ++ ")"
+            world.caret_shape = CaretShape.Underline
+            world.visual = VisualSelection.none()
+        },
+    }
+
+    if not vim.leader_strokes.is_empty() {
+        world.pending_keys_display = format_chord(vim.leader_strokes)
+    } else if not vim.plugin_strokes.is_empty() {
+        world.pending_keys_display = format_chord(vim.plugin_strokes)
+    } else {
+        var disp = ""
+        if vim.active_reg != "" {
+            disp = disp ++ "\"" ++ vim.active_reg
+        }
+        if vim.count1 > 0 {
+            disp = disp ++ vim.count1.to_string()
+        }
+        vim.mode match {
+            VimMode.OperatorPending(op) => { disp = disp ++ op },
+            _ => (),
+        }
+        if vim.count2 > 0 {
+            disp = disp ++ vim.count2.to_string()
+        }
+        if vim.pending_prefix != "" {
+            disp = disp ++ vim.pending_prefix
+        }
+        world.pending_keys_display = disp
+        if vim.pending_prefix != "<C-w>" {
+            world.which_key_items = List()
+        }
+    }
+}
+
+fn is_visual_mode(mode: VimMode) -> bool {
+    mode == VimMode.VisualChar or mode == VimMode.VisualLine or mode == VimMode.VisualBlock
+}
+
+fn save_visual_marks(buf: Buffer, vim: VimState, anchor: Pos, cursor: Pos) {
+    let norm = Span.normalized(anchor, cursor)
+    buf.named_marks.insert("<", norm.start)
+    buf.named_marks.insert(">", norm.end)
+    if is_visual_mode(vim.mode) {
+        vim.has_last_visual = true
+        vim.last_visual_mode = vim.mode
+        vim.last_visual_anchor = anchor
+        vim.last_visual_point = cursor
+    }
+}
+
+fn stroke_printable_char(stroke: KeyStroke) -> String {
+    if stroke.ctrl or stroke.alt or stroke.super_mod {
+        return ""
+    }
+    if stroke.key == "Space" {
+        return " "
+    }
+    if stroke.text != "" and stroke.text.char_len() == 1 {
+        return stroke.text
+    }
+    if stroke.key.char_len() == 1 {
+        return stroke.key
+    }
+    ""
+}
+
+fn toggle_case_str(s: String) -> String {
+    let n = s.char_len()
+    var out = ""
+    for i in 0..n {
+        let ch = s.slice(i, i + 1)
+        if ch.is_uppercase() {
+            out = out ++ ch.to_lower()
+        } else if ch.is_lowercase() {
+            out = out ++ ch.to_upper()
+        } else {
+            out = out ++ ch
+        }
+    }
+    out
+}
+
+fn transform_case_str(s: String, mode_op: String) -> String {
+    when {
+        mode_op == "gU" => s.to_upper(),
+        mode_op == "gu" => s.to_lower(),
+        mode_op == "g~" => toggle_case_str(s),
+        else => s,
+    }
+}
+
+fn dispatch_optional_cmd(
+    kernel: SystemKernel,
+    cmd_name: String,
+    args: List,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String bool {
+    if kernel.get_command(cmd_name) == null {
+        return false
+    }
+    let _ = kernel.dispatch_command(cmd_name, args)#!
+    true
+}
+
+fn sort_key_hints(hints: List) -> List {
+    let copy = List()
+    for i in 0..hints.len() {
+        copy.push(hints.get(i.as(usize)).as(KeyBindingEntry))
+    }
+    copy.sort_by(|a: Any, b: Any| {
+        a.as(KeyBindingEntry).chord.cmp(b.as(KeyBindingEntry).chord)
+    })
+    copy
+}
+
+fn build_window_which_key_hints() -> List {
+    let eid = ext_vim_id()
+    [
+        KeyBindingEntry { chord: "<C-w> =", command_name: "balance-windows", owner: eid, description: "Balance window sizes" },
+        KeyBindingEntry { chord: "<C-w> c", command_name: "delete-window", owner: eid, description: "Close active window" },
+        KeyBindingEntry { chord: "<C-w> h", command_name: "window-focus-left", owner: eid, description: "Focus window left" },
+        KeyBindingEntry { chord: "<C-w> j", command_name: "window-focus-down", owner: eid, description: "Focus window down" },
+        KeyBindingEntry { chord: "<C-w> k", command_name: "window-focus-up", owner: eid, description: "Focus window up" },
+        KeyBindingEntry { chord: "<C-w> l", command_name: "window-focus-right", owner: eid, description: "Focus window right" },
+        KeyBindingEntry { chord: "<C-w> o", command_name: "delete-other-windows", owner: eid, description: "Keep only active window" },
+        KeyBindingEntry { chord: "<C-w> s", command_name: "split-window-below", owner: eid, description: "Split window horizontally" },
+        KeyBindingEntry { chord: "<C-w> v", command_name: "split-window-right", owner: eid, description: "Split window vertically" },
+        KeyBindingEntry { chord: "<C-w> w", command_name: "other-window", owner: eid, description: "Cycle focus to next window" },
+    ]
+}
+
+fn populate_default_leader_keymap(km: Keymap, owner: ExtId) {
+    km.bind("<Space> f f", "find-file", owner, description = "Find file")
+    km.bind("<Space> b b", "switch-to-buffer", owner, description = "Switch buffer")
+    km.bind("<Space> f s", "save-buffer", owner, description = "Save buffer")
+    km.bind("<Space> f g", "grep", owner, description = "Project grep")
+    km.bind("<Space> e", "dired", owner, description = "Open Dired directory editor")
+    km.bind("<Space> v", "indent-expand-region", owner, description = "Expand selection by syntax/indent")
+    km.bind("<Space> V", "indent-shrink-region", owner, description = "Shrink selection to previous step")
+    km.bind("<Space> w v", "split-window-right", owner, description = "Split window right")
+    km.bind("<Space> w s", "split-window-below", owner, description = "Split window below")
+    km.bind("<Space> w d", "delete-window", owner, description = "Delete window")
+    km.bind("<Space> h f", "describe-command", owner, description = "Describe command")
+    km.bind("<Space> h k", "describe-key", owner, description = "Describe key")
+    km.bind("<Space> u", "undo-tree-visualize", owner, description = "Visualize undo-tree")
+}
+
+-- ============================================================================
+-- Operator Execution on Linewise / Charwise Spans & Visual Selections
+-- ============================================================================
+
+fn strip_line_comment_for_indent(s: String) -> String {
+    let idx_slash = s.find("//")
+    var cut = if idx_slash != null { s.slice(0, idx_slash.as(i64)) } else { s }
+    let idx_dash = cut.find("--")
+    if idx_dash != null {
+        cut = cut.slice(0, idx_dash.as(i64))
+    }
+    cut.trim()
+}
+
+fn auto_indent_range(world: EditorWorld, buf: Buffer, lo: i64, hi: i64) -> !String Unit {
+    buf.ensure_writable()!
+    let sw = if world.options.shiftwidth >= 1 { world.options.shiftwidth } else { 4 }
+    let ts = if world.options.tabstop >= 1 { world.options.tabstop } else { 4 }
+    let min_r = buf.min_row()
+    for r in lo..(hi + 1) {
+        let raw = buf.line_at(r)
+        let trimmed = raw.trim_start()
+        if trimmed == "" {
+            if raw != "" {
+                buf.set_line_at(r, "")
+                buf.modified = true
+            }
+            continue
+        }
+        var pr = r - 1
+        while pr >= min_r and buf.line_at(pr).trim() == "" {
+            pr -= 1
+        }
+        var base_cols: i64 = 0
+        if pr >= min_r {
+            let prev_raw = buf.line_at(pr)
+            let prev_cols = line_indent_cols(prev_raw, ts)
+            let prev_code = strip_line_comment_for_indent(prev_raw)
+            let opens = prev_code.ends_with("{{")
+                or prev_code.ends_with("(")
+                or prev_code.ends_with("[")
+                or prev_code.ends_with(":")
+            base_cols = if opens { prev_cols + sw } else { prev_cols }
+        }
+        let closes = trimmed.starts_with("}}")
+            or trimmed.starts_with(")")
+            or trimmed.starts_with("]")
+        let target_cols = if closes {
+            if base_cols >= sw { base_cols - sw } else { 0 }
+        } else {
+            base_cols
+        }
+        let pad = if world.options.expandtab {
+            " ".repeat(target_cols)
+        } else {
+            "\t".repeat(target_cols / ts) ++ " ".repeat(target_cols % ts)
+        }
+        let updated = pad ++ trimmed
+        if updated != raw {
+            buf.set_line_at(r, updated)
+            buf.modified = true
+        }
+    }
+    ()
+}
+
+fn join_buffer_rows_capped(buf: Buffer, lo: i64, hi: i64) -> String {
+    let max_lines: i64 = 4000
+    let max_chars: i64 = 200000
+    let end_r = if hi - lo + 1 > max_lines { lo + max_lines - 1 } else { hi }
+    let lines = List()
+    var total_chars: i64 = 0
+    for r in lo..(end_r + 1) {
+        let ln = buf.line_at(r)
+        let c = ln.char_len()
+        if total_chars + c > max_chars and (not lines.is_empty()) {
+            break
+        }
+        lines.push(ln)
+        total_chars += c + 1
+    }
+    lines.join("\n") ++ "\n"
+}
+
+fn apply_operator_linewise(
+    world: EditorWorld,
+    buf: Buffer,
+    vim: VimState,
+    op: String,
+    r1: i64,
+    r2: i64,
+) -> #[status_emit, clipboard_set] !String Unit {
+    let lo = if r1 <= r2 { r1 } else { r2 }
+    let hi = if r1 <= r2 { r2 } else { r1 }
+    let line_cnt = hi - lo + 1
+    let reg = vim.active_reg
+
+    if op == "y" {
+        let txt = join_buffer_rows_capped(buf, lo, hi)
+        world.registers.yank_store(RegisterValue.lines(txt), reg = reg)#
+        buf.point = buf.clamp_pos(Pos.new(lo, buf.first_non_blank_col(lo)), insert_mode = false)
+        vim.mode = VimMode.Normal
+        vim.clear_transient()
+        abort_change(vim)
+        if line_cnt > 1 {
+            status_emit(line_cnt.to_string() ++ " lines yanked")#
+        }
+        return ()
+    }
+
+    if op == "d" {
+        let (next_p, removed) = buf.delete_lines(lo, hi)!
+        world.registers.delete_store(RegisterValue.lines(removed), world.kill_ring, reg = reg)#
+        buf.point = buf.clamp_pos(next_p, insert_mode = false)
+        buf.named_marks.insert(".", buf.point)
+        buf.checkpoint(buf.point, "vim-delete-lines")
+        vim.mode = VimMode.Normal
+        vim.clear_transient()
+        commit_change(vim)
+        if line_cnt > 1 {
+            status_emit(line_cnt.to_string() ++ " fewer lines")#
+        }
+        return ()
+    }
+
+    if op == "c" {
+        buf.ensure_writable()!
+        let indent_col = buf.first_non_blank_col(lo)
+        let indent_prefix = buf.line_at(lo).take(indent_col)
+        let removed = join_buffer_rows_capped(buf, lo, hi)
+        if hi > lo {
+            let _ = buf.delete_lines(lo + 1, hi)!
+        }
+        buf.set_line_at(lo, indent_prefix)
+        buf.modified = true
+        buf.point = Pos.new(lo, indent_prefix.char_len())
+        world.registers.delete_store(RegisterValue.lines(removed), world.kill_ring, reg = reg)#
+        vim.mode = VimMode.Insert
+        vim.clear_transient()
+        return ()
+    }
+
+    if op == ">" {
+        buf.indent_lines(lo, hi, world.options.shiftwidth, world.options.expandtab)!
+        buf.point = buf.clamp_pos(Pos.new(lo, buf.first_non_blank_col(lo)), insert_mode = false)
+        buf.named_marks.insert(".", buf.point)
+        buf.checkpoint(buf.point, "vim-indent")
+        vim.mode = VimMode.Normal
+        vim.clear_transient()
+        commit_change(vim)
+        return ()
+    }
+
+    if op == "<" {
+        buf.dedent_lines(lo, hi, world.options.shiftwidth)!
+        buf.point = buf.clamp_pos(Pos.new(lo, buf.first_non_blank_col(lo)), insert_mode = false)
+        buf.named_marks.insert(".", buf.point)
+        buf.checkpoint(buf.point, "vim-dedent")
+        vim.mode = VimMode.Normal
+        vim.clear_transient()
+        commit_change(vim)
+        return ()
+    }
+
+    if op == "=" {
+        auto_indent_range(world, buf, lo, hi)!
+        buf.point = buf.clamp_pos(Pos.new(lo, buf.first_non_blank_col(lo)), insert_mode = false)
+        buf.named_marks.insert(".", buf.point)
+        buf.checkpoint(buf.point, "vim-auto-indent")
+        vim.mode = VimMode.Normal
+        vim.clear_transient()
+        commit_change(vim)
+        return ()
+    }
+
+    if op == "gU" or op == "gu" or op == "g~" {
+        buf.ensure_writable()!
+        for r in lo..(hi + 1) {
+            buf.set_line_at(r, transform_case_str(buf.line_at(r), op))
+        }
+        buf.modified = true
+        buf.point = buf.clamp_pos(Pos.new(lo, buf.first_non_blank_col(lo)), insert_mode = false)
+        buf.named_marks.insert(".", buf.point)
+        buf.checkpoint(buf.point, "vim-case-lines")
+        vim.mode = VimMode.Normal
+        vim.clear_transient()
+        commit_change(vim)
+        return ()
+    }
+
+    vim.mode = VimMode.Normal
+    vim.clear_transient()
+    ()
+}
+
+fn apply_operator_span(
+    world: EditorWorld,
+    buf: Buffer,
+    vim: VimState,
+    op: String,
+    raw_span: Span,
+) -> #[status_emit, clipboard_set] !String Unit {
+    let norm = Span.normalized(
+        buf.clamp_pos(raw_span.start, insert_mode = true),
+        buf.clamp_pos(raw_span.end, insert_mode = true),
+    )
+    let reg = vim.active_reg
+
+    if op == "y" {
+        let txt = buf.extract_span(norm)
+        world.registers.yank_store(RegisterValue.chars(txt), reg = reg)#
+        buf.point = buf.clamp_pos(norm.start, insert_mode = false)
+        vim.mode = VimMode.Normal
+        vim.clear_transient()
+        abort_change(vim)
+        return ()
+    }
+
+    if op == "d" {
+        let (next_p, removed) = buf.delete_span(norm)!
+        world.registers.delete_store(RegisterValue.chars(removed), world.kill_ring, reg = reg)#
+        buf.point = buf.clamp_pos(next_p, insert_mode = false)
+        buf.named_marks.insert(".", buf.point)
+        buf.checkpoint(buf.point, "vim-delete")
+        vim.mode = VimMode.Normal
+        vim.clear_transient()
+        commit_change(vim)
+        return ()
+    }
+
+    if op == "c" {
+        let (next_p, removed) = buf.delete_span(norm)!
+        world.registers.delete_store(RegisterValue.chars(removed), world.kill_ring, reg = reg)#
+        buf.point = buf.clamp_pos(next_p, insert_mode = true)
+        vim.mode = VimMode.Insert
+        vim.clear_transient()
+        return ()
+    }
+
+    if op == ">" or op == "<" or op == "=" {
+        let end_r = if norm.end.col == 0 and norm.end.row > norm.start.row {
+            norm.end.row - 1
+        } else {
+            norm.end.row
+        }
+        return apply_operator_linewise(world, buf, vim, op, norm.start.row, end_r)#
+    }
+
+    if op == "gU" or op == "gu" or op == "g~" {
+        let orig = buf.extract_span(norm)
+        let converted = transform_case_str(orig, op)
+        let _ = buf.replace_span(norm, converted)!
+        buf.point = buf.clamp_pos(norm.start, insert_mode = false)
+        buf.named_marks.insert(".", buf.point)
+        buf.checkpoint(buf.point, "vim-case")
+        vim.mode = VimMode.Normal
+        vim.clear_transient()
+        commit_change(vim)
+        return ()
+    }
+
+    vim.mode = VimMode.Normal
+    vim.clear_transient()
+    ()
+}
+
+fn span_from_motion(buf: Buffer, start_pos: Pos, target: MotionTarget) -> Span {
+    if target.shape == MotionShape.Exclusive {
+        return Span.normalized(start_pos, target.pos)
+    }
+    -- Inclusive motion: include character at the higher endpoint
+    let lo = if start_pos <= target.pos { start_pos } else { target.pos }
+    let hi = if start_pos <= target.pos { target.pos } else { start_pos }
+    let hi_len = buf.line_char_len(hi.row)
+    let end_col = if hi.col < hi_len { hi.col + 1 } else { hi_len }
+    Span.normalized(lo, Pos.new(hi.row, end_col))
+}
+
+-- ============================================================================
+-- Visual Block (`<C-v>`) Rectangular Operations
+-- ============================================================================
+
+fn visual_block_bounds(buf: Buffer, vim: VimState) -> (i64, i64, i64, i64) {
+    let a = vim.visual_anchor
+    let b = buf.point
+    let r1 = if a.row <= b.row { a.row } else { b.row }
+    let r2 = if a.row <= b.row { b.row } else { a.row }
+    let c1 = if a.col <= b.col { a.col } else { b.col }
+    var c2 = if a.col <= b.col { b.col } else { a.col }
+    if vim.visual_dollar {
+        for r in r1..(r2 + 1) {
+            let llen = buf.line_char_len(r)
+            if llen > c2 {
+                c2 = llen
+            }
+        }
+    }
+    (r1, r2, c1, c2)
+}
+
+fn extract_and_optionally_delete_block(
+    buf: Buffer,
+    r1: i64,
+    r2: i64,
+    c1: i64,
+    c2: i64,
+    do_delete: bool,
+) -> !String String {
+    if do_delete {
+        buf.ensure_writable()!
+    }
+    let pieces = List()
+    for r in r1..(r2 + 1) {
+        let line = buf.line_at(r)
+        let llen = line.char_len()
+        let sc = if c1 < llen { c1 } else { llen }
+        let ec = if c2 + 1 < llen { c2 + 1 } else { llen }
+        pieces.push(line.slice(sc, ec))
+        if do_delete and sc < ec {
+            buf.set_line_at(r, line.slice(0, sc) ++ line.slice(ec, llen))
+            buf.modified = true
+        }
+    }
+    pieces.join("\n")
+}
+
+fn start_visual_block_insert(
+    buf: Buffer,
+    vim: VimState,
+    r1: i64,
+    r2: i64,
+    target_col: i64,
+    pad_spaces: bool,
+    .eol_mode: bool = false,
+) -> !String Unit {
+    buf.ensure_writable()!
+    let first_line = buf.line_at(r1)
+    let flen = first_line.char_len()
+    var actual_col = if eol_mode { flen } else { target_col }
+    if (not eol_mode) and flen < target_col {
+        if pad_spaces {
+            buf.set_line_at(r1, first_line ++ " ".repeat(target_col - flen))
+            buf.modified = true
+        } else {
+            actual_col = flen
+        }
+    }
+    vim.block_insert_active = true
+    vim.block_insert_pad = pad_spaces and (not eol_mode)
+    vim.block_insert_eol = eol_mode
+    vim.block_insert_start_row = r1
+    vim.block_insert_end_row = r2
+    vim.block_insert_col = target_col
+    vim.block_insert_text = ""
+    vim.visual_dollar = false
+    buf.point = Pos.new(r1, actual_col)
+    vim.mode = VimMode.Insert
+    vim.clear_transient()
+    ()
+}
+
+fn finish_visual_block_insert(buf: Buffer, vim: VimState) -> !String Unit {
+    if not vim.block_insert_active {
+        return ()
+    }
+    let txt = vim.block_insert_text
+    let r1 = vim.block_insert_start_row
+    let r2 = vim.block_insert_end_row
+    let tcol = vim.block_insert_col
+    let pad = vim.block_insert_pad
+    let eol_mode = vim.block_insert_eol
+    vim.block_insert_active = false
+    vim.block_insert_eol = false
+    vim.block_insert_text = ""
+
+    if txt == "" or r2 <= r1 {
+        return ()
+    }
+
+    let max_r = buf.max_row()
+    let end_r = if r2 <= max_r { r2 } else { max_r }
+    for r in (r1 + 1)..(end_r + 1) {
+        let line = buf.line_at(r)
+        if eol_mode {
+            buf.set_line_at(r, line ++ txt)
+            buf.modified = true
+            continue
+        }
+        let llen = line.char_len()
+        if llen < tcol {
+            if pad {
+                let padded = line ++ " ".repeat(tcol - llen) ++ txt
+                buf.set_line_at(r, padded)
+                buf.modified = true
+            } else {
+                buf.set_line_at(r, line ++ txt)
+                buf.modified = true
+            }
+        } else {
+            buf.set_line_at(r, line.slice(0, tcol) ++ txt ++ line.slice(tcol, llen))
+            buf.modified = true
+        }
+    }
+    ()
+}
+
+-- ============================================================================
+-- Paste (`p` / `P`) for Linewise, Blockwise & Charwise Registers
+-- ============================================================================
+
+fn execute_paste(
+    world: EditorWorld,
+    buf: Buffer,
+    vim: VimState,
+    after_cursor: bool,
+    count: i64,
+) -> #[clipboard_get, status_emit] !String Unit {
+    buf.ensure_writable()!
+    let val? = world.registers.get_reg(vim.active_reg)# else {
+        status_emit("Nothing in register")#
+        vim.clear_transient()
+        abort_change(vim)
+        return ()
+    }
+    let eff_count = if count > 0 { count } else { 1 }
+
+    if val.linewise {
+        let clean = if val.text.ends_with("\n") {
+            val.text.slice(0, val.text.char_len() - 1)
+        } else {
+            val.text
+        }
+        let single_lines = clean.split("\n")
+        let all_lines = List()
+        for _ in 0..eff_count {
+            for i in 0..single_lines.len() {
+                all_lines.push(single_lines.get(i.as(usize)).as(String))
+            }
+        }
+        let next_p = if after_cursor {
+            buf.insert_lines_below(buf.point.row, all_lines)!
+        } else {
+            buf.insert_lines_above(buf.point.row, all_lines)!
+        }
+        let pasted_end_r = next_p.row + all_lines.len() - 1
+        vim.last_paste_buf_id = buf.id
+        vim.last_paste_span = Span.normalized(
+            Pos.new(next_p.row, 0),
+            Pos.new(pasted_end_r, buf.line_char_len(pasted_end_r)),
+        )
+        vim.last_paste_linewise = true
+        buf.point = buf.clamp_pos(next_p, insert_mode = false)
+        buf.named_marks.insert(".", buf.point)
+        buf.checkpoint(buf.point, "vim-paste-lines")
+        vim.clear_transient()
+        commit_change(vim)
+        return ()
+    }
+
+    if val.blockwise {
+        vim.last_paste_buf_id = null
+        vim.last_paste_span = null
+        vim.last_paste_linewise = false
+        let block_rows = val.text.split("\n")
+        let cur_len = buf.line_char_len(buf.point.row)
+        let ins_col = if after_cursor and cur_len > 0 {
+            if buf.point.col + 1 <= cur_len { buf.point.col + 1 } else { cur_len }
+        } else {
+            buf.point.col
+        }
+        for i in 0..block_rows.len() {
+            let r = buf.point.row + i
+            while r >= buf.line_count() {
+                buf.push_line("")
+            }
+            let line = buf.line_at(r)
+            let llen = line.char_len()
+            let padded = if llen < ins_col {
+                line ++ " ".repeat(ins_col - llen)
+            } else {
+                line
+            }
+            let chunk = block_rows.get(i.as(usize)).as(String).repeat(eff_count)
+            buf.set_line_at(r, padded.slice(0, ins_col) ++ chunk ++ padded.slice(ins_col, padded.char_len()))
+        }
+        buf.modified = true
+        buf.point = buf.clamp_pos(Pos.new(buf.point.row, ins_col), insert_mode = false)
+        buf.named_marks.insert(".", buf.point)
+        buf.checkpoint(buf.point, "vim-paste-block")
+        vim.clear_transient()
+        commit_change(vim)
+        return ()
+    }
+
+    -- Charwise paste
+    let payload = val.text.repeat(eff_count)
+    if payload == "" {
+        vim.clear_transient()
+        abort_change(vim)
+        return ()
+    }
+    let cur_len = buf.line_char_len(buf.point.row)
+    let ins_pos = if after_cursor and cur_len > 0 {
+        let c = if buf.point.col + 1 <= cur_len { buf.point.col + 1 } else { cur_len }
+        Pos.new(buf.point.row, c)
+    } else {
+        Pos.new(buf.point.row, buf.point.col)
+    }
+    let end_p = buf.insert_text(ins_pos, payload)!
+    vim.last_paste_buf_id = buf.id
+    vim.last_paste_span = Span.normalized(ins_pos, end_p)
+    vim.last_paste_linewise = false
+    let landing_c = if end_p.col > 0 { end_p.col - 1 } else { 0 }
+    buf.point = buf.clamp_pos(Pos.new(end_p.row, landing_c), insert_mode = false)
+    buf.named_marks.insert(".", buf.point)
+    buf.checkpoint(buf.point, "vim-paste")
+    vim.clear_transient()
+    commit_change(vim)
+    ()
+}
+
+fn execute_visual_paste(
+    world: EditorWorld,
+    buf: Buffer,
+    vim: VimState,
+    overwrite_unnamed: bool,
+    count: i64,
+) -> #[clipboard_get, clipboard_set, status_emit] !String Unit {
+    buf.ensure_writable()!
+    let val? = world.registers.get_reg(vim.active_reg)# else {
+        status_emit("Nothing in register")#
+        vim.mode = VimMode.Normal
+        vim.visual_dollar = false
+        vim.clear_transient()
+        abort_change(vim)
+        return ()
+    }
+    let eff_count = if count > 0 { count } else { 1 }
+    let paste_text = val.text
+    let paste_linewise = val.linewise
+    let paste_blockwise = val.blockwise
+
+    let a = vim.visual_anchor
+    let b = buf.point
+    save_visual_marks(buf, vim, a, b)
+
+    if vim.mode == VimMode.VisualLine {
+        let r1 = if a.row <= b.row { a.row } else { b.row }
+        let r2 = if a.row <= b.row { b.row } else { a.row }
+        let removed_val = RegisterValue.lines(join_buffer_rows_capped(buf, r1, r2))
+        let clean = if paste_linewise and paste_text.ends_with("\n") {
+            paste_text.slice(0, paste_text.char_len() - 1)
+        } else {
+            paste_text
+        }
+        let body = if paste_linewise {
+            let chunks = List()
+            for _ in 0..eff_count {
+                chunks.push(clean)
+            }
+            chunks.join("\n")
+        } else {
+            clean.repeat(eff_count)
+        }
+        let sp = Span.normalized(Pos.new(r1, 0), Pos.new(r2, buf.line_char_len(r2)))
+        let _ = buf.replace_span(sp, body)!
+        buf.point = buf.clamp_pos(Pos.new(r1, buf.first_non_blank_col(r1)), insert_mode = false)
+        if overwrite_unnamed {
+            world.registers.delete_store(removed_val, world.kill_ring)#
+        }
+    } else if vim.mode == VimMode.VisualBlock {
+        let (r1, r2, c1, c2) = visual_block_bounds(buf, vim)
+        let removed_txt = extract_and_optionally_delete_block(buf, r1, r2, c1, c2, true)!
+        let removed_val = RegisterValue.block(removed_txt)
+        if paste_blockwise {
+            let block_rows = paste_text.split("\n")
+            for i in 0..block_rows.len() {
+                let r = r1 + i
+                while r >= buf.line_count() {
+                    buf.push_line("")
+                }
+                let line = buf.line_at(r)
+                let llen = line.char_len()
+                let padded = if llen < c1 { line ++ " ".repeat(c1 - llen) } else { line }
+                let chunk = block_rows.get(i.as(usize)).as(String).repeat(eff_count)
+                buf.set_line_at(r, padded.slice(0, c1) ++ chunk ++ padded.slice(c1, padded.char_len()))
+            }
+            buf.modified = true
+        } else {
+            let clean = if paste_linewise and paste_text.ends_with("\n") {
+                paste_text.slice(0, paste_text.char_len() - 1)
+            } else {
+                paste_text
+            }
+            let payload = clean.repeat(eff_count)
+            for r in r1..(r2 + 1) {
+                let line = buf.line_at(r)
+                let llen = line.char_len()
+                let ic = if c1 <= llen { c1 } else { llen }
+                buf.set_line_at(r, line.slice(0, ic) ++ payload ++ line.slice(ic, llen))
+            }
+            buf.modified = true
+        }
+        buf.point = buf.clamp_pos(Pos.new(r1, c1), insert_mode = false)
+        if overwrite_unnamed {
+            world.registers.delete_store(removed_val, world.kill_ring)#
+        }
+    } else {
+        let lo = if a <= b { a } else { b }
+        let hi = if a <= b { b } else { a }
+        let hlen = buf.line_char_len(hi.row)
+        let end_c = if hi.col < hlen { hi.col + 1 } else { hlen }
+        let sp = Span.normalized(lo, Pos.new(hi.row, end_c))
+        let removed_txt = buf.extract_span(sp)
+        let removed_val = RegisterValue.chars(removed_txt)
+        if paste_linewise {
+            let clean = if paste_text.ends_with("\n") {
+                paste_text.slice(0, paste_text.char_len() - 1)
+            } else {
+                paste_text
+            }
+            let chunks = List()
+            for _ in 0..eff_count {
+                chunks.push(clean)
+            }
+            let body = chunks.join("\n")
+            let pre_nl = if lo.col > 0 { "\n" } else { "" }
+            let suf_nl = if end_c < hlen { "\n" } else { "" }
+            let _ = buf.replace_span(sp, pre_nl ++ body ++ suf_nl)!
+            let dest_r = if lo.col > 0 { lo.row + 1 } else { lo.row }
+            buf.point = buf.clamp_pos(Pos.new(dest_r, buf.first_non_blank_col(dest_r)), insert_mode = false)
+        } else {
+            let payload = paste_text.repeat(eff_count)
+            let (end_p, _) = buf.replace_span(sp, payload)!
+            let land_c = if end_p.col > 0 { end_p.col - 1 } else { 0 }
+            buf.point = buf.clamp_pos(Pos.new(end_p.row, land_c), insert_mode = false)
+        }
+        if overwrite_unnamed {
+            world.registers.delete_store(removed_val, world.kill_ring)#
+        }
+    }
+
+    buf.named_marks.insert(".", buf.point)
+    buf.checkpoint(buf.point, "vim-visual-paste")
+    vim.mode = VimMode.Normal
+    vim.visual_dollar = false
+    vim.clear_transient()
+    commit_change(vim)
+    ()
+}
+
+fn join_line_no_space(buf: Buffer, row: i64) -> !String Pos {
+    buf.ensure_writable()!
+    if row >= buf.max_row() {
+        return buf.point
+    }
+    let cur = buf.line_at(row)
+    let seam_col = cur.char_len()
+    let next_line = buf.remove_line_at(row + 1)
+    buf.set_line_at(row, cur ++ next_line)
+    if buf.narrow != null {
+        let nr = buf.narrow.as(NarrowRegion)
+        if nr.end_row > nr.start_row {
+            buf.narrow = NarrowRegion { start_row: nr.start_row, end_row: nr.end_row - 1 }
+        }
+    }
+    buf.modified = true
+    let next_p = Pos.new(row, seam_col)
+    buf.point = next_p
+    next_p
+}
+
+fn read_sub_delimited_part(s: String, start_idx: i64, delim: String, for_pattern: bool) -> (String, i64, bool) {
+    let n = s.char_len()
+    var out = ""
+    var i = start_idx
+    while i < n {
+        let ch = s.slice(i, i + 1)
+        if ch == "\\" and i + 1 < n {
+            let nx = s.slice(i + 1, i + 2)
+            if nx == delim {
+                out = out ++ delim
+                i += 2
+                continue
+            }
+            if not for_pattern {
+                if nx == "n" or nx == "r" {
+                    out = out ++ "\n"
+                    i += 2
+                    continue
+                }
+                if nx == "t" {
+                    out = out ++ "\t"
+                    i += 2
+                    continue
+                }
+                if nx == "\\" {
+                    out = out ++ "\\"
+                    i += 2
+                    continue
+                }
+                if nx == "&" {
+                    out = out ++ "\x00AMP\x00"
+                    i += 2
+                    continue
+                }
+            }
+            out = out ++ ch ++ nx
+            i += 2
+            continue
+        }
+        if ch == delim {
+            return (out, i + 1, true)
+        }
+        out = out ++ ch
+        i += 1
+    }
+    (out, n, false)
+}
+
+fn capture_last_substitute(world: EditorWorld, vim: VimState, raw_cmd: String) {
+    var s = raw_cmd.trim()
+    while s.starts_with(":") {
+        s = s.drop(1).trim_start()
+    }
+    if s == "" or s.starts_with("\"") or s.starts_with("!") {
+        return
+    }
+    -- Strip leading Ex range characters (`%`, `.`, `$`, digits, `,`, `;`, `+`, `-`, `'x`)
+    let n = s.char_len()
+    var i: i64 = 0
+    while i < n {
+        let ch = s.slice(i, i + 1)
+        if ch == "%" or ch == "." or ch == "$" or ch == "," or ch == ";" or ch == "+" or ch == "-"
+            or ch == " " or ch.is_ascii_digit() {
+            i += 1
+        } else if ch == "'" and i + 1 < n {
+            i += 2
+        } else {
+            break
+        }
+    }
+    let rest = s.slice(i, n)
+    let rlen = rest.char_len()
+    var ci: i64 = 0
+    while ci < rlen and rest.slice(ci, ci + 1).is_ascii_alphabetic() {
+        ci += 1
+    }
+    let verb = rest.slice(0, ci)
+    if verb != "s" and verb != "sub" and verb != "substitute" {
+        return
+    }
+    let sub_body = rest.slice(ci, rlen).trim_start()
+    if sub_body == "" or sub_body.slice(0, 1).is_ascii_alphanumeric() {
+        return
+    }
+    let delim = sub_body.slice(0, 1)
+    let (raw_pat, idx1, found1) = read_sub_delimited_part(sub_body, 1, delim, true)
+    if not found1 {
+        return
+    }
+    let (rep_tpl, idx2, _) = read_sub_delimited_part(sub_body, idx1, delim, false)
+    let flags = sub_body.slice(idx2, sub_body.char_len()).trim()
+    let eff_pat = if raw_pat != "" {
+        raw_pat
+    } else if world.last_search != "" {
+        world.last_search
+    } else {
+        vim.last_sub_pattern
+    }
+    if eff_pat != "" {
+        vim.last_sub_pattern = eff_pat
+        vim.last_sub_rep = rep_tpl
+        vim.last_sub_flags = flags
+    }
+}
+
+fn execute_repeat_substitute(
+    world: EditorWorld,
+    buf: Buffer,
+    vim: VimState,
+    count: i64,
+) -> #status_emit !String Unit {
+    let pat = if vim.last_sub_pattern != "" { vim.last_sub_pattern } else { world.last_search }
+    if pat == "" {
+        status_emit("E33: No previous substitute regular expression")#
+        vim.clear_transient()
+        abort_change(vim)
+        return ()
+    }
+    buf.ensure_writable()!
+    let rep_tpl = vim.last_sub_rep
+    let flags = vim.last_sub_flags
+    let replace_all = flags.contains("g")
+    let ignore_case = if flags.contains("I") {
+        false
+    } else if flags.contains("i") {
+        true
+    } else {
+        world.effective_ignore_case(pat)
+    }
+
+    let eff = if count > 0 { count } else { 1 }
+    let sr = buf.point.row
+    let max_r = buf.max_row()
+    let er = if sr + eff - 1 <= max_r { sr + eff - 1 } else { max_r }
+    let plen = pat.char_len()
+    var total_subs: i64 = 0
+    var changed_lines: i64 = 0
+    var last_row = sr
+
+    var r = er
+    while r >= sr {
+        let line = buf.line_at(r)
+        let hay = if ignore_case { line.to_lower() } else { line }
+        let needle = if ignore_case { pat.to_lower() } else { pat }
+        let indices = hay.find_indices(needle)
+        let mcount = indices.len()
+        if mcount > 0 {
+            let limit = if replace_all { mcount } else { 1 }
+            var out = ""
+            var last_end: i64 = 0
+            for mi in 0..limit {
+                let sc = indices.get(mi.as(usize)).as(i64)
+                let ec = sc + plen
+                out = out ++ line.slice(last_end, sc)
+                let orig_match = line.slice(sc, ec)
+                let expanded = rep_tpl.replace("&", orig_match).replace("\x00AMP\x00", "&")
+                out = out ++ expanded
+                last_end = ec
+            }
+            out = out ++ line.slice(last_end, line.char_len())
+            total_subs += limit
+            changed_lines += 1
+            last_row = r
+            if out.contains("\n") {
+                let parts = out.split("\n")
+                buf.set_line_at(r, parts.get(0).as(String))
+                for pi in 1..parts.len() {
+                    buf.insert_line_at(r + pi, parts.get(pi.as(usize)).as(String))
+                }
+                if buf.narrow != null {
+                    let nr = buf.narrow.as(NarrowRegion)
+                    buf.narrow = NarrowRegion {
+                        start_row: nr.start_row,
+                        end_row: nr.end_row + parts.len() - 1,
+                    }
+                }
+            } else {
+                buf.set_line_at(r, out)
+            }
+        }
+        r -= 1
+    }
+
+    if total_subs == 0 {
+        status_emit("E486: Pattern not found: " ++ pat)#
+        abort_change(vim)
+    } else {
+        buf.modified = true
+        let dest_r = if last_row <= buf.max_row() { last_row } else { buf.max_row() }
+        buf.point = buf.clamp_pos(Pos.new(dest_r, buf.first_non_blank_col(dest_r)), insert_mode = false)
+        buf.named_marks.insert(".", buf.point)
+        buf.checkpoint(buf.point, "vim-repeat-sub")
+        status_emit(total_subs.to_string() ++ " substitutions on " ++ changed_lines.to_string() ++ " lines")#
+        commit_change(vim)
+    }
+    vim.clear_transient()
+    ()
+}
+
+fn parent_dir_of_path(p: String) -> String {
+    let n = p.char_len()
+    var last_sep: i64 = -1
+    for i in 0..n {
+        let ch = p.slice(i, i + 1)
+        if ch == "/" or ch == "\\" {
+            last_sep = i
+        }
+    }
+    if last_sep < 0 {
+        ""
+    } else if last_sep == 0 {
+        "/"
+    } else {
+        p.slice(0, last_sep)
+    }
+}
+
+fn resolve_gf_path(world: EditorWorld, buf: Buffer, raw_path: String) -> String {
+    if raw_path.starts_with("/") {
+        return raw_path
+    }
+    if buf.file_path != "" {
+        let dir = parent_dir_of_path(buf.file_path)
+        if dir != "" {
+            let rel_buf = if dir.ends_with("/") { dir ++ raw_path } else { dir ++ "/" ++ raw_path }
+            if fs.exists(rel_buf) {
+                return rel_buf
+            }
+        }
+    }
+    world.resolve_path(raw_path)
+}
+
+fn make_char_expand_cand(buf: Buffer, sp: Span) -> ExpandCandidate {
+    let norm = Span.normalized(
+        buf.clamp_pos(sp.start, insert_mode = true),
+        buf.clamp_pos(sp.end, insert_mode = true),
+    )
+    let end_pt = if norm.end.col > 0 {
+        Pos.new(norm.end.row, norm.end.col - 1)
+    } else {
+        norm.end
+    }
+    ExpandCandidate {
+        mode: VimMode.VisualChar,
+        anchor: buf.clamp_pos(norm.start, insert_mode = false),
+        point: buf.clamp_pos(end_pt, insert_mode = false),
+        cov_start: norm.start,
+        cov_end: norm.end,
+    }
+}
+
+fn make_line_expand_cand(buf: Buffer, sr: i64, er: i64) -> ExpandCandidate {
+    let lo = if sr <= er { sr } else { er }
+    let hi = if sr <= er { er } else { sr }
+    ExpandCandidate {
+        mode: VimMode.VisualLine,
+        anchor: Pos.new(lo, 0),
+        point: buf.clamp_pos(Pos.new(hi, 0), insert_mode = false),
+        cov_start: Pos.new(lo, 0),
+        cov_end: Pos.new(hi, buf.line_char_len(hi)),
+    }
+}
+
+fn run_indent_expand_region(world: EditorWorld, vim: VimState) {
+    let buf = world.active_buffer()
+    let ts = if world.options.tabstop > 0 { world.options.tabstop } else { 4 }
+
+    let same_expand_chain = (not vim.region_stack.is_empty())
+        and (
+            if world.options.evil_mode {
+                vim.mode == vim.last_expand_mode
+                    and vim.visual_anchor == vim.last_expand_anchor
+                    and buf.point == vim.last_expand_point
+            } else {
+                buf.mark != null
+                    and buf.mark.as(Pos) == vim.last_expand_anchor
+                    and buf.point == vim.last_expand_point
+            }
+        )
+    if not same_expand_chain {
+        vim.region_stack = List()
+        vim.region_origin = buf.point
+    }
+
+    let cur_emacs_active = (not world.options.evil_mode) and (buf.mark != null)
+    let saved_anchor = if world.options.evil_mode {
+        vim.visual_anchor
+    } else if buf.mark != null {
+        buf.mark.as(Pos)
+    } else {
+        buf.point
+    }
+    vim.region_stack.push(SavedRegionState {
+        mode: vim.mode,
+        anchor: saved_anchor,
+        point: buf.point,
+        emacs_mark_active: cur_emacs_active,
+    })
+
+    var cur_s = buf.point
+    var cur_e = buf.point
+    var cur_linewise = false
+    if not world.options.evil_mode {
+        if buf.mark != null {
+            let norm = Span.normalized(buf.mark.as(Pos), buf.point)
+            cur_s = norm.start
+            cur_e = norm.end
+        }
+    } else if vim.mode == VimMode.VisualLine {
+        let r1 = if vim.visual_anchor.row <= buf.point.row { vim.visual_anchor.row } else { buf.point.row }
+        let r2 = if vim.visual_anchor.row <= buf.point.row { buf.point.row } else { vim.visual_anchor.row }
+        cur_s = Pos.new(r1, 0)
+        cur_e = Pos.new(r2, buf.line_char_len(r2))
+        cur_linewise = true
+    } else if vim.mode == VimMode.VisualChar {
+        let lo = if vim.visual_anchor <= buf.point { vim.visual_anchor } else { buf.point }
+        let hi = if vim.visual_anchor <= buf.point { buf.point } else { vim.visual_anchor }
+        let hlen = buf.line_char_len(hi.row)
+        cur_s = lo
+        cur_e = Pos.new(hi.row, if hi.col < hlen { hi.col + 1 } else { hlen })
+    } else if vim.mode == VimMode.VisualBlock {
+        let (r1, r2, c1, c2) = visual_block_bounds(buf, vim)
+        cur_s = Pos.new(r1, c1)
+        let hlen = buf.line_char_len(r2)
+        cur_e = Pos.new(r2, if c2 + 1 <= hlen { c2 + 1 } else { hlen })
+    }
+
+    let origin = buf.clamp_pos(vim.region_origin, insert_mode = false)
+    let cands = List()
+
+    -- Step 1: Word under cursor (`iw`)
+    let iw_opt = resolve_text_object(buf, origin, false, "w", 1, tabstop = ts)
+    if iw_opt != null {
+        let iw = iw_opt.as(TextObjectRange)
+        if iw.span.start < iw.span.end {
+            cands.push(make_char_expand_cand(buf, iw.span))
+        }
+    }
+
+    -- Step 2: Enclosing quotes & delimiter pairs on the same line (inner then around, innermost -> outermost)
+    let enc_spans = same_line_enclosing_spans(buf, origin)
+    for pi in 0..enc_spans.len() {
+        let sp = enc_spans.get(pi.as(usize)).as(Span)
+        if sp.start < sp.end {
+            cands.push(make_char_expand_cand(buf, sp))
+        }
+    }
+
+    -- Step 3: Current VisualLine `r..r`
+    cands.push(make_line_expand_cand(buf, origin.row, origin.row))
+
+    -- Steps 4-6: `ii` -> `ai` -> `aI` -> enclosing parent indent levels
+    var lvl = infer_effective_indent(buf, origin.row, ts)
+    var guard: i64 = 0
+    while lvl > 0 and guard < 64 {
+        guard += 1
+        let ii_r = text_obj_indent_at_level(buf, origin.row, lvl, false, false, ts)
+        cands.push(make_line_expand_cand(buf, ii_r.start_row, ii_r.end_row))
+        let ai_r = text_obj_indent_at_level(buf, origin.row, lvl, true, false, ts)
+        cands.push(make_line_expand_cand(buf, ai_r.start_row, ai_r.end_row))
+        let aI_r = text_obj_indent_at_level(buf, origin.row, lvl, true, true, ts)
+        cands.push(make_line_expand_cand(buf, aI_r.start_row, aI_r.end_row))
+
+        let (bsr, ber) = indent_block_bounds(buf, origin.row, lvl, true, ts)
+        let parent_lvl = enclosing_parent_indent(buf, bsr, ber, lvl, ts)
+        if parent_lvl <= 0 or parent_lvl >= lvl {
+            break
+        }
+        lvl = parent_lvl
+    }
+
+    -- Step 7: Entire buffer `min_row..max_row`
+    cands.push(make_line_expand_cand(buf, buf.min_row(), buf.max_row()))
+
+    var chosen: ?ExpandCandidate = null
+    for ci in 0..cands.len() {
+        let cand = cands.get(ci.as(usize)).as(ExpandCandidate)
+        let covers = cand.cov_start <= cur_s and cand.cov_end >= cur_e
+        let grows_span = cand.cov_start < cur_s or cand.cov_end > cur_e
+        let upgrades_linewise = world.options.evil_mode
+            and (not cur_linewise)
+            and cand.mode == VimMode.VisualLine
+            and (vim.mode != VimMode.Normal or cur_s == cur_e)
+        if covers and (grows_span or ((not cur_linewise) and cand.mode == VimMode.VisualLine and vim.mode != VimMode.Normal)) {
+            chosen = cand
+            break
+        }
+        if vim.mode == VimMode.Normal and world.options.evil_mode and cand.mode == VimMode.VisualLine and cur_s == cur_e {
+            chosen = cand
+            break
+        }
+        let _ = upgrades_linewise
+    }
+
+    let next_cand? = chosen else {
+        -- Already at maximum buffer selection; discard redundant stack frame
+        let _ = vim.region_stack.pop()
+        return
+    }
+
+    if world.options.evil_mode {
+        vim.mode = next_cand.mode
+        vim.visual_anchor = next_cand.anchor
+        vim.visual_dollar = false
+        buf.point = next_cand.point
+        vim.last_expand_mode = vim.mode
+        vim.last_expand_anchor = vim.visual_anchor
+        vim.last_expand_point = buf.point
+        sync_world_from_vim(world, vim)
+    } else {
+        buf.mark = next_cand.cov_start
+        buf.point = next_cand.cov_end
+        vim.last_expand_mode = vim.mode
+        vim.last_expand_anchor = next_cand.cov_start
+        vim.last_expand_point = next_cand.cov_end
+    }
+}
+
+fn run_indent_shrink_region(world: EditorWorld, vim: VimState) {
+    let buf = world.active_buffer()
+    if vim.region_stack.is_empty() {
+        if world.options.evil_mode and is_visual_mode(vim.mode) {
+            save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
+            vim.mode = VimMode.Normal
+            vim.visual_dollar = false
+            sync_world_from_vim(world, vim)
+        } else if (not world.options.evil_mode) and buf.mark != null {
+            buf.mark = null
+        }
+        return
+    }
+
+    let prev = vim.region_stack.pop().as(SavedRegionState)
+    if world.options.evil_mode {
+        if is_visual_mode(vim.mode) and not is_visual_mode(prev.mode) {
+            save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
+        }
+        vim.mode = prev.mode
+        vim.visual_anchor = buf.clamp_pos(prev.anchor, insert_mode = false)
+        vim.visual_dollar = false
+        buf.point = buf.clamp_pos(prev.point, insert_mode = false)
+        vim.last_expand_mode = vim.mode
+        vim.last_expand_anchor = vim.visual_anchor
+        vim.last_expand_point = buf.point
+        sync_world_from_vim(world, vim)
+    } else {
+        buf.mark = if prev.emacs_mark_active {
+            buf.clamp_pos(prev.anchor, insert_mode = true)
+        } else {
+            null
+        }
+        buf.point = buf.clamp_pos(prev.point, insert_mode = true)
+        vim.last_expand_anchor = if buf.mark != null { buf.mark.as(Pos) } else { buf.point }
+        vim.last_expand_point = buf.point
+    }
+}
+
+-- ============================================================================
+-- Applying Resolved Motions in Normal / Visual / OperatorPending Modes
+-- ============================================================================
+
+fn apply_resolved_motion(
+    world: EditorWorld,
+    buf: Buffer,
+    vim: VimState,
+    target: MotionTarget,
+) -> #[status_emit, clipboard_set] !String Unit {
+    if not target.valid {
+        vim.mode match {
+            VimMode.OperatorPending(_) => {
+                vim.mode = VimMode.Normal
+                abort_change(vim)
+            },
+            _ => (),
+        }
+        vim.clear_transient()
+        return ()
+    }
+
+    vim.mode match {
+        VimMode.OperatorPending(op) => {
+            if target.shape == MotionShape.Linewise {
+                return apply_operator_linewise(world, buf, vim, op, buf.point.row, target.pos.row)#
+            }
+            let sp = span_from_motion(buf, buf.point, target)
+            return apply_operator_span(world, buf, vim, op, sp)#
+        },
+        _ => (),
+    }
+
+    if target.is_jump {
+        vim.last_jump_origin = buf.point
+        world.jumps.record(buf.id, buf.file_path, buf.point)
+    }
+
+    let clamped = buf.clamp_pos(target.pos, insert_mode = false)
+    buf.point = clamped
+    if target.end_of_line_pref {
+        buf.preferred_col = 1000000
+        if vim.mode == VimMode.VisualBlock {
+            vim.visual_dollar = true
+        }
+    } else if not target.preserve_pref_col {
+        buf.preferred_col = clamped.col
+        vim.visual_dollar = false
+    }
+
+    -- Keep viewport scrolled to contain `buf.point.row`
+    let vrows = if world.viewport_rows > 1 { world.viewport_rows } else { 1 }
+    if buf.point.row < world.viewport_top_row {
+        world.viewport_top_row = buf.point.row
+    } else if buf.point.row >= world.viewport_top_row + vrows {
+        world.viewport_top_row = buf.point.row - vrows + 1
+    }
+
+    vim.count1 = 0
+    vim.count2 = 0
+    vim.pending_prefix = ""
+    ()
+}
+
+-- ============================================================================
+-- Insert & Replace Mode Key Handling
+-- ============================================================================
+
+fn handle_insert_mode_key(
+    world: EditorWorld,
+    buf: Buffer,
+    vim: VimState,
+    stroke: KeyStroke,
+) -> !String bool {
+    record_change_stroke(vim, stroke)
+
+    let is_esc = stroke.key == "Escape"
+        or (stroke.ctrl and (stroke.key == "[" or stroke.key == "c"))
+    if is_esc {
+        if vim.block_insert_active {
+            finish_visual_block_insert(buf, vim)!
+        }
+        buf.named_marks.insert("^", buf.clamp_pos(buf.point, insert_mode = true))
+        let step_back_c = if buf.point.col > 0 { buf.point.col - 1 } else { 0 }
+        buf.point = buf.clamp_pos(Pos.new(buf.point.row, step_back_c), insert_mode = false)
+        buf.preferred_col = buf.point.col
+        buf.named_marks.insert(".", buf.point)
+        buf.checkpoint(buf.point, "vim-insert")
+        vim.mode = VimMode.Normal
+        vim.clear_transient()
+        commit_change(vim)
+        return true
+    }
+
+    if stroke.key == "Return" or (stroke.ctrl and stroke.key == "m") {
+        vim.block_insert_active = false
+        if world.options.auto_indent {
+            let r = buf.point.row
+            let c = buf.point.col
+            let line = buf.line_at(r)
+            let llen = line.char_len()
+            let prefix = line.slice(0, c)
+            let suffix = line.slice(c, llen)
+            var base_cols: i64 = 0
+            while base_cols < prefix.char_len() {
+                let bch = prefix.slice(base_cols, base_cols + 1)
+                if bch == " " {
+                    base_cols += 1
+                } else if bch == "\t" {
+                    base_cols += world.options.tabstop
+                } else {
+                    break
+                }
+            }
+            let sw = if world.options.shiftwidth >= 1 { world.options.shiftwidth } else { 4 }
+            let trimmed_pre = prefix.trim()
+            let opens_block = trimmed_pre.ends_with("{{")
+                or trimmed_pre.ends_with("(")
+                or trimmed_pre.ends_with("[")
+                or trimmed_pre.ends_with(":")
+            let inner_cols = if opens_block { base_cols + sw } else { base_cols }
+            let inner_pad = if world.options.expandtab {
+                " ".repeat(inner_cols)
+            } else {
+                "\t".repeat(inner_cols / sw) ++ " ".repeat(inner_cols % sw)
+            }
+            let base_pad = if world.options.expandtab {
+                " ".repeat(base_cols)
+            } else {
+                "\t".repeat(base_cols / sw) ++ " ".repeat(base_cols % sw)
+            }
+            let trimmed_suf = suffix.trim_start()
+            let closes_pair = (trimmed_pre.ends_with("{{") and trimmed_suf.starts_with("}}"))
+                or (trimmed_pre.ends_with("(") and trimmed_suf.starts_with(")"))
+                or (trimmed_pre.ends_with("[") and trimmed_suf.starts_with("]"))
+            if closes_pair {
+                let lead_ws = suffix.char_len() - trimmed_suf.char_len()
+                if lead_ws > 0 {
+                    let _ = buf.delete_span(Span.normalized(Pos.new(r, c), Pos.new(r, c + lead_ws)))!
+                }
+                let _ = buf.insert_text(Pos.new(r, c), "\n" ++ inner_pad ++ "\n" ++ base_pad)!
+                buf.point = Pos.new(r + 1, inner_pad.char_len())
+                buf.preferred_col = buf.point.col
+                return true
+            }
+            let _ = buf.insert_text(buf.point, "\n" ++ inner_pad)!
+            buf.preferred_col = buf.point.col
+            return true
+        }
+        let _ = buf.insert_text(buf.point, "\n")!
+        buf.preferred_col = buf.point.col
+        return true
+    }
+
+    if stroke.key == "BackSpace" {
+        if vim.block_insert_active {
+            let blen = vim.block_insert_text.char_len()
+            if blen > 0 {
+                vim.block_insert_text = vim.block_insert_text.slice(0, blen - 1)
+            } else {
+                vim.block_insert_active = false
+            }
+            let _ = buf.delete_backward(buf.point)!
+            buf.preferred_col = buf.point.col
+            return true
+        }
+        if world.options.expandtab and buf.point.col > 1 {
+            let line = buf.line_at(buf.point.row)
+            let pre = line.slice(0, buf.point.col)
+            if pre.trim() == "" and not pre.contains("\t") {
+                let sw = if world.options.shiftwidth >= 1 { world.options.shiftwidth } else { 4 }
+                let rem = buf.point.col % sw
+                let drop_n = if rem == 0 { sw } else { rem }
+                let target_c = if buf.point.col - drop_n > 0 { buf.point.col - drop_n } else { 0 }
+                let _ = buf.delete_span(Span.normalized(Pos.new(buf.point.row, target_c), buf.point))!
+                buf.preferred_col = buf.point.col
+                return true
+            }
+        }
+        let _ = buf.delete_backward(buf.point)!
+        buf.preferred_col = buf.point.col
+        return true
+    }
+
+    if stroke.key == "Delete" {
+        vim.block_insert_active = false
+        let _ = buf.delete_char_at(buf.point)!
+        return true
+    }
+
+    if stroke.key == "Tab" and (not stroke.ctrl) and (not stroke.alt) {
+        let tab_str = if world.options.expandtab {
+            " ".repeat(world.options.tabstop)
+        } else {
+            "\t"
+        }
+        let _ = buf.insert_text(buf.point, tab_str)!
+        if vim.block_insert_active {
+            vim.block_insert_text = vim.block_insert_text ++ tab_str
+        }
+        buf.preferred_col = buf.point.col
+        return true
+    }
+
+    if stroke.ctrl and stroke.key == "w" {
+        vim.block_insert_active = false
+        let line = buf.line_at(buf.point.row)
+        var sc = buf.point.col
+        while sc > 0 and (line.slice(sc - 1, sc) == " " or line.slice(sc - 1, sc) == "\t") {
+            sc -= 1
+        }
+        while sc > 0 and line.slice(sc - 1, sc) != " " and line.slice(sc - 1, sc) != "\t" {
+            sc -= 1
+        }
+        if sc < buf.point.col {
+            let _ = buf.delete_span(Span.normalized(Pos.new(buf.point.row, sc), buf.point))!
+        } else {
+            let _ = buf.delete_backward(buf.point)!
+        }
+        return true
+    }
+
+    if stroke.ctrl and stroke.key == "u" {
+        vim.block_insert_active = false
+        if buf.point.col > 0 {
+            let _ = buf.delete_span(Span.normalized(Pos.new(buf.point.row, 0), buf.point))!
+        }
+        return true
+    }
+
+    if stroke.key == "Left" {
+        vim.block_insert_active = false
+        buf.point = buf.clamp_pos(Pos.new(buf.point.row, buf.point.col - 1), insert_mode = true)
+        return true
+    }
+    if stroke.key == "Right" {
+        vim.block_insert_active = false
+        buf.point = buf.clamp_pos(Pos.new(buf.point.row, buf.point.col + 1), insert_mode = true)
+        return true
+    }
+    if stroke.key == "Up" {
+        vim.block_insert_active = false
+        buf.point = buf.clamp_pos(Pos.new(buf.point.row - 1, buf.point.col), insert_mode = true)
+        return true
+    }
+    if stroke.key == "Down" {
+        vim.block_insert_active = false
+        buf.point = buf.clamp_pos(Pos.new(buf.point.row + 1, buf.point.col), insert_mode = true)
+        return true
+    }
+
+    let ch = stroke_printable_char(stroke)
+    if ch != "" {
+        let _ = buf.insert_text(buf.point, ch)!
+        if vim.block_insert_active {
+            vim.block_insert_text = vim.block_insert_text ++ ch
+        }
+        buf.preferred_col = buf.point.col
+        return true
+    }
+
+    true
+}
+
+fn handle_replace_mode_key(
+    buf: Buffer,
+    vim: VimState,
+    stroke: KeyStroke,
+) -> !String bool {
+    record_change_stroke(vim, stroke)
+
+    let is_esc = stroke.key == "Escape"
+        or (stroke.ctrl and (stroke.key == "[" or stroke.key == "c"))
+    if is_esc {
+        let step_back_c = if buf.point.col > 0 { buf.point.col - 1 } else { 0 }
+        buf.point = buf.clamp_pos(Pos.new(buf.point.row, step_back_c), insert_mode = false)
+        buf.preferred_col = buf.point.col
+        buf.named_marks.insert(".", buf.point)
+        buf.checkpoint(buf.point, "vim-replace")
+        vim.replace_stack = List()
+        vim.mode = VimMode.Normal
+        vim.clear_transient()
+        commit_change(vim)
+        return true
+    }
+
+    if stroke.key == "BackSpace" {
+        if not vim.replace_stack.is_empty() {
+            let step = vim.replace_stack.pop().as(ReplaceStep)
+            if step.was_append {
+                let _ = buf.delete_char_at(step.pos)!
+            } else {
+                let line = buf.line_at(step.pos.row)
+                let llen = line.char_len()
+                if step.pos.col < llen {
+                    let updated = line.slice(0, step.pos.col) ++ step.overwritten ++ line.slice(step.pos.col + 1, llen)
+                    buf.set_line_at(step.pos.row, updated)
+                    buf.modified = true
+                }
+            }
+            buf.point = step.pos
+        } else if buf.point.col > 0 {
+            buf.point = Pos.new(buf.point.row, buf.point.col - 1)
+        }
+        return true
+    }
+
+    let ch = stroke_printable_char(stroke)
+    if ch != "" {
+        buf.ensure_writable()!
+        let p = buf.clamp_pos(buf.point, insert_mode = true)
+        let line = buf.line_at(p.row)
+        let llen = line.char_len()
+        if p.col < llen {
+            let orig = line.slice(p.col, p.col + 1)
+            vim.replace_stack.push(ReplaceStep { pos: p, overwritten: orig, was_append: false })
+            let updated = line.slice(0, p.col) ++ ch ++ line.slice(p.col + 1, llen)
+            buf.set_line_at(p.row, updated)
+            buf.modified = true
+            buf.point = Pos.new(p.row, p.col + 1)
+        } else {
+            vim.replace_stack.push(ReplaceStep { pos: p, overwritten: "", was_append: true })
+            let _ = buf.insert_text(p, ch)!
+        }
+        return true
+    }
+
+    true
+}
+
+-- ============================================================================
+-- Pending Multi-Key Prefix Handling (`f/F/t/T`, `r`, `m`, `'/` `, `"`, `q`, `@`, `g`, `z`, `<C-w>`, `i`/`a`, `]`/`[`)
+-- ============================================================================
+
+fn handle_pending_prefix(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    buf: Buffer,
+    vim: VimState,
+    stroke: KeyStroke,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String bool {
+    let pfx = vim.pending_prefix
+    let was_vis_rep = vim.pending_visual_replace
+    let is_esc = stroke.key == "Escape"
+        or (stroke.ctrl and (stroke.key == "g" or stroke.key == "["))
+    if is_esc {
+        if was_vis_rep and is_visual_mode(vim.mode) {
+            save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
+            vim.mode = VimMode.Normal
+            vim.visual_dollar = false
+            abort_change(vim)
+        } else if not is_visual_mode(vim.mode) {
+            vim.mode = VimMode.Normal
+            abort_change(vim)
+        }
+        vim.clear_transient()
+        return true
+    }
+
+    if vim.recording_change {
+        record_change_stroke(vim, stroke)
+    }
+
+    -- 1. Character find `f`, `F`, `t`, `T`
+    if pfx == "f" or pfx == "F" or pfx == "t" or pfx == "T" {
+        let ch = stroke_printable_char(stroke)
+        vim.pending_prefix = ""
+        if ch == "" {
+            vim.clear_transient()
+            return true
+        }
+        vim.last_char_find = (pfx, ch)
+        let tgt = motion_find_char_in_line(buf, buf.point, pfx, ch, vim.effective_count(), false)
+        apply_resolved_motion(world, buf, vim, tgt)#!
+        return true
+    }
+
+    -- 2. Single-char replace `r<ch>`
+    if pfx == "r" {
+        vim.pending_prefix = ""
+        vim.pending_visual_replace = false
+        if is_visual_mode(vim.mode) {
+            let ch = stroke_printable_char(stroke)
+            if ch == "" {
+                save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
+                vim.mode = VimMode.Normal
+                vim.visual_dollar = false
+                vim.clear_transient()
+                abort_change(vim)
+                return true
+            }
+            buf.ensure_writable()!
+            save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
+            if vim.mode == VimMode.VisualBlock {
+                let (r1, r2, c1, c2) = visual_block_bounds(buf, vim)
+                for r in r1..(r2 + 1) {
+                    let line = buf.line_at(r)
+                    let llen = line.char_len()
+                    let sc = if c1 < llen { c1 } else { llen }
+                    let ec = if c2 + 1 < llen { c2 + 1 } else { llen }
+                    if sc < ec {
+                        buf.set_line_at(r, line.slice(0, sc) ++ ch.repeat(ec - sc) ++ line.slice(ec, llen))
+                    }
+                }
+                buf.point = buf.clamp_pos(Pos.new(r1, c1), insert_mode = false)
+            } else {
+                let sp = if vim.mode == VimMode.VisualLine {
+                    let r1 = if vim.visual_anchor.row <= buf.point.row { vim.visual_anchor.row } else { buf.point.row }
+                    let r2 = if vim.visual_anchor.row <= buf.point.row { buf.point.row } else { vim.visual_anchor.row }
+                    Span.normalized(Pos.new(r1, 0), Pos.new(r2, buf.line_char_len(r2)))
+                } else {
+                    let lo = if vim.visual_anchor <= buf.point { vim.visual_anchor } else { buf.point }
+                    let hi = if vim.visual_anchor <= buf.point { buf.point } else { vim.visual_anchor }
+                    let hlen = buf.line_char_len(hi.row)
+                    Span.normalized(lo, Pos.new(hi.row, if hi.col < hlen { hi.col + 1 } else { hlen }))
+                }
+                let orig = buf.extract_span(sp)
+                var rep = ""
+                for i in 0..orig.char_len() {
+                    let oc = orig.slice(i, i + 1)
+                    rep = rep ++ (if oc == "\n" { "\n" } else { ch })
+                }
+                let _ = buf.replace_span(sp, rep)!
+                buf.point = buf.clamp_pos(sp.start, insert_mode = false)
+            }
+            buf.modified = true
+            buf.named_marks.insert(".", buf.point)
+            buf.checkpoint(buf.point, "vim-visual-replace")
+            vim.mode = VimMode.Normal
+            vim.clear_transient()
+            commit_change(vim)
+            return true
+        }
+
+        buf.ensure_writable()!
+        let cnt = vim.effective_count()
+        if stroke.key == "Return" {
+            let line = buf.line_at(buf.point.row)
+            let llen = line.char_len()
+            if buf.point.col + cnt <= llen {
+                let sp = Span.normalized(buf.point, Pos.new(buf.point.row, buf.point.col + cnt))
+                let _ = buf.replace_span(sp, "\n")!
+                buf.point = buf.clamp_pos(buf.point, insert_mode = false)
+                buf.checkpoint(buf.point, "vim-replace-char")
+                commit_change(vim)
+            } else {
+                abort_change(vim)
+            }
+            vim.clear_transient()
+            return true
+        }
+
+        let ch = stroke_printable_char(stroke)
+        if ch == "" {
+            vim.clear_transient()
+            abort_change(vim)
+            return true
+        }
+        let line = buf.line_at(buf.point.row)
+        let llen = line.char_len()
+        if buf.point.col + cnt > llen or llen == 0 {
+            vim.clear_transient()
+            abort_change(vim)
+            return true
+        }
+        let updated = line.slice(0, buf.point.col)
+            ++ ch.repeat(cnt)
+            ++ line.slice(buf.point.col + cnt, llen)
+        buf.set_line_at(buf.point.row, updated)
+        buf.modified = true
+        buf.point = Pos.new(buf.point.row, buf.point.col + cnt - 1)
+        buf.named_marks.insert(".", buf.point)
+        buf.checkpoint(buf.point, "vim-replace-char")
+        vim.clear_transient()
+        commit_change(vim)
+        return true
+    }
+
+    -- 3. Register selection `"<reg>`
+    if pfx == "\"" {
+        vim.pending_prefix = ""
+        let ch = stroke_printable_char(stroke)
+        if ch != "" {
+            vim.active_reg = ch
+        }
+        return true
+    }
+
+    -- 4. Set mark `m<a-zA-Z>`
+    if pfx == "m" {
+        vim.pending_prefix = ""
+        let ch = stroke_printable_char(stroke)
+        if ch.char_len() == 1 and ch.is_ascii_alphabetic() {
+            if ch.is_ascii_lowercase() {
+                buf.named_marks.insert(ch, buf.point)
+                status_emit("Mark '" ++ ch ++ "' set")#
+            } else {
+                world.global_marks.insert(
+                    ch,
+                    JumpEntry {
+                        buf_id: buf.id,
+                        file_path: buf.file_path,
+                        pos: buf.point,
+                    },
+                )
+                status_emit("Global mark '" ++ ch ++ "' set")#
+            }
+        }
+        vim.clear_transient()
+        return true
+    }
+
+    -- 5. Jump to mark `'<ch>` (linewise) or `` `<ch> `` (charwise)
+    if pfx == "'" or pfx == "`" {
+        let linewise_mark = pfx == "'"
+        vim.pending_prefix = ""
+        let ch = stroke_printable_char(stroke)
+        if ch == "" {
+            vim.clear_transient()
+            return true
+        }
+
+        var dest_opt: ?Pos = null
+        if ch == "'" or ch == "`" {
+            dest_opt = vim.last_jump_origin
+        } else if ch.is_ascii_uppercase() {
+            let g_opt = world.global_marks.get(ch)
+            if g_opt != null {
+                let je = g_opt.as(JumpEntry)
+                if vim.mode == VimMode.Normal {
+                    vim.last_jump_origin = buf.point
+                    world.jumps.record(buf.id, buf.file_path, buf.point)
+                    if world.buffers.contains_key(je.buf_id) {
+                        let _ = world.switch_to_buffer(je.buf_id)
+                        kernel.emit_hook("buffer-switched", je.buf_id)
+                    } else if je.file_path != "" {
+                        let opened = world.open_file(je.file_path)#!
+                        kernel.emit_hook("buffer-switched", opened.id)
+                    }
+                    let nb = world.active_buffer()
+                    let p = if linewise_mark {
+                        Pos.new(je.pos.row, nb.first_non_blank_col(je.pos.row))
+                    } else {
+                        je.pos
+                    }
+                    nb.point = nb.clamp_pos(p, insert_mode = false)
+                    vim.clear_transient()
+                    return true
+                }
+                if je.buf_id == buf.id {
+                    dest_opt = je.pos
+                }
+            }
+        } else {
+            let l_opt = buf.named_marks.get(ch)
+            if l_opt != null {
+                dest_opt = l_opt.as(Pos)
+            }
+        }
+
+        let dest? = dest_opt else {
+            status_emit("E20: Mark not set: " ++ ch)#
+            vim.clear_transient()
+            vim.mode match {
+                VimMode.OperatorPending(_) => {
+                    vim.mode = VimMode.Normal
+                    abort_change(vim)
+                },
+                _ => (),
+            }
+            return true
+        }
+
+        let final_pos = if linewise_mark {
+            Pos.new(dest.row, buf.first_non_blank_col(dest.row))
+        } else {
+            dest
+        }
+        let shape = if linewise_mark { MotionShape.Linewise } else { MotionShape.Exclusive }
+        apply_resolved_motion(world, buf, vim, MotionTarget.ok(final_pos, shape, is_jump = true))#!
+        return true
+    }
+
+    -- 6. Start macro recording `q<reg>`
+    if pfx == "q" {
+        vim.pending_prefix = ""
+        let ch = stroke_printable_char(stroke)
+        if ch.char_len() == 1 and ch.is_ascii_alphanumeric() {
+            let reg_lower = ch.to_lower()
+            kernel.macros.start(reg_lower)
+            status_emit("recording @" ++ reg_lower)#
+        }
+        vim.clear_transient()
+        return true
+    }
+
+    -- 7. Replay macro `@<reg>` / `@@`
+    if pfx == "@" {
+        vim.pending_prefix = ""
+        let ch = stroke_printable_char(stroke)
+        let cnt = vim.effective_count()
+        vim.clear_transient()
+        if ch == "" {
+            return true
+        }
+        let seq? = kernel.macros.get_macro(if ch == "@" { "@" } else { ch.to_lower() }) else {
+            status_emit("Macro @" ++ ch ++ " is empty")#
+            return true
+        }
+        if vim.macro_depth >= 16 {
+            status_emit("Max macro recursion depth exceeded")#
+            return true
+        }
+        let strokes = clone_stroke_list(seq)
+        vim.macro_depth += 1
+        for _ in 0..cnt {
+            for i in 0..strokes.len() {
+                let s = strokes.get(i.as(usize)).as(KeyStroke)
+                let _ = vim_handle_key(kernel, s)#!
+            }
+        }
+        vim.macro_depth -= 1
+        return true
+    }
+
+    -- 8. Text objects `i<obj>` / `a<obj>` (in OperatorPending or Visual)
+    if pfx == "i" or pfx == "a" {
+        let around = pfx == "a"
+        vim.pending_prefix = ""
+        let obj_key = stroke_printable_char(stroke)
+        if obj_key == "" or not is_text_object_target(obj_key) {
+            vim.mode match {
+                VimMode.OperatorPending(_) => {
+                    vim.mode = VimMode.Normal
+                    abort_change(vim)
+                },
+                _ => (),
+            }
+            vim.clear_transient()
+            return true
+        }
+        let tr? = resolve_text_object(
+            buf,
+            buf.point,
+            around,
+            obj_key,
+            vim.effective_count(),
+            tabstop = world.options.tabstop,
+        ) else {
+            vim.mode match {
+                VimMode.OperatorPending(_) => {
+                    vim.mode = VimMode.Normal
+                    abort_change(vim)
+                },
+                _ => (),
+            }
+            vim.clear_transient()
+            return true
+        }
+        vim.mode match {
+            VimMode.OperatorPending(op) => {
+                if tr.linewise {
+                    apply_operator_linewise(world, buf, vim, op, tr.start_row, tr.end_row)#!
+                } else {
+                    apply_operator_span(world, buf, vim, op, tr.span)#!
+                }
+                return true
+            },
+            _ => {
+                if is_visual_mode(vim.mode) {
+                    if tr.linewise {
+                        vim.mode = VimMode.VisualLine
+                        vim.visual_anchor = Pos.new(tr.start_row, 0)
+                        buf.point = buf.clamp_pos(Pos.new(tr.end_row, 0), insert_mode = false)
+                    } else {
+                        vim.visual_anchor = tr.span.start
+                        let end_c = if tr.span.end.col > 0 { tr.span.end.col - 1 } else { 0 }
+                        buf.point = buf.clamp_pos(Pos.new(tr.span.end.row, end_c), insert_mode = false)
+                    }
+                    vim.count1 = 0
+                    vim.count2 = 0
+                }
+                return true
+            },
+        }
+    }
+
+    -- 9. `g` prefix (`gg`, `g_`, `ge`, `gu`, `gU`, `g~`, `g-`, `g+`)
+    if pfx == "g" {
+        vim.pending_prefix = ""
+        let k = stroke.key
+        if (not stroke.ctrl) and (not stroke.alt) {
+            if k == "g" {
+                let target_r = if vim.has_explicit_count() {
+                    let raw_r = vim.effective_count() - 1
+                    if raw_r < buf.min_row() {
+                        buf.min_row()
+                    } else if raw_r > buf.max_row() {
+                        buf.max_row()
+                    } else {
+                        raw_r
+                    }
+                } else {
+                    buf.min_row()
+                }
+                let tgt = MotionTarget.ok(
+                    Pos.new(target_r, buf.first_non_blank_col(target_r)),
+                    MotionShape.Linewise,
+                    is_jump = true,
+                )
+                apply_resolved_motion(world, buf, vim, tgt)#!
+                return true
+            }
+            if k == "_" {
+                let extra = if vim.effective_count() > 1 { vim.effective_count() - 1 } else { 0 }
+                let tr = if buf.point.row + extra <= buf.max_row() { buf.point.row + extra } else { buf.max_row() }
+                let tgt = MotionTarget.ok(
+                    Pos.new(tr, last_non_blank_col(buf, tr)),
+                    MotionShape.Inclusive,
+                )
+                apply_resolved_motion(world, buf, vim, tgt)#!
+                return true
+            }
+            if k == "e" or k == "E" {
+                let tgt = motion_word_end_backward(buf, buf.point, vim.effective_count(), k == "E")
+                apply_resolved_motion(world, buf, vim, tgt)#!
+                return true
+            }
+            if vim.mode == VimMode.Normal and (k == "u" or k == "U" or k == "~") {
+                let op_name = "g" ++ k
+                begin_change(vim, KeyStroke.plain("g"))
+                record_change_stroke(vim, stroke)
+                vim.mode = VimMode.OperatorPending(op_name)
+                return true
+            }
+            -- Doubled `gugu`, `gUgU`, `g~g~`
+            vim.mode match {
+                VimMode.OperatorPending(op) => {
+                    if (op == "gu" and (k == "u" or k == "g"))
+                        or (op == "gU" and (k == "U" or k == "g"))
+                        or (op == "g~" and (k == "~" or k == "g")) {
+                        let end_r = buf.point.row + vim.effective_count() - 1
+                        apply_operator_linewise(world, buf, vim, op, buf.point.row, end_r)#!
+                        return true
+                    }
+                },
+                _ => (),
+            }
+            if vim.mode == VimMode.Normal and (k == "-" or k == "+") {
+                let delta: i64 = if k == "-" { -1 } else { 1 }
+                let switched = buf.undo_switch_branch(delta)!
+                if switched == null {
+                    status_emit("No alternate undo branch at current parent")#
+                } else {
+                    buf.point = buf.clamp_pos(buf.point, insert_mode = false)
+                    status_emit("Switched undo branch -> state #" ++ buf.undo_tree.current_id.to_string())#
+                }
+                vim.clear_transient()
+                abort_change(vim)
+                return true
+            }
+            if k == "v" and (vim.mode == VimMode.Normal or is_visual_mode(vim.mode)) {
+                if vim.has_last_visual {
+                    vim.mode = vim.last_visual_mode
+                    vim.visual_anchor = buf.clamp_pos(vim.last_visual_anchor, insert_mode = false)
+                    buf.point = buf.clamp_pos(vim.last_visual_point, insert_mode = false)
+                    vim.visual_dollar = false
+                    vim.clear_transient()
+                    abort_change(vim)
+                    return true
+                }
+                let s_opt = buf.named_marks.get("<")
+                let e_opt = buf.named_marks.get(">")
+                if s_opt != null and e_opt != null {
+                    vim.mode = VimMode.VisualChar
+                    vim.visual_anchor = buf.clamp_pos(s_opt.as(Pos), insert_mode = false)
+                    buf.point = buf.clamp_pos(e_opt.as(Pos), insert_mode = false)
+                    vim.visual_dollar = false
+                } else {
+                    status_emit("No previous visual selection")#
+                }
+                vim.clear_transient()
+                abort_change(vim)
+                return true
+            }
+            if k == "i" and vim.mode == VimMode.Normal {
+                buf.ensure_writable()!
+                let ins_opt = buf.named_marks.get("^")
+                if ins_opt != null {
+                    buf.point = buf.clamp_pos(ins_opt.as(Pos), insert_mode = true)
+                    buf.preferred_col = buf.point.col
+                }
+                begin_change(vim, KeyStroke.plain("g"))
+                record_change_stroke(vim, stroke)
+                vim.mode = VimMode.Insert
+                vim.clear_transient()
+                return true
+            }
+            if k == "f" and (vim.mode == VimMode.Normal or is_visual_mode(vim.mode)) {
+                let target_opt = file_target_under_cursor(buf, buf.point)
+                if is_visual_mode(vim.mode) {
+                    save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
+                    vim.mode = VimMode.Normal
+                    vim.visual_dollar = false
+                }
+                vim.clear_transient()
+                abort_change(vim)
+                if target_opt == null {
+                    status_emit("E446: No file name under cursor")#
+                    return true
+                }
+                let (raw_p, tgt_line, tgt_col) = target_opt.as((String, i64, i64))
+                let resolved = resolve_gf_path(world, buf, raw_p)
+                if (not fs.exists(resolved)) or fs.is_dir(resolved) {
+                    status_emit("E447: Can't find file \"" ++ raw_p ++ "\" in path")#
+                    return true
+                }
+                vim.last_jump_origin = buf.point
+                world.jumps.record(buf.id, buf.file_path, buf.point)
+                let opened = world.open_file(resolved)#!
+                kernel.emit_hook("buffer-switched", opened.id)
+                let nb = world.active_buffer()
+                if tgt_line > 0 {
+                    let row_idx = tgt_line - 1
+                    let col_idx = if tgt_col > 0 { tgt_col - 1 } else { nb.first_non_blank_col(row_idx) }
+                    nb.point = nb.clamp_pos(Pos.new(row_idx, col_idx), insert_mode = false)
+                } else {
+                    nb.point = nb.clamp_pos(nb.point, insert_mode = false)
+                }
+                return true
+            }
+            if k == "J" {
+                if is_visual_mode(vim.mode) {
+                    buf.ensure_writable()!
+                    let a = vim.visual_anchor
+                    let b = buf.point
+                    save_visual_marks(buf, vim, a, b)
+                    let r1 = if a.row <= b.row { a.row } else { b.row }
+                    let r2 = if a.row <= b.row { b.row } else { a.row }
+                    let joins = if r2 > r1 { r2 - r1 } else { 1 }
+                    for _ in 0..joins {
+                        let _ = join_line_no_space(buf, r1)!
+                    }
+                    buf.point = buf.clamp_pos(buf.point, insert_mode = false)
+                    buf.named_marks.insert(".", buf.point)
+                    buf.checkpoint(buf.point, "vim-join-nospace")
+                    vim.mode = VimMode.Normal
+                    vim.visual_dollar = false
+                    vim.clear_transient()
+                    commit_change(vim)
+                    return true
+                }
+                if vim.mode == VimMode.Normal {
+                    buf.ensure_writable()!
+                    let cnt = vim.effective_count()
+                    let has_cnt = vim.has_explicit_count()
+                    begin_change(vim, KeyStroke.plain("g"))
+                    record_change_stroke(vim, stroke)
+                    let joins = if has_cnt and cnt > 1 { cnt - 1 } else { 1 }
+                    for _ in 0..joins {
+                        let _ = join_line_no_space(buf, buf.point.row)!
+                    }
+                    buf.point = buf.clamp_pos(buf.point, insert_mode = false)
+                    buf.named_marks.insert(".", buf.point)
+                    buf.checkpoint(buf.point, "vim-join-nospace")
+                    vim.clear_transient()
+                    commit_change(vim)
+                    return true
+                }
+            }
+        }
+        -- Fallback to plugin bindings under `g<key>` in `KEYMAP_VIM_NORMAL` / `KEYMAP_VIM_VISUAL`
+        let km_name = if is_visual_mode(vim.mode) { KEYMAP_VIM_VISUAL } else { KEYMAP_VIM_NORMAL }
+        let km_opt = kernel.keymaps.get(km_name)
+        if km_opt != null {
+            let seq = [KeyStroke.plain("g"), stroke]
+            km_opt.as(Keymap).lookup(seq) match {
+                KeyLookup.Exact(cmd_name, _) => {
+                    vim.clear_transient()
+                    abort_change(vim)
+                    let _ = dispatch_optional_cmd(kernel, cmd_name, List())#!
+                    return true
+                },
+                KeyLookup.Prefix(hints) => {
+                    vim.plugin_strokes = seq
+                    world.which_key_items = sort_key_hints(hints)
+                    return true
+                },
+                KeyLookup.Unbound => (),
+            }
+        }
+        vim.clear_transient()
+        return true
+    }
+
+    -- 10. `z` scroll prefix (`zz`, `zt`, `zb`)
+    if pfx == "z" {
+        vim.pending_prefix = ""
+        let k = stroke.key
+        let vrows = if world.viewport_rows > 1 { world.viewport_rows } else { 1 }
+        if k == "z" {
+            let new_top = if buf.point.row - vrows / 2 > 0 { buf.point.row - vrows / 2 } else { 0 }
+            world.viewport_top_row = new_top
+            let _ = dispatch_optional_cmd(kernel, "scroll-center", List())#!
+        } else if k == "t" {
+            world.viewport_top_row = buf.point.row
+            let _ = dispatch_optional_cmd(kernel, "scroll-top", List())#!
+        } else if k == "b" {
+            let new_top = if buf.point.row - vrows + 1 > 0 { buf.point.row - vrows + 1 } else { 0 }
+            world.viewport_top_row = new_top
+            let _ = dispatch_optional_cmd(kernel, "scroll-bottom", List())#!
+        }
+        vim.clear_transient()
+        return true
+    }
+
+    -- 10b. `Z` quit prefix (`ZZ` save-if-modified & quit, `ZQ` force quit without saving)
+    if pfx == "Z" {
+        vim.pending_prefix = ""
+        let k = stroke.key
+        vim.clear_transient()
+        abort_change(vim)
+        if (not stroke.ctrl) and (not stroke.alt) {
+            if k == "Z" {
+                let ex_arg = if buf.modified and buf.file_path != "" { "x" } else { "q" }
+                let _ = dispatch_optional_cmd(kernel, "evil-ex", [ex_arg])#!
+                return true
+            }
+            if k == "Q" {
+                let _ = dispatch_optional_cmd(kernel, "evil-ex", ["q!"])#!
+                return true
+            }
+        }
+        return true
+    }
+
+    -- 11. `]` / `[` bracket navigation (`]q`, `[q` quickfix; `]i`, `[i` indent boundaries)
+    if pfx == "]" or pfx == "[" {
+        let forward = pfx == "]"
+        vim.pending_prefix = ""
+        if stroke.key == "i" and (not stroke.ctrl) and (not stroke.alt) {
+            let cnt = vim.effective_count()
+            let ts = if world.options.tabstop > 0 { world.options.tabstop } else { 4 }
+            let tgt = if forward {
+                motion_indent_next_boundary(buf, buf.point, cnt, ts)
+            } else {
+                motion_indent_prev_boundary(buf, buf.point, cnt, ts)
+            }
+            apply_resolved_motion(world, buf, vim, tgt)#!
+            return true
+        }
+        if stroke.key == "q" {
+            let total = world.quickfix.len()
+            if total == 0 {
+                status_emit("No quickfix entries")#
+                vim.clear_transient()
+                return true
+            }
+            let step = vim.effective_count()
+            var next_idx = if forward {
+                world.quickfix_idx + step
+            } else {
+                world.quickfix_idx - step
+            }
+            if next_idx < 0 {
+                next_idx = 0
+            }
+            if next_idx >= total {
+                next_idx = total - 1
+            }
+            world.quickfix_idx = next_idx
+            let qf = world.quickfix.get(next_idx.as(usize)).as(QuickfixEntry)
+            if qf.file_path != "" {
+                let opened = world.open_file(qf.file_path)#!
+                kernel.emit_hook("buffer-switched", opened.id)
+            }
+            let nb = world.active_buffer()
+            nb.point = nb.clamp_pos(Pos.new(qf.row, qf.col), insert_mode = false)
+            status_emit("(" ++ (next_idx + 1).to_string() ++ "/" ++ total.to_string() ++ ") " ++ qf.text)#
+            vim.clear_transient()
+            return true
+        }
+        -- Fallback to plugin navigation bindings (`]c`/`[c`, `]d`/`[d`, `]x`/`[x`, `]r`/`[r`, `[y`/`]y`, etc.)
+        let km_name = if is_visual_mode(vim.mode) { KEYMAP_VIM_VISUAL } else { KEYMAP_VIM_NORMAL }
+        let km_opt = kernel.keymaps.get(km_name)
+        if km_opt != null {
+            let seq = [KeyStroke.plain(pfx), stroke]
+            km_opt.as(Keymap).lookup(seq) match {
+                KeyLookup.Exact(cmd_name, _) => {
+                    vim.clear_transient()
+                    abort_change(vim)
+                    let _ = dispatch_optional_cmd(kernel, cmd_name, List())#!
+                    return true
+                },
+                KeyLookup.Prefix(hints) => {
+                    vim.plugin_strokes = seq
+                    world.which_key_items = sort_key_hints(hints)
+                    return true
+                },
+                KeyLookup.Unbound => (),
+            }
+        }
+        vim.clear_transient()
+        return true
+    }
+
+    -- 12. Window `<C-w>` prefix
+    if pfx == "<C-w>" {
+        vim.pending_prefix = ""
+        world.which_key_items = List()
+        let k = stroke.key
+        var cmd = ""
+        when {
+            k == "s" or k == "S" => { cmd = "split-window-below" },
+            k == "v" or k == "V" => { cmd = "split-window-right" },
+            k == "c" or k == "q" => { cmd = "delete-window" },
+            k == "o" => { cmd = "delete-other-windows" },
+            k == "w" => { cmd = "other-window" },
+            k == "=" => { cmd = "balance-windows" },
+            k == "h" or k == "Left" => { cmd = "window-focus-left" },
+            k == "j" or k == "Down" => { cmd = "window-focus-down" },
+            k == "k" or k == "Up" => { cmd = "window-focus-up" },
+            k == "l" or k == "Right" => { cmd = "window-focus-right" },
+            else => (),
+        }
+        vim.clear_transient()
+        if cmd != "" {
+            let _ = dispatch_optional_cmd(kernel, cmd, List())#!
+        }
+        return true
+    }
+
+    vim.pending_prefix = ""
+    true
+}
+
+-- ============================================================================
+-- Leader Keymap (`<Space>`) Sequence Dispatch
+-- ============================================================================
+
+fn handle_leader_sequence(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    vim: VimState,
+    stroke: KeyStroke,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String bool {
+    let is_esc = stroke.key == "Escape" or (stroke.ctrl and stroke.key == "g")
+    if is_esc {
+        vim.leader_strokes = List()
+        world.which_key_items = List()
+        world.pending_keys_display = ""
+        return true
+    }
+
+    vim.leader_strokes.push(stroke)
+    let km = kernel.ensure_keymap(KEYMAP_VIM_LEADER)
+    var res = km.lookup(vim.leader_strokes)
+
+    -- Support user bindings registered without leading `<Space>` as well
+    let is_unbound = res match {
+        KeyLookup.Unbound => true,
+        _ => false,
+    }
+    if is_unbound and vim.leader_strokes.len() >= 2 {
+        let rel = List()
+        for i in 1..vim.leader_strokes.len() {
+            rel.push(vim.leader_strokes.get(i.as(usize)).as(KeyStroke))
+        }
+        res = km.lookup(rel)
+    }
+
+    res match {
+        KeyLookup.Exact(cmd_name, _owner) => {
+            vim.leader_strokes = List()
+            world.which_key_items = List()
+            world.pending_keys_display = ""
+            vim.clear_transient()
+            let dispatched = dispatch_optional_cmd(kernel, cmd_name, List())#!
+            if not dispatched {
+                status_emit("Command not available: " ++ cmd_name)#
+            }
+            return true
+        },
+        KeyLookup.Prefix(hints) => {
+            world.which_key_items = sort_key_hints(hints)
+            world.pending_keys_display = format_chord(vim.leader_strokes)
+            return true
+        },
+        KeyLookup.Unbound => {
+            let chord_str = format_chord(vim.leader_strokes)
+            vim.leader_strokes = List()
+            world.which_key_items = List()
+            world.pending_keys_display = ""
+            status_emit("Unbound leader chord: " ++ chord_str)#
+            return true
+        },
+    }
+}
+
+-- ============================================================================
+-- Dot Repeat (`.`) Execution
+-- ============================================================================
+
+fn execute_dot_repeat(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    vim: VimState,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String Unit {
+    if vim.last_change_strokes.is_empty() {
+        status_emit("No previous change to repeat")#
+        vim.clear_transient()
+        return ()
+    }
+    let override_cnt = if vim.count1 > 0 { vim.count1 } else { vim.last_change_count }
+    let use_reg = if vim.active_reg != "" { vim.active_reg } else { vim.last_change_reg }
+    let strokes = clone_stroke_list(vim.last_change_strokes)
+
+    vim.clear_transient()
+    vim.count1 = override_cnt
+    vim.active_reg = use_reg
+    let prev_dot = vim.replaying_dot
+    vim.replaying_dot = true
+    for i in 0..strokes.len() {
+        let s = strokes.get(i.as(usize)).as(KeyStroke)
+        let _ = vim_dispatch_stroke_core(kernel, world, vim, s)#!
+    }
+    vim.replaying_dot = prev_dot
+    ()
+}
+
+-- ============================================================================
+-- Visual Mode Action Keys (`d`, `c`, `y`, `I`, `A`, `>`, `<`, `~`, `u`, `U`, `J`, `o`, `:`)
+-- ============================================================================
+
+fn is_reserved_visual_starter(stroke: KeyStroke) -> bool {
+    if stroke.ctrl or stroke.alt or stroke.super_mod {
+        return false
+    }
+    let k = stroke.key
+    k == "g" or k == "]" or k == "[" or k == "i" or k == "a"
+        or k == "z" or k == "f" or k == "F" or k == "t" or k == "T"
+        or k == "'" or k == "`" or k == "\"" or k == "r" or k == ":"
+        or k == "/" or k == "?"
+}
+
+fn handle_visual_specific_key(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    buf: Buffer,
+    vim: VimState,
+    stroke: KeyStroke,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String bool {
+    let k = stroke.key
+
+    let vplain = (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod)
+    let vctrl_only = stroke.ctrl and (not stroke.alt) and (not stroke.super_mod)
+
+    -- Escape or toggling same Visual mode key returns to Normal mode
+    let toggle_off = stroke.key == "Escape"
+        or (stroke.ctrl and stroke.key == "[")
+        or (vplain and k == "v" and vim.mode == VimMode.VisualChar)
+        or (vplain and k == "V" and vim.mode == VimMode.VisualLine)
+        or (vctrl_only and k == "v" and vim.mode == VimMode.VisualBlock)
+    if toggle_off {
+        save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
+        vim.mode = VimMode.Normal
+        vim.visual_dollar = false
+        vim.clear_transient()
+        abort_change(vim)
+        return true
+    }
+
+    -- Switch between `v`, `V`, `<C-v>` seamlessly keeping anchor!
+    if vplain and k == "v" {
+        vim.mode = VimMode.VisualChar
+        return true
+    }
+    if vplain and k == "V" {
+        vim.mode = VimMode.VisualLine
+        return true
+    }
+    if vctrl_only and k == "v" {
+        vim.mode = VimMode.VisualBlock
+        return true
+    }
+
+    -- Swap anchor & cursor (`o` / `O`; in VisualBlock, `O` swaps horizontal block corner)
+    if vplain and (k == "o" or k == "O") {
+        if vim.mode == VimMode.VisualBlock and k == "O" {
+            let old_ac = vim.visual_anchor.col
+            let old_pc = buf.point.col
+            vim.visual_anchor = Pos.new(vim.visual_anchor.row, old_pc)
+            buf.point = buf.clamp_pos(Pos.new(buf.point.row, old_ac), insert_mode = false)
+            vim.visual_dollar = false
+        } else {
+            let old_anchor = vim.visual_anchor
+            vim.visual_anchor = buf.point
+            buf.point = old_anchor
+        }
+        return true
+    }
+
+    -- Ex command from Visual mode (`:'<,'>`)
+    if vplain and k == ":" {
+        save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
+        vim.mode = VimMode.Normal
+        vim.visual_dollar = false
+        vim.clear_transient()
+        abort_change(vim)
+        let _ = dispatch_optional_cmd(kernel, "evil-ex", ["'<,'>"])#!
+        return true
+    }
+
+    -- Register selection `"<reg>` in Visual mode
+    if vplain and k == "\"" {
+        vim.pending_prefix = "\""
+        return true
+    }
+
+    -- Visual replace `r<char>`
+    if vplain and k == "r" {
+        vim.pending_visual_replace = true
+        vim.pending_prefix = "r"
+        return true
+    }
+
+    -- Text object starter `i` / `a` inside Visual mode
+    if vplain and (k == "i" or k == "a") {
+        vim.pending_prefix = k
+        return true
+    }
+
+    -- Plugin Visual-mode keymap (`KEYMAP_VIM_VISUAL`, e.g. `S` surround, `<Space> v`/`V` expand/shrink, `<M-Up>`/`<M-Down>`, `<M-j>`/`<M-k>`, `<C-n>`)
+    if not is_reserved_visual_starter(stroke) {
+        let vkm_opt = kernel.keymaps.get(KEYMAP_VIM_VISUAL)
+        if vkm_opt != null {
+            vkm_opt.as(Keymap).lookup([stroke]) match {
+                KeyLookup.Exact(cmd_name, owner) => {
+                    if kernel.is_extension_active(owner) {
+                        let _ = dispatch_optional_cmd(kernel, cmd_name, List())#!
+                        return true
+                    }
+                },
+                KeyLookup.Prefix(hints) => {
+                    vim.plugin_strokes = [stroke]
+                    world.which_key_items = sort_key_hints(hints)
+                    return true
+                },
+                KeyLookup.Unbound => (),
+            }
+        }
+    }
+
+    -- Visual Block `I` and `A` multi-line block insert!
+    if vim.mode == VimMode.VisualBlock and vplain and (k == "I" or k == "A") {
+        let was_dollar = vim.visual_dollar
+        save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
+        let (r1, r2, c1, c2) = visual_block_bounds(buf, vim)
+        if k == "I" {
+            start_visual_block_insert(buf, vim, r1, r2, c1, false)!
+        } else {
+            start_visual_block_insert(buf, vim, r1, r2, c2 + 1, true, eol_mode = was_dollar)!
+        }
+        return true
+    }
+
+    -- Visual Block operators (`d`/`x`/`X`, `D`, `y`/`Y`, `c`/`s`, `C`, `S`/`R`, `p`/`P`, `>`, `<`, `=`, `~`, `u`, `U`, `J`)
+    if vim.mode == VimMode.VisualBlock and vplain {
+        if k == "d" or k == "x" or k == "X" {
+            save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
+            let (r1, r2, c1, c2) = visual_block_bounds(buf, vim)
+            let removed = extract_and_optionally_delete_block(buf, r1, r2, c1, c2, true)!
+            world.registers.delete_store(RegisterValue.block(removed), world.kill_ring, reg = vim.active_reg)#
+            buf.point = buf.clamp_pos(Pos.new(r1, c1), insert_mode = false)
+            buf.named_marks.insert(".", buf.point)
+            buf.checkpoint(buf.point, "visual-block-delete")
+            vim.mode = VimMode.Normal
+            vim.visual_dollar = false
+            vim.clear_transient()
+            commit_change(vim)
+            return true
+        }
+        if k == "D" {
+            buf.ensure_writable()!
+            save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
+            let (r1, r2, c1, _) = visual_block_bounds(buf, vim)
+            let pieces = List()
+            for r in r1..(r2 + 1) {
+                let line = buf.line_at(r)
+                let llen = line.char_len()
+                let sc = if c1 < llen { c1 } else { llen }
+                pieces.push(line.slice(sc, llen))
+                if sc < llen {
+                    buf.set_line_at(r, line.slice(0, sc))
+                    buf.modified = true
+                }
+            }
+            world.registers.delete_store(RegisterValue.block(pieces.join("\n")), world.kill_ring, reg = vim.active_reg)#
+            buf.point = buf.clamp_pos(Pos.new(r1, c1), insert_mode = false)
+            buf.named_marks.insert(".", buf.point)
+            buf.checkpoint(buf.point, "visual-block-delete-eol")
+            vim.mode = VimMode.Normal
+            vim.visual_dollar = false
+            vim.clear_transient()
+            commit_change(vim)
+            return true
+        }
+        if k == "y" or k == "Y" {
+            save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
+            let (r1, r2, c1, c2) = visual_block_bounds(buf, vim)
+            let yanked = extract_and_optionally_delete_block(buf, r1, r2, c1, c2, false)!
+            world.registers.yank_store(RegisterValue.block(yanked), reg = vim.active_reg)#
+            buf.point = buf.clamp_pos(Pos.new(r1, c1), insert_mode = false)
+            vim.mode = VimMode.Normal
+            vim.visual_dollar = false
+            vim.clear_transient()
+            abort_change(vim)
+            return true
+        }
+        if k == "c" or k == "s" {
+            save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
+            let (r1, r2, c1, c2) = visual_block_bounds(buf, vim)
+            let removed = extract_and_optionally_delete_block(buf, r1, r2, c1, c2, true)!
+            world.registers.delete_store(RegisterValue.block(removed), world.kill_ring, reg = vim.active_reg)#
+            start_visual_block_insert(buf, vim, r1, r2, c1, false)!
+            return true
+        }
+        if k == "C" {
+            buf.ensure_writable()!
+            save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
+            let (r1, r2, c1, _) = visual_block_bounds(buf, vim)
+            let pieces = List()
+            for r in r1..(r2 + 1) {
+                let line = buf.line_at(r)
+                let llen = line.char_len()
+                let sc = if c1 < llen { c1 } else { llen }
+                pieces.push(line.slice(sc, llen))
+                if sc < llen {
+                    buf.set_line_at(r, line.slice(0, sc))
+                    buf.modified = true
+                }
+            }
+            world.registers.delete_store(RegisterValue.block(pieces.join("\n")), world.kill_ring, reg = vim.active_reg)#
+            start_visual_block_insert(buf, vim, r1, r2, c1, false)!
+            return true
+        }
+        if k == "S" or k == "R" {
+            save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
+            let (r1, r2, _, _) = visual_block_bounds(buf, vim)
+            vim.visual_dollar = false
+            apply_operator_linewise(world, buf, vim, "c", r1, r2)#!
+            return true
+        }
+        if k == "p" or k == "P" {
+            execute_visual_paste(world, buf, vim, k == "p", vim.effective_count())#!
+            return true
+        }
+        if k == "~" or k == "u" or k == "U" {
+            buf.ensure_writable()!
+            save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
+            let (r1, r2, c1, c2) = visual_block_bounds(buf, vim)
+            let cop = if k == "u" { "gu" } else if k == "U" { "gU" } else { "g~" }
+            for r in r1..(r2 + 1) {
+                let line = buf.line_at(r)
+                let llen = line.char_len()
+                let sc = if c1 < llen { c1 } else { llen }
+                let ec = if c2 + 1 < llen { c2 + 1 } else { llen }
+                if sc < ec {
+                    let mid = transform_case_str(line.slice(sc, ec), cop)
+                    buf.set_line_at(r, line.slice(0, sc) ++ mid ++ line.slice(ec, llen))
+                }
+            }
+            buf.modified = true
+            buf.point = buf.clamp_pos(Pos.new(r1, c1), insert_mode = false)
+            buf.checkpoint(buf.point, "visual-block-case")
+            vim.mode = VimMode.Normal
+            vim.visual_dollar = false
+            vim.clear_transient()
+            commit_change(vim)
+            return true
+        }
+        if k == ">" or k == "<" or k == "=" {
+            save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
+            let (r1, r2, _, _) = visual_block_bounds(buf, vim)
+            apply_operator_linewise(world, buf, vim, k, r1, r2)#!
+            vim.visual_dollar = false
+            return true
+        }
+        if k == "J" {
+            buf.ensure_writable()!
+            save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
+            let (r1, r2, _, _) = visual_block_bounds(buf, vim)
+            let joins = if r2 > r1 { r2 - r1 } else { 1 }
+            for _ in 0..joins {
+                let _ = buf.join_line_with_next(r1)!
+            }
+            buf.point = buf.clamp_pos(buf.point, insert_mode = false)
+            buf.named_marks.insert(".", buf.point)
+            buf.checkpoint(buf.point, "vim-join")
+            vim.mode = VimMode.Normal
+            vim.visual_dollar = false
+            vim.clear_transient()
+            commit_change(vim)
+            return true
+        }
+    }
+
+    -- VisualChar & VisualLine operators
+    if vplain {
+        let a = vim.visual_anchor
+        let b = buf.point
+        let r1 = if a.row <= b.row { a.row } else { b.row }
+        let r2 = if a.row <= b.row { b.row } else { a.row }
+
+        if k == "D" or k == "X" {
+            save_visual_marks(buf, vim, a, b)
+            apply_operator_linewise(world, buf, vim, "d", r1, r2)#!
+            return true
+        }
+
+        if k == "C" or k == "S" or k == "R" {
+            save_visual_marks(buf, vim, a, b)
+            apply_operator_linewise(world, buf, vim, "c", r1, r2)#!
+            return true
+        }
+
+        if k == "Y" {
+            save_visual_marks(buf, vim, a, b)
+            apply_operator_linewise(world, buf, vim, "y", r1, r2)#!
+            return true
+        }
+
+        if k == "p" or k == "P" {
+            execute_visual_paste(world, buf, vim, k == "p", vim.effective_count())#!
+            return true
+        }
+
+        if k == "I" {
+            save_visual_marks(buf, vim, a, b)
+            var min_fnb: i64 = -1
+            for r in r1..(r2 + 1) {
+                if buf.line_at(r).trim() != "" {
+                    let fnb = buf.first_non_blank_col(r)
+                    if min_fnb < 0 or fnb < min_fnb {
+                        min_fnb = fnb
+                    }
+                }
+            }
+            if min_fnb < 0 {
+                min_fnb = buf.first_non_blank_col(r1)
+            }
+            start_visual_block_insert(buf, vim, r1, r2, min_fnb, false)!
+            return true
+        }
+
+        if k == "A" {
+            save_visual_marks(buf, vim, a, b)
+            if vim.mode == VimMode.VisualChar and r1 == r2 {
+                buf.ensure_writable()!
+                let hi = if a <= b { b } else { a }
+                let hlen = buf.line_char_len(hi.row)
+                let ins_c = if hi.col < hlen { hi.col + 1 } else { hlen }
+                buf.point = Pos.new(hi.row, ins_c)
+                vim.mode = VimMode.Insert
+                vim.clear_transient()
+            } else {
+                start_visual_block_insert(buf, vim, r1, r2, buf.line_char_len(r1), false, eol_mode = true)!
+            }
+            return true
+        }
+
+        if k == "d" or k == "x" or k == "y" or k == "c" or k == "s" or k == ">" or k == "<" or k == "="
+            or k == "~" or k == "u" or k == "U" {
+            save_visual_marks(buf, vim, a, b)
+            let mapped_op = when {
+                k == "x" => "d",
+                k == "s" => "c",
+                k == "~" => "g~",
+                k == "u" => "gu",
+                k == "U" => "gU",
+                else => k,
+            }
+            if vim.mode == VimMode.VisualLine or mapped_op == ">" or mapped_op == "<" or mapped_op == "=" {
+                apply_operator_linewise(world, buf, vim, mapped_op, r1, r2)#!
+            } else {
+                let lo = if a <= b { a } else { b }
+                let hi = if a <= b { b } else { a }
+                let hlen = buf.line_char_len(hi.row)
+                let end_c = if hi.col < hlen { hi.col + 1 } else { hlen }
+                apply_operator_span(world, buf, vim, mapped_op, Span.normalized(lo, Pos.new(hi.row, end_c)))#!
+            }
+            return true
+        }
+
+        if k == "J" {
+            buf.ensure_writable()!
+            save_visual_marks(buf, vim, a, b)
+            let joins = if r2 > r1 { r2 - r1 } else { 1 }
+            for _ in 0..joins {
+                let _ = buf.join_line_with_next(r1)!
+            }
+            buf.point = buf.clamp_pos(buf.point, insert_mode = false)
+            buf.named_marks.insert(".", buf.point)
+            buf.checkpoint(buf.point, "vim-join")
+            vim.mode = VimMode.Normal
+            vim.clear_transient()
+            commit_change(vim)
+            return true
+        }
+    }
+
+    false
+}
+
+fn try_plugin_keymap_step(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    vim: VimState,
+    km_name: String,
+    seq: List,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String i64 {
+    -- Returns 0 = Unbound, 1 = Prefix, 2 = Exact dispatched
+    let km_opt = kernel.keymaps.get(km_name)
+    if km_opt == null {
+        return 0
+    }
+    km_opt.as(Keymap).lookup(seq) match {
+        KeyLookup.Exact(cmd_name, _) => {
+            vim.plugin_strokes = List()
+            world.which_key_items = List()
+            world.pending_keys_display = ""
+            vim.clear_transient()
+            let _ = dispatch_optional_cmd(kernel, cmd_name, List())#!
+            2
+        },
+        KeyLookup.Prefix(hints) => {
+            vim.plugin_strokes = clone_stroke_list(seq)
+            world.which_key_items = sort_key_hints(hints)
+            world.pending_keys_display = format_chord(vim.plugin_strokes)
+            1
+        },
+        KeyLookup.Unbound => 0,
+    }
+}
+
+fn is_reserved_normal_starter(stroke: KeyStroke) -> bool {
+    if stroke.ctrl or stroke.alt or stroke.super_mod {
+        return false
+    }
+    let k = stroke.key
+    k == "g" or k == "]" or k == "[" or k == "y" or k == "d" or k == "c" or k == "="
+        or k == "z" or k == "Z" or k == "f" or k == "F" or k == "t" or k == "T"
+        or k == "m" or k == "'" or k == "`" or k == "\"" or k == "q" or k == "@"
+        or k == "Space" or k == ":"
+}
+
+-- ============================================================================
+-- Core Modal Stroke Dispatcher (Normal / Visual / OperatorPending / Insert / Replace)
+-- ============================================================================
+
+fn vim_dispatch_stroke_core(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    vim: VimState,
+    stroke: KeyStroke,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String bool {
+    let buf = world.active_buffer()
+
+    -- 0. Active modal interceptor (e.g. Flash jump label, Surround target char, Oil/Magit prompt)
+    if vim.modal_interceptor != null {
+        let mi = vim.modal_interceptor.as(ModalInterceptor)
+        let intercepted = (mi.handler)(kernel, stroke)#!
+        if intercepted {
+            sync_world_from_vim(world, vim)
+            return true
+        }
+    }
+
+    -- 0b. Active multi-key plugin chord (`gcc`, `gbc`, `ysiw`, etc.)
+    if not vim.plugin_strokes.is_empty() {
+        if stroke.key == "Escape" or (stroke.ctrl and (stroke.key == "[" or stroke.key == "g")) {
+            vim.plugin_strokes = List()
+            world.which_key_items = List()
+            sync_world_from_vim(world, vim)
+            return true
+        }
+        let seq = clone_stroke_list(vim.plugin_strokes)
+        seq.push(stroke)
+        let mode_km = "mode:" ++ buf.major_mode
+        var matched_step = if vim.mode == VimMode.Normal {
+            try_plugin_keymap_step(kernel, world, vim, mode_km, seq)#!
+        } else {
+            0
+        }
+        if matched_step == 0 {
+            let target_km = if is_visual_mode(vim.mode) { KEYMAP_VIM_VISUAL } else { KEYMAP_VIM_NORMAL }
+            matched_step = try_plugin_keymap_step(kernel, world, vim, target_km, seq)#!
+        }
+        if matched_step == 0 {
+            let chord_s = format_chord(seq)
+            vim.plugin_strokes = List()
+            world.which_key_items = List()
+            status_emit("Unbound chord: " ++ chord_s)#
+        }
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    -- 1. Active Insert or Replace mode
+    if vim.mode == VimMode.Insert {
+        let ikm_opt = kernel.keymaps.get(KEYMAP_VIM_INSERT)
+        if ikm_opt != null {
+            ikm_opt.as(Keymap).lookup([stroke]) match {
+                KeyLookup.Exact(cmd_name, _) => {
+                    let _ = dispatch_optional_cmd(kernel, cmd_name, List())#!
+                    sync_world_from_vim(world, vim)
+                    return true
+                },
+                _ => (),
+            }
+        }
+        for ii_idx in 0..vim.insert_interceptors.len() {
+            let ii = vim.insert_interceptors.get(ii_idx.as(usize)).as(InsertInterceptor)
+            if kernel.is_extension_active(ii.owner) {
+                let taken = (ii.handler)(kernel, stroke)#!
+                if taken {
+                    if vim.mode == VimMode.Insert {
+                        kernel.emit_hook("after-insert-stroke", stroke)
+                    }
+                    sync_world_from_vim(world, vim)
+                    return true
+                }
+            }
+        }
+        let handled = handle_insert_mode_key(world, buf, vim, stroke)!
+        if vim.mode == VimMode.Insert {
+            kernel.emit_hook("after-insert-stroke", stroke)
+        }
+        sync_world_from_vim(world, vim)
+        return handled
+    }
+    if vim.mode == VimMode.Replace {
+        let handled = handle_replace_mode_key(buf, vim, stroke)!
+        sync_world_from_vim(world, vim)
+        return handled
+    }
+
+    -- 2. Active `<Space>` leader keymap sequence
+    if not vim.leader_strokes.is_empty() {
+        let handled = handle_leader_sequence(kernel, world, vim, stroke)#!
+        sync_world_from_vim(world, vim)
+        return handled
+    }
+
+    -- 3. Active multi-key prefix (`f`, `r`, `m`, `'`, `"`, `q`, `@`, `g`, `z`, `<C-w>`, `i`/`a`, `]`/`[`)
+    if vim.pending_prefix != "" {
+        let handled = handle_pending_prefix(kernel, world, buf, vim, stroke)#!
+        sync_world_from_vim(world, vim)
+        return handled
+    }
+
+    -- 4. Count accumulation (`[1-9]` or `0` after digits)
+    let plain_ch = stroke_printable_char(stroke)
+    if plain_ch.char_len() == 1 and plain_ch.is_ascii_digit() {
+        let d = plain_ch.parse_i64().as(i64)
+        vim.mode match {
+            VimMode.OperatorPending(_) => {
+                if d > 0 or vim.count2 > 0 {
+                    vim.count2 = vim.count2 * 10 + d
+                    if vim.recording_change and not vim.replaying_dot {
+                        vim.change_count = vim.effective_count()
+                    }
+                    sync_world_from_vim(world, vim)
+                    return true
+                }
+            },
+            _ => {
+                if d > 0 or vim.count1 > 0 {
+                    vim.count1 = vim.count1 * 10 + d
+                    if vim.tentative_visual_change {
+                        record_change_stroke(vim, stroke)
+                    }
+                    sync_world_from_vim(world, vim)
+                    return true
+                }
+            },
+        }
+    }
+
+    -- Record stroke into active change transaction (for Visual or OperatorPending)
+    if vim.recording_change {
+        record_change_stroke(vim, stroke)
+    }
+
+    -- 5. Escape in Normal / OperatorPending cancels transient state
+    if stroke.key == "Escape" or (stroke.ctrl and stroke.key == "[") {
+        if is_visual_mode(vim.mode) {
+            save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
+        }
+        vim.mode = VimMode.Normal
+        vim.visual_dollar = false
+        vim.clear_transient()
+        abort_change(vim)
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    -- 5b. Buffer-local `"mode:<major_mode>"` and `KEYMAP_VIM_NORMAL` bindings when idle in Normal mode
+    if vim.mode == VimMode.Normal and vim.count1 == 0 and vim.active_reg == "" {
+        let mode_step = try_plugin_keymap_step(kernel, world, vim, "mode:" ++ buf.major_mode, [stroke])#!
+        if mode_step > 0 {
+            sync_world_from_vim(world, vim)
+            return true
+        }
+        if not is_reserved_normal_starter(stroke) {
+            let norm_step = try_plugin_keymap_step(kernel, world, vim, KEYMAP_VIM_NORMAL, [stroke])#!
+            if norm_step > 0 {
+                sync_world_from_vim(world, vim)
+                return true
+            }
+        }
+    }
+
+    -- 6. Visual-mode specific keys
+    if is_visual_mode(vim.mode) {
+        let vis_handled = handle_visual_specific_key(kernel, world, buf, vim, stroke)#!
+        if vis_handled {
+            sync_world_from_vim(world, vim)
+            return true
+        }
+    }
+
+    let k = stroke.key
+    let plain = (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod)
+    let ctrl_only = stroke.ctrl and (not stroke.alt) and (not stroke.super_mod)
+
+    -- 7. Operator-Pending specific keys (`i`/`a` text objects & doubled linewise operators `dd`, `cc`, `yy`, `>>`, `<<`)
+    vim.mode match {
+        VimMode.OperatorPending(op) => {
+            if plain and (k == "i" or k == "a") {
+                vim.pending_prefix = k
+                sync_world_from_vim(world, vim)
+                return true
+            }
+            if plain and k == op {
+                let end_r = buf.point.row + vim.effective_count() - 1
+                apply_operator_linewise(world, buf, vim, op, buf.point.row, end_r)#!
+                sync_world_from_vim(world, vim)
+                return true
+            }
+        },
+        _ => (),
+    }
+
+    -- 8. Shared Motions (usable in Normal, Visual, AND OperatorPending!)
+    let is_op_pending = vim.mode match {
+        VimMode.OperatorPending(_) => true,
+        _ => false,
+    }
+    let eff = vim.effective_count()
+
+    if plain and (k == "h" or k == "Left" or k == "BackSpace") {
+        let new_c = if buf.point.col - eff > 0 { buf.point.col - eff } else { 0 }
+        apply_resolved_motion(world, buf, vim, MotionTarget.ok(Pos.new(buf.point.row, new_c), MotionShape.Exclusive))#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if plain and (k == "l" or k == "Right") {
+        let llen = buf.line_char_len(buf.point.row)
+        let max_c = if is_op_pending { llen } else if llen > 0 { llen - 1 } else { 0 }
+        let new_c = if buf.point.col + eff <= max_c { buf.point.col + eff } else { max_c }
+        apply_resolved_motion(world, buf, vim, MotionTarget.ok(Pos.new(buf.point.row, new_c), MotionShape.Exclusive))#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if plain and (k == "j" or k == "Down") {
+        let new_r = if buf.point.row + eff <= buf.max_row() { buf.point.row + eff } else { buf.max_row() }
+        let pref = buf.preferred_col
+        let tgt = MotionTarget.ok(Pos.new(new_r, pref), MotionShape.Linewise, preserve_pref_col = true)
+        apply_resolved_motion(world, buf, vim, tgt)#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if plain and (k == "k" or k == "Up") {
+        let new_r = if buf.point.row - eff >= buf.min_row() { buf.point.row - eff } else { buf.min_row() }
+        let pref = buf.preferred_col
+        let tgt = MotionTarget.ok(Pos.new(new_r, pref), MotionShape.Linewise, preserve_pref_col = true)
+        apply_resolved_motion(world, buf, vim, tgt)#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if plain and k == "0" {
+        apply_resolved_motion(world, buf, vim, MotionTarget.ok(Pos.new(buf.point.row, 0), MotionShape.Exclusive))#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if plain and k == "^" {
+        let fnb = buf.first_non_blank_col(buf.point.row)
+        apply_resolved_motion(world, buf, vim, MotionTarget.ok(Pos.new(buf.point.row, fnb), MotionShape.Exclusive))#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if plain and k == "$" {
+        let tr = if buf.point.row + eff - 1 <= buf.max_row() { buf.point.row + eff - 1 } else { buf.max_row() }
+        let llen = buf.line_char_len(tr)
+        let ec = if llen > 0 { llen - 1 } else { 0 }
+        let tgt = MotionTarget.ok(Pos.new(tr, ec), MotionShape.Inclusive, end_of_line_pref = true)
+        apply_resolved_motion(world, buf, vim, tgt)#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if plain and (k == "w" or k == "W") {
+        let big = k == "W"
+        -- Classic Vim rule: `cw` / `cW` on non-blank behaves like `ce` / `cE` (does not eat trailing space)
+        var use_end = false
+        vim.mode match {
+            VimMode.OperatorPending(op) => {
+                if op == "c" {
+                    let cur_line = buf.line_at(buf.point.row)
+                    if buf.point.col < cur_line.char_len() {
+                        let cch = cur_line.slice(buf.point.col, buf.point.col + 1)
+                        if cch != " " and cch != "\t" {
+                            use_end = true
+                        }
+                    }
+                }
+            },
+            _ => (),
+        }
+        let tgt = if use_end {
+            motion_word_end(buf, buf.point, eff, big)
+        } else {
+            motion_word_forward(buf, buf.point, eff, big, is_op_pending)
+        }
+        apply_resolved_motion(world, buf, vim, tgt)#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if plain and (k == "b" or k == "B") {
+        let tgt = motion_word_backward(buf, buf.point, eff, k == "B")
+        apply_resolved_motion(world, buf, vim, tgt)#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if plain and (k == "e" or k == "E") {
+        let tgt = motion_word_end(buf, buf.point, eff, k == "E")
+        apply_resolved_motion(world, buf, vim, tgt)#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if plain and (k == "f" or k == "F" or k == "t" or k == "T") {
+        vim.pending_prefix = k
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if plain and (k == ";" or k == ",") {
+        let prev? = vim.last_char_find else {
+            vim.clear_transient()
+            sync_world_from_vim(world, vim)
+            return true
+        }
+        let (orig_kind, target_ch) = prev
+        let dir_kind = if k == "," { reverse_char_find_kind(orig_kind) } else { orig_kind }
+        let tgt = motion_find_char_in_line(buf, buf.point, dir_kind, target_ch, eff, true)
+        apply_resolved_motion(world, buf, vim, tgt)#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if plain and k == "G" {
+        let dest_r = if vim.has_explicit_count() {
+            let r = eff - 1
+            if r < buf.min_row() { buf.min_row() } else if r > buf.max_row() { buf.max_row() } else { r }
+        } else {
+            buf.max_row()
+        }
+        let tgt = MotionTarget.ok(
+            Pos.new(dest_r, buf.first_non_blank_col(dest_r)),
+            MotionShape.Linewise,
+            is_jump = true,
+        )
+        apply_resolved_motion(world, buf, vim, tgt)#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if plain and k == "{{" {
+        let tgt = motion_paragraph_prev(buf, buf.point, eff)
+        apply_resolved_motion(world, buf, vim, tgt)#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if plain and k == "}}" {
+        let tgt = motion_paragraph_next(buf, buf.point, eff)
+        apply_resolved_motion(world, buf, vim, tgt)#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if plain and k == "%" {
+        let tgt = motion_match_bracket(buf, buf.point)
+        apply_resolved_motion(world, buf, vim, tgt)#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if plain and (k == "H" or k == "M" or k == "L") {
+        let tgt = motion_viewport_line(world, buf, k, eff, vim.has_explicit_count())
+        apply_resolved_motion(world, buf, vim, tgt)#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    -- Page / Half-page scroll (`<C-d>`, `<C-u>`, `<C-f>`, `<C-b>`, `<PageDown>`, `<PageUp>`)
+    let is_page_key = plain and (k == "PageDown" or k == "PageUp")
+    if (ctrl_only and (k == "d" or k == "u" or k == "f" or k == "b")) or is_page_key {
+        let vrows = if world.viewport_rows > 2 { world.viewport_rows } else { 20 }
+        let is_half = ctrl_only and (k == "d" or k == "u")
+        let is_down = (ctrl_only and (k == "d" or k == "f")) or k == "PageDown"
+        let step_base = if is_half {
+            if vrows / 2 > 1 { vrows / 2 } else { 1 }
+        } else {
+            if vrows - 2 > 1 { vrows - 2 } else { 1 }
+        }
+        let delta = if is_down { step_base * eff } else { -(step_base * eff) }
+        var nr = buf.point.row + delta
+        if nr < buf.min_row() {
+            nr = buf.min_row()
+        }
+        if nr > buf.max_row() {
+            nr = buf.max_row()
+        }
+        var ntop = world.viewport_top_row + delta
+        if ntop < buf.min_row() {
+            ntop = buf.min_row()
+        }
+        if ntop > buf.max_row() {
+            ntop = buf.max_row()
+        }
+        world.viewport_top_row = ntop
+        let tgt = MotionTarget.ok(Pos.new(nr, buf.first_non_blank_col(nr)), MotionShape.Linewise)
+        apply_resolved_motion(world, buf, vim, tgt)#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    -- Viewport-only scroll (`<C-e>` down, `<C-y>` up) in Normal and Visual modes
+    if (not is_op_pending) and ctrl_only and (k == "e" or k == "y") {
+        let vrows = if world.viewport_rows > 1 { world.viewport_rows } else { 20 }
+        let delta = if k == "e" { eff } else { -eff }
+        var ntop = world.viewport_top_row + delta
+        if ntop < buf.min_row() {
+            ntop = buf.min_row()
+        }
+        if ntop > buf.max_row() {
+            ntop = buf.max_row()
+        }
+        world.viewport_top_row = ntop
+        if buf.point.row < ntop {
+            buf.point = buf.clamp_pos(Pos.new(ntop, buf.preferred_col), insert_mode = false)
+        } else if buf.point.row >= ntop + vrows {
+            let bot_r = if ntop + vrows - 1 <= buf.max_row() { ntop + vrows - 1 } else { buf.max_row() }
+            buf.point = buf.clamp_pos(Pos.new(bot_r, buf.preferred_col), insert_mode = false)
+        }
+        vim.count1 = 0
+        vim.count2 = 0
+        vim.pending_prefix = ""
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    -- Search motions `*`, `#`, `n`, `N`, `/`, `?`
+    if plain and (k == "*" or k == "#") {
+        let w_opt = word_under_cursor(buf, buf.point)
+        if w_opt == null {
+            status_emit("E348: No string under cursor")#
+            vim.clear_transient()
+            sync_world_from_vim(world, vim)
+            return true
+        }
+        let word = w_opt.as(String)
+        let fwd = k == "*"
+        world.last_search = word
+        world.last_search_forward = fwd
+        world.search_highlight_active = world.options.hlsearch
+        let ic = world.effective_ignore_case(word)
+        var cur_p = buf.point
+        var matched: ?Pos = null
+        for _ in 0..eff {
+            matched = if fwd {
+                buf.find_forward(word, cur_p, ic, true)
+            } else {
+                buf.find_backward(word, cur_p, ic, true)
+            }
+            if matched != null {
+                cur_p = matched.as(Pos)
+            }
+        }
+        if matched != null {
+            apply_resolved_motion(world, buf, vim, MotionTarget.ok(matched.as(Pos), MotionShape.Exclusive, is_jump = true))#!
+        }
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if plain and (k == "n" or k == "N") {
+        let pat = world.last_search
+        if pat == "" {
+            status_emit("E35: No previous regular expression")#
+            vim.clear_transient()
+            sync_world_from_vim(world, vim)
+            return true
+        }
+        let fwd = if k == "n" { world.last_search_forward } else { not world.last_search_forward }
+        world.search_highlight_active = world.options.hlsearch
+        let ic = world.effective_ignore_case(pat)
+        var cur_p = buf.point
+        var matched: ?Pos = null
+        for _ in 0..eff {
+            matched = if fwd {
+                buf.find_forward(pat, cur_p, ic, true)
+            } else {
+                buf.find_backward(pat, cur_p, ic, true)
+            }
+            if matched != null {
+                cur_p = matched.as(Pos)
+            }
+        }
+        if matched == null {
+            status_emit("E486: Pattern not found: " ++ pat)#
+            vim.clear_transient()
+        } else {
+            apply_resolved_motion(world, buf, vim, MotionTarget.ok(matched.as(Pos), MotionShape.Exclusive, is_jump = true))#!
+        }
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if plain and (k == "/" or k == "?") {
+        let cmd_name = if k == "/" { "evil-search-forward" } else { "evil-search-backward" }
+        vim.count1 = 0
+        vim.count2 = 0
+        let _ = dispatch_optional_cmd(kernel, cmd_name, [eff.to_string()])#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    -- Prefix starters usable across modes (`g`, `z`, `'`, `` ` ``, `]`, `[`, `<C-w>`)
+    if plain and (k == "g" or k == "z" or k == "'" or k == "`" or k == "]" or k == "[") {
+        vim.pending_prefix = k
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if ctrl_only and k == "w" {
+        vim.pending_prefix = "<C-w>"
+        world.which_key_items = build_window_which_key_hints()
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    -- If still in OperatorPending and key wasn't a valid motion, check plugin operator chords (`ys`, `ds`, `cs`) then cancel cleanly
+    if is_op_pending {
+        let op_name = vim.mode match {
+            VimMode.OperatorPending(op) => op,
+            _ => "",
+        }
+        if op_name != "" {
+            let op_seq = [KeyStroke.plain(op_name), stroke]
+            vim.mode = VimMode.Normal
+            abort_change(vim)
+            let op_step = try_plugin_keymap_step(kernel, world, vim, KEYMAP_VIM_NORMAL, op_seq)#!
+            if op_step > 0 {
+                sync_world_from_vim(world, vim)
+                return true
+            }
+        }
+        vim.mode = VimMode.Normal
+        vim.clear_transient()
+        abort_change(vim)
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    -- CRITICAL VISUAL GUARD: Never allow unhandled keys in Visual mode to fall through
+    -- into Section 9 Normal-mode-only editing commands!
+    if is_visual_mode(vim.mode) {
+        vim.count1 = 0
+        vim.count2 = 0
+        vim.pending_prefix = ""
+        vim.pending_visual_replace = false
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    -- ========================================================================
+    -- 9. Normal Mode Only Commands (Operators, Visual Entry, Single-Key Edits, Marks, Jumps, Macros, Leader, Ex)
+    -- ========================================================================
+
+    -- Jump list `<C-o>` / `<C-i>` / `<Tab>`
+    if ctrl_only and k == "o" {
+        let je_opt = world.jumps.jump_back(buf.id, buf.file_path, buf.point)
+        if je_opt != null {
+            let je = je_opt.as(JumpEntry)
+            if world.buffers.contains_key(je.buf_id) {
+                let _ = world.switch_to_buffer(je.buf_id)
+                kernel.emit_hook("buffer-switched", je.buf_id)
+            } else if je.file_path != "" {
+                let opened = world.open_file(je.file_path)#!
+                kernel.emit_hook("buffer-switched", opened.id)
+            }
+            let nb = world.active_buffer()
+            nb.point = nb.clamp_pos(je.pos, insert_mode = false)
+        }
+        vim.clear_transient()
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if (ctrl_only and k == "i") or (plain and k == "Tab") {
+        let je_opt = world.jumps.jump_forward()
+        if je_opt != null {
+            let je = je_opt.as(JumpEntry)
+            if world.buffers.contains_key(je.buf_id) {
+                let _ = world.switch_to_buffer(je.buf_id)
+                kernel.emit_hook("buffer-switched", je.buf_id)
+            } else if je.file_path != "" {
+                let opened = world.open_file(je.file_path)#!
+                kernel.emit_hook("buffer-switched", opened.id)
+            }
+            let nb = world.active_buffer()
+            nb.point = nb.clamp_pos(je.pos, insert_mode = false)
+        }
+        vim.clear_transient()
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    -- Visual Block `<C-v>`
+    if ctrl_only and k == "v" {
+        begin_change(vim, stroke, tentative_visual = true)
+        vim.visual_anchor = buf.point
+        vim.visual_dollar = false
+        vim.mode = VimMode.VisualBlock
+        vim.count1 = 0
+        vim.count2 = 0
+        vim.pending_prefix = ""
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    -- Redo `<C-r>` in Normal mode
+    if ctrl_only and k == "r" {
+        var redone = false
+        for _ in 0..eff {
+            let p_opt = buf.redo()!
+            if p_opt != null {
+                redone = true
+            }
+        }
+        if not redone {
+            status_emit("Already at newest change")#
+        } else {
+            buf.point = buf.clamp_pos(buf.point, insert_mode = false)
+            status_emit("Redo (state #" ++ buf.undo_tree.current_id.to_string() ++ ")")#
+        }
+        vim.clear_transient()
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if not plain {
+        return false
+    }
+
+    -- `<Space>` Leader keymap
+    if k == "Space" {
+        vim.clear_transient()
+        let handled = handle_leader_sequence(kernel, world, vim, stroke)#!
+        sync_world_from_vim(world, vim)
+        return handled
+    }
+
+    -- Ex command prompt `:`
+    if k == ":" {
+        vim.clear_transient()
+        let _ = dispatch_optional_cmd(kernel, "evil-ex", List())#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    -- Dot repeat `.`
+    if k == "." {
+        execute_dot_repeat(kernel, world, vim)#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    -- Register prefix `"` & Mark prefix `m` & Macro `q` / `@`
+    if k == "\"" {
+        vim.pending_prefix = "\""
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "m" {
+        vim.pending_prefix = "m"
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "q" {
+        if kernel.macros.is_recording() {
+            -- Remove the trailing `q` stroke if `vim_handle_key` pushed it before entering here
+            if not kernel.macros.buffer_strokes.is_empty() {
+                let last_s = kernel.macros.buffer_strokes.get((kernel.macros.buffer_strokes.len() - 1).as(usize)).as(KeyStroke)
+                if last_s.key == "q" and (not last_s.ctrl) and (not last_s.alt) {
+                    let _ = kernel.macros.buffer_strokes.pop()
+                }
+            }
+            let stopped_reg = kernel.macros.stop()
+            stopped_reg match {
+                rname? => { status_emit("recorded @" ++ rname)# },
+                _ => (),
+            }
+        } else {
+            vim.pending_prefix = "q"
+        }
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "@" {
+        vim.pending_prefix = "@"
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    -- Visual Char `v` & Visual Line `V`
+    if k == "v" {
+        begin_change(vim, stroke, tentative_visual = true)
+        vim.visual_anchor = buf.point
+        vim.visual_dollar = false
+        vim.mode = VimMode.VisualChar
+        vim.count1 = 0
+        vim.count2 = 0
+        vim.pending_prefix = ""
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "V" {
+        begin_change(vim, stroke, tentative_visual = true)
+        vim.visual_anchor = buf.point
+        vim.visual_dollar = false
+        vim.mode = VimMode.VisualLine
+        vim.count1 = 0
+        vim.count2 = 0
+        vim.pending_prefix = ""
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    -- Operators `d`, `c`, `y`, `>`, `<`, `=`
+    if k == "d" or k == "c" or k == ">" or k == "<" or k == "=" {
+        begin_change(vim, stroke)
+        vim.mode = VimMode.OperatorPending(k)
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "Z" {
+        vim.pending_prefix = "Z"
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "&" {
+        begin_change(vim, stroke)
+        execute_repeat_substitute(world, buf, vim, eff)#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "y" {
+        vim.mode = VimMode.OperatorPending("y")
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "Y" {
+        let end_r = buf.point.row + eff - 1
+        apply_operator_linewise(world, buf, vim, "y", buf.point.row, end_r)#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    -- Undo `u`
+    if k == "u" {
+        var undone = false
+        for _ in 0..eff {
+            let p_opt = buf.undo()!
+            if p_opt != null {
+                undone = true
+            }
+        }
+        if not undone {
+            status_emit("Already at oldest change")#
+        } else {
+            buf.point = buf.clamp_pos(buf.point, insert_mode = false)
+            status_emit("Undo (state #" ++ buf.undo_tree.current_id.to_string() ++ ")")#
+        }
+        vim.clear_transient()
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    -- Insert / Replace entry commands (`i`, `I`, `a`, `A`, `o`, `O`, `s`, `S`, `C`, `D`, `x`, `X`, `r`, `R`, `~`, `J`, `p`, `P`)
+    if k == "i" {
+        buf.ensure_writable()!
+        begin_change(vim, stroke)
+        vim.mode = VimMode.Insert
+        vim.clear_transient()
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "I" {
+        buf.ensure_writable()!
+        begin_change(vim, stroke)
+        buf.point = Pos.new(buf.point.row, buf.first_non_blank_col(buf.point.row))
+        vim.mode = VimMode.Insert
+        vim.clear_transient()
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "a" {
+        buf.ensure_writable()!
+        begin_change(vim, stroke)
+        let llen = buf.line_char_len(buf.point.row)
+        let nc = if buf.point.col < llen { buf.point.col + 1 } else { llen }
+        buf.point = Pos.new(buf.point.row, nc)
+        vim.mode = VimMode.Insert
+        vim.clear_transient()
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "A" {
+        buf.ensure_writable()!
+        begin_change(vim, stroke)
+        buf.point = Pos.new(buf.point.row, buf.line_char_len(buf.point.row))
+        vim.mode = VimMode.Insert
+        vim.clear_transient()
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "o" {
+        buf.ensure_writable()!
+        begin_change(vim, stroke)
+        let indent_str = if world.options.auto_indent {
+            buf.compute_smart_indent(buf.point.row, world.options.shiftwidth, world.options.expandtab)
+        } else {
+            let indent_col = buf.first_non_blank_col(buf.point.row)
+            buf.line_at(buf.point.row).take(indent_col)
+        }
+        let _ = buf.insert_lines_below(buf.point.row, [indent_str])!
+        buf.point = Pos.new(buf.point.row, indent_str.char_len())
+        vim.mode = VimMode.Insert
+        vim.clear_transient()
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "O" {
+        buf.ensure_writable()!
+        begin_change(vim, stroke)
+        let indent_col = buf.first_non_blank_col(buf.point.row)
+        let indent_str = buf.line_at(buf.point.row).take(indent_col)
+        let _ = buf.insert_lines_above(buf.point.row, [indent_str])!
+        buf.point = Pos.new(buf.point.row, indent_str.char_len())
+        vim.mode = VimMode.Insert
+        vim.clear_transient()
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "s" {
+        begin_change(vim, stroke)
+        let llen = buf.line_char_len(buf.point.row)
+        let ec = if buf.point.col + eff <= llen { buf.point.col + eff } else { llen }
+        apply_operator_span(world, buf, vim, "c", Span.normalized(buf.point, Pos.new(buf.point.row, ec)))#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "S" {
+        begin_change(vim, stroke)
+        apply_operator_linewise(world, buf, vim, "c", buf.point.row, buf.point.row + eff - 1)#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "C" {
+        begin_change(vim, stroke)
+        let tr = if buf.point.row + eff - 1 <= buf.max_row() { buf.point.row + eff - 1 } else { buf.max_row() }
+        apply_operator_span(world, buf, vim, "c", Span.normalized(buf.point, Pos.new(tr, buf.line_char_len(tr))))#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "D" {
+        begin_change(vim, stroke)
+        let tr = if buf.point.row + eff - 1 <= buf.max_row() { buf.point.row + eff - 1 } else { buf.max_row() }
+        apply_operator_span(world, buf, vim, "d", Span.normalized(buf.point, Pos.new(tr, buf.line_char_len(tr))))#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "x" {
+        begin_change(vim, stroke)
+        let llen = buf.line_char_len(buf.point.row)
+        let ec = if buf.point.col + eff <= llen { buf.point.col + eff } else { llen }
+        apply_operator_span(world, buf, vim, "d", Span.normalized(buf.point, Pos.new(buf.point.row, ec)))#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "X" {
+        begin_change(vim, stroke)
+        let sc = if buf.point.col - eff > 0 { buf.point.col - eff } else { 0 }
+        apply_operator_span(world, buf, vim, "d", Span.normalized(Pos.new(buf.point.row, sc), buf.point))#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "r" {
+        begin_change(vim, stroke)
+        vim.pending_prefix = "r"
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "R" {
+        buf.ensure_writable()!
+        begin_change(vim, stroke)
+        vim.replace_stack = List()
+        vim.mode = VimMode.Replace
+        vim.clear_transient()
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "~" {
+        buf.ensure_writable()!
+        begin_change(vim, stroke)
+        let line = buf.line_at(buf.point.row)
+        let llen = line.char_len()
+        if llen > 0 and buf.point.col < llen {
+            let ec = if buf.point.col + eff <= llen { buf.point.col + eff } else { llen }
+            let mid = toggle_case_str(line.slice(buf.point.col, ec))
+            buf.set_line_at(buf.point.row, line.slice(0, buf.point.col) ++ mid ++ line.slice(ec, llen))
+            buf.modified = true
+            let next_c = if ec < llen { ec } else { llen - 1 }
+            buf.point = Pos.new(buf.point.row, next_c)
+            buf.named_marks.insert(".", buf.point)
+            buf.checkpoint(buf.point, "vim-tilde")
+            commit_change(vim)
+        } else {
+            abort_change(vim)
+        }
+        vim.clear_transient()
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "J" {
+        buf.ensure_writable()!
+        begin_change(vim, stroke)
+        let joins = if vim.has_explicit_count() and eff > 1 { eff - 1 } else { 1 }
+        for _ in 0..joins {
+            let _ = buf.join_line_with_next(buf.point.row)!
+        }
+        buf.point = buf.clamp_pos(buf.point, insert_mode = false)
+        buf.named_marks.insert(".", buf.point)
+        buf.checkpoint(buf.point, "vim-join")
+        vim.clear_transient()
+        commit_change(vim)
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    if k == "p" or k == "P" {
+        begin_change(vim, stroke)
+        execute_paste(world, buf, vim, k == "p", eff)#!
+        sync_world_from_vim(world, vim)
+        return true
+    }
+
+    true
+}
+
+-- ============================================================================
+-- Public Entry Point: `vim_handle_key`
+-- ============================================================================
+
+fn has_mode_keymap_binding(kernel: SystemKernel, km_name: String, stroke: KeyStroke) -> bool {
+    let km_opt = kernel.keymaps.get(km_name)
+    if km_opt == null {
+        return false
+    }
+    km_opt.as(Keymap).lookup([stroke]) match {
+        KeyLookup.Unbound => false,
+        _ => true,
+    }
+}
+
+fn is_emacs_passthrough_chord(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    vim: VimState,
+    stroke: KeyStroke,
+) -> bool {
+    -- Do not passthrough when an active modal interceptor or pending Vim/plugin sequence owns input
+    if vim.modal_interceptor != null
+        or vim.pending_prefix != ""
+        or (not vim.leader_strokes.is_empty())
+        or (not vim.plugin_strokes.is_empty()) {
+        return false
+    }
+    let buf = world.active_buffer()
+    if vim.mode == VimMode.Insert {
+        if has_mode_keymap_binding(kernel, KEYMAP_VIM_INSERT, stroke) {
+            return false
+        }
+    } else if vim.mode == VimMode.Normal {
+        if has_mode_keymap_binding(kernel, "mode:" ++ buf.major_mode, stroke)
+            or has_mode_keymap_binding(kernel, KEYMAP_VIM_NORMAL, stroke) {
+            return false
+        }
+    } else if is_visual_mode(vim.mode) {
+        if has_mode_keymap_binding(kernel, KEYMAP_VIM_VISUAL, stroke) {
+            return false
+        }
+        return false
+    } else {
+        return false
+    }
+
+    -- `<M-x>`, `<M-%>`, `<M-!>`, `<M-&>` and other Meta chords pass through to Emacs unless bound in Vim!
+    if stroke.alt and not stroke.ctrl {
+        return true
+    }
+
+    if stroke.ctrl and not stroke.alt {
+        let k = stroke.key
+        if k == "x" or k == "h" or k == "s" {
+            return true
+        }
+        -- `<C-g>`: if idle in Normal/Insert with no pending count/reg, pass through to Emacs `keyboard-quit`
+        if k == "g" and vim.count1 == 0 and vim.active_reg == "" {
+            return true
+        }
+        -- `<C-r>` in Insert mode passes through to Emacs; in Normal mode it is Vim `redo`!
+        if k == "r" and vim.mode == VimMode.Insert {
+            return true
+        }
+    }
+
+    false
+}
+
+pub fn vim_handle_key(
+    kernel: SystemKernel,
+    stroke: KeyStroke,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String bool {
+    if not kernel.is_extension_active(ext_vim_id()) {
+        return false
+    }
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+
+    -- `<C-z>` toggles between Evil-Vim modal editing and pure Emacs mode!
+    if stroke.ctrl and (not stroke.alt) and (not stroke.super_mod) and (stroke.key == "z" or stroke.key == "Z") {
+        world.options.evil_mode = not world.options.evil_mode
+        vim.clear_transient()
+        vim.mode = VimMode.Normal
+        vim.visual_dollar = false
+        abort_change(vim)
+        if world.options.evil_mode {
+            let b = world.active_buffer()
+            b.point = b.clamp_pos(b.point, insert_mode = false)
+            sync_world_from_vim(world, vim)
+            status_emit("-- EVIL NORMAL MODE --")#
+        } else {
+            sync_world_from_vim(world, vim)
+            status_emit("-- EMACS MODE -- (C-z to return to Evil-Vim)")#
+        }
+        kernel.emit_hook("mode-changed", world.mode_name)
+        return true
+    }
+
+    if not world.options.evil_mode {
+        return false
+    }
+
+    -- Record into keyboard macro if active (and not currently replaying a macro or dot-repeat)
+    if kernel.macros.is_recording() and vim.macro_depth == 0 and not vim.replaying_dot {
+        kernel.macros.record_stroke(stroke)
+    }
+
+    if is_emacs_passthrough_chord(kernel, world, vim, stroke) {
+        return false
+    }
+
+    let prev_mode = vim.mode
+    let prev_anchor = vim.visual_anchor
+    let prev_buf = world.active_buffer()
+    let prev_buf_id = prev_buf.id
+    let prev_point = prev_buf.point
+    let prev_mod = prev_buf.modified
+    let prev_yank_len = world.registers.yank_history.len()
+
+    let handled = vim_dispatch_stroke_core(kernel, world, vim, stroke)#!
+
+    let cur_buf = world.active_buffer()
+    -- Ensure plugin-triggered exits from Visual mode (`ext_surround`, `ext_comment`, etc.) also record `last_visual_*`!
+    if is_visual_mode(prev_mode) and (not is_visual_mode(vim.mode)) and cur_buf.id == prev_buf_id {
+        if not vim.has_last_visual {
+            vim.has_last_visual = true
+            vim.last_visual_mode = prev_mode
+            vim.last_visual_anchor = prev_anchor
+            vim.last_visual_point = prev_point
+        }
+        vim.region_stack = List()
+    }
+    if (not is_visual_mode(vim.mode)) and (not vim.region_stack.is_empty()) {
+        vim.region_stack = List()
+    }
+    if world.registers.yank_history.len() > prev_yank_len and not world.registers.yank_history.is_empty() {
+        let latest = world.registers.yank_history.get(0)
+        kernel.emit_hook("vim-yank", latest)
+    }
+    if vim.mode != prev_mode {
+        kernel.emit_hook("mode-changed", world.mode_name)
+    }
+    if cur_buf.id != prev_buf_id or cur_buf.point != prev_point {
+        kernel.emit_hook("cursor-moved", cur_buf.id)
+    }
+    if cur_buf.id == prev_buf_id and cur_buf.modified != prev_mod {
+        kernel.emit_hook("buffer-modified", cur_buf.id)
+    }
+
+    handled
+}
+
+pub fn vim_feed_keys(
+    kernel: SystemKernel,
+    spec: String,
+) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String Unit {
+    let strokes = parse_key_sequence(spec)
+    for i in 0..strokes.len() {
+        let s = strokes.get(i.as(usize)).as(KeyStroke)
+        let _ = vim_handle_key(kernel, s)#!
+    }
+    ()
+}
+
+-- ============================================================================
+-- Extension Registration (`lava.org/ext_vim`)
+-- ============================================================================
+
+fn run_interactive_vim_search(
+    kernel: SystemKernel,
+    forward: bool,
+    args: List,
+) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    var count: i64 = 1
+    if not args.is_empty() {
+        let parsed = args.get(0).as(String).parse_i64()
+        if parsed != null and parsed.as(i64) > 0 {
+            count = parsed.as(i64)
+        }
+    }
+    let req = PromptRequest {
+        label: if forward { "/" } else { "?" },
+        initial: "",
+        kind: if forward { PromptKind.SearchForward } else { PromptKind.SearchBackward },
+        candidates: List(),
+    }
+    let ans_opt = ask_prompt(req)#
+    if ans_opt == null {
+        status_emit("Search cancelled")#
+        return ()
+    }
+    let raw_q = ans_opt.as(String)
+    let pat = if raw_q == "" { world.last_search } else { raw_q }
+    if pat == "" {
+        status_emit("E35: No previous regular expression")#
+        return ()
+    }
+    world.last_search = pat
+    world.last_search_forward = forward
+    world.search_highlight_active = world.options.hlsearch
+
+    let buf = world.active_buffer()
+    let ic = world.effective_ignore_case(pat)
+    var cur_p = buf.point
+    var matched: ?Pos = null
+    for _ in 0..count {
+        matched = if forward {
+            buf.find_forward(pat, cur_p, ic, true)
+        } else {
+            buf.find_backward(pat, cur_p, ic, true)
+        }
+        if matched != null {
+            cur_p = matched.as(Pos)
+        }
+    }
+    if matched == null {
+        status_emit("E486: Pattern not found: " ++ pat)#
+        vim.mode match {
+            VimMode.OperatorPending(_) => {
+                vim.mode = VimMode.Normal
+                abort_change(vim)
+            },
+            _ => (),
+        }
+    } else {
+        apply_resolved_motion(world, buf, vim, MotionTarget.ok(matched.as(Pos), MotionShape.Exclusive, is_jump = true))#!
+    }
+    sync_world_from_vim(world, vim)
+    ()
+}
+
+pub fn register_vim_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_vim_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_vim",
+        "0.1.0",
+        "Complete Evil-Vim modal editing, motions, nested text objects, rectangular visual-block, dot-repeat, macros, leader keymap, and Ex command engine.",
+        [ext_document_id()],
+        |k: SystemKernel| -> !String Unit {
+            let vim = VimState.new()
+            k.publish_service(SERVICE_VIM, ext_id, vim)
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            populate_default_leader_keymap(leader_km, ext_id)
+            let normal_km = k.ensure_keymap(KEYMAP_VIM_NORMAL)
+            let visual_km = k.ensure_keymap(KEYMAP_VIM_VISUAL)
+            let _ = k.ensure_keymap(KEYMAP_VIM_INSERT)
+            let emacs_km = k.ensure_keymap("emacs:global")
+
+            normal_km.bind("<M-Up>", "indent-expand-region", ext_id, description = "Expand selection by syntax/indent")
+            normal_km.bind("<M-Down>", "indent-shrink-region", ext_id, description = "Shrink selection to previous step")
+            normal_km.bind("[ i", "indent-prev-boundary", ext_id, description = "Jump to top of current indent block")
+            normal_km.bind("] i", "indent-next-boundary", ext_id, description = "Jump to bottom of current indent block")
+
+            visual_km.bind("<Space> v", "indent-expand-region", ext_id, description = "Expand selection by syntax/indent")
+            visual_km.bind("<Space> V", "indent-shrink-region", ext_id, description = "Shrink selection to previous step")
+            visual_km.bind("<M-Up>", "indent-expand-region", ext_id, description = "Expand selection by syntax/indent")
+            visual_km.bind("<M-Down>", "indent-shrink-region", ext_id, description = "Shrink selection to previous step")
+            visual_km.bind("[ i", "indent-prev-boundary", ext_id, description = "Jump to top of current indent block")
+            visual_km.bind("] i", "indent-next-boundary", ext_id, description = "Jump to bottom of current indent block")
+
+            emacs_km.bind("<M-Up>", "indent-expand-region", ext_id, description = "Expand selection by syntax/indent")
+            emacs_km.bind("<M-Down>", "indent-shrink-region", ext_id, description = "Shrink selection to previous step")
+
+            let world = require_editor_world(k)!
+            sync_world_from_vim(world, vim)
+
+            k.register_command(
+                "evil-ex",
+                ext_id,
+                "Open Evil Ex command prompt (`:`) or execute Ex command string directly.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    var initial = ""
+                    if not args.is_empty() {
+                        let first_arg = args.get(0).as(String)
+                        if first_arg != "'<,'>" {
+                            let w0 = require_editor_world(kern)!
+                            let vs0 = require_vim_state(kern)!
+                            capture_last_substitute(w0, vs0, first_arg)
+                            execute_ex_command(kern, first_arg)#!
+                            let w = require_editor_world(kern)!
+                            let vs = require_vim_state(kern)!
+                            capture_last_substitute(w, vs, first_arg)
+                            sync_world_from_vim(w, vs)
+                            return ()
+                        }
+                        initial = "'<,'>"
+                    }
+                    let req = PromptRequest {
+                        label: ":",
+                        initial: initial,
+                        kind: PromptKind.ExCommand,
+                        candidates: List(),
+                    }
+                    let ans? = ask_prompt(req)# else {
+                        return ()
+                    }
+                    let w0 = require_editor_world(kern)!
+                    let vs0 = require_vim_state(kern)!
+                    capture_last_substitute(w0, vs0, ans)
+                    execute_ex_command(kern, ans)#!
+                    let w = require_editor_world(kern)!
+                    let vs = require_vim_state(kern)!
+                    capture_last_substitute(w, vs, ans)
+                    sync_world_from_vim(w, vs)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "indent-expand-region",
+                ext_id,
+                "Incrementally expand selection from word -> quotes/pairs -> line -> indent block -> outer indents -> buffer.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let vs = require_vim_state(kern)!
+                    run_indent_expand_region(w, vs)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "indent-shrink-region",
+                ext_id,
+                "Shrink incremental selection back to the previous step (or Normal mode).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let vs = require_vim_state(kern)!
+                    run_indent_shrink_region(w, vs)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "ex:IndentExpand",
+                ext_id,
+                "Ex command `:IndentExpand` — incrementally expand selection by syntax and indentation.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let vs = require_vim_state(kern)!
+                    run_indent_expand_region(w, vs)
+                    ()
+                },
+                interactive = false,
+            )
+
+            k.register_command(
+                "ex:IndentShrink",
+                ext_id,
+                "Ex command `:IndentShrink` — shrink incremental selection to the previous step.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let vs = require_vim_state(kern)!
+                    run_indent_shrink_region(w, vs)
+                    ()
+                },
+                interactive = false,
+            )
+
+            k.register_command(
+                "indent-prev-boundary",
+                ext_id,
+                "Jump to first line of current indentation scope (`[i`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let vs = require_vim_state(kern)!
+                    let b = w.active_buffer()
+                    let ts = if w.options.tabstop > 0 { w.options.tabstop } else { 4 }
+                    let tgt = motion_indent_prev_boundary(b, b.point, 1, ts)
+                    apply_resolved_motion(w, b, vs, tgt)#!
+                    sync_world_from_vim(w, vs)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "indent-next-boundary",
+                ext_id,
+                "Jump to last line of current indentation scope (`]i`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let vs = require_vim_state(kern)!
+                    let b = w.active_buffer()
+                    let ts = if w.options.tabstop > 0 { w.options.tabstop } else { 4 }
+                    let tgt = motion_indent_next_boundary(b, b.point, 1, ts)
+                    apply_resolved_motion(w, b, vs, tgt)#!
+                    sync_world_from_vim(w, vs)
+                    ()
+                },
+            )
+
+            k.register_command(
+                "evil-search-forward",
+                ext_id,
+                "Interactive forward search (`/`) using delimited continuation prompt.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    run_interactive_vim_search(kern, true, args)#
+                },
+            )
+
+            k.register_command(
+                "evil-search-backward",
+                ext_id,
+                "Interactive backward search (`?`) using delimited continuation prompt.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    run_interactive_vim_search(kern, false, args)#
+                },
+            )
+
+            k.register_command(
+                "evil-toggle-mode",
+                ext_id,
+                "Toggle Evil-Vim modal editing vs pure Emacs mode (`C-z`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let vs = require_vim_state(kern)!
+                    w.options.evil_mode = not w.options.evil_mode
+                    vs.clear_transient()
+                    vs.mode = VimMode.Normal
+                    sync_world_from_vim(w, vs)
+                    if w.options.evil_mode {
+                        status_emit("-- EVIL NORMAL MODE --")#
+                    } else {
+                        status_emit("-- EMACS MODE --")#
+                    }
+                    ()
+                },
+            )
+
+            k.add_hook(
+                "buffer-switched",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| -> Unit {
+                    let w_opt = kern.service("lava.document.world")
+                    let v_opt = kern.service(SERVICE_VIM)
+                    if w_opt != null and v_opt != null {
+                        let w = w_opt.as(EditorWorld)
+                        let vs = v_opt.as(VimState)
+                        if w.options.evil_mode and vs.mode == VimMode.Normal {
+                            let b = w.active_buffer()
+                            b.point = b.clamp_pos(b.point, insert_mode = false)
+                        }
+                        sync_world_from_vim(w, vs)
+                    }
+                },
+            )
+
+            ()
+        },
+        |_k: SystemKernel| -> !String Unit { () },
+    )
+}

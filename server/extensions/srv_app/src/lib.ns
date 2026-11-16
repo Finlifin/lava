@@ -1,0 +1,81 @@
+-- srv_app: Top-Level Server Coordinator & Stdio JSON-RPC 2.0 Event Loop (`lava.server/srv_app`).
+-- Composes `srv_fs`, `srv_search`, `srv_git`, `srv_exec`, and `srv_lsp` on `ServerKernel`,
+-- activates all extensions in topological order, and drives the line-delimited JSON-RPC 2.0
+-- stdio transport via `server_sys.srv_rpc_recv` / `server_sys.srv_rpc_send`.
+
+use @server_sys.{srv_rpc_recv, srv_rpc_send}
+use @server_core.{ServerKernel, SrvExtId, handle_jsonrpc_message}
+use @srv_fs.{register_fs_extension, srv_fs_id}
+use @srv_search.{register_search_extension, srv_search_id}
+use @srv_git.{register_git_extension, srv_git_id}
+use @srv_exec.{register_exec_extension, srv_exec_id}
+use @srv_lsp.{register_lsp_extension, srv_lsp_id}
+
+pub fn srv_app_id() -> SrvExtId = SrvExtId("lava.server/srv_app")
+
+pub fn register_app_extension(kernel: ServerKernel) -> !String Unit {
+    let ext_id = srv_app_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.server",
+        "srv_app",
+        "0.1.0",
+        "Top-level Lava Server coordinator and JSON-RPC 2.0 stdio transport loop.",
+        [
+            srv_fs_id(),
+            srv_search_id(),
+            srv_git_id(),
+            srv_exec_id(),
+            srv_lsp_id(),
+        ],
+        |_k: ServerKernel| -> !String Unit { () },
+        |_k: ServerKernel| -> !String Unit { () },
+    )
+}
+
+pub fn register_default_server_extensions(kernel: ServerKernel) -> !String Unit {
+    register_fs_extension(kernel)!
+    register_search_extension(kernel)!
+    register_git_extension(kernel)!
+    register_exec_extension(kernel)!
+    register_lsp_extension(kernel)!
+    register_app_extension(kernel)!
+    ()
+}
+
+pub fn create_server_kernel() -> !String ServerKernel {
+    let kernel = ServerKernel.new()
+    register_default_server_extensions(kernel)!
+    kernel.activate_all()!
+    kernel
+}
+
+pub fn handle_rpc_json_line(kernel: ServerKernel, raw_json: String) -> String {
+    handle_jsonrpc_message(kernel, raw_json)
+}
+
+pub fn run_stdio_loop(kernel: ServerKernel) -> !String Unit {
+    while not kernel.shutdown_requested {
+        let (eof, raw_json) = srv_rpc_recv()
+        if eof {
+            kernel.emit_hook("server-shutdown", null)
+            break
+        }
+        if raw_json.trim() == "" {
+            continue
+        }
+        let response = handle_rpc_json_line(kernel, raw_json)
+        if response != "" {
+            srv_rpc_send(response)
+        }
+        if kernel.shutdown_requested {
+            break
+        }
+    }
+    ()
+}
+
+pub fn boot_and_run_stdio() -> !String Unit {
+    let kernel = create_server_kernel()!
+    run_stdio_loop(kernel)
+}

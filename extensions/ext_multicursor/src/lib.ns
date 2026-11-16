@@ -1,0 +1,1411 @@
+-- ext_multicursor: Synchronized Multi-Cursor Editing Engine (`lava.org/ext_multicursor`).
+-- Inspired by `vim-visual-multi` & VSCode `<C-d>`: `<C-n>` incremental token selection,
+-- `<C-x>` skip match, `<Space>mj`/`<Space>mk` vertical column cursors, `<Space>ma` select all,
+-- synchronized motions (`h`/`l`/`j`/`k`/`w`/`b`/`e`/`0`/`^`/`$`), multi-cursor operators
+-- (`x`, `dw`, `diw`/`ciw`, `c`+motion/textobj, `i`/`a`/`I`/`A`), exact same-line column offset
+-- tracking, and single atomic undo checkpoints.
+
+use std.collections.Set
+use @lava_sys.rgba
+use @lava_core.{
+    ExtId, InteractiveEffects, KeyStroke, ServiceEffects, SystemKernel, log_event, status_emit
+}
+use @ext_document.{
+    Buffer, EditorWorld, Pos, Span, ext_document_id, require_editor_world
+}
+use @ext_vim.{
+    KEYMAP_VIM_LEADER, KEYMAP_VIM_NORMAL, KEYMAP_VIM_VISUAL, ModalInterceptor, VimMode, VimState,
+    ext_vim_id, require_vim_state, sync_world_from_vim
+}
+use @ext_vim.motions.{
+    is_word_char, motion_word_backward, motion_word_end, motion_word_forward
+}
+use @ext_vim.text_objects.{TextObjectRange, resolve_text_object}
+
+pub const SERVICE_MULTICURSOR: String = "lava.multicursor.state"
+pub const OWNER_MULTICURSOR: String = "ext_multicursor"
+
+pub fn ext_multicursor_id() -> ExtId = ExtId("lava.org/ext_multicursor")
+
+pub enum McSubMode {
+    pub Normal,
+    pub PendingDelete,
+    pub PendingDeleteInner,
+    pub PendingDeleteAround,
+    pub PendingChange,
+    pub PendingChangeInner,
+    pub PendingChangeAround,
+    pub Insert,
+}
+derive Eq, PartialEq, Display for McSubMode
+
+pub struct MultiCursorState {
+    pub active: bool,
+    pub sub_mode: McSubMode,
+    pub pattern: String,
+    pub whole_word: bool,
+    pub token_highlight_active: bool,
+}
+
+impl MultiCursorState {
+    pub fn new() -> MultiCursorState {
+        MultiCursorState {
+            active: false,
+            sub_mode: McSubMode.Normal,
+            pattern: "",
+            whole_word: true,
+            token_highlight_active: false,
+        }
+    }
+
+    pub fn clear_state(self) {
+        self.active = false
+        self.sub_mode = McSubMode.Normal
+        self.pattern = ""
+        self.whole_word = true
+        self.token_highlight_active = false
+    }
+}
+
+pub fn require_multicursor_state(kernel: SystemKernel) -> !String MultiCursorState {
+    let raw = kernel.require_service(SERVICE_MULTICURSOR)!
+    raw.as(MultiCursorState)
+}
+
+struct TrackedCursor {
+    pos: Pos,
+    is_primary: bool,
+}
+
+struct DisjointEdit {
+    span: Span,
+    replacement: String,
+    is_primary: bool,
+}
+
+fn stroke_printable(stroke: KeyStroke) -> String {
+    if stroke.ctrl or stroke.alt or stroke.super_mod {
+        return ""
+    }
+    if stroke.key == "Space" {
+        return " "
+    }
+    if stroke.text != "" and stroke.text.char_len() == 1 {
+        return stroke.text
+    }
+    if stroke.key.char_len() == 1 {
+        return stroke.key
+    }
+    ""
+}
+
+-- ============================================================================
+-- Cursor Collection, Deduplication, Highlighting & Exact Coordinate Transforms
+-- ============================================================================
+
+fn collect_sorted_cursors(world: EditorWorld, buf: Buffer, insert_mode: bool) -> List {
+    let raw = List()
+    raw.push(TrackedCursor {
+        pos: buf.clamp_pos(buf.point, insert_mode = insert_mode),
+        is_primary: true,
+    })
+    for i in 0..world.secondary_cursors.len() {
+        let sp = world.secondary_cursors.get(i.as(usize)).as(Pos)
+        raw.push(TrackedCursor {
+            pos: buf.clamp_pos(sp, insert_mode = insert_mode),
+            is_primary: false,
+        })
+    }
+    normalize_tracked_cursors(raw)
+}
+
+fn normalize_tracked_cursors(raw: List) -> List {
+    if raw.is_empty() {
+        return raw
+    }
+    let sorted = List()
+    for i in 0..raw.len() {
+        sorted.push(raw.get(i.as(usize)).as(TrackedCursor))
+    }
+    sorted.sort_by_lt(|a: Any, b: Any| -> bool {
+        let ca = a.as(TrackedCursor)
+        let cb = b.as(TrackedCursor)
+        ca.pos < cb.pos
+    })
+
+    let dedup = List()
+    for i in 0..sorted.len() {
+        let item = sorted.get(i.as(usize)).as(TrackedCursor)
+        if not dedup.is_empty() {
+            let last_idx = (dedup.len() - 1).as(usize)
+            let prev = dedup.get(last_idx).as(TrackedCursor)
+            if prev.pos == item.pos {
+                dedup.set(
+                    last_idx,
+                    TrackedCursor {
+                        pos: prev.pos,
+                        is_primary: prev.is_primary or item.is_primary,
+                    },
+                )
+                continue
+            }
+        }
+        dedup.push(item)
+    }
+
+    var has_primary = false
+    for i in 0..dedup.len() {
+        if dedup.get(i.as(usize)).as(TrackedCursor).is_primary {
+            has_primary = true
+            break
+        }
+    }
+    if (not has_primary) and (not dedup.is_empty()) {
+        let last_idx = (dedup.len() - 1).as(usize)
+        let last_c = dedup.get(last_idx).as(TrackedCursor)
+        dedup.set(last_idx, TrackedCursor { pos: last_c.pos, is_primary: true })
+    }
+    dedup
+}
+
+fn apply_tracked_cursors(
+    world: EditorWorld,
+    buf: Buffer,
+    state: MultiCursorState,
+    cursors: List,
+    insert_mode: bool,
+) {
+    let clamped = List()
+    for i in 0..cursors.len() {
+        let tc = cursors.get(i.as(usize)).as(TrackedCursor)
+        clamped.push(TrackedCursor {
+            pos: buf.clamp_pos(tc.pos, insert_mode = insert_mode),
+            is_primary: tc.is_primary,
+        })
+    }
+    let norm = normalize_tracked_cursors(clamped)
+    let secondaries = List()
+    var primary_pos = buf.point
+    for i in 0..norm.len() {
+        let tc = norm.get(i.as(usize)).as(TrackedCursor)
+        if tc.is_primary {
+            primary_pos = tc.pos
+        } else {
+            secondaries.push(tc.pos)
+        }
+    }
+    buf.point = primary_pos
+    buf.preferred_col = primary_pos.col
+    world.secondary_cursors = secondaries
+    world.statusline_right_extra = "[MC: " ++ norm.len().to_string() ++ "]"
+    refresh_mc_decors(world, buf, state)
+}
+
+fn refresh_mc_decors(world: EditorWorld, buf: Buffer, state: MultiCursorState) {
+    buf.clear_owner_decors(OWNER_MULTICURSOR)
+    if not state.active {
+        return
+    }
+    let all_pos = List()
+    all_pos.push(buf.point)
+    for i in 0..world.secondary_cursors.len() {
+        all_pos.push(world.secondary_cursors.get(i.as(usize)).as(Pos))
+    }
+
+    let plen = state.pattern.char_len()
+    let tok_bg = rgba(203, 166, 247, 95)
+    let cur_bg = rgba(203, 166, 247, 70)
+
+    for i in 0..all_pos.len() {
+        let p = all_pos.get(i.as(usize)).as(Pos)
+        let line = buf.line_at(p.row)
+        let llen = line.char_len()
+        if state.token_highlight_active and plen > 0 and p.col + plen <= llen {
+            if line.slice(p.col, p.col + plen) == state.pattern {
+                buf.add_inline_decor(
+                    OWNER_MULTICURSOR,
+                    p.row,
+                    p.col,
+                    p.col + plen,
+                    bg_rgba = tok_bg,
+                    fg_rgba = 0,
+                    underline = true,
+                    replace_label = "",
+                )
+                continue
+            }
+        }
+        if llen > 0 and p.col < llen {
+            buf.add_inline_decor(
+                OWNER_MULTICURSOR,
+                p.row,
+                p.col,
+                p.col + 1,
+                bg_rgba = cur_bg,
+                fg_rgba = 0,
+                underline = false,
+                replace_label = "",
+            )
+        }
+    }
+}
+
+fn exit_multicursor(world: EditorWorld, vim: VimState, state: MultiCursorState) {
+    state.clear_state()
+    world.secondary_cursors = List()
+    if world.statusline_right_extra.starts_with("[MC:") {
+        world.statusline_right_extra = ""
+    }
+    for i in 0..world.buffer_order.len() {
+        let bid = world.buffer_order.get(i.as(usize))
+        let b_opt = world.buffers.get(bid)
+        if b_opt != null {
+            b_opt.as(Buffer).clear_owner_decors(OWNER_MULTICURSOR)
+        }
+    }
+    if vim.mode == VimMode.Insert {
+        let b = world.active_buffer()
+        b.point = b.clamp_pos(b.point, insert_mode = false)
+        vim.mode = VimMode.Normal
+    }
+    if vim.modal_interceptor != null {
+        if vim.modal_interceptor.as(ModalInterceptor).owner == OWNER_MULTICURSOR {
+            vim.clear_interceptor()
+        }
+    }
+    sync_world_from_vim(world, vim)
+}
+
+fn adjust_pos_after_replace(p: Pos, replaced_span: Span, rep_end: Pos) -> Pos {
+    if p < replaced_span.end {
+        return p
+    }
+    if p.row > replaced_span.end.row {
+        let row_delta = rep_end.row - replaced_span.end.row
+        return Pos.new(p.row + row_delta, p.col)
+    }
+    -- `p.row == replaced_span.end.row` and `p.col >= replaced_span.end.col`
+    let col_offset = p.col - replaced_span.end.col
+    Pos.new(rep_end.row, rep_end.col + col_offset)
+}
+
+-- Execute sorted edits across all cursors simultaneously (merging overlapping spans and
+-- shifting same-line/later-line cursor positions accurately!).
+fn execute_multi_edits(buf: Buffer, raw_edits: List) -> !String List {
+    buf.ensure_writable()!
+    if raw_edits.is_empty() {
+        return List()
+    }
+
+    let sorted = List()
+    for i in 0..raw_edits.len() {
+        let ed = raw_edits.get(i.as(usize)).as(DisjointEdit)
+        let norm_sp = Span.normalized(
+            buf.clamp_pos(ed.span.start, insert_mode = true),
+            buf.clamp_pos(ed.span.end, insert_mode = true),
+        )
+        sorted.push(DisjointEdit {
+            span: norm_sp,
+            replacement: ed.replacement,
+            is_primary: ed.is_primary,
+        })
+    }
+    sorted.sort_by_lt(|a: Any, b: Any| -> bool {
+        let ea = a.as(DisjointEdit)
+        let eb = b.as(DisjointEdit)
+        if ea.span.start != eb.span.start {
+            return ea.span.start < eb.span.start
+        }
+        ea.span.end < eb.span.end
+    })
+
+    -- Merge overlapping non-zero spans (keep identical zero-length insert points merged too)
+    let merged = List()
+    for i in 0..sorted.len() {
+        let cur = sorted.get(i.as(usize)).as(DisjointEdit)
+        if not merged.is_empty() {
+            let last_idx = (merged.len() - 1).as(usize)
+            let prev = merged.get(last_idx).as(DisjointEdit)
+            let overlaps = if prev.span.start == prev.span.end and cur.span.start == cur.span.end {
+                prev.span.start == cur.span.start
+            } else {
+                cur.span.start < prev.span.end
+                    or (cur.span.start == prev.span.end and prev.span.start == cur.span.start)
+            }
+            if overlaps {
+                let end_hi = if prev.span.end >= cur.span.end { prev.span.end } else { cur.span.end }
+                merged.set(
+                    last_idx,
+                    DisjointEdit {
+                        span: Span { start: prev.span.start, end: end_hi },
+                        replacement: prev.replacement,
+                        is_primary: prev.is_primary or cur.is_primary,
+                    },
+                )
+                continue
+            }
+        }
+        merged.push(cur)
+    }
+
+    -- Apply from bottom-to-top, right-to-left, adjusting already-recorded trailing cursor positions
+    let trailing_cursors = List()
+    var idx = merged.len() - 1
+    while idx >= 0 {
+        let ed = merged.get(idx.as(usize)).as(DisjointEdit)
+        let (rep_end, _) = buf.replace_span(ed.span, ed.replacement)!
+        for ti in 0..trailing_cursors.len() {
+            let tc = trailing_cursors.get(ti.as(usize)).as(TrackedCursor)
+            trailing_cursors.set(
+                ti.as(usize),
+                TrackedCursor {
+                    pos: adjust_pos_after_replace(tc.pos, ed.span, rep_end),
+                    is_primary: tc.is_primary,
+                },
+            )
+        }
+        trailing_cursors.insert(0, TrackedCursor { pos: rep_end, is_primary: ed.is_primary })
+        idx -= 1
+    }
+    trailing_cursors
+}
+
+-- ============================================================================
+-- Pattern Matching & Match Selection (`<C-n>`, `<C-x>`, `mc-add-all-matches`)
+-- ============================================================================
+
+fn word_token_at_cursor(buf: Buffer, pos: Pos) -> ?(Pos, String) {
+    let line = buf.line_at(pos.row)
+    let llen = line.char_len()
+    if llen == 0 {
+        return null
+    }
+    var c = if pos.col < llen { pos.col } else { llen - 1 }
+    while c < llen and (not is_word_char(line.slice(c, c + 1))) {
+        c += 1
+    }
+    if c >= llen {
+        return null
+    }
+    var sc = c
+    while sc > 0 and is_word_char(line.slice(sc - 1, sc)) {
+        sc -= 1
+    }
+    var ec = c + 1
+    while ec < llen and is_word_char(line.slice(ec, ec + 1)) {
+        ec += 1
+    }
+    (Pos.new(pos.row, sc), line.slice(sc, ec))
+}
+
+fn find_all_occurrences(buf: Buffer, pattern: String, whole_word: bool) -> List {
+    let out = List()
+    let plen = pattern.char_len()
+    if plen == 0 {
+        return out
+    }
+    let lo_r = buf.min_row()
+    let hi_r = buf.max_row()
+    for r in lo_r..(hi_r + 1) {
+        let line = buf.line_at(r)
+        let llen = line.char_len()
+        let hits = buf.find_all_in_line(r, pattern, false)
+        for hi in 0..hits.len() {
+            let (sc, ec) = hits.get(hi.as(usize)).as((i64, i64))
+            if whole_word {
+                let left_ok = sc == 0 or (not is_word_char(line.slice(sc - 1, sc)))
+                let right_ok = ec >= llen or (not is_word_char(line.slice(ec, ec + 1)))
+                if (not left_ok) or (not right_ok) {
+                    continue
+                }
+            }
+            out.push(Pos.new(r, sc))
+        }
+    }
+    out
+}
+
+fn next_unoccupied_match(all_matches: List, from_pos: Pos, occupied: Set) -> ?Pos {
+    for i in 0..all_matches.len() {
+        let cand = all_matches.get(i.as(usize)).as(Pos)
+        if cand > from_pos and (not occupied.contains(cand)) {
+            return cand
+        }
+    }
+    for i in 0..all_matches.len() {
+        let cand = all_matches.get(i.as(usize)).as(Pos)
+        if cand <= from_pos and (not occupied.contains(cand)) {
+            return cand
+        }
+    }
+    null
+}
+
+fn ensure_mc_active_interceptor(vim: VimState, state: MultiCursorState) {
+    state.active = true
+    vim.set_interceptor(OWNER_MULTICURSOR, mc_interceptor_step)
+}
+
+fn add_next_match_core(
+    world: EditorWorld,
+    buf: Buffer,
+    vim: VimState,
+    state: MultiCursorState,
+) -> #status_emit Unit {
+    if (not state.active) or state.pattern == "" {
+        var init_pos = buf.point
+        var pat = ""
+        var whole_w = true
+
+        if vim.mode == VimMode.VisualChar {
+            let a = vim.visual_anchor
+            let b = buf.point
+            let lo = if a <= b { a } else { b }
+            let hi = if a <= b { b } else { a }
+            if lo.row == hi.row {
+                let llen = buf.line_char_len(lo.row)
+                let ec = if hi.col + 1 <= llen { hi.col + 1 } else { llen }
+                pat = buf.line_at(lo.row).slice(lo.col, ec)
+                init_pos = lo
+                whole_w = false
+            }
+            vim.mode = VimMode.Normal
+            vim.visual_dollar = false
+        }
+
+        if pat == "" {
+            let tok? = word_token_at_cursor(buf, buf.point) else {
+                status_emit("MultiCursor: no word under cursor")#
+                return ()
+            }
+            let (wpos, wtxt) = tok
+            init_pos = wpos
+            pat = wtxt
+            whole_w = true
+        }
+
+        state.active = true
+        state.sub_mode = McSubMode.Normal
+        state.pattern = pat
+        state.whole_word = whole_w
+        state.token_highlight_active = true
+        world.secondary_cursors = List()
+        buf.point = init_pos
+        ensure_mc_active_interceptor(vim, state)
+    }
+
+    let all_matches = find_all_occurrences(buf, state.pattern, state.whole_word)
+    let occupied = Set.new()
+    occupied.insert(buf.point)
+    for i in 0..world.secondary_cursors.len() {
+        occupied.insert(world.secondary_cursors.get(i.as(usize)).as(Pos))
+    }
+
+    let next_opt = next_unoccupied_match(all_matches, buf.point, occupied)
+    if next_opt == null {
+        refresh_mc_decors(world, buf, state)
+        let total_c = world.secondary_cursors.len() + 1
+        world.statusline_right_extra = "[MC: " ++ total_c.to_string() ++ "]"
+        status_emit(
+            "MultiCursor: all " ++ total_c.to_string()
+            ++ " matches selected for '" ++ state.pattern ++ "'"
+        )#
+        return ()
+    }
+
+    let next_pos = next_opt.as(Pos)
+    let cursors = collect_sorted_cursors(world, buf, false)
+    let updated = List()
+    for i in 0..cursors.len() {
+        let tc = cursors.get(i.as(usize)).as(TrackedCursor)
+        updated.push(TrackedCursor { pos: tc.pos, is_primary: false })
+    }
+    updated.push(TrackedCursor { pos: next_pos, is_primary: true })
+    apply_tracked_cursors(world, buf, state, updated, false)
+    sync_world_from_vim(world, vim)
+
+    let total_c = world.secondary_cursors.len() + 1
+    status_emit("MultiCursor: " ++ total_c.to_string() ++ " cursors ('" ++ state.pattern ++ "')")#
+    ()
+}
+
+fn skip_current_match_core(
+    world: EditorWorld,
+    buf: Buffer,
+    vim: VimState,
+    state: MultiCursorState,
+) -> #status_emit Unit {
+    if (not state.active) or state.pattern == "" {
+        status_emit("MultiCursor: not active")#
+        return ()
+    }
+    let all_matches = find_all_occurrences(buf, state.pattern, state.whole_word)
+    let occupied = Set.new()
+    occupied.insert(buf.point)
+    for i in 0..world.secondary_cursors.len() {
+        occupied.insert(world.secondary_cursors.get(i.as(usize)).as(Pos))
+    }
+    let next_opt = next_unoccupied_match(all_matches, buf.point, occupied)
+    if next_opt == null {
+        status_emit("MultiCursor: no further unselected matches to jump to")#
+        return ()
+    }
+    buf.point = next_opt.as(Pos)
+    buf.preferred_col = buf.point.col
+    refresh_mc_decors(world, buf, state)
+    sync_world_from_vim(world, vim)
+    let total_c = world.secondary_cursors.len() + 1
+    status_emit("MultiCursor: skipped -> " ++ buf.point.to_string() ++ " (" ++ total_c.to_string() ++ " cursors)")#
+    ()
+}
+
+-- ============================================================================
+-- Multi-Cursor Motions, Operators & Synchronized Insert Mode
+-- ============================================================================
+
+fn move_single_cursor(buf: Buffer, pos: Pos, motion_key: String) -> Pos {
+    when {
+        motion_key == "h" or motion_key == "Left" => {
+            Pos.new(pos.row, if pos.col > 0 { pos.col - 1 } else { 0 })
+        },
+        motion_key == "l" or motion_key == "Right" => {
+            let llen = buf.line_char_len(pos.row)
+            let mc = if llen > 0 { llen - 1 } else { 0 }
+            Pos.new(pos.row, if pos.col < mc { pos.col + 1 } else { mc })
+        },
+        motion_key == "j" or motion_key == "Down" => {
+            let nr = if pos.row + 1 <= buf.max_row() { pos.row + 1 } else { buf.max_row() }
+            buf.clamp_pos(Pos.new(nr, pos.col), insert_mode = false)
+        },
+        motion_key == "k" or motion_key == "Up" => {
+            let nr = if pos.row - 1 >= buf.min_row() { pos.row - 1 } else { buf.min_row() }
+            buf.clamp_pos(Pos.new(nr, pos.col), insert_mode = false)
+        },
+        motion_key == "0" => Pos.new(pos.row, 0),
+        motion_key == "^" => Pos.new(pos.row, buf.first_non_blank_col(pos.row)),
+        motion_key == "$" => {
+            let llen = buf.line_char_len(pos.row)
+            Pos.new(pos.row, if llen > 0 { llen - 1 } else { 0 })
+        },
+        motion_key == "w" or motion_key == "W" => {
+            let tgt = motion_word_forward(buf, pos, 1, motion_key == "W", false)
+            buf.clamp_pos(tgt.pos, insert_mode = false)
+        },
+        motion_key == "b" or motion_key == "B" => {
+            let tgt = motion_word_backward(buf, pos, 1, motion_key == "B")
+            buf.clamp_pos(tgt.pos, insert_mode = false)
+        },
+        motion_key == "e" or motion_key == "E" => {
+            let tgt = motion_word_end(buf, pos, 1, motion_key == "E")
+            buf.clamp_pos(tgt.pos, insert_mode = false)
+        },
+        else => pos,
+    }
+}
+
+fn span_for_operator_motion(
+    buf: Buffer,
+    state: MultiCursorState,
+    pos: Pos,
+    op: String,
+    motion_key: String,
+) -> ?Span {
+    when {
+        motion_key == "m" or motion_key == "n" => {
+            let plen = state.pattern.char_len()
+            if plen > 0 {
+                let line = buf.line_at(pos.row)
+                if pos.col + plen <= line.char_len() and line.slice(pos.col, pos.col + plen) == state.pattern {
+                    return Span.normalized(pos, Pos.new(pos.row, pos.col + plen))
+                }
+            }
+            let tok? = word_token_at_cursor(buf, pos) else {
+                return null
+            }
+            let (wpos, wtxt) = tok
+            Span.normalized(wpos, Pos.new(wpos.row, wpos.col + wtxt.char_len()))
+        },
+        motion_key == "w" or motion_key == "W" => {
+            let big = motion_key == "W"
+            let line = buf.line_at(pos.row)
+            let on_non_blank = pos.col < line.char_len()
+                and line.slice(pos.col, pos.col + 1) != " "
+                and line.slice(pos.col, pos.col + 1) != "\t"
+            if op == "c" and on_non_blank {
+                let tgt = motion_word_end(buf, pos, 1, big)
+                let hi_len = buf.line_char_len(tgt.pos.row)
+                let end_c = if tgt.pos.col < hi_len { tgt.pos.col + 1 } else { hi_len }
+                Span.normalized(pos, Pos.new(tgt.pos.row, end_c))
+            } else {
+                let tgt = motion_word_forward(buf, pos, 1, big, true)
+                Span.normalized(pos, tgt.pos)
+            }
+        },
+        motion_key == "e" or motion_key == "E" => {
+            let tgt = motion_word_end(buf, pos, 1, motion_key == "E")
+            let hi_len = buf.line_char_len(tgt.pos.row)
+            let end_c = if tgt.pos.col < hi_len { tgt.pos.col + 1 } else { hi_len }
+            Span.normalized(pos, Pos.new(tgt.pos.row, end_c))
+        },
+        motion_key == "b" or motion_key == "B" => {
+            let tgt = motion_word_backward(buf, pos, 1, motion_key == "B")
+            Span.normalized(tgt.pos, pos)
+        },
+        motion_key == "0" => Span.normalized(Pos.new(pos.row, 0), pos),
+        motion_key == "^" => Span.normalized(Pos.new(pos.row, buf.first_non_blank_col(pos.row)), pos),
+        motion_key == "$" => Span.normalized(pos, Pos.new(pos.row, buf.line_char_len(pos.row))),
+        motion_key == "l" => {
+            let llen = buf.line_char_len(pos.row)
+            let ec = if pos.col + 1 <= llen { pos.col + 1 } else { llen }
+            Span.normalized(pos, Pos.new(pos.row, ec))
+        },
+        motion_key == "h" => {
+            let sc = if pos.col > 0 { pos.col - 1 } else { 0 }
+            Span.normalized(Pos.new(pos.row, sc), pos)
+        },
+        else => null,
+    }
+}
+
+fn enter_mc_insert(
+    world: EditorWorld,
+    buf: Buffer,
+    vim: VimState,
+    state: MultiCursorState,
+    cursors: List,
+) {
+    state.sub_mode = McSubMode.Insert
+    state.token_highlight_active = false
+    vim.mode = VimMode.Insert
+    apply_tracked_cursors(world, buf, state, cursors, true)
+    sync_world_from_vim(world, vim)
+}
+
+fn finish_mc_insert(
+    world: EditorWorld,
+    buf: Buffer,
+    vim: VimState,
+    state: MultiCursorState,
+) {
+    let cursors = collect_sorted_cursors(world, buf, true)
+    let stepped = List()
+    for i in 0..cursors.len() {
+        let tc = cursors.get(i.as(usize)).as(TrackedCursor)
+        let back_c = if tc.pos.col > 0 { tc.pos.col - 1 } else { 0 }
+        stepped.push(TrackedCursor {
+            pos: buf.clamp_pos(Pos.new(tc.pos.row, back_c), insert_mode = false),
+            is_primary: tc.is_primary,
+        })
+    }
+    state.sub_mode = McSubMode.Normal
+    vim.mode = VimMode.Normal
+    apply_tracked_cursors(world, buf, state, stepped, false)
+    buf.named_marks.insert(".", buf.point)
+    buf.checkpoint(buf.point, "multicursor-insert")
+    sync_world_from_vim(world, vim)
+}
+
+fn handle_mc_insert_stroke(
+    world: EditorWorld,
+    buf: Buffer,
+    vim: VimState,
+    state: MultiCursorState,
+    stroke: KeyStroke,
+) -> #ServiceEffects !String bool {
+    let is_esc = stroke.key == "Escape"
+        or (stroke.ctrl and (stroke.key == "[" or stroke.key == "c"))
+    if is_esc {
+        finish_mc_insert(world, buf, vim, state)
+        status_emit("MultiCursor: applied across " ++ (world.secondary_cursors.len() + 1).to_string() ++ " cursors")#
+        return true
+    }
+
+    let cursors = collect_sorted_cursors(world, buf, true)
+
+    if stroke.key == "BackSpace" or (stroke.ctrl and stroke.key == "h") {
+        let edits = List()
+        for i in 0..cursors.len() {
+            let tc = cursors.get(i.as(usize)).as(TrackedCursor)
+            let p = tc.pos
+            if p.col > 0 {
+                edits.push(DisjointEdit {
+                    span: Span { start: Pos.new(p.row, p.col - 1), end: p },
+                    replacement: "",
+                    is_primary: tc.is_primary,
+                })
+            } else if p.row > buf.min_row() {
+                let prev_len = buf.line_char_len(p.row - 1)
+                edits.push(DisjointEdit {
+                    span: Span { start: Pos.new(p.row - 1, prev_len), end: p },
+                    replacement: "",
+                    is_primary: tc.is_primary,
+                })
+            } else {
+                edits.push(DisjointEdit {
+                    span: Span { start: p, end: p },
+                    replacement: "",
+                    is_primary: tc.is_primary,
+                })
+            }
+        }
+        let next_cursors = execute_multi_edits(buf, edits)!
+        apply_tracked_cursors(world, buf, state, next_cursors, true)
+        return true
+    }
+
+    if stroke.key == "Delete" {
+        let edits = List()
+        for i in 0..cursors.len() {
+            let tc = cursors.get(i.as(usize)).as(TrackedCursor)
+            let p = tc.pos
+            let llen = buf.line_char_len(p.row)
+            if p.col < llen {
+                edits.push(DisjointEdit {
+                    span: Span { start: p, end: Pos.new(p.row, p.col + 1) },
+                    replacement: "",
+                    is_primary: tc.is_primary,
+                })
+            } else {
+                edits.push(DisjointEdit {
+                    span: Span { start: p, end: p },
+                    replacement: "",
+                    is_primary: tc.is_primary,
+                })
+            }
+        }
+        let next_cursors = execute_multi_edits(buf, edits)!
+        apply_tracked_cursors(world, buf, state, next_cursors, true)
+        return true
+    }
+
+    if stroke.key == "Return" or (stroke.ctrl and stroke.key == "m") {
+        let edits = List()
+        for i in 0..cursors.len() {
+            let tc = cursors.get(i.as(usize)).as(TrackedCursor)
+            edits.push(DisjointEdit {
+                span: Span { start: tc.pos, end: tc.pos },
+                replacement: "\n",
+                is_primary: tc.is_primary,
+            })
+        }
+        let next_cursors = execute_multi_edits(buf, edits)!
+        apply_tracked_cursors(world, buf, state, next_cursors, true)
+        return true
+    }
+
+    if stroke.key == "Tab" {
+        let sw = if world.options.tabstop > 0 { world.options.tabstop } else { 4 }
+        let ins = if world.options.expandtab { " ".repeat(sw) } else { "\t" }
+        let edits = List()
+        for i in 0..cursors.len() {
+            let tc = cursors.get(i.as(usize)).as(TrackedCursor)
+            edits.push(DisjointEdit {
+                span: Span { start: tc.pos, end: tc.pos },
+                replacement: ins,
+                is_primary: tc.is_primary,
+            })
+        }
+        let next_cursors = execute_multi_edits(buf, edits)!
+        apply_tracked_cursors(world, buf, state, next_cursors, true)
+        return true
+    }
+
+    let ch = stroke_printable(stroke)
+    if ch != "" {
+        let edits = List()
+        for i in 0..cursors.len() {
+            let tc = cursors.get(i.as(usize)).as(TrackedCursor)
+            edits.push(DisjointEdit {
+                span: Span { start: tc.pos, end: tc.pos },
+                replacement: ch,
+                is_primary: tc.is_primary,
+            })
+        }
+        let next_cursors = execute_multi_edits(buf, edits)!
+        apply_tracked_cursors(world, buf, state, next_cursors, true)
+        return true
+    }
+
+    true
+}
+
+fn apply_mc_text_object(
+    world: EditorWorld,
+    buf: Buffer,
+    vim: VimState,
+    state: MultiCursorState,
+    op: String,
+    around: bool,
+    obj_key: String,
+) -> !String Unit {
+    let cursors = collect_sorted_cursors(world, buf, false)
+    let edits = List()
+    for i in 0..cursors.len() {
+        let tc = cursors.get(i.as(usize)).as(TrackedCursor)
+        let tr_opt = resolve_text_object(buf, tc.pos, around, obj_key, 1)
+        if tr_opt != null {
+            let tr = tr_opt.as(TextObjectRange)
+            edits.push(DisjointEdit {
+                span: tr.span,
+                replacement: "",
+                is_primary: tc.is_primary,
+            })
+        } else {
+            edits.push(DisjointEdit {
+                span: Span { start: tc.pos, end: tc.pos },
+                replacement: "",
+                is_primary: tc.is_primary,
+            })
+        }
+    }
+    let next_cursors = execute_multi_edits(buf, edits)!
+    state.token_highlight_active = false
+    if op == "c" {
+        enter_mc_insert(world, buf, vim, state, next_cursors)
+    } else {
+        state.sub_mode = McSubMode.Normal
+        apply_tracked_cursors(world, buf, state, next_cursors, false)
+        buf.named_marks.insert(".", buf.point)
+        buf.checkpoint(buf.point, "multicursor-delete")
+    }
+    ()
+}
+
+fn apply_mc_operator_motion(
+    world: EditorWorld,
+    buf: Buffer,
+    vim: VimState,
+    state: MultiCursorState,
+    op: String,
+    motion_key: String,
+) -> !String bool {
+    let cursors = collect_sorted_cursors(world, buf, false)
+    let edits = List()
+    var any_valid = false
+    for i in 0..cursors.len() {
+        let tc = cursors.get(i.as(usize)).as(TrackedCursor)
+        let sp_opt = span_for_operator_motion(buf, state, tc.pos, op, motion_key)
+        if sp_opt != null {
+            any_valid = true
+            edits.push(DisjointEdit {
+                span: sp_opt.as(Span),
+                replacement: "",
+                is_primary: tc.is_primary,
+            })
+        } else {
+            edits.push(DisjointEdit {
+                span: Span { start: tc.pos, end: tc.pos },
+                replacement: "",
+                is_primary: tc.is_primary,
+            })
+        }
+    }
+    if not any_valid {
+        state.sub_mode = McSubMode.Normal
+        return false
+    }
+    let next_cursors = execute_multi_edits(buf, edits)!
+    state.token_highlight_active = false
+    if op == "c" {
+        enter_mc_insert(world, buf, vim, state, next_cursors)
+    } else {
+        state.sub_mode = McSubMode.Normal
+        apply_tracked_cursors(world, buf, state, next_cursors, false)
+        buf.named_marks.insert(".", buf.point)
+        buf.checkpoint(buf.point, "multicursor-delete")
+    }
+    true
+}
+
+fn mc_interceptor_step(
+    kernel: SystemKernel,
+    stroke: KeyStroke,
+) -> #ServiceEffects !String bool {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let state = require_multicursor_state(kernel)!
+
+    if not state.active {
+        vim.clear_interceptor()
+        return false
+    }
+
+    let buf = world.active_buffer()
+
+    -- 1. Synchronized Insert sub-mode
+    if state.sub_mode == McSubMode.Insert {
+        return handle_mc_insert_stroke(world, buf, vim, state, stroke)#
+    }
+
+    let k = stroke.key
+    let plain = (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod)
+    let ctrl_only = stroke.ctrl and (not stroke.alt) and (not stroke.super_mod)
+    let is_esc = k == "Escape" or (ctrl_only and (k == "[" or k == "c" or k == "g"))
+
+    -- 2. Pending text-object second key (`di<obj>`, `da<obj>`, `ci<obj>`, `ca<obj>`)
+    if state.sub_mode == McSubMode.PendingDeleteInner
+        or state.sub_mode == McSubMode.PendingDeleteAround
+        or state.sub_mode == McSubMode.PendingChangeInner
+        or state.sub_mode == McSubMode.PendingChangeAround {
+        if is_esc {
+            state.sub_mode = McSubMode.Normal
+            return true
+        }
+        let around = state.sub_mode == McSubMode.PendingDeleteAround
+            or state.sub_mode == McSubMode.PendingChangeAround
+        let op = if state.sub_mode == McSubMode.PendingChangeInner
+            or state.sub_mode == McSubMode.PendingChangeAround {
+            "c"
+        } else {
+            "d"
+        }
+        let obj_ch = stroke_printable(stroke)
+        if obj_ch != "" {
+            apply_mc_text_object(world, buf, vim, state, op, around, obj_ch)!
+        } else {
+            state.sub_mode = McSubMode.Normal
+        }
+        return true
+    }
+
+    -- 3. Pending operator (`d` or `c`)
+    if state.sub_mode == McSubMode.PendingDelete or state.sub_mode == McSubMode.PendingChange {
+        if is_esc {
+            state.sub_mode = McSubMode.Normal
+            return true
+        }
+        let op = if state.sub_mode == McSubMode.PendingChange { "c" } else { "d" }
+        if plain and k == "i" {
+            state.sub_mode = if op == "c" {
+                McSubMode.PendingChangeInner
+            } else {
+                McSubMode.PendingDeleteInner
+            }
+            return true
+        }
+        if plain and k == "a" {
+            state.sub_mode = if op == "c" {
+                McSubMode.PendingChangeAround
+            } else {
+                McSubMode.PendingDeleteAround
+            }
+            return true
+        }
+        if plain {
+            let _ = apply_mc_operator_motion(world, buf, vim, state, op, k)!
+            return true
+        }
+        state.sub_mode = McSubMode.Normal
+        return true
+    }
+
+    -- 4. Multi-Cursor Normal Mode
+    if (not vim.leader_strokes.is_empty()) or (not vim.plugin_strokes.is_empty()) {
+        return false
+    }
+
+    if is_esc {
+        exit_multicursor(world, vim, state)
+        status_emit("MultiCursor exited")#
+        return true
+    }
+
+    if ctrl_only and k == "n" {
+        add_next_match_core(world, buf, vim, state)#
+        return true
+    }
+
+    if ctrl_only and k == "x" {
+        skip_current_match_core(world, buf, vim, state)#
+        return true
+    }
+
+    -- Motions across all cursors (`h`, `l`, `j`, `k`, `w`, `W`, `b`, `B`, `e`, `E`, `0`, `^`, `$`)
+    if plain and (
+        k == "h" or k == "Left"
+        or k == "l" or k == "Right"
+        or k == "j" or k == "Down"
+        or k == "k" or k == "Up"
+        or k == "w" or k == "W"
+        or k == "b" or k == "B"
+        or k == "e" or k == "E"
+        or k == "0" or k == "^" or k == "$"
+    ) {
+        let cursors = collect_sorted_cursors(world, buf, false)
+        let moved = List()
+        for i in 0..cursors.len() {
+            let tc = cursors.get(i.as(usize)).as(TrackedCursor)
+            moved.push(TrackedCursor {
+                pos: move_single_cursor(buf, tc.pos, k),
+                is_primary: tc.is_primary,
+            })
+        }
+        state.token_highlight_active = false
+        apply_tracked_cursors(world, buf, state, moved, false)
+        return true
+    }
+
+    -- `x`: delete character under every cursor in a single undo checkpoint!
+    if plain and k == "x" {
+        let cursors = collect_sorted_cursors(world, buf, false)
+        let edits = List()
+        for i in 0..cursors.len() {
+            let tc = cursors.get(i.as(usize)).as(TrackedCursor)
+            let p = tc.pos
+            let llen = buf.line_char_len(p.row)
+            let ec = if p.col < llen { p.col + 1 } else { llen }
+            edits.push(DisjointEdit {
+                span: Span { start: p, end: Pos.new(p.row, ec) },
+                replacement: "",
+                is_primary: tc.is_primary,
+            })
+        }
+        let next_cursors = execute_multi_edits(buf, edits)!
+        state.token_highlight_active = false
+        apply_tracked_cursors(world, buf, state, next_cursors, false)
+        buf.named_marks.insert(".", buf.point)
+        buf.checkpoint(buf.point, "multicursor-x")
+        return true
+    }
+
+    -- `s`: substitute matched token (if highlighted) or single char at every cursor and enter Insert
+    if plain and k == "s" {
+        let cursors = collect_sorted_cursors(world, buf, false)
+        let plen = state.pattern.char_len()
+        let edits = List()
+        for i in 0..cursors.len() {
+            let tc = cursors.get(i.as(usize)).as(TrackedCursor)
+            let p = tc.pos
+            let line = buf.line_at(p.row)
+            let llen = line.char_len()
+            if state.token_highlight_active and plen > 0 and p.col + plen <= llen and line.slice(p.col, p.col + plen) == state.pattern {
+                edits.push(DisjointEdit {
+                    span: Span { start: p, end: Pos.new(p.row, p.col + plen) },
+                    replacement: "",
+                    is_primary: tc.is_primary,
+                })
+            } else {
+                let ec = if p.col < llen { p.col + 1 } else { llen }
+                edits.push(DisjointEdit {
+                    span: Span { start: p, end: Pos.new(p.row, ec) },
+                    replacement: "",
+                    is_primary: tc.is_primary,
+                })
+            }
+        }
+        let next_cursors = execute_multi_edits(buf, edits)!
+        enter_mc_insert(world, buf, vim, state, next_cursors)
+        return true
+    }
+
+    -- `D` / `C`: delete / change to end-of-line at every cursor
+    if plain and (k == "D" or k == "C") {
+        let _ = apply_mc_operator_motion(world, buf, vim, state, k.to_lower(), "$")!
+        return true
+    }
+
+    -- Operators `d` and `c`
+    if plain and k == "d" {
+        state.sub_mode = McSubMode.PendingDelete
+        return true
+    }
+    if plain and k == "c" {
+        state.sub_mode = McSubMode.PendingChange
+        return true
+    }
+
+    -- Synchronized Insert entry (`i`, `a`, `I`, `A`)
+    if plain and (k == "i" or k == "a" or k == "I" or k == "A") {
+        buf.ensure_writable()!
+        let cursors = collect_sorted_cursors(world, buf, false)
+        let target_cursors = List()
+        for i in 0..cursors.len() {
+            let tc = cursors.get(i.as(usize)).as(TrackedCursor)
+            let p = tc.pos
+            let llen = buf.line_char_len(p.row)
+            let np = when {
+                k == "i" => p,
+                k == "a" => Pos.new(p.row, if p.col < llen { p.col + 1 } else { llen }),
+                k == "I" => Pos.new(p.row, buf.first_non_blank_col(p.row)),
+                else => Pos.new(p.row, llen),
+            }
+            target_cursors.push(TrackedCursor { pos: np, is_primary: tc.is_primary })
+        }
+        enter_mc_insert(world, buf, vim, state, target_cursors)
+        return true
+    }
+
+    -- Pass `<Space>` leader chords through if user invokes `<Space> m j` / `<Space> m a`
+    if plain and k == "Space" {
+        return false
+    }
+
+    true
+}
+
+-- ============================================================================
+-- Command Entry Points & Extension Registration
+-- ============================================================================
+
+fn cmd_mc_add_next(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let state = require_multicursor_state(kernel)!
+    let buf = world.active_buffer()
+    add_next_match_core(world, buf, vim, state)#
+    log_event("info", OWNER_MULTICURSOR, "mc-add-next-match")#
+    ()
+}
+
+fn cmd_mc_skip(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let state = require_multicursor_state(kernel)!
+    let buf = world.active_buffer()
+    skip_current_match_core(world, buf, vim, state)#
+    ()
+}
+
+fn cmd_mc_add_vertical(kernel: SystemKernel, delta_row: i64) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let state = require_multicursor_state(kernel)!
+    let buf = world.active_buffer()
+
+    if vim.mode != VimMode.Normal {
+        vim.mode = VimMode.Normal
+    }
+
+    let target_r = buf.point.row + delta_row
+    if target_r < buf.min_row() or target_r > buf.max_row() {
+        status_emit("MultiCursor: reached buffer boundary")#
+        return ()
+    }
+
+    ensure_mc_active_interceptor(vim, state)
+    state.sub_mode = McSubMode.Normal
+    state.token_highlight_active = false
+
+    let cursors = collect_sorted_cursors(world, buf, false)
+    let updated = List()
+    for i in 0..cursors.len() {
+        let tc = cursors.get(i.as(usize)).as(TrackedCursor)
+        updated.push(TrackedCursor { pos: tc.pos, is_primary: false })
+    }
+    let dest = buf.clamp_pos(Pos.new(target_r, buf.point.col), insert_mode = false)
+    updated.push(TrackedCursor { pos: dest, is_primary: true })
+    apply_tracked_cursors(world, buf, state, updated, false)
+    sync_world_from_vim(world, vim)
+
+    let total_c = world.secondary_cursors.len() + 1
+    status_emit("MultiCursor: " ++ total_c.to_string() ++ " cursors")#
+    ()
+}
+
+fn cmd_mc_add_all_matches(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let state = require_multicursor_state(kernel)!
+    let buf = world.active_buffer()
+
+    var pat = state.pattern
+    var whole_w = state.whole_word
+    var anchor_p = buf.point
+
+    if vim.mode == VimMode.VisualChar {
+        let a = vim.visual_anchor
+        let b = buf.point
+        let lo = if a <= b { a } else { b }
+        let hi = if a <= b { b } else { a }
+        if lo.row == hi.row {
+            let llen = buf.line_char_len(lo.row)
+            let ec = if hi.col + 1 <= llen { hi.col + 1 } else { llen }
+            pat = buf.line_at(lo.row).slice(lo.col, ec)
+            whole_w = false
+            anchor_p = lo
+        }
+        vim.mode = VimMode.Normal
+        vim.visual_dollar = false
+    } else if (not state.active) or pat == "" {
+        let tok? = word_token_at_cursor(buf, buf.point) else {
+            status_emit("MultiCursor: no word under cursor")#
+            return ()
+        }
+        let (wpos, wtxt) = tok
+        anchor_p = wpos
+        pat = wtxt
+        whole_w = true
+    }
+
+    let all_matches = find_all_occurrences(buf, pat, whole_w)
+    if all_matches.is_empty() {
+        status_emit("MultiCursor: no occurrences of '" ++ pat ++ "'")#
+        return ()
+    }
+
+    state.active = true
+    state.sub_mode = McSubMode.Normal
+    state.pattern = pat
+    state.whole_word = whole_w
+    state.token_highlight_active = true
+    ensure_mc_active_interceptor(vim, state)
+
+    let built = List()
+    var marked_primary = false
+    for i in 0..all_matches.len() {
+        let mp = all_matches.get(i.as(usize)).as(Pos)
+        let is_prim = (not marked_primary) and mp == anchor_p
+        if is_prim {
+            marked_primary = true
+        }
+        built.push(TrackedCursor { pos: mp, is_primary: is_prim })
+    }
+    if not marked_primary {
+        let first_c = built.get(0).as(TrackedCursor)
+        built.set(0, TrackedCursor { pos: first_c.pos, is_primary: true })
+    }
+
+    apply_tracked_cursors(world, buf, state, built, false)
+    sync_world_from_vim(world, vim)
+
+    let total_c = world.secondary_cursors.len() + 1
+    status_emit("MultiCursor: selected all " ++ total_c.to_string() ++ " occurrences of '" ++ pat ++ "'")#
+    ()
+}
+
+pub fn register_multicursor_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_multicursor_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_multicursor",
+        "0.1.0",
+        "Synchronized multi-cursor selection, motion, operators, and insert engine (`<C-n>`, `<Space>ma`, `<Space>mj`/`mk`).",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let state = MultiCursorState.new()
+            k.publish_service(SERVICE_MULTICURSOR, ext_id, state)
+
+            let norm_km = k.ensure_keymap(KEYMAP_VIM_NORMAL)
+            norm_km.bind("<C-n>", "mc-add-next-match", ext_id, description = "MultiCursor add next match")
+
+            let vis_km = k.ensure_keymap(KEYMAP_VIM_VISUAL)
+            vis_km.bind("<C-n>", "mc-add-next-match", ext_id, description = "MultiCursor add next visual match")
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> m j", "mc-add-cursor-down", ext_id, description = "MultiCursor add cursor down")
+            leader_km.bind("<Space> m k", "mc-add-cursor-up", ext_id, description = "MultiCursor add cursor up")
+            leader_km.bind("<Space> m a", "mc-add-all-matches", ext_id, description = "MultiCursor select all matches")
+
+            k.register_command("mc-add-next-match", ext_id, "Select word/selection and add cursor at next match (`<C-n>`).", cmd_mc_add_next)
+            k.register_command("ex:MCAddNext", ext_id, "Ex `:MCAddNext`.", cmd_mc_add_next, interactive = false)
+
+            k.register_command("mc-skip-match", ext_id, "Skip current match and move primary cursor to next (`<C-x>`).", cmd_mc_skip)
+            k.register_command("ex:MCSkip", ext_id, "Ex `:MCSkip`.", cmd_mc_skip, interactive = false)
+
+            k.register_command(
+                "mc-add-cursor-down",
+                ext_id,
+                "Add cursor one line below (`<Space>mj` / `:MCAddDown`).",
+                |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any {
+                    cmd_mc_add_vertical(kern, 1)#
+                },
+            )
+            k.register_command(
+                "ex:MCAddDown",
+                ext_id,
+                "Ex `:MCAddDown`.",
+                |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any {
+                    cmd_mc_add_vertical(kern, 1)#
+                },
+                interactive = false,
+            )
+
+            k.register_command(
+                "mc-add-cursor-up",
+                ext_id,
+                "Add cursor one line above (`<Space>mk` / `:MCAddUp`).",
+                |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any {
+                    cmd_mc_add_vertical(kern, -1)#
+                },
+            )
+            k.register_command(
+                "ex:MCAddUp",
+                ext_id,
+                "Ex `:MCAddUp`.",
+                |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any {
+                    cmd_mc_add_vertical(kern, -1)#
+                },
+                interactive = false,
+            )
+
+            k.register_command(
+                "mc-add-all-matches",
+                ext_id,
+                "Place cursors on every occurrence of word under cursor (`<Space>ma` / `:MCSelectAll`).",
+                cmd_mc_add_all_matches,
+            )
+            k.register_command(
+                "ex:MCSelectAll",
+                ext_id,
+                "Ex `:MCSelectAll`.",
+                cmd_mc_add_all_matches,
+                interactive = false,
+            )
+
+            k.register_command(
+                "mc-clear",
+                ext_id,
+                "Exit multi-cursor mode and clear secondary cursors.",
+                |kern: SystemKernel, _a: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let vs = require_vim_state(kern)!
+                    let st = require_multicursor_state(kern)!
+                    exit_multicursor(w, vs, st)
+                    status_emit("MultiCursor exited")#
+                    ()
+                },
+            )
+            k.register_command(
+                "ex:MCClear",
+                ext_id,
+                "Ex `:MCClear`.",
+                |kern: SystemKernel, a: List| -> #InteractiveEffects !String Any {
+                    let _ = kern.dispatch_command("mc-clear", a)#!
+                    ()
+                },
+                interactive = false,
+            )
+
+            k.add_hook(
+                "buffer-switched",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| -> Unit {
+                    let st_opt = kern.service(SERVICE_MULTICURSOR)
+                    let w_opt = kern.service("lava.document.world")
+                    let v_opt = kern.service("lava.vim.state")
+                    if st_opt != null and w_opt != null and v_opt != null {
+                        let st = st_opt.as(MultiCursorState)
+                        if st.active {
+                            exit_multicursor(w_opt.as(EditorWorld), v_opt.as(VimState), st)
+                        }
+                    }
+                },
+            )
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            let v_opt = k.service("lava.vim.state")
+            let st_opt = k.service(SERVICE_MULTICURSOR)
+            if w_opt != null and v_opt != null and st_opt != null {
+                exit_multicursor(
+                    w_opt.as(EditorWorld),
+                    v_opt.as(VimState),
+                    st_opt.as(MultiCursorState),
+                )
+            }
+            ()
+        },
+    )
+}

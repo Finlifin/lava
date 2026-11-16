@@ -1,0 +1,1791 @@
+-- ext_telescope: Fuzzy Finder, Live Grep, Help/Docs, Command, Symbol, Buffer, Keymap & Theme Picker (`lava.org/ext_telescope`).
+-- Powered by `@lava_accel` (`accel_workspace_files`, `accel_fuzzy_rank`, `accel_workspace_grep`,
+-- `accel_scan_symbols`, `accel_index_docs`, `accel_search_docs`) and `@ext_render.all_theme_names`,
+-- driving dual floating windows (`"telescope-picker"` + `"telescope-preview"`) via `VimState.set_interceptor`.
+
+use std.collections.{HashMap, Set}
+use std.fs
+use std.path
+use @lava_core.{
+    CommandSpec, ExtId, InteractiveEffects, KeyBindingEntry, KeyStroke, Keymap, ServiceEffects,
+    SystemKernel, clipboard_get, clipboard_set, log_event, status_emit
+}
+use @lava_accel.{
+    DocNode, DocSearchHit, FuzzyHit, GrepHit, SymbolItem, SymbolOutlineSpan,
+    accel_doc_scan_symbol_spans, accel_fuzzy_rank, accel_index_docs, accel_search_docs,
+    accel_workspace_files, accel_workspace_grep
+}
+use @ext_document.{
+    Buffer, BufferId, EditorWorld, FloatingWindow, Pos, QuickfixEntry, ext_document_id,
+    require_editor_world
+}
+use @ext_vim.{
+    KEYMAP_VIM_LEADER, ModalInterceptor, VimMode, VimState, ext_vim_id, require_vim_state,
+    sync_world_from_vim
+}
+use @ext_render.{
+    RenderCompositor, SERVICE_RENDERER, all_theme_names, ext_render_id, theme_by_name
+}
+
+pub const SERVICE_TELESCOPE: String = "lava.telescope.state"
+pub const FLOAT_PICKER_ID: String = "telescope-picker"
+pub const FLOAT_PREVIEW_ID: String = "telescope-preview"
+const TELESCOPE_AVAILABLE_MODES_SUMMARY: String = "files, live_grep, buffers, symbols, help_tags, docs, commands, keymaps, colorscheme, resume"
+
+pub fn ext_telescope_id() -> ExtId = ExtId("lava.org/ext_telescope")
+
+pub struct PickerItem {
+    pub label: String,
+    pub display: String,
+    pub file_path: String,
+    pub row: i64,
+    pub end_row: i64,
+    pub col: i64,
+    pub buf_id: BufferId,
+    pub line_text: String,
+    pub command_name: String,
+    pub node_id: String,
+    pub item_kind: String,
+    pub detail: String,
+}
+
+pub struct TelescopeState {
+    pub active: bool,
+    pub mode: String,
+    pub query: String,
+    pub base_items: List,
+    pub filtered_items: List,
+    pub selected_idx: i64,
+    pub source_buf_id: BufferId,
+    pub original_theme: String,
+    pub has_history: bool,
+    pub qf_header_rows: i64,
+}
+
+impl TelescopeState {
+    pub fn new() -> TelescopeState {
+        TelescopeState {
+            active: false,
+            mode: "files",
+            query: "",
+            base_items: List(),
+            filtered_items: List(),
+            selected_idx: 0,
+            source_buf_id: BufferId(1),
+            original_theme: "catppuccin-mocha",
+            has_history: false,
+            qf_header_rows: 2,
+        }
+    }
+}
+
+pub fn require_telescope_state(kernel: SystemKernel) -> !String TelescopeState {
+    let raw = kernel.require_service(SERVICE_TELESCOPE)!
+    raw.as(TelescopeState)
+}
+
+pub fn collect_help_doc_roots(world: EditorWorld) -> List {
+    let roots = List()
+    let cwd_docs = path.join(world.cwd, "docs")
+    if fs.exists(cwd_docs) and fs.is_dir(cwd_docs) {
+        roots.push(path.normalize(cwd_docs))
+    }
+    let isolated_marker = path.join(world.cwd, ".lava_isolated_doc_test")
+    if not fs.exists(isolated_marker) {
+        let lava_docs = "/home/fin/apps/lava/docs"
+        if fs.exists(lava_docs) and fs.is_dir(lava_docs) {
+            let norm_lava = path.normalize(lava_docs)
+            if not roots.contains(norm_lava) {
+                roots.push(norm_lava)
+            }
+        }
+        let nessa_docs = "/home/fin/nessa2/docs"
+        if fs.exists(nessa_docs) and fs.is_dir(nessa_docs) {
+            let norm_nessa = path.normalize(nessa_docs)
+            if not roots.contains(norm_nessa) {
+                roots.push(norm_nessa)
+            }
+        }
+    }
+    roots
+}
+
+fn picker_printable_char(stroke: KeyStroke) -> String {
+    if stroke.ctrl or stroke.alt or stroke.super_mod {
+        return ""
+    }
+    if stroke.key == "Space" {
+        return " "
+    }
+    if stroke.text != "" and stroke.text.char_len() == 1 {
+        return stroke.text
+    }
+    if stroke.key.char_len() == 1 {
+        return stroke.key
+    }
+    ""
+}
+
+fn mode_display_title(mode: String) -> String {
+    when {
+        mode == "files" => "Find Files",
+        mode == "live_grep" => "Live Grep",
+        mode == "buffers" => "Buffers",
+        mode == "symbols" => "Document Symbols",
+        mode == "help_tags" => "Help Tags",
+        mode == "docs" => "Documentation Search",
+        mode == "commands" => "Commands",
+        mode == "keymaps" => "Keymaps",
+        mode == "colorscheme" => "Colorscheme",
+        mode == "builtin" => "Pickers",
+        else => "Picker",
+    }
+}
+
+fn normalize_picker_mode_opt(mode: String) -> ?String {
+    let m = mode.trim().to_lower().replace("-", "_")
+    when {
+        m == "find_files" or m == "files" => "files",
+        m == "live_grep" or m == "grep" => "live_grep",
+        m == "buffers" or m == "ls" => "buffers",
+        m == "symbols" or m == "lsp_document_symbols" or m == "document_symbols" => "symbols",
+        m == "help_tags" or m == "helptags" or m == "help" => "help_tags",
+        m == "docs" or m == "doc" or m == "search_docs" or m == "apropos_docs" => "docs",
+        m == "commands" or m == "command" => "commands",
+        m == "keymaps" or m == "keymap" => "keymaps",
+        m == "colorscheme" or m == "themes" or m == "theme" => "colorscheme",
+        m == "builtin" or m == "pickers" => "builtin",
+        else => null,
+    }
+}
+
+fn relative_to_cwd(full_path: String, cwd: String) -> String {
+    if full_path == "" {
+        return ""
+    }
+    let norm_cwd = path.normalize(cwd)
+    let prefix = if norm_cwd.ends_with("/") { norm_cwd } else { norm_cwd ++ "/" }
+    if full_path.starts_with(prefix) {
+        return full_path.drop(prefix.char_len())
+    }
+    full_path
+}
+
+fn short_owner_name(owner: ExtId) -> String {
+    let raw = owner.raw()
+    let slash_opt = raw.split_once("/")
+    if slash_opt != null {
+        let (_, short_n) = slash_opt.as((String, String))
+        return short_n
+    }
+    raw
+}
+
+fn format_chord_for_keymap(km_name: String, chord: String) -> String {
+    let c = chord.trim()
+    if c == "" {
+        return ""
+    }
+    if km_name.contains("leader") and (not c.starts_with("<Space>")) and (not c.starts_with("SPC")) {
+        return "<Space> " ++ c
+    }
+    c
+}
+
+fn collect_command_chords_map(kernel: SystemKernel) -> HashMap {
+    let map = HashMap.new()
+    let km_names = kernel.keymaps.keys()
+    km_names.sort()
+    for ki in 0..km_names.len() {
+        let km_name = km_names.get(ki.as(usize)).as(String)
+        let km = kernel.keymaps.get(km_name).as(Keymap)
+        let entries = km.all_entries()
+        entries.sort_by(|a: Any, b: Any| {
+            a.as(KeyBindingEntry).chord.cmp(b.as(KeyBindingEntry).chord)
+        })
+        for ei in 0..entries.len() {
+            let e = entries.get(ei.as(usize)).as(KeyBindingEntry)
+            let formatted = format_chord_for_keymap(km_name, e.chord)
+            if formatted != "" {
+                let existing_opt = map.get(e.command_name)
+                if existing_opt == null {
+                    let fresh = List()
+                    fresh.push(formatted)
+                    map.insert(e.command_name, fresh)
+                } else {
+                    let lst = existing_opt.as(List)
+                    if (not lst.contains(formatted)) and lst.len() < 3 {
+                        lst.push(formatted)
+                    }
+                }
+            }
+        }
+    }
+    let out = HashMap.new()
+    let cmd_keys = map.keys()
+    for ci in 0..cmd_keys.len() {
+        let cname = cmd_keys.get(ci.as(usize)).as(String)
+        let lst = map.get(cname).as(List)
+        out.insert(cname, lst.join(", "))
+    }
+    out
+}
+
+fn apply_theme_preview(kernel: SystemKernel, world: EditorWorld, theme_name: String) {
+    if theme_name == "" {
+        return
+    }
+    let rc_opt = kernel.service(SERVICE_RENDERER)
+    if rc_opt != null {
+        let _ = rc_opt.as(RenderCompositor).set_theme(theme_name, world) ! { _ => () }
+    } else {
+        world.options.theme_name = theme_name
+    }
+}
+
+fn make_plain_item(
+    label: String,
+    display: String,
+    file_path: String,
+    row: i64,
+    col: i64,
+    buf_id: BufferId,
+    line_text: String,
+    command_name: String,
+    detail: String,
+) -> PickerItem {
+    PickerItem {
+        label: label,
+        display: display,
+        file_path: file_path,
+        row: row,
+        end_row: row,
+        col: col,
+        buf_id: buf_id,
+        line_text: line_text,
+        command_name: command_name,
+        node_id: "",
+        item_kind: "",
+        detail: detail,
+    }
+}
+
+fn collect_base_items(kernel: SystemKernel, world: EditorWorld, state: TelescopeState) -> List {
+    let mode = state.mode
+    let items = List()
+
+    if mode == "builtin" {
+        let modes = [
+            ("files", "find_files", "<Space> s f", "Fuzzy find workspace files with live preview"),
+            ("live_grep", "live_grep", "<Space> s g", "Live grep workspace text with instant context preview"),
+            ("buffers", "buffers", "<Space> s b", "Fuzzy switch open buffers"),
+            ("symbols", "symbols", "<Space> s s", "Jump to symbols in active buffer"),
+            ("help_tags", "help_tags", "<Space> f h", "Fuzzy search manual chapters, *help-tags*, and commands"),
+            ("docs", "docs", "<Space> s H", "Live Orderless full-text global documentation search"),
+            ("commands", "commands", "<Space> f C", "Fuzzy/Orderless picker over registered commands"),
+            ("keymaps", "keymaps", "<Space> s k", "Inspect active keybindings across keymaps"),
+            ("colorscheme", "colorscheme", "<Space> s c", "Preview and apply editor color themes"),
+            ("resume", "resume", "<Space> s r", "Resume previous Telescope picker session"),
+        ]
+        for i in 0..modes.len() {
+            let (mkey, mname, chord, summary) = modes.get(i.as(usize)).as((String, String, String, String))
+            let disp = mname.pad_end(16, " ") ++ " " ++ chord.pad_end(14, " ") ++ " — " ++ summary
+            items.push(PickerItem {
+                label: mname ++ " " ++ mkey ++ " " ++ summary,
+                display: disp,
+                file_path: "",
+                row: 0,
+                end_row: 0,
+                col: 0,
+                buf_id: BufferId(0),
+                line_text: summary,
+                command_name: mkey,
+                node_id: "",
+                item_kind: "builtin_mode",
+                detail: chord,
+            })
+        }
+        return items
+    }
+
+    if mode == "files" {
+        let files = accel_workspace_files(world.cwd, max_files = 10000, include_hidden = false)
+        for i in 0..files.len() {
+            let rel = files.get(i.as(usize)).as(String)
+            items.push(make_plain_item(rel, rel, rel, 0, 0, BufferId(0), "", "", ""))
+        }
+        return items
+    }
+
+    if mode == "buffers" {
+        for i in 0..world.buffer_order.len() {
+            let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+            let b = world.buffers.get(bid).as(Buffer)
+            let active_mark = if bid == state.source_buf_id { "%" } else { " " }
+            let mod_mark = if b.modified { "+" } else if b.read_only { "-" } else { " " }
+            let rel = relative_to_cwd(b.file_path, world.cwd)
+            let tail = if rel != "" { "  — " ++ rel } else { "  [" ++ b.major_mode ++ "]" }
+            let disp = active_mark ++ mod_mark ++ " #" ++ bid.raw().to_string() ++ " " ++ b.name ++ tail
+            items.push(make_plain_item(
+                b.name ++ " " ++ rel,
+                disp,
+                b.file_path,
+                b.point.row,
+                b.point.col,
+                bid,
+                b.line_at(b.point.row),
+                "",
+                b.major_mode,
+            ))
+        }
+        return items
+    }
+
+    if mode == "symbols" {
+        let src_opt = world.buffer(state.source_buf_id)
+        let src = if src_opt != null { src_opt.as(Buffer) } else { world.active_buffer() }
+        src.sync_external_lines()
+        let raw_spans = accel_doc_scan_symbol_spans(src.doc_id, src.major_mode, 4000)
+        for i in 0..raw_spans.len() {
+            let sp = raw_spans.get(i.as(usize)).as(SymbolOutlineSpan)
+            let s = SymbolItem {
+                name: sp.name,
+                kind: sp.kind,
+                row: sp.row,
+                col: sp.col,
+                level: sp.level,
+            }
+            let indent = if s.level > 1 { "  ".repeat(s.level - 1) } else { "" }
+            let kind_tag = "[" ++ s.kind ++ "]"
+            let disp = indent ++ kind_tag.pad_end(11, " ") ++ " " ++ s.name ++ "  :" ++ (s.row + 1).to_string()
+            items.push(make_plain_item(
+                s.name ++ " " ++ s.kind,
+                disp,
+                src.file_path,
+                s.row,
+                s.col,
+                src.id,
+                src.line_at(s.row),
+                "",
+                s.kind,
+            ))
+        }
+        return items
+    }
+
+    if mode == "help_tags" {
+        let doc_roots = collect_help_doc_roots(world)
+        let doc_nodes = accel_index_docs(doc_roots)
+        let seen_tags = Set.new()
+
+        for ni in 0..doc_nodes.len() {
+            let node = doc_nodes.get(ni.as(usize)).as(DocNode)
+            for ti in 0..node.tags.len() {
+                let tag = node.tags.get(ti.as(usize)).as(String)
+                if not seen_tags.contains(tag) {
+                    seen_tags.insert(tag)
+                    let star_tag = "*" ++ tag ++ "*"
+                    let disp = star_tag.pad_end(26, " ") ++ " " ++ node.title ++ "  [" ++ node.manual ++ "]"
+                    items.push(PickerItem {
+                        label: star_tag ++ " " ++ tag ++ " " ++ node.title ++ " " ++ node.manual ++ " " ++ node.node_id,
+                        display: disp,
+                        file_path: node.file_path,
+                        row: node.start_row,
+                        end_row: node.end_row,
+                        col: 0,
+                        buf_id: BufferId(0),
+                        line_text: if node.summary != "" { node.summary } else { node.title },
+                        command_name: "",
+                        node_id: node.node_id,
+                        item_kind: "doc_tag",
+                        detail: node.manual,
+                    })
+                }
+            }
+        }
+
+        for ni in 0..doc_nodes.len() {
+            let node = doc_nodes.get(ni.as(usize)).as(DocNode)
+            let disp = "[section]   " ++ node.title ++ "  (" ++ node.node_id ++ ")"
+            items.push(PickerItem {
+                label: node.title ++ " " ++ node.node_id ++ " " ++ node.manual ++ " " ++ node.summary,
+                display: disp,
+                file_path: node.file_path,
+                row: node.start_row,
+                end_row: node.end_row,
+                col: 0,
+                buf_id: BufferId(0),
+                line_text: if node.summary != "" { node.summary } else { node.title },
+                command_name: "",
+                node_id: node.node_id,
+                item_kind: "doc_section",
+                detail: node.manual,
+            })
+        }
+
+        let chord_map = collect_command_chords_map(kernel)
+        let cmds = kernel.list_commands()
+        for ci in 0..cmds.len() {
+            let cs = cmds.get(ci.as(usize)).as(CommandSpec)
+            let ch_opt = chord_map.get(cs.name)
+            let chords = if ch_opt != null { ch_opt.as(String) } else { "" }
+            let chord_part = if chords != "" { " [" ++ chords ++ "]" } else { "" }
+            let disp = "[command]   " ++ cs.name.pad_end(24, " ") ++ chord_part ++ "  " ++ cs.summary
+            items.push(PickerItem {
+                label: cs.name ++ " " ++ chords ++ " " ++ cs.summary ++ " " ++ short_owner_name(cs.owner),
+                display: disp,
+                file_path: "",
+                row: 0,
+                end_row: 0,
+                col: 0,
+                buf_id: BufferId(0),
+                line_text: cs.summary,
+                command_name: cs.name,
+                node_id: "",
+                item_kind: "command",
+                detail: cs.owner.to_string() ++ (if chords != "" { " | " ++ chords } else { "" }),
+            })
+        }
+        return items
+    }
+
+    if mode == "commands" {
+        let chord_map = collect_command_chords_map(kernel)
+        let cmds = kernel.list_commands()
+        for ci in 0..cmds.len() {
+            let cs = cmds.get(ci.as(usize)).as(CommandSpec)
+            let ch_opt = chord_map.get(cs.name)
+            let chords = if ch_opt != null { ch_opt.as(String) } else { "" }
+            let owner_short = "[" ++ short_owner_name(cs.owner) ++ "]"
+            let chord_col = if chords != "" { chords } else { "(M-x)" }
+            let disp = cs.name.pad_end(26, " ")
+                ++ " " ++ chord_col.pad_end(16, " ")
+                ++ " " ++ owner_short.pad_end(16, " ")
+                ++ " " ++ cs.summary
+            items.push(PickerItem {
+                label: cs.name ++ " " ++ chords ++ " " ++ owner_short ++ " " ++ cs.summary,
+                display: disp,
+                file_path: "",
+                row: 0,
+                end_row: 0,
+                col: 0,
+                buf_id: BufferId(0),
+                line_text: cs.summary,
+                command_name: cs.name,
+                node_id: "",
+                item_kind: "command",
+                detail: cs.owner.to_string() ++ "||" ++ (if chords != "" { chords } else { "(unbound)" }),
+            })
+        }
+        return items
+    }
+
+    if mode == "keymaps" {
+        let km_names = kernel.keymaps.keys()
+        km_names.sort()
+        for ki in 0..km_names.len() {
+            let km_name = km_names.get(ki.as(usize)).as(String)
+            let km = kernel.keymaps.get(km_name).as(Keymap)
+            let entries = km.all_entries()
+            entries.sort_by(|a: Any, b: Any| {
+                a.as(KeyBindingEntry).chord.cmp(b.as(KeyBindingEntry).chord)
+            })
+            for ei in 0..entries.len() {
+                let e = entries.get(ei.as(usize)).as(KeyBindingEntry)
+                let tag = "[" ++ km_name ++ "]"
+                let desc_part = if e.description != "" { " — " ++ e.description } else { "" }
+                let disp = tag.pad_end(14, " ") ++ " " ++ e.chord.pad_end(14, " ") ++ " -> " ++ e.command_name ++ desc_part
+                items.push(make_plain_item(
+                    km_name ++ " " ++ e.chord ++ " " ++ e.command_name ++ " " ++ e.description,
+                    disp,
+                    "",
+                    0,
+                    0,
+                    BufferId(0),
+                    e.description,
+                    e.command_name,
+                    km_name ++ " | " ++ e.owner.to_string(),
+                ))
+            }
+        }
+        return items
+    }
+
+    if mode == "colorscheme" {
+        let themes = all_theme_names()
+        for i in 0..themes.len() {
+            let tname = themes.get(i.as(usize)).as(String)
+            let mark = if tname == state.original_theme { "* " } else { "  " }
+            items.push(make_plain_item(
+                tname,
+                mark ++ tname,
+                "",
+                0,
+                0,
+                BufferId(0),
+                "",
+                tname,
+                "ThemePalette",
+            ))
+        }
+        return items
+    }
+
+    items
+}
+
+fn score_orderless_token_for_picker(raw_tok: String, c_low: String) -> (bool, i64) {
+    let tlen = raw_tok.char_len()
+    if tlen == 0 {
+        return (false, 100)
+    }
+    let clen = c_low.char_len()
+    if raw_tok.starts_with("!") and tlen > 1 {
+        let neg = raw_tok.drop(1).to_lower()
+        if c_low.contains(neg) {
+            return (true, -1)
+        }
+        return (true, 200)
+    }
+    if raw_tok.starts_with("^") and tlen > 1 {
+        let anch = raw_tok.drop(1).to_lower()
+        if c_low.starts_with(anch) {
+            return (false, 9000 - clen)
+        }
+        return (false, -1)
+    }
+    if raw_tok.ends_with("$") and tlen > 1 {
+        let anch = raw_tok.slice(0, tlen - 1).to_lower()
+        if c_low.ends_with(anch) {
+            return (false, 8500 - clen)
+        }
+        return (false, -1)
+    }
+    if raw_tok.starts_with("=") and tlen > 1 {
+        let lit = raw_tok.drop(1).to_lower()
+        let hits = c_low.find_indices(lit)
+        if not hits.is_empty() {
+            return (false, 6000 - hits.get(0).as(i64) * 4 - clen)
+        }
+        return (false, -1)
+    }
+
+    let q = raw_tok.to_lower()
+    let qlen = q.char_len()
+    if c_low == q {
+        return (false, 20000)
+    }
+    if c_low.starts_with(q) {
+        return (false, 15000 - (clen - qlen))
+    }
+    let sub_hits = c_low.find_indices(q)
+    if not sub_hits.is_empty() {
+        return (false, 9000 - sub_hits.get(0).as(i64) * 4 - clen)
+    }
+    if qlen > clen {
+        return (false, -1)
+    }
+    var qi: i64 = 0
+    var ci: i64 = 0
+    var bonus: i64 = 0
+    while qi < qlen and ci < clen {
+        if c_low.slice(ci, ci + 1) == q.slice(qi, qi + 1) {
+            if ci == 0 {
+                bonus += 45
+            } else {
+                let prev = c_low.slice(ci - 1, ci)
+                if prev == "/" or prev == "_" or prev == "-" or prev == "." or prev == " " or prev == "*" {
+                    bonus += 45
+                }
+            }
+            qi += 1
+        }
+        ci += 1
+    }
+    if qi == qlen {
+        (false, 3000 + bonus - clen)
+    } else {
+        (false, -1)
+    }
+}
+
+fn has_orderless_syntax(q_trim: String) -> bool {
+    q_trim.contains(" ")
+        or q_trim.starts_with("!")
+        or q_trim.starts_with("^")
+        or q_trim.starts_with("=")
+        or q_trim.ends_with("$")
+}
+
+fn rank_candidates_orderless(query: String, candidates: List, limit: i64) -> List {
+    let raw_parts = query.trim().split(" ")
+    let tokens = List()
+    for i in 0..raw_parts.len() {
+        let tk = raw_parts.get(i.as(usize)).as(String).trim()
+        if tk != "" {
+            tokens.push(tk)
+        }
+    }
+    let scored = List()
+    for idx in 0..candidates.len() {
+        let c_low = candidates.get(idx.as(usize)).as(String).to_lower()
+        var ok = true
+        var sum_sc: i64 = 0
+        var pos_cnt: i64 = 0
+        for ti in 0..tokens.len() {
+            let tok = tokens.get(ti.as(usize)).as(String)
+            let (is_neg, sc) = score_orderless_token_for_picker(tok, c_low)
+            if sc < 0 {
+                ok = false
+                break
+            }
+            if not is_neg {
+                sum_sc += sc
+                pos_cnt += 1
+            }
+        }
+        if ok {
+            let final_sc = if pos_cnt > 0 { sum_sc / pos_cnt } else { 200 - c_low.char_len() }
+            scored.push(FuzzyHit { index: idx, score: final_sc })
+        }
+    }
+    scored.sort_by(|a: Any, b: Any| {
+        let fa = a.as(FuzzyHit)
+        let fb = b.as(FuzzyHit)
+        if fa.score != fb.score {
+            fb.score.cmp(fa.score)
+        } else {
+            fa.index.cmp(fb.index)
+        }
+    })
+    if limit > 0 and scored.len() > limit {
+        let out = List()
+        for j in 0..limit {
+            out.push(scored.get(j.as(usize)))
+        }
+        return out
+    }
+    scored
+}
+
+fn normalize_doc_search_query(raw_q: String) -> String {
+    let trimmed = raw_q.trim()
+    if trimmed == "" {
+        return ""
+    }
+    let parts = trimmed.split(" ")
+    let norm_parts = List()
+    for i in 0..parts.len() {
+        let p = parts.get(i.as(usize)).as(String).trim()
+        if p == "" {
+            continue
+        }
+        if p.char_len() >= 3 and p.starts_with("*") and p.ends_with("*") and (not p.starts_with("**")) {
+            norm_parts.push(p.slice(1, p.char_len() - 1))
+        } else {
+            norm_parts.push(p)
+        }
+    }
+    norm_parts.join(" ")
+}
+
+fn recompute_filtered_items(world: EditorWorld, state: TelescopeState) {
+    if state.mode == "live_grep" {
+        let q = state.query.trim()
+        if q == "" {
+            state.filtered_items = List()
+            state.selected_idx = 0
+            return
+        }
+        let case_sens = not world.effective_ignore_case(q)
+        let hits = accel_workspace_grep(
+            world.cwd,
+            q,
+            case_sensitive = case_sens,
+            max_results = 250,
+        )
+        let out = List()
+        for i in 0..hits.len() {
+            let h = hits.get(i.as(usize)).as(GrepHit)
+            let disp = h.file_path ++ ":" ++ (h.row + 1).to_string() ++ ":" ++ (h.col + 1).to_string() ++ ": " ++ h.line_text.trim()
+            out.push(make_plain_item(
+                disp,
+                disp,
+                h.file_path,
+                h.row,
+                h.col,
+                BufferId(0),
+                h.line_text,
+                "",
+                "",
+            ))
+        }
+        state.filtered_items = out
+        if state.selected_idx >= out.len() {
+            state.selected_idx = if out.is_empty() { 0 } else { out.len() - 1 }
+        }
+        if state.selected_idx < 0 {
+            state.selected_idx = 0
+        }
+        return
+    }
+
+    if state.mode == "docs" {
+        let doc_roots = collect_help_doc_roots(world)
+        let norm_q = normalize_doc_search_query(state.query)
+        let hits = accel_search_docs(doc_roots, norm_q, limit = 80)
+        let out = List()
+        for i in 0..hits.len() {
+            let h = hits.get(i.as(usize)).as(DocSearchHit)
+            let tag_part = if h.matched_tag != "" { " *" ++ h.matched_tag ++ "*" } else { "" }
+            let snip_part = if h.snippet != "" { " — " ++ h.snippet } else { "" }
+            let disp = "[" ++ h.manual ++ "] " ++ h.title ++ tag_part ++ snip_part
+            let qf_text = "[" ++ h.manual ++ "] " ++ h.title
+                ++ (if h.snippet != "" { ": " ++ h.snippet } else { "" })
+            out.push(PickerItem {
+                label: disp,
+                display: disp,
+                file_path: h.file_path,
+                row: h.row,
+                end_row: h.row,
+                col: 0,
+                buf_id: BufferId(0),
+                line_text: qf_text,
+                command_name: "",
+                node_id: h.node_id,
+                item_kind: "doc_hit",
+                detail: h.manual,
+            })
+        }
+        state.filtered_items = out
+        if state.selected_idx >= out.len() {
+            state.selected_idx = if out.is_empty() { 0 } else { out.len() - 1 }
+        }
+        if state.selected_idx < 0 {
+            state.selected_idx = 0
+        }
+        return
+    }
+
+    let cands = List()
+    for i in 0..state.base_items.len() {
+        cands.push(state.base_items.get(i.as(usize)).as(PickerItem).label)
+    }
+
+    let q_trim = state.query.trim()
+    if q_trim == "" {
+        let copy = List()
+        let limit = if state.base_items.len() > 250 { 250 } else { state.base_items.len() }
+        for i in 0..limit {
+            copy.push(state.base_items.get(i.as(usize)).as(PickerItem))
+        }
+        state.filtered_items = copy
+    } else {
+        let ranked = if has_orderless_syntax(q_trim) {
+            rank_candidates_orderless(q_trim, cands, 250)
+        } else {
+            accel_fuzzy_rank(state.query, cands, limit = 250)
+        }
+        let out = List()
+        for i in 0..ranked.len() {
+            let fh = ranked.get(i.as(usize)).as(FuzzyHit)
+            if fh.index >= 0 and fh.index < state.base_items.len() {
+                out.push(state.base_items.get(fh.index.as(usize)).as(PickerItem))
+            }
+        }
+        state.filtered_items = out
+    }
+
+    if state.selected_idx >= state.filtered_items.len() {
+        state.selected_idx = if state.filtered_items.is_empty() { 0 } else { state.filtered_items.len() - 1 }
+    }
+    if state.selected_idx < 0 {
+        state.selected_idx = 0
+    }
+}
+
+fn load_preview_source_lines(world: EditorWorld, item: PickerItem) -> ?List {
+    if item.buf_id.raw() > 0 {
+        let b_opt = world.buffer(item.buf_id)
+        if b_opt != null {
+            let b = b_opt.as(Buffer)
+            let lim = if b.line_count() < 300 { b.line_count() } else { 300 }
+            return b.slice_lines(0, lim)
+        }
+    }
+    if item.file_path == "" {
+        return null
+    }
+    let full = world.resolve_path(item.file_path)
+    let open_opt = world.find_buffer_by_path(full)
+    if open_opt != null {
+        let b = open_opt.as(Buffer)
+        let lim = if b.line_count() < 300 { b.line_count() } else { 300 }
+        return b.slice_lines(0, lim)
+    }
+    let raw! = fs.read_to_string(full) else {
+        return null
+    }
+    let norm = raw.replace("\r\n", "\n").replace("\r", "\n")
+    let parts = norm.split("\n")
+    if parts.len() > 1 and norm.ends_with("\n") {
+        let _ = parts.pop()
+    }
+    parts
+}
+
+fn build_command_preview_window(kernel: SystemKernel, item: PickerItem) -> FloatingWindow {
+    let cspec_opt = kernel.get_command(item.command_name)
+    let chord_map = collect_command_chords_map(kernel)
+    let ch_opt = chord_map.get(item.command_name)
+    let bound_chords = if ch_opt != null {
+        ch_opt.as(String)
+    } else {
+        "(unbound — invoke via M-x " ++ item.command_name ++ ")"
+    }
+    let lines = List()
+    lines.push("Command     : " ++ item.command_name)
+    if cspec_opt != null {
+        let sp = cspec_opt.as(CommandSpec)
+        lines.push("Extension   : " ++ sp.owner.to_string())
+        lines.push("Interactive : " ++ sp.interactive.to_string())
+        lines.push("Keybindings : " ++ bound_chords)
+        lines.push("────────────────────────────────────────────────────────")
+        lines.push(sp.summary)
+    } else {
+        lines.push("Keybindings : " ++ bound_chords)
+        lines.push("────────────────────────────────────────────────────────")
+        lines.push("(Command not currently registered)")
+    }
+    FloatingWindow {
+        id: FLOAT_PREVIEW_ID,
+        owner: "ext_telescope",
+        title: "Preview — Command: " ++ item.command_name,
+        anchor: "bottom",
+        width_cols: 78,
+        height_rows: 9,
+        lines: lines,
+        selected_row: 0,
+        border_rgba: 0,
+    }
+}
+
+fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: TelescopeState) -> FloatingWindow {
+    let preview_rows: i64 = 10
+    if state.filtered_items.is_empty() {
+        let empty_msg = if state.mode == "live_grep" and state.query.trim() == "" {
+            "(Type a pattern above to search across workspace files)"
+        } else if state.mode == "docs" and state.query.trim() == "" {
+            "(Type an Orderless query above to search all documentation)"
+        } else {
+            "(No matching items)"
+        }
+        return (FloatingWindow {
+            id: FLOAT_PREVIEW_ID,
+            owner: "ext_telescope",
+            title: "Telescope Preview",
+            anchor: "bottom",
+            width_cols: 78,
+            height_rows: 6,
+            lines: [empty_msg],
+            selected_row: -1,
+            border_rgba: 0,
+        })
+    }
+
+    let sel = if state.selected_idx < 0 {
+        0
+    } else if state.selected_idx >= state.filtered_items.len() {
+        state.filtered_items.len() - 1
+    } else {
+        state.selected_idx
+    }
+    let item = state.filtered_items.get(sel.as(usize)).as(PickerItem)
+
+    if state.mode == "builtin" {
+        let lines = [
+            "Picker Mode : " ++ item.command_name,
+            "Shortcut    : " ++ item.detail,
+            "────────────────────────────────────────────────────────",
+            item.line_text,
+            "",
+            "Available modes: " ++ TELESCOPE_AVAILABLE_MODES_SUMMARY,
+        ]
+        return (FloatingWindow {
+            id: FLOAT_PREVIEW_ID,
+            owner: "ext_telescope",
+            title: "Preview — Telescope: " ++ item.command_name,
+            anchor: "bottom",
+            width_cols: 78,
+            height_rows: 8,
+            lines: lines,
+            selected_row: 0,
+            border_rgba: 0,
+        })
+    }
+
+    if state.mode == "colorscheme" {
+        let p = theme_by_name(item.command_name)
+        let lines = [
+            "Theme Palette: " ++ p.name,
+            "────────────────────────────────────────────────────────",
+            "-- Sample Nessa Highlighting Preview",
+            "pub fn compute_answer(x: i64) -> i64 {{",
+            "    let base = 40",
+            "    x + base",
+            "}}",
+            "Press <Return> to apply theme, <Escape> to restore '" ++ state.original_theme ++ "'.",
+        ]
+        return (FloatingWindow {
+            id: FLOAT_PREVIEW_ID,
+            owner: "ext_telescope",
+            title: "Preview — Theme: " ++ p.name,
+            anchor: "bottom",
+            width_cols: 78,
+            height_rows: preview_rows,
+            lines: lines,
+            selected_row: 0,
+            border_rgba: p.accent,
+        })
+    }
+
+    if state.mode == "commands" or (state.mode == "help_tags" and item.item_kind == "command") {
+        return build_command_preview_window(kernel, item)
+    }
+
+    if state.mode == "keymaps" {
+        let cspec_opt = kernel.get_command(item.command_name)
+        let summary = if cspec_opt != null {
+            cspec_opt.as(CommandSpec).summary
+        } else {
+            "(Command not currently registered)"
+        }
+        let lines = [
+            "Command : " ++ item.command_name,
+            "Origin  : " ++ item.detail,
+            "Binding : " ++ item.display,
+            "────────────────────────────────────────────────────────",
+            summary,
+        ]
+        return (FloatingWindow {
+            id: FLOAT_PREVIEW_ID,
+            owner: "ext_telescope",
+            title: "Preview — Keybinding: " ++ item.command_name,
+            anchor: "bottom",
+            width_cols: 78,
+            height_rows: 8,
+            lines: lines,
+            selected_row: 0,
+            border_rgba: 0,
+        })
+    }
+
+    let src_lines_opt = load_preview_source_lines(world, item)
+    if src_lines_opt == null {
+        return (FloatingWindow {
+            id: FLOAT_PREVIEW_ID,
+            owner: "ext_telescope",
+            title: "Preview — " ++ item.display,
+            anchor: "bottom",
+            width_cols: 78,
+            height_rows: 6,
+            lines: ["(Binary or unreadable file: " ++ item.file_path ++ ")"],
+            selected_row: -1,
+            border_rgba: 0,
+        })
+    }
+
+    let src_lines = src_lines_opt.as(List)
+    let total = src_lines.len()
+
+    if state.mode == "help_tags" and (item.item_kind == "doc_tag" or item.item_kind == "doc_section") {
+        let sec_start = if item.row < 0 {
+            0
+        } else if item.row >= total {
+            if total > 0 { total - 1 } else { 0 }
+        } else {
+            item.row
+        }
+        let raw_end = if item.end_row >= sec_start and item.end_row < total {
+            item.end_row + 1
+        } else {
+            total
+        }
+        let max_sec_rows: i64 = 12
+        let sec_end = if sec_start + max_sec_rows < raw_end {
+            sec_start + max_sec_rows
+        } else {
+            raw_end
+        }
+        let sec_out = List()
+        for r in sec_start..sec_end {
+            let lnum = (r + 1).to_string().pad_start(4, " ")
+            let marker = if r == sec_start { ">>" } else { "  " }
+            sec_out.push(marker ++ lnum ++ " │ " ++ src_lines.get(r.as(usize)).as(String))
+        }
+        let hdr_label = if item.node_id != "" { item.node_id } else { item.display }
+        return (FloatingWindow {
+            id: FLOAT_PREVIEW_ID,
+            owner: "ext_telescope",
+            title: "Preview — " ++ hdr_label,
+            anchor: "bottom",
+            width_cols: 78,
+            height_rows: max_sec_rows,
+            lines: sec_out,
+            selected_row: 0,
+            border_rgba: 0,
+        })
+    }
+
+    let target_r = if item.row < 0 {
+        0
+    } else if item.row >= total {
+        if total > 0 { total - 1 } else { 0 }
+    } else {
+        item.row
+    }
+    var start_r = target_r - 3
+    if start_r + preview_rows > total {
+        start_r = total - preview_rows
+    }
+    if start_r < 0 {
+        start_r = 0
+    }
+    let end_r = if start_r + preview_rows < total { start_r + preview_rows } else { total }
+    let out_lines = List()
+    var highlight_row: i64 = -1
+    let use_double_arrow = state.mode == "docs"
+    for r in start_r..end_r {
+        if r == target_r {
+            highlight_row = r - start_r
+        }
+        let lnum = (r + 1).to_string().pad_start(4, " ")
+        let marker = if use_double_arrow {
+            if r == target_r { ">>" } else { "  " }
+        } else {
+            if r == target_r { ">" } else { " " }
+        }
+        out_lines.push(marker ++ lnum ++ " │ " ++ src_lines.get(r.as(usize)).as(String))
+    }
+
+    let title_target = if state.mode == "docs" and item.node_id != "" {
+        item.node_id ++ " (" ++ relative_to_cwd(world.resolve_path(item.file_path), world.cwd) ++ ":" ++ (target_r + 1).to_string() ++ ")"
+    } else if item.file_path != "" {
+        relative_to_cwd(world.resolve_path(item.file_path), world.cwd) ++ ":" ++ (target_r + 1).to_string()
+    } else {
+        item.display
+    }
+
+    FloatingWindow {
+        id: FLOAT_PREVIEW_ID,
+        owner: "ext_telescope",
+        title: "Preview — " ++ title_target,
+        anchor: "bottom",
+        width_cols: 78,
+        height_rows: preview_rows,
+        lines: out_lines,
+        selected_row: highlight_row,
+        border_rgba: 0,
+    }
+}
+
+pub fn sync_telescope_windows(kernel: SystemKernel, world: EditorWorld, state: TelescopeState) {
+    if not state.active {
+        let _ = world.remove_floating_window(FLOAT_PICKER_ID)
+        let _ = world.remove_floating_window(FLOAT_PREVIEW_ID)
+        return
+    }
+
+    if state.mode == "colorscheme" and (not state.filtered_items.is_empty()) {
+        let sel_item = state.filtered_items.get(state.selected_idx.as(usize)).as(PickerItem)
+        apply_theme_preview(kernel, world, sel_item.command_name)
+    }
+
+    let max_cand_rows: i64 = 10
+    let total_filtered = state.filtered_items.len()
+    let denom = if state.mode == "live_grep" or state.mode == "docs" {
+        total_filtered
+    } else {
+        state.base_items.len()
+    }
+
+    let picker_lines = List()
+    picker_lines.push("> " ++ state.query ++ "█")
+    picker_lines.push("────────────────────────────────────────────────────────────────────────")
+
+    var win_sel_row: i64 = -1
+    if total_filtered == 0 {
+        let hint = if state.mode == "live_grep" and state.query.trim() == "" {
+            "  (Type search query — <C-n>/<C-p> move, <C-q> quickfix, <Esc> close)"
+        } else {
+            "  (0 matches)"
+        }
+        picker_lines.push(hint)
+    } else {
+        var start_i = state.selected_idx - (max_cand_rows / 2)
+        if start_i + max_cand_rows > total_filtered {
+            start_i = total_filtered - max_cand_rows
+        }
+        if start_i < 0 {
+            start_i = 0
+        }
+        let end_i = if start_i + max_cand_rows < total_filtered {
+            start_i + max_cand_rows
+        } else {
+            total_filtered
+        }
+        for idx in start_i..end_i {
+            let it = state.filtered_items.get(idx.as(usize)).as(PickerItem)
+            let pfx = if idx == state.selected_idx { "❯ " } else { "  " }
+            if idx == state.selected_idx {
+                win_sel_row = picker_lines.len()
+            }
+            picker_lines.push(pfx ++ it.display)
+        }
+    }
+
+    let picker_title = "Telescope " ++ mode_display_title(state.mode)
+        ++ " (" ++ total_filtered.to_string() ++ "/" ++ denom.to_string()
+        ++ ") [<Ret>:open <C-q>:qf <Esc>:close]"
+
+    world.set_floating_window(FloatingWindow {
+        id: FLOAT_PICKER_ID,
+        owner: "ext_telescope",
+        title: picker_title,
+        anchor: "center",
+        width_cols: 76,
+        height_rows: 13,
+        lines: picker_lines,
+        selected_row: win_sel_row,
+        border_rgba: 0,
+    })
+
+    world.set_floating_window(build_preview_window(kernel, world, state))
+}
+
+fn close_telescope(kernel: SystemKernel, world: EditorWorld, vim: VimState, state: TelescopeState, restore_theme: bool) {
+    if restore_theme and state.mode == "colorscheme" {
+        apply_theme_preview(kernel, world, state.original_theme)
+    }
+    state.active = false
+    let _ = world.remove_floating_window(FLOAT_PICKER_ID)
+    let _ = world.remove_floating_window(FLOAT_PREVIEW_ID)
+    if vim.modal_interceptor != null {
+        let mi = vim.modal_interceptor.as(ModalInterceptor)
+        if mi.owner == "ext_telescope" {
+            vim.clear_interceptor()
+        }
+    }
+    sync_world_from_vim(world, vim)
+}
+
+fn send_filtered_to_quickfix(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    vim: VimState,
+    state: TelescopeState,
+) -> #ServiceEffects !String Unit {
+    let qf_entries = List()
+    for i in 0..state.filtered_items.len() {
+        let it = state.filtered_items.get(i.as(usize)).as(PickerItem)
+        var fpath = ""
+        if it.file_path != "" {
+            fpath = world.resolve_path(it.file_path)
+        } else if it.buf_id.raw() > 0 {
+            let b_opt = world.buffer(it.buf_id)
+            if b_opt != null {
+                let b = b_opt.as(Buffer)
+                fpath = if b.file_path != "" { b.file_path } else { "buffer:" ++ b.name }
+            }
+        }
+        if fpath != "" {
+            let txt = if it.line_text != "" { it.line_text.trim() } else { it.display }
+            qf_entries.push(QuickfixEntry {
+                file_path: fpath,
+                row: it.row,
+                col: it.col,
+                text: txt,
+            })
+        }
+    }
+
+    close_telescope(kernel, world, vim, state, true)
+
+    let title = "Telescope " ++ mode_display_title(state.mode)
+        ++ (if state.query != "" { " (" ++ state.query ++ ")" } else { "" })
+    world.quickfix = qf_entries
+    world.quickfix_idx = 0
+    world.quickfix_title = title
+
+    let lines = List()
+    lines.push("-- *Quickfix* — " ++ title ++ " (" ++ qf_entries.len().to_string() ++ " items)")
+    lines.push("------------------------------------------------------------------------")
+    state.qf_header_rows = lines.len()
+
+    for i in 0..qf_entries.len() {
+        let e = qf_entries.get(i.as(usize)).as(QuickfixEntry)
+        let disp_p = if e.file_path.starts_with("buffer:") {
+            e.file_path.drop(7)
+        } else {
+            relative_to_cwd(e.file_path, world.cwd)
+        }
+        lines.push(
+            disp_p ++ ":" ++ (e.row + 1).to_string() ++ ":" ++ (e.col + 1).to_string() ++ ": " ++ e.text
+        )
+    }
+    if qf_entries.is_empty() {
+        lines.push("(No quickfix entries)")
+    }
+
+    let qbuf = world.ensure_special_buffer("*Quickfix*", "quickfix", lines, read_only = true)
+    if not qf_entries.is_empty() {
+        qbuf.point = qbuf.clamp_pos(Pos.new(state.qf_header_rows, 0), insert_mode = false)
+    } else {
+        qbuf.point = Pos.zero()
+    }
+    let _ = world.switch_to_buffer(qbuf.id)
+    kernel.emit_hook("buffer-switched", qbuf.id)
+    status_emit("Telescope: sent " ++ qf_entries.len().to_string() ++ " item(s) to *Quickfix*")#
+    ()
+}
+
+fn open_file_at_row(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    file_path: String,
+    row: i64,
+    col: i64,
+) -> #ServiceEffects !String Buffer {
+    let cur = world.active_buffer()
+    world.jumps.record(cur.id, cur.file_path, cur.point)
+    let opened = world.open_file(file_path)#!
+    opened.point = opened.clamp_pos(Pos.new(row, col), insert_mode = false)
+    opened.preferred_col = opened.point.col
+    world.jumps.record(opened.id, opened.file_path, opened.point)
+    kernel.emit_hook("buffer-switched", opened.id)
+    kernel.emit_hook("cursor-moved", opened.id)
+    opened
+}
+
+fn accept_selected_item(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    vim: VimState,
+    state: TelescopeState,
+) -> #ServiceEffects !String Unit {
+    if state.filtered_items.is_empty() {
+        close_telescope(kernel, world, vim, state, true)
+        status_emit("Telescope: no item selected")#
+        return ()
+    }
+    let idx = if state.selected_idx < 0 {
+        0
+    } else if state.selected_idx >= state.filtered_items.len() {
+        state.filtered_items.len() - 1
+    } else {
+        state.selected_idx
+    }
+    let item = state.filtered_items.get(idx.as(usize)).as(PickerItem)
+    let picked_mode = state.mode
+
+    close_telescope(kernel, world, vim, state, false)
+
+    if picked_mode == "builtin" {
+        if item.command_name == "resume" {
+            open_telescope_picker(kernel, "files", resume_last = true)#!
+        } else {
+            open_telescope_picker(kernel, item.command_name)#!
+        }
+        return ()
+    }
+
+    if picked_mode == "colorscheme" {
+        let tname = item.command_name
+        apply_theme_preview(kernel, world, tname)
+        kernel.emit_hook("theme-changed", tname)
+        log_event("info", "ext_telescope", "Selected colorscheme " ++ tname)#
+        status_emit("Theme: " ++ tname)#
+        return ()
+    }
+
+    if picked_mode == "commands" or picked_mode == "keymaps" {
+        if item.command_name != "" and kernel.get_command(item.command_name) != null {
+            let _ = kernel.dispatch_command(item.command_name, List())#!
+        } else {
+            status_emit("Command: " ++ item.display)#
+        }
+        return ()
+    }
+
+    if picked_mode == "help_tags" {
+        if item.item_kind == "command" {
+            if kernel.get_command("describe-function") != null {
+                let _ = kernel.dispatch_command("describe-function", [item.command_name])#!
+            } else if kernel.get_command("describe-command") != null {
+                let _ = kernel.dispatch_command("describe-command", [item.command_name])#!
+            } else {
+                status_emit("Help command: " ++ item.command_name)#
+            }
+            return ()
+        }
+        if item.node_id != "" and kernel.get_command("info") != null {
+            let _ = kernel.dispatch_command("info", [item.node_id])#!
+            return ()
+        }
+        if item.file_path != "" {
+            let opened = open_file_at_row(kernel, world, item.file_path, item.row, 0)#!
+            status_emit("Help: " ++ opened.name ++ ":" ++ (item.row + 1).to_string())#
+        }
+        return ()
+    }
+
+    if picked_mode == "docs" {
+        if item.node_id != "" and kernel.get_command("info") != null {
+            let _ = kernel.dispatch_command("info", [item.node_id])#!
+            return ()
+        }
+        if item.file_path != "" {
+            let opened = open_file_at_row(kernel, world, item.file_path, item.row, 0)#!
+            status_emit("Docs: " ++ opened.name ++ ":" ++ (item.row + 1).to_string())#
+        }
+        return ()
+    }
+
+    if picked_mode == "buffers" {
+        if world.switch_to_buffer(item.buf_id) {
+            let b = world.active_buffer()
+            kernel.emit_hook("buffer-switched", b.id)
+            status_emit("Buffer: " ++ b.name)#
+        }
+        return ()
+    }
+
+    if picked_mode == "symbols" {
+        let cur = world.active_buffer()
+        world.jumps.record(cur.id, cur.file_path, cur.point)
+        if item.buf_id.raw() > 0 and world.buffers.contains_key(item.buf_id) {
+            let _ = world.switch_to_buffer(item.buf_id)
+            kernel.emit_hook("buffer-switched", item.buf_id)
+        } else if item.file_path != "" {
+            let opened = world.open_file(item.file_path)#!
+            kernel.emit_hook("buffer-switched", opened.id)
+        }
+        let b = world.active_buffer()
+        b.point = b.clamp_pos(Pos.new(item.row, item.col), insert_mode = false)
+        b.preferred_col = b.point.col
+        world.jumps.record(b.id, b.file_path, b.point)
+        kernel.emit_hook("cursor-moved", b.id)
+        status_emit("Symbol: " ++ item.display.trim())#
+        return ()
+    }
+
+    -- `"files"` or `"live_grep"`
+    let opened = open_file_at_row(kernel, world, item.file_path, item.row, item.col)#!
+    if picked_mode == "live_grep" {
+        status_emit(
+            opened.name ++ ":" ++ (item.row + 1).to_string() ++ ":" ++ (item.col + 1).to_string()
+        )#
+    }
+    ()
+}
+
+fn telescope_intercept_key(
+    kernel: SystemKernel,
+    stroke: KeyStroke,
+) -> #ServiceEffects !String bool {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let state = require_telescope_state(kernel)!
+
+    if not state.active {
+        vim.clear_interceptor()
+        return false
+    }
+
+    let is_cancel = stroke.key == "Escape"
+        or (stroke.ctrl and (stroke.key == "[" or stroke.key == "c" or stroke.key == "g"))
+    if is_cancel {
+        close_telescope(kernel, world, vim, state, true)
+        status_emit("Telescope cancelled")#
+        return true
+    }
+
+    if stroke.ctrl and (not stroke.alt) and stroke.key == "q" {
+        send_filtered_to_quickfix(kernel, world, vim, state)#!
+        return true
+    }
+
+    let is_down = stroke.key == "Down"
+        or (stroke.ctrl and stroke.key == "n")
+        or (stroke.ctrl and stroke.key == "j")
+        or (stroke.key == "Tab" and (not stroke.shift_mod))
+    if is_down {
+        let count = state.filtered_items.len()
+        if count > 0 {
+            state.selected_idx = (state.selected_idx + 1) % count
+        }
+        sync_telescope_windows(kernel, world, state)
+        return true
+    }
+
+    let is_up = stroke.key == "Up"
+        or (stroke.ctrl and stroke.key == "p")
+        or (stroke.ctrl and stroke.key == "k")
+        or (stroke.key == "Tab" and stroke.shift_mod)
+    if is_up {
+        let count = state.filtered_items.len()
+        if count > 0 {
+            state.selected_idx = (state.selected_idx - 1 + count) % count
+        }
+        sync_telescope_windows(kernel, world, state)
+        return true
+    }
+
+    if stroke.key == "Return" or (stroke.ctrl and stroke.key == "m") {
+        accept_selected_item(kernel, world, vim, state)#!
+        return true
+    }
+
+    if stroke.ctrl and stroke.key == "u" {
+        state.query = ""
+        state.selected_idx = 0
+        recompute_filtered_items(world, state)
+        sync_telescope_windows(kernel, world, state)
+        return true
+    }
+
+    if stroke.ctrl and stroke.key == "w" {
+        var trimmed = state.query.trim_end()
+        var n = trimmed.char_len()
+        while n > 0 and trimmed.slice(n - 1, n) != " " and trimmed.slice(n - 1, n) != "/" {
+            n -= 1
+        }
+        state.query = trimmed.slice(0, n)
+        state.selected_idx = 0
+        recompute_filtered_items(world, state)
+        sync_telescope_windows(kernel, world, state)
+        return true
+    }
+
+    if stroke.key == "BackSpace" or (stroke.ctrl and stroke.key == "h") {
+        let qlen = state.query.char_len()
+        if qlen > 0 {
+            state.query = state.query.slice(0, qlen - 1)
+            state.selected_idx = 0
+            recompute_filtered_items(world, state)
+            sync_telescope_windows(kernel, world, state)
+        }
+        return true
+    }
+
+    let ch = picker_printable_char(stroke)
+    if ch != "" {
+        state.query = state.query ++ ch
+        state.selected_idx = 0
+        recompute_filtered_items(world, state)
+        sync_telescope_windows(kernel, world, state)
+        return true
+    }
+
+    true
+}
+
+pub fn open_telescope_picker(
+    kernel: SystemKernel,
+    mode: String,
+    .initial_query: String = "",
+    .resume_last: bool = false,
+) -> #ServiceEffects !String Unit {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let state = require_telescope_state(kernel)!
+
+    vim.mode = VimMode.Normal
+    vim.clear_transient()
+
+    if resume_last and state.has_history {
+        state.active = true
+        state.original_theme = world.options.theme_name
+        if state.mode != "live_grep" and state.mode != "docs" {
+            state.base_items = collect_base_items(kernel, world, state)
+        }
+        recompute_filtered_items(world, state)
+    } else {
+        let resolved_opt = if mode == "" {
+            "builtin"
+        } else {
+            normalize_picker_mode_opt(mode)
+        }
+        let norm_mode = if resolved_opt != null {
+            resolved_opt.as(String)
+        } else {
+            "builtin"
+        }
+        state.active = true
+        state.mode = norm_mode
+        state.query = initial_query
+        state.selected_idx = 0
+        state.source_buf_id = world.active_buffer_id
+        state.original_theme = world.options.theme_name
+        state.has_history = true
+        state.base_items = collect_base_items(kernel, world, state)
+        recompute_filtered_items(world, state)
+    }
+
+    vim.set_interceptor("ext_telescope", telescope_intercept_key)
+    sync_telescope_windows(kernel, world, state)
+    sync_world_from_vim(world, vim)
+    if state.mode == "builtin" {
+        status_emit("Telescope modes: " ++ TELESCOPE_AVAILABLE_MODES_SUMMARY)#
+    } else {
+        status_emit("Telescope: " ++ mode_display_title(state.mode))#
+    }
+    ()
+}
+
+fn join_args_text(args: List) -> String {
+    if args.is_empty() {
+        return ""
+    }
+    let parts = List()
+    for i in 0..args.len() {
+        parts.push(args.get(i.as(usize)).as(String))
+    }
+    parts.join(" ").trim()
+}
+
+fn cmd_telescope_dispatch(kern: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let raw = join_args_text(args)
+    if raw == "" {
+        open_telescope_picker(kern, "builtin")#!
+        return ()
+    }
+    let split_opt = raw.split_once(" ")
+    let (sub, rest_q) = if split_opt != null {
+        let (a, b) = split_opt.as((String, String))
+        (a.trim(), b.trim())
+    } else {
+        (raw, "")
+    }
+    let sub_low = sub.to_lower().replace("-", "_")
+    if sub_low == "resume" {
+        open_telescope_picker(kern, "files", resume_last = true)#!
+        return ()
+    }
+    let resolved_opt = normalize_picker_mode_opt(sub_low)
+    if resolved_opt == null {
+        open_telescope_picker(kern, "builtin")#!
+        status_emit(
+            "Unknown Telescope mode '" ++ sub ++ "' — available: " ++ TELESCOPE_AVAILABLE_MODES_SUMMARY
+        )#
+        return ()
+    }
+    open_telescope_picker(kern, resolved_opt.as(String), initial_query = rest_q)#!
+    ()
+}
+
+fn cmd_quickfix_open_at_cursor(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let state = require_telescope_state(kern)!
+    let buf = world.active_buffer()
+    let idx = buf.point.row - state.qf_header_rows
+    if idx < 0 or idx >= world.quickfix.len() {
+        status_emit("Quickfix: no entry on current line")#
+        return ()
+    }
+    world.quickfix_idx = idx
+    let qf = world.quickfix.get(idx.as(usize)).as(QuickfixEntry)
+    if qf.file_path.starts_with("buffer:") {
+        let bname = qf.file_path.drop(7)
+        let b_opt = world.find_buffer_by_name(bname)
+        if b_opt != null {
+            let b = b_opt.as(Buffer)
+            let _ = world.switch_to_buffer(b.id)
+            b.point = b.clamp_pos(Pos.new(qf.row, qf.col), insert_mode = false)
+            b.preferred_col = b.point.col
+            kern.emit_hook("buffer-switched", b.id)
+            kern.emit_hook("cursor-moved", b.id)
+        }
+        return ()
+    }
+    let opened = world.open_file(qf.file_path)#!
+    opened.point = opened.clamp_pos(Pos.new(qf.row, qf.col), insert_mode = false)
+    opened.preferred_col = opened.point.col
+    kern.emit_hook("buffer-switched", opened.id)
+    kern.emit_hook("cursor-moved", opened.id)
+    status_emit(
+        "(" ++ (idx + 1).to_string() ++ "/" ++ world.quickfix.len().to_string() ++ ") " ++ qf.text
+    )#
+    ()
+}
+
+pub fn register_telescope_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_telescope_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_telescope",
+        "0.1.0",
+        "Fuzzy workspace file finder, live grep, help/docs search, command palette, buffer switcher, symbol outline, keymap inspector, and colorscheme picker with live floating preview.",
+        [ext_document_id(), ext_vim_id(), ext_render_id()],
+        |k: SystemKernel| -> !String Unit {
+            let state = TelescopeState.new()
+            k.publish_service(SERVICE_TELESCOPE, ext_id, state)
+
+            k.register_command(
+                "telescope",
+                ext_id,
+                "Open Telescope fuzzy picker (`:Telescope [files|live_grep|buffers|symbols|help_tags|docs|commands|keymaps|colorscheme|resume] [query]`).",
+                cmd_telescope_dispatch,
+            )
+
+            k.register_command(
+                "ex:Telescope",
+                ext_id,
+                "Open Telescope fuzzy picker (`:Telescope [files|live_grep|buffers|symbols|help_tags|docs|commands|keymaps|colorscheme|resume] [query]`).",
+                cmd_telescope_dispatch,
+                interactive = false,
+            )
+
+            k.register_command(
+                "telescope-find-files",
+                ext_id,
+                "Fuzzy find workspace files with live preview (`<Space> s f`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    open_telescope_picker(kern, "files", initial_query = join_args_text(args))#!
+                    ()
+                },
+            )
+
+            k.register_command(
+                "telescope-live-grep",
+                ext_id,
+                "Live grep workspace files with instant context preview (`<Space> s g`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    open_telescope_picker(kern, "live_grep", initial_query = join_args_text(args))#!
+                    ()
+                },
+            )
+
+            k.register_command(
+                "telescope-buffers",
+                ext_id,
+                "Fuzzy switch open buffers (`<Space> s b`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    open_telescope_picker(kern, "buffers", initial_query = join_args_text(args))#!
+                    ()
+                },
+            )
+
+            k.register_command(
+                "telescope-symbols",
+                ext_id,
+                "Fuzzy jump to symbols in active buffer (`<Space> s s`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    open_telescope_picker(kern, "symbols", initial_query = join_args_text(args))#!
+                    ()
+                },
+            )
+
+            k.register_command(
+                "telescope-help-tags",
+                ext_id,
+                "Fuzzy search manual chapters, *help-tag* anchors, and commands (`<Space> f h`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    open_telescope_picker(kern, "help_tags", initial_query = join_args_text(args))#!
+                    ()
+                },
+            )
+
+            k.register_command(
+                "telescope-docs",
+                ext_id,
+                "Live Orderless full-text global documentation search (`<Space> s H` / `<Space> h s`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    open_telescope_picker(kern, "docs", initial_query = join_args_text(args))#!
+                    ()
+                },
+            )
+
+            k.register_command(
+                "telescope-commands",
+                ext_id,
+                "Fuzzy/Orderless picker over registered commands (`<Space> f C`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    open_telescope_picker(kern, "commands", initial_query = join_args_text(args))#!
+                    ()
+                },
+            )
+
+            k.register_command(
+                "telescope-keymaps",
+                ext_id,
+                "Fuzzy search registered keybindings (`<Space> s k`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    open_telescope_picker(kern, "keymaps", initial_query = join_args_text(args))#!
+                    ()
+                },
+            )
+
+            k.register_command(
+                "telescope-colorscheme",
+                ext_id,
+                "Preview and switch color themes (`<Space> s c`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    open_telescope_picker(kern, "colorscheme", initial_query = join_args_text(args))#!
+                    ()
+                },
+            )
+
+            k.register_command(
+                "telescope-resume",
+                ext_id,
+                "Resume previous Telescope picker session (`<Space> s r`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    open_telescope_picker(kern, "files", resume_last = true)#!
+                    ()
+                },
+            )
+
+            k.register_command(
+                "telescope-quickfix-open",
+                ext_id,
+                "Jump to the Quickfix entry under cursor.",
+                cmd_quickfix_open_at_cursor,
+                interactive = false,
+            )
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> s f", "telescope-find-files", ext_id, description = "Search files (Telescope)")
+            leader_km.bind("<Space> s g", "telescope-live-grep", ext_id, description = "Live grep (Telescope)")
+            leader_km.bind("<Space> s b", "telescope-buffers", ext_id, description = "Search buffers (Telescope)")
+            leader_km.bind("<Space> s s", "telescope-symbols", ext_id, description = "Document symbols (Telescope)")
+            leader_km.bind("<Space> f h", "telescope-help-tags", ext_id, description = "Help tags & manuals (Telescope)")
+            leader_km.bind("<Space> s H", "telescope-docs", ext_id, description = "Search documentation (Telescope)")
+            leader_km.bind("<Space> h s", "telescope-docs", ext_id, description = "Search documentation (Telescope)")
+            leader_km.bind("<Space> f C", "telescope-commands", ext_id, description = "Commands (Telescope)")
+            leader_km.bind("<Space> s k", "telescope-keymaps", ext_id, description = "Search keymaps (Telescope)")
+            leader_km.bind("<Space> s c", "telescope-colorscheme", ext_id, description = "Colorschemes (Telescope)")
+            leader_km.bind("<Space> s r", "telescope-resume", ext_id, description = "Resume Telescope")
+
+            let qf_km = k.ensure_keymap("mode:quickfix")
+            qf_km.bind("<Return>", "telescope-quickfix-open", ext_id, description = "Open Quickfix entry")
+
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                w_opt.as(EditorWorld).clear_owner_ui("ext_telescope")
+            }
+            let v_opt = k.service("lava.vim.state")
+            if v_opt != null {
+                let vs = v_opt.as(VimState)
+                if vs.modal_interceptor != null and vs.modal_interceptor.as(ModalInterceptor).owner == "ext_telescope" {
+                    vs.clear_interceptor()
+                }
+            }
+            ()
+        },
+    )
+}

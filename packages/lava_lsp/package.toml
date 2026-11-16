@@ -1,0 +1,6 @@
+[package]
+name = "lava_lsp"
+domain = "lava.org"
+version = "0.1.0"
+type = "lib"
+description = "Non-blocking stdio JSON-RPC 2.0 Language Server Protocol (LSP) bridge for Lava."

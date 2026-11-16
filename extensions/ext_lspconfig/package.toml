@@ -1,0 +1,14 @@
+[package]
+name = "ext_lspconfig"
+domain = "lava.org"
+version = "0.1.0"
+type = "lib"
+
+[dependencies]
+lava_sys = { path = "../../packages/lava_sys" }
+lava_core = { path = "../../packages/lava_core" }
+"lava.org/lava_remote" = { path = "../../packages/lava_remote" }
+ext_document = { path = "../ext_document" }
+ext_window = { path = "../ext_window" }
+ext_vim = { path = "../ext_vim" }
+ext_lsp = { path = "../ext_lsp" }

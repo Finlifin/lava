@@ -1,0 +1,478 @@
+-- ext_noice: Non-Intrusive Toast Notifications & Interactive History (`lava.org/ext_noice`).
+-- Inspired by `noice.nvim` and `rcarriga/nvim-notify`: lifecycle toast cards on buffer save and
+-- colorscheme switches, `:Notify` command, `*Notifications*` special buffer with detail float
+-- (`<Return>`), clear (`d`/`c`), close (`q`), `:NoiceDismiss` (`<Space>nd`), and `:NoiceLast` (`<Space>nl`).
+
+use @lava_sys.rgb
+use @lava_core.{
+    ExtId, InteractiveEffects, SystemKernel, status_emit
+}
+use @ext_document.{
+    Buffer, BufferId, EditorWorld, FloatingWindow, Pos, ToastNotification, ext_document_id,
+    require_editor_world
+}
+use @ext_vim.{KEYMAP_VIM_LEADER, VimMode, ext_vim_id, require_vim_state, sync_world_from_vim}
+
+pub const SERVICE_NOICE: String = "lava.noice.notify"
+pub const OWNER_NOICE: String = "ext_noice"
+pub const NOTIFICATIONS_BUF_NAME: String = "*Notifications*"
+pub const MODE_NOTIFICATIONS: String = "notifications"
+pub const FLOAT_ID_NOICE_DETAIL: String = "noice-detail"
+pub const DEFAULT_NOICE_TTL: i64 = 6
+
+fn normalize_level(raw: String) -> String {
+    let low = raw.trim().to_lower()
+    when {
+        low == "error" or low == "err" => "error",
+        low == "warn" or low == "warning" => "warn",
+        else => "info",
+    }
+}
+
+fn default_title_for_level(level: String) -> String {
+    when {
+        level == "error" => "Error",
+        level == "warn" => "Warning",
+        else => "Notify",
+    }
+}
+
+fn border_color_for_level(level: String) -> i64 {
+    when {
+        level == "error" => rgb(243, 139, 168),
+        level == "warn" => rgb(249, 226, 175),
+        else => rgb(137, 180, 250),
+    }
+}
+
+fn format_history_entry(t: ToastNotification) -> String {
+    let lvl = t.level.to_upper()
+    let single_line_msg = t.message.replace("\r\n", " ").replace("\n", " ")
+    let ttl = if t.title != "" { t.title } else { default_title_for_level(t.level) }
+    "#" ++ t.id.to_string() ++ " [" ++ lvl ++ "] " ++ ttl ++ " — " ++ single_line_msg
+}
+
+pub struct NoiceService {
+    pub enabled: bool,
+    pub prev_buf_id: ?BufferId,
+}
+
+impl NoiceService {
+    pub fn new() -> NoiceService {
+        NoiceService {
+            enabled: true,
+            prev_buf_id: null,
+        }
+    }
+
+    pub fn notify(self, world: EditorWorld, level: String, title: String, message: String, ttl_ticks: i64) -> i64 {
+        let norm_lvl = normalize_level(level)
+        let norm_ttl = if ttl_ticks > 0 { ttl_ticks } else { DEFAULT_NOICE_TTL }
+        let clean_title = if title.trim() != "" { title.trim() } else { default_title_for_level(norm_lvl) }
+        let id = world.push_notification(norm_lvl, clean_title, message, ttl_ticks = norm_ttl)
+        refresh_notifications_buffer_if_open(world, self)
+        id
+    }
+
+    pub fn dismiss_all(self, world: EditorWorld) {
+        world.notifications = List()
+        let _ = world.remove_floating_window(FLOAT_ID_NOICE_DETAIL)
+    }
+
+    pub fn history_lines(self, world: EditorWorld) -> List {
+        let out = List()
+        if world.notification_history.is_empty() {
+            out.push("(No notifications recorded)")
+            return out
+        }
+        for i in 0..world.notification_history.len() {
+            let t = world.notification_history.get(i.as(usize)).as(ToastNotification)
+            out.push(format_history_entry(t))
+        }
+        out
+    }
+}
+
+pub fn require_noice_service(kernel: SystemKernel) -> !String NoiceService {
+    let raw = kernel.require_service(SERVICE_NOICE)!
+    raw.as(NoiceService)
+}
+
+fn refresh_notifications_buffer_if_open(world: EditorWorld, svc: NoiceService) {
+    let existing_opt = world.find_buffer_by_name(NOTIFICATIONS_BUF_NAME)
+    if existing_opt == null {
+        return
+    }
+    let buf = existing_opt.as(Buffer)
+    let lines = svc.history_lines(world)
+    let prev_row = buf.point.row
+    buf.read_only = false
+    buf.major_mode = MODE_NOTIFICATIONS
+    buf.set_lines(lines, record_undo = false)
+    buf.modified = false
+    buf.read_only = true
+    buf.point = buf.clamp_pos(Pos.new(prev_row, 0), insert_mode = false)
+}
+
+fn parse_notify_args(args: List) -> (String, String, String) {
+    let joined_parts = List()
+    for i in 0..args.len() {
+        let part = args.get(i.as(usize)).as(String)
+        if part != "" {
+            joined_parts.push(part)
+        }
+    }
+    let raw = joined_parts.join(" ").trim()
+    if raw == "" {
+        return ("info", "", "")
+    }
+    -- Split first whitespace token to check if user passed an explicit level (`info`, `warn`, `error`).
+    let n = raw.char_len()
+    var split_idx: i64 = -1
+    for i in 0..n {
+        let ch = raw.slice(i, i + 1)
+        if ch == " " or ch == "\t" {
+            split_idx = i
+            break
+        }
+    }
+    if split_idx > 0 {
+        let first = raw.slice(0, split_idx).to_lower()
+        let rest = raw.slice(split_idx + 1, n).trim()
+        if rest != "" and (first == "info" or first == "warn" or first == "warning" or first == "error" or first == "err") {
+            let lvl = normalize_level(first)
+            return (lvl, default_title_for_level(lvl), rest)
+        }
+    }
+    ("info", "Notify", raw)
+}
+
+fn parse_entry_id_from_line(line: String) -> i64 {
+    let trimmed = line.trim()
+    if not trimmed.starts_with("#") {
+        return -1
+    }
+    let n = trimmed.char_len()
+    var end_idx: i64 = 1
+    while end_idx < n and trimmed.slice(end_idx, end_idx + 1).is_ascii_digit() {
+        end_idx += 1
+    }
+    if end_idx <= 1 {
+        return -1
+    }
+    let digits = trimmed.slice(1, end_idx)
+    let parsed_opt = digits.parse_i64()
+    if parsed_opt == null {
+        return -1
+    }
+    parsed_opt.as(i64)
+}
+
+fn find_notification_for_row(world: EditorWorld, buf: Buffer, row: i64) -> ?ToastNotification {
+    if world.notification_history.is_empty() {
+        return null
+    }
+    let line = buf.line_at(row)
+    let parsed_id = parse_entry_id_from_line(line)
+    if parsed_id >= 0 {
+        for i in 0..world.notification_history.len() {
+            let t = world.notification_history.get(i.as(usize)).as(ToastNotification)
+            if t.id == parsed_id {
+                return t
+            }
+        }
+    }
+    if row >= 0 and row < world.notification_history.len() {
+        return world.notification_history.get(row.as(usize)).as(ToastNotification)
+    }
+    world.notification_history.get((world.notification_history.len() - 1).as(usize)).as(ToastNotification)
+}
+
+fn wrap_detail_lines(text: String, max_cols: i64) -> List {
+    let out = List()
+    let limit = if max_cols > 16 { max_cols } else { 56 }
+    let raw_lines = text.replace("\r\n", "\n").split("\n")
+    for i in 0..raw_lines.len() {
+        var rem = raw_lines.get(i.as(usize)).as(String)
+        if rem == "" {
+            out.push("")
+            continue
+        }
+        while rem.char_len() > limit {
+            out.push(rem.slice(0, limit))
+            rem = rem.slice(limit, rem.char_len())
+        }
+        out.push(rem)
+    }
+    if out.is_empty() {
+        out.push("")
+    }
+    out
+}
+
+fn cmd_notify(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_noice_service(kernel)!
+    let (level, title, msg) = parse_notify_args(args)
+    if msg == "" {
+        status_emit("Usage: :Notify [info|warn|error] <message>")#
+        return ()
+    }
+    let id = svc.notify(world, level, title, msg, DEFAULT_NOICE_TTL)
+    status_emit("[" ++ level.to_upper() ++ "] " ++ msg)#
+    id
+}
+
+fn cmd_open_notifications(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_noice_service(kernel)!
+    let cur_buf = world.active_buffer()
+    if cur_buf.name != NOTIFICATIONS_BUF_NAME {
+        svc.prev_buf_id = cur_buf.id
+    }
+    let lines = svc.history_lines(world)
+    let nbuf = world.ensure_special_buffer(NOTIFICATIONS_BUF_NAME, MODE_NOTIFICATIONS, lines, read_only = true)
+    let last_row = if nbuf.line_count() > 0 { nbuf.line_count() - 1 } else { 0 }
+    nbuf.point = nbuf.clamp_pos(Pos.new(last_row, 0), insert_mode = false)
+    let _ = world.switch_to_buffer(nbuf.id)
+    vim.mode = VimMode.Normal
+    vim.clear_transient()
+    sync_world_from_vim(world, vim)
+    kernel.emit_hook("buffer-switched", nbuf.id)
+    status_emit("Showing " ++ NOTIFICATIONS_BUF_NAME ++ " (" ++ world.notification_history.len().to_string() ++ " entries)")#
+    ()
+}
+
+fn cmd_noice_open_detail(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let buf = world.active_buffer()
+    let item? = find_notification_for_row(world, buf, buf.point.row) else {
+        status_emit("No notification to inspect")#
+        return ()
+    }
+    let body_width: i64 = 64
+    let lines = List()
+    lines.push("ID:      #" ++ item.id.to_string())
+    lines.push("Level:   " ++ item.level.to_upper())
+    lines.push("Title:   " ++ item.title)
+    lines.push("----------------------------------------------------------------")
+    let wrapped = wrap_detail_lines(item.message, body_width)
+    for i in 0..wrapped.len() {
+        lines.push(wrapped.get(i.as(usize)).as(String))
+    }
+    lines.push("")
+    lines.push("[q] close   [d/c] clear history")
+
+    let height = if lines.len() + 2 < 6 {
+        6
+    } else if lines.len() + 2 > 22 {
+        22
+    } else {
+        lines.len() + 2
+    }
+    let float_title = " Notification #" ++ item.id.to_string() ++ " [" ++ item.level.to_upper() ++ "] " ++ item.title ++ " "
+    world.set_floating_window(FloatingWindow {
+        id: FLOAT_ID_NOICE_DETAIL,
+        owner: OWNER_NOICE,
+        title: float_title,
+        anchor: "center",
+        width_cols: 70,
+        height_rows: height,
+        lines: lines,
+        selected_row: -1,
+        border_rgba: border_color_for_level(item.level),
+    })
+    status_emit("Notification #" ++ item.id.to_string() ++ ": " ++ item.title)#
+    ()
+}
+
+fn cmd_noice_clear_history(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_noice_service(kernel)!
+    world.notification_history = List()
+    svc.dismiss_all(world)
+    refresh_notifications_buffer_if_open(world, svc)
+    status_emit("Cleared notification history")#
+    ()
+}
+
+fn cmd_noice_close(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let vim = require_vim_state(kernel)!
+    let svc = require_noice_service(kernel)!
+    let _ = world.remove_floating_window(FLOAT_ID_NOICE_DETAIL)
+    let cur = world.active_buffer()
+    if cur.name == NOTIFICATIONS_BUF_NAME {
+        var switched = false
+        if svc.prev_buf_id != null {
+            let target_id? = svc.prev_buf_id else {
+                return ()
+            }
+            if target_id != cur.id and world.buffer(target_id) != null {
+                switched = world.switch_to_buffer(target_id)
+            }
+        }
+        if not switched {
+            let _ = world.switch_to_buffer(world.scratch_id)
+        }
+        vim.mode = VimMode.Normal
+        vim.clear_transient()
+        sync_world_from_vim(world, vim)
+        kernel.emit_hook("buffer-switched", world.active_buffer_id)
+    }
+    status_emit("Closed notifications")#
+    ()
+}
+
+fn cmd_noice_dismiss(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_noice_service(kernel)!
+    let count = world.notifications.len()
+    svc.dismiss_all(world)
+    status_emit("Dismissed " ++ count.to_string() ++ " active notification(s)")#
+    ()
+}
+
+fn cmd_noice_last(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    if world.notification_history.is_empty() {
+        status_emit("No notification history")#
+        return ()
+    }
+    let last_idx = (world.notification_history.len() - 1).as(usize)
+    let last = world.notification_history.get(last_idx).as(ToastNotification)
+    let re_toast = ToastNotification {
+        id: last.id,
+        level: last.level,
+        title: last.title,
+        message: last.message,
+        ttl_ticks: DEFAULT_NOICE_TTL,
+    }
+    -- Remove any duplicate active toast with the same ID before pushing fresh to top.
+    let kept = List()
+    for i in 0..world.notifications.len() {
+        let existing = world.notifications.get(i.as(usize)).as(ToastNotification)
+        if existing.id != last.id {
+            kept.push(existing)
+        }
+    }
+    kept.push(re_toast)
+    while kept.len() > 5 {
+        let _ = kept.remove(0)
+    }
+    world.notifications = kept
+    status_emit("Re-displayed notification #" ++ last.id.to_string() ++ ": " ++ last.message)#
+    ()
+}
+
+fn cmd_noice_toggle(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_noice_service(kernel)!
+    svc.enabled = not svc.enabled
+    if not svc.enabled {
+        svc.dismiss_all(world)
+        status_emit("Noice notifications disabled")#
+    } else {
+        status_emit("Noice notifications enabled")#
+    }
+    ()
+}
+
+pub fn ext_noice_id() -> ExtId = ExtId("lava.org/ext_noice")
+
+pub fn register_noice_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_noice_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_noice",
+        "0.1.0",
+        "Non-intrusive toast notifications, lifecycle event cards, and interactive `*Notifications*` history viewer.",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let svc = NoiceService.new()
+            k.publish_service(SERVICE_NOICE, ext_id, svc)
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> s n", "notifications", ext_id, description = "Notification history")
+            leader_km.bind("<Space> n d", "noice-dismiss", ext_id, description = "Dismiss notifications")
+            leader_km.bind("<Space> n l", "noice-last", ext_id, description = "Re-show last notification")
+
+            let mode_km = k.ensure_keymap("mode:" ++ MODE_NOTIFICATIONS)
+            mode_km.bind("d", "noice-clear-history", ext_id, description = "Clear notification history")
+            mode_km.bind("c", "noice-clear-history", ext_id, description = "Clear notification history")
+            mode_km.bind("<Return>", "noice-open-detail", ext_id, description = "Inspect notification details")
+            mode_km.bind("q", "noice-close", ext_id, description = "Close notifications")
+
+            k.register_command("notify", ext_id, "Push a notification toast (`:Notify [level] <message>`).", cmd_notify)
+            k.register_command("ex:Notify", ext_id, "Ex `:Notify`.", cmd_notify, interactive = false)
+
+            k.register_command("notifications", ext_id, "Open interactive `*Notifications*` history buffer.", cmd_open_notifications)
+            k.register_command("noice-history", ext_id, "Open interactive `*Notifications*` history buffer.", cmd_open_notifications)
+            k.register_command("ex:Notifications", ext_id, "Ex `:Notifications`.", cmd_open_notifications, interactive = false)
+            k.register_command("ex:Noice", ext_id, "Ex `:Noice`.", cmd_open_notifications, interactive = false)
+
+            k.register_command("noice-open-detail", ext_id, "Show full notification in centered floating window.", cmd_noice_open_detail)
+            k.register_command("noice-clear-history", ext_id, "Clear notification history and refresh `*Notifications*`.", cmd_noice_clear_history)
+            k.register_command("noice-close", ext_id, "Close `*Notifications*` buffer and detail float.", cmd_noice_close)
+
+            k.register_command("noice-dismiss", ext_id, "Dismiss all active toast notifications.", cmd_noice_dismiss)
+            k.register_command("ex:NoiceDismiss", ext_id, "Ex `:NoiceDismiss`.", cmd_noice_dismiss, interactive = false)
+
+            k.register_command("noice-last", ext_id, "Re-display most recent notification from history.", cmd_noice_last)
+            k.register_command("ex:NoiceLast", ext_id, "Ex `:NoiceLast`.", cmd_noice_last, interactive = false)
+
+            k.register_command("noice-toggle", ext_id, "Toggle Noice lifecycle toast notifications.", cmd_noice_toggle)
+            k.register_command("ex:NoiceToggle", ext_id, "Ex `:NoiceToggle`.", cmd_noice_toggle, interactive = false)
+
+            k.add_hook("buffer-saved", ext_id, |kern: SystemKernel, payload: Any| -> Unit {
+                let w_opt = kern.service("lava.document.world")
+                let s_opt = kern.service(SERVICE_NOICE)
+                if w_opt == null or s_opt == null {
+                    return
+                }
+                let world = w_opt.as(EditorWorld)
+                let noice = s_opt.as(NoiceService)
+                if not noice.enabled {
+                    return
+                }
+                var target_buf = world.active_buffer()
+                if payload != null {
+                    let bid = payload.as(BufferId)
+                    let b_opt = world.buffer(bid)
+                    if b_opt != null {
+                        target_buf = b_opt.as(Buffer)
+                    }
+                }
+                let msg = target_buf.name ++ " (" ++ target_buf.line_count().to_string() ++ "L)"
+                let _ = noice.notify(world, "info", "Saved", msg, DEFAULT_NOICE_TTL)
+            })
+
+            k.add_hook("theme-changed", ext_id, |kern: SystemKernel, _payload: Any| -> Unit {
+                let w_opt = kern.service("lava.document.world")
+                let s_opt = kern.service(SERVICE_NOICE)
+                if w_opt == null or s_opt == null {
+                    return
+                }
+                let world = w_opt.as(EditorWorld)
+                let noice = s_opt.as(NoiceService)
+                if not noice.enabled {
+                    return
+                }
+                let msg = "Switched to " ++ world.options.theme_name
+                let _ = noice.notify(world, "info", "Colorscheme", msg, DEFAULT_NOICE_TTL)
+            })
+
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                let world = w_opt.as(EditorWorld)
+                world.clear_owner_ui(OWNER_NOICE)
+            }
+            ()
+        },
+    )
+}
