@@ -56,7 +56,12 @@ pub struct GitsignsState {
     pub last_ver_by_buf: HashMap,
     pub last_win_by_buf: HashMap,
     pub tracked_by_buf: HashMap,
+    pub last_diff_buf_id: BufferId,
+    pub last_diff_ver: i64,
     pub blame_enabled: bool,
+    pub blame_file_path: String,
+    pub blame_row: i64,
+    pub blame_text: String,
 }
 
 impl GitsignsState {
@@ -69,7 +74,12 @@ impl GitsignsState {
             last_ver_by_buf: HashMap.new(),
             last_win_by_buf: HashMap.new(),
             tracked_by_buf: HashMap.new(),
+            last_diff_buf_id: BufferId(0),
+            last_diff_ver: -1,
             blame_enabled: false,
+            blame_file_path: "",
+            blame_row: -1,
+            blame_text: "",
         }
     }
 
@@ -96,7 +106,14 @@ impl GitsignsState {
             let norm = path.normalize(file_path)
             let _ = self.head_cache.remove(norm)
             let _ = self.untracked_cache.remove(norm)
+            if self.blame_file_path == file_path or path.normalize(self.blame_file_path) == norm {
+                self.blame_file_path = ""
+                self.blame_row = -1
+                self.blame_text = ""
+            }
         }
+        self.last_diff_buf_id = BufferId(0)
+        self.last_diff_ver = -1
     }
 
     pub fn clear_all_caches(self) {
@@ -107,6 +124,11 @@ impl GitsignsState {
         self.last_ver_by_buf = HashMap.new()
         self.last_win_by_buf = HashMap.new()
         self.tracked_by_buf = HashMap.new()
+        self.last_diff_buf_id = BufferId(0)
+        self.last_diff_ver = -1
+        self.blame_file_path = ""
+        self.blame_row = -1
+        self.blame_text = ""
     }
 }
 
@@ -204,7 +226,9 @@ fn apply_gitsigns_decorations(world: EditorWorld, state: GitsignsState, buf: Buf
     buf.clear_owner_decors(OWNER_GITSIGNS)
     let lcount = buf.line_count()
     let (win_start, win_end) = compute_gitsigns_window(world, lcount)
-    state.last_win_by_buf.insert(buf.id, (win_start, win_end, buf.point.row))
+    let blame_active_now = state.blame_enabled and world.mode_name != "INSERT"
+    let rendered_blame_row = if blame_active_now { buf.point.row } else { -1 }
+    state.last_win_by_buf.insert(buf.id, (win_start, win_end, rendered_blame_row))
     if not is_tracked {
         return
     }
@@ -241,21 +265,29 @@ fn apply_gitsigns_decorations(world: EditorWorld, state: GitsignsState, buf: Buf
         }
     }
 
-    if state.blame_enabled and buf.file_path != "" {
+    if blame_active_now and buf.file_path != "" {
         let cur_row = buf.point.row
-        let cwd = effective_git_cwd(world, buf.file_path)
-        let blame_opt = accel_git_blame_line(cwd, buf.file_path, cur_row)
-        let blame = if blame_opt != null {
-            blame_opt.as(GitBlame)
+        let vt_text = if state.blame_file_path == buf.file_path and state.blame_row == cur_row and state.blame_text != "" {
+            state.blame_text
         } else {
-            GitBlame {
-                commit_short: "0000000",
-                author: "Uncommitted",
-                date_ymd: "recent",
-                summary: "Not committed yet",
+            let cwd = effective_git_cwd(world, buf.file_path)
+            let blame_opt = accel_git_blame_line(cwd, buf.file_path, cur_row)
+            let blame = if blame_opt != null {
+                blame_opt.as(GitBlame)
+            } else {
+                GitBlame {
+                    commit_short: "0000000",
+                    author: "Uncommitted",
+                    date_ymd: "recent",
+                    summary: "Not committed yet",
+                }
             }
+            let built = "   " ++ blame.author ++ ", " ++ blame.date_ymd ++ " • " ++ blame.summary
+            state.blame_file_path = buf.file_path
+            state.blame_row = cur_row
+            state.blame_text = built
+            built
         }
-        let vt_text = "   " ++ blame.author ++ ", " ++ blame.date_ymd ++ " • " ++ blame.summary
         buf.add_virt_text(OWNER_GITSIGNS, cur_row, vt_text, rgba_hex(0x6C7086, 255), italic = true)
     }
 }
@@ -266,13 +298,17 @@ pub fn refresh_buffer_gitsigns(
     buf: Buffer,
     force_reload_head: bool,
 ) {
-    if buf.kind != BufferKind.File or buf.file_path == "" {
+    if buf.kind != BufferKind.file or buf.file_path == "" {
         buf.clear_owner_decors(OWNER_GITSIGNS)
         let _ = state.hunks_by_buf.remove(buf.id)
         let _ = state.counts_by_buf.remove(buf.id)
         let _ = state.last_ver_by_buf.remove(buf.id)
         let _ = state.last_win_by_buf.remove(buf.id)
         let _ = state.tracked_by_buf.remove(buf.id)
+        if state.last_diff_buf_id == buf.id {
+            state.last_diff_buf_id = BufferId(0)
+            state.last_diff_ver = -1
+        }
         return
     }
 
@@ -281,6 +317,10 @@ pub fn refresh_buffer_gitsigns(
     }
 
     buf.sync_external_lines()
+    if (not force_reload_head) and state.last_diff_buf_id == buf.id and state.last_diff_ver == buf.edit_version {
+        return
+    }
+
     let diff_opt = accel_doc_diff_head(buf.doc_id, buf.file_path, force_reload_head)
     let diff_res? = diff_opt else {
         buf.clear_owner_decors(OWNER_GITSIGNS)
@@ -288,9 +328,11 @@ pub fn refresh_buffer_gitsigns(
         state.counts_by_buf.insert(buf.id, (0, 0, 0))
         state.tracked_by_buf.insert(buf.id, false)
         state.last_ver_by_buf.insert(buf.id, buf.edit_version)
+        state.last_diff_buf_id = buf.id
+        state.last_diff_ver = buf.edit_version
         let lcount = buf.line_count()
         let (ws, we) = compute_gitsigns_window(world, lcount)
-        state.last_win_by_buf.insert(buf.id, (ws, we, buf.point.row))
+        state.last_win_by_buf.insert(buf.id, (ws, we, -1))
         buf.vars.insert("gitsigns_counts", (0, 0, 0))
         return
     }
@@ -300,6 +342,13 @@ pub fn refresh_buffer_gitsigns(
     state.counts_by_buf.insert(buf.id, (added, changed, deleted))
     state.tracked_by_buf.insert(buf.id, true)
     state.last_ver_by_buf.insert(buf.id, buf.edit_version)
+    state.last_diff_buf_id = buf.id
+    state.last_diff_ver = buf.edit_version
+    if state.blame_file_path == buf.file_path {
+        state.blame_file_path = ""
+        state.blame_row = -1
+        state.blame_text = ""
+    }
     buf.vars.insert("gitsigns_counts", (added, changed, deleted))
     buf.vars.insert("gitsigns_added", added)
     buf.vars.insert("gitsigns_changed", changed)
@@ -309,7 +358,7 @@ pub fn refresh_buffer_gitsigns(
 }
 
 fn ensure_buffer_diff_current(world: EditorWorld, state: GitsignsState, buf: Buffer) {
-    if buf.kind != BufferKind.File or buf.file_path == "" {
+    if buf.kind != BufferKind.file or buf.file_path == "" {
         return
     }
     buf.sync_external_lines()
@@ -322,12 +371,13 @@ fn ensure_buffer_diff_current(world: EditorWorld, state: GitsignsState, buf: Buf
     let lcount = buf.line_count()
     let win_opt = state.last_win_by_buf.get(buf.id)
     if win_opt != null {
-        let (ws, we, prev_row) = win_opt.as((i64, i64, i64))
+        let (ws, we, prev_blame_row) = win_opt.as((i64, i64, i64))
         let escaped = viewport_escaped_gitsigns_window(world, lcount, ws, we)
-        if (not state.blame_enabled) and (not escaped) {
+        let blame_active_now = state.blame_enabled and world.mode_name != "INSERT"
+        if (not blame_active_now) and prev_blame_row < 0 and (not escaped) {
             return
         }
-        if state.blame_enabled and buf.point.row == prev_row and (not escaped) {
+        if blame_active_now and buf.point.row == prev_blame_row and (not escaped) {
             return
         }
     }
@@ -597,6 +647,8 @@ fn cmd_reset_hunk(kernel: SystemKernel) -> #InteractiveEffects !String Any {
     buf.checkpoint(buf.point, "gitsigns-reset-hunk")
 
     let _ = world.remove_floating_window(FLOAT_GITSIGNS_PREVIEW)
+    state.last_diff_buf_id = BufferId(0)
+    state.last_diff_ver = -1
     refresh_buffer_gitsigns(world, state, buf, false)
     buf.modified = not state.buffer_hunks(buf.id).is_empty()
     kernel.emit_hook("buffer-modified", buf.id)
@@ -640,16 +692,16 @@ fn cmd_stage_hunk(kernel: SystemKernel) -> #InteractiveEffects !String Any {
         ++ "+++ b/" ++ rel ++ "\n"
         ++ body_lines.join("\n") ++ "\n"
 
-    let apply_res = process.exec(
+    let apply_res = process.run(
         "git",
         args = ["apply", "--cached", "--unidiff-zero", "-"],
-        stdin_data = patch,
+        stdin = patch,
         cwd = st.root,
     )
     var staged_ok = false
     apply_res match {
         out! => {
-            if out.success() {
+            if out.is_success() {
                 staged_ok = true
             }
         },
@@ -663,6 +715,9 @@ fn cmd_stage_hunk(kernel: SystemKernel) -> #InteractiveEffects !String Any {
 
     let updated_base = splice_hunk_into_base(base_lines, buf, hunk)
     state.head_cache.insert(full, updated_base)
+    state.blame_file_path = ""
+    state.blame_row = -1
+    state.blame_text = ""
     let remaining_hunks = List()
     var added: i64 = 0
     var changed: i64 = 0
@@ -747,6 +802,21 @@ fn on_buffer_sync_hook(kernel: SystemKernel, _payload: Any) {
     ensure_buffer_diff_current(world, state, buf)
 }
 
+fn on_buffer_burst_guarded_hook(kernel: SystemKernel, _payload: Any) {
+    let w_opt = kernel.service("lava.document.world")
+    let s_opt = kernel.service(SERVICE_GITSIGNS)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    if world.in_key_burst {
+        return
+    }
+    let state = s_opt.as(GitsignsState)
+    let buf = world.active_buffer()
+    ensure_buffer_diff_current(world, state, buf)
+}
+
 fn on_gitsigns_insert_hook(kernel: SystemKernel, _payload: Any) {
     let w_opt = kernel.service("lava.document.world")
     let s_opt = kernel.service(SERVICE_GITSIGNS)
@@ -754,6 +824,9 @@ fn on_gitsigns_insert_hook(kernel: SystemKernel, _payload: Any) {
         return
     }
     let world = w_opt.as(EditorWorld)
+    if world.in_key_burst {
+        return
+    }
     let buf = world.active_buffer()
     if buf.line_count() > 2000 {
         return
@@ -884,8 +957,8 @@ pub fn register_gitsigns_extension(kernel: SystemKernel) -> !String Unit {
                 }
                 on_buffer_sync_hook(kern, payload)
             })
-            k.add_hook("buffer-modified", ext_id, on_buffer_sync_hook)
-            k.add_hook("cursor-moved", ext_id, on_buffer_sync_hook)
+            k.add_hook("buffer-modified", ext_id, on_buffer_burst_guarded_hook)
+            k.add_hook("cursor-moved", ext_id, on_buffer_burst_guarded_hook)
             k.add_hook("mode-changed", ext_id, on_buffer_sync_hook)
             k.add_hook("after-insert-stroke", ext_id, on_gitsigns_insert_hook)
             k.add_hook("vim-yank", ext_id, on_buffer_sync_hook)

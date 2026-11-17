@@ -570,10 +570,7 @@ fn run_cli(opts: CliOptions) -> Result<i32, String> {
                     && let Some(state_path) = resolve_window_state_path()
                 {
                     let remember = std::fs::read_to_string(&state_path)
-                        .map(|raw| {
-                            !raw.lines()
-                                .any(|l| l.trim() == "remember=false")
-                        })
+                        .map(|raw| !raw.lines().any(|l| l.trim() == "remember=false"))
                         .unwrap_or(true);
                     if remember && win_w >= 64 && win_h >= 64 {
                         if let Some(parent) = state_path.parent() {

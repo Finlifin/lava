@@ -161,7 +161,7 @@ fn parse_entry_id_from_line(line: String) -> i64 {
         return -1
     }
     let digits = trimmed.slice(1, end_idx)
-    let parsed_opt = digits.parse_i64()
+    let parsed_opt = digits.try_parse(i64)
     if parsed_opt == null {
         return -1
     }
@@ -236,7 +236,7 @@ fn cmd_open_notifications(kernel: SystemKernel, _args: List) -> #InteractiveEffe
     let last_row = if nbuf.line_count() > 0 { nbuf.line_count() - 1 } else { 0 }
     nbuf.point = nbuf.clamp_pos(Pos.new(last_row, 0), insert_mode = false)
     let _ = world.switch_to_buffer(nbuf.id)
-    vim.mode = VimMode.Normal
+    vim.mode = VimMode.normal
     vim.clear_transient()
     sync_world_from_vim(world, vim)
     kernel.emit_hook("buffer-switched", nbuf.id)
@@ -316,7 +316,7 @@ fn cmd_noice_close(kernel: SystemKernel, _args: List) -> #InteractiveEffects !St
         if not switched {
             let _ = world.switch_to_buffer(world.scratch_id)
         }
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.clear_transient()
         sync_world_from_vim(world, vim)
         kernel.emit_hook("buffer-switched", world.active_buffer_id)

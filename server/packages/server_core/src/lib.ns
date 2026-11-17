@@ -34,12 +34,23 @@ impl SrvExtId {
 }
 
 pub enum SrvExtState {
-    pub Registered,
-    pub Active,
-    pub Disabled,
-    pub Failed(reason: String),
+    pub registered,
+    pub active,
+    pub disabled,
+    pub failed(reason: String),
 }
-derive Eq, PartialEq, Display for SrvExtState
+derive Eq, PartialEq for SrvExtState
+
+impl Display for SrvExtState {
+    pub fn to_string(self) -> String {
+        self match {
+            SrvExtState.registered => "Registered",
+            SrvExtState.active => "Active",
+            SrvExtState.disabled => "Disabled",
+            SrvExtState.failed(r) => "Failed(" ++ r ++ ")",
+        }
+    }
+}
 
 pub struct SrvExtensionRecord {
     pub id: SrvExtId,
@@ -112,7 +123,7 @@ impl ServerKernel {
                 let exts = k.list_extensions()
                 for i in 0..exts.len() {
                     let rec = exts.get(i.as(usize)).as(SrvExtensionRecord)
-                    if rec.state == SrvExtState.Active {
+                    if rec.state == SrvExtState.active {
                         active_ids.push(rec.id.raw())
                     }
                 }
@@ -136,7 +147,7 @@ impl ServerKernel {
                 let exts = k.list_extensions()
                 for i in 0..exts.len() {
                     let rec = exts.get(i.as(usize)).as(SrvExtensionRecord)
-                    let is_active = rec.state == SrvExtState.Active
+                    let is_active = rec.state == SrvExtState.active
                     if is_active {
                         active_ids.push(rec.id.raw())
                     }
@@ -195,7 +206,7 @@ impl ServerKernel {
             version: version,
             description: description,
             dependencies: dependencies,
-            state: SrvExtState.Registered,
+            state: SrvExtState.registered,
             on_activate: on_activate,
             on_deactivate: on_deactivate,
         }
@@ -214,7 +225,7 @@ impl ServerKernel {
             return error ("unknown server extension dependency: " ++ id.to_string())
         }
         let rec = rec_any.as(SrvExtensionRecord)
-        if rec.state == SrvExtState.Active {
+        if rec.state == SrvExtState.active {
             return ()
         }
         if visiting.contains(id) {
@@ -229,11 +240,11 @@ impl ServerKernel {
         let activate_fn = rec.on_activate
         activate_fn(self) ! {
             err => {
-                rec.state = SrvExtState.Failed(err)
+                rec.state = SrvExtState.failed(err)
                 return error ("server extension " ++ id.to_string() ++ " failed to activate: " ++ err)
             },
         }
-        rec.state = SrvExtState.Active
+        rec.state = SrvExtState.active
         self.emit_hook("extension-activated", id)
         ()
     }
@@ -242,7 +253,7 @@ impl ServerKernel {
         for i in 0..self.ext_order.len() {
             let id = self.ext_order.get(i.as(usize)).as(SrvExtId)
             let rec = self.extensions.get(id).as(SrvExtensionRecord)
-            if rec.state == SrvExtState.Registered {
+            if rec.state == SrvExtState.registered {
                 self.activate_extension(id)!
             }
         }
@@ -254,7 +265,7 @@ impl ServerKernel {
             return error ("unknown server extension: " ++ id.to_string())
         }
         let rec = rec_any.as(SrvExtensionRecord)
-        if rec.state != SrvExtState.Active {
+        if rec.state != SrvExtState.active {
             return ()
         }
         for i in 0..self.ext_order.len() {
@@ -263,7 +274,7 @@ impl ServerKernel {
                 continue
             }
             let other = self.extensions.get(other_id).as(SrvExtensionRecord)
-            if other.state == SrvExtState.Active {
+            if other.state == SrvExtState.active {
                 for j in 0..other.dependencies.len() {
                     if other.dependencies.get(j.as(usize)).as(SrvExtId) == id {
                         return error (
@@ -290,7 +301,7 @@ impl ServerKernel {
                 let _ = self.rpc_methods.remove(rk)
             }
         }
-        rec.state = SrvExtState.Disabled
+        rec.state = SrvExtState.disabled
         self.emit_hook("extension-deactivated", id)
         ()
     }
@@ -299,7 +310,7 @@ impl ServerKernel {
         let rec_any? = self.extensions.get(id) else {
             return false
         }
-        rec_any.as(SrvExtensionRecord).state == SrvExtState.Active
+        rec_any.as(SrvExtensionRecord).state == SrvExtState.active
     }
 
     pub fn list_extensions(self) -> List {

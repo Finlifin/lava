@@ -5,6 +5,7 @@
 //! and the native GTK4 UI thread pushes [`UiEvent`] values into [`EventQueue`].
 
 use std::collections::VecDeque;
+use std::sync::atomic::{Ordering, fence};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -342,10 +343,15 @@ struct EventQueueState {
     quit_requested: Option<i32>,
 }
 
+/// Thread-safe callback invoked when events or quit signals enter [`EventQueue`].
+pub type EventQueueWakeFn = Arc<dyn Fn() + Send + Sync>;
+
 /// Thread-safe event mailbox from UI / timer / background workers to the Nessa VM thread.
 pub struct EventQueue {
     state: Mutex<EventQueueState>,
     cvar: Condvar,
+    push_waker: Mutex<Option<EventQueueWakeFn>>,
+    quit_waker: Mutex<Option<EventQueueWakeFn>>,
 }
 
 impl Default for EventQueue {
@@ -363,45 +369,83 @@ impl EventQueue {
                 quit_requested: None,
             }),
             cvar: Condvar::new(),
+            push_waker: Mutex::new(None),
+            quit_waker: Mutex::new(None),
         }
     }
 
+    /// Install or clear a callback invoked outside `state` lock whenever an event or quit signal
+    /// is queued, allowing the Nessa VM `Scheduler` to wake suspended UI tasks directly.
+    pub fn set_push_waker(&self, waker: Option<EventQueueWakeFn>) {
+        let mut guard = self.push_waker.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = waker;
+    }
+
+    /// Install or clear a callback invoked outside `state` lock when [`Self::request_quit`] runs,
+    /// allowing the GTK4 main loop to wake immediately without periodic timer polling.
+    pub fn set_quit_waker(&self, waker: Option<EventQueueWakeFn>) {
+        let mut guard = self.quit_waker.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = waker;
+    }
+
+    /// Return `true` if at least one event is queued or quit has been requested.
+    pub fn has_pending_or_quit(&self) -> bool {
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        !guard.queue.is_empty() || guard.quit_requested.is_some() || guard.closed
+    }
+
     pub fn push(&self, event: UiEvent) {
-        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !guard.closed {
-            // Coalesce consecutive resize or mouse-move events to keep UI snappy.
-            match (&event, guard.queue.back_mut()) {
-                (
-                    UiEvent::Resize {
-                        width,
-                        height,
-                        scale_factor,
-                    },
-                    Some(UiEvent::Resize {
-                        width: pw,
-                        height: ph,
-                        scale_factor: ps,
-                    }),
-                ) => {
-                    *pw = *width;
-                    *ph = *height;
-                    *ps = *scale_factor;
+        let pushed = {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.closed {
+                false
+            } else {
+                // Coalesce consecutive resize or mouse-move events to keep UI snappy.
+                match (&event, guard.queue.back_mut()) {
+                    (
+                        UiEvent::Resize {
+                            width,
+                            height,
+                            scale_factor,
+                        },
+                        Some(UiEvent::Resize {
+                            width: pw,
+                            height: ph,
+                            scale_factor: ps,
+                        }),
+                    ) => {
+                        *pw = *width;
+                        *ph = *height;
+                        *ps = *scale_factor;
+                    }
+                    (
+                        UiEvent::MouseMove { x, y, modifiers },
+                        Some(UiEvent::MouseMove {
+                            x: px,
+                            y: py,
+                            modifiers: pm,
+                        }),
+                    ) => {
+                        *px = *x;
+                        *py = *y;
+                        *pm = *modifiers;
+                    }
+                    _ => guard.queue.push_back(event),
                 }
-                (
-                    UiEvent::MouseMove { x, y, modifiers },
-                    Some(UiEvent::MouseMove {
-                        x: px,
-                        y: py,
-                        modifiers: pm,
-                    }),
-                ) => {
-                    *px = *x;
-                    *py = *y;
-                    *pm = *modifiers;
-                }
-                _ => guard.queue.push_back(event),
+                self.cvar.notify_all();
+                true
             }
-            self.cvar.notify_all();
+        };
+        if pushed {
+            fence(Ordering::SeqCst);
+            let waker = self
+                .push_waker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(wake) = waker {
+                wake();
+            }
         }
     }
 
@@ -430,10 +474,29 @@ impl EventQueue {
     }
 
     pub fn request_quit(&self, exit_code: i32) {
-        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        guard.quit_requested = Some(exit_code);
-        guard.closed = true;
-        self.cvar.notify_all();
+        {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.quit_requested = Some(exit_code);
+            guard.closed = true;
+            self.cvar.notify_all();
+        }
+        fence(Ordering::SeqCst);
+        let push_waker = self
+            .push_waker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(wake) = push_waker {
+            wake();
+        }
+        let quit_waker = self
+            .quit_waker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(wake) = quit_waker {
+            wake();
+        }
     }
 
     pub fn quit_code(&self) -> Option<i32> {

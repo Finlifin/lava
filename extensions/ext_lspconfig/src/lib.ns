@@ -500,7 +500,7 @@ impl LspConfigRegistry {
     }
 
     pub fn resolve_preset_for_buffer(self, buf: Buffer) -> ?LspLanguagePreset {
-        if buf.kind == BufferKind.Special or buf.kind == BufferKind.Directory or buf.kind == BufferKind.Results {
+        if buf.kind == BufferKind.special or buf.kind == BufferKind.directory or buf.kind == BufferKind.results {
             return null
         }
         let fp = if buf.file_path != "" { buf.file_path.to_lower() } else { buf.name.to_lower() }

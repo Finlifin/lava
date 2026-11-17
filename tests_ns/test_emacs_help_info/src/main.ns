@@ -72,9 +72,9 @@ fn setup_fixture_workspace() -> (String, String, String, String, String) {
     let nessa_docs_dir = path.join(path.join(root, "nessa2"), "docs")
     let code_dir = path.join(root, "src")
 
-    let _ = fs.create_dir_all(docs_dir) ! { e => panic("mkdir docs: " ++ e.to_string()) }
-    let _ = fs.create_dir_all(nessa_docs_dir) ! { e => panic("mkdir nessa2/docs: " ++ e.to_string()) }
-    let _ = fs.create_dir_all(code_dir) ! { e => panic("mkdir src: " ++ e.to_string()) }
+    let _ = fs.create_dir(docs_dir, parents = true) ! { e => panic("mkdir docs: " ++ e.to_string()) }
+    let _ = fs.create_dir(nessa_docs_dir, parents = true) ! { e => panic("mkdir nessa2/docs: " ++ e.to_string()) }
+    let _ = fs.create_dir(code_dir, parents = true) ! { e => panic("mkdir src: " ++ e.to_string()) }
 
     let guide_md = path.join(docs_dir, "guide.md")
     let guide_content = [
@@ -541,6 +541,6 @@ fn main() {
     println("=== test_emacs_help_info ===")
     let (root, docs_dir, nessa_docs_dir, code_dir, sample_ns) = setup_fixture_workspace()
     run_help_info_apropos_suite(root, docs_dir, nessa_docs_dir, code_dir, sample_ns)
-    let _ = fs.remove_dir_all(root) ! { _ => () }
+    let _ = fs.remove_dir(root, recursive = true) ! { _ => () }
     println("test_emacs_help_info: ALL PASSED")
 }

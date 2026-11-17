@@ -69,7 +69,7 @@ GTK4 主事件循环线程与 Nessa VM 工作线程严格隔离，通过单槽�
 各 Rust Crate 的精确边界如下：
 
 1. **`crates/lava-proto`**：纯数据结构与并发同步原语库（不依赖 GTK4 或 Nessa VM）。定义平台无关的 7 种 2D 绘制指令 `DrawCmd`、完整帧快照 `RenderFrame`、9 种原始平台事件 `UiEvent`，以及基于 `AtomicU64` 世代号与 `Mutex<Arc<RenderFrame>>` 的单槽无锁帧交换器 `FrameSlot`。
-2. **`crates/lava-gtk`**：GTK4 图形前端与离线渲染器。在 GTK4 主线程创建 `DrawingArea`、键盘/鼠标/滚轮事件控制器与剪贴板桥接；当收到 VM 线程的帧唤醒信号时，调用 `FrameSlot::latest()` 取出最新 `Arc<RenderFrame>`，使用 **Pango + Cairo** 精确绘制裁剪矩形、背景色块、等宽字体文本段（`TextRun`）与四种光标形状（`Block`、`Beam`、`Underline`、`HollowBlock`）。同时提供 `render_frame_to_png_file` 支持无头 PNG 渲染导出。
+2. **`crates/lava-gtk`**：GTK4 图形前端与离线渲染器。在 GTK4 主线程创建 `DrawingArea`、键盘/鼠标/滚轮事件控制器与剪贴板桥接；当收到 VM 线程的帧唤醒信号时，调用 `FrameSlot::latest()` 取出最新 `Arc<RenderFrame>`，使用 **Pango + Cairo** 精确绘制裁剪矩形、背景色块、等宽字体文本段（`DrawCmd.text_run`）与四种光标形状（`CaretShape.block`、`CaretShape.beam`、`CaretShape.underline`、`CaretShape.hollow_block`）。同时提供 `render_frame_to_png_file` 支持无头 PNG 渲染导出。
 3. **`crates/lava-vm`**：单 VM 引导组合器（`composer.rs`）与宿主外部函数处理器（`host.rs`）。负责扫描工作区包、合成 `user_init` 与 `lava_boot` 根可执行包、读写 `.nsbc` 字节码缓存，并实现 `HostCallHandler` trait 处理全部系统、UI、加速与 PTY 宿主调用。
 4. **`crates/lava-accel`**：无状态/并发安全的 Rust 原生算法加速引擎。利用多核工作线程提供工作区文件遍历（自动尊重 `.gitignore` 并跳过 `.git` 与 `target`）、子序列/词边界模糊打分（`fuzzy_rank`）、并行子串/大小写感知 `workspace_grep`、原子多文件 `workspace_replace`、Myers 行级差异算法（`diff_lines`）、Git 状态/HEAD/行级 Blame 解析、多语言符号大纲提取、TODO 扫描，以及 Markdown/Nessa 文档分节索引与五域打分引擎（`index_docs` / `search_docs` / `find_symbol_defs`）。
 5. **`crates/lava-term`**：原生 Linux POSIX 伪终端与虚拟屏幕模拟器。使用 `openpty`、`fork`、`setsid`、`TIOCSCTTY` 与 `TIOCSWINSZ` 管理真实子 Shell 进程，后台读取线程将字节流实时喂入内置 **VT100 / xterm / ANSI 16/256/24-bit TrueColor** 解析器 `VtScreen`（支持主屏幕与 `?1049h` 备用屏幕、滚动区间 `DECSTBM`、OSC 0/2 标题与 OSC 7 工作目录跟踪），并通过定时器事件主动唤醒 VM 刷新画面（详见 `[terminal-and-pty#top]`）。
@@ -117,11 +117,11 @@ Lava 将一帧画面的生命周期严格划分为 **Nessa 逻辑合成阶段** 
 
 ```text
 [Nessa VM 线程]                                      [GTK4 UI 主线程]
-1. RawUiEvent 唤醒 (Key / Mouse / Resize / Tick)
+1. RawUiEvent 唤醒 (key / mouse_* / resize / tick)
 2. ext_app 路由事件 -> 更新 EditorWorld & Panes
-3. ext_render.compose_frame() 生成 Vec<DrawCmd>
+3. ext_render.compose_frame() 生成 List<DrawCmd>
 4. host_commit_frame() 写入 FrameSlot::commit() ───► 原子递增 generation 并触发 glib::MainContext 唤醒
-   (零等待立即返回，继续处理下一批事件或挂起)          5. DrawingArea draw_func 调用 FrameSlot::latest()
+   (Bytes 零分配编码，零等待立即返回)                5. DrawingArea draw_func 调用 FrameSlot::latest()
                                                      6. PangoCairo 遍历 DrawCmd 绘制像素到 Wayland/X11 Surface
 ```
 
@@ -131,13 +131,13 @@ Lava 将一帧画面的生命周期严格划分为 **Nessa 逻辑合成阶段** 
 
 | `DrawCmd` 变体 | 字段签名 | 渲染职责 |
 | --- | --- | --- |
-| `ClipPush` | `(x: f64, y: f64, w: f64, h: f64)` | 压入矩形裁剪区域（隔离各分屏窗格、侧边栏与浮窗边界） |
-| `ClipPop` | `()` | 弹出最近一层裁剪区域 |
-| `FillRect` | `(x, y, w, h, color_rgba: i64, radius: f64)` | 绘制直角或圆角填充矩形（背景、光标行、选区、Toast 卡片、色块） |
-| `StrokeRect` | `(x, y, w, h, color_rgba, line_width, radius)` | 绘制描边矩形边框（Telescope / ToggleTerm 浮窗与补全菜单外框） |
-| `Line` | `(x1, y1, x2, y2, color_rgba, line_width)` | 绘制分割线、缩进参考线（Indent Guides）与诊断下划线 |
-| `TextRun` | `(x, y, text, font_family, font_size_pt, color_rgba, bold, italic)` | 使用 Pango 渲染单段同样式 UTF-8 文本（自动处理 CJK 宽字符与连字） |
-| `CursorCaret` | `(x, y, w, h, color_rgba, shape: CaretShape)` | 绘制光标（Normal `Block`、Insert `Beam`、Replace `Underline`、失焦 `HollowBlock`） |
+| `clip_push` | `(x: f64, y: f64, w: f64, h: f64)` | 压入矩形裁剪区域（隔离各分屏窗格、侧边栏与浮窗边界） |
+| `clip_pop` | 无载荷 | 弹出最近一层裁剪区域 |
+| `fill_rect` | `(x, y, w, h, color_rgba: i64, radius: f64)` | 绘制直角或圆角填充矩形（背景、光标行、选区、Toast 卡片、色块） |
+| `stroke_rect` | `(x, y, w, h, color_rgba, line_width, radius)` | 绘制描边矩形边框（Telescope / ToggleTerm 浮窗与补全菜单外框） |
+| `line` | `(x1, y1, x2, y2, color_rgba, line_width)` | 绘制分割线、缩进参考线（Indent Guides）与诊断下划线 |
+| `text_run` | `(x, y, text, font_family, font_size_pt, color_rgba, bold, italic, underline)` | 使用 Pango 渲染单段同样式 UTF-8 文本（自动处理 CJK 宽字符与连字） |
+| `cursor_caret` | `(x, y, w, h, shape: CaretShape, color_rgba)` | 绘制光标（Normal `CaretShape.block`、Insert `CaretShape.beam`、Replace `CaretShape.underline`、失焦 `CaretShape.hollow_block`） |
 
 ### 为什么 `FrameSlot` 不会积压掉帧？ *frameslot-design*
 
@@ -154,13 +154,13 @@ Nessa 代码仅通过 `std.runtime.host_call(op_name, args)` 与 Rust 宿主交�
 | **引导与窗口事件** | `sys_boot_config` | 读取当前会话的命令行 `startup_files`、`headless_keys` 与 `headless` 标志 |
 | | `ui_poll_events` | 非阻塞拉取当前待处理的全部 `RawUiEvent` 列表 |
 | | `ui_wait_events` | 若队列为空则通过 `SuspendRetry` 零开销挂起至事件到达或超时 |
-| | `ui_commit_frame` | 将 `WindowSpec` 与 `DrawCmd` 列表构建为 `RenderFrame` 写入 `FrameSlot` |
+| | `ui_commit_frame_bytes` / `ui_commit_frame` | 将 `WindowSpec` 与二进制编码 `Bytes`（或兼容列表）解码为 `RenderFrame` 写入 `FrameSlot` |
 | | `ui_measure_font` | 调用 Pango 度量给定字体族与字号的精确等宽单元格宽高与基线（`FontMetrics`） |
 | | `ui_clipboard_get` / `ui_clipboard_set` | 读写系统剪贴板（Wayland / X11 原生剪贴板或无头内存缓冲） |
 | | `ui_request_quit` | 通知宿主退出主窗口事件循环并记录进程退出码 |
 | **文件与异步任务** | `fs_read_lines` / `fs_write_lines` | 高效按行读取与原子落盘保存 UTF-8 文本文件 |
-| | `sys_spawn_job` / `sys_cancel_job` | 在后台 OS 线程派生外部编译/Grep 子进程，完成后推送 `RawUiEvent.AsyncJobDone` |
-| | `sys_schedule_timer` | 注册毫秒级延时定时器，到期推送 `RawUiEvent.Tick(timer_id, now_ms)` |
+| | `sys_spawn_job` / `sys_cancel_job` | 在后台 OS 线程派生外部编译/Grep 子进程，完成后推送 `RawUiEvent.async_job_done` |
+| | `sys_schedule_timer` | 注册毫秒级延时定时器，到期推送 `RawUiEvent.tick(timer_id, now_ms)` |
 | **多核加速算子 (`@lava_accel`)** | `accel_fuzzy_rank` | 对候选集执行词边界/前缀/连续子串加权模糊打分并返回匹配字符下标 |
 | | `accel_workspace_files` | 快速递归枚举工作区文件（自动过滤忽略规则与二进制目录） |
 | | `accel_workspace_grep` / `accel_workspace_replace` | 多线程并行全文搜索与跨文件精确行号替换 |
@@ -188,13 +188,13 @@ Lava 利用 Nessa 的 **多提示符定界延续（Multi-Prompt Delimited Contin
 pub effect ask_prompt(req: PromptRequest, catch k) -> ?String
 ```
 
-1. 当任意命令（如 `find-file`、`evil-ex` 或 `query-replace`）执行 `let ans? = ask_prompt(req)# else { return () }` 时，`SystemKernel.dispatch_command` 外围的消除块捕获从该调用点直到命令边界的剩余计算栈段 `k: Continuation`（零帧拷贝栈段分离），将 `(req, k)` 存入 `kernel.active_prompt`，并立即返回 `PromptTurn.Suspended(req, k)`！
+1. 当任意命令（如 `find-file`、`evil-ex` 或 `query-replace`）执行 `let ans? = ask_prompt(req)# else { return () }` 时，`SystemKernel.dispatch_command` 外围的消除块捕获从该调用点直到命令边界的剩余计算栈段 `k: Continuation`（零帧拷贝栈段分离），将 `(req, k)` 存入 `kernel.active_prompt`，并立即返回 `PromptTurn.suspended(req, k)`！
 2. 顶层事件循环（`ext_app`）毫无阻塞地继续渲染界面、响应窗口缩放与后台消息，同时 `ext_minibuffer` 接管键盘输入，为用户提供实时 Orderless 过滤与 Consult 预览。
-3. 当用户按下 `<Return>`（或 `<C-g>` 取消）时，`ext_minibuffer` 调用 `kernel.submit_prompt_answer(answer)`，内核直接调用 `k(answer)` 恢复刚才暂停的栈段！如果后续逻辑再次调用 `ask_prompt`（例如 `query-replace` 的第二次提问），它会再次平滑挂起为新的 `PromptTurn.Suspended`，直至整个命令流自然走完返回 `PromptTurn.Completed`。
+3. 当用户按下 `<Return>`（或 `<C-g>` 取消）时，`ext_minibuffer` 调用 `kernel.submit_prompt_answer(answer)`，内核直接调用 `k(answer)` 恢复刚才暂停的栈段！如果后续逻辑再次调用 `ask_prompt`（例如 `query-replace` 的第二次提问），它会再次平滑挂起为新的 `PromptTurn.suspended`，直至整个命令流自然走完返回 `PromptTurn.completed`。
 
 ### 全局五级按键路由管线（`ext_app::route_stroke_inner`） *stroke-routing-order*
 
-每一次物理按键事件 `RawUiEvent.Key` 进入 `ext_app` 后，按以下确定性优先级依次派发（先消费先返回）：
+每一次物理按键事件 `RawUiEvent.key` 进入 `ext_app` 后，按以下确定性优先级依次派发（先消费先返回）：
 
 1. **第 1 级 — 挂起态交互提示符（Minibuffer Continuation）**：只要 `kernel.active_prompt != null`，所有按键无条件交给 `ext_minibuffer.minibuffer_handle_key` 处理（编辑输入、`<C-n>`/`<C-p>` 选词、`<C-g>` 取消回滚、`<Return>` 恢复延续）。
 2. **第 2 级 — 进行中的 Emacs 前缀序列**：若 `EmacsState` 正处于未完成的 `C-x ...` / `C-h ...` 前缀等待或 `C-u` 通用数字参数累积状态，直接交由 `ext_emacs.emacs_handle_key` 完成序列。

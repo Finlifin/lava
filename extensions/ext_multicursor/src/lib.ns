@@ -6,6 +6,7 @@
 -- tracking, and single atomic undo checkpoints.
 
 use std.collections.Set
+
 use @lava_sys.rgba
 use @lava_core.{
     ExtId, InteractiveEffects, KeyStroke, ServiceEffects, SystemKernel, log_event, status_emit
@@ -28,16 +29,31 @@ pub const OWNER_MULTICURSOR: String = "ext_multicursor"
 pub fn ext_multicursor_id() -> ExtId = ExtId("lava.org/ext_multicursor")
 
 pub enum McSubMode {
-    pub Normal,
-    pub PendingDelete,
-    pub PendingDeleteInner,
-    pub PendingDeleteAround,
-    pub PendingChange,
-    pub PendingChangeInner,
-    pub PendingChangeAround,
-    pub Insert,
+    pub normal,
+    pub pending_delete,
+    pub pending_delete_inner,
+    pub pending_delete_around,
+    pub pending_change,
+    pub pending_change_inner,
+    pub pending_change_around,
+    pub insert,
 }
-derive Eq, PartialEq, Display for McSubMode
+derive Eq, PartialEq for McSubMode
+
+impl Display for McSubMode {
+    pub fn to_string(self) -> String {
+        self match {
+            McSubMode.normal => "Normal",
+            McSubMode.pending_delete => "PendingDelete",
+            McSubMode.pending_delete_inner => "PendingDeleteInner",
+            McSubMode.pending_delete_around => "PendingDeleteAround",
+            McSubMode.pending_change => "PendingChange",
+            McSubMode.pending_change_inner => "PendingChangeInner",
+            McSubMode.pending_change_around => "PendingChangeAround",
+            McSubMode.insert => "Insert",
+        }
+    }
+}
 
 pub struct MultiCursorState {
     pub active: bool,
@@ -51,7 +67,7 @@ impl MultiCursorState {
     pub fn new() -> MultiCursorState {
         MultiCursorState {
             active: false,
-            sub_mode: McSubMode.Normal,
+            sub_mode: McSubMode.normal,
             pattern: "",
             whole_word: true,
             token_highlight_active: false,
@@ -60,7 +76,7 @@ impl MultiCursorState {
 
     pub fn clear_state(self) {
         self.active = false
-        self.sub_mode = McSubMode.Normal
+        self.sub_mode = McSubMode.normal
         self.pattern = ""
         self.whole_word = true
         self.token_highlight_active = false
@@ -263,10 +279,10 @@ fn exit_multicursor(world: EditorWorld, vim: VimState, state: MultiCursorState) 
             b_opt.as(Buffer).clear_owner_decors(OWNER_MULTICURSOR)
         }
     }
-    if vim.mode == VimMode.Insert {
+    if vim.mode == VimMode.insert {
         let b = world.active_buffer()
         b.point = b.clamp_pos(b.point, insert_mode = false)
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
     }
     if vim.modal_interceptor != null {
         if vim.modal_interceptor.as(ModalInterceptor).owner == OWNER_MULTICURSOR {
@@ -457,7 +473,7 @@ fn add_next_match_core(
         var pat = ""
         var whole_w = true
 
-        if vim.mode == VimMode.VisualChar {
+        if vim.mode == VimMode.visual_char {
             let a = vim.visual_anchor
             let b = buf.point
             let lo = if a <= b { a } else { b }
@@ -469,7 +485,7 @@ fn add_next_match_core(
                 init_pos = lo
                 whole_w = false
             }
-            vim.mode = VimMode.Normal
+            vim.mode = VimMode.normal
             vim.visual_dollar = false
         }
 
@@ -485,7 +501,7 @@ fn add_next_match_core(
         }
 
         state.active = true
-        state.sub_mode = McSubMode.Normal
+        state.sub_mode = McSubMode.normal
         state.pattern = pat
         state.whole_word = whole_w
         state.token_highlight_active = true
@@ -674,9 +690,9 @@ fn enter_mc_insert(
     state: MultiCursorState,
     cursors: List,
 ) {
-    state.sub_mode = McSubMode.Insert
+    state.sub_mode = McSubMode.insert
     state.token_highlight_active = false
-    vim.mode = VimMode.Insert
+    vim.mode = VimMode.insert
     apply_tracked_cursors(world, buf, state, cursors, true)
     sync_world_from_vim(world, vim)
 }
@@ -697,8 +713,8 @@ fn finish_mc_insert(
             is_primary: tc.is_primary,
         })
     }
-    state.sub_mode = McSubMode.Normal
-    vim.mode = VimMode.Normal
+    state.sub_mode = McSubMode.normal
+    vim.mode = VimMode.normal
     apply_tracked_cursors(world, buf, state, stepped, false)
     buf.named_marks.insert(".", buf.point)
     buf.checkpoint(buf.point, "multicursor-insert")
@@ -863,7 +879,7 @@ fn apply_mc_text_object(
     if op == "c" {
         enter_mc_insert(world, buf, vim, state, next_cursors)
     } else {
-        state.sub_mode = McSubMode.Normal
+        state.sub_mode = McSubMode.normal
         apply_tracked_cursors(world, buf, state, next_cursors, false)
         buf.named_marks.insert(".", buf.point)
         buf.checkpoint(buf.point, "multicursor-delete")
@@ -901,7 +917,7 @@ fn apply_mc_operator_motion(
         }
     }
     if not any_valid {
-        state.sub_mode = McSubMode.Normal
+        state.sub_mode = McSubMode.normal
         return false
     }
     let next_cursors = execute_multi_edits(buf, edits)!
@@ -909,7 +925,7 @@ fn apply_mc_operator_motion(
     if op == "c" {
         enter_mc_insert(world, buf, vim, state, next_cursors)
     } else {
-        state.sub_mode = McSubMode.Normal
+        state.sub_mode = McSubMode.normal
         apply_tracked_cursors(world, buf, state, next_cursors, false)
         buf.named_marks.insert(".", buf.point)
         buf.checkpoint(buf.point, "multicursor-delete")
@@ -933,7 +949,7 @@ fn mc_interceptor_step(
     let buf = world.active_buffer()
 
     -- 1. Synchronized Insert sub-mode
-    if state.sub_mode == McSubMode.Insert {
+    if state.sub_mode == McSubMode.insert {
         return handle_mc_insert_stroke(world, buf, vim, state, stroke)#
     }
 
@@ -943,18 +959,18 @@ fn mc_interceptor_step(
     let is_esc = k == "Escape" or (ctrl_only and (k == "[" or k == "c" or k == "g"))
 
     -- 2. Pending text-object second key (`di<obj>`, `da<obj>`, `ci<obj>`, `ca<obj>`)
-    if state.sub_mode == McSubMode.PendingDeleteInner
-        or state.sub_mode == McSubMode.PendingDeleteAround
-        or state.sub_mode == McSubMode.PendingChangeInner
-        or state.sub_mode == McSubMode.PendingChangeAround {
+    if state.sub_mode == McSubMode.pending_delete_inner
+        or state.sub_mode == McSubMode.pending_delete_around
+        or state.sub_mode == McSubMode.pending_change_inner
+        or state.sub_mode == McSubMode.pending_change_around {
         if is_esc {
-            state.sub_mode = McSubMode.Normal
+            state.sub_mode = McSubMode.normal
             return true
         }
-        let around = state.sub_mode == McSubMode.PendingDeleteAround
-            or state.sub_mode == McSubMode.PendingChangeAround
-        let op = if state.sub_mode == McSubMode.PendingChangeInner
-            or state.sub_mode == McSubMode.PendingChangeAround {
+        let around = state.sub_mode == McSubMode.pending_delete_around
+            or state.sub_mode == McSubMode.pending_change_around
+        let op = if state.sub_mode == McSubMode.pending_change_inner
+            or state.sub_mode == McSubMode.pending_change_around {
             "c"
         } else {
             "d"
@@ -963,31 +979,31 @@ fn mc_interceptor_step(
         if obj_ch != "" {
             apply_mc_text_object(world, buf, vim, state, op, around, obj_ch)!
         } else {
-            state.sub_mode = McSubMode.Normal
+            state.sub_mode = McSubMode.normal
         }
         return true
     }
 
     -- 3. Pending operator (`d` or `c`)
-    if state.sub_mode == McSubMode.PendingDelete or state.sub_mode == McSubMode.PendingChange {
+    if state.sub_mode == McSubMode.pending_delete or state.sub_mode == McSubMode.pending_change {
         if is_esc {
-            state.sub_mode = McSubMode.Normal
+            state.sub_mode = McSubMode.normal
             return true
         }
-        let op = if state.sub_mode == McSubMode.PendingChange { "c" } else { "d" }
+        let op = if state.sub_mode == McSubMode.pending_change { "c" } else { "d" }
         if plain and k == "i" {
             state.sub_mode = if op == "c" {
-                McSubMode.PendingChangeInner
+                McSubMode.pending_change_inner
             } else {
-                McSubMode.PendingDeleteInner
+                McSubMode.pending_delete_inner
             }
             return true
         }
         if plain and k == "a" {
             state.sub_mode = if op == "c" {
-                McSubMode.PendingChangeAround
+                McSubMode.pending_change_around
             } else {
-                McSubMode.PendingDeleteAround
+                McSubMode.pending_delete_around
             }
             return true
         }
@@ -995,7 +1011,7 @@ fn mc_interceptor_step(
             let _ = apply_mc_operator_motion(world, buf, vim, state, op, k)!
             return true
         }
-        state.sub_mode = McSubMode.Normal
+        state.sub_mode = McSubMode.normal
         return true
     }
 
@@ -1106,11 +1122,11 @@ fn mc_interceptor_step(
 
     -- Operators `d` and `c`
     if plain and k == "d" {
-        state.sub_mode = McSubMode.PendingDelete
+        state.sub_mode = McSubMode.pending_delete
         return true
     }
     if plain and k == "c" {
-        state.sub_mode = McSubMode.PendingChange
+        state.sub_mode = McSubMode.pending_change
         return true
     }
 
@@ -1172,8 +1188,8 @@ fn cmd_mc_add_vertical(kernel: SystemKernel, delta_row: i64) -> #InteractiveEffe
     let state = require_multicursor_state(kernel)!
     let buf = world.active_buffer()
 
-    if vim.mode != VimMode.Normal {
-        vim.mode = VimMode.Normal
+    if vim.mode != VimMode.normal {
+        vim.mode = VimMode.normal
     }
 
     let target_r = buf.point.row + delta_row
@@ -1183,7 +1199,7 @@ fn cmd_mc_add_vertical(kernel: SystemKernel, delta_row: i64) -> #InteractiveEffe
     }
 
     ensure_mc_active_interceptor(vim, state)
-    state.sub_mode = McSubMode.Normal
+    state.sub_mode = McSubMode.normal
     state.token_highlight_active = false
 
     let cursors = collect_sorted_cursors(world, buf, false)
@@ -1212,7 +1228,7 @@ fn cmd_mc_add_all_matches(kernel: SystemKernel, _args: List) -> #InteractiveEffe
     var whole_w = state.whole_word
     var anchor_p = buf.point
 
-    if vim.mode == VimMode.VisualChar {
+    if vim.mode == VimMode.visual_char {
         let a = vim.visual_anchor
         let b = buf.point
         let lo = if a <= b { a } else { b }
@@ -1224,7 +1240,7 @@ fn cmd_mc_add_all_matches(kernel: SystemKernel, _args: List) -> #InteractiveEffe
             whole_w = false
             anchor_p = lo
         }
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.visual_dollar = false
     } else if (not state.active) or pat == "" {
         let tok? = word_token_at_cursor(buf, buf.point) else {
@@ -1244,7 +1260,7 @@ fn cmd_mc_add_all_matches(kernel: SystemKernel, _args: List) -> #InteractiveEffe
     }
 
     state.active = true
-    state.sub_mode = McSubMode.Normal
+    state.sub_mode = McSubMode.normal
     state.pattern = pat
     state.whole_word = whole_w
     state.token_highlight_active = true
@@ -1381,14 +1397,13 @@ pub fn register_multicursor_extension(kernel: SystemKernel) -> !String Unit {
                 "buffer-switched",
                 ext_id,
                 |kern: SystemKernel, _payload: Any| -> Unit {
-                    let st_opt = kern.service(SERVICE_MULTICURSOR)
+                    if not state.active {
+                        return
+                    }
                     let w_opt = kern.service("lava.document.world")
                     let v_opt = kern.service("lava.vim.state")
-                    if st_opt != null and w_opt != null and v_opt != null {
-                        let st = st_opt.as(MultiCursorState)
-                        if st.active {
-                            exit_multicursor(w_opt.as(EditorWorld), v_opt.as(VimState), st)
-                        }
+                    if w_opt != null and v_opt != null {
+                        exit_multicursor(w_opt.as(EditorWorld), v_opt.as(VimState), state)
                     }
                 },
             )

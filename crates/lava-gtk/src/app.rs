@@ -279,16 +279,24 @@ unsafe extern "C" fn on_frame_wakeup_idle(user_data: *mut c_void) -> c_int {
     G_SOURCE_REMOVE
 }
 
-unsafe extern "C" fn on_quit_poll_timeout(user_data: *mut c_void) -> c_int {
-    if user_data.is_null() {
-        return G_SOURCE_REMOVE;
+unsafe extern "C" fn on_quit_wakeup_idle(_user_data: *mut c_void) -> c_int {
+    G_SOURCE_REMOVE
+}
+
+fn schedule_quit_wakeup(state: &Arc<UiSharedState>) {
+    if !state.alive.load(Ordering::Acquire) {
+        return;
     }
-    // SAFETY: `user_data` is a borrowed `&UiSharedState` kept alive by `Arc` until `drop_state_source`.
-    let state = unsafe { &*(user_data.cast::<UiSharedState>()) };
-    if !state.alive.load(Ordering::Acquire) || state.event_queue.quit_code().is_some() {
-        G_SOURCE_REMOVE
-    } else {
-        G_SOURCE_CONTINUE
+    let raw = Arc::into_raw(Arc::clone(state)).cast_mut().cast::<c_void>();
+    // SAFETY: `g_idle_add_full` is thread-safe and wakes a blocked `g_main_context_iteration`
+    // immediately; `raw` is reclaimed once by `drop_state_source` when the idle source runs.
+    unsafe {
+        ffi::g_idle_add_full(
+            G_PRIORITY_DEFAULT,
+            Some(on_quit_wakeup_idle),
+            raw,
+            Some(drop_state_source),
+        );
     }
 }
 
@@ -665,11 +673,14 @@ pub fn run_gtk_app(
     run_gtk_app_with_final_size(config, frame_slot, event_queue, None)
 }
 
+/// Thread-safe slot capturing final `(width, height)` on clean GTK4 window shutdown.
+pub type FinalWindowSizeSlot = Arc<Mutex<Option<(i32, i32)>>>;
+
 pub fn run_gtk_app_with_final_size(
     config: GtkAppConfig,
     frame_slot: Arc<FrameSlot>,
     event_queue: Arc<EventQueue>,
-    final_window_size: Option<Arc<Mutex<Option<(i32, i32)>>>>,
+    final_window_size: Option<FinalWindowSizeSlot>,
 ) -> Result<(), String> {
     if !is_display_available() {
         return Err(
@@ -877,22 +888,13 @@ pub fn run_gtk_app_with_final_size(
         schedule_ui_wakeup(&state);
     }
 
-    // Register periodic 16ms quit check so `request_quit` wakes a blocked `g_main_context_iteration`.
+    // Register event-driven quit waker so `request_quit` wakes a blocked `g_main_context_iteration`
+    // immediately with zero periodic timer polling when idle.
     {
-        let poll_state = Arc::into_raw(Arc::clone(&state))
-            .cast_mut()
-            .cast::<c_void>();
-        // SAFETY: `g_timeout_add_full` attaches to the default GLib main context and frees `poll_state`
-        // via `drop_state_source` once `on_quit_poll_timeout` returns `G_SOURCE_REMOVE`.
-        unsafe {
-            ffi::g_timeout_add_full(
-                G_PRIORITY_DEFAULT,
-                16,
-                Some(on_quit_poll_timeout),
-                poll_state,
-                Some(drop_state_source),
-            );
-        }
+        let quit_state = Arc::clone(&state);
+        event_queue.set_quit_waker(Some(Arc::new(move || {
+            schedule_quit_wakeup(&quit_state);
+        })));
     }
 
     // SAFETY: `g_main_context_default` returns the process-global default GLib main context.
@@ -904,7 +906,8 @@ pub fn run_gtk_app_with_final_size(
         }
     }
 
-    // Detach waker, mark window dead before destruction, destroy window, and drain pending cleanups.
+    // Detach wakers, mark window dead before destruction, destroy window, and drain pending cleanups.
+    event_queue.set_quit_waker(None);
     frame_slot.set_ui_waker(Box::new(|| {}));
     state.alive.store(false, Ordering::Release);
 

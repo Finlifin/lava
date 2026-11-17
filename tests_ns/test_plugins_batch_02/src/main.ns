@@ -231,7 +231,7 @@ fn test_ext_flash() -> #[log_event, status_emit, clipboard_get, clipboard_set] !
     assert_i64_eq(flash.targets.len(), 1, "1 match for '20'")
     let lbl_vis = flash.targets.get(0).as(FlashTarget).label
     vim_feed_keys(kernel, lbl_vis)#!
-    assert_true(vim.mode == VimMode.VisualChar, "remained in VisualChar after vgs jump")
+    assert_true(vim.mode == VimMode.visual_char, "remained in VisualChar after vgs jump")
     assert_pos_eq(vim.visual_anchor, 1, 4, "visual_anchor preserved at (1, 4)")
     assert_pos_eq(buf.point, 2, 19, "visual cursor extended to (2, 19)")
     vim_feed_keys(kernel, "<Escape>")#!
@@ -261,7 +261,7 @@ fn test_ext_flash() -> #[log_event, status_emit, clipboard_get, clipboard_set] !
     assert_true(paren_lbl != "", "found paren_expr target in gS")
     vim_feed_keys(kernel, paren_lbl)#!
     assert_true(not flash.active, "gS finished after pressing node label")
-    assert_true(vim.mode == VimMode.VisualChar, "gS selected node in VisualChar")
+    assert_true(vim.mode == VimMode.visual_char, "gS selected node in VisualChar")
     assert_pos_eq(vim.visual_anchor, 1, 14, "gS visual_anchor at '(' (1, 14)")
     assert_pos_eq(ts_buf.point, 1, 23, "gS point at ')' (1, 23)")
     assert_i64_eq(count_owner_total_decors(ts_buf, OWNER_FLASH), 0, "gS cleared decors")
@@ -278,7 +278,7 @@ fn test_ext_harpoon() -> #[log_event, status_emit, clipboard_get, clipboard_set]
     let harpoon = require_harpoon_state(kernel)!
 
     let tmp_dir = "/tmp/lava_test_harpoon_batch_02"
-    let _ = fs.create_dir_all(tmp_dir) ! { _ => () }
+    let _ = fs.create_dir(tmp_dir, parents = true) ! { _ => () }
     let f1 = tmp_dir ++ "/alpha.ns"
     let f2 = tmp_dir ++ "/beta.ns"
     let f3 = tmp_dir ++ "/gamma.ns"

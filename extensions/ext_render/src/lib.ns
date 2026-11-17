@@ -2612,7 +2612,7 @@ fn inspect_line_indent(line: String, tabstop: i64) -> (bool, i64, bool, bool) {
     (true, 0, false, false)
 }
 
--- Precompute `(eff_indent_map, active_guide_vcol, scope_start_row, scope_end_row)` for `vis_rows`.
+-- Precompute `(lo_anchor, eff_arr, active_guide_vcol, scope_start_row, scope_end_row)` for `vis_rows`.
 fn compute_pane_indent_guides(
     buf: Buffer,
     vis_rows: List,
@@ -2620,10 +2620,9 @@ fn compute_pane_indent_guides(
     is_focused: bool,
     tabstop: i64,
     shiftwidth: i64,
-) -> (HashMap, i64, i64, i64) {
-    let eff_map = HashMap.new()
+) -> (i64, List, i64, i64, i64) {
     if vis_rows.is_empty() {
-        return (eff_map, -1, -1, -1)
+        return (0, List(), -1, -1, -1)
     }
     let indent_step = if shiftwidth > 0 { shiftwidth } else { if tabstop > 0 { tabstop } else { 4 } }
     let buf_lo = buf.min_row()
@@ -2659,6 +2658,7 @@ fn compute_pane_indent_guides(
     }
 
     let count = hi_anchor - lo_anchor + 1
+    let anchor_lines = buf.slice_lines(lo_anchor, hi_anchor + 1)
     let blank_arr = List()
     let raw_arr = List()
     let close_arr = List()
@@ -2666,8 +2666,12 @@ fn compute_pane_indent_guides(
     var prev_for_blank: i64 = -1
 
     for idx in 0..count {
-        let r = lo_anchor + idx
-        let (is_blank, raw_vcol, starts_close, ends_open) = inspect_line_indent(buf.line_at(r), tabstop)
+        let ln = if idx < anchor_lines.len() {
+            anchor_lines.get(idx.as(usize)).as(String)
+        } else {
+            buf.line_at(lo_anchor + idx)
+        }
+        let (is_blank, raw_vcol, starts_close, ends_open) = inspect_line_indent(ln, tabstop)
         blank_arr.push(is_blank)
         raw_arr.push(raw_vcol)
         close_arr.push(starts_close)
@@ -2678,9 +2682,7 @@ fn compute_pane_indent_guides(
     }
 
     let eff_arr = List()
-    for _ in 0..count {
-        eff_arr.push(0)
-    }
+    eff_arr.resize(count.as(usize), 0)
     var next_for_blank: i64 = -1
     var rev_i = count - 1
     while rev_i >= 0 {
@@ -2700,12 +2702,11 @@ fn compute_pane_indent_guides(
                 eff_arr.set(u, 0)
             }
         }
-        eff_map.insert(lo_anchor + rev_i, eff_arr.get(u).as(i64))
         rev_i -= 1
     }
 
     if (not is_focused) or cursor_row < lo_anchor or cursor_row > hi_anchor {
-        return (eff_map, -1, -1, -1)
+        return (lo_anchor, eff_arr, -1, -1, -1)
     }
 
     let cur_idx = cursor_row - lo_anchor
@@ -2728,7 +2729,7 @@ fn compute_pane_indent_guides(
     }
 
     if active_vcol < 0 {
-        return (eff_map, -1, -1, -1)
+        return (lo_anchor, eff_arr, -1, -1, -1)
     }
 
     var s_idx = seed_idx
@@ -2739,7 +2740,105 @@ fn compute_pane_indent_guides(
     while e_idx + 1 < count and eff_arr.get((e_idx + 1).as(usize)).as(i64) > active_vcol {
         e_idx += 1
     }
-    (eff_map, active_vcol, lo_anchor + s_idx, lo_anchor + e_idx)
+    (lo_anchor, eff_arr, active_vcol, lo_anchor + s_idx, lo_anchor + e_idx)
+}
+
+private struct IndentGuideCacheEntry {
+    pane_id: i64,
+    buf_id: i64,
+    doc_id: i64,
+    edit_version: i64,
+    top_row: i64,
+    max_rows: i64,
+    vis_len: i64,
+    cursor_row: i64,
+    is_focused: bool,
+    tabstop: i64,
+    shiftwidth: i64,
+    fold_count: i64,
+    min_row: i64,
+    max_row: i64,
+    lo_anchor: i64,
+    eff_arr: List,
+    active_vcol: i64,
+    scope_start: i64,
+    scope_end: i64,
+}
+
+private global _indent_guide_cache: ?HashMap = null
+
+fn get_cached_pane_indent_guides(
+    pane_id: i64,
+    buf: Buffer,
+    vis_rows: List,
+    top_row: i64,
+    max_rows: i64,
+    cursor_row: i64,
+    is_focused: bool,
+    tabstop: i64,
+    shiftwidth: i64,
+) -> (i64, List, i64, i64, i64) {
+    let cache = if _indent_guide_cache != null {
+        _indent_guide_cache.as(HashMap)
+    } else {
+        let m = HashMap.new()
+        _indent_guide_cache = m
+        m
+    }
+    let buf_id_raw = buf.id.raw()
+    let vis_len = vis_rows.len()
+    let fold_cnt = buf.folded_rows.len()
+    let min_r = buf.min_row()
+    let max_r = buf.max_row()
+    let hit_opt = cache.get(pane_id)
+    if hit_opt != null {
+        let e = hit_opt.as(IndentGuideCacheEntry)
+        if e.buf_id == buf_id_raw
+            and e.doc_id == buf.doc_id
+            and e.edit_version == buf.edit_version
+            and e.top_row == top_row
+            and e.max_rows == max_rows
+            and e.vis_len == vis_len
+            and e.cursor_row == cursor_row
+            and e.is_focused == is_focused
+            and e.tabstop == tabstop
+            and e.shiftwidth == shiftwidth
+            and e.fold_count == fold_cnt
+            and e.min_row == min_r
+            and e.max_row == max_r {
+            return (e.lo_anchor, e.eff_arr, e.active_vcol, e.scope_start, e.scope_end)
+        }
+    }
+    if cache.len() > 16 {
+        cache.clear()
+    }
+    let (lo_anchor, eff_arr, active_vcol, scope_start, scope_end) =
+        compute_pane_indent_guides(buf, vis_rows, cursor_row, is_focused, tabstop, shiftwidth)
+    cache.insert(
+        pane_id,
+        IndentGuideCacheEntry {
+            pane_id: pane_id,
+            buf_id: buf_id_raw,
+            doc_id: buf.doc_id,
+            edit_version: buf.edit_version,
+            top_row: top_row,
+            max_rows: max_rows,
+            vis_len: vis_len,
+            cursor_row: cursor_row,
+            is_focused: is_focused,
+            tabstop: tabstop,
+            shiftwidth: shiftwidth,
+            fold_count: fold_cnt,
+            min_row: min_r,
+            max_row: max_r,
+            lo_anchor: lo_anchor,
+            eff_arr: eff_arr,
+            active_vcol: active_vcol,
+            scope_start: scope_start,
+            scope_end: scope_end,
+        },
+    )
+    (lo_anchor, eff_arr, active_vcol, scope_start, scope_end)
 }
 
 fn mode_pill_color(mode_name: String, theme: ThemePalette) -> i64 {
@@ -2837,8 +2936,8 @@ fn render_top_tab_bar(
     let font_fam = world.options.font_family
     let font_sz = world.options.font_size_pt
 
-    cmds.push(DrawCmd.ClipPush(0.0, 0.0, win_w, TAB_BAR_HEIGHT))
-    cmds.push(DrawCmd.FillRect(0.0, 0.0, win_w, TAB_BAR_HEIGHT, theme.bg_tab_bar, 0.0))
+    cmds.push(DrawCmd.clip_push(0.0, 0.0, win_w, TAB_BAR_HEIGHT))
+    cmds.push(DrawCmd.fill_rect(0.0, 0.0, win_w, TAB_BAR_HEIGHT, theme.bg_tab_bar, 0.0))
 
     var cur_x: f64 = 6.0
     let text_y: f64 = 3.0
@@ -2860,11 +2959,11 @@ fn render_top_tab_bar(
             }
             let tab_w = (str_display_width(bname) + 3).as(f64) * cell_w
             let pill_bg = if is_active { theme.bg } else { theme.bg_alt }
-            cmds.push(DrawCmd.FillRect(cur_x, 2.0, tab_w, TAB_BAR_HEIGHT - 3.0, pill_bg, 4.0))
+            cmds.push(DrawCmd.fill_rect(cur_x, 2.0, tab_w, TAB_BAR_HEIGHT - 3.0, pill_bg, 4.0))
             if is_active {
-                cmds.push(DrawCmd.FillRect(cur_x, 2.0, tab_w, 2.0, theme.accent, 0.0))
+                cmds.push(DrawCmd.fill_rect(cur_x, 2.0, tab_w, 2.0, theme.accent, 0.0))
             }
-            cmds.push(DrawCmd.TextRun(
+            cmds.push(DrawCmd.text_run(
                 cur_x + cell_w * 1.2,
                 text_y,
                 bname,
@@ -2893,7 +2992,7 @@ fn render_top_tab_bar(
             let is_active = bid == world.active_buffer_id
             let label = nerd_icon_for_buffer(b) ++ b.name ++ (if b.modified { " [+]" } else { "" })
             let tab_w = (str_display_width(label) + 3).as(f64) * cell_w
-            cmds.push(DrawCmd.FillRect(
+            cmds.push(DrawCmd.fill_rect(
                 cur_x,
                 2.0,
                 tab_w,
@@ -2902,9 +3001,9 @@ fn render_top_tab_bar(
                 4.0,
             ))
             if is_active {
-                cmds.push(DrawCmd.FillRect(cur_x, 2.0, tab_w, 2.0, theme.accent, 0.0))
+                cmds.push(DrawCmd.fill_rect(cur_x, 2.0, tab_w, 2.0, theme.accent, 0.0))
             }
-            cmds.push(DrawCmd.TextRun(
+            cmds.push(DrawCmd.text_run(
                 cur_x + cell_w * 1.2,
                 text_y,
                 label,
@@ -2924,7 +3023,7 @@ fn render_top_tab_bar(
     let theme_tag = "[" ++ theme.name ++ "]"
     let theme_w = str_display_width(theme_tag).as(f64) * cell_w
     right_x -= theme_w
-    cmds.push(DrawCmd.TextRun(right_x, text_y, theme_tag, font_fam, font_sz, theme.fg_muted, false, false, false))
+    cmds.push(DrawCmd.text_run(right_x, text_y, theme_tag, font_fam, font_sz, theme.fg_muted, false, false, false))
 
     if not world.active_jobs.is_empty() {
         let jcount = world.active_jobs.len()
@@ -2932,8 +3031,8 @@ fn render_top_tab_bar(
         let job_badge = " Jobs:" ++ jcount.to_string() ++ " " ++ clip_str(first_job.title, 18) ++ " "
         let jw = str_display_width(job_badge).as(f64) * cell_w
         right_x -= jw + 8.0
-        cmds.push(DrawCmd.FillRect(right_x, 3.0, jw, TAB_BAR_HEIGHT - 6.0, theme.bg_popup, 4.0))
-        cmds.push(DrawCmd.TextRun(right_x, text_y, job_badge, font_fam, font_sz, theme.diag_warn, false, false, false))
+        cmds.push(DrawCmd.fill_rect(right_x, 3.0, jw, TAB_BAR_HEIGHT - 6.0, theme.bg_popup, 4.0))
+        cmds.push(DrawCmd.text_run(right_x, text_y, job_badge, font_fam, font_sz, theme.diag_warn, false, false, false))
     }
 
     -- Optional symbol breadcrumb (`world.winbar_text`) in center-right of header bar
@@ -2941,12 +3040,12 @@ fn render_top_tab_bar(
         let max_bc = (((right_x - cur_x - 24.0) / cell_w).floor().as(i64))
         if max_bc > 12 {
             let bc = clip_str(world.winbar_text, max_bc)
-            cmds.push(DrawCmd.TextRun(cur_x + 12.0, text_y, bc, font_fam, font_sz, theme.fg_muted, false, true, false))
+            cmds.push(DrawCmd.text_run(cur_x + 12.0, text_y, bc, font_fam, font_sz, theme.fg_muted, false, true, false))
         }
     }
 
-    cmds.push(DrawCmd.Line(0.0, TAB_BAR_HEIGHT - 1.0, win_w, TAB_BAR_HEIGHT - 1.0, theme.border, 1.0))
-    cmds.push(DrawCmd.ClipPop)
+    cmds.push(DrawCmd.line(0.0, TAB_BAR_HEIGHT - 1.0, win_w, TAB_BAR_HEIGHT - 1.0, theme.border, 1.0))
+    cmds.push(DrawCmd.clip_pop)
 }
 
 fn emit_visual_span_rect(
@@ -2978,7 +3077,7 @@ fn emit_visual_span_rect(
     let raw_w = (clamped_e - clamped_s).as(f64) * cell_w
     let rw = if rx + raw_w > max_x { max_x - rx } else { raw_w }
     if rw > 0.0 {
-        cmds.push(DrawCmd.FillRect(rx, row_y, rw, cell_h, color, radius))
+        cmds.push(DrawCmd.fill_rect(rx, row_y, rw, cell_h, color, radius))
     }
 }
 
@@ -2998,11 +3097,11 @@ fn render_pane_selection_for_row(
     cell_h: f64,
     theme: ThemePalette,
 ) {
-    if is_focused and world.visual.kind != VisualKind.None {
+    if is_focused and world.visual.kind != VisualKind.none {
         let a = world.visual.anchor
         let c = world.visual.cursor
         world.visual.kind match {
-            VisualKind.Char => {
+            VisualKind.char => {
                 let norm = Span.normalized(a, c)
                 if buf_row >= norm.start.row and buf_row <= norm.end.row {
                     let sc = if buf_row == norm.start.row { norm.start.col } else { 0 }
@@ -3017,14 +3116,14 @@ fn render_pane_selection_for_row(
                     )
                 }
             },
-            VisualKind.Line => {
+            VisualKind.line => {
                 let lo_r = if a.row <= c.row { a.row } else { c.row }
                 let hi_r = if a.row <= c.row { c.row } else { a.row }
                 if buf_row >= lo_r and buf_row <= hi_r and pane_right_x > text_x0 {
-                    cmds.push(DrawCmd.FillRect(text_x0, row_y, pane_right_x - text_x0, cell_h, theme.bg_selection, 0.0))
+                    cmds.push(DrawCmd.fill_rect(text_x0, row_y, pane_right_x - text_x0, cell_h, theme.bg_selection, 0.0))
                 }
             },
-            VisualKind.Block => {
+            VisualKind.block => {
                 let lo_r = if a.row <= c.row { a.row } else { c.row }
                 let hi_r = if a.row <= c.row { c.row } else { a.row }
                 if buf_row >= lo_r and buf_row <= hi_r {
@@ -3055,13 +3154,13 @@ fn render_pane_selection_for_row(
                             let raw_w = (de - cs).as(f64) * cell_w
                             let rw = if rx + raw_w > pane_right_x { pane_right_x - rx } else { raw_w }
                             if rw > 0.0 {
-                                cmds.push(DrawCmd.FillRect(rx, row_y, rw, cell_h, theme.bg_selection, 0.0))
+                                cmds.push(DrawCmd.fill_rect(rx, row_y, rw, cell_h, theme.bg_selection, 0.0))
                             }
                         }
                     }
                 }
             },
-            VisualKind.None => (),
+            VisualKind.none => (),
         }
         return
     }
@@ -3100,8 +3199,8 @@ fn render_pane_mode_line(
     let font_fam = world.options.font_family
     let font_sz = world.options.font_size_pt
     let status_bg = if is_focused { theme.bg_status_active } else { theme.bg_status_inactive }
-    cmds.push(DrawCmd.FillRect(r.x, ml_y, r.w, ml_h, status_bg, 0.0))
-    cmds.push(DrawCmd.Line(r.x, ml_y, r.x + r.w, ml_y, theme.border, 1.0))
+    cmds.push(DrawCmd.fill_rect(r.x, ml_y, r.w, ml_h, status_bg, 0.0))
+    cmds.push(DrawCmd.line(r.x, ml_y, r.x + r.w, ml_y, theme.border, 1.0))
 
     let text_y = ml_y + 2.0
     var cur_x = r.x + 6.0
@@ -3109,8 +3208,8 @@ fn render_pane_mode_line(
     let mode_label = if is_focused { world.mode_name } else { "WIN" }
     let pill_w = (str_display_width(mode_label) + 2).as(f64) * cell_w
     let pill_bg = if is_focused { mode_pill_color(mode_label, theme) } else { theme.border }
-    cmds.push(DrawCmd.FillRect(cur_x, ml_y + 2.0, pill_w, ml_h - 4.0, pill_bg, 3.0))
-    cmds.push(DrawCmd.TextRun(
+    cmds.push(DrawCmd.fill_rect(cur_x, ml_y + 2.0, pill_w, ml_h - 4.0, pill_bg, 3.0))
+    cmds.push(DrawCmd.text_run(
         cur_x + cell_w,
         text_y,
         mode_label,
@@ -3125,7 +3224,7 @@ fn render_pane_mode_line(
 
     -- Buffer file-type icon + name + `[+]` / `[RO]` / `[Narrow Lx-Ly]`
     let bicon = nerd_icon_for_buffer(buf)
-    cmds.push(DrawCmd.TextRun(
+    cmds.push(DrawCmd.text_run(
         cur_x,
         text_y,
         bicon,
@@ -3138,7 +3237,7 @@ fn render_pane_mode_line(
     ))
     cur_x += str_display_width(bicon).as(f64) * cell_w
 
-    cmds.push(DrawCmd.TextRun(
+    cmds.push(DrawCmd.text_run(
         cur_x,
         text_y,
         buf.name,
@@ -3152,21 +3251,21 @@ fn render_pane_mode_line(
     cur_x += (str_display_width(buf.name) + 1).as(f64) * cell_w
 
     if buf.modified {
-        cmds.push(DrawCmd.TextRun(cur_x, text_y, "[+]", font_fam, font_sz, theme.diag_warn, false, false, false))
+        cmds.push(DrawCmd.text_run(cur_x, text_y, "[+]", font_fam, font_sz, theme.diag_warn, false, false, false))
         cur_x += 4.0 * cell_w
     }
     if buf.read_only {
-        cmds.push(DrawCmd.TextRun(cur_x, text_y, "[RO]", font_fam, font_sz, theme.diag_err, false, false, false))
+        cmds.push(DrawCmd.text_run(cur_x, text_y, "[RO]", font_fam, font_sz, theme.diag_err, false, false, false))
         cur_x += 5.0 * cell_w
     }
     if buf.is_narrowed() {
         let ntag = "[Narrow L" ++ (buf.min_row() + 1).to_string() ++ "-L" ++ (buf.max_row() + 1).to_string() ++ "]"
-        cmds.push(DrawCmd.TextRun(cur_x, text_y, ntag, font_fam, font_sz, theme.accent, false, false, false))
+        cmds.push(DrawCmd.text_run(cur_x, text_y, ntag, font_fam, font_sz, theme.accent, false, false, false))
         cur_x += (str_display_width(ntag) + 1).as(f64) * cell_w
     }
 
     let mode_tag = "(" ++ buf.major_mode ++ ")"
-    cmds.push(DrawCmd.TextRun(cur_x, text_y, mode_tag, font_fam, font_sz, theme.fg_muted, false, false, false))
+    cmds.push(DrawCmd.text_run(cur_x, text_y, mode_tag, font_fam, font_sz, theme.fg_muted, false, false, false))
     cur_x += (str_display_width(mode_tag) + 1).as(f64) * cell_w
 
     if is_focused and kernel.macros.is_recording() {
@@ -3176,18 +3275,18 @@ fn render_pane_mode_line(
         }
         rname = reg_val
         let rec_badge = "[REC @" ++ rname ++ "]"
-        cmds.push(DrawCmd.TextRun(cur_x, text_y, rec_badge, font_fam, font_sz, theme.diag_err, false, false, false))
+        cmds.push(DrawCmd.text_run(cur_x, text_y, rec_badge, font_fam, font_sz, theme.diag_err, false, false, false))
         cur_x += (str_display_width(rec_badge) + 1).as(f64) * cell_w
     }
 
     if not world.active_jobs.is_empty() {
         let jbadge = "[Jobs: " ++ world.active_jobs.len().to_string() ++ "]"
-        cmds.push(DrawCmd.TextRun(cur_x, text_y, jbadge, font_fam, font_sz, theme.diag_warn, false, false, false))
+        cmds.push(DrawCmd.text_run(cur_x, text_y, jbadge, font_fam, font_sz, theme.diag_warn, false, false, false))
         cur_x += (str_display_width(jbadge) + 1).as(f64) * cell_w
     }
 
     if is_focused and world.statusline_left_extra != "" {
-        cmds.push(DrawCmd.TextRun(
+        cmds.push(DrawCmd.text_run(
             cur_x,
             text_y,
             world.statusline_left_extra,
@@ -3202,7 +3301,7 @@ fn render_pane_mode_line(
     }
 
     if is_focused and world.pending_keys_display != "" {
-        cmds.push(DrawCmd.TextRun(
+        cmds.push(DrawCmd.text_run(
             cur_x,
             text_y,
             world.pending_keys_display,
@@ -3230,43 +3329,8 @@ fn render_pane_mode_line(
         ++ "  " ++ pct.to_string() ++ "%"
     let rhs_x = r.x + r.w - (str_display_width(rhs).as(f64) * cell_w) - 8.0
     if rhs_x > cur_x {
-        cmds.push(DrawCmd.TextRun(rhs_x, text_y, rhs, font_fam, font_sz, theme.fg_muted, false, false, false))
+        cmds.push(DrawCmd.text_run(rhs_x, text_y, rhs, font_fam, font_sz, theme.fg_muted, false, false, false))
     }
-}
-
-fn index_best_signs_by_row(signs: List) -> HashMap {
-    let by_row = HashMap.new()
-    for i in 0..signs.len() {
-        let s = signs.get(i.as(usize)).as(GutterSign)
-        let prev_opt = by_row.get(s.row)
-        if prev_opt != null {
-            let prev = prev_opt.as(GutterSign)
-            if s.priority >= prev.priority {
-                by_row.insert(s.row, s)
-            }
-        } else {
-            by_row.insert(s.row, s)
-        }
-    }
-    by_row
-}
-
-fn index_virt_texts_by_row(vts: List) -> HashMap {
-    let by_row = HashMap.new()
-    for i in 0..vts.len() {
-        let vt = vts.get(i.as(usize)).as(VirtualTextDecor)
-        if vt.text != "" {
-            let bucket_opt = by_row.get(vt.row)
-            if bucket_opt != null {
-                bucket_opt.as(List).push(vt)
-            } else {
-                let b = List()
-                b.push(vt)
-                by_row.insert(vt.row, b)
-            }
-        }
-    }
-    by_row
 }
 
 fn index_inline_decors_by_row(decors: List) -> HashMap {
@@ -3311,12 +3375,220 @@ fn emit_single_text_segment(
         let draw_vcol = if cur_vcol < left_col { extra_off } else { cur_vcol - left_col }
         let draw_x = text_x0 + draw_vcol.as(f64) * cell_w
         if draw_x < pane_right_x and vis_text != "" {
-            cmds.push(DrawCmd.TextRun(
+            cmds.push(DrawCmd.text_run(
                 draw_x, row_y, vis_text, font_fam, font_sz, fg, false, italic, ul,
             ))
         }
     }
     next_vcol
+}
+
+fn emit_ts_row_spans(
+    cmds: List,
+    raw_line: String,
+    spans: List,
+    dim_row: bool,
+    tabstop: i64,
+    left_col: i64,
+    text_x0: f64,
+    pane_right_x: f64,
+    row_y: f64,
+    cell_w: f64,
+    font_fam: String,
+    font_sz: f64,
+    theme: ThemePalette,
+) -> i64 {
+    let n = raw_line.char_len()
+    if n == 0 {
+        return 0
+    }
+    let default_eff_fg = if dim_row { theme.fg_muted } else { theme.fg }
+    if spans.is_empty() {
+        return emit_single_text_segment(
+            cmds, raw_line, 0, tabstop, left_col, text_x0, pane_right_x,
+            row_y, cell_w, font_fam, font_sz, default_eff_fg, false, false,
+        )
+    }
+    var cur_vcol: i64 = 0
+    var pos: i64 = 0
+    var run_start: i64 = 0
+    var cur_raw_fg: i64 = theme.fg
+    var cur_it = false
+    var has_run = false
+
+    for i in 0..spans.len() {
+        let sp = spans.get(i.as(usize)).as(TsSpan)
+        let s0 = if sp.start_col < pos { pos } else if sp.start_col > n { n } else { sp.start_col }
+        let e0 = if sp.end_col > n { n } else { sp.end_col }
+        if s0 > pos {
+            if not has_run {
+                run_start = pos
+                cur_raw_fg = theme.fg
+                cur_it = false
+                has_run = true
+            } else if cur_raw_fg != theme.fg or cur_it != false {
+                cur_vcol = emit_single_text_segment(
+                    cmds, raw_line.slice(run_start, pos), cur_vcol, tabstop, left_col,
+                    text_x0, pane_right_x, row_y, cell_w, font_fam, font_sz,
+                    if dim_row { theme.fg_muted } else { cur_raw_fg }, cur_it, false,
+                )
+                run_start = pos
+                cur_raw_fg = theme.fg
+                cur_it = false
+            }
+            pos = s0
+        }
+        if e0 > s0 {
+            let (tok_col, is_it) = ts_hl_group_style(sp.hl_group, theme)
+            if not has_run {
+                run_start = s0
+                cur_raw_fg = tok_col
+                cur_it = is_it
+                has_run = true
+            } else if cur_raw_fg != tok_col or cur_it != is_it {
+                cur_vcol = emit_single_text_segment(
+                    cmds, raw_line.slice(run_start, s0), cur_vcol, tabstop, left_col,
+                    text_x0, pane_right_x, row_y, cell_w, font_fam, font_sz,
+                    if dim_row { theme.fg_muted } else { cur_raw_fg }, cur_it, false,
+                )
+                run_start = s0
+                cur_raw_fg = tok_col
+                cur_it = is_it
+            }
+            pos = e0
+        }
+    }
+    if pos < n {
+        if not has_run {
+            run_start = pos
+            cur_raw_fg = theme.fg
+            cur_it = false
+            has_run = true
+        } else if cur_raw_fg != theme.fg or cur_it != false {
+            cur_vcol = emit_single_text_segment(
+                cmds, raw_line.slice(run_start, pos), cur_vcol, tabstop, left_col,
+                text_x0, pane_right_x, row_y, cell_w, font_fam, font_sz,
+                if dim_row { theme.fg_muted } else { cur_raw_fg }, cur_it, false,
+            )
+            run_start = pos
+            cur_raw_fg = theme.fg
+            cur_it = false
+        }
+    }
+    if has_run and run_start < n {
+        cur_vcol = emit_single_text_segment(
+            cmds, raw_line.slice(run_start, n), cur_vcol, tabstop, left_col,
+            text_x0, pane_right_x, row_y, cell_w, font_fam, font_sz,
+            if dim_row { theme.fg_muted } else { cur_raw_fg }, cur_it, false,
+        )
+    }
+    cur_vcol
+}
+
+fn clamp_col_bound(c: i64, n: i64) -> i64 {
+    if c < 0 { 0 } else if c > n { n } else { c }
+}
+
+fn emit_ts_row_spans_with_fg_decs(
+    cmds: List,
+    raw_line: String,
+    spans: List,
+    fg_decs: List,
+    dim_row: bool,
+    tabstop: i64,
+    left_col: i64,
+    text_x0: f64,
+    pane_right_x: f64,
+    row_y: f64,
+    cell_w: f64,
+    font_fam: String,
+    font_sz: f64,
+    theme: ThemePalette,
+) -> i64 {
+    let n = raw_line.char_len()
+    if n == 0 {
+        return 0
+    }
+    let base_default_fg = if dim_row { theme.fg_muted } else { theme.fg }
+    var cur_vcol: i64 = 0
+    var ts_idx: usize = 0
+    let ts_len = spans.len()
+    let dec_len = fg_decs.len()
+    var has_run = false
+    var run_start: i64 = 0
+    var cur_fg: i64 = base_default_fg
+    var cur_it = false
+    var cur_ul = false
+
+    var pos: i64 = 0
+    while pos < n {
+        var next_pos = n
+        var fg = base_default_fg
+        var it = false
+        var ul = false
+        while ts_idx < ts_len {
+            let sp = spans.get(ts_idx).as(TsSpan)
+            let s0 = clamp_col_bound(sp.start_col, n)
+            let e0 = clamp_col_bound(sp.end_col, n)
+            if e0 <= pos {
+                ts_idx += 1
+            } else {
+                if s0 <= pos {
+                    let (tok_col, is_it) = ts_hl_group_style(sp.hl_group, theme)
+                    fg = if dim_row { theme.fg_muted } else { tok_col }
+                    it = is_it
+                    if e0 < next_pos {
+                        next_pos = e0
+                    }
+                } else if s0 < next_pos {
+                    next_pos = s0
+                }
+                break
+            }
+        }
+        for di in 0..dec_len {
+            let dec = fg_decs.get(di.as(usize)).as(InlineSpanDecor)
+            let ds = clamp_col_bound(dec.start_col, n)
+            let de = clamp_col_bound(dec.end_col, n)
+            if ds <= pos and pos < de {
+                fg = if dec.fg_rgba != 0 { dec.fg_rgba } else { theme.accent }
+                if dec.underline {
+                    ul = true
+                }
+                if de < next_pos {
+                    next_pos = de
+                }
+            } else if ds > pos and ds < next_pos {
+                next_pos = ds
+            }
+        }
+        if not has_run {
+            run_start = pos
+            cur_fg = fg
+            cur_it = it
+            cur_ul = ul
+            has_run = true
+        } else if cur_fg != fg or cur_it != it or cur_ul != ul {
+            cur_vcol = emit_single_text_segment(
+                cmds, raw_line.slice(run_start, pos), cur_vcol, tabstop, left_col,
+                text_x0, pane_right_x, row_y, cell_w, font_fam, font_sz,
+                cur_fg, cur_it, cur_ul,
+            )
+            run_start = pos
+            cur_fg = fg
+            cur_it = it
+            cur_ul = ul
+        }
+        pos = if next_pos > pos { next_pos } else { pos + 1 }
+    }
+    if has_run and run_start < n {
+        cur_vcol = emit_single_text_segment(
+            cmds, raw_line.slice(run_start, n), cur_vcol, tabstop, left_col,
+            text_x0, pane_right_x, row_y, cell_w, font_fam, font_sz,
+            cur_fg, cur_it, cur_ul,
+        )
+    }
+    cur_vcol
 }
 
 fn emit_segmented_row_runs(
@@ -3339,72 +3611,175 @@ fn emit_segmented_row_runs(
     if n == 0 {
         return 0
     }
-    let col_fg = List()
-    let col_italic = List()
-    let col_ul = List()
     let base_default_fg = if dim_row { theme.fg_muted } else { theme.fg }
-    for _ in 0..n {
-        col_fg.push(base_default_fg)
-        col_italic.push(false)
-        col_ul.push(false)
-    }
-    for ri in 0..runs.len() {
-        let (s_col, tok_text, tok_color, _tok_bold, tok_italic) =
-            runs.get(ri.as(usize)).as((i64, String, i64, bool, bool))
-        let tlen = tok_text.char_len()
-        let e_col = if s_col + tlen > n { n } else { s_col + tlen }
-        let s0 = if s_col < 0 { 0 } else { s_col }
-        let eff_fg = if dim_row { theme.fg_muted } else { tok_color }
-        for c in s0..e_col {
-            let cu = c.as(usize)
-            col_fg.set(cu, eff_fg)
-            col_italic.set(cu, tok_italic)
+    if fg_decs.is_empty() {
+        var monotonic = true
+        var chk_pos: i64 = 0
+        for ri in 0..runs.len() {
+            let (s_col, tok_text, _, _, _) =
+                runs.get(ri.as(usize)).as((i64, String, i64, bool, bool))
+            if s_col < chk_pos {
+                monotonic = false
+                break
+            }
+            chk_pos = s_col + tok_text.char_len()
         }
-    }
-    for di in 0..fg_decs.len() {
-        let dec = fg_decs.get(di.as(usize)).as(InlineSpanDecor)
-        let s0 = if dec.start_col < 0 { 0 } else { dec.start_col }
-        let e0 = if dec.end_col > n { n } else { dec.end_col }
-        if e0 > s0 {
-            let dfg = if dec.fg_rgba != 0 { dec.fg_rgba } else { theme.accent }
-            for c in s0..e0 {
-                let cu = c.as(usize)
-                col_fg.set(cu, dfg)
-                if dec.underline {
-                    col_ul.set(cu, true)
+        if monotonic {
+            var fast_vcol: i64 = 0
+            var pos: i64 = 0
+            var run_start: i64 = 0
+            var cur_fg = base_default_fg
+            var cur_it = false
+            var has_run = false
+            for ri in 0..runs.len() {
+                let (s_col, tok_text, tok_color, _tok_bold, tok_italic) =
+                    runs.get(ri.as(usize)).as((i64, String, i64, bool, bool))
+                let s0 = if s_col > n { n } else { s_col }
+                let e_raw = s_col + tok_text.char_len()
+                let e0 = if e_raw > n { n } else { e_raw }
+                if s0 > pos {
+                    if not has_run {
+                        run_start = pos
+                        cur_fg = base_default_fg
+                        cur_it = false
+                        has_run = true
+                    } else if cur_fg != base_default_fg or cur_it != false {
+                        fast_vcol = emit_single_text_segment(
+                            cmds, raw_line.slice(run_start, pos), fast_vcol, tabstop, left_col,
+                            text_x0, pane_right_x, row_y, cell_w, font_fam, font_sz,
+                            cur_fg, cur_it, false,
+                        )
+                        run_start = pos
+                        cur_fg = base_default_fg
+                        cur_it = false
+                    }
+                    pos = s0
+                }
+                if e0 > s0 {
+                    let eff_fg = if dim_row { theme.fg_muted } else { tok_color }
+                    if not has_run {
+                        run_start = s0
+                        cur_fg = eff_fg
+                        cur_it = tok_italic
+                        has_run = true
+                    } else if cur_fg != eff_fg or cur_it != tok_italic {
+                        fast_vcol = emit_single_text_segment(
+                            cmds, raw_line.slice(run_start, s0), fast_vcol, tabstop, left_col,
+                            text_x0, pane_right_x, row_y, cell_w, font_fam, font_sz,
+                            cur_fg, cur_it, false,
+                        )
+                        run_start = s0
+                        cur_fg = eff_fg
+                        cur_it = tok_italic
+                    }
+                    pos = e0
                 }
             }
+            if pos < n {
+                if not has_run {
+                    run_start = pos
+                    cur_fg = base_default_fg
+                    cur_it = false
+                    has_run = true
+                } else if cur_fg != base_default_fg or cur_it != false {
+                    fast_vcol = emit_single_text_segment(
+                        cmds, raw_line.slice(run_start, pos), fast_vcol, tabstop, left_col,
+                        text_x0, pane_right_x, row_y, cell_w, font_fam, font_sz,
+                        cur_fg, cur_it, false,
+                    )
+                    run_start = pos
+                    cur_fg = base_default_fg
+                    cur_it = false
+                }
+            }
+            if has_run and run_start < n {
+                fast_vcol = emit_single_text_segment(
+                    cmds, raw_line.slice(run_start, n), fast_vcol, tabstop, left_col,
+                    text_x0, pane_right_x, row_y, cell_w, font_fam, font_sz,
+                    cur_fg, cur_it, false,
+                )
+            }
+            return fast_vcol
         }
     }
+    let r_len = runs.len()
+    let run_ranges = List()
+    for ri in 0..r_len {
+        let (s_col, tok_text, tok_color, _tok_bold, tok_italic) =
+            runs.get(ri.as(usize)).as((i64, String, i64, bool, bool))
+        let s0 = clamp_col_bound(s_col, n)
+        let e0 = clamp_col_bound(s_col + tok_text.char_len(), n)
+        run_ranges.push((s0, e0, if dim_row { theme.fg_muted } else { tok_color }, tok_italic))
+    }
+    let dec_len = fg_decs.len()
 
     var cur_vcol: i64 = 0
+    var has_run = false
     var run_start: i64 = 0
-    var cur_fg = col_fg.get(0).as(i64)
-    var cur_italic = col_italic.get(0).as(bool)
-    var cur_ul = col_ul.get(0).as(bool)
+    var cur_fg = base_default_fg
+    var cur_italic = false
+    var cur_ul = false
 
-    for c in 1..n {
-        let cu = c.as(usize)
-        let fg = col_fg.get(cu).as(i64)
-        let italic = col_italic.get(cu).as(bool)
-        let ul = col_ul.get(cu).as(bool)
-        if fg != cur_fg or italic != cur_italic or ul != cur_ul {
-            let seg = raw_line.slice(run_start, c)
+    var pos: i64 = 0
+    while pos < n {
+        var next_pos = n
+        var fg = base_default_fg
+        var italic = false
+        var ul = false
+        for ri in 0..r_len {
+            let (s0, e0, eff_fg, tok_it) = run_ranges.get(ri.as(usize)).as((i64, i64, i64, bool))
+            if s0 <= pos and pos < e0 {
+                fg = eff_fg
+                italic = tok_it
+                if e0 < next_pos {
+                    next_pos = e0
+                }
+            } else if s0 > pos and s0 < next_pos {
+                next_pos = s0
+            }
+        }
+        for di in 0..dec_len {
+            let dec = fg_decs.get(di.as(usize)).as(InlineSpanDecor)
+            let ds = clamp_col_bound(dec.start_col, n)
+            let de = clamp_col_bound(dec.end_col, n)
+            if ds <= pos and pos < de {
+                fg = if dec.fg_rgba != 0 { dec.fg_rgba } else { theme.accent }
+                if dec.underline {
+                    ul = true
+                }
+                if de < next_pos {
+                    next_pos = de
+                }
+            } else if ds > pos and ds < next_pos {
+                next_pos = ds
+            }
+        }
+        if not has_run {
+            run_start = pos
+            cur_fg = fg
+            cur_italic = italic
+            cur_ul = ul
+            has_run = true
+        } else if fg != cur_fg or italic != cur_italic or ul != cur_ul {
             cur_vcol = emit_single_text_segment(
-                cmds, seg, cur_vcol, tabstop, left_col, text_x0, pane_right_x,
-                row_y, cell_w, font_fam, font_sz, cur_fg, cur_italic, cur_ul,
+                cmds, raw_line.slice(run_start, pos), cur_vcol, tabstop, left_col,
+                text_x0, pane_right_x, row_y, cell_w, font_fam, font_sz,
+                cur_fg, cur_italic, cur_ul,
             )
-            run_start = c
+            run_start = pos
             cur_fg = fg
             cur_italic = italic
             cur_ul = ul
         }
+        pos = if next_pos > pos { next_pos } else { pos + 1 }
     }
-    let tail = raw_line.slice(run_start, n)
-    cur_vcol = emit_single_text_segment(
-        cmds, tail, cur_vcol, tabstop, left_col, text_x0, pane_right_x,
-        row_y, cell_w, font_fam, font_sz, cur_fg, cur_italic, cur_ul,
-    )
+    if has_run and run_start < n {
+        cur_vcol = emit_single_text_segment(
+            cmds, raw_line.slice(run_start, n), cur_vcol, tabstop, left_col,
+            text_x0, pane_right_x, row_y, cell_w, font_fam, font_sz,
+            cur_fg, cur_italic, cur_ul,
+        )
+    }
     cur_vcol
 }
 
@@ -3433,8 +3808,8 @@ fn render_yazi_column(
     let text_x0 = x + pad_x
     let right_x = x + w - 4.0
 
-    cmds.push(DrawCmd.ClipPush(x, y, w, h))
-    cmds.push(DrawCmd.FillRect(x, y, w, h, theme.bg, 0.0))
+    cmds.push(DrawCmd.clip_push(x, y, w, h))
+    cmds.push(DrawCmd.fill_rect(x, y, w, h, theme.bg, 0.0))
 
     let max_rows = ((h / cell_h).floor().as(i64))
     let total_lines = col_buf.line_count()
@@ -3465,10 +3840,10 @@ fn render_yazi_column(
             (0, "", -1)
         }
         if col_fk > 0 and col_fk <= 4 and right_x > text_x0 {
-            cmds.push(DrawCmd.FillRect(text_x0, row_y, right_x - text_x0, cell_h, theme.bg_alt, 0.0))
+            cmds.push(DrawCmd.fill_rect(text_x0, row_y, right_x - text_x0, cell_h, theme.bg_alt, 0.0))
         }
         if highlight_active_row and buf_row == active_row {
-            cmds.push(DrawCmd.FillRect(x + 2.0, row_y, w - 4.0, cell_h, theme.bg_cursor_line, 3.0))
+            cmds.push(DrawCmd.fill_rect(x + 2.0, row_y, w - 4.0, cell_h, theme.bg_cursor_line, 3.0))
         }
         let raw_line = col_buf.line_at(buf_row)
         let row_decs_opt = row_decors_map.get(buf_row)
@@ -3525,7 +3900,7 @@ fn render_yazi_column(
         ri += 1
     }
 
-    cmds.push(DrawCmd.ClipPop)
+    cmds.push(DrawCmd.clip_pop)
 }
 
 fn render_yazi_dirvish_pane(
@@ -3545,8 +3920,8 @@ fn render_yazi_dirvish_pane(
     let content_h = if r.h - ml_h > cell_h { r.h - ml_h } else { cell_h }
     let tabstop = safe_tabstop(world.options)
 
-    cmds.push(DrawCmd.ClipPush(r.x, r.y, r.w, r.h))
-    cmds.push(DrawCmd.FillRect(r.x, r.y, r.w, content_h, theme.bg, 0.0))
+    cmds.push(DrawCmd.clip_push(r.x, r.y, r.w, r.h))
+    cmds.push(DrawCmd.fill_rect(r.x, r.y, r.w, content_h, theme.bg, 0.0))
 
     let parent_opt = world.find_buffer_by_name("*dirvish-parent*")
     let preview_opt = world.find_buffer_by_name("*dirvish-preview*")
@@ -3580,8 +3955,8 @@ fn render_yazi_dirvish_pane(
             cmds, world, preview_buf, r.x + parent_w + center_w, r.y, preview_w, content_h,
             0, -1, false, cell_w, cell_h, tabstop, theme,
         )
-        cmds.push(DrawCmd.Line(r.x + parent_w, r.y, r.x + parent_w, r.y + content_h, theme.border, 1.0))
-        cmds.push(DrawCmd.Line(r.x + parent_w + center_w, r.y, r.x + parent_w + center_w, r.y + content_h, theme.border, 1.0))
+        cmds.push(DrawCmd.line(r.x + parent_w, r.y, r.x + parent_w, r.y + content_h, theme.border, 1.0))
+        cmds.push(DrawCmd.line(r.x + parent_w + center_w, r.y, r.x + parent_w + center_w, r.y + content_h, theme.border, 1.0))
     } else {
         render_yazi_column(
             cmds, world, buf, r.x, r.y, r.w, content_h,
@@ -3593,19 +3968,87 @@ fn render_yazi_dirvish_pane(
         cmds, kernel, world, buf, pane, is_focused,
         r.y + r.h - ml_h, ml_h, cell_w, theme,
     )
-    cmds.push(DrawCmd.ClipPop)
+    cmds.push(DrawCmd.clip_pop)
 
     if r.x > 1.0 {
-        cmds.push(DrawCmd.Line(r.x, r.y, r.x, r.y + r.h, theme.border, 1.0))
+        cmds.push(DrawCmd.line(r.x, r.y, r.x, r.y + r.h, theme.border, 1.0))
     }
     if r.y > top_bar_height(world) + 1.0 {
-        cmds.push(DrawCmd.Line(r.x, r.y, r.x + r.w, r.y, theme.border, 1.0))
+        cmds.push(DrawCmd.line(r.x, r.y, r.x + r.w, r.y, theme.border, 1.0))
     }
 }
 
 private global _scope_shadow_doc_id: i64 = -1
 private global _scope_shadow_edit_ver: i64 = -1
-private global _scope_shadow_map: ?HashMap = null
+private global _scope_shadow_line_cnt: i64 = -1
+private global _scope_shadow_win_lo: i64 = -1
+private global _scope_shadow_win_hi: i64 = -1
+private global _scope_shadow_blocks: ?List = null
+private global _scope_shadow_map: ?Map = null
+private global _ts_vp_doc_id: i64 = -1
+private global _ts_vp_edit_ver: i64 = -1
+private global _ts_vp_lang: String = ""
+private global _ts_vp_first_row: i64 = -1
+private global _ts_vp_last_row: i64 = -1
+private global _ts_vp_rows: ?List = null
+
+fn index_inline_decors_in_row_range(decors: List, lo_row: i64, hi_row: i64) -> Map {
+    let by_row = Map.new()
+    for i in 0..decors.len() {
+        let dec = decors.get(i.as(usize)).as(InlineSpanDecor)
+        if dec.row >= lo_row and dec.row <= hi_row {
+            let rk = dec.row.to_string()
+            let bucket_opt = by_row.get(rk)
+            if bucket_opt != null {
+                bucket_opt.as(List).push(dec)
+            } else {
+                let b = List()
+                b.push(dec)
+                by_row.set(rk, b)
+            }
+        }
+    }
+    by_row
+}
+
+fn index_best_signs_in_row_range(signs: List, lo_row: i64, hi_row: i64) -> Map {
+    let by_row = Map.new()
+    for i in 0..signs.len() {
+        let s = signs.get(i.as(usize)).as(GutterSign)
+        if s.row >= lo_row and s.row <= hi_row {
+            let rk = s.row.to_string()
+            let prev_opt = by_row.get(rk)
+            if prev_opt != null {
+                let prev = prev_opt.as(GutterSign)
+                if s.priority >= prev.priority {
+                    by_row.set(rk, s)
+                }
+            } else {
+                by_row.set(rk, s)
+            }
+        }
+    }
+    by_row
+}
+
+fn index_virt_texts_in_row_range(vts: List, lo_row: i64, hi_row: i64) -> Map {
+    let by_row = Map.new()
+    for i in 0..vts.len() {
+        let vt = vts.get(i.as(usize)).as(VirtualTextDecor)
+        if vt.row >= lo_row and vt.row <= hi_row and vt.text != "" {
+            let rk = vt.row.to_string()
+            let bucket_opt = by_row.get(rk)
+            if bucket_opt != null {
+                bucket_opt.as(List).push(vt)
+            } else {
+                let b = List()
+                b.push(vt)
+                by_row.set(rk, b)
+            }
+        }
+    }
+    by_row
+}
 
 fn color_with_alpha(packed_rgba: i64, alpha_byte: i64) -> i64 {
     let clamped = if alpha_byte < 0 { 0 } else if alpha_byte > 255 { 255 } else { alpha_byte }
@@ -3637,32 +4080,58 @@ fn short_scope_kind_prefix(raw_kind: String) -> String {
     }
 }
 
-fn get_cached_closing_scope_hints(buf: Buffer, mode_lc: String) -> HashMap {
-    if not is_brace_scope_mode(mode_lc) {
-        return HashMap.new()
+fn get_cached_closing_scope_hints(
+    buf: Buffer,
+    mode_lc: String,
+    first_vis_row: i64,
+    last_vis_row: i64,
+) -> Map {
+    if (not is_brace_scope_mode(mode_lc)) or last_vis_row < first_vis_row or first_vis_row < 0 {
+        return Map.new()
     }
     if _scope_shadow_doc_id == buf.doc_id
         and _scope_shadow_edit_ver == buf.edit_version
+        and first_vis_row >= _scope_shadow_win_lo
+        and last_vis_row <= _scope_shadow_win_hi
         and _scope_shadow_map != null {
-        return _scope_shadow_map.as(HashMap)
+        return _scope_shadow_map.as(Map)
     }
-    let m = HashMap.new()
+    let lcount = buf.line_count()
+    let win_lo = if first_vis_row > 32 { first_vis_row - 32 } else { 0 }
+    let win_hi = if last_vis_row + 32 < lcount { last_vis_row + 32 } else { lcount - 1 }
+    let cur_line = buf.line_at(buf.point.row)
+    let blocks = if _scope_shadow_doc_id == buf.doc_id
+        and _scope_shadow_line_cnt == lcount
+        and _scope_shadow_blocks != null
+        and (not cur_line.contains("{{"))
+        and (not cur_line.contains("}}")) {
+        _scope_shadow_blocks.as(List)
+    } else {
+        buf.scan_symbol_blocks(max_items = 600)
+    }
+    let m = Map.new()
     let cmt_pfx = if mode_lc == "nessa" or mode_lc == "lua" { "-- " } else { "// " }
-    let blocks = buf.scan_symbol_blocks(max_items = 600)
     for i in 0..blocks.len() {
         let (sname, skind, srow, erow) = blocks.get(i.as(usize)).as((String, String, i64, i64))
-        if sname != "" and erow - srow >= 6 and (not m.contains_key(erow)) {
-            let end_trim = buf.line_at(erow).trim()
-            if end_trim == "}}" or end_trim == "}};" or end_trim == "}}," {
-                let kp = short_scope_kind_prefix(skind)
-                if kp != "" {
-                    m.insert(erow, cmt_pfx ++ kp ++ sname)
+        if erow >= win_lo and erow <= win_hi and sname != "" and erow - srow >= 6 {
+            let erk = erow.to_string()
+            if not m.contains(erk) {
+                let end_trim = buf.line_at(erow).trim()
+                if end_trim == "}}" or end_trim == "}};" or end_trim == "}}," {
+                    let kp = short_scope_kind_prefix(skind)
+                    if kp != "" {
+                        m.set(erk, cmt_pfx ++ kp ++ sname)
+                    }
                 }
             }
         }
     }
     _scope_shadow_doc_id = buf.doc_id
     _scope_shadow_edit_ver = buf.edit_version
+    _scope_shadow_line_cnt = lcount
+    _scope_shadow_win_lo = win_lo
+    _scope_shadow_win_hi = win_hi
+    _scope_shadow_blocks = blocks
     _scope_shadow_map = m
     m
 }
@@ -3702,29 +4171,13 @@ fn render_window_pane(
     let font_fam = world.options.font_family
     let font_sz = world.options.font_size_pt
 
-    cmds.push(DrawCmd.ClipPush(r.x, r.y, r.w, r.h))
-    cmds.push(DrawCmd.FillRect(r.x, r.y, r.w, content_h, theme.bg, 0.0))
-    cmds.push(DrawCmd.FillRect(r.x, r.y, gutter_w, content_h, theme.bg_alt, 0.0))
+    cmds.push(DrawCmd.clip_push(r.x, r.y, r.w, r.h))
+    cmds.push(DrawCmd.fill_rect(r.x, r.y, r.w, content_h, theme.bg, 0.0))
+    cmds.push(DrawCmd.fill_rect(r.x, r.y, gutter_w, content_h, theme.bg_alt, 0.0))
 
     let max_rows = wm.pane_rows(pane)
     let vis_rows = visible_buffer_rows(buf, pane.top_row, max_rows)
     let row_count = vis_rows.len()
-    let row_decors_map = if buf.inline_decors.is_empty() {
-        HashMap.new()
-    } else {
-        index_inline_decors_by_row(buf.inline_decors)
-    }
-    let row_signs_map = if buf.signs.is_empty() {
-        HashMap.new()
-    } else {
-        index_best_signs_by_row(buf.signs)
-    }
-    let row_vts_map = if buf.virt_texts.is_empty() {
-        HashMap.new()
-    } else {
-        index_virt_texts_by_row(buf.virt_texts)
-    }
-
     let mode_lc = buf.major_mode.to_lower()
     let is_markdown_buf = mode_lc == "markdown" or mode_lc == "md" or mode_lc == "gfm"
     let first_vis_row = if row_count > 0 { vis_rows.get(0).as(i64) } else { -1 }
@@ -3733,6 +4186,22 @@ fn render_window_pane(
     } else {
         -1
     }
+    let row_decors_map = if buf.inline_decors.is_empty() or first_vis_row < 0 {
+        Map.new()
+    } else {
+        index_inline_decors_in_row_range(buf.inline_decors, first_vis_row, last_vis_row)
+    }
+    let row_signs_map = if buf.signs.is_empty() or first_vis_row < 0 {
+        Map.new()
+    } else {
+        index_best_signs_in_row_range(buf.signs, first_vis_row, last_vis_row)
+    }
+    let row_vts_map = if buf.virt_texts.is_empty() or first_vis_row < 0 {
+        Map.new()
+    } else {
+        index_virt_texts_in_row_range(buf.virt_texts, first_vis_row, last_vis_row)
+    }
+
     let md_fence_states = if is_markdown_buf and last_vis_row >= 0 {
         compute_markdown_fence_states(buf, last_vis_row)
     } else {
@@ -3744,18 +4213,44 @@ fn render_window_pane(
         ""
     }
     let ts_viewport_rows = if ts_lang != "" and first_vis_row >= 0 and last_vis_row >= first_vis_row {
-        buf.sync_external_lines()
-        accel_ts_highlight_rows(buf.doc_id, ts_lang, first_vis_row, last_vis_row)
+        if _ts_vp_doc_id == buf.doc_id
+            and _ts_vp_edit_ver == buf.edit_version
+            and _ts_vp_lang == ts_lang
+            and _ts_vp_first_row == first_vis_row
+            and _ts_vp_last_row == last_vis_row
+            and _ts_vp_rows != null {
+            _ts_vp_rows.as(List)
+        } else {
+            buf.sync_external_lines()
+            let fetched = accel_ts_highlight_rows(buf.doc_id, ts_lang, first_vis_row, last_vis_row)
+            _ts_vp_doc_id = buf.doc_id
+            _ts_vp_edit_ver = buf.edit_version
+            _ts_vp_lang = ts_lang
+            _ts_vp_first_row = first_vis_row
+            _ts_vp_last_row = last_vis_row
+            _ts_vp_rows = fetched
+            fetched
+        }
     } else {
         List()
     }
 
     let show_indent_guides = world.options.indent_guides and should_render_indent_guides(buf.major_mode)
     let indent_step = if world.options.shiftwidth > 0 { world.options.shiftwidth } else { tabstop }
-    let (eff_indent_map, active_guide_vcol, scope_start_row, scope_end_row) = if show_indent_guides and row_count > 0 {
-        compute_pane_indent_guides(buf, vis_rows, pane.cursor.row, is_focused, tabstop, world.options.shiftwidth)
+    let (eff_indent_lo, eff_indent_arr, active_guide_vcol, scope_start_row, scope_end_row) = if show_indent_guides and row_count > 0 {
+        get_cached_pane_indent_guides(
+            pane.id.raw(),
+            buf,
+            vis_rows,
+            pane.top_row,
+            max_rows,
+            pane.cursor.row,
+            is_focused,
+            tabstop,
+            world.options.shiftwidth,
+        )
     } else {
-        (HashMap.new(), -1, -1, -1)
+        (0, List(), -1, -1, -1)
     }
 
     let search_active = world.options.hlsearch and world.search_highlight_active and world.last_search != ""
@@ -3766,28 +4261,44 @@ fn render_window_pane(
         null
     }
     let scope_hints_map = if world.options.shadow_text {
-        get_cached_closing_scope_hints(buf, mode_lc)
+        get_cached_closing_scope_hints(buf, mode_lc, first_vis_row, last_vis_row)
     } else {
-        HashMap.new()
+        Map.new()
+    }
+
+    let has_any_folds = not buf.folded_rows.is_empty()
+    let is_narrowed = buf.is_narrowed()
+    let contiguous_vis = row_count > 0 and first_vis_row >= 0 and (last_vis_row - first_vis_row + 1 == row_count)
+    let batched_lines = if contiguous_vis {
+        buf.slice_lines(first_vis_row, last_vis_row + 1)
+    } else {
+        List()
     }
 
     for s_idx in 0..row_count {
         let buf_row = vis_rows.get(s_idx.as(usize)).as(i64)
+        let buf_row_key = buf_row.to_string()
         let row_y = r.y + s_idx.as(f64) * cell_h
-        let raw_line = buf.line_at(buf_row)
+        let raw_line = if contiguous_vis and s_idx < batched_lines.len() {
+            batched_lines.get(s_idx.as(usize)).as(String)
+        } else {
+            buf.line_at(buf_row)
+        }
         let is_cursor_row = buf_row == pane.cursor.row
         let (md_fence_kind, md_fence_mode, md_open_row) = if is_markdown_buf and buf_row >= 0 and buf_row < md_fence_states.len() {
             md_fence_states.get(buf_row.as(usize)).as((i64, String, i64))
         } else {
             (0, "", -1)
         }
-        let is_folded = buf.folded_rows.contains(buf_row)
+        let is_folded = has_any_folds and (
+            buf.folded_rows.contains(buf_row)
             or (
                 md_fence_kind == 0
                 and heading_fold_level(raw_line, buf.major_mode) > 0
                 and buf_row + 1 <= buf.max_row()
                 and buf.folded_rows.contains(buf_row + 1)
             )
+        )
         let dim_row = world.options.twilight_mode
             and is_focused
             and abs_i64(buf_row - pane.cursor.row) > 8
@@ -3799,19 +4310,19 @@ fn render_window_pane(
             and raw_line.contains("|")
             and is_markdown_table_sep(buf.line_at(buf_row + 1).chars(), buf.line_at(buf_row + 1).char_len())
         if ((md_fence_kind >= 1 and md_fence_kind <= 4) or is_md_table_hdr) and pane_right_x > text_x0 {
-            cmds.push(DrawCmd.FillRect(text_x0, row_y, pane_right_x - text_x0, cell_h, theme.bg_alt, 0.0))
+            cmds.push(DrawCmd.fill_rect(text_x0, row_y, pane_right_x - text_x0, cell_h, theme.bg_alt, 0.0))
         }
 
         -- 1. Focused cursor line background
         if is_focused and is_cursor_row and world.options.cursorline and pane_right_x > text_x0 {
-            cmds.push(DrawCmd.FillRect(text_x0, row_y, pane_right_x - text_x0, cell_h, theme.bg_cursor_line, 0.0))
+            cmds.push(DrawCmd.fill_rect(text_x0, row_y, pane_right_x - text_x0, cell_h, theme.bg_cursor_line, 0.0))
         }
 
         -- 2. Gutter (narrow marker `N`, fold marker `▸`, plugin `GutterSign`, absolute / relative line numbers)
-        let row_sign_opt = row_signs_map.get(buf_row)
+        let row_sign_opt = row_signs_map.get(buf_row_key)
         let (marker_ch, marker_color) = if is_folded {
             ("▸", theme.accent)
-        } else if buf.is_narrowed() {
+        } else if is_narrowed {
             ("N", theme.diag_warn)
         } else if row_sign_opt != null {
             let sg = row_sign_opt.as(GutterSign)
@@ -3820,7 +4331,7 @@ fn render_window_pane(
             (" ", theme.diag_warn)
         }
         if marker_ch != " " and marker_ch != "" {
-            cmds.push(DrawCmd.TextRun(r.x + 2.0, row_y, marker_ch, font_fam, font_sz, marker_color, false, false, false))
+            cmds.push(DrawCmd.text_run(r.x + 2.0, row_y, marker_ch, font_fam, font_sz, marker_color, false, false, false))
         }
 
         if world.options.number or world.options.relativenumber {
@@ -3837,7 +4348,7 @@ fn render_window_pane(
                 (buf_row + 1).to_string()
             }
             let aligned_num = pad_left(num_str, num_width)
-            cmds.push(DrawCmd.TextRun(
+            cmds.push(DrawCmd.text_run(
                 r.x + cell_w,
                 row_y,
                 aligned_num,
@@ -3852,8 +4363,12 @@ fn render_window_pane(
 
         -- 2b. Continuous alignment vertical indent guides + active scope highlight (`world.options.indent_guides`)
         if show_indent_guides {
-            let eff_opt = eff_indent_map.get(buf_row)
-            let eff_indent = if eff_opt != null { eff_opt.as(i64) } else { 0 }
+            let eff_idx = buf_row - eff_indent_lo
+            let eff_indent = if eff_idx >= 0 and eff_idx < eff_indent_arr.len() {
+                eff_indent_arr.get(eff_idx.as(usize)).as(i64)
+            } else {
+                0
+            }
             if eff_indent > 0 and indent_step > 0 {
                 var ig_col: i64 = 0
                 while ig_col < eff_indent {
@@ -3865,7 +4380,7 @@ fn render_window_pane(
                                 and buf_row >= scope_start_row
                                 and buf_row <= scope_end_row
                             let g_color = if is_active_scope { theme.accent } else { theme.border }
-                            cmds.push(DrawCmd.Line(gx, row_y, gx, row_y + cell_h, g_color, 1.0))
+                            cmds.push(DrawCmd.line(gx, row_y, gx, row_y + cell_h, g_color, 1.0))
                         }
                     }
                     ig_col += indent_step
@@ -3901,7 +4416,7 @@ fn render_window_pane(
             }
         }
 
-        let row_decs_opt = row_decors_map.get(buf_row)
+        let row_decs_opt = row_decors_map.get(buf_row_key)
         let row_decs = if row_decs_opt != null { row_decs_opt.as(List) } else { List() }
         let fg_decs = List()
         if not row_decs.is_empty() {
@@ -3922,7 +4437,7 @@ fn render_window_pane(
             collect_markdown_link_url_decors(raw_line, buf_row, theme, fg_decs)
         }
 
-        -- 5. Syntax-highlighted `DrawCmd.TextRun` spans (with inline shadow ghost completion split at cursor)
+        -- 5. Syntax-highlighted `DrawCmd.text_run` spans (with inline shadow ghost completion split at cursor)
         let ig = world.inline_ghost
         let has_row_ghost = is_focused
             and is_cursor_row
@@ -3934,55 +4449,175 @@ fn render_window_pane(
             and ig.text != ""
 
         var cur_vcol: i64 = 0
-        let full_runs = if is_markdown_buf and md_fence_kind == 1 {
-            tokenize_markdown_fence_delim(raw_line, theme)
-        } else if is_markdown_buf and md_fence_kind == 2 {
-            if md_fence_mode != "" {
-                let block_ts = if world.options.treesitter {
-                    get_md_fenced_block_ts_spans(buf, md_fence_states, md_open_row, md_fence_mode)
+        let has_ts_row = (not is_markdown_buf)
+            and (not has_row_ghost)
+            and (not ts_viewport_rows.is_empty())
+            and buf_row >= first_vis_row
+            and (buf_row - first_vis_row) < ts_viewport_rows.len()
+
+        if has_ts_row {
+            let row_ts = ts_viewport_rows.get((buf_row - first_vis_row).as(usize)).as(List)
+            if fg_decs.is_empty() {
+                cur_vcol = emit_ts_row_spans(
+                    cmds,
+                    raw_line,
+                    row_ts,
+                    dim_row,
+                    tabstop,
+                    pane.left_col,
+                    text_x0,
+                    pane_right_x,
+                    row_y,
+                    cell_w,
+                    font_fam,
+                    font_sz,
+                    theme,
+                )
+            } else {
+                cur_vcol = emit_ts_row_spans_with_fg_decs(
+                    cmds,
+                    raw_line,
+                    row_ts,
+                    fg_decs,
+                    dim_row,
+                    tabstop,
+                    pane.left_col,
+                    text_x0,
+                    pane_right_x,
+                    row_y,
+                    cell_w,
+                    font_fam,
+                    font_sz,
+                    theme,
+                )
+            }
+        } else {
+            let full_runs = if is_markdown_buf and md_fence_kind == 1 {
+                tokenize_markdown_fence_delim(raw_line, theme)
+            } else if is_markdown_buf and md_fence_kind == 2 {
+                if md_fence_mode != "" {
+                    let block_ts = if world.options.treesitter {
+                        get_md_fenced_block_ts_spans(buf, md_fence_states, md_open_row, md_fence_mode)
+                    } else {
+                        List()
+                    }
+                    let rel_idx = buf_row - (md_open_row + 1)
+                    if (not block_ts.is_empty()) and rel_idx >= 0 and rel_idx < block_ts.len() {
+                        ts_spans_to_runs(raw_line, block_ts.get(rel_idx.as(usize)).as(List), theme)
+                    } else {
+                        tokenize_line(raw_line, md_fence_mode, theme)
+                    }
+                } else if raw_line != "" {
+                    [(0, raw_line, theme.fg, false, false)]
                 } else {
                     List()
                 }
-                let rel_idx = buf_row - (md_open_row + 1)
-                if (not block_ts.is_empty()) and rel_idx >= 0 and rel_idx < block_ts.len() {
-                    ts_spans_to_runs(raw_line, block_ts.get(rel_idx.as(usize)).as(List), theme)
-                } else {
-                    tokenize_line(raw_line, md_fence_mode, theme)
-                }
-            } else if raw_line != "" {
-                [(0, raw_line, theme.fg, false, false)]
+            } else if is_markdown_buf and md_fence_kind == 3 {
+                [(0, raw_line, theme.border, false, false)]
+            } else if is_markdown_buf and md_fence_kind == 4 {
+                tokenize_toml_or_json(raw_line, "toml", theme)
+            } else if is_markdown_buf and md_fence_kind == 5 {
+                [(0, raw_line, theme.syn_comment, false, true)]
+            } else if (not ts_viewport_rows.is_empty()) and buf_row >= first_vis_row and (buf_row - first_vis_row) < ts_viewport_rows.len() {
+                let row_ts = ts_viewport_rows.get((buf_row - first_vis_row).as(usize)).as(List)
+                ts_spans_to_runs(raw_line, row_ts, theme)
             } else {
-                List()
+                tokenize_line(raw_line, buf.major_mode, theme)
             }
-        } else if is_markdown_buf and md_fence_kind == 3 {
-            [(0, raw_line, theme.border, false, false)]
-        } else if is_markdown_buf and md_fence_kind == 4 {
-            tokenize_toml_or_json(raw_line, "toml", theme)
-        } else if is_markdown_buf and md_fence_kind == 5 {
-            [(0, raw_line, theme.syn_comment, false, true)]
-        } else if (not ts_viewport_rows.is_empty()) and buf_row >= first_vis_row and (buf_row - first_vis_row) < ts_viewport_rows.len() {
-            let row_ts = ts_viewport_rows.get((buf_row - first_vis_row).as(usize)).as(List)
-            ts_spans_to_runs(raw_line, row_ts, theme)
-        } else {
-            tokenize_line(raw_line, buf.major_mode, theme)
-        }
 
-        if has_row_ghost {
-            let split_col = if pane.cursor.col < 0 {
-                0
-            } else if pane.cursor.col > raw_line.char_len() {
-                raw_line.char_len()
+            if has_row_ghost {
+                let split_col = if pane.cursor.col < 0 {
+                    0
+                } else if pane.cursor.col > raw_line.char_len() {
+                    raw_line.char_len()
+                } else {
+                    pane.cursor.col
+                }
+                let (left_runs, right_runs) = split_runs_at_char_col(full_runs, split_col)
+                for ri in 0..left_runs.len() {
+                    let (_, tok_text, tok_color, _tok_bold, tok_italic) =
+                        left_runs.get(ri.as(usize)).as((i64, String, i64, bool, bool))
+                    cur_vcol = emit_single_text_segment(
+                        cmds,
+                        tok_text,
+                        cur_vcol,
+                        tabstop,
+                        pane.left_col,
+                        text_x0,
+                        pane_right_x,
+                        row_y,
+                        cell_w,
+                        font_fam,
+                        font_sz,
+                        if dim_row { theme.fg_muted } else { tok_color },
+                        tok_italic,
+                        false,
+                    )
+                }
+                cur_vcol = emit_single_text_segment(
+                    cmds,
+                    ig.text,
+                    cur_vcol,
+                    tabstop,
+                    pane.left_col,
+                    text_x0,
+                    pane_right_x,
+                    row_y,
+                    cell_w,
+                    font_fam,
+                    font_sz,
+                    color_with_alpha(theme.fg_muted, 160),
+                    true,
+                    false,
+                )
+                for rri in 0..right_runs.len() {
+                    let (_, rtok_text, rtok_color, _rtok_bold, rtok_italic) =
+                        right_runs.get(rri.as(usize)).as((i64, String, i64, bool, bool))
+                    cur_vcol = emit_single_text_segment(
+                        cmds,
+                        rtok_text,
+                        cur_vcol,
+                        tabstop,
+                        pane.left_col,
+                        text_x0,
+                        pane_right_x,
+                        row_y,
+                        cell_w,
+                        font_fam,
+                        font_sz,
+                        if dim_row { theme.fg_muted } else { rtok_color },
+                        rtok_italic,
+                        false,
+                    )
+                }
+            } else if fg_decs.is_empty() {
+                for ri in 0..full_runs.len() {
+                    let (_, tok_text, tok_color, _tok_bold, tok_italic) =
+                        full_runs.get(ri.as(usize)).as((i64, String, i64, bool, bool))
+                    cur_vcol = emit_single_text_segment(
+                        cmds,
+                        tok_text,
+                        cur_vcol,
+                        tabstop,
+                        pane.left_col,
+                        text_x0,
+                        pane_right_x,
+                        row_y,
+                        cell_w,
+                        font_fam,
+                        font_sz,
+                        if dim_row { theme.fg_muted } else { tok_color },
+                        tok_italic,
+                        false,
+                    )
+                }
             } else {
-                pane.cursor.col
-            }
-            let (left_runs, right_runs) = split_runs_at_char_col(full_runs, split_col)
-            for ri in 0..left_runs.len() {
-                let (_, tok_text, tok_color, _tok_bold, tok_italic) =
-                    left_runs.get(ri.as(usize)).as((i64, String, i64, bool, bool))
-                cur_vcol = emit_single_text_segment(
+                cur_vcol = emit_segmented_row_runs(
                     cmds,
-                    tok_text,
-                    cur_vcol,
+                    raw_line,
+                    full_runs,
+                    fg_decs,
+                    dim_row,
                     tabstop,
                     pane.left_col,
                     text_x0,
@@ -3991,85 +4626,9 @@ fn render_window_pane(
                     cell_w,
                     font_fam,
                     font_sz,
-                    if dim_row { theme.fg_muted } else { tok_color },
-                    tok_italic,
-                    false,
+                    theme,
                 )
             }
-            cur_vcol = emit_single_text_segment(
-                cmds,
-                ig.text,
-                cur_vcol,
-                tabstop,
-                pane.left_col,
-                text_x0,
-                pane_right_x,
-                row_y,
-                cell_w,
-                font_fam,
-                font_sz,
-                color_with_alpha(theme.fg_muted, 160),
-                true,
-                false,
-            )
-            for rri in 0..right_runs.len() {
-                let (_, rtok_text, rtok_color, _rtok_bold, rtok_italic) =
-                    right_runs.get(rri.as(usize)).as((i64, String, i64, bool, bool))
-                cur_vcol = emit_single_text_segment(
-                    cmds,
-                    rtok_text,
-                    cur_vcol,
-                    tabstop,
-                    pane.left_col,
-                    text_x0,
-                    pane_right_x,
-                    row_y,
-                    cell_w,
-                    font_fam,
-                    font_sz,
-                    if dim_row { theme.fg_muted } else { rtok_color },
-                    rtok_italic,
-                    false,
-                )
-            }
-        } else if fg_decs.is_empty() {
-            for ri in 0..full_runs.len() {
-                let (_, tok_text, tok_color, _tok_bold, tok_italic) =
-                    full_runs.get(ri.as(usize)).as((i64, String, i64, bool, bool))
-                cur_vcol = emit_single_text_segment(
-                    cmds,
-                    tok_text,
-                    cur_vcol,
-                    tabstop,
-                    pane.left_col,
-                    text_x0,
-                    pane_right_x,
-                    row_y,
-                    cell_w,
-                    font_fam,
-                    font_sz,
-                    if dim_row { theme.fg_muted } else { tok_color },
-                    tok_italic,
-                    false,
-                )
-            }
-        } else {
-            cur_vcol = emit_segmented_row_runs(
-                cmds,
-                raw_line,
-                full_runs,
-                fg_decs,
-                dim_row,
-                tabstop,
-                pane.left_col,
-                text_x0,
-                pane_right_x,
-                row_y,
-                cell_w,
-                font_fam,
-                font_sz,
-                theme,
-            )
         }
 
         -- 5b. Plugin `InlineSpanDecor` Flash jump badges (`replace_label` with opaque pill background)
@@ -4084,8 +4643,8 @@ fn render_window_pane(
                             let lw = str_display_width(dec.replace_label).as(f64) * cell_w
                             let pill_bg = if dec.bg_rgba != 0 { dec.bg_rgba } else { theme.diag_err }
                             let pill_fg = if dec.fg_rgba != 0 { dec.fg_rgba } else { theme.bg }
-                            cmds.push(DrawCmd.FillRect(dx, row_y, lw, cell_h, pill_bg, 3.0))
-                            cmds.push(DrawCmd.TextRun(dx, row_y, dec.replace_label, font_fam, font_sz, pill_fg, false, false, false))
+                            cmds.push(DrawCmd.fill_rect(dx, row_y, lw, cell_h, pill_bg, 3.0))
+                            cmds.push(DrawCmd.text_run(dx, row_y, dec.replace_label, font_fam, font_sz, pill_fg, false, false, false))
                         }
                     }
                 }
@@ -4097,7 +4656,7 @@ fn render_window_pane(
             let fold_vcol = if cur_vcol < pane.left_col { 0 } else { cur_vcol - pane.left_col }
             let fold_x = text_x0 + fold_vcol.as(f64) * cell_w
             if fold_x < pane_right_x {
-                cmds.push(DrawCmd.TextRun(
+                cmds.push(DrawCmd.text_run(
                     fold_x, row_y, " [...]", font_fam, font_sz,
                     theme.accent, false, true, false,
                 ))
@@ -4110,7 +4669,7 @@ fn render_window_pane(
             world.mode_name.to_upper().contains("INSERT")
             or world.mode_name.to_upper().contains("REPLACE")
         )
-        let row_vts_opt = row_vts_map.get(buf_row)
+        let row_vts_opt = row_vts_map.get(buf_row_key)
         var rendered_row_vt = false
         if row_vts_opt != null {
             let row_vts = row_vts_opt.as(List)
@@ -4124,7 +4683,7 @@ fn render_window_pane(
                 if vx < pane_right_x - cell_w * 2.0 {
                     let max_vt = (((pane_right_x - vx) / cell_w).floor().as(i64))
                     let vtxt = clip_str(vt.text, max_vt)
-                    cmds.push(DrawCmd.TextRun(
+                    cmds.push(DrawCmd.text_run(
                         vx, row_y, vtxt, font_fam, font_sz,
                         if vt.fg_rgba != 0 { vt.fg_rgba } else { theme.fg_muted },
                         false, vt.italic, false,
@@ -4135,7 +4694,7 @@ fn render_window_pane(
             }
         }
         if (not rendered_row_vt) and (not has_row_ghost) and world.options.shadow_text {
-            let scope_lbl_opt = scope_hints_map.get(buf_row)
+            let scope_lbl_opt = scope_hints_map.get(buf_row_key)
             if scope_lbl_opt != null {
                 let scope_lbl = scope_lbl_opt.as(String)
                 let sh_vcol = (if cur_vcol < pane.left_col { 0 } else { cur_vcol - pane.left_col }) + 2
@@ -4143,7 +4702,7 @@ fn render_window_pane(
                 if sh_x < pane_right_x - cell_w * 4.0 {
                     let max_sh = (((pane_right_x - sh_x) / cell_w).floor().as(i64))
                     let clipped_sh = clip_str(scope_lbl, max_sh)
-                    cmds.push(DrawCmd.TextRun(
+                    cmds.push(DrawCmd.text_run(
                         sh_x,
                         row_y,
                         clipped_sh,
@@ -4167,7 +4726,7 @@ fn render_window_pane(
                     let shape = if is_focused and (not world.minibuffer_view.active) {
                         world.caret_shape
                     } else {
-                        CaretShape.HollowBlock
+                        CaretShape.hollow_block
                     }
                     let c_color = if is_focused and (not world.minibuffer_view.active) {
                         theme.accent
@@ -4180,8 +4739,8 @@ fn render_window_pane(
                     } else {
                         1
                     }
-                    let c_w = if shape == CaretShape.Beam { 2.0 } else { cur_ch_cells.as(f64) * cell_w }
-                    cmds.push(DrawCmd.CursorCaret(caret_x, row_y, c_w, cell_h, shape, c_color))
+                    let c_w = if shape == CaretShape.beam { 2.0 } else { cur_ch_cells.as(f64) * cell_w }
+                    cmds.push(DrawCmd.cursor_caret(caret_x, row_y, c_w, cell_h, shape, c_color))
                 }
             }
         }
@@ -4201,8 +4760,8 @@ fn render_window_pane(
                             } else {
                                 1
                             }
-                            let s_w = if s_shape == CaretShape.Beam { 2.0 } else { s_cells.as(f64) * cell_w }
-                            cmds.push(DrawCmd.CursorCaret(sx, row_y, s_w, cell_h, s_shape, theme.mode_visual))
+                            let s_w = if s_shape == CaretShape.beam { 2.0 } else { s_cells.as(f64) * cell_w }
+                            cmds.push(DrawCmd.cursor_caret(sx, row_y, s_w, cell_h, s_shape, theme.mode_visual))
                         }
                     }
                 }
@@ -4216,14 +4775,14 @@ fn render_window_pane(
         r.y + r.h - ml_h, ml_h, cell_w, theme,
     )
 
-    cmds.push(DrawCmd.ClipPop)
+    cmds.push(DrawCmd.clip_pop)
 
     -- 8. Crisp 1px split borders between adjacent panes
     if r.x > 1.0 {
-        cmds.push(DrawCmd.Line(r.x, r.y, r.x, r.y + r.h, theme.border, 1.0))
+        cmds.push(DrawCmd.line(r.x, r.y, r.x, r.y + r.h, theme.border, 1.0))
     }
     if r.y > top_bar_height(world) + 1.0 {
-        cmds.push(DrawCmd.Line(r.x, r.y, r.x + r.w, r.y, theme.border, 1.0))
+        cmds.push(DrawCmd.line(r.x, r.y, r.x + r.w, r.y, theme.border, 1.0))
     }
 }
 
@@ -4266,9 +4825,9 @@ fn render_which_key_overlay(
         top_h + 4.0
     }
 
-    cmds.push(DrawCmd.ClipPush(box_x, box_y, box_w, box_h))
-    cmds.push(DrawCmd.FillRect(box_x, box_y, box_w, box_h, theme.bg_popup, 6.0))
-    cmds.push(DrawCmd.StrokeRect(box_x, box_y, box_w, box_h, theme.border, 1.0, 6.0))
+    cmds.push(DrawCmd.clip_push(box_x, box_y, box_w, box_h))
+    cmds.push(DrawCmd.fill_rect(box_x, box_y, box_w, box_h, theme.bg_popup, 6.0))
+    cmds.push(DrawCmd.stroke_rect(box_x, box_y, box_w, box_h, theme.border, 1.0, 6.0))
 
     let pk = world.pending_keys_display
     let hdr_suffix = if pk != "" {
@@ -4281,7 +4840,7 @@ fn render_which_key_overlay(
         "(" ++ world.mode_name ++ ")"
     }
     let hdr = " Which-Key " ++ hdr_suffix
-    cmds.push(DrawCmd.TextRun(box_x + 10.0, box_y + 5.0, hdr, font_fam, font_sz, theme.accent, false, false, false))
+    cmds.push(DrawCmd.text_run(box_x + 10.0, box_y + 5.0, hdr, font_fam, font_sz, theme.accent, false, false, false))
 
     let col_w = (box_w - 20.0) / cols.as(f64)
     let max_cell_chars = ((col_w / cell_w).floor().as(i64)) - 2
@@ -4292,13 +4851,13 @@ fn render_which_key_overlay(
         let iy = box_y + 7.0 + (r_idx + 1).as(f64) * cell_h
         let (chord, cmd_name) = extract_which_key_pair(world.which_key_items.get(idx.as(usize)))
         let chord_w = str_display_width(chord)
-        cmds.push(DrawCmd.TextRun(ix, iy, chord, font_fam, font_sz, theme.syn_keyword, false, false, false))
+        cmds.push(DrawCmd.text_run(ix, iy, chord, font_fam, font_sz, theme.syn_keyword, false, false, false))
         let arrow_x = ix + (chord_w + 1).as(f64) * cell_w
-        cmds.push(DrawCmd.TextRun(arrow_x, iy, "->", font_fam, font_sz, theme.fg_muted, false, false, false))
+        cmds.push(DrawCmd.text_run(arrow_x, iy, "->", font_fam, font_sz, theme.fg_muted, false, false, false))
         let cmd_x = arrow_x + 3.0 * cell_w
         let avail_chars = max_cell_chars - chord_w - 4
         let cmd_fg = if cmd_name.starts_with("+") { theme.accent } else { theme.fg }
-        cmds.push(DrawCmd.TextRun(
+        cmds.push(DrawCmd.text_run(
             cmd_x,
             iy,
             clip_str(cmd_name, if avail_chars > 4 { avail_chars } else { 8 }),
@@ -4311,7 +4870,7 @@ fn render_which_key_overlay(
         ))
     }
 
-    cmds.push(DrawCmd.ClipPop)
+    cmds.push(DrawCmd.clip_pop)
 }
 
 fn minibuffer_mode_pill_color(badge: String, theme: ThemePalette) -> i64 {
@@ -4375,7 +4934,7 @@ fn render_minibuffer_label_runs(
         return
     }
     if match_indices.is_empty() {
-        cmds.push(DrawCmd.TextRun(start_x, y, label, font_fam, font_sz, theme.fg, false, false, false))
+        cmds.push(DrawCmd.text_run(start_x, y, label, font_fam, font_sz, theme.fg, false, false, false))
         return
     }
     let matched_set = Set.new()
@@ -4386,7 +4945,7 @@ fn render_minibuffer_label_runs(
         }
     }
     if matched_set.is_empty() {
-        cmds.push(DrawCmd.TextRun(start_x, y, label, font_fam, font_sz, theme.fg, false, false, false))
+        cmds.push(DrawCmd.text_run(start_x, y, label, font_fam, font_sz, theme.fg, false, false, false))
         return
     }
 
@@ -4398,9 +4957,9 @@ fn render_minibuffer_label_runs(
         if m != cur_matched {
             let seg = label.slice(run_start, ci)
             if cur_matched {
-                cmds.push(DrawCmd.TextRun(cx, y, seg, font_fam, font_sz, theme.accent, false, false, true))
+                cmds.push(DrawCmd.text_run(cx, y, seg, font_fam, font_sz, theme.accent, false, false, true))
             } else {
-                cmds.push(DrawCmd.TextRun(cx, y, seg, font_fam, font_sz, theme.fg, false, false, false))
+                cmds.push(DrawCmd.text_run(cx, y, seg, font_fam, font_sz, theme.fg, false, false, false))
             }
             cx += str_display_width(seg).as(f64) * cell_w
             run_start = ci
@@ -4410,9 +4969,9 @@ fn render_minibuffer_label_runs(
     let tail = label.slice(run_start, n)
     if tail != "" {
         if cur_matched {
-            cmds.push(DrawCmd.TextRun(cx, y, tail, font_fam, font_sz, theme.accent, false, false, true))
+            cmds.push(DrawCmd.text_run(cx, y, tail, font_fam, font_sz, theme.accent, false, false, true))
         } else {
-            cmds.push(DrawCmd.TextRun(cx, y, tail, font_fam, font_sz, theme.fg, false, false, false))
+            cmds.push(DrawCmd.text_run(cx, y, tail, font_fam, font_sz, theme.fg, false, false, false))
         }
     }
 }
@@ -4432,9 +4991,9 @@ fn render_echo_or_minibuffer(
     let mb = world.minibuffer_view
 
     -- Bottom bar background
-    cmds.push(DrawCmd.ClipPush(0.0, echo_y, win_w, ECHO_BAR_HEIGHT))
-    cmds.push(DrawCmd.FillRect(0.0, echo_y, win_w, ECHO_BAR_HEIGHT, theme.bg_alt, 0.0))
-    cmds.push(DrawCmd.Line(0.0, echo_y, win_w, echo_y, theme.border, 1.0))
+    cmds.push(DrawCmd.clip_push(0.0, echo_y, win_w, ECHO_BAR_HEIGHT))
+    cmds.push(DrawCmd.fill_rect(0.0, echo_y, win_w, ECHO_BAR_HEIGHT, theme.bg_alt, 0.0))
+    cmds.push(DrawCmd.line(0.0, echo_y, win_w, echo_y, theme.border, 1.0))
 
     if mb.active {
         var prompt_x: f64 = 8.0
@@ -4443,22 +5002,22 @@ fn render_echo_or_minibuffer(
             let pill_txt = "[" ++ world.minibuffer_mode_badge ++ "]"
             let pill_w = str_display_width(pill_txt).as(f64) * cell_w + 8.0
             let pill_bg = minibuffer_mode_pill_color(world.minibuffer_mode_badge, theme)
-            cmds.push(DrawCmd.FillRect(prompt_x, echo_y + 2.0, pill_w, cell_h, pill_bg, 4.0))
-            cmds.push(DrawCmd.TextRun(
+            cmds.push(DrawCmd.fill_rect(prompt_x, echo_y + 2.0, pill_w, cell_h, pill_bg, 4.0))
+            cmds.push(DrawCmd.text_run(
                 prompt_x + 4.0, text_y, pill_txt, font_fam, font_sz,
                 theme.bg, false, false, false,
             ))
             prompt_x += pill_w + 8.0
         }
         if mb.prompt_label != "" {
-            cmds.push(DrawCmd.TextRun(
+            cmds.push(DrawCmd.text_run(
                 prompt_x, text_y, mb.prompt_label, font_fam, font_sz,
                 theme.mode_command, false, false, false,
             ))
         }
         let input_x = prompt_x + str_display_width(mb.prompt_label).as(f64) * cell_w
         if mb.input_text != "" {
-            cmds.push(DrawCmd.TextRun(
+            cmds.push(DrawCmd.text_run(
                 input_x, text_y, mb.input_text, font_fam, font_sz,
                 theme.fg, false, false, false,
             ))
@@ -4476,10 +5035,10 @@ fn render_echo_or_minibuffer(
             0
         }
         let beam_x = input_x + prefix_cols.as(f64) * cell_w
-        cmds.push(DrawCmd.CursorCaret(beam_x, text_y, 2.0, cell_h, CaretShape.Beam, theme.accent))
+        cmds.push(DrawCmd.cursor_caret(beam_x, text_y, 2.0, cell_h, CaretShape.beam, theme.accent))
     } else if world.status_message != "" {
         let is_err = world.status_message.starts_with("Error") or world.status_message.starts_with("error:")
-        cmds.push(DrawCmd.TextRun(
+        cmds.push(DrawCmd.text_run(
             8.0,
             echo_y + 2.0,
             world.status_message,
@@ -4491,7 +5050,7 @@ fn render_echo_or_minibuffer(
             false,
         ))
     }
-    cmds.push(DrawCmd.ClipPop)
+    cmds.push(DrawCmd.clip_pop)
 
     -- Vertico + Marginalia completion candidate popup (up to 12 visible items around `mb.selected_idx`)
     if mb.active and not mb.items.is_empty() {
@@ -4524,9 +5083,9 @@ fn render_echo_or_minibuffer(
             top_h + 2.0
         }
 
-        cmds.push(DrawCmd.ClipPush(pop_x, pop_y, pop_w, pop_h))
-        cmds.push(DrawCmd.FillRect(pop_x, pop_y, pop_w, pop_h, theme.bg_popup, 6.0))
-        cmds.push(DrawCmd.StrokeRect(pop_x, pop_y, pop_w, pop_h, theme.border, 1.0, 6.0))
+        cmds.push(DrawCmd.clip_push(pop_x, pop_y, pop_w, pop_h))
+        cmds.push(DrawCmd.fill_rect(pop_x, pop_y, pop_w, pop_h, theme.bg_popup, 6.0))
+        cmds.push(DrawCmd.stroke_rect(pop_x, pop_y, pop_w, pop_h, theme.border, 1.0, 6.0))
 
         let match_total = if mb.total_matches > 0 { mb.total_matches } else { total }
         let hdr_badge_prefix = if world.minibuffer_mode_badge != "" {
@@ -4535,17 +5094,17 @@ fn render_echo_or_minibuffer(
             ""
         }
         let pop_hdr = hdr_badge_prefix ++ "Completions (" ++ (sel + 1).to_string() ++ "/" ++ match_total.to_string() ++ ")"
-        cmds.push(DrawCmd.TextRun(pop_x + 10.0, pop_y + 4.0, pop_hdr, font_fam, font_sz, theme.accent, false, false, false))
+        cmds.push(DrawCmd.text_run(pop_x + 10.0, pop_y + 4.0, pop_hdr, font_fam, font_sz, theme.accent, false, false, false))
 
         if world.minibuffer_hint_bar != "" {
             let max_hdr_cols = (((pop_w - 24.0) / cell_w).floor().as(i64)) - str_display_width(pop_hdr) - 3
             if max_hdr_cols > 12 {
                 let hint_txt = clip_str(world.minibuffer_hint_bar, max_hdr_cols)
                 let hint_x = pop_x + pop_w - (str_display_width(hint_txt).as(f64) * cell_w) - 12.0
-                cmds.push(DrawCmd.TextRun(hint_x, pop_y + 4.0, hint_txt, font_fam, font_sz, theme.fg_muted, false, false, false))
+                cmds.push(DrawCmd.text_run(hint_x, pop_y + 4.0, hint_txt, font_fam, font_sz, theme.fg_muted, false, false, false))
             }
         }
-        cmds.push(DrawCmd.Line(pop_x + 6.0, pop_y + 5.0 + cell_h, pop_x + pop_w - 6.0, pop_y + 5.0 + cell_h, theme.border, 1.0))
+        cmds.push(DrawCmd.line(pop_x + 6.0, pop_y + 5.0 + cell_h, pop_x + pop_w - 6.0, pop_y + 5.0 + cell_h, theme.border, 1.0))
 
         let sb_pad: f64 = if total > vis_count { 10.0 } else { 0.0 }
         let query_lc = mb.input_text.trim().to_lower()
@@ -4556,8 +5115,8 @@ fn render_echo_or_minibuffer(
             let iy = pop_y + 6.0 + (row_i + 1).as(f64) * cell_h
             let is_sel = item_idx == sel
             if is_sel {
-                cmds.push(DrawCmd.FillRect(pop_x + 4.0, iy, pop_w - 8.0 - sb_pad, cell_h, theme.bg_selection, 3.0))
-                cmds.push(DrawCmd.FillRect(pop_x + 4.0, iy, 3.0, cell_h, theme.accent, 0.0))
+                cmds.push(DrawCmd.fill_rect(pop_x + 4.0, iy, pop_w - 8.0 - sb_pad, cell_h, theme.bg_selection, 3.0))
+                cmds.push(DrawCmd.fill_rect(pop_x + 4.0, iy, 3.0, cell_h, theme.accent, 0.0))
             }
 
             if item_idx < rich_total and (world.minibuffer_rich_items.get(item_idx.as(usize)) matches _: MinibufferRichItem) {
@@ -4566,7 +5125,7 @@ fn render_echo_or_minibuffer(
                 var label_x = badge_x
                 if rich.kind_badge != "" {
                     let bcol = minibuffer_badge_color(rich.kind_badge, rich.badge_rgba, theme)
-                    cmds.push(DrawCmd.TextRun(badge_x, iy, rich.kind_badge, font_fam, font_sz, bcol, false, false, false))
+                    cmds.push(DrawCmd.text_run(badge_x, iy, rich.kind_badge, font_fam, font_sz, bcol, false, false, false))
                     let bw = str_display_width(rich.kind_badge)
                     let badge_cols = if bw > 6 { bw + 1 } else { 7 }
                     label_x = badge_x + badge_cols.as(f64) * cell_w
@@ -4590,7 +5149,7 @@ fn render_echo_or_minibuffer(
                     let clipped_marg = clip_str(rich.marginalia, if max_marg_chars > 12 { max_marg_chars } else { 20 })
                     let marg_x = right_limit_x - (str_display_width(clipped_marg).as(f64) * cell_w)
                     if marg_x > min_right_x {
-                        cmds.push(DrawCmd.TextRun(
+                        cmds.push(DrawCmd.text_run(
                             marg_x, iy, clipped_marg, font_fam, font_sz,
                             theme.fg_muted, false, true, false,
                         ))
@@ -4604,8 +5163,8 @@ fn render_echo_or_minibuffer(
                     let pill_w = str_display_width(pill_str).as(f64) * cell_w
                     let pill_x = right_limit_x - pill_w
                     if pill_x > min_right_x {
-                        cmds.push(DrawCmd.FillRect(pill_x, iy + 1.0, pill_w, cell_h - 2.0, theme.bg_alt, 3.0))
-                        cmds.push(DrawCmd.TextRun(
+                        cmds.push(DrawCmd.fill_rect(pill_x, iy + 1.0, pill_w, cell_h - 2.0, theme.bg_alt, 3.0))
+                        cmds.push(DrawCmd.text_run(
                             pill_x, iy, pill_str, font_fam, font_sz,
                             theme.syn_keyword, false, false, false,
                         ))
@@ -4625,16 +5184,16 @@ fn render_echo_or_minibuffer(
                     let post = cand_label.slice(h1, cand_label.char_len())
                     var cx = label_x
                     if pre != "" {
-                        cmds.push(DrawCmd.TextRun(cx, iy, pre, font_fam, font_sz, theme.fg, false, false, false))
+                        cmds.push(DrawCmd.text_run(cx, iy, pre, font_fam, font_sz, theme.fg, false, false, false))
                         cx += str_display_width(pre).as(f64) * cell_w
                     }
-                    cmds.push(DrawCmd.TextRun(cx, iy, mid, font_fam, font_sz, theme.accent, false, false, true))
+                    cmds.push(DrawCmd.text_run(cx, iy, mid, font_fam, font_sz, theme.accent, false, false, true))
                     cx += str_display_width(mid).as(f64) * cell_w
                     if post != "" {
-                        cmds.push(DrawCmd.TextRun(cx, iy, post, font_fam, font_sz, theme.fg, false, false, false))
+                        cmds.push(DrawCmd.text_run(cx, iy, post, font_fam, font_sz, theme.fg, false, false, false))
                     }
                 } else {
-                    cmds.push(DrawCmd.TextRun(
+                    cmds.push(DrawCmd.text_run(
                         label_x, iy, cand_label, font_fam, font_sz,
                         theme.fg,
                         false, false, false,
@@ -4648,7 +5207,7 @@ fn render_echo_or_minibuffer(
                     let det_x = pop_x + pop_w - (str_display_width(clipped_det).as(f64) * cell_w) - 12.0 - sb_pad
                     let min_det_x = label_x + (str_display_width(cand_label) + 2).as(f64) * cell_w
                     if det_x > min_det_x {
-                        cmds.push(DrawCmd.TextRun(
+                        cmds.push(DrawCmd.text_run(
                             det_x, iy, clipped_det, font_fam, font_sz,
                             theme.fg_muted, false, true, false,
                         ))
@@ -4662,7 +5221,7 @@ fn render_echo_or_minibuffer(
             let track_x = pop_x + pop_w - 7.0
             let track_y = pop_y + 6.0 + cell_h
             let track_h = vis_count.as(f64) * cell_h
-            cmds.push(DrawCmd.FillRect(track_x, track_y, 3.0, track_h, theme.bg_alt, 1.5))
+            cmds.push(DrawCmd.fill_rect(track_x, track_y, 3.0, track_h, theme.bg_alt, 1.5))
             let raw_thumb_h = track_h * (vis_count.as(f64) / total.as(f64))
             let thumb_h = if raw_thumb_h < 10.0 {
                 if track_h < 10.0 { track_h } else { 10.0 }
@@ -4674,10 +5233,10 @@ fn render_echo_or_minibuffer(
             let max_start = if total - vis_count > 0 { total - vis_count } else { 1 }
             let frac = start_idx.as(f64) / max_start.as(f64)
             let thumb_y = track_y + (track_h - thumb_h) * frac
-            cmds.push(DrawCmd.FillRect(track_x, thumb_y, 3.0, thumb_h, theme.accent, 1.5))
+            cmds.push(DrawCmd.fill_rect(track_x, thumb_y, 3.0, thumb_h, theme.accent, 1.5))
         }
 
-        cmds.push(DrawCmd.ClipPop)
+        cmds.push(DrawCmd.clip_pop)
     }
 }
 
@@ -4701,16 +5260,16 @@ fn render_sidebar_panel(
     let font_fam = world.options.font_family
     let font_sz = world.options.font_size_pt
 
-    cmds.push(DrawCmd.ClipPush(x, y, w, h))
-    cmds.push(DrawCmd.FillRect(x, y, w, h, theme.bg_alt, 0.0))
+    cmds.push(DrawCmd.clip_push(x, y, w, h))
+    cmds.push(DrawCmd.fill_rect(x, y, w, h, theme.bg_alt, 0.0))
 
     -- Sidebar header
     let hdr_h = cell_h + 6.0
-    cmds.push(DrawCmd.FillRect(x, y, w, hdr_h, theme.bg_status_inactive, 0.0))
+    cmds.push(DrawCmd.fill_rect(x, y, w, hdr_h, theme.bg_status_inactive, 0.0))
     let max_chars = (((w - 14.0) / cell_w).floor().as(i64))
     let hdr_txt = clip_str(panel.title, max_chars)
-    cmds.push(DrawCmd.TextRun(x + 8.0, y + 3.0, hdr_txt, font_fam, font_sz, theme.accent, false, false, false))
-    cmds.push(DrawCmd.Line(x, y + hdr_h - 1.0, x + w, y + hdr_h - 1.0, theme.border, 1.0))
+    cmds.push(DrawCmd.text_run(x + 8.0, y + 3.0, hdr_txt, font_fam, font_sz, theme.accent, false, false, false))
+    cmds.push(DrawCmd.line(x, y + hdr_h - 1.0, x + w, y + hdr_h - 1.0, theme.border, 1.0))
 
     let max_rows = (((h - hdr_h - 4.0) / cell_h).floor().as(i64))
     let total = panel.lines.len()
@@ -4732,7 +5291,7 @@ fn render_sidebar_panel(
         let ln = panel.lines.get(idx.as(usize)).as(String)
         let is_sel = idx == sel
         if is_sel {
-            cmds.push(DrawCmd.FillRect(x + 2.0, ry, w - 4.0, cell_h, theme.bg_selection, 3.0))
+            cmds.push(DrawCmd.fill_rect(x + 2.0, ry, w - 4.0, cell_h, theme.bg_selection, 3.0))
         }
         let clipped = clip_str(ln, max_chars)
         let is_dir = clipped.ends_with("/")
@@ -4747,12 +5306,12 @@ fn render_sidebar_panel(
         } else {
             theme.fg_muted
         }
-        cmds.push(DrawCmd.TextRun(x + 8.0, ry, clipped, font_fam, font_sz, fg, false, false, false))
+        cmds.push(DrawCmd.text_run(x + 8.0, ry, clipped, font_fam, font_sz, fg, false, false, false))
     }
 
     let bx = if is_left { x + w - 1.0 } else { x }
-    cmds.push(DrawCmd.Line(bx, y, bx, y + h, theme.border, 1.0))
-    cmds.push(DrawCmd.ClipPop)
+    cmds.push(DrawCmd.line(bx, y, bx, y + h, theme.border, 1.0))
+    cmds.push(DrawCmd.clip_pop)
 }
 
 fn cmp_kind_badge_and_color(kind: String, theme: ThemePalette) -> (String, i64) {
@@ -4794,7 +5353,7 @@ fn emit_popup_code_line(
     let eff_mode = if mode != "" { mode } else { "nessa" }
     let runs = tokenize_line(clipped, eff_mode, theme)
     if runs.is_empty() {
-        cmds.push(DrawCmd.TextRun(x0, y, clipped, font_fam, font_sz, theme.fg, false, false, false))
+        cmds.push(DrawCmd.text_run(x0, y, clipped, font_fam, font_sz, theme.fg, false, false, false))
         return
     }
     var cur_x = x0
@@ -4802,7 +5361,7 @@ fn emit_popup_code_line(
         let (_, tok_text, tok_color, _tok_bold, tok_italic) =
             runs.get(ri.as(usize)).as((i64, String, i64, bool, bool))
         if tok_text != "" {
-            cmds.push(DrawCmd.TextRun(cur_x, y, tok_text, font_fam, font_sz, tok_color, false, tok_italic, false))
+            cmds.push(DrawCmd.text_run(cur_x, y, tok_text, font_fam, font_sz, tok_color, false, tok_italic, false))
             cur_x += str_display_width(tok_text).as(f64) * cell_w
         }
     }
@@ -4898,9 +5457,9 @@ fn render_buffer_completion_popup(
         if above_y > top_h { above_y } else { top_h + 4.0 }
     }
 
-    cmds.push(DrawCmd.ClipPush(pop_x, pop_y, pop_w, pop_h))
-    cmds.push(DrawCmd.FillRect(pop_x, pop_y, pop_w, pop_h, theme.bg_popup, 5.0))
-    cmds.push(DrawCmd.StrokeRect(pop_x, pop_y, pop_w, pop_h, theme.border, 1.0, 5.0))
+    cmds.push(DrawCmd.clip_push(pop_x, pop_y, pop_w, pop_h))
+    cmds.push(DrawCmd.fill_rect(pop_x, pop_y, pop_w, pop_h, theme.bg_popup, 5.0))
+    cmds.push(DrawCmd.stroke_rect(pop_x, pop_y, pop_w, pop_h, theme.border, 1.0, 5.0))
 
     let sb_pad = if total > vis_count { 8.0 } else { 0.0 }
     let pfx_lc = cp.prefix.to_lower()
@@ -4916,11 +5475,11 @@ fn render_buffer_completion_popup(
         let item = cp.items.get(idx.as(usize)).as(CompletionItem)
         let is_sel = idx == sel
         if is_sel {
-            cmds.push(DrawCmd.FillRect(pop_x + 3.0, iy, pop_w - 6.0 - sb_pad, cell_h, theme.bg_selection, 3.0))
+            cmds.push(DrawCmd.fill_rect(pop_x + 3.0, iy, pop_w - 6.0 - sb_pad, cell_h, theme.bg_selection, 3.0))
         }
         let (kshort, kcol) = cmp_kind_badge_and_color(item.kind, theme)
         let ktag = "[" ++ kshort ++ "]"
-        cmds.push(DrawCmd.TextRun(pop_x + 8.0, iy, ktag, font_fam, font_sz, kcol, false, false, false))
+        cmds.push(DrawCmd.text_run(pop_x + 8.0, iy, ktag, font_fam, font_sz, kcol, false, false, false))
 
         let lx = pop_x + 8.0 + 7.0 * cell_w
         let shown_lbl = clip_str(item.label, max_lbl_clip)
@@ -4933,18 +5492,18 @@ fn render_buffer_completion_popup(
             let post = shown_lbl.slice(h1, shown_lbl.char_len())
             var cx = lx
             if pre != "" {
-                cmds.push(DrawCmd.TextRun(cx, iy, pre, font_fam, font_sz, theme.fg, false, false, false))
+                cmds.push(DrawCmd.text_run(cx, iy, pre, font_fam, font_sz, theme.fg, false, false, false))
                 cx += str_display_width(pre).as(f64) * cell_w
             }
             if mid != "" {
-                cmds.push(DrawCmd.TextRun(cx, iy, mid, font_fam, font_sz, theme.accent, false, false, true))
+                cmds.push(DrawCmd.text_run(cx, iy, mid, font_fam, font_sz, theme.accent, false, false, true))
                 cx += str_display_width(mid).as(f64) * cell_w
             }
             if post != "" {
-                cmds.push(DrawCmd.TextRun(cx, iy, post, font_fam, font_sz, theme.fg, false, false, false))
+                cmds.push(DrawCmd.text_run(cx, iy, post, font_fam, font_sz, theme.fg, false, false, false))
             }
         } else {
-            cmds.push(DrawCmd.TextRun(lx, iy, shown_lbl, font_fam, font_sz, theme.fg, false, false, false))
+            cmds.push(DrawCmd.text_run(lx, iy, shown_lbl, font_fam, font_sz, theme.fg, false, false, false))
         }
 
         if item.detail != "" {
@@ -4956,7 +5515,7 @@ fn render_buffer_completion_popup(
                 let det = clip_str(item.detail, avail_det_cols)
                 let dx = right_edge_x - (str_display_width(det).as(f64) * cell_w)
                 if dx >= min_det_x - 1.0 {
-                    cmds.push(DrawCmd.TextRun(dx, iy, det, font_fam, font_sz, theme.fg_muted, false, true, false))
+                    cmds.push(DrawCmd.text_run(dx, iy, det, font_fam, font_sz, theme.fg_muted, false, true, false))
                 }
             }
         }
@@ -4966,7 +5525,7 @@ fn render_buffer_completion_popup(
         let track_x = pop_x + pop_w - 6.0
         let track_y = pop_y + 4.0
         let track_h = vis_count.as(f64) * cell_h
-        cmds.push(DrawCmd.FillRect(track_x, track_y, 3.0, track_h, theme.bg_alt, 1.5))
+        cmds.push(DrawCmd.fill_rect(track_x, track_y, 3.0, track_h, theme.bg_alt, 1.5))
         let raw_th = track_h * (vis_count.as(f64) / total.as(f64))
         let thumb_h = if raw_th < 8.0 {
             if track_h < 8.0 { track_h } else { 8.0 }
@@ -4977,9 +5536,9 @@ fn render_buffer_completion_popup(
         }
         let max_s = if total - vis_count > 0 { total - vis_count } else { 1 }
         let ty = track_y + (track_h - thumb_h) * (start_i.as(f64) / max_s.as(f64))
-        cmds.push(DrawCmd.FillRect(track_x, ty, 3.0, thumb_h, theme.accent, 1.5))
+        cmds.push(DrawCmd.fill_rect(track_x, ty, 3.0, thumb_h, theme.accent, 1.5))
     }
-    cmds.push(DrawCmd.ClipPop)
+    cmds.push(DrawCmd.clip_pop)
 
     -- Adjacent Documentation Side Window when navigating candidates (`cp.doc_lines`)
     if has_doc {
@@ -5066,28 +5625,28 @@ fn render_buffer_completion_popup(
             }
             let max_doc_chars = (((doc_w - 16.0) / cell_w).floor().as(i64))
             if max_doc_chars >= 12 {
-                cmds.push(DrawCmd.ClipPush(doc_x, doc_y, doc_w, doc_h))
-                cmds.push(DrawCmd.FillRect(doc_x, doc_y, doc_w, doc_h, theme.bg_popup, 5.0))
-                cmds.push(DrawCmd.StrokeRect(doc_x, doc_y, doc_w, doc_h, theme.border, 1.0, 5.0))
+                cmds.push(DrawCmd.clip_push(doc_x, doc_y, doc_w, doc_h))
+                cmds.push(DrawCmd.fill_rect(doc_x, doc_y, doc_w, doc_h, theme.bg_popup, 5.0))
+                cmds.push(DrawCmd.stroke_rect(doc_x, doc_y, doc_w, doc_h, theme.border, 1.0, 5.0))
                 let hdr_title = clip_str(if cp.doc_title != "" { cp.doc_title } else { "Documentation" }, max_doc_chars)
-                cmds.push(DrawCmd.TextRun(doc_x + 8.0, doc_y + 4.0, hdr_title, font_fam, font_sz, theme.accent, false, false, false))
-                cmds.push(DrawCmd.Line(doc_x + 6.0, doc_y + cell_h + 6.0, doc_x + doc_w - 6.0, doc_y + cell_h + 6.0, theme.border, 1.0))
+                cmds.push(DrawCmd.text_run(doc_x + 8.0, doc_y + 4.0, hdr_title, font_fam, font_sz, theme.accent, false, false, false))
+                cmds.push(DrawCmd.line(doc_x + 6.0, doc_y + cell_h + 6.0, doc_x + doc_w - 6.0, doc_y + cell_h + 6.0, theme.border, 1.0))
 
                 for dri in 0..display_rows.len() {
                     let dy = doc_y + cell_h + 8.0 + dri.as(f64) * cell_h
                     let (dtxt, is_code, code_lang) = display_rows.get(dri.as(usize)).as((String, bool, String))
                     if is_code {
-                        cmds.push(DrawCmd.FillRect(doc_x + 4.0, dy, doc_w - 8.0, cell_h, theme.bg_alt, 2.0))
+                        cmds.push(DrawCmd.fill_rect(doc_x + 4.0, dy, doc_w - 8.0, cell_h, theme.bg_alt, 2.0))
                         emit_popup_code_line(cmds, dtxt, code_lang, doc_x + 8.0, dy, max_doc_chars, cell_w, font_fam, font_sz, theme)
                     } else if dtxt.starts_with("────") or dtxt == "---" {
-                        cmds.push(DrawCmd.Line(doc_x + 8.0, dy + cell_h * 0.5, doc_x + doc_w - 8.0, dy + cell_h * 0.5, theme.border, 1.0))
+                        cmds.push(DrawCmd.line(doc_x + 8.0, dy + cell_h * 0.5, doc_x + doc_w - 8.0, dy + cell_h * 0.5, theme.border, 1.0))
                     } else if dtxt.starts_with("Defined ") or dtxt.starts_with("Local binding ") {
-                        cmds.push(DrawCmd.TextRun(doc_x + 8.0, dy, clip_str(dtxt, max_doc_chars), font_fam, font_sz, theme.fg_muted, false, true, false))
+                        cmds.push(DrawCmd.text_run(doc_x + 8.0, dy, clip_str(dtxt, max_doc_chars), font_fam, font_sz, theme.fg_muted, false, true, false))
                     } else {
                         emit_popup_code_line(cmds, dtxt, "markdown", doc_x + 8.0, dy, max_doc_chars, cell_w, font_fam, font_sz, theme)
                     }
                 }
-                cmds.push(DrawCmd.ClipPop)
+                cmds.push(DrawCmd.clip_pop)
             }
         }
     }
@@ -5166,9 +5725,9 @@ fn render_signature_help_popup(
         top_h + 2.0
     }
 
-    cmds.push(DrawCmd.ClipPush(box_x, box_y, box_w, box_h))
-    cmds.push(DrawCmd.FillRect(box_x, box_y, box_w, box_h, theme.bg_popup, 5.0))
-    cmds.push(DrawCmd.StrokeRect(box_x, box_y, box_w, box_h, theme.accent, 1.0, 5.0))
+    cmds.push(DrawCmd.clip_push(box_x, box_y, box_w, box_h))
+    cmds.push(DrawCmd.fill_rect(box_x, box_y, box_w, box_h, theme.bg_popup, 5.0))
+    cmds.push(DrawCmd.stroke_rect(box_x, box_y, box_w, box_h, theme.accent, 1.0, 5.0))
 
     let inner_cols = box_cols - 3
     let shown_sig = clip_str(sh.label, inner_cols)
@@ -5186,11 +5745,11 @@ fn render_signature_help_popup(
         let post_s = shown_sig.slice(pe, shown_sig.char_len())
         let pre_w = str_display_width(pre_s).as(f64) * cell_w
         let mid_w = str_display_width(mid_s).as(f64) * cell_w
-        cmds.push(DrawCmd.FillRect(sx0 + pre_w - 2.0, sy, mid_w + 4.0, cell_h, theme.bg_selection, 3.0))
+        cmds.push(DrawCmd.fill_rect(sx0 + pre_w - 2.0, sy, mid_w + 4.0, cell_h, theme.bg_selection, 3.0))
         if pre_s != "" {
             emit_popup_code_line(cmds, pre_s, buf.major_mode, sx0, sy, inner_cols, cell_w, font_fam, font_sz, theme)
         }
-        cmds.push(DrawCmd.TextRun(sx0 + pre_w, sy, mid_s, font_fam, font_sz, theme.accent, false, false, true))
+        cmds.push(DrawCmd.text_run(sx0 + pre_w, sy, mid_s, font_fam, font_sz, theme.accent, false, false, true))
         if post_s != "" {
             emit_popup_code_line(cmds, post_s, buf.major_mode, sx0 + pre_w + mid_w, sy, inner_cols, cell_w, font_fam, font_sz, theme)
         }
@@ -5200,8 +5759,8 @@ fn render_signature_help_popup(
 
     if has_doc {
         let div_y = box_y + cell_h + 6.0
-        cmds.push(DrawCmd.Line(box_x + 6.0, div_y, box_x + box_w - 6.0, div_y, theme.border, 1.0))
-        cmds.push(DrawCmd.TextRun(
+        cmds.push(DrawCmd.line(box_x + 6.0, div_y, box_x + box_w - 6.0, div_y, theme.border, 1.0))
+        cmds.push(DrawCmd.text_run(
             sx0,
             div_y + 2.0,
             clip_str(sh.doc_summary.trim(), inner_cols),
@@ -5213,7 +5772,7 @@ fn render_signature_help_popup(
             false,
         ))
     }
-    cmds.push(DrawCmd.ClipPop)
+    cmds.push(DrawCmd.clip_pop)
 }
 
 fn collect_floating_row_decors(raw_spans: Any, target_row: i64) -> List {
@@ -5274,7 +5833,7 @@ fn render_floating_row_with_spans(
     if row_decors.is_empty() {
         if txt != "" {
             let (exp_txt, _) = expand_tabs_from_col(txt, 0, tabstop)
-            cmds.push(DrawCmd.TextRun(base_x, y, exp_txt, font_fam, font_sz, theme.fg, false, false, false))
+            cmds.push(DrawCmd.text_run(base_x, y, exp_txt, font_fam, font_sz, theme.fg, false, false, false))
         }
         return
     }
@@ -5292,7 +5851,7 @@ fn render_floating_row_with_spans(
                     let ce = if ve > max_chars { max_chars } else { ve }
                     let rx = base_x + vs.as(f64) * cell_w
                     let rw = (ce - vs).as(f64) * cell_w
-                    cmds.push(DrawCmd.FillRect(rx, y, rw, cell_h, dec.bg_rgba, 2.0))
+                    cmds.push(DrawCmd.fill_rect(rx, y, rw, cell_h, dec.bg_rgba, 2.0))
                 }
             }
         }
@@ -5329,7 +5888,7 @@ fn render_floating_row_with_spans(
             let seg = txt.slice(run_start, c)
             let (exp_seg, next_vcol) = expand_tabs_from_col(seg, cur_vcol, tabstop)
             let sx = base_x + cur_vcol.as(f64) * cell_w
-            cmds.push(DrawCmd.TextRun(sx, y, exp_seg, font_fam, font_sz, cur_fg, false, false, cur_ul))
+            cmds.push(DrawCmd.text_run(sx, y, exp_seg, font_fam, font_sz, cur_fg, false, false, cur_ul))
             cur_vcol = next_vcol
             run_start = c
             cur_fg = fg
@@ -5340,7 +5899,7 @@ fn render_floating_row_with_spans(
     if tail != "" {
         let (exp_tail, _) = expand_tabs_from_col(tail, cur_vcol, tabstop)
         let sx = base_x + cur_vcol.as(f64) * cell_w
-        cmds.push(DrawCmd.TextRun(sx, y, exp_tail, font_fam, font_sz, cur_fg, false, false, cur_ul))
+        cmds.push(DrawCmd.text_run(sx, y, exp_tail, font_fam, font_sz, cur_fg, false, false, cur_ul))
     }
 }
 
@@ -5426,11 +5985,11 @@ fn render_floating_windows(
         }
         let bcol = if fw.border_rgba != 0 { fw.border_rgba } else { theme.accent }
 
-        cmds.push(DrawCmd.ClipPush(box_x, box_y, box_w, box_h))
-        cmds.push(DrawCmd.FillRect(box_x, box_y, box_w, box_h, theme.bg_popup, 6.0))
-        cmds.push(DrawCmd.StrokeRect(box_x, box_y, box_w, box_h, bcol, 1.5, 6.0))
-        cmds.push(DrawCmd.TextRun(box_x + 10.0, box_y + 4.0, fw.title, font_fam, font_sz, bcol, false, false, false))
-        cmds.push(DrawCmd.Line(box_x + 6.0, box_y + cell_h + 6.0, box_x + box_w - 6.0, box_y + cell_h + 6.0, theme.border, 1.0))
+        cmds.push(DrawCmd.clip_push(box_x, box_y, box_w, box_h))
+        cmds.push(DrawCmd.fill_rect(box_x, box_y, box_w, box_h, theme.bg_popup, 6.0))
+        cmds.push(DrawCmd.stroke_rect(box_x, box_y, box_w, box_h, bcol, 1.5, 6.0))
+        cmds.push(DrawCmd.text_run(box_x + 10.0, box_y + 4.0, fw.title, font_fam, font_sz, bcol, false, false, false))
+        cmds.push(DrawCmd.line(box_x + 6.0, box_y + cell_h + 6.0, box_x + box_w - 6.0, box_y + cell_h + 6.0, theme.border, 1.0))
 
         let max_rows = (((box_h - cell_h - 12.0) / cell_h).floor().as(i64))
         let max_chars = (((box_w - 20.0) / cell_w).floor().as(i64))
@@ -5475,10 +6034,10 @@ fn render_floating_windows(
                 let (raw_r, in_code, clang) = md_rows.get(li.as(usize)).as((String, bool, String))
                 let (exp_r, _) = expand_tabs_from_col(raw_r, 0, tabstop)
                 if in_code {
-                    cmds.push(DrawCmd.FillRect(box_x + 6.0, ly, box_w - 12.0, cell_h, theme.bg_alt, 2.0))
+                    cmds.push(DrawCmd.fill_rect(box_x + 6.0, ly, box_w - 12.0, cell_h, theme.bg_alt, 2.0))
                     emit_popup_code_line(cmds, exp_r, clang, box_x + 10.0, ly, max_chars, cell_w, font_fam, font_sz, theme)
                 } else if exp_r.trim() == "---" or exp_r.trim().starts_with("────") {
-                    cmds.push(DrawCmd.Line(box_x + 10.0, ly + cell_h * 0.5, box_x + box_w - 10.0, ly + cell_h * 0.5, theme.border, 1.0))
+                    cmds.push(DrawCmd.line(box_x + 10.0, ly + cell_h * 0.5, box_x + box_w - 10.0, ly + cell_h * 0.5, theme.border, 1.0))
                 } else {
                     emit_popup_code_line(cmds, exp_r, "markdown", box_x + 10.0, ly, max_chars, cell_w, font_fam, font_sz, theme)
                 }
@@ -5490,9 +6049,9 @@ fn render_floating_windows(
                 let ly = box_y + cell_h + 9.0 + li.as(f64) * cell_h
                 let is_sel = li == fw.selected_row
                 if is_sel and (not has_cursor) {
-                    cmds.push(DrawCmd.FillRect(box_x + 6.0, ly, box_w - 12.0, cell_h, theme.bg_selection, 3.0))
+                    cmds.push(DrawCmd.fill_rect(box_x + 6.0, ly, box_w - 12.0, cell_h, theme.bg_selection, 3.0))
                 } else if is_sel and has_cursor {
-                    cmds.push(DrawCmd.FillRect(box_x + 6.0, ly, box_w - 12.0, cell_h, theme.bg_cursor_line, 3.0))
+                    cmds.push(DrawCmd.fill_rect(box_x + 6.0, ly, box_w - 12.0, cell_h, theme.bg_cursor_line, 3.0))
                 }
                 let raw_row_s = fw.lines.get(li.as(usize)).as(String)
                 if has_spans {
@@ -5505,7 +6064,7 @@ fn render_floating_windows(
                 } else {
                     let (exp_txt, _) = expand_tabs_from_col(raw_row_s, 0, tabstop)
                     let clipped_exp = clip_str(exp_txt, max_chars)
-                    cmds.push(DrawCmd.TextRun(box_x + 10.0, ly, clipped_exp, font_fam, font_sz, theme.fg, false, false, false))
+                    cmds.push(DrawCmd.text_run(box_x + 10.0, ly, clipped_exp, font_fam, font_sz, theme.fg, false, false, false))
                 }
             }
         }
@@ -5536,11 +6095,11 @@ fn render_floating_windows(
                 }
                 let cx = box_x + 10.0 + cvcol.as(f64) * cell_w
                 let cy = box_y + cell_h + 9.0 + crow.as(f64) * cell_h
-                cmds.push(DrawCmd.CursorCaret(cx, cy, c_cells.as(f64) * cell_w, cell_h, CaretShape.Block, theme.accent))
+                cmds.push(DrawCmd.cursor_caret(cx, cy, c_cells.as(f64) * cell_w, cell_h, CaretShape.block, theme.accent))
             }
         }
 
-        cmds.push(DrawCmd.ClipPop)
+        cmds.push(DrawCmd.clip_pop)
     }
 }
 
@@ -5572,12 +6131,12 @@ fn render_toast_notifications(
             else => theme.accent,
         }
         let max_chars = (((card_w - 20.0) / cell_w).floor().as(i64))
-        cmds.push(DrawCmd.ClipPush(x, cur_y, card_w, card_h))
-        cmds.push(DrawCmd.FillRect(x, cur_y, card_w, card_h, theme.bg_popup, 5.0))
-        cmds.push(DrawCmd.StrokeRect(x, cur_y, card_w, card_h, bcol, 1.2, 5.0))
-        cmds.push(DrawCmd.TextRun(x + 10.0, cur_y + 3.0, clip_str(t.title, max_chars), font_fam, font_sz, bcol, false, false, false))
-        cmds.push(DrawCmd.TextRun(x + 10.0, cur_y + 5.0 + cell_h, clip_str(t.message, max_chars), font_fam, font_sz, theme.fg, false, false, false))
-        cmds.push(DrawCmd.ClipPop)
+        cmds.push(DrawCmd.clip_push(x, cur_y, card_w, card_h))
+        cmds.push(DrawCmd.fill_rect(x, cur_y, card_w, card_h, theme.bg_popup, 5.0))
+        cmds.push(DrawCmd.stroke_rect(x, cur_y, card_w, card_h, bcol, 1.2, 5.0))
+        cmds.push(DrawCmd.text_run(x + 10.0, cur_y + 3.0, clip_str(t.title, max_chars), font_fam, font_sz, bcol, false, false, false))
+        cmds.push(DrawCmd.text_run(x + 10.0, cur_y + 5.0 + cell_h, clip_str(t.message, max_chars), font_fam, font_sz, theme.fg, false, false, false))
+        cmds.push(DrawCmd.clip_pop)
         cur_y += card_h + 6.0
     }
 }
@@ -5603,11 +6162,11 @@ pub fn compose_frame(
         width: wm.pixel_width,
         height: wm.pixel_height,
         bg_rgba: theme.bg,
-        pointer: PointerHint.Default,
+        pointer: PointerHint.default,
     }
 
     let cmds = List()
-    cmds.push(DrawCmd.FillRect(0.0, 0.0, win_w, win_h, theme.bg, 0.0))
+    cmds.push(DrawCmd.fill_rect(0.0, 0.0, win_w, win_h, theme.bg, 0.0))
 
     -- 1. Optional Top Tab / Buffer Header Bar (closed by default; vertical `ext_tablist` replaces it)
     if world.options.show_tab_bar {
@@ -5685,7 +6244,7 @@ pub fn register_render_extension(kernel: SystemKernel) -> !String Unit {
                         let ans? = ask_prompt(PromptRequest.with_candidates(
                             "Color theme: ",
                             "",
-                            PromptKind.Choice,
+                            PromptKind.choice,
                             builtin_theme_names(),
                         ))# else {
                             status_emit("Cancelled")#

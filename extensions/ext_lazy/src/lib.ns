@@ -62,10 +62,10 @@ pub fn require_lazy_service(kernel: SystemKernel) -> !String LazyService {
 
 fn format_ext_state(st: ExtState) -> String {
     st match {
-        ExtState.Active => "Active",
-        ExtState.Disabled => "Disabled",
-        ExtState.Registered => "Registered",
-        ExtState.Failed(reason) => "Failed: " ++ reason,
+        ExtState.active => "Active",
+        ExtState.disabled => "Disabled",
+        ExtState.registered => "Registered",
+        ExtState.failed(reason) => "Failed: " ++ reason,
     }
 }
 
@@ -122,7 +122,7 @@ fn active_dependents_of(kernel: SystemKernel, target_id: ExtId) -> List {
     let all = kernel.list_extensions()
     for i in 0..all.len() {
         let rec = all.get(i.as(usize)).as(ExtensionRecord)
-        if rec.id != target_id and rec.state == ExtState.Active {
+        if rec.id != target_id and rec.state == ExtState.active {
             for j in 0..rec.dependencies.len() {
                 if rec.dependencies.get(j.as(usize)).as(ExtId) == target_id {
                     out.push(rec.id)
@@ -153,7 +153,7 @@ pub fn render_lazy_buffer(kernel: SystemKernel, _world: EditorWorld) -> List {
 
     for i in 0..all.len() {
         let rec = all.get(i.as(usize)).as(ExtensionRecord)
-        if rec.state == ExtState.Active {
+        if rec.state == ExtState.active {
             active_list.push(rec)
         } else {
             other_list.push(rec)
@@ -435,7 +435,7 @@ pub fn build_checkhealth_lines(kernel: SystemKernel, svc: LazyService) -> List {
     lines.push("")
 
     -- 1. Nessa VM & GC Runtime
-    let vm_ver = runtime.VERSION
+    let vm_ver = runtime.version()
     let gc_cols = runtime.gc_collections()
     lines.push("## Nessa Runtime & Garbage Collector")
     lines.push("  [OK] Nessa VM Version: " ++ vm_ver)
@@ -487,8 +487,8 @@ pub fn build_checkhealth_lines(kernel: SystemKernel, svc: LazyService) -> List {
     for i in 0..all_exts.len() {
         let rec = all_exts.get(i.as(usize)).as(ExtensionRecord)
         rec.state match {
-            ExtState.Active => { active_cnt += 1 },
-            ExtState.Failed(reason) => {
+            ExtState.active => { active_cnt += 1 },
+            ExtState.failed(reason) => {
                 failed_msgs.push(rec.id.raw() ++ ": " ++ reason)
             },
             _ => { disabled_cnt += 1 },
@@ -536,7 +536,7 @@ fn cmd_lazy_open(kernel: SystemKernel, _args: List) -> #InteractiveEffects !Stri
 
     let lbuf = refresh_lazy_buffer(kernel, world, svc)
     let _ = world.switch_to_buffer(lbuf.id)
-    vim.mode = VimMode.Normal
+    vim.mode = VimMode.normal
     vim.clear_transient()
     sync_world_from_vim(world, vim)
     kernel.emit_hook("buffer-switched", lbuf.id)
@@ -604,7 +604,7 @@ fn cmd_lazy_toggle_ext(kernel: SystemKernel, _args: List) -> #InteractiveEffects
     }
     let rec = rec_any.as(ExtensionRecord)
 
-    if rec.state == ExtState.Active {
+    if rec.state == ExtState.active {
         let deps = active_dependents_of(kernel, target_id)
         if not deps.is_empty() {
             let first_dep = deps.get(0).as(ExtId)
@@ -672,7 +672,7 @@ fn cmd_lazy_activate_all(kernel: SystemKernel, _args: List) -> #InteractiveEffec
     var activated_cnt: i64 = 0
     for i in 0..all.len() {
         let rec = all.get(i.as(usize)).as(ExtensionRecord)
-        if rec.state != ExtState.Active {
+        if rec.state != ExtState.active {
             let res = kernel.activate_extension(rec.id)
             res match {
                 _! => { activated_cnt += 1 },
@@ -708,7 +708,7 @@ fn cmd_lazy_check_health(kernel: SystemKernel, _args: List) -> #InteractiveEffec
     let hbuf = world.ensure_special_buffer(CHECKHEALTH_BUF_NAME, MODE_CHECKHEALTH, lines, read_only = true)
     hbuf.point = Pos.zero()
     let _ = world.switch_to_buffer(hbuf.id)
-    vim.mode = VimMode.Normal
+    vim.mode = VimMode.normal
     vim.clear_transient()
     sync_world_from_vim(world, vim)
     kernel.emit_hook("buffer-switched", hbuf.id)
@@ -745,7 +745,7 @@ fn cmd_lazy_close(kernel: SystemKernel, _args: List) -> #InteractiveEffects !Str
         if not switched_h {
             let _ = world.switch_to_buffer(world.scratch_id)
         }
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.clear_transient()
         sync_world_from_vim(world, vim)
         kernel.emit_hook("buffer-switched", world.active_buffer_id)
@@ -766,7 +766,7 @@ fn cmd_lazy_close(kernel: SystemKernel, _args: List) -> #InteractiveEffects !Str
         if not switched {
             let _ = world.switch_to_buffer(world.scratch_id)
         }
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.clear_transient()
         sync_world_from_vim(world, vim)
         kernel.emit_hook("buffer-switched", world.active_buffer_id)

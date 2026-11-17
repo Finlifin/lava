@@ -75,24 +75,24 @@ pub struct LspStatus {
 }
 
 pub enum LspWireEvent {
-    pub Initialized(server_name: String, server_version: String, capabilities: String),
-    pub Diagnostics(file_path: String, items: List),
-    pub Hover(req_id: i64, markdown: String),
-    pub Locations(req_id: i64, kind: String, items: List),
-    pub Symbols(req_id: i64, items: List),
-    pub Completions(req_id: i64, items: List),
-    pub SignatureHelp(
+    pub initialized(server_name: String, server_version: String, capabilities: String),
+    pub diagnostics(file_path: String, items: List),
+    pub hover(req_id: i64, markdown: String),
+    pub locations(req_id: i64, kind: String, items: List),
+    pub symbols(req_id: i64, items: List),
+    pub completions(req_id: i64, items: List),
+    pub signature_help(
         req_id: i64,
         label: String,
         documentation: String,
         parameters: List,
         active_param: i64,
     ),
-    pub WorkspaceEdit(req_id: i64, label: String, edits: List),
-    pub CodeActions(req_id: i64, items: List),
-    pub Log(level: String, message: String),
-    pub RequestError(req_id: i64, method: String, message: String),
-    pub Exited(exit_code: i64),
+    pub workspace_edit(req_id: i64, label: String, edits: List),
+    pub code_actions(req_id: i64, items: List),
+    pub log(level: String, message: String),
+    pub request_error(req_id: i64, method: String, message: String),
+    pub exited(exit_code: i64),
 }
 
 pub fn lsp_available() -> bool {
@@ -272,7 +272,7 @@ pub fn lsp_poll_events(session_id: i64) -> !String List {
         let tag = rec.get(0).as(String)
         when {
             tag == "initialized" => {
-                out.push(LspWireEvent.Initialized(
+                out.push(LspWireEvent.initialized(
                     rec.get(1).as(String),
                     rec.get(2).as(String),
                     rec.get(3).as(String),
@@ -295,10 +295,10 @@ pub fn lsp_poll_events(session_id: i64) -> !String List {
                         message: d.get(7).as(String),
                     })
                 }
-                out.push(LspWireEvent.Diagnostics(fp, items))
+                out.push(LspWireEvent.diagnostics(fp, items))
             },
             tag == "hover" => {
-                out.push(LspWireEvent.Hover(rec.get(1).as(i64), rec.get(2).as(String)))
+                out.push(LspWireEvent.hover(rec.get(1).as(i64), rec.get(2).as(String)))
             },
             tag == "locations" => {
                 let req_id = rec.get(1).as(i64)
@@ -315,7 +315,7 @@ pub fn lsp_poll_events(session_id: i64) -> !String List {
                         end_col: lc.get(4).as(i64),
                     })
                 }
-                out.push(LspWireEvent.Locations(req_id, lkind, locs))
+                out.push(LspWireEvent.locations(req_id, lkind, locs))
             },
             tag == "symbols" => {
                 let req_id = rec.get(1).as(i64)
@@ -332,7 +332,7 @@ pub fn lsp_poll_events(session_id: i64) -> !String List {
                         end_row: sy.get(5).as(i64),
                     })
                 }
-                out.push(LspWireEvent.Symbols(req_id, syms))
+                out.push(LspWireEvent.symbols(req_id, syms))
             },
             tag == "completions" => {
                 let req_id = rec.get(1).as(i64)
@@ -349,7 +349,7 @@ pub fn lsp_poll_events(session_id: i64) -> !String List {
                         documentation: doc_str,
                     })
                 }
-                out.push(LspWireEvent.Completions(req_id, cmps))
+                out.push(LspWireEvent.completions(req_id, cmps))
             },
             tag == "signature_help" => {
                 let req_id = rec.get(1).as(i64)
@@ -361,13 +361,13 @@ pub fn lsp_poll_events(session_id: i64) -> !String List {
                     params.push(raw_params.get(pi.as(usize)).as(String))
                 }
                 let act_p = rec.get(5).as(i64)
-                out.push(LspWireEvent.SignatureHelp(req_id, lbl, doc, params, act_p))
+                out.push(LspWireEvent.signature_help(req_id, lbl, doc, params, act_p))
             },
             tag == "workspace_edit" => {
                 let req_id = rec.get(1).as(i64)
                 let lbl = rec.get(2).as(String)
                 let edits = decode_text_edits(rec.get(3).as(List))
-                out.push(LspWireEvent.WorkspaceEdit(req_id, lbl, edits))
+                out.push(LspWireEvent.workspace_edit(req_id, lbl, edits))
             },
             tag == "code_actions" => {
                 let req_id = rec.get(1).as(i64)
@@ -381,20 +381,20 @@ pub fn lsp_poll_events(session_id: i64) -> !String List {
                         edits: decode_text_edits(ac.get(2).as(List)),
                     })
                 }
-                out.push(LspWireEvent.CodeActions(req_id, acts))
+                out.push(LspWireEvent.code_actions(req_id, acts))
             },
             tag == "log" => {
-                out.push(LspWireEvent.Log(rec.get(1).as(String), rec.get(2).as(String)))
+                out.push(LspWireEvent.log(rec.get(1).as(String), rec.get(2).as(String)))
             },
             tag == "error" => {
-                out.push(LspWireEvent.RequestError(
+                out.push(LspWireEvent.request_error(
                     rec.get(1).as(i64),
                     rec.get(2).as(String),
                     rec.get(3).as(String),
                 ))
             },
             tag == "exited" => {
-                out.push(LspWireEvent.Exited(rec.get(1).as(i64)))
+                out.push(LspWireEvent.exited(rec.get(1).as(i64)))
             },
             else => (),
         }

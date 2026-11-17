@@ -142,7 +142,7 @@ fn test_batch_08_plugins() {
     mock_enable(true)
 
     let tmp_dir = "/tmp/lava_batch08_" ++ time.unix_millis().to_string()
-    let _ = fs.create_dir_all(tmp_dir) ! { e => panic(e.to_string()) }
+    let _ = fs.create_dir(tmp_dir, parents = true) ! { e => panic(e.to_string()) }
 
     let kernel = boot_batch08_kernel()
     check_eq_str(ext_todo_comments_id().raw(), "lava.org/ext_todo_comments", "ext_todo_comments_id")
@@ -160,7 +160,7 @@ fn test_batch_08_plugins() {
         (require_colorizer_service(kernel) ! { e => panic(e) }).as(ColorizerService)
 
     handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
-    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+    let _ = app_step_event(kernel, RawUiEvent.resize(1280, 800, 1))# ! { e => panic(e) }
 
     -- ========================================================================
     -- PART A: Plugin 22 — `ext_todo_comments`
@@ -170,7 +170,7 @@ fn test_batch_08_plugins() {
     let tbuf_file = path.join(tmp_dir, "engine_notes.ns")
     let tbuf = world.create_buffer(
         "engine_notes.ns",
-        BufferKind.File,
+        BufferKind.file,
         file_path = tbuf_file,
         major_mode = "nessa",
         initial_lines = [
@@ -285,7 +285,7 @@ fn test_batch_08_plugins() {
 
     -- 4. Workspace scan `:TodoQuickfix` & `<Space> s t`, `f` tag filter cycling, `<Return>` jump
     let ws_dir = path.join(tmp_dir, "todo_ws")
-    let _ = fs.create_dir_all(path.join(ws_dir, "src")) ! { e => panic(e.to_string()) }
+    let _ = fs.create_dir(path.join(ws_dir, "src"), parents = true) ! { e => panic(e.to_string()) }
     let file_a = path.join(ws_dir, "src/lexer.ns")
     let file_b = path.join(ws_dir, "src/parser.ns")
     let _ = fs.write_string(
@@ -353,7 +353,7 @@ fn test_batch_08_plugins() {
 
     let ibuf = world.create_buffer(
         "symbols.ns",
-        BufferKind.File,
+        BufferKind.file,
         file_path = path.join(tmp_dir, "symbols.ns"),
         major_mode = "nessa",
         initial_lines = [
@@ -446,7 +446,7 @@ fn test_batch_08_plugins() {
 
     let cbuf = world.create_buffer(
         "palette.ns",
-        BufferKind.File,
+        BufferKind.file,
         file_path = path.join(tmp_dir, "palette.ns"),
         major_mode = "nessa",
         initial_lines = [
@@ -634,7 +634,7 @@ fn test_batch_08_plugins() {
     check_eq_i64(count_decors_for_owner(tbuf, OWNER_TODO_COMMENTS), 0, "deactivate cleared todo decors")
 
     let _ = cap
-    let _ = fs.remove_dir_all(tmp_dir) ! { _ => () }
+    let _ = fs.remove_dir(tmp_dir, recursive = true) ! { _ => () }
 }
 
 fn main() {

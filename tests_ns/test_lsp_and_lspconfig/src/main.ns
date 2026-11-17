@@ -131,7 +131,7 @@ fn route_stroke_local(
             true
         } else {
             let vs = vim_opt.as(VimState)
-            vs.mode == VimMode.Normal
+            vs.mode == VimMode.normal
                 and vs.pending_prefix == ""
                 and vs.leader_strokes.is_empty()
                 and (not kernel.macros.is_recording())
@@ -220,10 +220,10 @@ fn setup_temp_projects() -> (String, String, String, String, String, String) {
     let py_root = path.join(base, "py_proj")
     let py_sub = path.join(path.join(py_root, "pkg"), "sub")
 
-    let _ = fs.create_dir_all(bin_dir) ! { e => panic("mkdir bin: " ++ e.to_string()) }
-    let _ = fs.create_dir_all(rust_src) ! { e => panic("mkdir rust_src: " ++ e.to_string()) }
-    let _ = fs.create_dir_all(nessa_src) ! { e => panic("mkdir nessa_src: " ++ e.to_string()) }
-    let _ = fs.create_dir_all(py_sub) ! { e => panic("mkdir py_sub: " ++ e.to_string()) }
+    let _ = fs.create_dir(bin_dir, parents = true) ! { e => panic("mkdir bin: " ++ e.to_string()) }
+    let _ = fs.create_dir(rust_src, parents = true) ! { e => panic("mkdir rust_src: " ++ e.to_string()) }
+    let _ = fs.create_dir(nessa_src, parents = true) ! { e => panic("mkdir nessa_src: " ++ e.to_string()) }
+    let _ = fs.create_dir(py_sub, parents = true) ! { e => panic("mkdir py_sub: " ++ e.to_string()) }
 
     -- Create mock executable LSP binary script in `bin_dir`
     let mock_ra = path.join(bin_dir, "mock-rust-lsp")
@@ -692,7 +692,7 @@ fn main() {
     check_true(ns_fw_txt.contains("Evaluates orbital harmonic score"), "`*lsp-hover*` shows Nessa `--` doc comment")
 
     -- Clean up temp fixture directory
-    let _ = fs.remove_dir_all(base_dir) ! { _ => () }
+    let _ = fs.remove_dir(base_dir, recursive = true) ! { _ => () }
 
     println("PASS: test_lsp_and_lspconfig — all 18 presets, $PATH scanner, *LspConfig*/*LspInfo*, gd/gI/gy/gr/Hover/Rename/CodeAction/Symbols/Diagnostics/Cmp & K-Help harmony verified!")
 }

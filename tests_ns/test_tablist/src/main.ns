@@ -1,4 +1,3 @@
-use std.io
 use @lava_sys.DrawCmd
 use @lava_core.{
     SystemKernel, clipboard_get, clipboard_set, log_event, status_emit
@@ -48,8 +47,8 @@ fn main() {
     assert_true(not is_tablist_open(world), "vertical tablist is closed by default")
 
     let b1 = world.active_buffer()
-    let b2 = world.create_buffer("alpha.ns", BufferKind.File)
-    let b3 = world.create_buffer("beta.ns", BufferKind.File)
+    let b2 = world.create_buffer("alpha.ns", BufferKind.file)
+    let b3 = world.create_buffer("beta.ns", BufferKind.file)
     let _ = world.switch_to_buffer(b1.id)
 
     -- 2. Toggle open: renders vertically in left_sidebar
@@ -69,7 +68,7 @@ fn main() {
     for i in 0..cmds.len() {
         let cmd = cmds.get(i.as(usize)).as(DrawCmd)
         cmd match {
-            DrawCmd.TextRun(_, _, text, _, _, _, _, _, _) => {
+            DrawCmd.text_run(_, _, text, _, _, _, _, _, _) => {
                 if text == "Tablist" {
                     saw_tablist_hdr = true
                 }
@@ -107,5 +106,5 @@ fn main() {
     assert_true(not is_tablist_open(world), "second tablist-toggle closes vertical tablist")
     assert_true(not world.left_sidebar.visible, "left_sidebar is hidden again")
 
-    io.println("PASS: test_tablist — vertical tablist defaults to closed, toggles cleanly, and switches tabs/buffers!")
+    println("PASS: test_tablist — vertical tablist defaults to closed, toggles cleanly, and switches tabs/buffers!")
 }

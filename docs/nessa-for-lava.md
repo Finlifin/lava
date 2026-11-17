@@ -56,17 +56,17 @@ impl Pos {
     pub fn zero() -> Pos = Pos { row: 0, col: 0 }
 }
 
--- 3. 带载荷枚举与后缀 `match` 表达式
+-- 3. 带载荷枚举与后缀 `match` 表达式（普通值枚举 variant 遵循 snake_case）
 pub enum VimMode {
-    Normal,
-    Insert,
-    VisualChar,
-    OperatorPending(String),
+    pub normal,
+    pub insert,
+    pub visual_char,
+    pub operator_pending(op: String),
 }
 
 mode match {
-    VimMode.Normal => "NORMAL",
-    VimMode.OperatorPending(op) => "OP(" ++ op ++ ")",
+    VimMode.normal => "NORMAL",
+    VimMode.operator_pending(op) => "OP(" ++ op ++ ")",
     _ => "OTHER",
 }
 ```
@@ -135,8 +135,8 @@ pub effect status_emit(message: String) -> Unit
 pub effect clipboard_get() -> String
 pub effect clipboard_set(text: String) -> Unit
 
--- 使用类型别名打包常用效应集合
-pub typealias ServiceEffects = [log_event, status_emit, clipboard_get, clipboard_set]
+-- 使用常量列表打包常用效应集合
+pub const ServiceEffects = [log_event, status_emit, clipboard_get, clipboard_set]
 ```
 
 **核心语法规则**：
@@ -185,10 +185,10 @@ pub effect ask_prompt(req: PromptRequest, catch k) -> ?String
 ```nessa
 let outcome = ((spec.handler)(self, args))# {
     ask_prompt(req, k) => {
-        -- 不立即调用 k，而是将 k 存入内核并返回 Suspended！
+        -- 不立即调用 k，而是将 k 存入内核并返回 suspended！
         -- Nessa VM 仅分离 delimiter 边界的独立栈段链，零调用帧复制！
         self.active_prompt = (req, k)
-        PromptTurn.Suspended(req, k)
+        PromptTurn.suspended(req, k)
     }
 }
 ```
@@ -214,12 +214,12 @@ let outcome = ((spec.handler)(self, args))# {
 
 | 标准库模块 | 核心类型与高频函数 |
 | --- | --- |
-| **预导入 (`prelude`)** | `List`（`List()`、`[a, b]`、`.len()`、`.is_empty()`、`.push(v)`、`.pop()`、`.get(i)`、`.set(i, v)`、`.sort()`、`.sort_by(fn)`、`.join(sep)`）、`String`（`.char_len()`、`.slice(lo, hi)`、`.take(n)`、`.drop(n)`、`.trim()`、`.split(sep)`、`.split_once(sep)`、`.starts_with()`、`.ends_with()`、`.contains()`、`.replace()`、`.to_lower()`、`.to_upper()`、`.parse_i64()`）、`HashMap`（`.new()`、`.insert(k, v)`、`.get(k)`、`.contains_key(k)`、`.remove(k)`、`.keys()`）、`Set`、`Deque`、`println` / `eprintln`、`assert` / `assert_eq` |
-| `std.fs` | `read_to_string(p)`、`write_string(p, s)`、`exists(p)`、`is_file(p)`、`is_dir(p)`、`metadata(p)`、`create_dir_all(p)`、`read_dir(p)`、`rename(a, b)`、`copy(a, b)`、`remove(p)` |
+| **预导入 (`prelude`)** | `List`（`List()`、`[a, b]`、`.len()`、`.is_empty()`、`.push(v)`、`.pop()`、`.get(i)`、`.set(i, v)`、`.sort()`、`.sort_by(fn)`、`.join(sep)`）、`String`（`.char_len()`、`.slice(lo, hi)`、`.take(n)`、`.drop(n)`、`.trim()`、`.split(sep)`、`.split_once(sep)`、`.starts_with()`、`.ends_with()`、`.contains()`、`.replace()`、`.to_lower()`、`.to_upper()`、`.try_parse(i64)` / `.parse(i64)!`）、`HashMap`（`.new()`、`.insert(k, v)`、`.get(k)`、`.contains_key(k)`、`.remove(k)`、`.keys()`）、`Set`、`Deque`、`println` / `eprintln`、`assert` / `assert_eq` |
+| `std.fs` | `read_to_string(p)`、`write_string(p, s)`、`exists(p)`、`is_file(p)`、`is_dir(p)`、`metadata(p)`、`create_dir(p, parents = true)`、`read_dir(p)`、`iter_dir(p)`、`rename(a, b)`、`copy(a, b)`、`remove(p)`、`remove_dir(p, recursive = true)` |
 | `std.path` | `join(a, b)`、`normalize(p)`、`parent(p)`、`file_name(p)`、`file_stem(p)`、`extension(p)`、`is_absolute(p)` |
 | `std.json` | `json.parse(text)`（返回 `!JsonError Any`）与 `json.stringify(val)`（用于持久化会话、Harpoon 书签等状态） |
 | `std.pattern` | 完整模式匹配与捕获替换：`find`、`match_once`、`captures`、`gmatch`、`gsub`、`escape` |
 | `std.env` & `std.time` | `env.get(name)`、`env.current_dir()`、`time.unix_millis()`、`time.monotonic_nanos()`、`time.format_date(...)` |
-| `std.process` & `std.task` | `process.exec(prog, args)`、`process.shell(cmd)`、`task.await_all(futures)`、`task.await_any(futures)` |
+| `std.process` & `std.task` | `process.run(prog, args = ...)`、`Command.new(prog)`、`process.shell(cmd)`、`task.await_all(futures)`、`task.await_any(futures)`、`task.with_timeout(ms, fn)` |
 
 掌握以上特性后，您已经具备阅读 Lava 全部 `.ns` 源码并编写任意复杂插件的能力！下一步请结合 `[extension-development#top]` 与 `[plugins-catalog#top]` 动手实践。

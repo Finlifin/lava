@@ -839,7 +839,7 @@ fn find_dial_match_on_line(line: String, cursor_col: i64, signed_delta: i64) -> 
             }
             if j > cursor_col {
                 let num_str = line.slice(i, j)
-                let parsed_opt = num_str.parse_i64()
+                let parsed_opt = num_str.try_parse(i64)
                 if parsed_opt != null {
                     let next_num = parsed_opt.as(i64) + signed_delta
                     return (DialMatch {
@@ -870,7 +870,7 @@ fn parse_step_arg(args: List) -> i64 {
         return if v > 0 { v } else { 1 }
     }
     let s = first.as(String).trim()
-    let p_opt = s.parse_i64()
+    let p_opt = s.try_parse(i64)
     if p_opt != null and p_opt.as(i64) > 0 {
         return p_opt.as(i64)
     }
@@ -915,7 +915,7 @@ pub fn dial_step(kernel: SystemKernel, sign: i64, args: List) -> #InteractiveEff
 -- ============================================================================
 
 fn is_vim_visual(mode: VimMode) -> bool {
-    mode == VimMode.VisualChar or mode == VimMode.VisualLine or mode == VimMode.VisualBlock
+    mode == VimMode.visual_char or mode == VimMode.visual_line or mode == VimMode.visual_block
 }
 
 pub fn move_lines(kernel: SystemKernel, delta: i64) -> #InteractiveEffects !String bool {

@@ -293,9 +293,9 @@ fn test_ex_completion_stages_and_consult_previews() {
     let readme_file = path.join(tmp_dir, "README.md")
     let inner_file = path.join(sub_dir, "mod.ns")
 
-    let _ = fs.create_dir_all(sub_dir) ! { _ => panic("mkdir sub_dir") }
+    let _ = fs.create_dir(sub_dir, parents = true) ! { _ => panic("mkdir sub_dir") }
     defer {
-        let _ = fs.remove_dir_all(tmp_dir) ! { _ => () }
+        let _ = fs.remove_dir(tmp_dir, recursive = true) ! { _ => () }
     }
     let _ = fs.write_string(readme_file, "# Lava Rich Minibuffer\nSecond line of docs\n") ! { _ => panic("write readme") }
     let _ = fs.write_string(inner_file, "pub fn answer() -> i64 = 99\n") ! { _ => panic("write inner") }
@@ -312,14 +312,14 @@ fn test_ex_completion_stages_and_consult_previews() {
 
     let other_buf = world.create_buffer(
         "notes_preview.md",
-        BufferKind.File,
+        BufferKind.file,
         file_path = readme_file,
         major_mode = "markdown",
         initial_lines = ["# Preview Buffer", "Consult switches live!"],
     )
     other_buf.modified = true
     let _ = world.switch_to_buffer(main_buf.id)
-    assert_true(vim.mode == VimMode.Normal, "starts in Evil Normal mode")
+    assert_true(vim.mode == VimMode.normal, "starts in Evil Normal mode")
 
     -- 2a. Open `:` -> Stage 1 lists built-in Ex verbs + `ex:*` plugin commands + mode badge `"EX :"`
     send_keys(kernel, world, ":", clip_cap, log_cap, status_cap)
@@ -457,7 +457,7 @@ fn test_mx_keybinding_discovery_and_history_boost() {
     assert_eq_str(dj_key, "-", "vim:normal '-' keybinding pill discovered")
 
     -- Record `"undo-tree-visualize"` in CommandName history and verify +250 recency boost puts it #1 on empty M-x!
-    mb.record_history(PromptKind.CommandName, "undo-tree-visualize")
+    mb.record_history(PromptKind.command_name, "undo-tree-visualize")
     send_keys(kernel, world, "<M-x>", clip_cap, log_cap, status_cap)
     assert_true(world.minibuffer_view.active, "M-x opened CommandName minibuffer")
     assert_eq_str(world.minibuffer_mode_badge, "M-x", "M-x mode badge")
@@ -497,9 +497,9 @@ fn test_filepath_vertico_and_rich_render_scene() {
     let level1 = path.join(root_dir, "alpha")
     let level2 = path.join(level1, "beta")
     let leaf_ns = path.join(level2, "deep.ns")
-    let _ = fs.create_dir_all(level2) ! { _ => panic("mkdir level2") }
+    let _ = fs.create_dir(level2, parents = true) ! { _ => panic("mkdir level2") }
     defer {
-        let _ = fs.remove_dir_all(root_dir) ! { _ => () }
+        let _ = fs.remove_dir(root_dir, recursive = true) ! { _ => () }
     }
     let _ = fs.write_string(leaf_ns, "let deep = true\n") ! { _ => panic("write leaf_ns") }
     -- Also create 15 sibling files in root_dir so `FilePath` has > 15 entries (testing 12-row popup + scrollbar!)
@@ -533,7 +533,7 @@ fn test_filepath_vertico_and_rich_render_scene() {
     for ci in 0..cmds_popup.len() {
         let cmd = cmds_popup.get(ci.as(usize)).as(DrawCmd)
         cmd match {
-            DrawCmd.TextRun(_, _, txt, _, _, col, bold, _, ul) => {
+            DrawCmd.text_run(_, _, txt, _, _, col, bold, _, ul) => {
                 if txt == "[FILE]" {
                     saw_file_pill = true
                 }
@@ -556,7 +556,7 @@ fn test_filepath_vertico_and_rich_render_scene() {
     for ci in 0..cmds_popup.len() {
         let cmd = cmds_popup.get(ci.as(usize)).as(DrawCmd)
         cmd match {
-            DrawCmd.TextRun(_, _, txt, _, _, _, _, _, _) => {
+            DrawCmd.text_run(_, _, txt, _, _, _, _, _, _) => {
                 if txt == "[ns]" {
                     ns_badges_drawn += 1
                 }
@@ -647,12 +647,12 @@ fn test_filepath_vertico_and_rich_render_scene() {
     for ci in 0..cmds_float.len() {
         let cmd = cmds_float.get(ci.as(usize)).as(DrawCmd)
         cmd match {
-            DrawCmd.FillRect(_, _, _, _, col, _) => {
+            DrawCmd.fill_rect(_, _, _, _, col, _) => {
                 if col == custom_bg {
                     saw_span_bg = true
                 }
             },
-            DrawCmd.TextRun(_, _, txt, _, _, col, bold, _, ul) => {
+            DrawCmd.text_run(_, _, txt, _, _, col, bold, _, ul) => {
                 if txt == "$ " and col == custom_fg and (not bold) {
                     saw_span_fg_nobold = true
                 }
@@ -660,8 +660,8 @@ fn test_filepath_vertico_and_rich_render_scene() {
                     saw_span_ul = true
                 }
             },
-            DrawCmd.CursorCaret(_, _, _, _, shape, _) => {
-                if shape == CaretShape.Block {
+            DrawCmd.cursor_caret(_, _, _, _, shape, _) => {
+                if shape == CaretShape.block {
                     block_carets += 1
                 }
             },

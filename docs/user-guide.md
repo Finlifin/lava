@@ -211,7 +211,7 @@ pub fn configure(kernel: SystemKernel) -> !String Unit {
                     }
                     let buf = w.create_buffer(
                         "*journal:" ++ topic ++ "*",
-                        BufferKind.Scratch,
+                        BufferKind.scratch,
                         major_mode = "org",
                         initial_lines = ["* TODO " ++ topic, ""],
                     )

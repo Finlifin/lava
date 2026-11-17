@@ -117,6 +117,17 @@ struct TSPoint {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TSInputEdit {
+    start_byte: u32,
+    old_end_byte: u32,
+    new_end_byte: u32,
+    start_point: TSPoint,
+    old_end_point: TSPoint,
+    new_end_point: TSPoint,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct TSNode {
     context: [u32; 4],
@@ -173,6 +184,8 @@ struct TsApi {
     ts_parser_parse_string:
         unsafe extern "C" fn(*mut TSParser, *const TSTree, *const c_char, u32) -> *mut TSTree,
     ts_parser_reset: unsafe extern "C" fn(*mut TSParser),
+    ts_tree_copy: Option<unsafe extern "C" fn(*const TSTree) -> *mut TSTree>,
+    ts_tree_edit: Option<unsafe extern "C" fn(*mut TSTree, *const TSInputEdit)>,
     ts_tree_delete: unsafe extern "C" fn(*mut TSTree),
     ts_tree_root_node: unsafe extern "C" fn(*const TSTree) -> TSNode,
     ts_node_type: unsafe extern "C" fn(TSNode) -> *const c_char,
@@ -287,6 +300,8 @@ fn try_load_ts_api() -> Option<TsApi> {
             ts_parser_set_language: load_sym(handle, b"ts_parser_set_language\0")?,
             ts_parser_parse_string: load_sym(handle, b"ts_parser_parse_string\0")?,
             ts_parser_reset: load_sym(handle, b"ts_parser_reset\0")?,
+            ts_tree_copy: load_sym(handle, b"ts_tree_copy\0"),
+            ts_tree_edit: load_sym(handle, b"ts_tree_edit\0"),
             ts_tree_delete: load_sym(handle, b"ts_tree_delete\0")?,
             ts_tree_root_node: load_sym(handle, b"ts_tree_root_node\0")?,
             ts_node_type: load_sym(handle, b"ts_node_type\0")?,
@@ -2069,13 +2084,82 @@ fn line_slice_at<'a>(source: &'a str, line_starts: &[usize], row: usize) -> &'a 
     }
 }
 
+#[inline]
+fn byte_offset_to_ts_point(line_starts: &[usize], byte_offset: usize) -> TSPoint {
+    let actual_lines = line_starts.len().saturating_sub(1);
+    if actual_lines == 0 {
+        return TSPoint {
+            row: 0,
+            column: byte_offset as u32,
+        };
+    }
+    let row = line_starts[..actual_lines]
+        .partition_point(|&start| start <= byte_offset)
+        .saturating_sub(1);
+    let col_bytes = byte_offset.saturating_sub(line_starts[row]);
+    TSPoint {
+        row: row as u32,
+        column: col_bytes as u32,
+    }
+}
+
+fn compute_ts_input_edit(
+    old_src: &str,
+    old_starts: &[usize],
+    new_src: &str,
+    new_starts: &[usize],
+) -> Option<TSInputEdit> {
+    if old_src.len() > MAX_PARSE_SOURCE_BYTES || new_src.len() > MAX_PARSE_SOURCE_BYTES {
+        return None;
+    }
+    let old_b = old_src.as_bytes();
+    let new_b = new_src.as_bytes();
+    let min_len = old_b.len().min(new_b.len());
+    let mut prefix = 0usize;
+    while prefix < min_len && old_b[prefix] == new_b[prefix] {
+        prefix += 1;
+    }
+    while prefix > 0 && !old_src.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let old_rem = old_b.len() - prefix;
+    let new_rem = new_b.len() - prefix;
+    let min_rem = old_rem.min(new_rem);
+    let mut suffix = 0usize;
+    while suffix < min_rem && old_b[old_b.len() - 1 - suffix] == new_b[new_b.len() - 1 - suffix] {
+        suffix += 1;
+    }
+    while suffix > 0 && !old_src.is_char_boundary(old_b.len() - suffix) {
+        suffix -= 1;
+    }
+    let old_end = old_b.len() - suffix;
+    let new_end = new_b.len() - suffix;
+    Some(TSInputEdit {
+        start_byte: u32::try_from(prefix).ok()?,
+        old_end_byte: u32::try_from(old_end).ok()?,
+        new_end_byte: u32::try_from(new_end).ok()?,
+        start_point: byte_offset_to_ts_point(old_starts, prefix),
+        old_end_point: byte_offset_to_ts_point(old_starts, old_end),
+        new_end_point: byte_offset_to_ts_point(new_starts, new_end),
+    })
+}
+
 fn parse_source_to_tree(api: &TsApi, lang: &LoadedLanguage, source: &str) -> Option<*mut TSTree> {
+    parse_source_to_tree_with_old(api, lang, source, ptr::null())
+}
+
+fn parse_source_to_tree_with_old(
+    api: &TsApi,
+    lang: &LoadedLanguage,
+    source: &str,
+    old_tree: *const TSTree,
+) -> Option<*mut TSTree> {
     if source.len() > MAX_PARSE_SOURCE_BYTES {
         return None;
     }
     let src_len = u32::try_from(source.len()).ok()?;
     // SAFETY: Creates an owned `TSParser`, assigns verified `lang.language_ptr`, parses `source`
-    // (`src_len` valid UTF-8 bytes), and deletes the temporary `TSParser`.
+    // (`src_len` valid UTF-8 bytes) optionally reusing `old_tree`, and deletes `TSParser`.
     unsafe {
         let parser = (api.ts_parser_new)();
         if parser.is_null() {
@@ -2087,7 +2171,7 @@ fn parse_source_to_tree(api: &TsApi, lang: &LoadedLanguage, source: &str) -> Opt
         }
         let tree = (api.ts_parser_parse_string)(
             parser,
-            ptr::null(),
+            old_tree,
             source.as_ptr().cast::<c_char>(),
             src_len,
         );
@@ -3290,7 +3374,7 @@ fn highlight_nessa_line(line: &str, state: &mut NessaLexState) -> Vec<TsHighligh
     spans
 }
 
-const NESSA_CHECKPOINT_STRIDE: usize = 128;
+const NESSA_CHECKPOINT_STRIDE: usize = 32;
 
 struct CachedNessaDoc {
     doc_id: i64,
@@ -3304,10 +3388,81 @@ static NESSA_DOC_CACHE: OnceLock<Mutex<VecDeque<CachedNessaDoc>>> = OnceLock::ne
 
 type NessaDocSnapshot = (Vec<Arc<Vec<String>>>, usize, Vec<NessaLexState>);
 
+fn find_dirty_row_window(
+    old_chunks: &[Arc<Vec<String>>],
+    old_total: usize,
+    new_chunks: &[Arc<Vec<String>>],
+    new_total: usize,
+) -> (usize, usize) {
+    let mut row = 0usize;
+    let mut oi = 0usize;
+    let mut o_off = 0usize;
+    let mut ni = 0usize;
+    let mut n_off = 0usize;
+    let min_total = old_total.min(new_total);
+
+    while row < min_total && oi < old_chunks.len() && ni < new_chunks.len() {
+        if o_off == 0 && n_off == 0 && Arc::ptr_eq(&old_chunks[oi], &new_chunks[ni]) {
+            row += old_chunks[oi].len();
+            oi += 1;
+            ni += 1;
+            continue;
+        }
+        if old_chunks[oi][o_off] != new_chunks[ni][n_off] {
+            break;
+        }
+        row += 1;
+        o_off += 1;
+        if o_off >= old_chunks[oi].len() {
+            oi += 1;
+            o_off = 0;
+        }
+        n_off += 1;
+        if n_off >= new_chunks[ni].len() {
+            ni += 1;
+            n_off = 0;
+        }
+    }
+    let first_diff = row;
+
+    if old_total != new_total {
+        return (first_diff, new_total);
+    }
+
+    // Same line count: scan backward from the end (skipping `Arc::ptr_eq` tail chunks) to bound `last_diff`.
+    let mut rem_rows = new_total;
+    let mut b_oi = old_chunks.len();
+    let mut b_ni = new_chunks.len();
+    while rem_rows > first_diff && b_oi > 0 && b_ni > 0 {
+        if Arc::ptr_eq(&old_chunks[b_oi - 1], &new_chunks[b_ni - 1]) {
+            let clen = new_chunks[b_ni - 1].len();
+            if rem_rows.saturating_sub(clen) >= first_diff {
+                rem_rows -= clen;
+                b_oi -= 1;
+                b_ni -= 1;
+                continue;
+            }
+        }
+        break;
+    }
+    while rem_rows > first_diff {
+        let r = rem_rows - 1;
+        let eq = match (chunks_line_at(old_chunks, r), chunks_line_at(new_chunks, r)) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
+        if !eq {
+            break;
+        }
+        rem_rows -= 1;
+    }
+    (first_diff, rem_rows)
+}
+
 fn get_or_build_nessa_doc(doc_id: i64) -> Option<NessaDocSnapshot> {
     let (ver, total_lines) = doc_version_and_line_count(doc_id)?;
     let cache = NESSA_DOC_CACHE.get_or_init(|| Mutex::new(VecDeque::new()));
-    {
+    let prev_cached = {
         let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(pos) = guard
             .iter()
@@ -3322,20 +3477,61 @@ fn get_or_build_nessa_doc(doc_id: i64) -> Option<NessaDocSnapshot> {
             guard.push_back(entry);
             return Some(res);
         }
-    }
+        guard
+            .iter()
+            .find(|e| e.doc_id == doc_id)
+            .map(|e| (e.chunks.clone(), e.total_lines, e.checkpoints.clone()))
+    };
 
     let (snap_ver, chunks, snap_total) = doc_snapshot_source_and_offsets(doc_id)?;
     let _ = total_lines;
-    let mut checkpoints = Vec::with_capacity(snap_total.div_ceil(NESSA_CHECKIDE_GUARD) + 1);
-    let mut state = NessaLexState::default();
-    let mut row = 0usize;
-    for chunk in &chunks {
-        for line in chunk.iter() {
-            if row.is_multiple_of(NESSA_CHECKPOINT_STRIDE) {
+    let total_cps = if snap_total == 0 {
+        0
+    } else {
+        (snap_total - 1) / NESSA_CHECKPOINT_STRIDE + 1
+    };
+    let mut checkpoints = Vec::with_capacity(total_cps);
+
+    if let Some((prev_chunks, prev_total, prev_cps)) = prev_cached
+        && !prev_cps.is_empty()
+        && snap_total > 0
+    {
+        let (first_diff, dirty_end_excl) =
+            find_dirty_row_window(&prev_chunks, prev_total, &chunks, snap_total);
+        let reuse_cp_idx = (first_diff / NESSA_CHECKPOINT_STRIDE).min(prev_cps.len() - 1);
+        checkpoints.extend_from_slice(&prev_cps[..=reuse_cp_idx]);
+        let mut state = checkpoints[reuse_cp_idx].clone();
+        let start_lex_row = reuse_cp_idx * NESSA_CHECKPOINT_STRIDE;
+        let same_line_count = prev_total == snap_total && prev_cps.len() == total_cps;
+
+        let mut converged_at_cp: Option<usize> = None;
+        for row in start_lex_row..snap_total {
+            if row > start_lex_row && row.is_multiple_of(NESSA_CHECKPOINT_STRIDE) {
+                let cp_i = row / NESSA_CHECKPOINT_STRIDE;
+                if same_line_count && row >= dirty_end_excl && prev_cps[cp_i] == state {
+                    converged_at_cp = Some(cp_i);
+                    break;
+                }
                 checkpoints.push(state.clone());
             }
-            let _ = highlight_nessa_line(line, &mut state);
-            row += 1;
+            if let Some(line) = chunks_line_at(&chunks, row) {
+                let _ = highlight_nessa_line(line, &mut state);
+            }
+        }
+        if let Some(cp_i) = converged_at_cp {
+            checkpoints.extend_from_slice(&prev_cps[cp_i..]);
+        }
+    } else {
+        let mut state = NessaLexState::default();
+        let mut row = 0usize;
+        for chunk in &chunks {
+            for line in chunk.iter() {
+                if row.is_multiple_of(NESSA_CHECKPOINT_STRIDE) {
+                    checkpoints.push(state.clone());
+                }
+                let _ = highlight_nessa_line(line, &mut state);
+                row += 1;
+            }
         }
     }
 
@@ -3353,8 +3549,6 @@ fn get_or_build_nessa_doc(doc_id: i64) -> Option<NessaDocSnapshot> {
     });
     Some((chunks, snap_total, checkpoints))
 }
-
-const NESSA_CHECKIDE_GUARD: usize = NESSA_CHECKPOINT_STRIDE;
 
 fn chunks_line_at(chunks: &[Arc<Vec<String>>], target_row: usize) -> Option<&str> {
     let mut base = 0usize;
@@ -3421,17 +3615,64 @@ fn ensure_cached_doc_tree(
         lang: norm_lang.to_string(),
     };
     let lru = DOC_TREE_LRU.get_or_init(|| Mutex::new(DocTreeLru::new()));
-    {
+    let prev_tree_bundle = {
         let mut guard = lru.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(idx) = guard.get_idx(&key) {
             let entry = &guard.entries[idx];
             return Some((Arc::clone(&entry.source), Arc::clone(&entry.line_starts)));
         }
-    }
+        if let (Some(copy_fn), Some(_edit_fn)) = (api.ts_tree_copy, api.ts_tree_edit) {
+            guard
+                .entries
+                .iter()
+                .find(|e| {
+                    e.key.doc_id == doc_id && e.key.lang == norm_lang && !e.tree_ptr.is_null()
+                })
+                .and_then(|e| {
+                    // SAFETY: `e.tree_ptr` is a valid `TSTree` protected by `DOC_TREE_LRU` mutex;
+                    // `ts_tree_copy` returns an independent refcounted copy safe to edit outside the lock.
+                    let copied = unsafe { copy_fn(e.tree_ptr) };
+                    if copied.is_null() {
+                        None
+                    } else {
+                        Some((copied, Arc::clone(&e.source), Arc::clone(&e.line_starts)))
+                    }
+                })
+        } else {
+            None
+        }
+    };
 
-    let (snap_ver, chunks, total_lines) = doc_snapshot_source_and_offsets(doc_id)?;
+    let (snap_ver, chunks, total_lines) = match doc_snapshot_source_and_offsets(doc_id) {
+        Some(s) => s,
+        None => {
+            if let Some((copied, _, _)) = prev_tree_bundle {
+                // SAFETY: `copied` is uniquely owned here and must be freed on early return.
+                unsafe { (api.ts_tree_delete)(copied) };
+            }
+            return None;
+        }
+    };
     let (source_raw, line_starts_raw) = build_source_and_line_starts(&chunks, total_lines);
-    let tree_ptr = parse_source_to_tree(api, loaded_lang, &source_raw)?;
+
+    let tree_ptr = if let Some((copied_tree, prev_src, prev_starts)) = prev_tree_bundle {
+        let parsed = if let (Some(edit_fn), Some(ts_edit)) = (
+            api.ts_tree_edit,
+            compute_ts_input_edit(&prev_src, &prev_starts, &source_raw, &line_starts_raw),
+        ) {
+            // SAFETY: `copied_tree` is a uniquely owned `TSTree` copy and `ts_edit` has verified
+            // byte/point bounds derived directly from `prev_src` -> `source_raw`.
+            unsafe { edit_fn(copied_tree, &ts_edit) };
+            parse_source_to_tree_with_old(api, loaded_lang, &source_raw, copied_tree)
+        } else {
+            parse_source_to_tree(api, loaded_lang, &source_raw)
+        };
+        // SAFETY: `copied_tree` was created by `ts_tree_copy` for this incremental parse and is no longer needed.
+        unsafe { (api.ts_tree_delete)(copied_tree) };
+        parsed?
+    } else {
+        parse_source_to_tree(api, loaded_lang, &source_raw)?
+    };
 
     let source_arc = Arc::new(source_raw);
     let starts_arc = Arc::new(line_starts_raw);
@@ -4388,6 +4629,61 @@ mod tests {
                     "expected non-empty spans for {alias} ({norm})"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn incremental_ts_tree_edit_and_nessa_checkpoint_reuse_match_fresh_highlights() {
+        use crate::doc_store::{
+            doc_delete_span, doc_free, doc_insert_text, doc_new, doc_slice_lines,
+        };
+
+        // 1. Nessa incremental checkpoint convergence across a 300-line document
+        let mut ns_lines: Vec<String> = (0..300)
+            .map(|i| format!("pub fn item_{i}(x: i64) -> i64 = x + {i}"))
+            .collect();
+        let ns_doc = doc_new(ns_lines.clone());
+        let _initial = ts_highlight_doc_rows(ns_doc, "nessa", 0, 299);
+
+        // Single-line edit at row 150 (converges at next checkpoint without lexing tail)
+        let _ = doc_insert_text(ns_doc, 150, 41, " + 99");
+        ns_lines[150].push_str(" + 99");
+        let inc_ns_1 = ts_highlight_doc_rows(ns_doc, "nessa", 140, 299);
+        let fresh_ns_doc_1 = doc_new(ns_lines.clone());
+        let exp_ns_1 = ts_highlight_doc_rows(fresh_ns_doc_1, "nessa", 140, 299);
+        assert_eq!(inc_ns_1, exp_ns_1);
+        doc_free(fresh_ns_doc_1);
+
+        // Multi-line block comment insertion + removal
+        let _ = doc_insert_text(ns_doc, 60, 0, "{-\nmultiline doc\n-}\n");
+        let cur_ns_lines = doc_slice_lines(ns_doc, 0, 310);
+        let inc_ns_2 = ts_highlight_doc_rows(ns_doc, "nessa", 55, 220);
+        let fresh_ns_doc_2 = doc_new(cur_ns_lines);
+        let exp_ns_2 = ts_highlight_doc_rows(fresh_ns_doc_2, "nessa", 55, 220);
+        assert_eq!(inc_ns_2, exp_ns_2);
+        doc_free(fresh_ns_doc_2);
+        doc_free(ns_doc);
+
+        // 2. Incremental `ts_tree_edit` on Rust grammar (if system `rust.so` available)
+        if get_loaded_language("rust").is_some() {
+            let rs_lines: Vec<String> = (0..120)
+                .map(|i| format!("pub fn compute_{i}(val: i32) -> i32 {{ val + {i} }}"))
+                .collect();
+            let rs_doc = doc_new(rs_lines);
+            let _ = ts_highlight_doc_rows(rs_doc, "rust", 0, 119);
+
+            // Burst of edits: insert UTF-8 string + newline + delete span before next render
+            let _ = doc_insert_text(rs_doc, 40, 36, " let label = \"café\";\n    let extra = 7;");
+            let _ = doc_delete_span(rs_doc, 10, 0, 11, 0);
+
+            let inc_rs = ts_highlight_doc_rows(rs_doc, "rust", 0, 120);
+            let snap_lines = doc_slice_lines(rs_doc, 0, 130);
+            let fresh_rs_doc = doc_new(snap_lines);
+            let exp_rs = ts_highlight_doc_rows(fresh_rs_doc, "rust", 0, 120);
+            assert_eq!(inc_rs, exp_rs);
+
+            doc_free(fresh_rs_doc);
+            doc_free(rs_doc);
         }
     }
 }

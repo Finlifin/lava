@@ -4,7 +4,6 @@
 --   3. `:set smooth_scroll`, `:set cursor_anim`, `:set treesitter` & `push_anim_viewport_hints`
 
 use std.fs
-use std.io
 use std.path
 use @lava_sys.{DrawCmd, RawUiEvent, mock_enable}
 use @lava_core.{SystemKernel, clipboard_get, clipboard_set, log_event, status_emit}
@@ -56,7 +55,7 @@ fn find_float_by_id(world: EditorWorld, id: String) -> ?FloatingWindow {
 }
 
 fn run_treesitter_suite() {
-    io.println("=== test_treesitter & markdown_preview ===")
+    println("=== test_treesitter & markdown_preview ===")
     mock_enable(true)
 
     let kernel: SystemKernel = (boot_kernel() ! { e => panic(e) }).as(SystemKernel)
@@ -67,7 +66,7 @@ fn run_treesitter_suite() {
     let wm = require_window_manager(kernel) ! { e => panic(e) }
     handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
     let _ = cap
-    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+    let _ = app_step_event(kernel, RawUiEvent.resize(1280, 800, 1))# ! { e => panic(e) }
 
     -- ----------------------------------------------------------------
     -- Part 1: Native Tree-sitter Highlighting, Inspector & Status
@@ -80,7 +79,7 @@ fn run_treesitter_suite() {
     }
 
     let tmp_dir = "/tmp/lava_test_treesitter"
-    let _ = fs.create_dir_all(tmp_dir)
+    let _ = fs.create_dir(tmp_dir, parents = true)
     let rs_path = path.join(tmp_dir, "demo.rs")
     let rs_code = "pub struct Point {{\n    pub x: i32,\n    pub y: i32,\n}}\n\npub fn origin() -> Point {{\n    Point {{ x: 0, y: 42 }}\n}}\n"
     let _ = fs.write_string(rs_path, rs_code) ! { e => panic(e.to_string()) }
@@ -141,7 +140,7 @@ fn run_treesitter_suite() {
     app_feed_keys(kernel, "q")# ! { e => panic(e) }
     check_true(world.active_buffer_id == origin_id, "`q` in *TreeSitter* restores origin buffer")
 
-    io.println("  [PASS] Part 1: ext_treesitter (:TSStatus, <Space>uI AST float, <Space>uT toggle, Rust & Nessa spans)")
+    println("  [PASS] Part 1: ext_treesitter (:TSStatus, <Space>uI AST float, <Space>uT toggle, Rust & Nessa spans)")
 
     -- ----------------------------------------------------------------
     -- Part 2: `:MarkdownPreview` CJK GFM Tables, Checkboxes & `<C-c>` Which-Key
@@ -177,7 +176,7 @@ fn run_treesitter_suite() {
     app_feed_keys(kernel, "q")# ! { e => panic(e) }
     check_true(world.active_buffer_id == md_buf_id, "`q` closes *Markdown Preview* back to source buffer")
 
-    io.println("  [PASS] Part 2: :MarkdownPreview (CJK box-drawn GFM tables, callouts) & C-c C-t checkbox + Which-Key")
+    println("  [PASS] Part 2: :MarkdownPreview (CJK box-drawn GFM tables, callouts) & C-c C-t checkbox + Which-Key")
 
     -- ----------------------------------------------------------------
     -- Part 3: `:set smooth_scroll` / `:set cursor_anim` / `:set treesitter` & Frame Commit
@@ -199,7 +198,7 @@ fn run_treesitter_suite() {
     for i in 0..cmds.len() {
         let cmd = cmds.get(i.as(usize)).as(DrawCmd)
         cmd match {
-            DrawCmd.TextRun(_, _, _, _, _, _, is_bold, _, _) => {
+            DrawCmd.text_run(_, _, _, _, _, _, is_bold, _, _) => {
                 check_true(not is_bold, "no-bold invariant preserved across composed frame")
             },
             _ => (),
@@ -208,8 +207,8 @@ fn run_treesitter_suite() {
     let gen: i64 = (app_commit_frame(kernel)# ! { e => panic(e) }).as(i64)
     check_true(gen >= 1, "app_commit_frame pushes anim hints and commits frame")
 
-    io.println("  [PASS] Part 3: :set smooth_scroll / cursor_anim / treesitter & frame commit invariants")
-    io.println("ALL TREESITTER + MARKDOWN PREVIEW + ANIM OPTIONS TESTS PASSED!")
+    println("  [PASS] Part 3: :set smooth_scroll / cursor_anim / treesitter & frame commit invariants")
+    println("ALL TREESITTER + MARKDOWN PREVIEW + ANIM OPTIONS TESTS PASSED!")
 }
 
 fn main() {

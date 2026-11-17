@@ -91,9 +91,9 @@ fn test_modes_and_motions() -> #[log_event, status_emit, clipboard_get, clipboar
     let (kernel, world, vim) = make_test_kernel()!
     assert_true(kernel.service(SERVICE_VIM) != null, "SERVICE_VIM published")
     assert_str_eq(ext_vim_id().raw(), "lava.org/ext_vim", "ext_vim_id")
-    assert_true(vim.mode == VimMode.Normal, "starts in Normal mode")
+    assert_true(vim.mode == VimMode.normal, "starts in Normal mode")
     assert_str_eq(world.mode_name, "NORMAL", "initial mode_name")
-    assert_true(world.caret_shape == CaretShape.Block, "initial caret Block")
+    assert_true(world.caret_shape == CaretShape.block, "initial caret Block")
 
     -- Emacs global chord passthrough in Normal mode vs Vim `<C-r>` / `<C-v>`
     let mx = parse_key_sequence("<M-x>").get(0).as(KeyStroke)
@@ -197,7 +197,7 @@ fn test_modes_and_motions() -> #[log_event, status_emit, clipboard_get, clipboar
         fail_test("/ suspends prompt continuation")
     }
     let (sreq, _) = pending
-    assert_true(sreq.kind == PromptKind.SearchForward, "SearchForward kind")
+    assert_true(sreq.kind == PromptKind.search_forward, "SearchForward kind")
     let _ = kernel.submit_prompt_answer("target")#!
     assert_pos_eq(m_buf.point, 3, 0, "/ prompt jump lands on 'target'")
 
@@ -261,7 +261,7 @@ fn test_visual_and_visual_block() -> #[log_event, status_emit, clipboard_get, cl
     let vbuf = setup_buffer(world, ["abcdef"])
     vim_feed_keys(kernel, "lv2loU")#!
     assert_str_eq(vbuf.line_at(0), "aBCDef", "VisualChar selection uppercase")
-    assert_true(vim.mode == VimMode.Normal, "returns to Normal after Visual U")
+    assert_true(vim.mode == VimMode.normal, "returns to Normal after Visual U")
 
     -- Visual Line `V` + `j` + `d`
     let vlbuf = setup_buffer(world, ["keep0", "drop1", "drop2", "keep3"])
@@ -277,8 +277,8 @@ fn test_visual_and_visual_block() -> #[log_event, status_emit, clipboard_get, cl
         "delta = 4"
     ])
     vim_feed_keys(kernel, "<C-v>")#!
-    assert_true(vim.mode == VimMode.VisualBlock, "entered VisualBlock")
-    assert_true(world.visual.kind == VisualKind.Block, "world.visual is Block")
+    assert_true(vim.mode == VimMode.visual_block, "entered VisualBlock")
+    assert_true(world.visual.kind == VisualKind.block, "world.visual is Block")
     vim_feed_keys(kernel, "2jI--<Space><Escape>")#!
     assert_str_eq(bbuf.line_at(0), "-- alpha = 1", "V-Block I row 0")
     assert_str_eq(bbuf.line_at(1), "-- beta  = 2", "V-Block I row 1")
@@ -494,7 +494,7 @@ fn test_ex_commands() -> #[log_event, status_emit, clipboard_get, clipboard_set]
     assert_str_eq(world.options.theme_name, "gruvbox-dark", ":theme updates theme_name")
 
     -- `:q` warns on unsaved File buffer, `:q!` forces quit
-    ebuf.kind = BufferKind.File
+    ebuf.kind = BufferKind.file
     ebuf.file_path = "/tmp/unsaved_test_lava.ns"
     ebuf.modified = true
     let _ = kernel.dispatch_command("evil-ex", ["q"])#!

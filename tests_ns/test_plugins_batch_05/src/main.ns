@@ -121,7 +121,7 @@ fn test_batch_05_plugins() {
     mock_enable(true)
 
     let tmp_dir = "/tmp/lava_batch05_" ++ time.unix_millis().to_string()
-    let _ = fs.create_dir_all(tmp_dir) ! { e => panic(e.to_string()) }
+    let _ = fs.create_dir(tmp_dir, parents = true) ! { e => panic(e.to_string()) }
 
     let kernel = boot_batch05_kernel()
     check_eq_i64(kernel.list_extensions().len(), 11, "11 active extensions (8 core + 3 batch05)")
@@ -134,7 +134,7 @@ fn test_batch_05_plugins() {
     let conform_svc: ConformService = (require_conform_service(kernel) ! { e => panic(e) }).as(ConformService)
 
     handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
-    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+    let _ = app_step_event(kernel, RawUiEvent.resize(1280, 800, 1))# ! { e => panic(e) }
 
     -- ========================================================================
     -- PART 1: Plugin 13 — `ext_trouble` (`trouble.nvim` / `Flycheck`)
@@ -524,7 +524,7 @@ fn test_batch_05_plugins() {
     -- Commit a render frame with all Batch 05 chrome active to verify end-to-end rendering compatibility
     app_commit_frame(kernel)# ! { e => panic(e) }
 
-    let _ = fs.remove_dir_all(tmp_dir) ! { _ => () }
+    let _ = fs.remove_dir(tmp_dir, recursive = true) ! { _ => () }
 }
 
 fn main() {

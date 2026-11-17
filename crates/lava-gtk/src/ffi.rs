@@ -259,16 +259,10 @@ unsafe extern "C" {
     pub(crate) fn pango_attr_list_new() -> *mut PangoAttrList;
     pub(crate) fn pango_attr_list_unref(list: *mut PangoAttrList);
     pub(crate) fn pango_attr_list_insert(list: *mut PangoAttrList, attr: *mut PangoAttribute);
-    pub(crate) fn pango_attr_foreground_new(
-        red: u16,
-        green: u16,
-        blue: u16,
-    ) -> *mut PangoAttribute;
+    pub(crate) fn pango_attr_foreground_new(red: u16, green: u16, blue: u16)
+    -> *mut PangoAttribute;
     pub(crate) fn pango_attr_style_new(style: c_int) -> *mut PangoAttribute;
-    pub(crate) fn pango_layout_set_attributes(
-        layout: *mut PangoLayout,
-        attrs: *mut PangoAttrList,
-    );
+    pub(crate) fn pango_layout_set_attributes(layout: *mut PangoLayout, attrs: *mut PangoAttrList);
     pub(crate) fn g_object_unref(object: *mut c_void);
 
     // GLib & GObject
@@ -282,13 +276,6 @@ unsafe extern "C" {
     ) -> c_ulong;
     pub(crate) fn g_idle_add_full(
         priority: c_int,
-        function: GSourceFunc,
-        data: *mut c_void,
-        notify: GDestroyNotify,
-    ) -> c_uint;
-    pub(crate) fn g_timeout_add_full(
-        priority: c_int,
-        interval: c_uint,
         function: GSourceFunc,
         data: *mut c_void,
         notify: GDestroyNotify,

@@ -934,10 +934,12 @@ dependencies = [
  "lava-proto",
  "lava-remote",
  "lava-term",
+ "libc",
  "nsbc",
  "nsbc_io",
  "pkg_manager",
  "runtime",
+ "scheduler",
 ]
 
 [[package]]

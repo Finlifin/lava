@@ -1,6 +1,7 @@
 //! Cairo + PangoCairo 2D scene renderer, offscreen PNG export, and monospace font metrics.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::f64::consts::{FRAC_PI_2, PI};
 use std::ffi::CString;
@@ -32,10 +33,44 @@ struct CachedFont {
     baseline_px: f64,
 }
 
-/// RAII scope owning a single `PangoLayout` and cached `PangoFontDescription` pointers + metrics for a frame.
+struct ThreadFontCache {
+    fonts: HashMap<FontKey, CachedFont>,
+}
+
+impl ThreadFontCache {
+    fn new() -> Self {
+        Self {
+            fonts: HashMap::new(),
+        }
+    }
+
+    fn clear_all(&mut self) {
+        for (_, cached) in self.fonts.drain() {
+            if !cached.desc.is_null() {
+                // SAFETY: Every `desc` stored in `ThreadFontCache` was allocated by
+                // `pango_font_description_new` on this thread and is uniquely owned by the cache.
+                unsafe {
+                    ffi::pango_font_description_free(cached.desc);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ThreadFontCache {
+    fn drop(&mut self) {
+        self.clear_all();
+    }
+}
+
+thread_local! {
+    static THREAD_PANGO_FONTS: RefCell<ThreadFontCache> = RefCell::new(ThreadFontCache::new());
+}
+
+/// RAII scope owning a frame's `PangoLayout` while reusing persistent thread-local
+/// `PangoFontDescription`s and monospace metrics across frames.
 struct PangoFrameScope {
     layout: *mut PangoLayout,
-    fonts: HashMap<FontKey, CachedFont>,
     active_key: Option<FontKey>,
     active_metrics: (f64, f64),
 }
@@ -47,7 +82,6 @@ impl PangoFrameScope {
         let layout = unsafe { ffi::pango_cairo_create_layout(cr) };
         Self {
             layout,
-            fonts: HashMap::new(),
             active_key: None,
             active_metrics: (8.4, 12.0),
         }
@@ -96,57 +130,53 @@ impl PangoFrameScope {
             italic,
         };
 
-        if let Some(&cached) = self.fonts.get(&key) {
-            // SAFETY: `self.layout` and `cached.desc` are valid non-null Pango objects owned by `self`
-            // on the current thread; Pango copies the font description internally.
-            unsafe {
-                ffi::pango_layout_set_font_description(self.layout, cached.desc);
+        let cached_opt = THREAD_PANGO_FONTS.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            if let Some(&cached) = cache.fonts.get(&key) {
+                return Some(cached);
             }
-            self.active_key = Some(key);
-            self.active_metrics = (cached.cell_width, cached.baseline_px);
-            return Some((self.layout, cached.cell_width, cached.baseline_px));
+            if cache.fonts.len() >= 128 {
+                cache.clear_all();
+            }
+            let desc_ptr = create_font_description(normalized_family, size_pango, bold, italic)?;
+            let mut logical = PangoRectangle::default();
+            // SAFETY: `self.layout` and `desc_ptr` are valid non-null Pango objects on this thread;
+            // `"M"` is a 1-byte static UTF-8 slice and `logical` is a valid stack out-pointer.
+            let baseline_pango = unsafe {
+                ffi::pango_layout_set_font_description(self.layout, desc_ptr);
+                ffi::pango_layout_set_text(self.layout, b"M".as_ptr().cast(), 1);
+                ffi::pango_layout_get_extents(self.layout, ptr::null_mut(), &mut logical);
+                ffi::pango_layout_get_baseline(self.layout)
+            };
+
+            let scale = f64::from(PANGO_SCALE);
+            let raw_cw = f64::from(logical.width) / scale;
+            let cell_width = if raw_cw > 0.0 { raw_cw } else { 8.4 };
+            let raw_base = f64::from(baseline_pango) / scale;
+            let baseline_px = if raw_base > 0.0 { raw_base } else { clamped_pt };
+
+            let entry = CachedFont {
+                desc: desc_ptr,
+                cell_width,
+                baseline_px,
+            };
+            cache.fonts.insert(key.clone(), entry);
+            Some(entry)
+        })?;
+
+        // SAFETY: `self.layout` and `cached_opt.desc` are valid non-null Pango objects on this
+        // thread; Pango copies/references the font description internally.
+        unsafe {
+            ffi::pango_layout_set_font_description(self.layout, cached_opt.desc);
         }
-
-        let desc_ptr = create_font_description(normalized_family, size_pango, bold, italic)?;
-        let mut logical = PangoRectangle::default();
-        // SAFETY: `self.layout` and `desc_ptr` are valid non-null Pango objects on this thread;
-        // `"M"` is a 1-byte static UTF-8 slice and `logical` is a valid stack out-pointer.
-        let baseline_pango = unsafe {
-            ffi::pango_layout_set_font_description(self.layout, desc_ptr);
-            ffi::pango_layout_set_text(self.layout, b"M".as_ptr().cast(), 1);
-            ffi::pango_layout_get_extents(self.layout, ptr::null_mut(), &mut logical);
-            ffi::pango_layout_get_baseline(self.layout)
-        };
-
-        let scale = f64::from(PANGO_SCALE);
-        let raw_cw = f64::from(logical.width) / scale;
-        let cell_width = if raw_cw > 0.0 { raw_cw } else { 8.4 };
-        let raw_base = f64::from(baseline_pango) / scale;
-        let baseline_px = if raw_base > 0.0 { raw_base } else { clamped_pt };
-
-        let cached = CachedFont {
-            desc: desc_ptr,
-            cell_width,
-            baseline_px,
-        };
-        self.fonts.insert(key.clone(), cached);
         self.active_key = Some(key);
-        self.active_metrics = (cell_width, baseline_px);
-        Some((self.layout, cell_width, baseline_px))
+        self.active_metrics = (cached_opt.cell_width, cached_opt.baseline_px);
+        Some((self.layout, cached_opt.cell_width, cached_opt.baseline_px))
     }
 }
 
 impl Drop for PangoFrameScope {
     fn drop(&mut self) {
-        for (_, cached) in self.fonts.drain() {
-            if !cached.desc.is_null() {
-                // SAFETY: Every `desc` in `self.fonts` was allocated by `pango_font_description_new`
-                // and is uniquely owned by `self`.
-                unsafe {
-                    ffi::pango_font_description_free(cached.desc);
-                }
-            }
-        }
         if !self.layout.is_null() {
             // SAFETY: `self.layout` was returned by `pango_cairo_create_layout` with refcount 1
             // and has not been unreferenced elsewhere.
@@ -870,13 +900,10 @@ pub(crate) unsafe fn render_frame_to_cairo_with_opts(
                             let start_u32 = u32::try_from(row_buf.len()).unwrap_or(u32::MAX);
                             row_buf.push_str(ntext);
                             let end_u32 = u32::try_from(row_buf.len()).unwrap_or(u32::MAX);
-                            if start_u32 < end_u32
-                                && ntext.bytes().any(|b| b > b' ' && b != 0x7F)
-                            {
+                            if start_u32 < end_u32 && ntext.bytes().any(|b| b > b' ' && b != 0x7F) {
                                 row_spans.push((start_u32, end_u32, *ncol, *nitalic));
                             }
-                            let ncells =
-                                ntext.bytes().filter(|b| *b >= 0x20 && *b != 0x7F).count();
+                            let ncells = ntext.bytes().filter(|b| *b >= 0x20 && *b != 0x7F).count();
                             expected_x += ((gap_cells + ncells) as f64) * cell_w;
                             lookahead += 1;
                         }
@@ -919,10 +946,7 @@ pub(crate) unsafe fn render_frame_to_cairo_with_opts(
                                 ffi::cairo_move_to(cr, snap_x(*x), draw_y);
                                 ffi::pango_cairo_show_layout(cr, batch_layout);
                                 if !attr_list.is_null() {
-                                    ffi::pango_layout_set_attributes(
-                                        batch_layout,
-                                        ptr::null_mut(),
-                                    );
+                                    ffi::pango_layout_set_attributes(batch_layout, ptr::null_mut());
                                     ffi::pango_attr_list_unref(attr_list);
                                 }
                             }
@@ -1536,8 +1560,12 @@ mod tests {
         };
 
         let (h_min, h_max) = vertical_bounds(10, (10.0 + cw).ceil() as i32);
-        let (cjk_min, cjk_max) = vertical_bounds((10.0 + cw).floor() as i32, (10.0 + 3.0 * cw).ceil() as i32);
-        let (m_min, m_max) = vertical_bounds((10.0 + 3.0 * cw).floor() as i32, (10.0 + 4.0 * cw).ceil() as i32);
+        let (cjk_min, cjk_max) =
+            vertical_bounds((10.0 + cw).floor() as i32, (10.0 + 3.0 * cw).ceil() as i32);
+        let (m_min, m_max) = vertical_bounds(
+            (10.0 + 3.0 * cw).floor() as i32,
+            (10.0 + 4.0 * cw).ceil() as i32,
+        );
 
         assert!(h_min < h_max, "expected 'H' ink");
         assert!(cjk_min < cjk_max, "expected '中' ink");

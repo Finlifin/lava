@@ -685,7 +685,7 @@ fn render_active_diff_buffers(world: EditorWorld, wm_opt: ?WindowManager, sessio
             left_pane.top_row = 0
             world.active_buffer_id = lbuf.id
 
-            let right_wid = wm.split_active(SplitAxis.Vertical, world)
+            let right_wid = wm.split_active(SplitAxis.vertical, world)
             let right_pane = wm.panes.get(right_wid).as(WindowPane)
             right_pane.buffer_id = rbuf.id
             right_pane.cursor = rbuf.point
@@ -1000,7 +1000,7 @@ fn cmd_diff_buffers(kernel: SystemKernel, args: List) -> #InteractiveEffects !St
         let ans_a? = ask_prompt(PromptRequest.with_candidates(
             "Diff Left buffer: ",
             cur_name,
-            PromptKind.BufferName,
+            PromptKind.buffer_name,
             cands,
         ))# else {
             status_emit("DiffBuffers cancelled")#
@@ -1020,7 +1020,7 @@ fn cmd_diff_buffers(kernel: SystemKernel, args: List) -> #InteractiveEffects !St
     let ans_b? = ask_prompt(PromptRequest.with_candidates(
         "Diff Right buffer: ",
         default_right,
-        PromptKind.BufferName,
+        PromptKind.buffer_name,
         cands,
     ))# else {
         status_emit("DiffBuffers cancelled")#
@@ -1053,7 +1053,7 @@ fn cmd_diff_files(kernel: SystemKernel, args: List) -> #InteractiveEffects !Stri
         let ans_a? = ask_prompt(PromptRequest {
             label: "Diff Left file (local or ssh://): ",
             initial: init_a,
-            kind: PromptKind.FilePath,
+            kind: PromptKind.file_path,
             candidates: List(),
         })# else {
             status_emit("DiffFiles cancelled")#
@@ -1068,7 +1068,7 @@ fn cmd_diff_files(kernel: SystemKernel, args: List) -> #InteractiveEffects !Stri
         let ans_b? = ask_prompt(PromptRequest {
             label: "Diff Right file (local or ssh://): ",
             initial: world.cwd ++ "/",
-            kind: PromptKind.FilePath,
+            kind: PromptKind.file_path,
             candidates: List(),
         })# else {
             status_emit("DiffFiles cancelled")#
@@ -1244,7 +1244,7 @@ fn cmd_diff_dirs(kernel: SystemKernel, args: List) -> #InteractiveEffects !Strin
         let ans_a? = ask_prompt(PromptRequest {
             label: "Diff Left directory: ",
             initial: world.cwd,
-            kind: PromptKind.FilePath,
+            kind: PromptKind.file_path,
             candidates: List(),
         })# else {
             status_emit("DiffDirs cancelled")#
@@ -1259,7 +1259,7 @@ fn cmd_diff_dirs(kernel: SystemKernel, args: List) -> #InteractiveEffects !Strin
         let ans_b? = ask_prompt(PromptRequest {
             label: "Diff Right directory: ",
             initial: world.cwd,
-            kind: PromptKind.FilePath,
+            kind: PromptKind.file_path,
             candidates: List(),
         })# else {
             status_emit("DiffDirs cancelled")#
@@ -1336,13 +1336,13 @@ fn extract_current_or_last_selection(
 ) -> ?(List, String) {
     if vim_opt != null {
         let vim = vim_opt.as(VimState)
-        if vim.mode == VimMode.VisualLine or vim.mode == VimMode.VisualChar or vim.mode == VimMode.VisualBlock {
+        if vim.mode == VimMode.visual_line or vim.mode == VimMode.visual_char or vim.mode == VimMode.visual_block {
             let a = vim.visual_anchor
             let b = buf.point
             let r1 = min_i64(a.row, b.row)
             let r2 = max_i64(a.row, b.row)
             let lines = List()
-            if vim.mode == VimMode.VisualChar {
+            if vim.mode == VimMode.visual_char {
                 let lo = if a <= b { a } else { b }
                 let hi = if a <= b { b } else { a }
                 let hi_excl = Pos.new(hi.row, min_i64(buf.line_char_len(hi.row), hi.col + 1))
@@ -1351,7 +1351,7 @@ fn extract_current_or_last_selection(
                 for i in 0..split_l.len() {
                     lines.push(split_l.get(i.as(usize)).as(String))
                 }
-            } else if vim.mode == VimMode.VisualBlock {
+            } else if vim.mode == VimMode.visual_block {
                 let c1 = min_i64(a.col, b.col)
                 let c2 = max_i64(a.col, b.col) + 1
                 for r in r1..(r2 + 1) {
@@ -1372,7 +1372,7 @@ fn extract_current_or_last_selection(
             vim.last_visual_mode = vim.mode
             vim.last_visual_anchor = a
             vim.last_visual_point = b
-            vim.mode = VimMode.Normal
+            vim.mode = VimMode.normal
             vim.clear_transient()
             sync_world_from_vim(world, vim)
             let label = buf.name ++ ":" ++ (r1 + 1).to_string() ++ "-" ++ (r2 + 1).to_string()
@@ -1908,8 +1908,8 @@ fn cmd_add_pipeline_stage(
         arg_cmd
     } else {
         let prompt_lbl = kind match {
-            DiffStageKind.Filter => "Diff Filter command (stdin -> stdout, e.g. rg -v '^DEBUG'): ",
-            DiffStageKind.Mapper => "Diff Mapper command (stdin -> stdout, e.g. sed -E 's/0x[0-9a-fA-F]+/0xADDR/g'): ",
+            DiffStageKind.filter => "Diff Filter command (stdin -> stdout, e.g. rg -v '^DEBUG'): ",
+            DiffStageKind.mapper => "Diff Mapper command (stdin -> stdout, e.g. sed -E 's/0x[0-9a-fA-F]+/0xADDR/g'): ",
         }
         let ans? = ask_prompt(PromptRequest.text(prompt_lbl, ""))# else {
             status_emit(kind.name() ++ " cancelled")#
@@ -1976,7 +1976,7 @@ fn cmd_apply_preset(kernel: SystemKernel, args: List) -> #InteractiveEffects !St
         let ans? = ask_prompt(PromptRequest.with_candidates(
             "Apply Diff Preset: ",
             "",
-            PromptKind.Choice,
+            PromptKind.choice,
             cands,
         ))# else {
             status_emit("DiffPreset cancelled")#
@@ -1988,7 +1988,7 @@ fn cmd_apply_preset(kernel: SystemKernel, args: List) -> #InteractiveEffects !St
         return ()
     }
 
-    -- Extract preset key before whitespace description if chosen from `PromptKind.Choice`
+    -- Extract preset key before whitespace description if chosen from `PromptKind.choice`
     let preset_key = chosen_raw.split(" ").get(0).as(String).trim()
     let preset? = service.find_preset(preset_key) else {
         return error ("Unknown diff preset: " ++ preset_key)
@@ -2100,7 +2100,7 @@ fn cmd_pipeline_manage(kernel: SystemKernel, args: List) -> #InteractiveEffects 
         let ans? = ask_prompt(PromptRequest.with_candidates(
             "Manage Diff Pipeline: ",
             "",
-            PromptKind.Choice,
+            PromptKind.choice,
             cands,
         ))# else {
             let _ = world.remove_floating_window(FLOAT_DIFF_PIPELINE)
@@ -2141,7 +2141,7 @@ fn cmd_pipeline_manage(kernel: SystemKernel, args: List) -> #InteractiveEffects 
     }
     if low.starts_with("toggle ") {
         let idx_str = low.drop(7).trim()
-        let idx_1? = idx_str.parse_i64() else {
+        let idx_1? = idx_str.try_parse(i64) else {
             return error ("Invalid stage index: " ++ idx_str)
         }
         let idx0 = idx_1 - 1
@@ -2162,7 +2162,7 @@ fn cmd_pipeline_manage(kernel: SystemKernel, args: List) -> #InteractiveEffects 
     }
     if low.starts_with("drop ") or low.starts_with("del ") {
         let rest = if low.starts_with("drop ") { low.drop(5).trim() } else { low.drop(4).trim() }
-        let idx_1? = rest.parse_i64() else {
+        let idx_1? = rest.try_parse(i64) else {
             return error ("Invalid stage index: " ++ rest)
         }
         let idx0 = idx_1 - 1
@@ -2308,7 +2308,7 @@ fn cmd_export_patch(kernel: SystemKernel, args: List) -> #InteractiveEffects !St
         if p_opt != null {
             let pdir = p_opt.as(String)
             if pdir != "" and (not fs.exists(pdir)) {
-                let _ = fs.create_dir_all(pdir) ! { _ => () }
+                let _ = fs.create_dir(pdir, parents = true) ! { _ => () }
             }
         }
         let patch_text = patch_lines.join("\n") ++ "\n"
@@ -2327,7 +2327,7 @@ fn cmd_export_patch(kernel: SystemKernel, args: List) -> #InteractiveEffects !St
     }
 
     let pbuf = world.ensure_special_buffer(BUF_DIFF_PATCH, "diff", patch_lines, read_only = false)
-    pbuf.kind = BufferKind.Scratch
+    pbuf.kind = BufferKind.scratch
     let wm_opt = optional_wm(kernel)
     if wm_opt != null {
         let wm = wm_opt.as(WindowManager)
@@ -2652,14 +2652,14 @@ pub fn register_diff_extension(kernel: SystemKernel) -> !String Unit {
                 k, ext_id, "diff-filter", "DiffFilter",
                 "Add a stdio Filter stage (`:DiffFilter [cmd]`, `f`, `<Space> d |`).",
                 |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
-                    cmd_add_pipeline_stage(kern, DiffStageKind.Filter, args)#
+                    cmd_add_pipeline_stage(kern, DiffStageKind.filter, args)#
                 },
             )
             register_cmd_with_ex(
                 k, ext_id, "diff-map", "DiffMap",
                 "Add a stdio Mapper stage (`:DiffMap [cmd]`, `m`, `<Space> d m`).",
                 |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
-                    cmd_add_pipeline_stage(kern, DiffStageKind.Mapper, args)#
+                    cmd_add_pipeline_stage(kern, DiffStageKind.mapper, args)#
                 },
             )
             register_cmd_with_ex(

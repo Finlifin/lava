@@ -78,7 +78,7 @@ fn setup_buffer(world: EditorWorld, lines: List) -> Buffer {
 }
 
 fn selected_visual_text(buf: Buffer, vim: VimState) -> String {
-    if vim.mode == VimMode.VisualLine {
+    if vim.mode == VimMode.visual_line {
         let r1 = if vim.visual_anchor.row <= buf.point.row { vim.visual_anchor.row } else { buf.point.row }
         let r2 = if vim.visual_anchor.row <= buf.point.row { buf.point.row } else { vim.visual_anchor.row }
         let out = List()
@@ -110,7 +110,7 @@ fn test_visual_operators_completeness() -> #[log_event, status_emit, clipboard_g
     -- 1a. `VD` deletes the entire selected line cleanly and populates linewise register!
     let b1 = setup_buffer(world, ["first line", "  second line", "third line"])
     vim_feed_keys(kernel, "j$VD")#!
-    assert_true(vim.mode == VimMode.Normal, "VD exits to Normal")
+    assert_true(vim.mode == VimMode.normal, "VD exits to Normal")
     assert_str_eq(b1.to_text(), "first line\nthird line", "VD deleted entire second line even from EOL")
     let reg_vd? = world.registers.get_reg("")# else {
         fail_test("VD populated unnamed register")
@@ -130,7 +130,7 @@ fn test_visual_operators_completeness() -> #[log_event, status_emit, clipboard_g
     -- 1c. `VC` / `VS` / `VR` / `vllC` change entire selected lines linewise -> Insert
     let b3 = setup_buffer(world, ["keep_top", "    old_body_1", "    old_body_2", "keep_bot"])
     vim_feed_keys(kernel, "jVjCnew_body<Escape>")#!
-    assert_true(vim.mode == VimMode.Normal, "VC + text + Esc returns to Normal")
+    assert_true(vim.mode == VimMode.normal, "VC + text + Esc returns to Normal")
     assert_str_eq(b3.to_text(), "keep_top\n    new_body\nkeep_bot", "VjC preserved indent and replaced 2 lines")
     vim_feed_keys(kernel, "jvllCreplaced_char_line<Escape>")#!
     assert_str_eq(b3.to_text(), "keep_top\n    new_body\nreplaced_char_line", "vllC changed entire line")
@@ -138,7 +138,7 @@ fn test_visual_operators_completeness() -> #[log_event, status_emit, clipboard_g
     -- 1d. `VY` and `vllY` yank entire lines linewise
     let b4 = setup_buffer(world, ["alpha", "beta_line", "gamma"])
     vim_feed_keys(kernel, "jvllY")#!
-    assert_true(vim.mode == VimMode.Normal, "vllY exits to Normal")
+    assert_true(vim.mode == VimMode.normal, "vllY exits to Normal")
     vim_feed_keys(kernel, "Gp")#!
     assert_str_eq(b4.to_text(), "alpha\nbeta_line\ngamma\nbeta_line", "vllY yanked full line linewise")
 
@@ -164,12 +164,12 @@ fn test_visual_operators_completeness() -> #[log_event, status_emit, clipboard_g
     -- 1f. `r<char>` in VisualChar / VisualLine / VisualBlock (preserving `\n`!) + `<Escape>` cancel
     let br = setup_buffer(world, ["abc", "defg", "hi"])
     vim_feed_keys(kernel, "gg0vjr*")#!
-    assert_true(vim.mode == VimMode.Normal, "vjr* exits to Normal")
+    assert_true(vim.mode == VimMode.normal, "vjr* exits to Normal")
     assert_str_eq(br.to_text(), "***\n*efg\nhi", "vjr* masked chars across newline without eating newline")
     vim_feed_keys(kernel, "u")#!
     assert_str_eq(br.to_text(), "abc\ndefg\nhi", "vjr* is a single undo group")
     vim_feed_keys(kernel, "ggVr<Escape>")#!
-    assert_true(vim.mode == VimMode.Normal, "Vr<Escape> cancels cleanly to Normal")
+    assert_true(vim.mode == VimMode.normal, "Vr<Escape> cancels cleanly to Normal")
     assert_str_eq(br.line_at(0), "abc", "Vr<Escape> left text untouched")
 
     -- 1g. `VjI` and `VjA` in VisualLine across uneven line lengths
@@ -198,7 +198,7 @@ fn test_visual_operators_completeness() -> #[log_event, status_emit, clipboard_g
     -- 1i. CRITICAL VISUAL GUARD: unhandled keys in Visual mode never leak into Section 9 Normal commands
     let bguard = setup_buffer(world, ["safe_line_1", "safe_line_2"])
     vim_feed_keys(kernel, "ggVQ.&")#!
-    assert_true(vim.mode == VimMode.VisualLine, "unhandled keys in VisualLine stay in VisualLine")
+    assert_true(vim.mode == VimMode.visual_line, "unhandled keys in VisualLine stay in VisualLine")
     assert_str_eq(bguard.to_text(), "safe_line_1\nsafe_line_2", "Visual guard prevented Normal-mode edits")
     vim_feed_keys(kernel, "<Escape>")#!
     ()
@@ -253,7 +253,7 @@ fn test_normal_and_shared_commands() -> #[log_event, status_emit, clipboard_get,
 
     -- `<C-d>` in Visual mode extends selection!
     vim_feed_keys(kernel, "ggV<C-d>")#!
-    assert_true(vim.mode == VimMode.VisualLine, "<C-d> preserved VisualLine mode")
+    assert_true(vim.mode == VimMode.visual_line, "<C-d> preserved VisualLine mode")
     assert_i64_eq(vim.visual_anchor.row, 0, "VisualLine anchor stayed at 0")
     assert_i64_eq(sb.point.row, 5, "VisualLine point moved to 5 via <C-d>")
     vim_feed_keys(kernel, "<Escape>")#!
@@ -261,7 +261,7 @@ fn test_normal_and_shared_commands() -> #[log_event, status_emit, clipboard_get,
     -- 2b. `gv` reselects last Visual mode, anchor, and cursor
     vim_feed_keys(kernel, "gg")#!
     vim_feed_keys(kernel, "gv")#!
-    assert_true(vim.mode == VimMode.VisualLine, "gv restored VisualLine")
+    assert_true(vim.mode == VimMode.visual_line, "gv restored VisualLine")
     assert_i64_eq(vim.visual_anchor.row, 0, "gv restored anchor row 0")
     assert_i64_eq(sb.point.row, 5, "gv restored point row 5")
     vim_feed_keys(kernel, "<Escape>")#!
@@ -318,16 +318,16 @@ fn test_normal_and_shared_commands() -> #[log_event, status_emit, clipboard_get,
     -- 2h. `:` `evil-ex` passes empty `candidates: List()` for instant minibuffer open
     vim_feed_keys(kernel, ":")#!
     let ex_pending? = kernel.active_prompt else {
-        fail_test(": opens PromptKind.ExCommand")
+        fail_test(": opens PromptKind.ex_command")
     }
     let (ex_req, _) = ex_pending
-    assert_true(ex_req.kind == PromptKind.ExCommand, "ExCommand prompt kind")
+    assert_true(ex_req.kind == PromptKind.ex_command, "ExCommand prompt kind")
     assert_true(ex_req.candidates.is_empty(), "evil-ex passes empty candidates list")
     let _ = kernel.submit_prompt_answer(null)#!
 
     -- 2i. `ZZ` and `ZQ`
     let qb = setup_buffer(world, ["dirty content"])
-    qb.kind = BufferKind.File
+    qb.kind = BufferKind.file
     qb.file_path = "/tmp/lava_test_zz_zq_unsaved.txt"
     qb.modified = true
     world.quit_requested = false
@@ -363,7 +363,7 @@ fn test_indent_text_objects_and_motions() -> #[log_event, status_emit, clipboard
     -- `vii` bridges blank line inside the `if` body (rows 3..5)
     let b = setup_buffer(world, code)
     vim_feed_keys(kernel, "3j^vii")#!
-    assert_true(vim.mode == VimMode.VisualLine, "vii enters VisualLine")
+    assert_true(vim.mode == VimMode.visual_line, "vii enters VisualLine")
     assert_i64_eq(vim.visual_anchor.row, 3, "vii start row 3")
     assert_i64_eq(b.point.row, 5, "vii end row 5 (bridged blank row 4)")
     vim_feed_keys(kernel, "<Escape>")#!
@@ -436,27 +436,27 @@ fn test_incremental_expand_shrink() -> #[log_event, status_emit, clipboard_get, 
 
     -- Step 1 (`<Space> v`): word `hello`
     vim_feed_keys(kernel, "<Space>v")#!
-    assert_true(vim.mode == VimMode.VisualChar, "step 1 VisualChar")
+    assert_true(vim.mode == VimMode.visual_char, "step 1 VisualChar")
     assert_str_eq(selected_visual_text(b, vim), "hello", "step 1 selected 'hello'")
 
     -- Step 2 (`<Space> v`): inner quotes `hello world`
     vim_feed_keys(kernel, "<Space>v")#!
-    assert_true(vim.mode == VimMode.VisualChar, "step 2 VisualChar")
+    assert_true(vim.mode == VimMode.visual_char, "step 2 VisualChar")
     assert_str_eq(selected_visual_text(b, vim), "hello world", "step 2 selected inner quotes")
 
     -- Step 3 (`<M-Up>`): around quotes `"hello world"`
     vim_feed_keys(kernel, "<M-Up>")#!
-    assert_true(vim.mode == VimMode.VisualChar, "step 3 VisualChar")
+    assert_true(vim.mode == VimMode.visual_char, "step 3 VisualChar")
     assert_str_eq(selected_visual_text(b, vim), "\"hello world\"", "step 3 selected around quotes")
 
     -- Step 4 (`:IndentExpand`): inner parens == around quotes, so strictly grows to around parens `("hello world")`!
     let _ = kernel.dispatch_command("evil-ex", ["IndentExpand"])#!
-    assert_true(vim.mode == VimMode.VisualChar, "step 4 VisualChar")
+    assert_true(vim.mode == VimMode.visual_char, "step 4 VisualChar")
     assert_str_eq(selected_visual_text(b, vim), "(\"hello world\")", "step 4 selected around parens")
 
     -- Step 5 (`<M-Up>`): current VisualLine `3..3`
     vim_feed_keys(kernel, "<M-Up>")#!
-    assert_true(vim.mode == VimMode.VisualLine, "step 5 upgraded to VisualLine")
+    assert_true(vim.mode == VimMode.visual_line, "step 5 upgraded to VisualLine")
     assert_i64_eq(vim.visual_anchor.row, 3, "step 5 row 3 start")
     assert_i64_eq(b.point.row, 3, "step 5 row 3 end")
 
@@ -511,7 +511,7 @@ fn test_incremental_expand_shrink() -> #[log_event, status_emit, clipboard_get, 
     assert_i64_eq(b.point.row, 3, "shrink -> step 5 (3..3)")
 
     vim_feed_keys(kernel, "<M-Down>")#!
-    assert_true(vim.mode == VimMode.VisualChar, "shrink -> step 4 VisualChar")
+    assert_true(vim.mode == VimMode.visual_char, "shrink -> step 4 VisualChar")
     assert_str_eq(selected_visual_text(b, vim), "(\"hello world\")", "shrink -> step 4 text")
 
     vim_feed_keys(kernel, "<M-Down>")#!
@@ -524,7 +524,7 @@ fn test_incremental_expand_shrink() -> #[log_event, status_emit, clipboard_get, 
     assert_str_eq(selected_visual_text(b, vim), "hello", "shrink -> step 1 text")
 
     vim_feed_keys(kernel, "<Space>V")#!
-    assert_true(vim.mode == VimMode.Normal, "final shrink returned to VimMode.Normal")
+    assert_true(vim.mode == VimMode.normal, "final shrink returned to VimMode.normal")
     assert_pos_eq(b.point, 3, 25, "final shrink restored exact starting cursor (3, 25)")
     ()
 }

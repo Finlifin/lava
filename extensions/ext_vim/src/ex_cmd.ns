@@ -5,6 +5,7 @@
 
 use std.fs
 use std.process
+
 use @lava_sys.{host_request_quit, host_write_file_lines}
 use @lava_remote.{is_ssh_uri, remote_stat, remote_write_lines}
 use @lava_core.{
@@ -76,7 +77,7 @@ fn parse_single_address(world: EditorWorld, buf: Buffer, s: String, start_idx: i
         while j < n and s.slice(j, j + 1).is_ascii_digit() {
             j += 1
         }
-        let num_opt = s.slice(i, j).parse_i64()
+        let num_opt = s.slice(i, j).try_parse(i64)
         if num_opt == null {
             return null
         }
@@ -100,7 +101,7 @@ fn parse_single_address(world: EditorWorld, buf: Buffer, s: String, start_idx: i
             j += 1
         }
         let delta = if j > i {
-            let parsed_opt = s.slice(i, j).parse_i64()
+            let parsed_opt = s.slice(i, j).try_parse(i64)
             if parsed_opt != null { parsed_opt.as(i64) } else { 1 }
         } else {
             1
@@ -531,7 +532,7 @@ fn apply_set_options(world: EditorWorld, arg_str: String) -> !String String {
                 return error ("E521: Number required after =: " ++ tok)
             }
             let (_, val_s) = eq_pair
-            let v? = val_s.parse_i64() else {
+            let v? = val_s.try_parse(i64) else {
                 return error ("E521: Number required after =: " ++ tok)
             }
             if v >= 1 {
@@ -543,7 +544,7 @@ fn apply_set_options(world: EditorWorld, arg_str: String) -> !String String {
                 return error ("E521: Number required after =: " ++ tok)
             }
             let (_, val_s) = eq_pair
-            let v? = val_s.parse_i64() else {
+            let v? = val_s.try_parse(i64) else {
                 return error ("E521: Number required after =: " ++ tok)
             }
             if v >= 1 {
@@ -555,7 +556,7 @@ fn apply_set_options(world: EditorWorld, arg_str: String) -> !String String {
                 return error ("E521: Number required after =: " ++ tok)
             }
             let (_, val_s) = eq_pair
-            let v? = val_s.parse_i64() else {
+            let v? = val_s.try_parse(i64) else {
                 return error ("E521: Number required after =: " ++ tok)
             }
             if v >= 0 {
@@ -567,7 +568,7 @@ fn apply_set_options(world: EditorWorld, arg_str: String) -> !String String {
                 return error ("E521: Number required after =: " ++ tok)
             }
             let (_, val_s) = eq_pair
-            let v? = val_s.parse_i64() else {
+            let v? = val_s.try_parse(i64) else {
                 return error ("E521: Number required after =: " ++ tok)
             }
             if v >= 0 {
@@ -684,7 +685,7 @@ fn apply_set_options(world: EditorWorld, arg_str: String) -> !String String {
 
 fn prompt_turn_bool(turn: PromptTurn) -> bool {
     turn match {
-        PromptTurn.Completed(v) => (v matches _: bool) and v.as(bool),
+        PromptTurn.completed(v) => (v matches _: bool) and v.as(bool),
         _ => false,
     }
 }

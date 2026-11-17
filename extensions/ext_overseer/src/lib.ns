@@ -606,7 +606,7 @@ fn cmd_overseer_run(kernel: SystemKernel, args: List) -> #InteractiveEffects !St
         let ans? = ask_prompt(PromptRequest.with_candidates(
             "Overseer Run: ",
             "",
-            PromptKind.Choice,
+            PromptKind.choice,
             candidates,
         ))# else {
             status_emit("Overseer cancelled")#
@@ -691,8 +691,8 @@ fn cmd_overseer_toggle(kernel: SystemKernel, _args: List) -> #InteractiveEffects
     svc.previous_buf_id = cur.id
     let obuf = refresh_overseer_buffer(world, svc)
     let _ = world.switch_to_buffer(obuf.id)
-    if vim.mode != VimMode.Normal {
-        vim.mode = VimMode.Normal
+    if vim.mode != VimMode.normal {
+        vim.mode = VimMode.normal
     }
     vim.clear_transient()
     sync_world_from_vim(world, vim)

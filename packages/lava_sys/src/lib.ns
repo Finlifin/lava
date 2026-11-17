@@ -3,8 +3,8 @@
 -- clipboard, non-blocking background jobs/timers, and line-streaming file I/O.
 -- Also supports deterministic in-memory mock mode for standalone `nessa run` tests.
 
+use std.bytes.Bytes
 use std.fs
-use std.io
 use std.process
 use std.runtime
 use std.time
@@ -15,41 +15,64 @@ pub const MOD_SHIFT: i64 = 4
 pub const MOD_SUPER: i64 = 8
 
 pub enum CaretShape {
-    pub Block,
-    pub Beam,
-    pub Underline,
-    pub HollowBlock,
+    pub block,
+    pub beam,
+    pub underline,
+    pub hollow_block,
 }
-derive Eq, PartialEq, Display for CaretShape
+derive Eq, PartialEq for CaretShape
+
+impl Display for CaretShape {
+    pub fn to_string(self) -> String {
+        self match {
+            CaretShape.block => "Block",
+            CaretShape.beam => "Beam",
+            CaretShape.underline => "Underline",
+            CaretShape.hollow_block => "HollowBlock",
+        }
+    }
+}
 
 impl CaretShape {
     pub fn code(self) -> i64 {
         self match {
-            CaretShape.Block => 0,
-            CaretShape.Beam => 1,
-            CaretShape.Underline => 2,
-            CaretShape.HollowBlock => 3,
+            CaretShape.block => 0,
+            CaretShape.beam => 1,
+            CaretShape.underline => 2,
+            CaretShape.hollow_block => 3,
         }
     }
 }
 
 pub enum PointerHint {
-    pub Default,
-    pub Text,
-    pub Pointer,
-    pub ResizeHorizontal,
-    pub ResizeVertical,
+    pub default,
+    pub text,
+    pub pointer,
+    pub resize_horizontal,
+    pub resize_vertical,
 }
-derive Eq, PartialEq, Display for PointerHint
+derive Eq, PartialEq for PointerHint
+
+impl Display for PointerHint {
+    pub fn to_string(self) -> String {
+        self match {
+            PointerHint.default => "Default",
+            PointerHint.text => "Text",
+            PointerHint.pointer => "Pointer",
+            PointerHint.resize_horizontal => "ResizeHorizontal",
+            PointerHint.resize_vertical => "ResizeVertical",
+        }
+    }
+}
 
 impl PointerHint {
     pub fn code(self) -> i64 {
         self match {
-            PointerHint.Default => 0,
-            PointerHint.Text => 1,
-            PointerHint.Pointer => 2,
-            PointerHint.ResizeHorizontal => 3,
-            PointerHint.ResizeVertical => 4,
+            PointerHint.default => 0,
+            PointerHint.text => 1,
+            PointerHint.pointer => 2,
+            PointerHint.resize_horizontal => 3,
+            PointerHint.resize_vertical => 4,
         }
     }
 }
@@ -89,18 +112,18 @@ impl WindowSpec {
             width: 1280,
             height: 800,
             bg_rgba: rgb(30, 30, 46),
-            pointer: PointerHint.Default,
+            pointer: PointerHint.default,
         }
     }
 }
 
 pub enum DrawCmd {
-    pub ClipPush(x: f64, y: f64, w: f64, h: f64),
-    pub ClipPop,
-    pub FillRect(x: f64, y: f64, w: f64, h: f64, color: i64, radius: f64),
-    pub StrokeRect(x: f64, y: f64, w: f64, h: f64, color: i64, line_width: f64, radius: f64),
-    pub Line(x1: f64, y1: f64, x2: f64, y2: f64, color: i64, line_width: f64),
-    pub TextRun(
+    pub clip_push(x: f64, y: f64, w: f64, h: f64),
+    pub clip_pop,
+    pub fill_rect(x: f64, y: f64, w: f64, h: f64, color: i64, radius: f64),
+    pub stroke_rect(x: f64, y: f64, w: f64, h: f64, color: i64, line_width: f64, radius: f64),
+    pub line(x1: f64, y1: f64, x2: f64, y2: f64, color: i64, line_width: f64),
+    pub text_run(
         x: f64,
         y: f64,
         text: String,
@@ -111,22 +134,22 @@ pub enum DrawCmd {
         italic: bool,
         underline: bool
     ),
-    pub CursorCaret(x: f64, y: f64, w: f64, h: f64, shape: CaretShape, color: i64),
+    pub cursor_caret(x: f64, y: f64, w: f64, h: f64, shape: CaretShape, color: i64),
 }
 derive PartialEq for DrawCmd
 
 impl DrawCmd {
     pub fn to_wire(self) -> List {
         self match {
-            DrawCmd.ClipPush(x, y, w, h) => [0, x, y, w, h],
-            DrawCmd.ClipPop => [1],
-            DrawCmd.FillRect(x, y, w, h, color, radius) => [2, x, y, w, h, color, radius],
-            DrawCmd.StrokeRect(x, y, w, h, color, lw, radius) => [3, x, y, w, h, color, lw, radius],
-            DrawCmd.Line(x1, y1, x2, y2, color, lw) => [4, x1, y1, x2, y2, color, lw],
-            DrawCmd.TextRun(x, y, text, fam, sz, color, bold, italic, ul) => {
+            DrawCmd.clip_push(x, y, w, h) => [0, x, y, w, h],
+            DrawCmd.clip_pop => [1],
+            DrawCmd.fill_rect(x, y, w, h, color, radius) => [2, x, y, w, h, color, radius],
+            DrawCmd.stroke_rect(x, y, w, h, color, lw, radius) => [3, x, y, w, h, color, lw, radius],
+            DrawCmd.line(x1, y1, x2, y2, color, lw) => [4, x1, y1, x2, y2, color, lw],
+            DrawCmd.text_run(x, y, text, fam, sz, color, bold, italic, ul) => {
                 [5, x, y, text, fam, sz, color, bold, italic, ul]
             },
-            DrawCmd.CursorCaret(x, y, w, h, shape, color) => [6, x, y, w, h, shape.code(), color],
+            DrawCmd.cursor_caret(x, y, w, h, shape, color) => [6, x, y, w, h, shape.code(), color],
         }
     }
 }
@@ -182,31 +205,31 @@ impl ScrollViewportSpec {
 }
 
 pub enum RawUiEvent {
-    pub Key(key: String, modifiers: i64, text: String),
-    pub MouseButton(is_press: bool, button: i64, x: f64, y: f64, modifiers: i64, press_count: i64),
-    pub MouseMove(x: f64, y: f64, modifiers: i64),
-    pub MouseScroll(dx: f64, dy: f64, x: f64, y: f64, modifiers: i64),
-    pub Resize(width: i64, height: i64, scale_factor: i64),
-    pub Focus(focused: bool),
-    pub CloseRequested,
-    pub Tick(timer_id: i64, now_ms: i64),
-    pub AsyncJobDone(job_id: i64, ok: bool, exit_code: i64, stdout: String, stderr: String),
+    pub key(key: String, modifiers: i64, text: String),
+    pub mouse_button(is_press: bool, button: i64, x: f64, y: f64, modifiers: i64, press_count: i64),
+    pub mouse_move(x: f64, y: f64, modifiers: i64),
+    pub mouse_scroll(dx: f64, dy: f64, x: f64, y: f64, modifiers: i64),
+    pub resize(width: i64, height: i64, scale_factor: i64),
+    pub focus(focused: bool),
+    pub close_requested,
+    pub tick(timer_id: i64, now_ms: i64),
+    pub async_job_done(job_id: i64, ok: bool, exit_code: i64, stdout: String, stderr: String),
 }
 derive PartialEq for RawUiEvent
 
 pub fn encode_wire_event(ev: RawUiEvent) -> List {
     ev match {
-        RawUiEvent.Key(key, modifiers, text) => [0, key, modifiers, text],
-        RawUiEvent.MouseButton(is_press, button, x, y, modifiers, press_count) => {
+        RawUiEvent.key(key, modifiers, text) => [0, key, modifiers, text],
+        RawUiEvent.mouse_button(is_press, button, x, y, modifiers, press_count) => {
             [1, is_press, button, x, y, modifiers, press_count]
         },
-        RawUiEvent.MouseMove(x, y, modifiers) => [2, x, y, modifiers],
-        RawUiEvent.MouseScroll(dx, dy, x, y, modifiers) => [3, dx, dy, x, y, modifiers],
-        RawUiEvent.Resize(width, height, scale_factor) => [4, width, height, scale_factor],
-        RawUiEvent.Focus(focused) => [5, focused],
-        RawUiEvent.CloseRequested => [6],
-        RawUiEvent.Tick(timer_id, now_ms) => [7, timer_id, now_ms],
-        RawUiEvent.AsyncJobDone(job_id, ok, exit_code, stdout, stderr) => {
+        RawUiEvent.mouse_move(x, y, modifiers) => [2, x, y, modifiers],
+        RawUiEvent.mouse_scroll(dx, dy, x, y, modifiers) => [3, dx, dy, x, y, modifiers],
+        RawUiEvent.resize(width, height, scale_factor) => [4, width, height, scale_factor],
+        RawUiEvent.focus(focused) => [5, focused],
+        RawUiEvent.close_requested => [6],
+        RawUiEvent.tick(timer_id, now_ms) => [7, timer_id, now_ms],
+        RawUiEvent.async_job_done(job_id, ok, exit_code, stdout, stderr) => {
             [8, job_id, ok, exit_code, stdout, stderr]
         },
     }
@@ -224,14 +247,14 @@ pub fn decode_wire_event(item: Any) -> ?RawUiEvent {
     let tag = arr.get(0).as(i64)
     when {
         tag == 0 and len >= 4 => {
-            RawUiEvent.Key(
+            RawUiEvent.key(
                 arr.get(1).as(String),
                 arr.get(2).as(i64),
                 arr.get(3).as(String),
             )
         },
         tag == 1 and len >= 7 => {
-            RawUiEvent.MouseButton(
+            RawUiEvent.mouse_button(
                 arr.get(1).as(bool),
                 arr.get(2).as(i64),
                 arr.get(3).as(f64),
@@ -241,14 +264,14 @@ pub fn decode_wire_event(item: Any) -> ?RawUiEvent {
             )
         },
         tag == 2 and len >= 4 => {
-            RawUiEvent.MouseMove(
+            RawUiEvent.mouse_move(
                 arr.get(1).as(f64),
                 arr.get(2).as(f64),
                 arr.get(3).as(i64),
             )
         },
         tag == 3 and len >= 6 => {
-            RawUiEvent.MouseScroll(
+            RawUiEvent.mouse_scroll(
                 arr.get(1).as(f64),
                 arr.get(2).as(f64),
                 arr.get(3).as(f64),
@@ -257,22 +280,22 @@ pub fn decode_wire_event(item: Any) -> ?RawUiEvent {
             )
         },
         tag == 4 and len >= 4 => {
-            RawUiEvent.Resize(
+            RawUiEvent.resize(
                 arr.get(1).as(i64),
                 arr.get(2).as(i64),
                 arr.get(3).as(i64),
             )
         },
-        tag == 5 and len >= 2 => RawUiEvent.Focus(arr.get(1).as(bool)),
-        tag == 6 => RawUiEvent.CloseRequested,
+        tag == 5 and len >= 2 => RawUiEvent.focus(arr.get(1).as(bool)),
+        tag == 6 => RawUiEvent.close_requested,
         tag == 7 and len >= 3 => {
-            RawUiEvent.Tick(
+            RawUiEvent.tick(
                 arr.get(1).as(i64),
                 arr.get(2).as(i64),
             )
         },
         tag == 8 and len >= 6 => {
-            RawUiEvent.AsyncJobDone(
+            RawUiEvent.async_job_done(
                 arr.get(1).as(i64),
                 arr.get(2).as(bool),
                 arr.get(3).as(i64),
@@ -293,9 +316,14 @@ private global _mock_last_cmds: List = List()
 private global _mock_last_title: String = "Lava"
 private global _mock_quit_code: ?i64 = null
 private global _mock_next_id: i64 = 1
+private global _frame_flat_buf: List = List()
+private global _frame_wire_buf: Bytes = Bytes.with_capacity(65536)
+
+private fn pack_color_u32(c: i64) -> u32 = (((c % 4294967296) + 4294967296) % 4294967296).as(u32)
 
 pub fn mock_enable(enabled: bool) {
     _mock_enabled = enabled
+    let _ = runtime.host_call("sys_set_mock_mode", [enabled]) ! { _ => null }
     if enabled {
         _mock_events = List()
         _mock_clipboard = ""
@@ -366,6 +394,185 @@ pub fn host_commit_frame(spec: WindowSpec, cmds: List) -> i64 {
         _mock_last_title = spec.title
         return _mock_frame_gen
     }
+    let flat = _frame_flat_buf
+    flat.clear()
+    var last_fam_flat = ""
+    for i in 0..cmds.len() {
+        let cmd = cmds.get(i.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.clip_push(x, y, w, h) => {
+                flat.push(0)
+                flat.push(x)
+                flat.push(y)
+                flat.push(w)
+                flat.push(h)
+            },
+            DrawCmd.clip_pop => {
+                flat.push(1)
+            },
+            DrawCmd.fill_rect(x, y, w, h, color, radius) => {
+                flat.push(2)
+                flat.push(x)
+                flat.push(y)
+                flat.push(w)
+                flat.push(h)
+                flat.push(color)
+                flat.push(radius)
+            },
+            DrawCmd.stroke_rect(x, y, w, h, color, lw, radius) => {
+                flat.push(3)
+                flat.push(x)
+                flat.push(y)
+                flat.push(w)
+                flat.push(h)
+                flat.push(color)
+                flat.push(lw)
+                flat.push(radius)
+            },
+            DrawCmd.line(x1, y1, x2, y2, color, lw) => {
+                flat.push(4)
+                flat.push(x1)
+                flat.push(y1)
+                flat.push(x2)
+                flat.push(y2)
+                flat.push(color)
+                flat.push(lw)
+            },
+            DrawCmd.text_run(x, y, text, fam, sz, color, bold, italic, ul) => {
+                let f_b = if bold { 1 } else { 0 }
+                let f_i = if italic { 2 } else { 0 }
+                let f_u = if ul { 4 } else { 0 }
+                let flags = f_b + f_i + f_u
+                if fam == last_fam_flat and fam != "" {
+                    flat.push(7)
+                    flat.push(x)
+                    flat.push(y)
+                    flat.push(sz)
+                    flat.push(color)
+                    flat.push(flags)
+                    flat.push(text)
+                } else {
+                    last_fam_flat = fam
+                    flat.push(5)
+                    flat.push(x)
+                    flat.push(y)
+                    flat.push(sz)
+                    flat.push(color)
+                    flat.push(flags)
+                    flat.push(text)
+                    flat.push(fam)
+                }
+            },
+            DrawCmd.cursor_caret(x, y, w, h, shape, color) => {
+                flat.push(6)
+                flat.push(x)
+                flat.push(y)
+                flat.push(w)
+                flat.push(h)
+                flat.push(shape.code())
+                flat.push(color)
+            },
+        }
+    }
+    let flat_res = runtime.host_call(
+        "ui_commit_frame_flat",
+        [spec.title, spec.width, spec.height, spec.bg_rgba, spec.pointer.code(), flat],
+    )
+    flat_res match {
+        gen! => return gen.as(i64),
+        error _ => (),
+    }
+    _frame_wire_buf.clear()
+    var last_fam = ""
+    let buf = _frame_wire_buf
+    for i in 0..cmds.len() {
+        let cmd = cmds.get(i.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.clip_push(x, y, w, h) => {
+                buf.push(0)
+                buf.write_u64_le(x.to_bits())
+                buf.write_u64_le(y.to_bits())
+                buf.write_u64_le(w.to_bits())
+                buf.write_u64_le(h.to_bits())
+            },
+            DrawCmd.clip_pop => {
+                buf.push(1)
+            },
+            DrawCmd.fill_rect(x, y, w, h, color, radius) => {
+                buf.push(2)
+                buf.write_u64_le(x.to_bits())
+                buf.write_u64_le(y.to_bits())
+                buf.write_u64_le(w.to_bits())
+                buf.write_u64_le(h.to_bits())
+                buf.write_u32_le(pack_color_u32(color))
+                buf.write_u64_le(radius.to_bits())
+            },
+            DrawCmd.stroke_rect(x, y, w, h, color, lw, radius) => {
+                buf.push(3)
+                buf.write_u64_le(x.to_bits())
+                buf.write_u64_le(y.to_bits())
+                buf.write_u64_le(w.to_bits())
+                buf.write_u64_le(h.to_bits())
+                buf.write_u32_le(pack_color_u32(color))
+                buf.write_u64_le(lw.to_bits())
+                buf.write_u64_le(radius.to_bits())
+            },
+            DrawCmd.line(x1, y1, x2, y2, color, lw) => {
+                buf.push(4)
+                buf.write_u64_le(x1.to_bits())
+                buf.write_u64_le(y1.to_bits())
+                buf.write_u64_le(x2.to_bits())
+                buf.write_u64_le(y2.to_bits())
+                buf.write_u32_le(pack_color_u32(color))
+                buf.write_u64_le(lw.to_bits())
+            },
+            DrawCmd.text_run(x, y, text, fam, sz, color, bold, italic, ul) => {
+                let f_b = if bold { 1 } else { 0 }
+                let f_i = if italic { 2 } else { 0 }
+                let f_u = if ul { 4 } else { 0 }
+                let flags: u8 = (f_b + f_i + f_u).as(u8)
+                if fam == last_fam and fam != "" {
+                    buf.push(7)
+                    buf.write_u64_le(x.to_bits())
+                    buf.write_u64_le(y.to_bits())
+                    buf.write_u64_le(sz.to_bits())
+                    buf.write_u32_le(pack_color_u32(color))
+                    buf.push(flags)
+                    buf.write_u32_le(text.len().as(u32))
+                    buf.extend_str(text)
+                } else {
+                    last_fam = fam
+                    buf.push(5)
+                    buf.write_u64_le(x.to_bits())
+                    buf.write_u64_le(y.to_bits())
+                    buf.write_u64_le(sz.to_bits())
+                    buf.write_u32_le(pack_color_u32(color))
+                    buf.push(flags)
+                    buf.write_u32_le(text.len().as(u32))
+                    buf.extend_str(text)
+                    buf.write_u32_le(fam.len().as(u32))
+                    buf.extend_str(fam)
+                }
+            },
+            DrawCmd.cursor_caret(x, y, w, h, shape, color) => {
+                buf.push(6)
+                buf.write_u64_le(x.to_bits())
+                buf.write_u64_le(y.to_bits())
+                buf.write_u64_le(w.to_bits())
+                buf.write_u64_le(h.to_bits())
+                buf.push(shape.code().as(u8))
+                buf.write_u32_le(pack_color_u32(color))
+            },
+        }
+    }
+    let fast_res = runtime.host_call(
+        "ui_commit_frame_bytes",
+        [spec.title, spec.width, spec.height, spec.bg_rgba, spec.pointer.code(), buf],
+    )
+    fast_res match {
+        gen! => return gen.as(i64),
+        error _ => (),
+    }
     let wire = List()
     for cmd in cmds {
         wire.push(cmd.as(DrawCmd).to_wire())
@@ -376,6 +583,7 @@ pub fn host_commit_frame(spec: WindowSpec, cmds: List) -> i64 {
     ) else {
         _mock_frame_gen += 1
         _mock_last_cmds = cmds
+        _mock_last_title = spec.title
         return _mock_frame_gen
     }
     gen.as(i64)
@@ -443,24 +651,26 @@ pub fn host_request_quit(exit_code: i64) {
 }
 
 pub fn host_spawn_job(cmd: String, cwd: String, stdin_data: String) -> i64 {
+    let stdin_opt: ?String = if stdin_data == "" { null } else { stdin_data }
+    let cwd_opt: ?String = if cwd == "" { null } else { cwd }
     if _mock_enabled {
         let id = _mock_next_id
         _mock_next_id += 1
-        let out! = process.shell(cmd) else {
-            _mock_events.push(RawUiEvent.AsyncJobDone(id, false, -1, "", "shell execution failed"))
+        let out! = process.shell(cmd, stdin = stdin_opt, cwd = cwd_opt) else {
+            _mock_events.push(RawUiEvent.async_job_done(id, false, -1, "", "shell execution failed"))
             return id
         }
-        _mock_events.push(RawUiEvent.AsyncJobDone(id, out.status == 0, out.status, out.stdout, out.stderr))
+        _mock_events.push(RawUiEvent.async_job_done(id, out.is_success(), out.status, out.stdout, out.stderr))
         return id
     }
     let res! = runtime.host_call("sys_spawn_job", [cmd, cwd, stdin_data]) else {
         let id = _mock_next_id
         _mock_next_id += 1
-        let out! = process.shell(cmd) else {
-            _mock_events.push(RawUiEvent.AsyncJobDone(id, false, -1, "", "shell execution failed"))
+        let out! = process.shell(cmd, stdin = stdin_opt, cwd = cwd_opt) else {
+            _mock_events.push(RawUiEvent.async_job_done(id, false, -1, "", "shell execution failed"))
             return id
         }
-        _mock_events.push(RawUiEvent.AsyncJobDone(id, out.status == 0, out.status, out.stdout, out.stderr))
+        _mock_events.push(RawUiEvent.async_job_done(id, out.is_success(), out.status, out.stdout, out.stderr))
         return id
     }
     res.as(i64)
@@ -480,13 +690,13 @@ pub fn host_schedule_timer(delay_ms: i64) -> i64 {
     if _mock_enabled {
         let id = _mock_next_id
         _mock_next_id += 1
-        _mock_events.push(RawUiEvent.Tick(id, time.unix_millis()))
+        _mock_events.push(RawUiEvent.tick(id, time.unix_millis()))
         return id
     }
     let res! = runtime.host_call("sys_schedule_timer", [delay_ms]) else {
         let id = _mock_next_id
         _mock_next_id += 1
-        _mock_events.push(RawUiEvent.Tick(id, time.unix_millis()))
+        _mock_events.push(RawUiEvent.tick(id, time.unix_millis()))
         return id
     }
     res.as(i64)

@@ -49,7 +49,10 @@ pub struct CmpService {
     pub custom_sources: List,
     pub doc_providers: List,
     pub sig_providers: List,
-    pub doc_cache: HashMap,
+    pub doc_cache: Map,
+    pub bg_word_cache: HashMap,
+    pub cached_path_dir: String,
+    pub cached_path_entries: List,
     pub suppress_next_hook: bool,
 }
 
@@ -64,16 +67,20 @@ struct CallSiteContext {
 
 struct BufSymMeta {
     name: String,
+    raw_kind: String,
     kind: String,
     sig: String,
     doc: String,
     row: i64,
+    details_loaded: bool,
 }
 
 struct CachedBufSymIndex {
     doc_id: i64,
     edit_version: i64,
-    by_name: HashMap,
+    line_count: i64,
+    decl_rows: Map,
+    by_name: Map,
     ordered: List,
 }
 
@@ -238,9 +245,24 @@ fn resolve_completion_dir(world: EditorWorld, buf: Buffer, dir_part: String) -> 
     path.normalize(path.join(base_dir, dir_part))
 }
 
-fn collect_path_candidates(search_dir: String, leaf_prefix: String, max_items: i64) -> List {
-    let entries! = fs.read_dir_entries(search_dir) else {
-        return List()
+fn collect_path_candidates(
+    search_dir: String,
+    leaf_prefix: String,
+    max_items: i64,
+    .cmp: ?CmpService = null,
+) -> List {
+    let entries = if cmp != null and cmp.as(CmpService).cached_path_dir == search_dir {
+        cmp.as(CmpService).cached_path_entries
+    } else {
+        let read_entries! = fs.read_dir_entries(search_dir) else {
+            return List()
+        }
+        if cmp != null {
+            let c = cmp.as(CmpService)
+            c.cached_path_dir = search_dir
+            c.cached_path_entries = read_entries
+        }
+        read_entries
     }
     let show_hidden = leaf_prefix.starts_with(".")
     let dirs = List()
@@ -253,7 +275,7 @@ fn collect_path_candidates(search_dir: String, leaf_prefix: String, max_items: i
         if (not show_hidden) and e.name.starts_with(".") {
             continue
         }
-        if e.is_dir {
+        if e.is_dir() {
             dirs.push(e)
         } else {
             files.push(e)
@@ -367,7 +389,7 @@ fn scan_buffer_words(
     skip_row: i64,
     skip_col: i64,
     max_words: i64,
-    seen_words: Set,
+    seen_words: Map,
     out_words: List,
 ) {
     src_buf.sync_external_lines()
@@ -381,8 +403,7 @@ fn scan_buffer_words(
     )
     for i in 0..collected.len() {
         let word = collected.get(i.as(usize)).as(String)
-        if not seen_words.contains(word) {
-            seen_words.insert(word)
+        if seen_words.insert_absent(word, true) {
             out_words.push(word)
         }
     }
@@ -524,30 +545,73 @@ fn normalize_sym_kind(raw_kind: String, sig: String) -> String {
     "Symbol"
 }
 
+fn line_may_declare_symbol(line: String) -> bool {
+    let t = line.trim_start()
+    if t == "" or t.starts_with("//") or t.starts_with("--") or t.starts_with("/*") or t.starts_with("*") {
+        return false
+    }
+    t.contains("fn ")
+        or t.contains("struct ")
+        or t.contains("enum ")
+        or t.contains("trait ")
+        or t.contains("newtype ")
+        or t.contains("typealias ")
+        or t.contains("const ")
+        or t.contains("def ")
+        or t.contains("class ")
+        or t.contains("func ")
+        or t.contains("type ")
+        or t.contains("interface ")
+        or t.contains("module ")
+        or t.contains("mod ")
+}
+
+fn ensure_buf_sym_details(buf: Buffer, meta: BufSymMeta) {
+    if meta.details_loaded {
+        return
+    }
+    let sig = clean_decl_header_at(buf, meta.row)
+    meta.kind = normalize_sym_kind(meta.raw_kind, sig)
+    meta.sig = sig
+    meta.doc = extract_doc_comments_above_row(buf, meta.row)
+    meta.details_loaded = true
+}
+
 fn get_cached_buf_sym_index(buf: Buffer) -> CachedBufSymIndex {
     let cache = ensure_cmp_sym_cache()
+    let lcount = buf.line_count()
     let prev_opt = cache.get(buf.id)
     if prev_opt != null {
         let prev = prev_opt.as(CachedBufSymIndex)
-        if prev.doc_id == buf.doc_id and prev.edit_version == buf.edit_version {
-            return prev
+        if prev.doc_id == buf.doc_id {
+            if prev.edit_version == buf.edit_version {
+                return prev
+            }
+            let cur_row = buf.point.row
+            if prev.line_count == lcount
+                and (not prev.decl_rows.contains(cur_row.to_string()))
+                and (not line_may_declare_symbol(buf.line_at(cur_row))) {
+                prev.edit_version = buf.edit_version
+                return prev
+            }
         }
     }
-    let by_name = HashMap.new()
+    let by_name = Map.new()
     let ordered = List()
+    let decl_rows = Map.new()
     let blocks = buf.scan_symbol_blocks(max_items = 600)
     for i in 0..blocks.len() {
         let (sname, skind, srow, _erow) = blocks.get(i.as(usize)).as((String, String, i64, i64))
         if sname != "" and skind.to_lower() != "impl" and (not by_name.contains_key(sname)) {
-            let sig = clean_decl_header_at(buf, srow)
-            let norm_k = normalize_sym_kind(skind, sig)
-            let doc = extract_doc_comments_above_row(buf, srow)
+            decl_rows.set(srow.to_string(), true)
             let meta = BufSymMeta {
                 name: sname,
-                kind: norm_k,
-                sig: sig,
-                doc: doc,
+                raw_kind: skind,
+                kind: normalize_sym_kind(skind, ""),
+                sig: "",
+                doc: "",
                 row: srow,
+                details_loaded: false,
             }
             by_name.insert(sname, meta)
             ordered.push(meta)
@@ -559,6 +623,8 @@ fn get_cached_buf_sym_index(buf: Buffer) -> CachedBufSymIndex {
     let idx = CachedBufSymIndex {
         doc_id: buf.doc_id,
         edit_version: buf.edit_version,
+        line_count: lcount,
+        decl_rows: decl_rows,
         by_name: by_name,
         ordered: ordered,
     }
@@ -692,7 +758,9 @@ fn lookup_sym_meta_across_open_buffers(world: EditorWorld, buf: Buffer, ident: S
     let cur_idx = get_cached_buf_sym_index(buf)
     let cur_hit = cur_idx.by_name.get(ident)
     if cur_hit != null {
-        return (cur_hit.as(BufSymMeta), buf.name)
+        let meta = cur_hit.as(BufSymMeta)
+        ensure_buf_sym_details(buf, meta)
+        return (meta, buf.name)
     }
     var scanned: i64 = 0
     var bi = world.buffer_order.len() - 1
@@ -709,7 +777,9 @@ fn lookup_sym_meta_across_open_buffers(world: EditorWorld, buf: Buffer, ident: S
         let o_idx = get_cached_buf_sym_index(other)
         let o_hit = o_idx.by_name.get(ident)
         if o_hit != null {
-            return (o_hit.as(BufSymMeta), other.name)
+            let ometa = o_hit.as(BufSymMeta)
+            ensure_buf_sym_details(other, ometa)
+            return (ometa, other.name)
         }
         scanned += 1
     }
@@ -1265,9 +1335,9 @@ pub fn collect_candidates(
     .replace_start_col: i64 = -1,
     .limit: i64 = 19,
 ) -> List {
-    let raw_items = List()
+    let raw_entries = List()
     let labels = List()
-    let seen_non_snippet = Set.new()
+    let seen_non_snippet = Map.new()
 
     -- 1. Custom registered completion sources on `CmpService` (e.g. LSP) take priority
     let cmp_opt = kernel.service(SERVICE_CMP)
@@ -1278,10 +1348,10 @@ pub fn collect_candidates(
             let provided = (cs.provider)(buf, prefix)
             for pi in 0..provided.len() {
                 let item = provided.get(pi.as(usize)).as(CompletionItem)
-                raw_items.push(item)
+                raw_entries.push(item)
                 labels.push(item.label)
                 if item.kind != "Snippet" {
-                    seen_non_snippet.insert(item.label)
+                    seen_non_snippet.set(item.label, true)
                 }
             }
         }
@@ -1294,22 +1364,17 @@ pub fn collect_candidates(
         let snips = snip_svc.snippets_for_mode(buf.major_mode)
         for i in 0..snips.len() {
             let s = snips.get(i.as(usize)).as(SnippetSpec)
-            raw_items.push(CompletionItem {
-                label: s.trigger,
-                insert_text: s.body,
-                kind: "Snippet",
-                detail: s.description,
-            })
+            raw_entries.push(s)
             labels.push(s.trigger)
         }
     }
 
     -- 3. Mode-aware Language Keywords (`kind = "Keyword"`)
     let kws = keywords_for_mode(buf.major_mode)
-    let kw_set = Set.new()
+    let kw_set = Map.new()
     for i in 0..kws.len() {
         let kw = kws.get(i.as(usize)).as(String)
-        kw_set.insert(kw)
+        kw_set.set(kw, true)
     }
 
     -- 4. Buffer Identifiers (`kind = "Identifier"`) from active buffer + other open buffers
@@ -1324,7 +1389,7 @@ pub fn collect_candidates(
         sc
     }
     let words = List()
-    let seen_scan = Set.new()
+    let seen_scan = Map.new()
     scan_buffer_words(buf, buf.point.row, 250, buf.point.row, start_col, 400, seen_scan, words)
     var other_scanned: i64 = 0
     var bi = world.buffer_order.len() - 1
@@ -1338,73 +1403,157 @@ pub fn collect_candidates(
         if other.name.starts_with("*") and other.id != world.scratch_id {
             continue
         }
-        scan_buffer_words(other, other.point.row, 120, -1, -1, 150, seen_scan, words)
+        if cmp_opt != null {
+            let cmp = cmp_opt.as(CmpService)
+            var bg_words_opt: ?List = null
+            let cached_bg = cmp.bg_word_cache.get(other.id)
+            if cached_bg != null {
+                let (cached_ver, cached_list) = cached_bg.as((i64, List))
+                if cached_ver == other.edit_version {
+                    bg_words_opt = cached_list
+                }
+            }
+            let bg_words = if bg_words_opt != null {
+                bg_words_opt.as(List)
+            } else {
+                let fresh_words = List()
+                let fresh_seen = Map.new()
+                scan_buffer_words(other, other.point.row, 120, -1, -1, 150, fresh_seen, fresh_words)
+                if cmp.bg_word_cache.len() > 64 {
+                    cmp.bg_word_cache.clear()
+                }
+                cmp.bg_word_cache.insert(other.id, (other.edit_version, fresh_words))
+                fresh_words
+            }
+            for wi in 0..bg_words.len() {
+                let bw = bg_words.get(wi.as(usize)).as(String)
+                if seen_scan.insert_absent(bw, true) {
+                    words.push(bw)
+                }
+            }
+        } else {
+            scan_buffer_words(other, other.point.row, 120, -1, -1, 150, seen_scan, words)
+        }
         other_scanned += 1
     }
 
     let cur_sym_idx = get_cached_buf_sym_index(buf)
     for si in 0..cur_sym_idx.ordered.len() {
         let meta = cur_sym_idx.ordered.get(si.as(usize)).as(BufSymMeta)
-        if (not kw_set.contains(meta.name)) and (not seen_non_snippet.contains(meta.name)) {
-            seen_non_snippet.insert(meta.name)
-            raw_items.push(CompletionItem {
-                label: meta.name,
-                insert_text: meta.name,
-                kind: meta.kind,
-                detail: if meta.sig != "" { meta.sig } else { "Symbol" },
-            })
+        if (not kw_set.contains(meta.name)) and seen_non_snippet.insert_absent(meta.name, true) {
+            raw_entries.push(meta)
             labels.push(meta.name)
         }
     }
 
     for i in 0..words.len() {
         let w = words.get(i.as(usize)).as(String)
-        if (not kw_set.contains(w)) and (not seen_non_snippet.contains(w)) {
-            seen_non_snippet.insert(w)
-            let cross_sym_opt = lookup_sym_meta_across_open_buffers(world, buf, w)
-            if cross_sym_opt != null {
-                let (cmeta, src_bname) = cross_sym_opt.as((BufSymMeta, String))
-                raw_items.push(CompletionItem {
-                    label: w,
-                    insert_text: w,
-                    kind: cmeta.kind,
-                    detail: if cmeta.sig != "" { cmeta.sig } else { src_bname },
-                })
-            } else {
-                raw_items.push(CompletionItem {
-                    label: w,
-                    insert_text: w,
-                    kind: "Identifier",
-                    detail: "Buffer identifier",
-                })
-            }
+        if (not kw_set.contains(w)) and seen_non_snippet.insert_absent(w, true) {
+            raw_entries.push(1)
             labels.push(w)
         }
     }
 
     for i in 0..kws.len() {
         let kw = kws.get(i.as(usize)).as(String)
-        if not seen_non_snippet.contains(kw) {
-            seen_non_snippet.insert(kw)
-            raw_items.push(CompletionItem {
-                label: kw,
-                insert_text: kw,
-                kind: "Keyword",
-                detail: "Keyword (" ++ buf.major_mode ++ ")",
-            })
+        if seen_non_snippet.insert_absent(kw, true) {
+            raw_entries.push(2)
             labels.push(kw)
         }
     }
 
-    if raw_items.is_empty() {
-        return raw_items
+    if raw_entries.is_empty() {
+        return raw_entries
     }
     let lim = if limit > 0 { limit } else { 19 }
     let hits = accel_fuzzy_rank(prefix, labels, limit = lim)
+    if hits.is_empty() {
+        return List()
+    }
+
+    var cross_sym_by_name: ?Map = null
+    let kw_detail = "Keyword (" ++ buf.major_mode ++ ")"
     let ranked = List()
     for i in 0..hits.len() {
         let h = hits.get(i.as(usize)).as(FuzzyHit)
-        ranked.push(raw_items.get(h.index.as(usize)))
+        let idx_u = h.index.as(usize)
+        let entry_any = raw_entries.get(idx_u)
+        let lbl = labels.get(idx_u).as(String)
+        if entry_any matches _: CompletionItem {
+            ranked.push(entry_any.as(CompletionItem))
+        } else if entry_any matches _: SnippetSpec {
+            let s = entry_any.as(SnippetSpec)
+            ranked.push(CompletionItem {
+                label: s.trigger,
+                insert_text: s.body,
+                kind: "Snippet",
+                detail: s.description,
+            })
+        } else if entry_any matches _: BufSymMeta {
+            let smeta = entry_any.as(BufSymMeta)
+            ensure_buf_sym_details(buf, smeta)
+            ranked.push(CompletionItem {
+                label: smeta.name,
+                insert_text: smeta.name,
+                kind: smeta.kind,
+                detail: if smeta.sig != "" { smeta.sig } else { "Symbol" },
+            })
+        } else {
+            let tag = entry_any.as(i64)
+            if tag == 2 {
+                ranked.push(CompletionItem {
+                    label: lbl,
+                    insert_text: lbl,
+                    kind: "Keyword",
+                    detail: kw_detail,
+                })
+            } else {
+                let cmap = if cross_sym_by_name != null {
+                    cross_sym_by_name.as(Map)
+                } else {
+                    let built = Map.new()
+                    var sym_bg_scanned: i64 = 0
+                    var sbi = world.buffer_order.len() - 1
+                    while sbi >= 0 and sym_bg_scanned < 6 {
+                        let sbid = world.buffer_order.get(sbi.as(usize)).as(BufferId)
+                        sbi -= 1
+                        if sbid == buf.id or sbid == world.messages_id {
+                            continue
+                        }
+                        let sother = world.buffers.get(sbid).as(Buffer)
+                        if sother.name.starts_with("*") and sother.id != world.scratch_id {
+                            continue
+                        }
+                        let o_idx = get_cached_buf_sym_index(sother)
+                        for oi in 0..o_idx.ordered.len() {
+                            let ometa = o_idx.ordered.get(oi.as(usize)).as(BufSymMeta)
+                            let _ = built.insert_absent(ometa.name, (sother, ometa))
+                        }
+                        sym_bg_scanned += 1
+                    }
+                    cross_sym_by_name = built
+                    built
+                }
+                let cross_sym_opt = cmap.get(lbl)
+                if cross_sym_opt != null {
+                    let (src_buf, cmeta) = cross_sym_opt.as((Buffer, BufSymMeta))
+                    ensure_buf_sym_details(src_buf, cmeta)
+                    ranked.push(CompletionItem {
+                        label: lbl,
+                        insert_text: lbl,
+                        kind: cmeta.kind,
+                        detail: if cmeta.sig != "" { cmeta.sig } else { src_buf.name },
+                    })
+                } else {
+                    ranked.push(CompletionItem {
+                        label: lbl,
+                        insert_text: lbl,
+                        kind: "Identifier",
+                        detail: "Buffer identifier",
+                    })
+                }
+            }
+        }
     }
     ranked
 }
@@ -1433,7 +1582,10 @@ impl CmpService {
             custom_sources: List(),
             doc_providers: List(),
             sig_providers: List(),
-            doc_cache: HashMap.new(),
+            doc_cache: Map.new(),
+            bg_word_cache: HashMap.new(),
+            cached_path_dir: "",
+            cached_path_entries: List(),
             suppress_next_hook: false,
         }
     }
@@ -1627,6 +1779,7 @@ impl CmpService {
             for i in 0..sym_idx.ordered.len() {
                 let meta = sym_idx.ordered.get(i.as(usize)).as(BufSymMeta)
                 if meta.name.char_len() > ctx.prefix.char_len() and meta.name.to_lower().starts_with(p_low) {
+                    ensure_buf_sym_details(buf, meta)
                     let rem = meta.name.drop(ctx.prefix.char_len())
                     let is_meth = has_member_trigger_before(buf, p.row, ctx.replace_start_col)
                     let before_rep = cur_line.slice(0, ctx.replace_start_col)
@@ -1783,6 +1936,8 @@ impl CmpService {
 
     pub fn dismiss_all(self, world: EditorWorld) -> bool {
         let was_active = self.dismiss(world)
+        self.cached_path_dir = ""
+        self.cached_path_entries = List()
         if world.signature_help.owner == OWNER_CMP or world.signature_help.owner == "" {
             world.signature_help = SignatureHelpPopup.inactive()
         }
@@ -1822,7 +1977,7 @@ impl CmpService {
         let ctx = extract_prefix_context(world, buf, p.row, p.col)
 
         if ctx.kind == "path" {
-            let items = collect_path_candidates(ctx.dir_part, ctx.prefix, self.max_items)
+            let items = collect_path_candidates(ctx.dir_part, ctx.prefix, self.max_items, cmp = self)
             if items.is_empty() {
                 let _ = self.dismiss(world)
                 return false
@@ -1893,7 +2048,7 @@ impl CmpService {
         let vim_opt = kernel.service(SERVICE_VIM)
         if vim_opt != null and world.options.evil_mode {
             let vim = vim_opt.as(VimState)
-            if vim.mode != VimMode.Insert or vim.block_insert_active {
+            if vim.mode != VimMode.insert or vim.block_insert_active {
                 return false
             }
         }
@@ -2107,7 +2262,7 @@ fn cmp_insert_interceptor(
     let cmp = cmp_opt.as(CmpService)
     let world = require_editor_world(kernel)!
     let vim = require_vim_state(kernel)!
-    if vim.mode != VimMode.Insert or vim.block_insert_active {
+    if vim.mode != VimMode.insert or vim.block_insert_active {
         return false
     }
     let buf = world.active_buffer()
@@ -2302,8 +2457,11 @@ pub fn register_cmp_extension(kernel: SystemKernel) -> !String Unit {
                         return
                     }
                     let w = w_opt.as(EditorWorld)
+                    if w.in_key_burst {
+                        return
+                    }
                     let vs = v_opt.as(VimState)
-                    if (not c.enabled) or vs.mode != VimMode.Insert or vs.block_insert_active {
+                    if (not c.enabled) or vs.mode != VimMode.insert or vs.block_insert_active {
                         let _ = c.dismiss_all(w)
                         return
                     }
@@ -2329,8 +2487,11 @@ pub fn register_cmp_extension(kernel: SystemKernel) -> !String Unit {
                     }
                     let c = cmp_opt.as(CmpService)
                     let w = w_opt.as(EditorWorld)
+                    if w.in_key_burst {
+                        return
+                    }
                     let vs = v_opt.as(VimState)
-                    if vs.mode == VimMode.Insert and (not vs.block_insert_active) {
+                    if vs.mode == VimMode.insert and (not vs.block_insert_active) {
                         let b = w.active_buffer()
                         let ig = w.inline_ghost
                         if ig.active and (b.point.row != ig.row or b.point.col != ig.col) {
@@ -2350,7 +2511,7 @@ pub fn register_cmp_extension(kernel: SystemKernel) -> !String Unit {
                     let v_opt = kern.service(SERVICE_VIM)
                     if cmp_opt != null and w_opt != null and v_opt != null {
                         let vs = v_opt.as(VimState)
-                        if vs.mode != VimMode.Insert {
+                        if vs.mode != VimMode.insert {
                             let _ = cmp_opt.as(CmpService).dismiss_all(w_opt.as(EditorWorld))
                         }
                     }

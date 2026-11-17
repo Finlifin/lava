@@ -4,6 +4,7 @@
 -- structural node selection into `VisualChar`.
 
 use std.collections.Set
+
 use @lava_sys.{rgb, rgba}
 use @lava_core.{
     ExtId, InteractiveEffects, KeyStroke, ServiceEffects, SystemKernel, log_event, status_emit
@@ -416,7 +417,7 @@ fn execute_flash_target(
         let b_pos = buf.clamp_pos(target.end_pos, insert_mode = false)
         vim.visual_anchor = a_pos
         vim.visual_dollar = false
-        vim.mode = VimMode.VisualChar
+        vim.mode = VimMode.visual_char
         buf.point = b_pos
         buf.preferred_col = b_pos.col
         sync_world_from_vim(world, vim)
@@ -644,14 +645,13 @@ pub fn register_flash_extension(kernel: SystemKernel) -> !String Unit {
                 "buffer-switched",
                 ext_id,
                 |kern: SystemKernel, _payload: Any| -> Unit {
-                    let st_opt = kern.service(SERVICE_FLASH)
+                    if not state.active {
+                        return
+                    }
                     let w_opt = kern.service("lava.document.world")
                     let v_opt = kern.service("lava.vim.state")
-                    if st_opt != null and w_opt != null and v_opt != null {
-                        let st = st_opt.as(FlashState)
-                        if st.active {
-                            cancel_flash(w_opt.as(EditorWorld), v_opt.as(VimState), st)
-                        }
+                    if w_opt != null and v_opt != null {
+                        cancel_flash(w_opt.as(EditorWorld), v_opt.as(VimState), state)
                     }
                 },
             )

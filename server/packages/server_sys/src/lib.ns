@@ -6,7 +6,6 @@
 use std.collections.HashMap
 use std.env
 use std.fs
-use std.io
 use std.path
 use std.process
 use std.runtime
@@ -347,7 +346,7 @@ pub fn accel_workspace_files(
             rg_args.push("-g")
             rg_args.push("!.git")
         }
-        let rg_res = process.exec("rg", args = rg_args, cwd = root)
+        let rg_res = process.run("rg", args = rg_args, cwd = root)
         rg_res match {
             rg_out! => {
                 if rg_out.status == 0 {
@@ -395,13 +394,10 @@ private fn parse_positive_i64(s: String) -> ?i64 {
     if trimmed == "" {
         return null
     }
-    let val? = io.tonumber(trimmed, base = 10) else {
+    let val? = trimmed.try_parse(i64, radix = 10) else {
         return null
     }
-    val match {
-        n: i64 => n,
-        _ => null,
-    }
+    val
 }
 
 private fn byte_col_to_char_col(line: String, byte_col_0: i64) -> i64 {
@@ -526,7 +522,7 @@ pub fn accel_workspace_grep(
         rg_args.push(query)
         rg_args.push(".")
 
-        let rg_res = process.exec("rg", args = rg_args, cwd = root)
+        let rg_res = process.run("rg", args = rg_args, cwd = root)
         rg_res match {
             rg_out! => {
                 -- `rg` exit code 1 means 0 matches found cleanly!
@@ -816,7 +812,7 @@ private fn format_unix_secs_ymd(unix_secs: i64) -> String {
 
 pub fn accel_git_status(cwd: String) -> SrvGitStatus {
     let raw! = runtime.host_call("accel_git_status", [cwd]) else {
-        let top! = process.exec("git", args = ["rev-parse", "--show-toplevel"], cwd = cwd) else {
+        let top! = process.run("git", args = ["rev-parse", "--show-toplevel"], cwd = cwd) else {
             return (SrvGitStatus {
                 is_repo: false,
                 root: "",
@@ -827,7 +823,7 @@ pub fn accel_git_status(cwd: String) -> SrvGitStatus {
                 entries: List(),
             })
         }
-        if not top.success() {
+        if not top.is_success() {
             return (SrvGitStatus {
                 is_repo: false,
                 root: "",
@@ -840,10 +836,10 @@ pub fn accel_git_status(cwd: String) -> SrvGitStatus {
         }
         let root = top.stdout.trim()
         var branch = "HEAD"
-        let br_res = process.exec("git", args = ["symbolic-ref", "--short", "HEAD"], cwd = root)
+        let br_res = process.run("git", args = ["symbolic-ref", "--short", "HEAD"], cwd = root)
         br_res match {
             b! => {
-                if b.success() and b.stdout.trim() != "" {
+                if b.is_success() and b.stdout.trim() != "" {
                     branch = b.stdout.trim()
                 }
             },
@@ -853,10 +849,10 @@ pub fn accel_git_status(cwd: String) -> SrvGitStatus {
         var modified: i64 = 0
         var untracked: i64 = 0
         let entries = List()
-        let st_res = process.exec("git", args = ["status", "--porcelain=v1", "-uall"], cwd = root)
+        let st_res = process.run("git", args = ["status", "--porcelain=v1", "-uall"], cwd = root)
         st_res match {
             st! => {
-                if st.success() {
+                if st.is_success() {
                     let lines = st.stdout.replace("\r\n", "\n").split("\n")
                     for i in 0..lines.len() {
                         let l = lines.get(i.as(usize)).as(String)
@@ -966,10 +962,10 @@ pub fn accel_git_head_lines(cwd: String, file_path: String, .rev: String = "HEAD
     let rel? = resolve_repo_rel_path(st.root, cwd, file_path) else {
         return null
     }
-    let out! = process.exec("git", args = ["show", effective_rev ++ ":" ++ rel], cwd = st.root) else {
+    let out! = process.run("git", args = ["show", effective_rev ++ ":" ++ rel], cwd = st.root) else {
         return null
     }
-    if not out.success() {
+    if not out.is_success() {
         return null
     }
     let norm = out.stdout.replace("\r\n", "\n")
@@ -990,14 +986,14 @@ pub fn accel_git_blame_line(cwd: String, file_path: String, row_0based: i64) -> 
     let raw! = runtime.host_call("accel_git_blame_line", [cwd, file_path, row_0based]) else {
         let line_1 = (row_0based + 1).to_string()
         let range = line_1 ++ "," ++ line_1
-        let out! = process.exec(
+        let out! = process.run(
             "git",
             args = ["blame", "-L", range, "--porcelain", "--", file_path],
             cwd = cwd,
         ) else {
             return null
         }
-        if not out.success() {
+        if not out.is_success() {
             return null
         }
         let lines = out.stdout.replace("\r\n", "\n").split("\n")
@@ -1067,7 +1063,7 @@ pub struct SrvLspStatus {
     pub pending_requests: i64,
 }
 
-private struct _FallbackLspSession {
+private struct FallbackLspSession {
     id: i64,
     command: String,
     root_dir: String,
@@ -1091,9 +1087,9 @@ private fn is_executable_file(candidate: String) -> bool {
     if not fs.exists(candidate) or fs.is_dir(candidate) {
         return false
     }
-    let res = process.exec("test", args = ["-x", candidate])
+    let res = process.run("test", args = ["-x", candidate])
     res match {
-        out! => out.success(),
+        out! => out.is_success(),
         error _ => true,
     }
 }
@@ -1200,7 +1196,7 @@ pub fn lsp_spawn(
     }
     let init_events = List()
     init_events.push(["initialized", cmd, "fallback-0.1.0", "hover,definition,symbols,completion"])
-    let sess = _FallbackLspSession {
+    let sess = FallbackLspSession {
         id: id,
         command: resolved_bin,
         root_dir: resolved_root,
@@ -1213,11 +1209,11 @@ pub fn lsp_spawn(
     id
 }
 
-private fn require_fb_session(session_id: i64) -> !String _FallbackLspSession {
+private fn require_fb_session(session_id: i64) -> !String FallbackLspSession {
     let s_any? = _fb_lsp_sessions.get(session_id) else {
         return error ("unknown LSP session_id: " ++ session_id.to_string())
     }
-    let sess = s_any.as(_FallbackLspSession)
+    let sess = s_any.as(FallbackLspSession)
     if not sess.alive {
         return error ("LSP session is stopped: " ++ session_id.to_string())
     }
@@ -1368,7 +1364,7 @@ pub fn lsp_status(session_id: i64) -> !String SrvLspStatus {
     let s_any? = _fb_lsp_sessions.get(session_id) else {
         return error ("unknown LSP session_id: " ++ session_id.to_string())
     }
-    let sess = s_any.as(_FallbackLspSession)
+    let sess = s_any.as(FallbackLspSession)
     SrvLspStatus {
         id: sess.id,
         command: sess.command,
@@ -1393,7 +1389,7 @@ pub fn lsp_stop(session_id: i64) -> bool {
     let s_any? = _fb_lsp_sessions.get(session_id) else {
         return false
     }
-    let sess = s_any.as(_FallbackLspSession)
+    let sess = s_any.as(FallbackLspSession)
     if not sess.alive {
         return false
     }

@@ -9,6 +9,7 @@ pub mod ex_cmd
 use std.collections.HashMap
 use std.fs
 use std.path
+
 use @lava_sys.CaretShape
 use @lava_core.{
     ExtId, InteractiveEffects, KeyBindingEntry, KeyLookup, KeyStroke, Keymap, PromptKind,
@@ -19,6 +20,7 @@ use @ext_document.{
     Buffer, BufferId, EditorWorld, JumpEntry, NarrowRegion, Pos, QuickfixEntry, RegisterValue, Span,
     VisualKind, VisualSelection, ext_document_id, require_editor_world
 }
+
 use motions.{
     MotionShape, MotionTarget, file_target_under_cursor, infer_effective_indent, last_non_blank_col,
     line_indent_cols, motion_find_char_in_line, motion_indent_next_boundary,
@@ -41,15 +43,29 @@ pub const KEYMAP_VIM_INSERT: String = "vim-insert"
 pub fn ext_vim_id() -> ExtId = ExtId("lava.org/ext_vim")
 
 pub enum VimMode {
-    pub Normal,
-    pub Insert,
-    pub Replace,
-    pub VisualChar,
-    pub VisualLine,
-    pub VisualBlock,
-    pub OperatorPending(op: String),
+    pub normal,
+    pub insert,
+    pub replace,
+    pub visual_char,
+    pub visual_line,
+    pub visual_block,
+    pub operator_pending(op: String),
 }
-derive Eq, PartialEq, Display for VimMode
+derive Eq, PartialEq for VimMode
+
+impl Display for VimMode {
+    pub fn to_string(self) -> String {
+        self match {
+            VimMode.normal => "Normal",
+            VimMode.insert => "Insert",
+            VimMode.replace => "Replace",
+            VimMode.visual_char => "VisualChar",
+            VimMode.visual_line => "VisualLine",
+            VimMode.visual_block => "VisualBlock",
+            VimMode.operator_pending(op) => "OperatorPending(" ++ op ++ ")",
+        }
+    }
+}
 
 struct ReplaceStep {
     pos: Pos,
@@ -138,7 +154,7 @@ pub struct VimState {
 impl VimState {
     pub fn new() -> VimState {
         VimState {
-            mode: VimMode.Normal,
+            mode: VimMode.normal,
             count1: 0,
             count2: 0,
             active_reg: "",
@@ -154,7 +170,7 @@ impl VimState {
             visual_anchor: Pos.zero(),
             visual_dollar: false,
             has_last_visual: false,
-            last_visual_mode: VimMode.VisualChar,
+            last_visual_mode: VimMode.visual_char,
             last_visual_anchor: Pos.zero(),
             last_visual_point: Pos.zero(),
             last_char_find: null,
@@ -182,7 +198,7 @@ impl VimState {
             macro_depth: 0,
             region_stack: List(),
             region_origin: Pos.zero(),
-            last_expand_mode: VimMode.Normal,
+            last_expand_mode: VimMode.normal,
             last_expand_anchor: Pos.zero(),
             last_expand_point: Pos.zero(),
             plugin_hint_cache: HashMap.new(),
@@ -365,7 +381,7 @@ fn collect_prefix_hints_from_keymaps(
         let km_opt = kernel.keymaps.get(km_name)
         if km_opt != null {
             km_opt.as(Keymap).lookup([KeyStroke.plain(prefix_key)]) match {
-                KeyLookup.Prefix(hints) => {
+                KeyLookup.prefix(hints) => {
                     let sorted = sort_key_hints(hints)
                     for hi in 0..sorted.len() {
                         let e = sorted.get(hi.as(usize)).as(KeyBindingEntry)
@@ -523,7 +539,7 @@ fn build_prefix_which_key_hints(world: EditorWorld, buf: Buffer, vim: VimState, 
         base.push(("ge", "prev word end"))
         base.push(("gE", "prev WORD end"))
         base.push(("g_", "last non-blank"))
-        if vim.mode == VimMode.Normal {
+        if vim.mode == VimMode.normal {
             base.push(("gu", "lowercase operator"))
             base.push(("gU", "uppercase operator"))
             base.push(("g~", "toggle case operator"))
@@ -539,7 +555,7 @@ fn build_prefix_which_key_hints(world: EditorWorld, buf: Buffer, vim: VimState, 
             base.push(("gJ", "join no-space"))
         } else {
             vim.mode match {
-                VimMode.OperatorPending(op) => {
+                VimMode.operator_pending(op) => {
                     if op == "gu" {
                         base.push(("gu", "lowercase line"))
                     } else if op == "gU" {
@@ -689,7 +705,7 @@ fn build_visual_which_key_hints(vim: VimState) -> List {
     base.push(("y", "yank"))
     base.push(("i", "inner text-obj"))
     base.push(("a", "around text-obj"))
-    if vim.mode == VimMode.VisualBlock {
+    if vim.mode == VimMode.visual_block {
         base.push(("I", "block insert"))
         base.push(("A", "block append"))
     }
@@ -713,7 +729,7 @@ pub fn sync_world_from_vim(world: EditorWorld, vim: VimState) {
     let buf = world.active_buffer()
     if not world.options.evil_mode {
         world.mode_name = "EMACS"
-        world.caret_shape = CaretShape.Beam
+        world.caret_shape = CaretShape.beam
         world.visual = VisualSelection.none()
         world.pending_keys_display = ""
         world.which_key_items = List()
@@ -722,52 +738,68 @@ pub fn sync_world_from_vim(world: EditorWorld, vim: VimState) {
     }
 
     vim.mode match {
-        VimMode.Normal => {
+        VimMode.normal => {
             world.mode_name = "NORMAL"
-            world.caret_shape = CaretShape.Block
-            world.visual = VisualSelection.none()
+            world.caret_shape = CaretShape.block
+            if world.visual.kind != VisualKind.none {
+                world.visual = VisualSelection.none()
+            }
         },
-        VimMode.Insert => {
+        VimMode.insert => {
             world.mode_name = if vim.block_insert_active { "V-BLOCK INSERT" } else { "INSERT" }
-            world.caret_shape = CaretShape.Beam
-            world.visual = VisualSelection.none()
+            world.caret_shape = CaretShape.beam
+            if world.visual.kind != VisualKind.none {
+                world.visual = VisualSelection.none()
+            }
+            if vim.modal_interceptor == null and vim.leader_strokes.is_empty() and vim.plugin_strokes.is_empty() {
+                world.pending_keys_display = ""
+                if not world.which_key_items.is_empty() {
+                    world.which_key_items = List()
+                }
+                vim.vim_owns_which_key = false
+                return
+            }
         },
-        VimMode.Replace => {
+        VimMode.replace => {
             world.mode_name = "REPLACE"
-            world.caret_shape = CaretShape.Underline
-            world.visual = VisualSelection.none()
+            world.caret_shape = CaretShape.underline
+            if world.visual.kind != VisualKind.none {
+                world.visual = VisualSelection.none()
+            }
         },
-        VimMode.VisualChar => {
+        VimMode.visual_char => {
             world.mode_name = "VISUAL"
-            world.caret_shape = CaretShape.Block
+            world.caret_shape = CaretShape.block
             world.visual = VisualSelection {
-                kind: VisualKind.Char,
+                kind: VisualKind.char,
                 anchor: vim.visual_anchor,
                 cursor: buf.point,
             }
         },
-        VimMode.VisualLine => {
+        VimMode.visual_line => {
             world.mode_name = "V-LINE"
-            world.caret_shape = CaretShape.Block
+            world.caret_shape = CaretShape.block
             world.visual = VisualSelection {
-                kind: VisualKind.Line,
+                kind: VisualKind.line,
                 anchor: vim.visual_anchor,
                 cursor: buf.point,
             }
         },
-        VimMode.VisualBlock => {
+        VimMode.visual_block => {
             world.mode_name = "V-BLOCK"
-            world.caret_shape = CaretShape.Block
+            world.caret_shape = CaretShape.block
             world.visual = VisualSelection {
-                kind: VisualKind.Block,
+                kind: VisualKind.block,
                 anchor: vim.visual_anchor,
                 cursor: buf.point,
             }
         },
-        VimMode.OperatorPending(op) => {
+        VimMode.operator_pending(op) => {
             world.mode_name = "OP-PENDING(" ++ op ++ ")"
-            world.caret_shape = CaretShape.Underline
-            world.visual = VisualSelection.none()
+            world.caret_shape = CaretShape.underline
+            if world.visual.kind != VisualKind.none {
+                world.visual = VisualSelection.none()
+            }
         },
     }
 
@@ -806,7 +838,7 @@ pub fn sync_world_from_vim(world: EditorWorld, vim: VimState) {
         disp = disp ++ vim.count1.to_string()
     }
     vim.mode match {
-        VimMode.OperatorPending(op) => { disp = disp ++ op },
+        VimMode.operator_pending(op) => { disp = disp ++ op },
         _ => (),
     }
     if vim.count2 > 0 {
@@ -824,7 +856,7 @@ pub fn sync_world_from_vim(world: EditorWorld, vim: VimState) {
     }
 
     vim.mode match {
-        VimMode.OperatorPending(op) => {
+        VimMode.operator_pending(op) => {
             world.which_key_items = build_operator_pending_which_key_hints(vim, op)
             vim.vim_owns_which_key = true
             return
@@ -838,12 +870,14 @@ pub fn sync_world_from_vim(world: EditorWorld, vim: VimState) {
         return
     }
 
-    world.which_key_items = List()
+    if not world.which_key_items.is_empty() {
+        world.which_key_items = List()
+    }
     vim.vim_owns_which_key = false
 }
 
 fn is_visual_mode(mode: VimMode) -> bool {
-    mode == VimMode.VisualChar or mode == VimMode.VisualLine or mode == VimMode.VisualBlock
+    mode == VimMode.visual_char or mode == VimMode.visual_line or mode == VimMode.visual_block
 }
 
 fn save_visual_marks(buf: Buffer, vim: VimState, anchor: Pos, cursor: Pos) {
@@ -862,13 +896,21 @@ fn stroke_printable_char(stroke: KeyStroke) -> String {
     if stroke.ctrl or stroke.alt or stroke.super_mod {
         return ""
     }
+    let tlen = stroke.text.len()
+    if tlen == 1 {
+        return stroke.text
+    }
+    let klen = stroke.key.len()
+    if klen == 1 {
+        return stroke.key
+    }
     if stroke.key == "Space" {
         return " "
     }
-    if stroke.text != "" and stroke.text.char_len() == 1 {
+    if tlen > 1 and stroke.text.char_len() == 1 {
         return stroke.text
     }
-    if stroke.key.char_len() == 1 {
+    if klen > 1 and stroke.key.char_len() == 1 {
         return stroke.key
     }
     ""
@@ -1140,7 +1182,7 @@ fn apply_operator_linewise(
         let txt = join_buffer_rows_capped(buf, lo, hi)
         world.registers.yank_store(RegisterValue.lines(txt), reg = reg)#
         buf.point = buf.clamp_pos(Pos.new(lo, buf.first_non_blank_col(lo)), insert_mode = false)
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.clear_transient()
         abort_change(vim)
         if line_cnt > 1 {
@@ -1155,7 +1197,7 @@ fn apply_operator_linewise(
         buf.point = buf.clamp_pos(next_p, insert_mode = false)
         buf.named_marks.insert(".", buf.point)
         buf.checkpoint(buf.point, "vim-delete-lines")
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.clear_transient()
         commit_change(vim)
         if line_cnt > 1 {
@@ -1176,7 +1218,7 @@ fn apply_operator_linewise(
         buf.modified = true
         buf.point = Pos.new(lo, indent_prefix.char_len())
         world.registers.delete_store(RegisterValue.lines(removed), world.kill_ring, reg = reg)#
-        vim.mode = VimMode.Insert
+        vim.mode = VimMode.insert
         vim.clear_transient()
         return ()
     }
@@ -1186,7 +1228,7 @@ fn apply_operator_linewise(
         buf.point = buf.clamp_pos(Pos.new(lo, buf.first_non_blank_col(lo)), insert_mode = false)
         buf.named_marks.insert(".", buf.point)
         buf.checkpoint(buf.point, "vim-indent")
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.clear_transient()
         commit_change(vim)
         return ()
@@ -1197,7 +1239,7 @@ fn apply_operator_linewise(
         buf.point = buf.clamp_pos(Pos.new(lo, buf.first_non_blank_col(lo)), insert_mode = false)
         buf.named_marks.insert(".", buf.point)
         buf.checkpoint(buf.point, "vim-dedent")
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.clear_transient()
         commit_change(vim)
         return ()
@@ -1208,7 +1250,7 @@ fn apply_operator_linewise(
         buf.point = buf.clamp_pos(Pos.new(lo, buf.first_non_blank_col(lo)), insert_mode = false)
         buf.named_marks.insert(".", buf.point)
         buf.checkpoint(buf.point, "vim-auto-indent")
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.clear_transient()
         commit_change(vim)
         return ()
@@ -1223,13 +1265,13 @@ fn apply_operator_linewise(
         buf.point = buf.clamp_pos(Pos.new(lo, buf.first_non_blank_col(lo)), insert_mode = false)
         buf.named_marks.insert(".", buf.point)
         buf.checkpoint(buf.point, "vim-case-lines")
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.clear_transient()
         commit_change(vim)
         return ()
     }
 
-    vim.mode = VimMode.Normal
+    vim.mode = VimMode.normal
     vim.clear_transient()
     ()
 }
@@ -1251,7 +1293,7 @@ fn apply_operator_span(
         let txt = buf.extract_span(norm)
         world.registers.yank_store(RegisterValue.chars(txt), reg = reg)#
         buf.point = buf.clamp_pos(norm.start, insert_mode = false)
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.clear_transient()
         abort_change(vim)
         return ()
@@ -1263,7 +1305,7 @@ fn apply_operator_span(
         buf.point = buf.clamp_pos(next_p, insert_mode = false)
         buf.named_marks.insert(".", buf.point)
         buf.checkpoint(buf.point, "vim-delete")
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.clear_transient()
         commit_change(vim)
         return ()
@@ -1273,7 +1315,7 @@ fn apply_operator_span(
         let (next_p, removed) = buf.delete_span(norm)!
         world.registers.delete_store(RegisterValue.chars(removed), world.kill_ring, reg = reg)#
         buf.point = buf.clamp_pos(next_p, insert_mode = true)
-        vim.mode = VimMode.Insert
+        vim.mode = VimMode.insert
         vim.clear_transient()
         return ()
     }
@@ -1294,19 +1336,19 @@ fn apply_operator_span(
         buf.point = buf.clamp_pos(norm.start, insert_mode = false)
         buf.named_marks.insert(".", buf.point)
         buf.checkpoint(buf.point, "vim-case")
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.clear_transient()
         commit_change(vim)
         return ()
     }
 
-    vim.mode = VimMode.Normal
+    vim.mode = VimMode.normal
     vim.clear_transient()
     ()
 }
 
 fn span_from_motion(buf: Buffer, start_pos: Pos, target: MotionTarget) -> Span {
-    if target.shape == MotionShape.Exclusive {
+    if target.shape == MotionShape.exclusive {
         return Span.normalized(start_pos, target.pos)
     }
     -- Inclusive motion: include character at the higher endpoint
@@ -1395,7 +1437,7 @@ fn start_visual_block_insert(
     vim.block_insert_text = ""
     vim.visual_dollar = false
     buf.point = Pos.new(r1, actual_col)
-    vim.mode = VimMode.Insert
+    vim.mode = VimMode.insert
     vim.clear_transient()
     ()
 }
@@ -1570,7 +1612,7 @@ fn execute_visual_paste(
     buf.ensure_writable()!
     let val? = world.registers.get_reg(vim.active_reg)# else {
         status_emit("Nothing in register")#
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.visual_dollar = false
         vim.clear_transient()
         abort_change(vim)
@@ -1585,7 +1627,7 @@ fn execute_visual_paste(
     let b = buf.point
     save_visual_marks(buf, vim, a, b)
 
-    if vim.mode == VimMode.VisualLine {
+    if vim.mode == VimMode.visual_line {
         let r1 = if a.row <= b.row { a.row } else { b.row }
         let r2 = if a.row <= b.row { b.row } else { a.row }
         let removed_val = RegisterValue.lines(join_buffer_rows_capped(buf, r1, r2))
@@ -1609,7 +1651,7 @@ fn execute_visual_paste(
         if overwrite_unnamed {
             world.registers.delete_store(removed_val, world.kill_ring)#
         }
-    } else if vim.mode == VimMode.VisualBlock {
+    } else if vim.mode == VimMode.visual_block {
         let (r1, r2, c1, c2) = visual_block_bounds(buf, vim)
         let removed_txt = extract_and_optionally_delete_block(buf, r1, r2, c1, c2, true)!
         let removed_val = RegisterValue.block(removed_txt)
@@ -1683,7 +1725,7 @@ fn execute_visual_paste(
 
     buf.named_marks.insert(".", buf.point)
     buf.checkpoint(buf.point, "vim-visual-paste")
-    vim.mode = VimMode.Normal
+    vim.mode = VimMode.normal
     vim.visual_dollar = false
     vim.clear_transient()
     commit_change(vim)
@@ -1955,7 +1997,7 @@ fn make_char_expand_cand(buf: Buffer, sp: Span) -> ExpandCandidate {
         norm.end
     }
     ExpandCandidate {
-        mode: VimMode.VisualChar,
+        mode: VimMode.visual_char,
         anchor: buf.clamp_pos(norm.start, insert_mode = false),
         point: buf.clamp_pos(end_pt, insert_mode = false),
         cov_start: norm.start,
@@ -1967,7 +2009,7 @@ fn make_line_expand_cand(buf: Buffer, sr: i64, er: i64) -> ExpandCandidate {
     let lo = if sr <= er { sr } else { er }
     let hi = if sr <= er { er } else { sr }
     ExpandCandidate {
-        mode: VimMode.VisualLine,
+        mode: VimMode.visual_line,
         anchor: Pos.new(lo, 0),
         point: buf.clamp_pos(Pos.new(hi, 0), insert_mode = false),
         cov_start: Pos.new(lo, 0),
@@ -2020,19 +2062,19 @@ fn run_indent_expand_region(world: EditorWorld, vim: VimState) {
             cur_s = norm.start
             cur_e = norm.end
         }
-    } else if vim.mode == VimMode.VisualLine {
+    } else if vim.mode == VimMode.visual_line {
         let r1 = if vim.visual_anchor.row <= buf.point.row { vim.visual_anchor.row } else { buf.point.row }
         let r2 = if vim.visual_anchor.row <= buf.point.row { buf.point.row } else { vim.visual_anchor.row }
         cur_s = Pos.new(r1, 0)
         cur_e = Pos.new(r2, buf.line_char_len(r2))
         cur_linewise = true
-    } else if vim.mode == VimMode.VisualChar {
+    } else if vim.mode == VimMode.visual_char {
         let lo = if vim.visual_anchor <= buf.point { vim.visual_anchor } else { buf.point }
         let hi = if vim.visual_anchor <= buf.point { buf.point } else { vim.visual_anchor }
         let hlen = buf.line_char_len(hi.row)
         cur_s = lo
         cur_e = Pos.new(hi.row, if hi.col < hlen { hi.col + 1 } else { hlen })
-    } else if vim.mode == VimMode.VisualBlock {
+    } else if vim.mode == VimMode.visual_block {
         let (r1, r2, c1, c2) = visual_block_bounds(buf, vim)
         cur_s = Pos.new(r1, c1)
         let hlen = buf.line_char_len(r2)
@@ -2072,8 +2114,8 @@ fn run_indent_expand_region(world: EditorWorld, vim: VimState) {
         cands.push(make_line_expand_cand(buf, ii_r.start_row, ii_r.end_row))
         let ai_r = text_obj_indent_at_level(buf, origin.row, lvl, true, false, ts)
         cands.push(make_line_expand_cand(buf, ai_r.start_row, ai_r.end_row))
-        let aI_r = text_obj_indent_at_level(buf, origin.row, lvl, true, true, ts)
-        cands.push(make_line_expand_cand(buf, aI_r.start_row, aI_r.end_row))
+        let ai_upper_r = text_obj_indent_at_level(buf, origin.row, lvl, true, true, ts)
+        cands.push(make_line_expand_cand(buf, ai_upper_r.start_row, ai_upper_r.end_row))
 
         let (bsr, ber) = indent_block_bounds(buf, origin.row, lvl, true, ts)
         let parent_lvl = enclosing_parent_indent(buf, bsr, ber, lvl, ts)
@@ -2093,13 +2135,13 @@ fn run_indent_expand_region(world: EditorWorld, vim: VimState) {
         let grows_span = cand.cov_start < cur_s or cand.cov_end > cur_e
         let upgrades_linewise = world.options.evil_mode
             and (not cur_linewise)
-            and cand.mode == VimMode.VisualLine
-            and (vim.mode != VimMode.Normal or cur_s == cur_e)
-        if covers and (grows_span or ((not cur_linewise) and cand.mode == VimMode.VisualLine and vim.mode != VimMode.Normal)) {
+            and cand.mode == VimMode.visual_line
+            and (vim.mode != VimMode.normal or cur_s == cur_e)
+        if covers and (grows_span or ((not cur_linewise) and cand.mode == VimMode.visual_line and vim.mode != VimMode.normal)) {
             chosen = cand
             break
         }
-        if vim.mode == VimMode.Normal and world.options.evil_mode and cand.mode == VimMode.VisualLine and cur_s == cur_e {
+        if vim.mode == VimMode.normal and world.options.evil_mode and cand.mode == VimMode.visual_line and cur_s == cur_e {
             chosen = cand
             break
         }
@@ -2135,7 +2177,7 @@ fn run_indent_shrink_region(world: EditorWorld, vim: VimState) {
     if vim.region_stack.is_empty() {
         if world.options.evil_mode and is_visual_mode(vim.mode) {
             save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
-            vim.mode = VimMode.Normal
+            vim.mode = VimMode.normal
             vim.visual_dollar = false
             sync_world_from_vim(world, vim)
         } else if (not world.options.evil_mode) and buf.mark != null {
@@ -2181,8 +2223,8 @@ fn apply_resolved_motion(
 ) -> #[status_emit, clipboard_set] !String Unit {
     if not target.valid {
         vim.mode match {
-            VimMode.OperatorPending(_) => {
-                vim.mode = VimMode.Normal
+            VimMode.operator_pending(_) => {
+                vim.mode = VimMode.normal
                 abort_change(vim)
             },
             _ => (),
@@ -2192,8 +2234,8 @@ fn apply_resolved_motion(
     }
 
     vim.mode match {
-        VimMode.OperatorPending(op) => {
-            if target.shape == MotionShape.Linewise {
+        VimMode.operator_pending(op) => {
+            if target.shape == MotionShape.linewise {
                 return apply_operator_linewise(world, buf, vim, op, buf.point.row, target.pos.row)#
             }
             let sp = span_from_motion(buf, buf.point, target)
@@ -2211,7 +2253,7 @@ fn apply_resolved_motion(
     buf.point = clamped
     if target.end_of_line_pref {
         buf.preferred_col = 1000000
-        if vim.mode == VimMode.VisualBlock {
+        if vim.mode == VimMode.visual_block {
             vim.visual_dollar = true
         }
     } else if not target.preserve_pref_col {
@@ -2237,6 +2279,15 @@ fn apply_resolved_motion(
 -- Insert & Replace Mode Key Handling
 -- ============================================================================
 
+fn insert_printable_stroke(buf: Buffer, vim: VimState, ch: String) -> !String bool {
+    let _ = buf.insert_text(buf.point, ch)!
+    if vim.block_insert_active {
+        vim.block_insert_text = vim.block_insert_text ++ ch
+    }
+    buf.preferred_col = buf.point.col
+    true
+}
+
 fn handle_insert_mode_key(
     world: EditorWorld,
     buf: Buffer,
@@ -2244,6 +2295,11 @@ fn handle_insert_mode_key(
     stroke: KeyStroke,
 ) -> !String bool {
     record_change_stroke(vim, stroke)
+
+    if (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod) and stroke.key.len() == 1 {
+        let ascii_ch = if stroke.text.len() == 1 { stroke.text } else { stroke.key }
+        return insert_printable_stroke(buf, vim, ascii_ch)!
+    }
 
     let is_esc = stroke.key == "Escape"
         or (stroke.ctrl and (stroke.key == "[" or stroke.key == "c"))
@@ -2257,7 +2313,7 @@ fn handle_insert_mode_key(
         buf.preferred_col = buf.point.col
         buf.named_marks.insert(".", buf.point)
         buf.checkpoint(buf.point, "vim-insert")
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.clear_transient()
         commit_change(vim)
         return true
@@ -2422,12 +2478,7 @@ fn handle_insert_mode_key(
 
     let ch = stroke_printable_char(stroke)
     if ch != "" {
-        let _ = buf.insert_text(buf.point, ch)!
-        if vim.block_insert_active {
-            vim.block_insert_text = vim.block_insert_text ++ ch
-        }
-        buf.preferred_col = buf.point.col
-        return true
+        return insert_printable_stroke(buf, vim, ch)!
     }
 
     true
@@ -2449,7 +2500,7 @@ fn handle_replace_mode_key(
         buf.named_marks.insert(".", buf.point)
         buf.checkpoint(buf.point, "vim-replace")
         vim.replace_stack = List()
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.clear_transient()
         commit_change(vim)
         return true
@@ -2517,11 +2568,11 @@ fn handle_pending_prefix(
     if is_esc {
         if was_vis_rep and is_visual_mode(vim.mode) {
             save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
-            vim.mode = VimMode.Normal
+            vim.mode = VimMode.normal
             vim.visual_dollar = false
             abort_change(vim)
         } else if not is_visual_mode(vim.mode) {
-            vim.mode = VimMode.Normal
+            vim.mode = VimMode.normal
             abort_change(vim)
         }
         vim.clear_transient()
@@ -2554,7 +2605,7 @@ fn handle_pending_prefix(
             let ch = stroke_printable_char(stroke)
             if ch == "" {
                 save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
-                vim.mode = VimMode.Normal
+                vim.mode = VimMode.normal
                 vim.visual_dollar = false
                 vim.clear_transient()
                 abort_change(vim)
@@ -2562,7 +2613,7 @@ fn handle_pending_prefix(
             }
             buf.ensure_writable()!
             save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
-            if vim.mode == VimMode.VisualBlock {
+            if vim.mode == VimMode.visual_block {
                 let (r1, r2, c1, c2) = visual_block_bounds(buf, vim)
                 for r in r1..(r2 + 1) {
                     let line = buf.line_at(r)
@@ -2575,7 +2626,7 @@ fn handle_pending_prefix(
                 }
                 buf.point = buf.clamp_pos(Pos.new(r1, c1), insert_mode = false)
             } else {
-                let sp = if vim.mode == VimMode.VisualLine {
+                let sp = if vim.mode == VimMode.visual_line {
                     let r1 = if vim.visual_anchor.row <= buf.point.row { vim.visual_anchor.row } else { buf.point.row }
                     let r2 = if vim.visual_anchor.row <= buf.point.row { buf.point.row } else { vim.visual_anchor.row }
                     Span.normalized(Pos.new(r1, 0), Pos.new(r2, buf.line_char_len(r2)))
@@ -2597,7 +2648,7 @@ fn handle_pending_prefix(
             buf.modified = true
             buf.named_marks.insert(".", buf.point)
             buf.checkpoint(buf.point, "vim-visual-replace")
-            vim.mode = VimMode.Normal
+            vim.mode = VimMode.normal
             vim.clear_transient()
             commit_change(vim)
             return true
@@ -2698,7 +2749,7 @@ fn handle_pending_prefix(
             let g_opt = world.global_marks.get(ch)
             if g_opt != null {
                 let je = g_opt.as(JumpEntry)
-                if vim.mode == VimMode.Normal {
+                if vim.mode == VimMode.normal {
                     vim.last_jump_origin = buf.point
                     world.jumps.record(buf.id, buf.file_path, buf.point)
                     if world.buffers.contains_key(je.buf_id) {
@@ -2733,8 +2784,8 @@ fn handle_pending_prefix(
             status_emit("E20: Mark not set: " ++ ch)#
             vim.clear_transient()
             vim.mode match {
-                VimMode.OperatorPending(_) => {
-                    vim.mode = VimMode.Normal
+                VimMode.operator_pending(_) => {
+                    vim.mode = VimMode.normal
                     abort_change(vim)
                 },
                 _ => (),
@@ -2747,7 +2798,7 @@ fn handle_pending_prefix(
         } else {
             dest
         }
-        let shape = if linewise_mark { MotionShape.Linewise } else { MotionShape.Exclusive }
+        let shape = if linewise_mark { MotionShape.linewise } else { MotionShape.exclusive }
         apply_resolved_motion(world, buf, vim, MotionTarget.ok(final_pos, shape, is_jump = true))#!
         return true
     }
@@ -2801,8 +2852,8 @@ fn handle_pending_prefix(
         let obj_key = stroke_printable_char(stroke)
         if obj_key == "" or not is_text_object_target(obj_key) {
             vim.mode match {
-                VimMode.OperatorPending(_) => {
-                    vim.mode = VimMode.Normal
+                VimMode.operator_pending(_) => {
+                    vim.mode = VimMode.normal
                     abort_change(vim)
                 },
                 _ => (),
@@ -2819,8 +2870,8 @@ fn handle_pending_prefix(
             tabstop = world.options.tabstop,
         ) else {
             vim.mode match {
-                VimMode.OperatorPending(_) => {
-                    vim.mode = VimMode.Normal
+                VimMode.operator_pending(_) => {
+                    vim.mode = VimMode.normal
                     abort_change(vim)
                 },
                 _ => (),
@@ -2829,7 +2880,7 @@ fn handle_pending_prefix(
             return true
         }
         vim.mode match {
-            VimMode.OperatorPending(op) => {
+            VimMode.operator_pending(op) => {
                 if tr.linewise {
                     apply_operator_linewise(world, buf, vim, op, tr.start_row, tr.end_row)#!
                 } else {
@@ -2840,7 +2891,7 @@ fn handle_pending_prefix(
             _ => {
                 if is_visual_mode(vim.mode) {
                     if tr.linewise {
-                        vim.mode = VimMode.VisualLine
+                        vim.mode = VimMode.visual_line
                         vim.visual_anchor = Pos.new(tr.start_row, 0)
                         buf.point = buf.clamp_pos(Pos.new(tr.end_row, 0), insert_mode = false)
                     } else {
@@ -2876,7 +2927,7 @@ fn handle_pending_prefix(
                 }
                 let tgt = MotionTarget.ok(
                     Pos.new(target_r, buf.first_non_blank_col(target_r)),
-                    MotionShape.Linewise,
+                    MotionShape.linewise,
                     is_jump = true,
                 )
                 apply_resolved_motion(world, buf, vim, tgt)#!
@@ -2887,7 +2938,7 @@ fn handle_pending_prefix(
                 let tr = if buf.point.row + extra <= buf.max_row() { buf.point.row + extra } else { buf.max_row() }
                 let tgt = MotionTarget.ok(
                     Pos.new(tr, last_non_blank_col(buf, tr)),
-                    MotionShape.Inclusive,
+                    MotionShape.inclusive,
                 )
                 apply_resolved_motion(world, buf, vim, tgt)#!
                 return true
@@ -2897,16 +2948,16 @@ fn handle_pending_prefix(
                 apply_resolved_motion(world, buf, vim, tgt)#!
                 return true
             }
-            if vim.mode == VimMode.Normal and (k == "u" or k == "U" or k == "~") {
+            if vim.mode == VimMode.normal and (k == "u" or k == "U" or k == "~") {
                 let op_name = "g" ++ k
                 begin_change(vim, KeyStroke.plain("g"))
                 record_change_stroke(vim, stroke)
-                vim.mode = VimMode.OperatorPending(op_name)
+                vim.mode = VimMode.operator_pending(op_name)
                 return true
             }
             -- Doubled `gugu`, `gUgU`, `g~g~`
             vim.mode match {
-                VimMode.OperatorPending(op) => {
+                VimMode.operator_pending(op) => {
                     if (op == "gu" and (k == "u" or k == "g"))
                         or (op == "gU" and (k == "U" or k == "g"))
                         or (op == "g~" and (k == "~" or k == "g")) {
@@ -2917,7 +2968,7 @@ fn handle_pending_prefix(
                 },
                 _ => (),
             }
-            if vim.mode == VimMode.Normal and (k == "-" or k == "+") {
+            if vim.mode == VimMode.normal and (k == "-" or k == "+") {
                 let delta: i64 = if k == "-" { -1 } else { 1 }
                 let switched = buf.undo_switch_branch(delta)!
                 if switched == null {
@@ -2930,7 +2981,7 @@ fn handle_pending_prefix(
                 abort_change(vim)
                 return true
             }
-            if k == "v" and (vim.mode == VimMode.Normal or is_visual_mode(vim.mode)) {
+            if k == "v" and (vim.mode == VimMode.normal or is_visual_mode(vim.mode)) {
                 if vim.has_last_visual {
                     vim.mode = vim.last_visual_mode
                     vim.visual_anchor = buf.clamp_pos(vim.last_visual_anchor, insert_mode = false)
@@ -2943,7 +2994,7 @@ fn handle_pending_prefix(
                 let s_opt = buf.named_marks.get("<")
                 let e_opt = buf.named_marks.get(">")
                 if s_opt != null and e_opt != null {
-                    vim.mode = VimMode.VisualChar
+                    vim.mode = VimMode.visual_char
                     vim.visual_anchor = buf.clamp_pos(s_opt.as(Pos), insert_mode = false)
                     buf.point = buf.clamp_pos(e_opt.as(Pos), insert_mode = false)
                     vim.visual_dollar = false
@@ -2954,7 +3005,7 @@ fn handle_pending_prefix(
                 abort_change(vim)
                 return true
             }
-            if k == "i" and vim.mode == VimMode.Normal {
+            if k == "i" and vim.mode == VimMode.normal {
                 buf.ensure_writable()!
                 let ins_opt = buf.named_marks.get("^")
                 if ins_opt != null {
@@ -2963,15 +3014,15 @@ fn handle_pending_prefix(
                 }
                 begin_change(vim, KeyStroke.plain("g"))
                 record_change_stroke(vim, stroke)
-                vim.mode = VimMode.Insert
+                vim.mode = VimMode.insert
                 vim.clear_transient()
                 return true
             }
-            if k == "f" and (vim.mode == VimMode.Normal or is_visual_mode(vim.mode)) {
+            if k == "f" and (vim.mode == VimMode.normal or is_visual_mode(vim.mode)) {
                 let target_opt = file_target_under_cursor(buf, buf.point)
                 if is_visual_mode(vim.mode) {
                     save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
-                    vim.mode = VimMode.Normal
+                    vim.mode = VimMode.normal
                     vim.visual_dollar = false
                 }
                 vim.clear_transient()
@@ -3015,13 +3066,13 @@ fn handle_pending_prefix(
                     buf.point = buf.clamp_pos(buf.point, insert_mode = false)
                     buf.named_marks.insert(".", buf.point)
                     buf.checkpoint(buf.point, "vim-join-nospace")
-                    vim.mode = VimMode.Normal
+                    vim.mode = VimMode.normal
                     vim.visual_dollar = false
                     vim.clear_transient()
                     commit_change(vim)
                     return true
                 }
-                if vim.mode == VimMode.Normal {
+                if vim.mode == VimMode.normal {
                     buf.ensure_writable()!
                     let cnt = vim.effective_count()
                     let has_cnt = vim.has_explicit_count()
@@ -3051,7 +3102,7 @@ fn handle_pending_prefix(
             let km_opt = kernel.keymaps.get(kms.get(ki.as(usize)).as(String))
             if km_opt != null {
                 km_opt.as(Keymap).lookup(seq) match {
-                    KeyLookup.Exact(cmd_name, _) => {
+                    KeyLookup.exact(cmd_name, _) => {
                         vim.clear_transient()
                         world.which_key_items = List()
                         world.pending_keys_display = ""
@@ -3060,12 +3111,12 @@ fn handle_pending_prefix(
                         let _ = dispatch_optional_cmd(kernel, cmd_name, List())#!
                         return true
                     },
-                    KeyLookup.Prefix(hints) => {
+                    KeyLookup.prefix(hints) => {
                         vim.plugin_strokes = seq
                         world.which_key_items = sort_key_hints(hints)
                         return true
                     },
-                    KeyLookup.Unbound => (),
+                    KeyLookup.unbound => (),
                 }
             }
         }
@@ -3104,7 +3155,7 @@ fn handle_pending_prefix(
             let km_opt = kernel.keymaps.get(kms.get(ki.as(usize)).as(String))
             if km_opt != null {
                 km_opt.as(Keymap).lookup(seq) match {
-                    KeyLookup.Exact(cmd_name, _) => {
+                    KeyLookup.exact(cmd_name, _) => {
                         vim.clear_transient()
                         world.which_key_items = List()
                         world.pending_keys_display = ""
@@ -3113,12 +3164,12 @@ fn handle_pending_prefix(
                         let _ = dispatch_optional_cmd(kernel, cmd_name, List())#!
                         return true
                     },
-                    KeyLookup.Prefix(hints) => {
+                    KeyLookup.prefix(hints) => {
                         vim.plugin_strokes = seq
                         world.which_key_items = sort_key_hints(hints)
                         return true
                     },
-                    KeyLookup.Unbound => (),
+                    KeyLookup.unbound => (),
                 }
             }
         }
@@ -3203,7 +3254,7 @@ fn handle_pending_prefix(
             let km_opt = kernel.keymaps.get(kms.get(ki.as(usize)).as(String))
             if km_opt != null {
                 km_opt.as(Keymap).lookup(seq) match {
-                    KeyLookup.Exact(cmd_name, _) => {
+                    KeyLookup.exact(cmd_name, _) => {
                         vim.clear_transient()
                         world.which_key_items = List()
                         world.pending_keys_display = ""
@@ -3212,12 +3263,12 @@ fn handle_pending_prefix(
                         let _ = dispatch_optional_cmd(kernel, cmd_name, List())#!
                         return true
                     },
-                    KeyLookup.Prefix(hints) => {
+                    KeyLookup.prefix(hints) => {
                         vim.plugin_strokes = seq
                         world.which_key_items = sort_key_hints(hints)
                         return true
                     },
-                    KeyLookup.Unbound => (),
+                    KeyLookup.unbound => (),
                 }
             }
         }
@@ -3279,7 +3330,7 @@ fn handle_leader_sequence(
 
     -- Support user bindings registered without leading `<Space>` as well
     let is_unbound = res match {
-        KeyLookup.Unbound => true,
+        KeyLookup.unbound => true,
         _ => false,
     }
     if is_unbound and vim.leader_strokes.len() >= 2 {
@@ -3291,7 +3342,7 @@ fn handle_leader_sequence(
     }
 
     res match {
-        KeyLookup.Exact(cmd_name, _owner) => {
+        KeyLookup.exact(cmd_name, _owner) => {
             vim.leader_strokes = List()
             world.which_key_items = List()
             world.pending_keys_display = ""
@@ -3302,13 +3353,13 @@ fn handle_leader_sequence(
             }
             return true
         },
-        KeyLookup.Prefix(hints) => {
+        KeyLookup.prefix(hints) => {
             let pfx_str = format_chord(vim.leader_strokes)
             world.which_key_items = group_which_key_hints(hints, pfx_str)
             world.pending_keys_display = pfx_str
             return true
         },
-        KeyLookup.Unbound => {
+        KeyLookup.unbound => {
             let chord_str = format_chord(vim.leader_strokes)
             vim.leader_strokes = List()
             world.which_key_items = List()
@@ -3380,12 +3431,12 @@ fn handle_visual_specific_key(
     -- Escape or toggling same Visual mode key returns to Normal mode
     let toggle_off = stroke.key == "Escape"
         or (stroke.ctrl and stroke.key == "[")
-        or (vplain and k == "v" and vim.mode == VimMode.VisualChar)
-        or (vplain and k == "V" and vim.mode == VimMode.VisualLine)
-        or (vctrl_only and k == "v" and vim.mode == VimMode.VisualBlock)
+        or (vplain and k == "v" and vim.mode == VimMode.visual_char)
+        or (vplain and k == "V" and vim.mode == VimMode.visual_line)
+        or (vctrl_only and k == "v" and vim.mode == VimMode.visual_block)
     if toggle_off {
         save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.visual_dollar = false
         vim.clear_transient()
         abort_change(vim)
@@ -3394,21 +3445,21 @@ fn handle_visual_specific_key(
 
     -- Switch between `v`, `V`, `<C-v>` seamlessly keeping anchor!
     if vplain and k == "v" {
-        vim.mode = VimMode.VisualChar
+        vim.mode = VimMode.visual_char
         return true
     }
     if vplain and k == "V" {
-        vim.mode = VimMode.VisualLine
+        vim.mode = VimMode.visual_line
         return true
     }
     if vctrl_only and k == "v" {
-        vim.mode = VimMode.VisualBlock
+        vim.mode = VimMode.visual_block
         return true
     }
 
     -- Swap anchor & cursor (`o` / `O`; in VisualBlock, `O` swaps horizontal block corner)
     if vplain and (k == "o" or k == "O") {
-        if vim.mode == VimMode.VisualBlock and k == "O" {
+        if vim.mode == VimMode.visual_block and k == "O" {
             let old_ac = vim.visual_anchor.col
             let old_pc = buf.point.col
             vim.visual_anchor = Pos.new(vim.visual_anchor.row, old_pc)
@@ -3425,7 +3476,7 @@ fn handle_visual_specific_key(
     -- Ex command from Visual mode (`:'<,'>`)
     if vplain and k == ":" {
         save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.visual_dollar = false
         vim.clear_transient()
         abort_change(vim)
@@ -3457,7 +3508,7 @@ fn handle_visual_specific_key(
         let vkm_opt = kernel.keymaps.get(KEYMAP_VIM_VISUAL)
         if vkm_opt != null {
             vkm_opt.as(Keymap).lookup([stroke]) match {
-                KeyLookup.Exact(cmd_name, owner) => {
+                KeyLookup.exact(cmd_name, owner) => {
                     if kernel.is_extension_active(owner) {
                         world.which_key_items = List()
                         world.pending_keys_display = ""
@@ -3466,18 +3517,18 @@ fn handle_visual_specific_key(
                         return true
                     }
                 },
-                KeyLookup.Prefix(hints) => {
+                KeyLookup.prefix(hints) => {
                     vim.plugin_strokes = [stroke]
                     world.which_key_items = sort_key_hints(hints)
                     return true
                 },
-                KeyLookup.Unbound => (),
+                KeyLookup.unbound => (),
             }
         }
     }
 
     -- Visual Block `I` and `A` multi-line block insert!
-    if vim.mode == VimMode.VisualBlock and vplain and (k == "I" or k == "A") {
+    if vim.mode == VimMode.visual_block and vplain and (k == "I" or k == "A") {
         let was_dollar = vim.visual_dollar
         save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
         let (r1, r2, c1, c2) = visual_block_bounds(buf, vim)
@@ -3490,7 +3541,7 @@ fn handle_visual_specific_key(
     }
 
     -- Visual Block operators (`d`/`x`/`X`, `D`, `y`/`Y`, `c`/`s`, `C`, `S`/`R`, `p`/`P`, `>`, `<`, `=`, `~`, `u`, `U`, `J`)
-    if vim.mode == VimMode.VisualBlock and vplain {
+    if vim.mode == VimMode.visual_block and vplain {
         if k == "d" or k == "x" or k == "X" {
             save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
             let (r1, r2, c1, c2) = visual_block_bounds(buf, vim)
@@ -3499,7 +3550,7 @@ fn handle_visual_specific_key(
             buf.point = buf.clamp_pos(Pos.new(r1, c1), insert_mode = false)
             buf.named_marks.insert(".", buf.point)
             buf.checkpoint(buf.point, "visual-block-delete")
-            vim.mode = VimMode.Normal
+            vim.mode = VimMode.normal
             vim.visual_dollar = false
             vim.clear_transient()
             commit_change(vim)
@@ -3524,7 +3575,7 @@ fn handle_visual_specific_key(
             buf.point = buf.clamp_pos(Pos.new(r1, c1), insert_mode = false)
             buf.named_marks.insert(".", buf.point)
             buf.checkpoint(buf.point, "visual-block-delete-eol")
-            vim.mode = VimMode.Normal
+            vim.mode = VimMode.normal
             vim.visual_dollar = false
             vim.clear_transient()
             commit_change(vim)
@@ -3536,7 +3587,7 @@ fn handle_visual_specific_key(
             let yanked = extract_and_optionally_delete_block(buf, r1, r2, c1, c2, false)!
             world.registers.yank_store(RegisterValue.block(yanked), reg = vim.active_reg)#
             buf.point = buf.clamp_pos(Pos.new(r1, c1), insert_mode = false)
-            vim.mode = VimMode.Normal
+            vim.mode = VimMode.normal
             vim.visual_dollar = false
             vim.clear_transient()
             abort_change(vim)
@@ -3598,7 +3649,7 @@ fn handle_visual_specific_key(
             buf.modified = true
             buf.point = buf.clamp_pos(Pos.new(r1, c1), insert_mode = false)
             buf.checkpoint(buf.point, "visual-block-case")
-            vim.mode = VimMode.Normal
+            vim.mode = VimMode.normal
             vim.visual_dollar = false
             vim.clear_transient()
             commit_change(vim)
@@ -3622,7 +3673,7 @@ fn handle_visual_specific_key(
             buf.point = buf.clamp_pos(buf.point, insert_mode = false)
             buf.named_marks.insert(".", buf.point)
             buf.checkpoint(buf.point, "vim-join")
-            vim.mode = VimMode.Normal
+            vim.mode = VimMode.normal
             vim.visual_dollar = false
             vim.clear_transient()
             commit_change(vim)
@@ -3680,13 +3731,13 @@ fn handle_visual_specific_key(
 
         if k == "A" {
             save_visual_marks(buf, vim, a, b)
-            if vim.mode == VimMode.VisualChar and r1 == r2 {
+            if vim.mode == VimMode.visual_char and r1 == r2 {
                 buf.ensure_writable()!
                 let hi = if a <= b { b } else { a }
                 let hlen = buf.line_char_len(hi.row)
                 let ins_c = if hi.col < hlen { hi.col + 1 } else { hlen }
                 buf.point = Pos.new(hi.row, ins_c)
-                vim.mode = VimMode.Insert
+                vim.mode = VimMode.insert
                 vim.clear_transient()
             } else {
                 start_visual_block_insert(buf, vim, r1, r2, buf.line_char_len(r1), false, eol_mode = true)!
@@ -3705,7 +3756,7 @@ fn handle_visual_specific_key(
                 k == "U" => "gU",
                 else => k,
             }
-            if vim.mode == VimMode.VisualLine or mapped_op == ">" or mapped_op == "<" or mapped_op == "=" {
+            if vim.mode == VimMode.visual_line or mapped_op == ">" or mapped_op == "<" or mapped_op == "=" {
                 apply_operator_linewise(world, buf, vim, mapped_op, r1, r2)#!
             } else {
                 let lo = if a <= b { a } else { b }
@@ -3727,7 +3778,7 @@ fn handle_visual_specific_key(
             buf.point = buf.clamp_pos(buf.point, insert_mode = false)
             buf.named_marks.insert(".", buf.point)
             buf.checkpoint(buf.point, "vim-join")
-            vim.mode = VimMode.Normal
+            vim.mode = VimMode.normal
             vim.clear_transient()
             commit_change(vim)
             return true
@@ -3750,7 +3801,7 @@ fn try_plugin_keymap_step(
         return 0
     }
     km_opt.as(Keymap).lookup(seq) match {
-        KeyLookup.Exact(cmd_name, _) => {
+        KeyLookup.exact(cmd_name, _) => {
             vim.plugin_strokes = List()
             world.which_key_items = List()
             world.pending_keys_display = ""
@@ -3759,14 +3810,14 @@ fn try_plugin_keymap_step(
             let _ = dispatch_optional_cmd(kernel, cmd_name, List())#!
             2
         },
-        KeyLookup.Prefix(hints) => {
+        KeyLookup.prefix(hints) => {
             vim.plugin_strokes = clone_stroke_list(seq)
             world.which_key_items = sort_key_hints(hints)
             world.pending_keys_display = format_chord(vim.plugin_strokes)
             vim.vim_owns_which_key = true
             1
         },
-        KeyLookup.Unbound => 0,
+        KeyLookup.unbound => 0,
     }
 }
 
@@ -3791,8 +3842,12 @@ fn vim_dispatch_stroke_core(
     vim: VimState,
     stroke: KeyStroke,
 ) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String bool {
-    refresh_plugin_hint_cache(kernel, world, vim)
     let buf = world.active_buffer()
+    if (vim.mode != VimMode.insert and vim.mode != VimMode.replace)
+        or vim.modal_interceptor != null
+        or (not vim.plugin_strokes.is_empty()) {
+        refresh_plugin_hint_cache(kernel, world, vim)
+    }
 
     -- 0. Active modal interceptor (e.g. Flash jump label, Surround target char, Oil/Magit prompt)
     if vim.modal_interceptor != null {
@@ -3816,7 +3871,7 @@ fn vim_dispatch_stroke_core(
         let seq = clone_stroke_list(vim.plugin_strokes)
         seq.push(stroke)
         let mode_km = "mode:" ++ buf.major_mode
-        var matched_step = if vim.mode == VimMode.Normal {
+        var matched_step = if vim.mode == VimMode.normal {
             try_plugin_keymap_step(kernel, world, vim, mode_km, seq)#!
         } else {
             0
@@ -3868,16 +3923,19 @@ fn vim_dispatch_stroke_core(
     }
 
     -- 1. Active Insert or Replace mode
-    if vim.mode == VimMode.Insert {
+    if vim.mode == VimMode.insert {
         let ikm_opt = kernel.keymaps.get(KEYMAP_VIM_INSERT)
         if ikm_opt != null {
-            ikm_opt.as(Keymap).lookup([stroke]) match {
-                KeyLookup.Exact(cmd_name, _) => {
-                    let _ = dispatch_optional_cmd(kernel, cmd_name, List())#!
-                    sync_world_from_vim(world, vim)
-                    return true
-                },
-                _ => (),
+            let ikm = ikm_opt.as(Keymap)
+            if (not ikm.bindings.is_empty()) or ikm.parent != null {
+                ikm.lookup([stroke]) match {
+                    KeyLookup.exact(cmd_name, _) => {
+                        let _ = dispatch_optional_cmd(kernel, cmd_name, List())#!
+                        sync_world_from_vim(world, vim)
+                        return true
+                    },
+                    _ => (),
+                }
             }
         }
         for ii_idx in 0..vim.insert_interceptors.len() {
@@ -3885,7 +3943,7 @@ fn vim_dispatch_stroke_core(
             if kernel.is_extension_active(ii.owner) {
                 let taken = (ii.handler)(kernel, stroke)#!
                 if taken {
-                    if vim.mode == VimMode.Insert {
+                    if vim.mode == VimMode.insert {
                         kernel.emit_hook("after-insert-stroke", stroke)
                     }
                     sync_world_from_vim(world, vim)
@@ -3894,13 +3952,13 @@ fn vim_dispatch_stroke_core(
             }
         }
         let handled = handle_insert_mode_key(world, buf, vim, stroke)!
-        if vim.mode == VimMode.Insert {
+        if vim.mode == VimMode.insert {
             kernel.emit_hook("after-insert-stroke", stroke)
         }
         sync_world_from_vim(world, vim)
         return handled
     }
-    if vim.mode == VimMode.Replace {
+    if vim.mode == VimMode.replace {
         let handled = handle_replace_mode_key(buf, vim, stroke)!
         sync_world_from_vim(world, vim)
         return handled
@@ -3922,10 +3980,10 @@ fn vim_dispatch_stroke_core(
 
     -- 4. Count accumulation (`[1-9]` or `0` after digits)
     let plain_ch = stroke_printable_char(stroke)
-    if plain_ch.char_len() == 1 and plain_ch.is_ascii_digit() {
-        let d = plain_ch.parse_i64().as(i64)
+    if plain_ch.len() == 1 and plain_ch.is_ascii_digit() {
+        let d = plain_ch.byte_at(0) - 48
         vim.mode match {
-            VimMode.OperatorPending(_) => {
+            VimMode.operator_pending(_) => {
                 if d > 0 or vim.count2 > 0 {
                     vim.count2 = vim.count2 * 10 + d
                     if vim.recording_change and not vim.replaying_dot {
@@ -3958,7 +4016,7 @@ fn vim_dispatch_stroke_core(
         if is_visual_mode(vim.mode) {
             save_visual_marks(buf, vim, vim.visual_anchor, buf.point)
         }
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.visual_dollar = false
         vim.clear_transient()
         abort_change(vim)
@@ -3967,7 +4025,7 @@ fn vim_dispatch_stroke_core(
     }
 
     -- 5b. Buffer-local `"mode:<major_mode>"` and `KEYMAP_VIM_NORMAL` bindings when idle in Normal mode
-    if vim.mode == VimMode.Normal and vim.count1 == 0 and vim.active_reg == "" {
+    if vim.mode == VimMode.normal and vim.count1 == 0 and vim.active_reg == "" {
         let mode_step = try_plugin_keymap_step(kernel, world, vim, "mode:" ++ buf.major_mode, [stroke])#!
         if mode_step > 0 {
             sync_world_from_vim(world, vim)
@@ -3997,7 +4055,7 @@ fn vim_dispatch_stroke_core(
 
     -- 7. Operator-Pending specific keys (`i`/`a` text objects & doubled linewise operators `dd`, `cc`, `yy`, `>>`, `<<`)
     vim.mode match {
-        VimMode.OperatorPending(op) => {
+        VimMode.operator_pending(op) => {
             if plain and (k == "i" or k == "a") {
                 vim.pending_prefix = k
                 sync_world_from_vim(world, vim)
@@ -4015,14 +4073,14 @@ fn vim_dispatch_stroke_core(
 
     -- 8. Shared Motions (usable in Normal, Visual, AND OperatorPending!)
     let is_op_pending = vim.mode match {
-        VimMode.OperatorPending(_) => true,
+        VimMode.operator_pending(_) => true,
         _ => false,
     }
     let eff = vim.effective_count()
 
     if plain and (k == "h" or k == "Left" or k == "BackSpace") {
         let new_c = if buf.point.col - eff > 0 { buf.point.col - eff } else { 0 }
-        apply_resolved_motion(world, buf, vim, MotionTarget.ok(Pos.new(buf.point.row, new_c), MotionShape.Exclusive))#!
+        apply_resolved_motion(world, buf, vim, MotionTarget.ok(Pos.new(buf.point.row, new_c), MotionShape.exclusive))#!
         sync_world_from_vim(world, vim)
         return true
     }
@@ -4031,7 +4089,7 @@ fn vim_dispatch_stroke_core(
         let llen = buf.line_char_len(buf.point.row)
         let max_c = if is_op_pending { llen } else if llen > 0 { llen - 1 } else { 0 }
         let new_c = if buf.point.col + eff <= max_c { buf.point.col + eff } else { max_c }
-        apply_resolved_motion(world, buf, vim, MotionTarget.ok(Pos.new(buf.point.row, new_c), MotionShape.Exclusive))#!
+        apply_resolved_motion(world, buf, vim, MotionTarget.ok(Pos.new(buf.point.row, new_c), MotionShape.exclusive))#!
         sync_world_from_vim(world, vim)
         return true
     }
@@ -4039,7 +4097,7 @@ fn vim_dispatch_stroke_core(
     if plain and (k == "j" or k == "Down") {
         let new_r = if buf.point.row + eff <= buf.max_row() { buf.point.row + eff } else { buf.max_row() }
         let pref = buf.preferred_col
-        let tgt = MotionTarget.ok(Pos.new(new_r, pref), MotionShape.Linewise, preserve_pref_col = true)
+        let tgt = MotionTarget.ok(Pos.new(new_r, pref), MotionShape.linewise, preserve_pref_col = true)
         apply_resolved_motion(world, buf, vim, tgt)#!
         sync_world_from_vim(world, vim)
         return true
@@ -4048,21 +4106,21 @@ fn vim_dispatch_stroke_core(
     if plain and (k == "k" or k == "Up") {
         let new_r = if buf.point.row - eff >= buf.min_row() { buf.point.row - eff } else { buf.min_row() }
         let pref = buf.preferred_col
-        let tgt = MotionTarget.ok(Pos.new(new_r, pref), MotionShape.Linewise, preserve_pref_col = true)
+        let tgt = MotionTarget.ok(Pos.new(new_r, pref), MotionShape.linewise, preserve_pref_col = true)
         apply_resolved_motion(world, buf, vim, tgt)#!
         sync_world_from_vim(world, vim)
         return true
     }
 
     if plain and k == "0" {
-        apply_resolved_motion(world, buf, vim, MotionTarget.ok(Pos.new(buf.point.row, 0), MotionShape.Exclusive))#!
+        apply_resolved_motion(world, buf, vim, MotionTarget.ok(Pos.new(buf.point.row, 0), MotionShape.exclusive))#!
         sync_world_from_vim(world, vim)
         return true
     }
 
     if plain and k == "^" {
         let fnb = buf.first_non_blank_col(buf.point.row)
-        apply_resolved_motion(world, buf, vim, MotionTarget.ok(Pos.new(buf.point.row, fnb), MotionShape.Exclusive))#!
+        apply_resolved_motion(world, buf, vim, MotionTarget.ok(Pos.new(buf.point.row, fnb), MotionShape.exclusive))#!
         sync_world_from_vim(world, vim)
         return true
     }
@@ -4071,7 +4129,7 @@ fn vim_dispatch_stroke_core(
         let tr = if buf.point.row + eff - 1 <= buf.max_row() { buf.point.row + eff - 1 } else { buf.max_row() }
         let llen = buf.line_char_len(tr)
         let ec = if llen > 0 { llen - 1 } else { 0 }
-        let tgt = MotionTarget.ok(Pos.new(tr, ec), MotionShape.Inclusive, end_of_line_pref = true)
+        let tgt = MotionTarget.ok(Pos.new(tr, ec), MotionShape.inclusive, end_of_line_pref = true)
         apply_resolved_motion(world, buf, vim, tgt)#!
         sync_world_from_vim(world, vim)
         return true
@@ -4082,7 +4140,7 @@ fn vim_dispatch_stroke_core(
         -- Classic Vim rule: `cw` / `cW` on non-blank behaves like `ce` / `cE` (does not eat trailing space)
         var use_end = false
         vim.mode match {
-            VimMode.OperatorPending(op) => {
+            VimMode.operator_pending(op) => {
                 if op == "c" {
                     let cur_line = buf.line_at(buf.point.row)
                     if buf.point.col < cur_line.char_len() {
@@ -4148,7 +4206,7 @@ fn vim_dispatch_stroke_core(
         }
         let tgt = MotionTarget.ok(
             Pos.new(dest_r, buf.first_non_blank_col(dest_r)),
-            MotionShape.Linewise,
+            MotionShape.linewise,
             is_jump = true,
         )
         apply_resolved_motion(world, buf, vim, tgt)#!
@@ -4211,7 +4269,7 @@ fn vim_dispatch_stroke_core(
             ntop = buf.max_row()
         }
         world.viewport_top_row = ntop
-        let tgt = MotionTarget.ok(Pos.new(nr, buf.first_non_blank_col(nr)), MotionShape.Linewise)
+        let tgt = MotionTarget.ok(Pos.new(nr, buf.first_non_blank_col(nr)), MotionShape.linewise)
         apply_resolved_motion(world, buf, vim, tgt)#!
         sync_world_from_vim(world, vim)
         return true
@@ -4270,7 +4328,7 @@ fn vim_dispatch_stroke_core(
             }
         }
         if matched != null {
-            apply_resolved_motion(world, buf, vim, MotionTarget.ok(matched.as(Pos), MotionShape.Exclusive, is_jump = true))#!
+            apply_resolved_motion(world, buf, vim, MotionTarget.ok(matched.as(Pos), MotionShape.exclusive, is_jump = true))#!
         }
         sync_world_from_vim(world, vim)
         return true
@@ -4303,7 +4361,7 @@ fn vim_dispatch_stroke_core(
             status_emit("E486: Pattern not found: " ++ pat)#
             vim.clear_transient()
         } else {
-            apply_resolved_motion(world, buf, vim, MotionTarget.ok(matched.as(Pos), MotionShape.Exclusive, is_jump = true))#!
+            apply_resolved_motion(world, buf, vim, MotionTarget.ok(matched.as(Pos), MotionShape.exclusive, is_jump = true))#!
         }
         sync_world_from_vim(world, vim)
         return true
@@ -4335,12 +4393,12 @@ fn vim_dispatch_stroke_core(
     -- If still in OperatorPending and key wasn't a valid motion, check plugin operator chords (`ys`, `ds`, `cs`) then cancel cleanly
     if is_op_pending {
         let op_name = vim.mode match {
-            VimMode.OperatorPending(op) => op,
+            VimMode.operator_pending(op) => op,
             _ => "",
         }
         if op_name != "" {
             let op_seq = [KeyStroke.plain(op_name), stroke]
-            vim.mode = VimMode.Normal
+            vim.mode = VimMode.normal
             abort_change(vim)
             let op_step = try_plugin_keymap_step(kernel, world, vim, KEYMAP_VIM_NORMAL, op_seq)#!
             if op_step > 0 {
@@ -4348,7 +4406,7 @@ fn vim_dispatch_stroke_core(
                 return true
             }
         }
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.clear_transient()
         abort_change(vim)
         sync_world_from_vim(world, vim)
@@ -4414,7 +4472,7 @@ fn vim_dispatch_stroke_core(
         begin_change(vim, stroke, tentative_visual = true)
         vim.visual_anchor = buf.point
         vim.visual_dollar = false
-        vim.mode = VimMode.VisualBlock
+        vim.mode = VimMode.visual_block
         vim.count1 = 0
         vim.count2 = 0
         vim.pending_prefix = ""
@@ -4514,7 +4572,7 @@ fn vim_dispatch_stroke_core(
         begin_change(vim, stroke, tentative_visual = true)
         vim.visual_anchor = buf.point
         vim.visual_dollar = false
-        vim.mode = VimMode.VisualChar
+        vim.mode = VimMode.visual_char
         vim.count1 = 0
         vim.count2 = 0
         vim.pending_prefix = ""
@@ -4526,7 +4584,7 @@ fn vim_dispatch_stroke_core(
         begin_change(vim, stroke, tentative_visual = true)
         vim.visual_anchor = buf.point
         vim.visual_dollar = false
-        vim.mode = VimMode.VisualLine
+        vim.mode = VimMode.visual_line
         vim.count1 = 0
         vim.count2 = 0
         vim.pending_prefix = ""
@@ -4537,7 +4595,7 @@ fn vim_dispatch_stroke_core(
     -- Operators `d`, `c`, `y`, `>`, `<`, `=`
     if k == "d" or k == "c" or k == ">" or k == "<" or k == "=" {
         begin_change(vim, stroke)
-        vim.mode = VimMode.OperatorPending(k)
+        vim.mode = VimMode.operator_pending(k)
         sync_world_from_vim(world, vim)
         return true
     }
@@ -4556,7 +4614,7 @@ fn vim_dispatch_stroke_core(
     }
 
     if k == "y" {
-        vim.mode = VimMode.OperatorPending("y")
+        vim.mode = VimMode.operator_pending("y")
         sync_world_from_vim(world, vim)
         return true
     }
@@ -4592,7 +4650,7 @@ fn vim_dispatch_stroke_core(
     if k == "i" {
         buf.ensure_writable()!
         begin_change(vim, stroke)
-        vim.mode = VimMode.Insert
+        vim.mode = VimMode.insert
         vim.clear_transient()
         sync_world_from_vim(world, vim)
         return true
@@ -4602,7 +4660,7 @@ fn vim_dispatch_stroke_core(
         buf.ensure_writable()!
         begin_change(vim, stroke)
         buf.point = Pos.new(buf.point.row, buf.first_non_blank_col(buf.point.row))
-        vim.mode = VimMode.Insert
+        vim.mode = VimMode.insert
         vim.clear_transient()
         sync_world_from_vim(world, vim)
         return true
@@ -4614,7 +4672,7 @@ fn vim_dispatch_stroke_core(
         let llen = buf.line_char_len(buf.point.row)
         let nc = if buf.point.col < llen { buf.point.col + 1 } else { llen }
         buf.point = Pos.new(buf.point.row, nc)
-        vim.mode = VimMode.Insert
+        vim.mode = VimMode.insert
         vim.clear_transient()
         sync_world_from_vim(world, vim)
         return true
@@ -4624,7 +4682,7 @@ fn vim_dispatch_stroke_core(
         buf.ensure_writable()!
         begin_change(vim, stroke)
         buf.point = Pos.new(buf.point.row, buf.line_char_len(buf.point.row))
-        vim.mode = VimMode.Insert
+        vim.mode = VimMode.insert
         vim.clear_transient()
         sync_world_from_vim(world, vim)
         return true
@@ -4641,7 +4699,7 @@ fn vim_dispatch_stroke_core(
         }
         let _ = buf.insert_lines_below(buf.point.row, [indent_str])!
         buf.point = Pos.new(buf.point.row, indent_str.char_len())
-        vim.mode = VimMode.Insert
+        vim.mode = VimMode.insert
         vim.clear_transient()
         sync_world_from_vim(world, vim)
         return true
@@ -4654,7 +4712,7 @@ fn vim_dispatch_stroke_core(
         let indent_str = buf.line_at(buf.point.row).take(indent_col)
         let _ = buf.insert_lines_above(buf.point.row, [indent_str])!
         buf.point = Pos.new(buf.point.row, indent_str.char_len())
-        vim.mode = VimMode.Insert
+        vim.mode = VimMode.insert
         vim.clear_transient()
         sync_world_from_vim(world, vim)
         return true
@@ -4720,7 +4778,7 @@ fn vim_dispatch_stroke_core(
         buf.ensure_writable()!
         begin_change(vim, stroke)
         vim.replace_stack = List()
-        vim.mode = VimMode.Replace
+        vim.mode = VimMode.replace
         vim.clear_transient()
         sync_world_from_vim(world, vim)
         return true
@@ -4785,7 +4843,7 @@ fn has_mode_keymap_binding(kernel: SystemKernel, km_name: String, stroke: KeyStr
         return false
     }
     km_opt.as(Keymap).lookup([stroke]) match {
-        KeyLookup.Unbound => false,
+        KeyLookup.unbound => false,
         _ => true,
     }
 }
@@ -4804,14 +4862,14 @@ fn is_emacs_passthrough_chord(
         return false
     }
     let buf = world.active_buffer()
-    if vim.mode == VimMode.Insert {
+    if vim.mode == VimMode.insert {
         if has_mode_keymap_binding(kernel, KEYMAP_VIM_INSERT, stroke) {
             return false
         }
         if stroke.alt and (not stroke.ctrl) and (stroke.key == "n" or stroke.key == "p") {
             return false
         }
-    } else if vim.mode == VimMode.Normal {
+    } else if vim.mode == VimMode.normal {
         if has_mode_keymap_binding(kernel, "mode:" ++ buf.major_mode, stroke)
             or has_mode_keymap_binding(kernel, KEYMAP_VIM_NORMAL, stroke) {
             return false
@@ -4840,7 +4898,7 @@ fn is_emacs_passthrough_chord(
             return true
         }
         -- `<C-r>` in Insert mode passes through to Emacs; in Normal mode it is Vim `redo`!
-        if k == "r" and vim.mode == VimMode.Insert {
+        if k == "r" and vim.mode == VimMode.insert {
             return true
         }
     }
@@ -4862,7 +4920,7 @@ pub fn vim_handle_key(
     if stroke.ctrl and (not stroke.alt) and (not stroke.super_mod) and (stroke.key == "z" or stroke.key == "Z") {
         world.options.evil_mode = not world.options.evil_mode
         vim.clear_transient()
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.visual_dollar = false
         abort_change(vim)
         if world.options.evil_mode {
@@ -4962,7 +5020,7 @@ fn run_interactive_vim_search(
     let vim = require_vim_state(kernel)!
     var count: i64 = 1
     if not args.is_empty() {
-        let parsed = args.get(0).as(String).parse_i64()
+        let parsed = args.get(0).as(String).try_parse(i64)
         if parsed != null and parsed.as(i64) > 0 {
             count = parsed.as(i64)
         }
@@ -4970,7 +5028,7 @@ fn run_interactive_vim_search(
     let req = PromptRequest {
         label: if forward { "/" } else { "?" },
         initial: "",
-        kind: if forward { PromptKind.SearchForward } else { PromptKind.SearchBackward },
+        kind: if forward { PromptKind.search_forward } else { PromptKind.search_backward },
         candidates: List(),
     }
     let ans_opt = ask_prompt(req)#
@@ -5005,14 +5063,14 @@ fn run_interactive_vim_search(
     if matched == null {
         status_emit("E486: Pattern not found: " ++ pat)#
         vim.mode match {
-            VimMode.OperatorPending(_) => {
-                vim.mode = VimMode.Normal
+            VimMode.operator_pending(_) => {
+                vim.mode = VimMode.normal
                 abort_change(vim)
             },
             _ => (),
         }
     } else {
-        apply_resolved_motion(world, buf, vim, MotionTarget.ok(matched.as(Pos), MotionShape.Exclusive, is_jump = true))#!
+        apply_resolved_motion(world, buf, vim, MotionTarget.ok(matched.as(Pos), MotionShape.exclusive, is_jump = true))#!
     }
     sync_world_from_vim(world, vim)
     ()
@@ -5080,7 +5138,7 @@ pub fn register_vim_extension(kernel: SystemKernel) -> !String Unit {
                     let req = PromptRequest {
                         label: ":",
                         initial: initial,
-                        kind: PromptKind.ExCommand,
+                        kind: PromptKind.ex_command,
                         candidates: List(),
                     }
                     let ans? = ask_prompt(req)# else {
@@ -5207,7 +5265,7 @@ pub fn register_vim_extension(kernel: SystemKernel) -> !String Unit {
                     let vs = require_vim_state(kern)!
                     w.options.evil_mode = not w.options.evil_mode
                     vs.clear_transient()
-                    vs.mode = VimMode.Normal
+                    vs.mode = VimMode.normal
                     sync_world_from_vim(w, vs)
                     if w.options.evil_mode {
                         status_emit("-- EVIL NORMAL MODE --")#
@@ -5227,7 +5285,7 @@ pub fn register_vim_extension(kernel: SystemKernel) -> !String Unit {
                     if w_opt != null and v_opt != null {
                         let w = w_opt.as(EditorWorld)
                         let vs = v_opt.as(VimState)
-                        if w.options.evil_mode and vs.mode == VimMode.Normal {
+                        if w.options.evil_mode and vs.mode == VimMode.normal {
                             let b = w.active_buffer()
                             b.point = b.clamp_pos(b.point, insert_mode = false)
                         }

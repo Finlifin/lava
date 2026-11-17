@@ -3,7 +3,7 @@
 -- `fs/mkdir`, `fs/remove`, `fs/rename`, `fs/copy`, `fs/realpath`, and `fs/find_root`.
 
 use std.fs
-use std.io.{File, IoError}
+use std.io.{File, IoError, OpenMode}
 use std.ordering.Ordering
 use std.path
 use std.process
@@ -19,22 +19,22 @@ private global _atomic_tmp_seq: i64 = 1
 
 private fn check_path_readonly(resolved_path: String, is_dir: bool) -> bool {
     if is_dir {
-        let res = process.exec("test", args = ["-w", resolved_path])
+        let res = process.run("test", args = ["-w", resolved_path])
         return res match {
-            out! => not out.success(),
+            out! => not out.is_success(),
             error _ => false,
         }
     }
-    File.open(resolved_path, mode = "r+") match {
+    File.open(resolved_path, mode = OpenMode.read_write) match {
         f! => {
             let _ = f.close()
             false
         },
         error IoError.PermissionDenied(_) => true,
         error _ => {
-            let res = process.exec("test", args = ["-w", resolved_path])
+            let res = process.run("test", args = ["-w", resolved_path])
             res match {
-                out! => not out.success(),
+                out! => not out.is_success(),
                 error _ => false,
             }
         },
@@ -42,7 +42,7 @@ private fn check_path_readonly(resolved_path: String, is_dir: bool) -> bool {
 }
 
 private fn copy_dir_recursive(src_dir: String, dst_dir: String) -> !String i64 {
-    fs.create_dir_all(dst_dir) match {
+    fs.create_dir(dst_dir, parents = true) match {
         _! => (),
         error err => return error ("cannot create directory '" ++ dst_dir ++ "': " ++ err.to_string()),
     }
@@ -54,7 +54,7 @@ private fn copy_dir_recursive(src_dir: String, dst_dir: String) -> !String i64 {
     for i in 0..entries.len() {
         let ent = entries.get(i.as(usize)).as(fs.DirEntry)
         let dst_child = path.join(dst_dir, ent.name)
-        if ent.is_dir {
+        if ent.is_dir() {
             total_bytes += copy_dir_recursive(ent.path, dst_child)!
         } else {
             let copied = fs.copy(ent.path, dst_child) match {
@@ -86,10 +86,10 @@ private fn rpc_fs_stat(_k: ServerKernel, params: JsonValue) -> !String JsonValue
         error err => return error ("fs/stat failed on '" ++ resolved ++ "': " ++ err.to_string()),
     }
     out.set("exists", true)
-    out.set("is_dir", meta.is_dir)
-    out.set("is_file", meta.is_file)
+    out.set("is_dir", meta.is_dir())
+    out.set("is_file", meta.is_file())
     out.set("size", meta.size)
-    out.set("readonly", check_path_readonly(resolved, meta.is_dir))
+    out.set("readonly", check_path_readonly(resolved, meta.is_dir()))
     out
 }
 
@@ -144,7 +144,7 @@ private fn rpc_fs_write(_k: ServerKernel, params: JsonValue) -> !String JsonValu
         let par_dir = par_opt.as(String)
         if not fs.exists(par_dir) {
             if create_dirs {
-                fs.create_dir_all(par_dir) match {
+                fs.create_dir(par_dir, parents = true) match {
                     _! => (),
                     error err => return error ("cannot create parent directories '" ++ par_dir ++ "': " ++ err.to_string()),
                 }
@@ -242,8 +242,8 @@ private fn rpc_fs_readdir(_k: ServerKernel, params: JsonValue) -> !String JsonVa
     filtered.sort_by(|a: Any, b: Any| {
         let ea = a.as(fs.DirEntry)
         let eb = b.as(fs.DirEntry)
-        if ea.is_dir != eb.is_dir {
-            if ea.is_dir {
+        if ea.is_dir() != eb.is_dir() {
+            if ea.is_dir() {
                 return Ordering.less
             } else {
                 return Ordering.greater
@@ -263,7 +263,7 @@ private fn rpc_fs_readdir(_k: ServerKernel, params: JsonValue) -> !String JsonVa
         let item = Map()
         item.set("name", ent.name)
         item.set("path", ent.path)
-        item.set("is_dir", ent.is_dir)
+        item.set("is_dir", ent.is_dir())
         item.set("size", ent.size)
         entries_json.push(item)
     }
@@ -280,7 +280,7 @@ private fn rpc_fs_mkdir(_k: ServerKernel, params: JsonValue) -> !String JsonValu
     let recursive = opt_bool_param(m, "recursive", true)!
     let target = resolve_server_path(raw_path)
     if recursive {
-        fs.create_dir_all(target) match {
+        fs.create_dir(target, parents = true) match {
             _! => (),
             error err => return error ("cannot create directory '" ++ target ++ "': " ++ err.to_string()),
         }
@@ -306,7 +306,7 @@ private fn rpc_fs_remove(_k: ServerKernel, params: JsonValue) -> !String JsonVal
     }
     if fs.is_dir(target) {
         if recursive {
-            fs.remove_dir_all(target) match {
+            fs.remove_dir(target, recursive = true) match {
                 _! => (),
                 error err => return error ("cannot remove directory '" ++ target ++ "': " ++ err.to_string()),
             }

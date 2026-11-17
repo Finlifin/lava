@@ -69,7 +69,7 @@ pub fn configure(kernel: SystemKernel) -> !String Unit {
                     c.created += 1
                     let note_buf = w.create_buffer(
                         "*note:" ++ title ++ "*",
-                        BufferKind.Scratch,
+                        BufferKind.scratch,
                         major_mode = "org",
                         initial_lines = [
                             "* TODO " ++ title,

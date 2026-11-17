@@ -4,7 +4,11 @@
 -- Capability providers, canonical KeyStroke/Chord parsing, hierarchical Keymap tries, and Macro recording.
 
 use std.collections.{HashMap, Set}
+use std.process
 use std.string
+use std.task
+use std.time
+
 use @lava_sys.{
     MOD_ALT, MOD_CTRL, MOD_SHIFT, MOD_SUPER, RawUiEvent, host_clipboard_get, host_clipboard_set,
     host_spawn_job, host_wait_events
@@ -25,29 +29,56 @@ impl ExtId {
 }
 
 pub enum ExtState {
-    pub Registered,
-    pub Active,
-    pub Disabled,
-    pub Failed(reason: String),
+    pub registered,
+    pub active,
+    pub disabled,
+    pub failed(reason: String),
 }
-derive Eq, PartialEq, Display for ExtState
+derive Eq, PartialEq for ExtState
+
+impl Display for ExtState {
+    pub fn to_string(self) -> String {
+        self match {
+            ExtState.registered => "Registered",
+            ExtState.active => "Active",
+            ExtState.disabled => "Disabled",
+            ExtState.failed(r) => "Failed(" ++ r ++ ")",
+        }
+    }
+}
 
 -- ============================================================================
 -- 2. Algebraic Effects, Continuation Prompts & Async Background Services
 -- ============================================================================
 
 pub enum PromptKind {
-    pub FreeText,
-    pub CommandName,
-    pub FilePath,
-    pub BufferName,
-    pub Choice,
-    pub Confirm,
-    pub SearchForward,
-    pub SearchBackward,
-    pub ExCommand,
+    pub free_text,
+    pub command_name,
+    pub file_path,
+    pub buffer_name,
+    pub choice,
+    pub confirm,
+    pub search_forward,
+    pub search_backward,
+    pub ex_command,
 }
-derive Eq, PartialEq, Display for PromptKind
+derive Eq, PartialEq for PromptKind
+
+impl Display for PromptKind {
+    pub fn to_string(self) -> String {
+        self match {
+            PromptKind.free_text => "FreeText",
+            PromptKind.command_name => "CommandName",
+            PromptKind.file_path => "FilePath",
+            PromptKind.buffer_name => "BufferName",
+            PromptKind.choice => "Choice",
+            PromptKind.confirm => "Confirm",
+            PromptKind.search_forward => "SearchForward",
+            PromptKind.search_backward => "SearchBackward",
+            PromptKind.ex_command => "ExCommand",
+        }
+    }
+}
 
 pub struct PromptRequest {
     pub label: String,
@@ -61,7 +92,7 @@ impl PromptRequest {
         PromptRequest {
             label: label,
             initial: initial,
-            kind: PromptKind.FreeText,
+            kind: PromptKind.free_text,
             candidates: List(),
         }
     }
@@ -104,15 +135,103 @@ pub async effect sleep_ticks(delay_ms: i64) -> i64
 pub const ServiceEffects = [log_event, status_emit, clipboard_get, clipboard_set]
 pub const InteractiveEffects = [log_event, status_emit, clipboard_get, clipboard_set, ask_prompt]
 
+private fn exec_bg_job_on_libuv(req: BgJobSpec) -> BgJobResult {
+    let stdin_opt: ?String = if req.stdin_text == "" { null } else { req.stdin_text }
+    let cwd_opt: ?String = if req.cwd == "" { null } else { req.cwd }
+    let out = process.shell(req.command, stdin = stdin_opt, cwd = cwd_opt) ! {
+        err => {
+            return (BgJobResult {
+                job_id: 0,
+                ok: false,
+                exit_code: -1,
+                stdout: "",
+                stderr: err.to_string(),
+            })
+        },
+    }
+    BgJobResult {
+        job_id: 0,
+        ok: out.is_success(),
+        exit_code: out.status,
+        stdout: out.stdout,
+        stderr: out.stderr,
+    }
+}
+
+pub fn with_libuv_async(thunk: fn() -> #spawn_bg_job #sleep_ticks Any) -> Any {
+    thunk()# # {
+        async spawn_bg_job(req) => exec_bg_job_on_libuv(req),
+        async sleep_ticks(delay_ms) => {
+            time.sleep_ms(if delay_ms > 0 { delay_ms } else { 0 })
+            time.unix_millis()
+        },
+    }
+}
+
+private fn dispatch_bg_jobs_batch(specs: List) -> #[spawn_bg_job, sleep_ticks] List {
+    let futures = List()
+    for i in 0..specs.len() {
+        let spec = specs.get(i.as(usize)).as(BgJobSpec)
+        futures.push(spawn_bg_job(spec)#)
+    }
+    let raw = task.await_all(futures)
+    let out = List()
+    for i in 0..raw.len() {
+        let r = raw.get(i.as(usize)).as(BgJobResult)
+        out.push(BgJobResult {
+            job_id: i + 1,
+            ok: r.ok,
+            exit_code: r.exit_code,
+            stdout: r.stdout,
+            stderr: r.stderr,
+        })
+    }
+    out
+}
+
+pub fn run_bg_jobs_parallel(specs: List, .timeout_ms: i64 = 0) -> List {
+    if specs.is_empty() {
+        return List()
+    }
+    if timeout_ms > 0 {
+        let timed = task.with_timeout(timeout_ms, || -> List {
+            let res = with_libuv_async(|| -> #[spawn_bg_job, sleep_ticks] Any {
+                dispatch_bg_jobs_batch(specs)#
+            })
+            res.as(List)
+        }) ! {
+            err => {
+                let msg = error_message(err)
+                let fallback = List()
+                for i in 0..specs.len() {
+                    fallback.push(BgJobResult {
+                        job_id: i + 1,
+                        ok: false,
+                        exit_code: -1,
+                        stdout: "",
+                        stderr: msg,
+                    })
+                }
+                return fallback
+            },
+        }
+        return timed
+    }
+    let res = with_libuv_async(|| -> #[spawn_bg_job, sleep_ticks] Any {
+        dispatch_bg_jobs_batch(specs)#
+    })
+    res.as(List)
+}
+
 pub enum PromptTurn {
-    pub Completed(value: Any),
-    pub Suspended(request: PromptRequest, cont: Continuation),
+    pub completed(value: Any),
+    pub suspended(request: PromptRequest, cont: Continuation),
 }
 
 -- Execute an interactive computation that may suspend via `ask_prompt(req)#` one or more times!
 pub fn start_interactive_turn(thunk: fn() -> #ask_prompt Any) -> PromptTurn {
-    (PromptTurn.Completed(thunk()#)) # {
-        ask_prompt(req, k) => PromptTurn.Suspended(req, k),
+    (PromptTurn.completed(thunk()#)) # {
+        ask_prompt(req, k) => PromptTurn.suspended(req, k),
     }
 }
 
@@ -408,15 +527,15 @@ pub struct KeyBindingEntry {
 }
 
 pub enum KeyLookup {
-    pub Exact(command_name: String, owner: ExtId),
-    pub Prefix(hints: List),
-    pub Unbound,
+    pub exact(command_name: String, owner: ExtId),
+    pub prefix(hints: List),
+    pub unbound,
 }
 
 pub struct Keymap {
     pub name: String,
-    pub bindings: HashMap,
-    pub prefixes: HashMap,
+    pub bindings: Map,
+    pub prefixes: Map,
     pub parent: ?Keymap,
 }
 
@@ -424,8 +543,8 @@ impl Keymap {
     pub fn new(name: String, .parent: ?Keymap = null) -> Keymap {
         Keymap {
             name: name,
-            bindings: HashMap.new(),
-            prefixes: HashMap.new(),
+            bindings: Map.new(),
+            prefixes: Map.new(),
             parent: parent,
         }
     }
@@ -450,9 +569,9 @@ impl Keymap {
                     let pfx = canon.slice(0, idx)
                     let sub_opt = self.prefixes.get(pfx)
                     let sub_map = if sub_opt != null {
-                        sub_opt.as(HashMap)
+                        sub_opt.as(Map)
                     } else {
-                        let m = HashMap.new()
+                        let m = Map.new()
                         self.prefixes.insert(pfx, m)
                         m
                     }
@@ -476,7 +595,7 @@ impl Keymap {
                     let pfx = canon.slice(0, idx)
                     let sub_opt = self.prefixes.get(pfx)
                     if sub_opt != null {
-                        let sub_map = sub_opt.as(HashMap)
+                        let sub_map = sub_opt.as(Map)
                         let _ = sub_map.remove(canon)
                         if sub_map.is_empty() {
                             let _ = self.prefixes.remove(pfx)
@@ -490,42 +609,41 @@ impl Keymap {
 
     pub fn lookup(self, strokes: List) -> KeyLookup {
         if strokes.is_empty() {
-            return KeyLookup.Unbound
+            return KeyLookup.unbound
         }
         let canon = format_chord(strokes)
         let exact_opt = self.bindings.get(canon)
         if exact_opt != null {
             let entry = exact_opt.as(KeyBindingEntry)
-            return KeyLookup.Exact(entry.command_name, entry.owner)
+            return KeyLookup.exact(entry.command_name, entry.owner)
         }
         let pfx_opt = self.prefixes.get(canon)
         if pfx_opt != null {
-            let sub_map = pfx_opt.as(HashMap)
+            let sub_map = pfx_opt.as(Map)
             let hints = List()
             for k in sub_map.keys() {
                 let ks = k.as(String)
                 hints.push(sub_map.get(ks).as(KeyBindingEntry))
             }
             if not hints.is_empty() {
-                return KeyLookup.Prefix(hints)
+                return KeyLookup.prefix(hints)
             }
         }
         let p? = self.parent else {
-            return KeyLookup.Unbound
+            return KeyLookup.unbound
         }
         p.lookup(strokes)
     }
 
     pub fn all_entries(self) -> List {
         let out = List()
-        let seen = Set.new()
+        let seen = Map.new()
         var cur: ?Keymap = self
         while cur != null {
             let km = cur.as(Keymap)
             for k in km.bindings.keys() {
                 let ks = k.as(String)
-                if not seen.contains(ks) {
-                    seen.insert(ks)
+                if seen.insert_absent(ks, true) {
                     out.push(km.bindings.get(ks).as(KeyBindingEntry))
                 }
             }
@@ -630,8 +748,8 @@ pub struct ExtensionRecord {
 }
 
 private enum TurnEnvelope {
-    OkTurn(turn: PromptTurn),
-    ErrTurn(msg: String),
+    ok_turn(turn: PromptTurn),
+    err_turn(msg: String),
 }
 
 private fn run_action_envelope(
@@ -640,18 +758,19 @@ private fn run_action_envelope(
     args: List,
 ) -> #InteractiveEffects TurnEnvelope {
     let val = act(kernel, args)# ! {
-        err => return TurnEnvelope.ErrTurn(err),
+        err => return TurnEnvelope.err_turn(err),
     }
-    TurnEnvelope.OkTurn(PromptTurn.Completed(val))
+    TurnEnvelope.ok_turn(PromptTurn.completed(val))
 }
 
 pub struct SystemKernel {
     pub extensions: HashMap,
+    pub active_ext_ids: Map,
     pub ext_order: List,
-    pub services: HashMap,
-    pub commands: HashMap,
-    pub hooks: HashMap,
-    pub keymaps: HashMap,
+    pub services: Map,
+    pub commands: Map,
+    pub hooks: Map,
+    pub keymaps: Map,
     pub macros: MacroRecorder,
     pub active_prompt: ?(PromptRequest, Continuation),
     pub batch_activating: bool,
@@ -661,11 +780,12 @@ impl SystemKernel {
     pub fn new() -> SystemKernel {
         SystemKernel {
             extensions: HashMap.new(),
+            active_ext_ids: Map.new(),
             ext_order: List(),
-            services: HashMap.new(),
-            commands: HashMap.new(),
-            hooks: HashMap.new(),
-            keymaps: HashMap.new(),
+            services: Map.new(),
+            commands: Map.new(),
+            hooks: Map.new(),
+            keymaps: Map.new(),
             macros: MacroRecorder.new(),
             active_prompt: null,
             batch_activating: false,
@@ -694,7 +814,7 @@ impl SystemKernel {
             version: version,
             description: description,
             dependencies: dependencies,
-            state: ExtState.Registered,
+            state: ExtState.registered,
             on_activate: on_activate,
             on_deactivate: on_deactivate,
         }
@@ -714,7 +834,7 @@ impl SystemKernel {
             return error ("unknown extension dependency: " ++ id.to_string())
         }
         let rec = rec_any.as(ExtensionRecord)
-        if rec.state == ExtState.Active {
+        if rec.state == ExtState.active {
             return ()
         }
         if visiting.contains(id) {
@@ -730,11 +850,12 @@ impl SystemKernel {
         let activate_fn = rec.on_activate
         activate_fn(self) ! {
             err => {
-                rec.state = ExtState.Failed(err)
+                rec.state = ExtState.failed(err)
                 return error ("extension " ++ id.to_string() ++ " failed to activate: " ++ err)
             },
         }
-        rec.state = ExtState.Active
+        rec.state = ExtState.active
+        self.active_ext_ids.set(id.raw(), true)
         if not self.batch_activating {
             self.emit_hook("extension-activated", id)
         }
@@ -747,7 +868,7 @@ impl SystemKernel {
         for i in 0..n {
             let id = self.ext_order.get(i.as(usize)).as(ExtId)
             let rec = self.extensions.get(id).as(ExtensionRecord)
-            if rec.state == ExtState.Registered {
+            if rec.state == ExtState.registered {
                 self.activate_extension(id) ! {
                     err => {
                         self.batch_activating = false
@@ -769,7 +890,7 @@ impl SystemKernel {
             return error ("unknown extension: " ++ id.to_string())
         }
         let rec = rec_any.as(ExtensionRecord)
-        if rec.state != ExtState.Active {
+        if rec.state != ExtState.active {
             return ()
         }
         -- Ensure no active extension still depends on `id`
@@ -780,7 +901,7 @@ impl SystemKernel {
                 continue
             }
             let other = self.extensions.get(other_id).as(ExtensionRecord)
-            if other.state == ExtState.Active {
+            if other.state == ExtState.active {
                 let dc = other.dependencies.len()
                 for j in 0..dc {
                     if other.dependencies.get(j.as(usize)).as(ExtId) == id {
@@ -809,16 +930,14 @@ impl SystemKernel {
                 let _ = self.commands.remove(ck)
             }
         }
-        rec.state = ExtState.Disabled
+        rec.state = ExtState.disabled
+        let _ = self.active_ext_ids.remove(id.raw())
         self.emit_hook("extension-deactivated", id)
         ()
     }
 
     pub fn is_extension_active(self, id: ExtId) -> bool {
-        let rec_any? = self.extensions.get(id) else {
-            return false
-        }
-        rec_any.as(ExtensionRecord).state == ExtState.Active
+        self.active_ext_ids.contains(id.raw())
     }
 
     pub fn list_extensions(self) -> List {
@@ -915,20 +1034,20 @@ impl SystemKernel {
         let kernel = self
         let act = spec.action
         let env_any = (run_action_envelope(act, kernel, args)#) # {
-            ask_prompt(req, k) => TurnEnvelope.OkTurn(PromptTurn.Suspended(req, k)),
+            ask_prompt(req, k) => TurnEnvelope.ok_turn(PromptTurn.suspended(req, k)),
         }
         let turn = env_any.as(TurnEnvelope) match {
-            TurnEnvelope.OkTurn(t) => t,
-            TurnEnvelope.ErrTurn(msg) => return error msg,
+            TurnEnvelope.ok_turn(t) => t,
+            TurnEnvelope.err_turn(msg) => return error msg,
         }
         turn match {
-            PromptTurn.Suspended(req, k) => {
+            PromptTurn.suspended(req, k) => {
                 self.active_prompt = (req, k)
-                PromptTurn.Suspended(req, k)
+                PromptTurn.suspended(req, k)
             },
-            PromptTurn.Completed(v) => {
+            PromptTurn.completed(v) => {
                 self.active_prompt = null
-                PromptTurn.Completed(v)
+                PromptTurn.completed(v)
             },
         }
     }
@@ -938,23 +1057,23 @@ impl SystemKernel {
         answer: ?String,
     ) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String PromptTurn {
         let pending? = self.active_prompt else {
-            return PromptTurn.Completed(())
+            return PromptTurn.completed(())
         }
         let (_, k) = pending
         self.active_prompt = null
         let env_any = k(answer)
         let turn = env_any.as(TurnEnvelope) match {
-            TurnEnvelope.OkTurn(t) => t,
-            TurnEnvelope.ErrTurn(msg) => return error msg,
+            TurnEnvelope.ok_turn(t) => t,
+            TurnEnvelope.err_turn(msg) => return error msg,
         }
         turn match {
-            PromptTurn.Suspended(next_req, next_k) => {
+            PromptTurn.suspended(next_req, next_k) => {
                 self.active_prompt = (next_req, next_k)
-                PromptTurn.Suspended(next_req, next_k)
+                PromptTurn.suspended(next_req, next_k)
             },
-            PromptTurn.Completed(v) => {
+            PromptTurn.completed(v) => {
                 self.active_prompt = null
-                PromptTurn.Completed(v)
+                PromptTurn.completed(v)
             },
         }
     }
@@ -1004,7 +1123,7 @@ impl SystemKernel {
         let n = listeners.len()
         for i in 0..n {
             let item = listeners.get(i.as(usize)).as(HookListener)
-            if self.is_extension_active(item.owner) {
+            if self.active_ext_ids.contains(item.owner.raw()) {
                 let cb = item.callback
                 cb(self, payload)
             }

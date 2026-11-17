@@ -5,6 +5,7 @@
 use std.collections.{HashMap, Set}
 use std.fs
 use std.path
+
 use @lava_sys.{CaretShape, host_cancel_job, host_request_quit}
 use @lava_remote.{is_ssh_uri, parent_ssh_uri, remote_stat}
 use @lava_core.{
@@ -70,6 +71,15 @@ impl EmacsState {
                 return first.as(i64)
             }
         }
+        let p_opt = self.prefix_arg
+        self.prefix_arg = null
+        if p_opt != null {
+            return p_opt.as(i64)
+        }
+        1
+    }
+
+    pub fn consume_prefix_count(self) -> i64 {
         let p_opt = self.prefix_arg
         self.prefix_arg = null
         if p_opt != null {
@@ -427,7 +437,7 @@ private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
             let ans? = ask_prompt(PromptRequest {
                 label: "M-x ",
                 initial: "",
-                kind: PromptKind.CommandName,
+                kind: PromptKind.command_name,
                 candidates: List(),
             })# else {
                 emit_status(w, "Quit")#
@@ -509,13 +519,13 @@ private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
             if w.options.evil_mode {
                 w.options.evil_mode = false
                 w.mode_name = "EMACS"
-                w.caret_shape = CaretShape.Beam
+                w.caret_shape = CaretShape.beam
                 w.visual = VisualSelection.none()
                 emit_status(w, "Emacs modeless mode enabled")#
             } else {
                 w.options.evil_mode = true
                 w.mode_name = "NORMAL"
-                w.caret_shape = CaretShape.Block
+                w.caret_shape = CaretShape.block
                 w.visual = VisualSelection.none()
                 buf.point = buf.clamp_pos(buf.point, insert_mode = false)
                 emit_status(w, "Evil modal mode enabled (NORMAL)")#
@@ -547,7 +557,7 @@ private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
                 let ans? = ask_prompt(PromptRequest {
                     label: "Find file: ",
                     initial: init_dir,
-                    kind: PromptKind.FilePath,
+                    kind: PromptKind.file_path,
                     candidates: List(),
                 })# else {
                     emit_status(w, "Quit")#
@@ -585,17 +595,20 @@ private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
                     let dact = dired_spec_opt.as(CommandSpec).action
                     return dact(kern, [full_path])#!
                 }
-                let entries! = fs.read_dir(full_path) else {
+                let dir_iter! = fs.iter_dir(full_path) else {
                     return error ("cannot read directory: " ++ full_path)
                 }
+                let entry_rows = List()
+                for entry in dir_iter {
+                    let suffix = if entry.is_dir() { "/" } else { "" }
+                    entry_rows.push(entry.name ++ suffix)
+                }
+                entry_rows.sort()
                 let lines = List()
                 lines.push("Dired: " ++ full_path)
                 lines.push("----------------------------------------")
-                for i in 0..entries.len() {
-                    let ename = entries.get(i.as(usize)).as(String)
-                    let child = path.join(full_path, ename)
-                    let suffix = if fs.is_dir(child) { "/" } else { "" }
-                    lines.push("  " ++ ename ++ suffix)
+                for row_txt in entry_rows.iter() {
+                    lines.push("  " ++ row_txt.as(String))
                 }
                 let db = w.ensure_special_buffer("*Dired*", "dired", lines, read_only = true)
                 db.file_path = full_path
@@ -630,7 +643,7 @@ private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
                 let ans? = ask_prompt(PromptRequest {
                     label: "Write file: ",
                     initial: init_dir,
-                    kind: PromptKind.FilePath,
+                    kind: PromptKind.file_path,
                     candidates: List(),
                 })# else {
                     emit_status(w, "Quit")#
@@ -664,7 +677,7 @@ private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
                 let ans? = ask_prompt(PromptRequest {
                     label: "Write file: ",
                     initial: init_p,
-                    kind: PromptKind.FilePath,
+                    kind: PromptKind.file_path,
                     candidates: List(),
                 })# else {
                     emit_status(w, "Quit")#
@@ -705,7 +718,7 @@ private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
                     let reply? = ask_prompt(PromptRequest.with_candidates(
                         "Save file " ++ label_path ++ "? (y/n/!/q) ",
                         "",
-                        PromptKind.Confirm,
+                        PromptKind.confirm,
                         ["y", "n", "!", "q"],
                     ))# else {
                         emit_status(w, "Quit")#
@@ -743,7 +756,7 @@ private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
                 let ans? = ask_prompt(PromptRequest {
                     label: "Switch to buffer: ",
                     initial: "",
-                    kind: PromptKind.BufferName,
+                    kind: PromptKind.buffer_name,
                     candidates: List(),
                 })# else {
                     emit_status(w, "Quit")#
@@ -766,7 +779,7 @@ private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
                 emit_status(w, "Switched to buffer " ++ b.name)#
                 return ()
             }
-            let created = w.create_buffer(clean, BufferKind.Scratch, major_mode = "text")
+            let created = w.create_buffer(clean, BufferKind.scratch, major_mode = "text")
             let _ = w.switch_to_buffer(created.id)
             w.viewport_top_row = 0
             kern.emit_hook("buffer-switched", created.id)
@@ -788,7 +801,7 @@ private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
                 let ans? = ask_prompt(PromptRequest {
                     label: "Kill buffer: ",
                     initial: cur_name,
-                    kind: PromptKind.BufferName,
+                    kind: PromptKind.buffer_name,
                     candidates: List(),
                 })# else {
                     emit_status(w, "Quit")#
@@ -805,11 +818,11 @@ private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
                 emit_status(w, "Cannot kill *Messages* buffer")#
                 return ()
             }
-            if target.modified and target.kind == BufferKind.File {
+            if target.modified and target.kind == BufferKind.file {
                 let confirm? = ask_prompt(PromptRequest.with_candidates(
                     "Buffer " ++ target.name ++ " modified; kill anyway? (y/n) ",
                     "",
-                    PromptKind.Confirm,
+                    PromptKind.confirm,
                     ["y", "n"],
                 ))# else {
                     emit_status(w, "Quit")#
@@ -873,7 +886,7 @@ private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
                     let reply? = ask_prompt(PromptRequest.with_candidates(
                         "Save file " ++ label_p ++ "? (y/n/!/q) ",
                         "",
-                        PromptKind.Confirm,
+                        PromptKind.confirm,
                         ["y", "n", "!", "q"],
                     ))# else {
                         emit_status(w, "Quit")#
@@ -897,7 +910,7 @@ private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
                 let exit_anyway? = ask_prompt(PromptRequest.with_candidates(
                     "Modified buffers exist; exit anyway? (y/n) ",
                     "",
-                    PromptKind.Confirm,
+                    PromptKind.confirm,
                     ["y", "n"],
                 ))# else {
                     emit_status(w, "Quit")#
@@ -1585,7 +1598,7 @@ private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
             let ans? = ask_prompt(PromptRequest {
                 label: "I-search: ",
                 initial: "",
-                kind: PromptKind.SearchForward,
+                kind: PromptKind.search_forward,
                 candidates: List(),
             })# else {
                 buf.point = buf.clamp_pos(orig_pos, insert_mode = true)
@@ -1637,7 +1650,7 @@ private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
             let ans? = ask_prompt(PromptRequest {
                 label: "I-search backward: ",
                 initial: "",
-                kind: PromptKind.SearchBackward,
+                kind: PromptKind.search_backward,
                 candidates: List(),
             })# else {
                 buf.point = buf.clamp_pos(orig_pos, insert_mode = true)
@@ -1727,7 +1740,7 @@ private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
                     let ans_opt = ask_prompt(PromptRequest.with_candidates(
                         "Query replacing " ++ from_text ++ " with " ++ to_text ++ ": (y/n/!/q) ",
                         "",
-                        PromptKind.Confirm,
+                        PromptKind.confirm,
                         ["y", "n", "!", "q"],
                     ))#
                     if ans_opt == null {
@@ -1772,7 +1785,7 @@ private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
             let ans? = ask_prompt(PromptRequest {
                 label: "Describe command: ",
                 initial: "",
-                kind: PromptKind.CommandName,
+                kind: PromptKind.command_name,
                 candidates: List(),
             })# else {
                 emit_status(w, "Quit")#
@@ -2242,6 +2255,54 @@ private fn trim_macro_tail(kernel: SystemKernel, count: i64) {
     }
 }
 
+private fn keymap_has_canon(km: Keymap, canon: String) -> bool {
+    var cur_opt: ?Keymap = km
+    while cur_opt != null {
+        let cur = cur_opt.as(Keymap)
+        if cur.bindings.contains_key(canon) or cur.prefixes.contains_key(canon) {
+            return true
+        }
+        cur_opt = cur.parent
+    }
+    false
+}
+
+private fn self_insert(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    state: EmacsState,
+    buf: Buffer,
+    stroke: KeyStroke,
+    ch: String,
+) -> #status_emit !String bool {
+    if kernel.macros.is_recording() and (not state.replaying_macro) {
+        kernel.macros.record_stroke(stroke)
+    }
+    let count = state.consume_prefix_count()
+    world.pending_keys_display = ""
+    if buf.read_only {
+        if ch == "q" and (buf.name == "*Help*" or buf.name == "*Buffers*" or buf.name == "*undo-tree*") {
+            let _ = world.cycle_buffer(-1)
+            kernel.emit_hook("buffer-switched", world.active_buffer_id)
+            emit_status(world, "Buffer: " ++ world.active_buffer().name)#
+            return true
+        }
+        emit_status(world, "Buffer is read-only: " ++ buf.name)#
+        return true
+    }
+    let reps = if count < 1 { 1 } else { count }
+    let to_insert = if reps > 1 { ch.repeat(reps) } else { ch }
+    buf.checkpoint(buf.point, "self-insert-pre")
+    let _ = buf.insert_text(buf.point, to_insert)!
+    buf.checkpoint(buf.point, "self-insert")
+    buf.preferred_col = buf.point.col
+    world.kill_ring.clear_kill_streak()
+    world.kill_ring.last_yank_span = null
+    state.last_command = "self-insert-command"
+    ensure_cursor_visible(world, buf.point.row)
+    true
+}
+
 pub fn emacs_handle_key(
     kernel: SystemKernel,
     stroke: KeyStroke,
@@ -2285,7 +2346,7 @@ pub fn emacs_handle_key(
                     kernel.macros.record_stroke(stroke)
                 }
                 state.universal_digits = state.universal_digits ++ stroke.key
-                let parsed_opt = state.universal_digits.parse_i64()
+                let parsed_opt = state.universal_digits.try_parse(i64)
                 if parsed_opt != null {
                     state.prefix_arg = parsed_opt.as(i64)
                 }
@@ -2298,17 +2359,33 @@ pub fn emacs_handle_key(
 
     -- 4. Build candidate chord and look up in active Emacs keymap hierarchy
     let had_pending = not state.pending_strokes.is_empty()
+    let km = active_emacs_keymap(kernel, world)
+    if (not world.options.evil_mode)
+        and (not had_pending)
+        and (not stroke.ctrl)
+        and (not stroke.alt)
+        and (not stroke.shift_mod)
+        and (not stroke.super_mod)
+        and stroke.key.len() == 1
+        and stroke.key != "<"
+        and stroke.key != ">"
+        and stroke.key != " " {
+        if not keymap_has_canon(km, stroke.key) {
+            let ascii_ch = if stroke.text.len() == 1 { stroke.text } else { stroke.key }
+            return self_insert(kernel, world, state, world.active_buffer(), stroke, ascii_ch)#!
+        }
+    }
+
     let candidate = List()
     for i in 0..state.pending_strokes.len() {
         candidate.push(state.pending_strokes.get(i.as(usize)).as(KeyStroke))
     }
     candidate.push(stroke)
 
-    let km = active_emacs_keymap(kernel, world)
     let lookup_res = km.lookup(candidate)
 
     lookup_res match {
-        KeyLookup.Prefix(hints) => {
+        KeyLookup.prefix(hints) => {
             if kernel.macros.is_recording() and (not state.replaying_macro) {
                 kernel.macros.record_stroke(stroke)
             }
@@ -2318,7 +2395,7 @@ pub fn emacs_handle_key(
             world.which_key_items = format_which_key_hints(canon, hints)
             return true
         },
-        KeyLookup.Exact(cmd_name, _owner) => {
+        KeyLookup.exact(cmd_name, _owner) => {
             let chord_len = candidate.len()
             if kernel.macros.is_recording() and (not state.replaying_macro) {
                 kernel.macros.record_stroke(stroke)
@@ -2345,7 +2422,7 @@ pub fn emacs_handle_key(
             state.last_command = cmd_name
             return true
         },
-        KeyLookup.Unbound => {
+        KeyLookup.unbound => {
             if had_pending {
                 if kernel.macros.is_recording() and (not state.replaying_macro) {
                     kernel.macros.record_stroke(stroke)
@@ -2375,33 +2452,7 @@ pub fn emacs_handle_key(
     if not world.options.evil_mode {
         let ch_opt = stroke_printable_text(stroke)
         if ch_opt != null {
-            let ch = ch_opt.as(String)
-            if kernel.macros.is_recording() and (not state.replaying_macro) {
-                kernel.macros.record_stroke(stroke)
-            }
-            let count = state.consume_count(List())
-            world.pending_keys_display = ""
-            if buf.read_only {
-                if ch == "q" and (buf.name == "*Help*" or buf.name == "*Buffers*" or buf.name == "*undo-tree*") {
-                    let _ = world.cycle_buffer(-1)
-                    kernel.emit_hook("buffer-switched", world.active_buffer_id)
-                    emit_status(world, "Buffer: " ++ world.active_buffer().name)#
-                    return true
-                }
-                emit_status(world, "Buffer is read-only: " ++ buf.name)#
-                return true
-            }
-            let reps = if count < 1 { 1 } else { count }
-            let to_insert = if reps > 1 { ch.repeat(reps) } else { ch }
-            buf.checkpoint(buf.point, "self-insert-pre")
-            let _ = buf.insert_text(buf.point, to_insert)!
-            buf.checkpoint(buf.point, "self-insert")
-            buf.preferred_col = buf.point.col
-            world.kill_ring.clear_kill_streak()
-            world.kill_ring.last_yank_span = null
-            state.last_command = "self-insert-command"
-            ensure_cursor_visible(world, buf.point.row)
-            return true
+            return self_insert(kernel, world, state, buf, stroke, ch_opt.as(String))#!
         }
     }
 

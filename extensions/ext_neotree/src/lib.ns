@@ -199,7 +199,7 @@ fn walk_tree_nodes(
         if (not state.show_hidden) and e.name.starts_with(".") {
             continue
         }
-        if e.is_dir {
+        if e.is_dir() {
             dirs.push(e)
         } else {
             files.push(e)
@@ -232,7 +232,7 @@ fn walk_tree_nodes(
             full_path: norm_full,
             parent_path: dir_path,
             is_dir: true,
-            is_symlink: d.is_symlink,
+            is_symlink: d.is_symlink(),
             depth: depth,
             expanded: is_exp,
             git_badge: badge,
@@ -252,7 +252,7 @@ fn walk_tree_nodes(
             full_path: norm_full,
             parent_path: dir_path,
             is_dir: false,
-            is_symlink: f.is_symlink,
+            is_symlink: f.is_symlink(),
             depth: depth,
             expanded: false,
             git_badge: badge,
@@ -340,7 +340,7 @@ pub fn refresh_neotree(
 
 fn focus_neotree(kernel: SystemKernel, world: EditorWorld, vim: VimState, state: NeotreeState) {
     state.focused = true
-    vim.mode = VimMode.Normal
+    vim.mode = VimMode.normal
     vim.clear_transient()
     vim.set_interceptor(NEOTREE_OWNER, neotree_intercept_key)
     sync_world_from_vim(world, vim)
@@ -569,7 +569,7 @@ fn cmd_neotree_add(kern: SystemKernel, args: List) -> #InteractiveEffects !Strin
     }
 
     if make_dir {
-        let res = fs.create_dir_all(target_full)
+        let res = fs.create_dir(target_full, parents = true)
         res match {
             _! => (),
             error err => return error ("Neo-tree mkdir failed: " ++ err.to_string()),
@@ -586,7 +586,7 @@ fn cmd_neotree_add(kern: SystemKernel, args: List) -> #InteractiveEffects !Strin
     if pdir_opt != null {
         let pdir = pdir_opt.as(String)
         if pdir != "" and (not fs.exists(pdir)) {
-            let mk_res = fs.create_dir_all(pdir)
+            let mk_res = fs.create_dir(pdir, parents = true)
             mk_res match {
                 _! => (),
                 error err => return error ("Neo-tree mkdir parent failed: " ++ err.to_string()),
@@ -645,7 +645,7 @@ fn cmd_neotree_rename(kern: SystemKernel, args: List) -> #InteractiveEffects !St
     if pdir_opt != null {
         let pdir = pdir_opt.as(String)
         if pdir != "" and (not fs.exists(pdir)) {
-            let _ = fs.create_dir_all(pdir) ! { _ => () }
+            let _ = fs.create_dir(pdir, parents = true) ! { _ => () }
         }
     }
 
@@ -689,7 +689,7 @@ fn cmd_neotree_delete(kern: SystemKernel, _args: List) -> #InteractiveEffects !S
     let ans? = ask_prompt(PromptRequest {
         label: "Neo-tree delete " ++ node.name ++ "? (y/n) ",
         initial: "",
-        kind: PromptKind.Confirm,
+        kind: PromptKind.confirm,
         candidates: ["y", "n"],
     })# else {
         status_emit("Neo-tree delete cancelled")#
@@ -703,7 +703,7 @@ fn cmd_neotree_delete(kern: SystemKernel, _args: List) -> #InteractiveEffects !S
     }
 
     if node.is_dir {
-        let rm_res = fs.remove_dir_all(node.full_path)
+        let rm_res = fs.remove_dir(node.full_path, recursive = true)
         rm_res match {
             _! => (),
             error err => return error ("Neo-tree remove dir failed: " ++ err.to_string()),

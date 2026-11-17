@@ -34,7 +34,11 @@ pub struct TodoCommentsService {
     pub tag_filter: String,
     pub items_by_buf: HashMap,
     pub last_ver_by_buf: HashMap,
+    pub last_lcount_by_buf: HashMap,
     pub last_win_by_buf: HashMap,
+    pub last_scan_buf_id: BufferId,
+    pub last_scan_ver: i64,
+    pub last_todo_count: i64,
     pub workspace_items: List,
     pub panel_row_map: HashMap,
     pub source_buf_id: BufferId,
@@ -47,7 +51,11 @@ impl TodoCommentsService {
             tag_filter: "ALL",
             items_by_buf: HashMap.new(),
             last_ver_by_buf: HashMap.new(),
+            last_lcount_by_buf: HashMap.new(),
             last_win_by_buf: HashMap.new(),
+            last_scan_buf_id: BufferId(0),
+            last_scan_ver: -1,
+            last_todo_count: 0,
             workspace_items: List(),
             panel_row_map: HashMap.new(),
             source_buf_id: BufferId(1),
@@ -112,7 +120,7 @@ fn is_decoratable_buffer(buf: Buffer) -> bool {
     if buf.name == TODOS_BUF_NAME or buf.name == "*Messages*" or buf.name == "*Trouble*" {
         return false
     }
-    buf.kind != BufferKind.Special and buf.kind != BufferKind.Directory
+    buf.kind != BufferKind.special and buf.kind != BufferKind.directory
 }
 
 fn compute_todo_window(world: ?EditorWorld, lcount: i64) -> (i64, i64) {
@@ -190,6 +198,18 @@ fn apply_todo_decorations(buf: Buffer, items: List, win_start: i64, win_end: i64
     }
 }
 
+fn line_may_have_todo_tag(line: String) -> bool {
+    let up = line.to_upper()
+    up.contains("TODO")
+        or up.contains("FIXME")
+        or up.contains("HACK")
+        or up.contains("NOTE")
+        or up.contains("WARN")
+        or up.contains("PERF")
+        or up.contains("BUG")
+        or up.contains("XXX")
+}
+
 fn sync_buffer_todos(
     world: ?EditorWorld,
     service: TodoCommentsService,
@@ -200,7 +220,13 @@ fn sync_buffer_todos(
         buf.clear_owner_decors(OWNER_TODO_COMMENTS)
         let _ = service.items_by_buf.remove(buf.id)
         let _ = service.last_ver_by_buf.remove(buf.id)
+        let _ = service.last_lcount_by_buf.remove(buf.id)
         let _ = service.last_win_by_buf.remove(buf.id)
+        if service.last_scan_buf_id == buf.id {
+            service.last_scan_buf_id = BufferId(0)
+            service.last_scan_ver = -1
+            service.last_todo_count = 0
+        }
         return List()
     }
 
@@ -209,8 +235,12 @@ fn sync_buffer_todos(
 
     if not force {
         let ver_opt = service.last_ver_by_buf.get(buf.id)
-        if ver_opt != null and ver_opt.as(i64) == buf.edit_version {
+        if (service.last_scan_buf_id == buf.id and service.last_scan_ver == buf.edit_version)
+            or (ver_opt != null and ver_opt.as(i64) == buf.edit_version) {
             let cached_items = service.buffer_todos(buf.id)
+            service.last_scan_buf_id = buf.id
+            service.last_scan_ver = buf.edit_version
+            service.last_todo_count = cached_items.len()
             if not service.enabled {
                 return cached_items
             }
@@ -229,11 +259,62 @@ fn sync_buffer_todos(
             }
             return cached_items
         }
+
+        let prev_cnt = if service.last_scan_buf_id == buf.id {
+            service.last_todo_count
+        } else {
+            service.buffer_todos(buf.id).len()
+        }
+        let prev_lc_opt = service.last_lcount_by_buf.get(buf.id)
+        if ver_opt != null and prev_lc_opt != null {
+            let ldelta = lcount - prev_lc_opt.as(i64)
+            let cur_row = buf.point.row
+            if ldelta == 0 {
+                let cur_line = buf.line_at(cur_row)
+                if not line_may_have_todo_tag(cur_line) {
+                    let cached_items = service.buffer_todos(buf.id)
+                    var had_on_cur = false
+                    for ti in 0..cached_items.len() {
+                        if cached_items.get(ti.as(usize)).as(TodoItem).row == cur_row {
+                            had_on_cur = true
+                            break
+                        }
+                    }
+                    if not had_on_cur {
+                        service.last_ver_by_buf.insert(buf.id, buf.edit_version)
+                        service.last_lcount_by_buf.insert(buf.id, lcount)
+                        service.last_scan_buf_id = buf.id
+                        service.last_scan_ver = buf.edit_version
+                        service.last_todo_count = cached_items.len()
+                        return cached_items
+                    }
+                }
+            } else if prev_cnt == 0 and ldelta == 1 {
+                let cur_line = buf.line_at(cur_row)
+                let prev_ok = if cur_row > 0 {
+                    not line_may_have_todo_tag(buf.line_at(cur_row - 1))
+                } else {
+                    true
+                }
+                if (not line_may_have_todo_tag(cur_line)) and prev_ok {
+                    service.last_ver_by_buf.insert(buf.id, buf.edit_version)
+                    service.last_lcount_by_buf.insert(buf.id, lcount)
+                    service.last_scan_buf_id = buf.id
+                    service.last_scan_ver = buf.edit_version
+                    service.last_todo_count = 0
+                    return List()
+                }
+            }
+        }
     }
 
     let items = collect_buffer_todos(buf)
     service.items_by_buf.insert(buf.id, items)
     service.last_ver_by_buf.insert(buf.id, buf.edit_version)
+    service.last_lcount_by_buf.insert(buf.id, lcount)
+    service.last_scan_buf_id = buf.id
+    service.last_scan_ver = buf.edit_version
+    service.last_todo_count = items.len()
 
     if not service.enabled {
         buf.clear_owner_decors(OWNER_TODO_COMMENTS)
@@ -306,7 +387,7 @@ fn jump_todo_in_buffer(kernel: SystemKernel, forward: bool) -> #InteractiveEffec
     world.jumps.record(buf.id, buf.file_path, buf.point)
     buf.point = buf.clamp_pos(Pos.new(target.row, target.col), insert_mode = false)
     buf.preferred_col = buf.point.col
-    vim.mode = VimMode.Normal
+    vim.mode = VimMode.normal
     vim.clear_transient()
     sync_world_from_vim(world, vim)
     kernel.emit_hook("cursor-moved", buf.id)
@@ -453,7 +534,7 @@ fn open_todos_panel(
     tbuf.point = tbuf.clamp_pos(Pos.new(first_row, 0), insert_mode = false)
     tbuf.preferred_col = 0
     let _ = world.switch_to_buffer(tbuf.id)
-    vim.mode = VimMode.Normal
+    vim.mode = VimMode.normal
     vim.clear_transient()
     sync_world_from_vim(world, vim)
     kernel.emit_hook("buffer-switched", tbuf.id)
@@ -483,7 +564,7 @@ fn close_todos_panel(
         }
     }
     let _ = world.switch_to_buffer(dest_id)
-    vim.mode = VimMode.Normal
+    vim.mode = VimMode.normal
     vim.clear_transient()
     sync_world_from_vim(world, vim)
     kernel.emit_hook("buffer-switched", dest_id)
@@ -539,6 +620,21 @@ fn on_todo_buffer_hook(kern: SystemKernel, payload: Any) {
     let _ = sync_buffer_todos(world, service, buf, false)
 }
 
+fn on_todo_burst_guarded_hook(kern: SystemKernel, payload: Any) {
+    let w_opt = kern.service("lava.document.world")
+    let s_opt = kern.service(SERVICE_TODO_COMMENTS)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    if world.in_key_burst {
+        return
+    }
+    let service = s_opt.as(TodoCommentsService)
+    let buf = resolve_todo_hook_buf(world, payload)
+    let _ = sync_buffer_todos(world, service, buf, false)
+}
+
 fn on_todo_insert_hook(kern: SystemKernel, payload: Any) {
     let w_opt = kern.service("lava.document.world")
     let s_opt = kern.service(SERVICE_TODO_COMMENTS)
@@ -546,6 +642,9 @@ fn on_todo_insert_hook(kern: SystemKernel, payload: Any) {
         return
     }
     let world = w_opt.as(EditorWorld)
+    if world.in_key_burst {
+        return
+    }
     let service = s_opt.as(TodoCommentsService)
     let buf = resolve_todo_hook_buf(world, payload)
     if buf.line_count() > 2000 {
@@ -687,7 +786,7 @@ pub fn register_todo_comments_extension(kernel: SystemKernel) -> !String Unit {
                     let target_buf = world.open_file(item.file_path)#!
                     target_buf.point = target_buf.clamp_pos(Pos.new(item.row, item.col), insert_mode = false)
                     target_buf.preferred_col = target_buf.point.col
-                    vim.mode = VimMode.Normal
+                    vim.mode = VimMode.normal
                     vim.clear_transient()
                     sync_world_from_vim(world, vim)
                     let _ = sync_buffer_todos(world, svc, target_buf, false)
@@ -748,9 +847,9 @@ pub fn register_todo_comments_extension(kernel: SystemKernel) -> !String Unit {
 
             k.add_hook("buffer-opened", ext_id, on_todo_buffer_hook)
             k.add_hook("buffer-switched", ext_id, on_todo_buffer_hook)
-            k.add_hook("buffer-modified", ext_id, on_todo_buffer_hook)
+            k.add_hook("buffer-modified", ext_id, on_todo_burst_guarded_hook)
             k.add_hook("buffer-saved", ext_id, on_todo_buffer_hook)
-            k.add_hook("cursor-moved", ext_id, on_todo_buffer_hook)
+            k.add_hook("cursor-moved", ext_id, on_todo_burst_guarded_hook)
             k.add_hook("mode-changed", ext_id, on_todo_buffer_hook)
             k.add_hook("after-insert-stroke", ext_id, on_todo_insert_hook)
 

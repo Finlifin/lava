@@ -92,11 +92,11 @@ private fn rpc_git_diff(_k: ServerKernel, params: JsonValue) -> !String JsonValu
         args.push(file_path.trim())
     }
 
-    let cmd_out = process.exec("git", args = args, cwd = cwd) match {
+    let cmd_out = process.run("git", args = args, cwd = cwd) match {
         v! => v,
         error err => return error ("git diff failed: " ++ err.to_string()),
     }
-    if (not cmd_out.success()) and cmd_out.status != 1 {
+    if (not cmd_out.is_success()) and cmd_out.status != 1 {
         return error ("git diff exited with status " ++ cmd_out.status.to_string() ++ ": " ++ cmd_out.stderr.trim())
     }
 
@@ -149,13 +149,13 @@ private fn rpc_git_log(_k: ServerKernel, params: JsonValue) -> !String JsonValue
         "--date=short",
         "--pretty=format:%h%x1f%an%x1f%ad%x1f%s",
     ]
-    let cmd_out = process.exec("git", args = args, cwd = cwd) match {
+    let cmd_out = process.run("git", args = args, cwd = cwd) match {
         v! => v,
         error err => return error ("git log failed: " ++ err.to_string()),
     }
 
     let commits = List()
-    if cmd_out.success() and cmd_out.stdout.trim() != "" {
+    if cmd_out.is_success() and cmd_out.stdout.trim() != "" {
         let lines = cmd_out.stdout.replace("\r\n", "\n").split("\n")
         for i in 0..lines.len() {
             let line = lines.get(i.as(usize)).as(String)

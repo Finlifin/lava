@@ -126,22 +126,22 @@ fn resolve_git_status(world: EditorWorld, state: MagitState) -> GitStatusSummary
 }
 
 fn git_head_exists(root: String) -> bool {
-    let res = process.exec("git", args = ["rev-parse", "--verify", "HEAD"], cwd = root)
+    let res = process.run("git", args = ["rev-parse", "--verify", "HEAD"], cwd = root)
     res match {
-        out! => out.success(),
+        out! => out.is_success(),
         error _ => false,
     }
 }
 
 fn git_latest_subject(root: String) -> String {
-    let res = process.exec(
+    let res = process.run(
         "git",
         args = ["log", "-1", "--pretty=format:%h %s"],
         cwd = root,
     )
     res match {
         out! => {
-            if out.success() and out.stdout.trim() != "" {
+            if out.is_success() and out.stdout.trim() != "" {
                 return out.stdout.trim()
             }
             "(no commits yet)"
@@ -152,14 +152,14 @@ fn git_latest_subject(root: String) -> String {
 
 fn git_recent_commits(root: String, limit: i64) -> List {
     let out_list = List()
-    let res = process.exec(
+    let res = process.run(
         "git",
         args = ["log", "--oneline", "-n", limit.to_string()],
         cwd = root,
     )
     res match {
         out! => {
-            if out.success() and out.stdout.trim() != "" {
+            if out.is_success() and out.stdout.trim() != "" {
                 let raw_lines = out.stdout.replace("\r\n", "\n").split("\n")
                 for i in 0..raw_lines.len() {
                     let ln = raw_lines.get(i.as(usize)).as(String).trim_end()
@@ -200,10 +200,10 @@ fn git_inline_diff_lines(root: String, section: String, rel_path: String) -> Lis
     } else {
         ["diff", "--no-color", "-U2", "--", rel_path]
     }
-    let res = process.exec("git", args = args, cwd = root)
+    let res = process.run("git", args = args, cwd = root)
     res match {
         out! => {
-            if out.success() and out.stdout.trim() != "" {
+            if out.is_success() and out.stdout.trim() != "" {
                 let raw_lines = out.stdout.replace("\r\n", "\n").split("\n")
                 for i in 0..raw_lines.len() {
                     let ln = raw_lines.get(i.as(usize)).as(String)
@@ -242,7 +242,7 @@ fn parse_hunk_new_start(hunk_line: String) -> i64 {
     if i == 0 {
         return 0
     }
-    let parsed_opt = after_plus.slice(0, i).parse_i64()
+    let parsed_opt = after_plus.slice(0, i).try_parse(i64)
     if parsed_opt == null {
         return 0
     }
@@ -650,14 +650,14 @@ fn cmd_magit_toggle_diff(kernel: SystemKernel) -> #InteractiveEffects !String An
 }
 
 fn run_git_checked(root: String, args: List) -> !String String {
-    let raw_res = process.exec("git", args = args, cwd = root)
+    let raw_res = process.run("git", args = args, cwd = root)
     var ok_out = ""
     var ok_err = ""
     var exited_zero = false
     var io_err_msg = ""
     raw_res match {
         out! => {
-            exited_zero = out.success()
+            exited_zero = out.is_success()
             ok_out = out.stdout
             ok_err = out.stderr
         },
@@ -829,7 +829,7 @@ fn cmd_magit_discard(kernel: SystemKernel) -> #InteractiveEffects !String Any {
     let ans? = ask_prompt(PromptRequest {
         label: "Discard changes in " ++ rel ++ "? (y/n): ",
         initial: "",
-        kind: PromptKind.Confirm,
+        kind: PromptKind.confirm,
         candidates: ["y", "n"],
     })# else {
         status_emit("Discard cancelled")#
@@ -844,7 +844,7 @@ fn cmd_magit_discard(kernel: SystemKernel) -> #InteractiveEffects !String Any {
     if meta.section == "untracked" {
         var rm_err = ""
         if fs.is_dir(full) {
-            let rm_res = fs.remove_dir_all(full)
+            let rm_res = fs.remove_dir(full, recursive = true)
             rm_res match {
                 _! => (),
                 error e => { rm_err = e.to_string() },
@@ -873,7 +873,7 @@ fn notify_repo_buffers_saved(kernel: SystemKernel, world: EditorWorld, root: Str
     for i in 0..world.buffer_order.len() {
         let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
         let b = world.buffers.get(bid).as(Buffer)
-        if b.kind == BufferKind.File and b.file_path.starts_with(pfx) {
+        if b.kind == BufferKind.file and b.file_path.starts_with(pfx) {
             kernel.emit_hook("buffer-saved", b.id)
         }
     }
@@ -910,14 +910,14 @@ fn cmd_magit_commit(kernel: SystemKernel) -> #InteractiveEffects !String Any {
 
 fn list_git_branches(root: String) -> List {
     let out_list = List()
-    let res = process.exec(
+    let res = process.run(
         "git",
         args = ["branch", "--format=%(refname:short)"],
         cwd = root,
     )
     res match {
         out! => {
-            if out.success() {
+            if out.is_success() {
                 let raw_lines = out.stdout.replace("\r\n", "\n").split("\n")
                 for i in 0..raw_lines.len() {
                     let b = raw_lines.get(i.as(usize)).as(String).trim()
@@ -942,7 +942,7 @@ fn cmd_magit_branch(kernel: SystemKernel) -> #InteractiveEffects !String Any {
     let ans? = ask_prompt(PromptRequest.with_candidates(
         "Checkout or create branch: ",
         "",
-        PromptKind.Choice,
+        PromptKind.choice,
         branches,
     ))# else {
         status_emit("Branch switch cancelled")#
@@ -983,14 +983,14 @@ fn cmd_magit_log(kernel: SystemKernel) -> #InteractiveEffects !String Any {
     let lines = List()
     lines.push("Commits in " ++ state.repo_root ++ "  ([g] refresh, [q] back)")
     lines.push("========================================================================")
-    let res = process.exec(
+    let res = process.run(
         "git",
         args = ["log", "--graph", "--decorate", "--date=short", "--pretty=format:%h  %ad  %an  %s", "-n", "50"],
         cwd = state.repo_root,
     )
     res match {
         out! => {
-            if out.success() and out.stdout.trim() != "" {
+            if out.is_success() and out.stdout.trim() != "" {
                 let raw_lines = out.stdout.replace("\r\n", "\n").split("\n")
                 for i in 0..raw_lines.len() {
                     lines.push(raw_lines.get(i.as(usize)).as(String))
@@ -1039,14 +1039,14 @@ fn cmd_magit_visit(kernel: SystemKernel) -> #InteractiveEffects !String Any {
         return ()
     }
     if meta.kind == "commit" and meta.commit_hash != "" {
-        let res = process.exec(
+        let res = process.run(
             "git",
             args = ["show", "--stat", "--no-color", meta.commit_hash],
             cwd = state.repo_root,
         )
         res match {
             out! => {
-                if out.success() {
+                if out.is_success() {
                     let show_lines = out.stdout.replace("\r\n", "\n").split("\n")
                     let cbuf = world.ensure_special_buffer(MAGIT_LOG_BUF_NAME, "magit-log", show_lines, read_only = true)
                     let _ = world.switch_to_buffer(cbuf.id)

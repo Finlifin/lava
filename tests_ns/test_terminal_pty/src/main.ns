@@ -79,12 +79,12 @@ fn test_terminal_pty_suite() {
     check_true(not pty_available(), "standalone nessa run reports pty_available() == false")
 
     let raw_tmp = "/tmp/lava_term_pty_" ++ time.unix_millis().to_string()
-    let _ = fs.create_dir_all(raw_tmp) ! { e => panic(e.to_string()) }
+    let _ = fs.create_dir(raw_tmp, parents = true) ! { e => panic(e.to_string()) }
     let tmp_dir = fs.canonicalize(raw_tmp) ! { _ => raw_tmp }
     let sub_a = path.join(tmp_dir, "sub_a")
     let dirvish_target = path.join(path.join(tmp_dir, "nested"), "project_dir")
-    let _ = fs.create_dir_all(sub_a) ! { e => panic(e.to_string()) }
-    let _ = fs.create_dir_all(dirvish_target) ! { e => panic(e.to_string()) }
+    let _ = fs.create_dir(sub_a, parents = true) ! { e => panic(e.to_string()) }
+    let _ = fs.create_dir(dirvish_target, parents = true) ! { e => panic(e.to_string()) }
 
     let kernel = boot_terminal_kernel()
     let world: EditorWorld = (require_editor_world(kernel) ! { e => panic(e) }).as(EditorWorld)
@@ -94,7 +94,7 @@ fn test_terminal_pty_suite() {
     world.cwd = tmp_dir
 
     handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
-    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+    let _ = app_step_event(kernel, RawUiEvent.resize(1280, 800, 1))# ! { e => panic(e) }
 
     let code_file = path.join(tmp_dir, "script.sh")
     let _ = fs.write_string(
@@ -151,7 +151,7 @@ fn test_terminal_pty_suite() {
     println("STEP 2: testing <C-\\><C-n> TERM-NORMAL scrollback navigation & yank")
     app_feed_keys(kernel, "<C-\\><C-n>")# ! { e => panic(e) }
     check_true(not term_state.term_insert_mode, "<C-\\><C-n> switched to TERM-NORMAL")
-    check_true(vim.mode == VimMode.Normal, "Vim mode is Normal in TERM-NORMAL")
+    check_true(vim.mode == VimMode.normal, "Vim mode is Normal in TERM-NORMAL")
     check_true(world.statusline_left_extra.contains("TERM-NORMAL"), "statusline badge shows TERM-NORMAL")
 
     -- Navigate scrollback with `gg` + `j` + `/hello_jik_term<Return>` and yank output line with `yy`
@@ -327,12 +327,12 @@ fn test_terminal_pty_suite() {
     let px_end = box_x + 10.0 + ((target_float_col + needle.char_len() - 1).as(f64) + 0.3) * cw
     let py_row = box_y + ch + 9.0 + (target_float_row.as(f64) + 0.5) * ch
 
-    let _ = app_step_event(kernel, RawUiEvent.MouseButton(true, 1, px_start, py_row, 0, 1))# ! { e => panic(e) }
-    let _ = app_step_event(kernel, RawUiEvent.MouseMove(px_end, py_row, 0))# ! { e => panic(e) }
-    let _ = app_step_event(kernel, RawUiEvent.MouseButton(false, 1, px_end, py_row, 0, 1))# ! { e => panic(e) }
+    let _ = app_step_event(kernel, RawUiEvent.mouse_button(true, 1, px_start, py_row, 0, 1))# ! { e => panic(e) }
+    let _ = app_step_event(kernel, RawUiEvent.mouse_move(px_end, py_row, 0))# ! { e => panic(e) }
+    let _ = app_step_event(kernel, RawUiEvent.mouse_button(false, 1, px_end, py_row, 0, 1))# ! { e => panic(e) }
 
     check_true(bg_buf.point == bg_orig_pos, "mouse drag in floating terminal did NOT move background buffer cursor")
-    check_true(vim.mode == VimMode.Normal, "mouse drag in floating terminal did NOT put background buffer into Visual")
+    check_true(vim.mode == VimMode.normal, "mouse drag in floating terminal did NOT put background buffer into Visual")
     check_true(term_state.float_sel_anchor != null and term_state.float_sel_cursor != null, "floating selection active")
     check_eq_str(host_clipboard_get(), needle, "floating mouse drag yanked exact text to system clipboard")
     check_eq_str(
@@ -366,7 +366,7 @@ fn test_terminal_pty_suite() {
     app_feed_keys(kernel, "<C-d>")# ! { e => panic(e) }
     check_true(not world.minibuffer_view.active, "<C-d> at EOL of C-x C-f sent EOF and closed Minibuffer")
 
-    let _ = fs.remove_dir_all(tmp_dir) ! { _ => () }
+    let _ = fs.remove_dir(tmp_dir, recursive = true) ! { _ => () }
     let _ = cap
 }
 

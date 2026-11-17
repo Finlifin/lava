@@ -1472,24 +1472,38 @@ struct PtyInstance {
     child: Child,
     child_pid: u32,
     initial_cwd: String,
+    cached_cwd: String,
+    last_cwd_gen: u64,
+    output_gen: Arc<AtomicU64>,
     screen: Arc<Mutex<VtScreen>>,
     eof_reached: Arc<AtomicBool>,
     cached_exit_code: Option<i32>,
 }
 
 impl PtyInstance {
-    fn current_cwd(&self, screen_osc: &str) -> String {
-        let proc_link = format!("/proc/{}/cwd", self.child_pid);
-        if let Ok(target) = fs::read_link(&proc_link) {
-            let s = target.to_string_lossy().into_owned();
-            if !s.is_empty() {
-                return s;
+    fn current_cwd(&mut self, screen_osc: &str) -> String {
+        if !screen_osc.is_empty() {
+            if self.cached_cwd != screen_osc {
+                self.cached_cwd = screen_osc.to_string();
+            }
+            return self.cached_cwd.clone();
+        }
+        let cur_gen = self.output_gen.load(Ordering::Acquire);
+        if cur_gen != self.last_cwd_gen || self.cached_cwd.is_empty() {
+            self.last_cwd_gen = cur_gen;
+            let proc_link = format!("/proc/{}/cwd", self.child_pid);
+            if let Ok(target) = fs::read_link(&proc_link) {
+                let s = target.to_string_lossy().into_owned();
+                if !s.is_empty() {
+                    self.cached_cwd = s;
+                    return self.cached_cwd.clone();
+                }
+            }
+            if self.cached_cwd.is_empty() {
+                self.cached_cwd = self.initial_cwd.clone();
             }
         }
-        if !screen_osc.is_empty() {
-            return screen_osc.to_string();
-        }
-        self.initial_cwd.clone()
+        self.cached_cwd.clone()
     }
 
     fn poll_alive(&mut self) -> (bool, i64) {
@@ -1502,16 +1516,9 @@ impl PtyInstance {
             return (false, code as i64);
         }
         if self.eof_reached.load(Ordering::Acquire) {
-            for _ in 0..10 {
-                if let Ok(Some(status)) = self.child.try_wait() {
-                    let code = status.code().unwrap_or(0);
-                    self.cached_exit_code = Some(code);
-                    return (false, code as i64);
-                }
-                thread::sleep(std::time::Duration::from_millis(1));
-            }
-            self.cached_exit_code = Some(0);
-            return (false, 0);
+            let code = self.child.wait().ok().and_then(|s| s.code()).unwrap_or(0);
+            self.cached_exit_code = Some(code);
+            return (false, code as i64);
         }
         (true, 0)
     }
@@ -1628,9 +1635,11 @@ impl PtyManager {
 
         let screen = Arc::new(Mutex::new(VtScreen::new(r, c, 2000)));
         let eof_reached = Arc::new(AtomicBool::new(false));
+        let output_gen = Arc::new(AtomicU64::new(1));
 
         let reader_screen = Arc::clone(&screen);
         let reader_eof = Arc::clone(&eof_reached);
+        let reader_gen = Arc::clone(&output_gen);
         let reader_dirty = Arc::clone(&self.dirty);
         let waker_opt = self
             .waker
@@ -1649,6 +1658,7 @@ impl PtyManager {
                     match reader.read(&mut buf) {
                         Ok(0) => {
                             reader_eof.store(true, Ordering::Release);
+                            reader_gen.fetch_add(1, Ordering::Release);
                             if !reader_dirty.swap(true, Ordering::AcqRel)
                                 && let Some(ref wake) = waker_opt
                             {
@@ -1668,6 +1678,7 @@ impl PtyManager {
                                 let _ = writer.write_all(&reply_buf);
                                 let _ = writer.flush();
                             }
+                            reader_gen.fetch_add(1, Ordering::Release);
                             if !reader_dirty.swap(true, Ordering::AcqRel)
                                 && let Some(ref wake) = waker_opt
                             {
@@ -1677,6 +1688,7 @@ impl PtyManager {
                         Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => {
                             reader_eof.store(true, Ordering::Release);
+                            reader_gen.fetch_add(1, Ordering::Release);
                             if !reader_dirty.swap(true, Ordering::AcqRel)
                                 && let Some(ref wake) = waker_opt
                             {
@@ -1695,7 +1707,10 @@ impl PtyManager {
             master_fd: master_raw_fd,
             child,
             child_pid,
+            cached_cwd: resolved_cwd.clone(),
             initial_cwd: resolved_cwd,
+            last_cwd_gen: 0,
+            output_gen,
             screen,
             eof_reached,
             cached_exit_code: None,
@@ -1786,8 +1801,8 @@ impl PtyManager {
             return Err(format!("unknown PTY session id {id}"));
         };
         let (alive, exit_code) = inst.poll_alive();
-        let scr = inst
-            .screen
+        let screen_arc = Arc::clone(&inst.screen);
+        let scr = screen_arc
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let osc_cwd = scr.osc_cwd.as_deref().unwrap_or("");

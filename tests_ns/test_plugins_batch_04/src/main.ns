@@ -44,7 +44,7 @@ fn check_eq_i64(actual: i64, expected: i64, label: String) {
 }
 
 fn run_git_checked(cwd: String, args: List) -> String {
-    let out_res = process.exec("git", args = args, cwd = cwd)
+    let out_res = process.run("git", args = args, cwd = cwd)
     out_res match {
         out! => {
             if out.status != 0 {
@@ -144,7 +144,7 @@ fn test_batch_04_git_plugins() {
 
     -- 1. Create a real temporary git repository with an initial committed file
     let tmp_dir = "/tmp/lava_batch04_" ++ time.unix_millis().to_string()
-    let _ = fs.create_dir_all(tmp_dir) ! { e => panic(e.to_string()) }
+    let _ = fs.create_dir(tmp_dir, parents = true) ! { e => panic(e.to_string()) }
 
     let _ = run_git_checked(tmp_dir, ["init"])
     let _ = run_git_checked(tmp_dir, ["config", "user.email", "test@lava.org"])
@@ -179,7 +179,7 @@ fn test_batch_04_git_plugins() {
     let gc_state: GitConflictState = (require_git_conflict_state(kernel) ! { e => panic(e) }).as(GitConflictState)
 
     handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
-    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+    let _ = app_step_event(kernel, RawUiEvent.resize(1280, 800, 1))# ! { e => panic(e) }
 
     -- ========================================================================
     -- PART A: Plugin 10 — `ext_gitsigns`
@@ -399,7 +399,7 @@ fn test_batch_04_git_plugins() {
     ]
     let cbuf = world.create_buffer(
         "conflict.ns",
-        BufferKind.File,
+        BufferKind.file,
         file_path = path.join(tmp_dir, "conflict.ns"),
         major_mode = "nessa",
         initial_lines = conflict_lines,
@@ -465,7 +465,7 @@ fn test_batch_04_git_plugins() {
     -- Also verify diff3 3-way conflict (`||||||| base`) + `<Space> c b` (both)!
     let diff3_buf = world.create_buffer(
         "diff3.ns",
-        BufferKind.File,
+        BufferKind.file,
         major_mode = "nessa",
         initial_lines = [
             "<<<<<<< HEAD",
@@ -498,7 +498,7 @@ fn test_batch_04_git_plugins() {
     check_true(gen2 > gen1, "final frame committed cleanly")
 
     let _ = cap
-    let _ = fs.remove_dir_all(tmp_dir) ! { _ => () }
+    let _ = fs.remove_dir(tmp_dir, recursive = true) ! { _ => () }
 }
 
 fn main() {

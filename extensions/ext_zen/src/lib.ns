@@ -111,7 +111,7 @@ fn parse_optional_zen_width(args: List) -> i64 {
     if raw == "" {
         return 0
     }
-    let parsed_opt = raw.parse_i64()
+    let parsed_opt = raw.try_parse(i64)
     if parsed_opt == null {
         return 0
     }
@@ -280,19 +280,19 @@ fn apply_narrow_around_cursor_or_selection(kernel: SystemKernel, world: EditorWo
     var r1: i64 = 0
     var r2: i64 = 0
 
-    let in_vim_visual = vim.mode == VimMode.VisualChar
-        or vim.mode == VimMode.VisualLine
-        or vim.mode == VimMode.VisualBlock
+    let in_vim_visual = vim.mode == VimMode.visual_char
+        or vim.mode == VimMode.visual_line
+        or vim.mode == VimMode.visual_block
     if in_vim_visual {
         r1 = vim.visual_anchor.row
         r2 = buf.point.row
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.clear_transient()
         sync_world_from_vim(world, vim)
-    } else if world.visual.kind != VisualKind.None {
+    } else if world.visual.kind != VisualKind.none {
         r1 = world.visual.anchor.row
         r2 = world.visual.cursor.row
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.clear_transient()
         sync_world_from_vim(world, vim)
     } else if buf.mark_active and buf.mark != null {
@@ -359,7 +359,7 @@ fn run_zen_mode_toggle(kernel: SystemKernel, args: List, allow_leader_lookahead:
     if world.options.zen_mode and width_arg == 0 {
         let was_narrow = svc.narrowed_by_zen
         exit_zen_mode_core(kernel, world, svc)
-        if allow_leader_lookahead and args.is_empty() and vim.mode == VimMode.Normal {
+        if allow_leader_lookahead and args.is_empty() and vim.mode == VimMode.normal {
             svc.leader_z_action = if was_narrow { "exited_zen_narrow" } else { "exited_zen" }
             vim.set_interceptor(OWNER_ZEN, zen_leader_z_lookahead)
         }
@@ -370,7 +370,7 @@ fn run_zen_mode_toggle(kernel: SystemKernel, args: List, allow_leader_lookahead:
     enter_zen_mode_core(kernel, world, svc, width_arg)
     let active_w = world.options.zen_width
     let _ = world.push_notification("info", "Zen Mode", "Focus enabled (" ++ active_w.to_string() ++ " cols)", ttl_ticks = 4)
-    if allow_leader_lookahead and args.is_empty() and vim.mode == VimMode.Normal {
+    if allow_leader_lookahead and args.is_empty() and vim.mode == VimMode.normal {
         svc.leader_z_action = "entered_zen"
         vim.set_interceptor(OWNER_ZEN, zen_leader_z_lookahead)
     }
@@ -412,11 +412,11 @@ fn cmd_zen_narrow(kernel: SystemKernel, _args: List) -> #InteractiveEffects !Str
     }
 
     -- Capture Visual selection BEFORE entering Zen Mode in case mode sync touches transient state.
-    let in_vis = vim.mode == VimMode.VisualChar
-        or vim.mode == VimMode.VisualLine
-        or vim.mode == VimMode.VisualBlock
-        or world.visual.kind != VisualKind.None
-    let saved_anchor = if vim.mode == VimMode.VisualChar or vim.mode == VimMode.VisualLine or vim.mode == VimMode.VisualBlock {
+    let in_vis = vim.mode == VimMode.visual_char
+        or vim.mode == VimMode.visual_line
+        or vim.mode == VimMode.visual_block
+        or world.visual.kind != VisualKind.none
+    let saved_anchor = if vim.mode == VimMode.visual_char or vim.mode == VimMode.visual_line or vim.mode == VimMode.visual_block {
         vim.visual_anchor
     } else {
         world.visual.anchor
@@ -431,7 +431,7 @@ fn cmd_zen_narrow(kernel: SystemKernel, _args: List) -> #InteractiveEffects !Str
     var lo: i64 = 0
     var hi: i64 = 0
     if in_vis {
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.clear_transient()
         sync_world_from_vim(world, vim)
         if not svc.narrowed_by_zen {

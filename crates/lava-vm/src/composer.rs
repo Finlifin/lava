@@ -305,16 +305,18 @@ impl LavaWorkspace {
             return Ok(cached);
         }
 
-        let opt_level = OptLevel::from_env();
+        let opt_level = resolve_lava_opt_level();
         let ext_count = composed.extensions.len();
         eprintln!("[lava] compiling {ext_count} Nessa extension(s) ({opt_level:?})...");
         let compile_start = Instant::now();
         let privileged = BTreeSet::new();
-        let compiled = Driver::new().compile_package_sources_with_privileged(
-            &composed.boot_package,
-            &composed.catalog,
-            &privileged,
-        );
+        let compiled = Driver::new()
+            .with_opt_level(opt_level)
+            .compile_package_sources_with_privileged(
+                &composed.boot_package,
+                &composed.catalog,
+                &privileged,
+            );
         let artifact = compile_result_to_artifact(compiled)?;
         let elapsed = compile_start.elapsed().as_secs_f64();
         if let Some(path) = &cache_path {
@@ -322,7 +324,10 @@ impl LavaWorkspace {
             if let Some(ptr_path) = &stat_ptr_path {
                 store_stat_manifest_ptr(ptr_path, path);
             }
-            eprintln!("[lava] compiled in {elapsed:.2}s (cached: {})", path.display());
+            eprintln!(
+                "[lava] compiled in {elapsed:.2}s (cached: {})",
+                path.display()
+            );
         } else {
             eprintln!("[lava] compiled in {elapsed:.2}s");
         }
@@ -332,16 +337,18 @@ impl LavaWorkspace {
     /// Validate all discovered extensions (and optional `init.ns`) in a single Nessa compile pass.
     pub fn check_boot(&self, options: &BootOptions) -> Result<Vec<ExtensionPackageInfo>, String> {
         let composed = self.compose_boot(options)?;
-        let opt_level = OptLevel::from_env();
+        let opt_level = resolve_lava_opt_level();
         let ext_count = composed.extensions.len();
         eprintln!("[lava] checking {ext_count} Nessa extension(s) ({opt_level:?})...");
         let compile_start = Instant::now();
         let privileged = BTreeSet::new();
-        let compiled = Driver::new().compile_package_sources_with_privileged(
-            &composed.boot_package,
-            &composed.catalog,
-            &privileged,
-        );
+        let compiled = Driver::new()
+            .with_opt_level(opt_level)
+            .compile_package_sources_with_privileged(
+                &composed.boot_package,
+                &composed.catalog,
+                &privileged,
+            );
         let artifact = compile_result_to_artifact(compiled)?;
         eprintln!(
             "[lava] checked in {:.2}s",
@@ -479,13 +486,14 @@ pub fn run_entry_package(
     {
         cached
     } else {
-        let opt_level = OptLevel::from_env();
+        let opt_level = resolve_lava_opt_level();
         let pkg_name = root_pkg.manifest.manifest().name.clone();
         eprintln!("[lava] compiling package '{pkg_name}' ({opt_level:?})...");
         let compile_start = Instant::now();
         let privileged = BTreeSet::new();
-        let compiled =
-            Driver::new().compile_package_sources_with_privileged(&root_pkg, &catalog, &privileged);
+        let compiled = Driver::new()
+            .with_opt_level(opt_level)
+            .compile_package_sources_with_privileged(&root_pkg, &catalog, &privileged);
         let built = compile_result_to_artifact(compiled)?;
         let elapsed = compile_start.elapsed().as_secs_f64();
         if let Some(path) = &cache_path {
@@ -693,6 +701,14 @@ fn resolve_nsbc_cache_dir(override_dir: Option<&Path>) -> Option<PathBuf> {
     )
 }
 
+fn resolve_lava_opt_level() -> OptLevel {
+    if std::env::var_os("NESSA_OPT_LEVEL").is_some() {
+        OptLevel::from_env()
+    } else {
+        OptLevel::O1
+    }
+}
+
 fn nsbc_cache_path_for(
     override_cache_dir: Option<&Path>,
     boot_pkg: &PackageSources,
@@ -703,7 +719,7 @@ fn nsbc_cache_path_for(
     hasher.write_str("lava-nsbc-cache-v2");
     hasher.write_str(env!("CARGO_PKG_VERSION"));
     hasher.write_u64(u64::from(nsbc::VERSION));
-    hasher.write_u64(u64::from(driver::OptLevel::from_env().as_u8()));
+    hasher.write_u64(u64::from(resolve_lava_opt_level().as_u8()));
     hash_package_sources(&mut hasher, boot_pkg);
 
     let mut sorted_catalog: Vec<&PackageSources> = catalog.iter().collect();
@@ -750,7 +766,7 @@ fn prune_old_cache_files(dir: &Path, ext: &str, keep_latest: usize) {
     if files.len() <= keep_latest {
         return;
     }
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|a| std::cmp::Reverse(a.0));
     for (_, old_path) in files.into_iter().skip(keep_latest) {
         let _ = fs::remove_file(old_path);
     }
@@ -778,8 +794,8 @@ fn store_cached_artifact(path: &Path, artifact: &CompiledArtifact) {
     let tmp_path = parent.join(tmp_name);
     if fs::write(&tmp_path, &bytes).is_ok() {
         if fs::rename(&tmp_path, path).is_ok() {
-            prune_old_cache_files(parent, "nsbc", 12);
-            prune_old_cache_files(parent, "ptr", 12);
+            prune_old_cache_files(parent, "nsbc", 36);
+            prune_old_cache_files(parent, "ptr", 36);
         } else {
             let _ = fs::remove_file(&tmp_path);
         }
@@ -926,7 +942,7 @@ impl LavaWorkspace {
         hasher.write_str("lava-stat-v2");
         hasher.write_str(env!("CARGO_PKG_VERSION"));
         hasher.write_u64(u64::from(nsbc::VERSION));
-        hasher.write_u64(u64::from(driver::OptLevel::from_env().as_u8()));
+        hasher.write_u64(u64::from(resolve_lava_opt_level().as_u8()));
         hasher.write_str(&options.entry_pkg);
         hasher.write_u64(u64::from(self.user_script.is_some()));
         hasher.write_u64(stats.len() as u64);
@@ -1321,7 +1337,7 @@ fn attach_host_abi_anchor_module(pkg: &mut PackageSources) {
 -- Pre-registers `(bool, T)` structural tuples and optional inner types returned by
 -- `std.runtime.host_call` so finalized multi-package `TypePool` identities cover every
 -- `NativeValue` variant without runtime structural interning.
-private struct _LavaHostCallTupleAbi {
+private struct LavaHostCallTupleAbi {
     t_unit: (bool, Unit),
     t_bool: (bool, bool),
     t_char: (bool, char),
@@ -1329,6 +1345,7 @@ private struct _LavaHostCallTupleAbi {
     t_u64: (bool, u64),
     t_f64: (bool, f64),
     t_str: (bool, String),
+    t_bytes: (bool, Bytes),
     t_any: (bool, Any),
     t_list: (bool, List),
     t_map: (bool, Map),
@@ -2517,11 +2534,21 @@ fn main() {{
     fn xdg_cache_dir_resolution_respects_precedence_and_disable() {
         let explicit = PathBuf::from("/tmp/explicit-ws-cache");
         assert_eq!(
-            resolve_nsbc_cache_dir_from_vars(Some(&explicit), Some("/tmp/env"), Some("/tmp/xdg"), Some("/tmp/home")),
+            resolve_nsbc_cache_dir_from_vars(
+                Some(&explicit),
+                Some("/tmp/env"),
+                Some("/tmp/xdg"),
+                Some("/tmp/home")
+            ),
             Some(explicit)
         );
         assert_eq!(
-            resolve_nsbc_cache_dir_from_vars(None, Some("off"), Some("/tmp/xdg"), Some("/tmp/home")),
+            resolve_nsbc_cache_dir_from_vars(
+                None,
+                Some("off"),
+                Some("/tmp/xdg"),
+                Some("/tmp/home")
+            ),
             None
         );
         assert_eq!(
@@ -2529,7 +2556,12 @@ fn main() {{
             None
         );
         assert_eq!(
-            resolve_nsbc_cache_dir_from_vars(None, Some("/tmp/custom-lava"), Some("/tmp/xdg"), Some("/tmp/home")),
+            resolve_nsbc_cache_dir_from_vars(
+                None,
+                Some("/tmp/custom-lava"),
+                Some("/tmp/xdg"),
+                Some("/tmp/home")
+            ),
             Some(PathBuf::from("/tmp/custom-lava"))
         );
         assert_eq!(

@@ -1540,7 +1540,7 @@ impl LspManager {
                     ),
                 ]),
             ),
-            "documentSymbol" => (
+            "documentSymbol" | "symbols" => (
                 "textDocument/documentSymbol",
                 JsonValue::obj([("textDocument", td)]),
             ),

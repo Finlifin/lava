@@ -437,7 +437,7 @@ fn paste_entry_from_picker(
     buf.preferred_col = buf.point.col
     buf.named_marks.insert(".", buf.point)
     buf.checkpoint(buf.point, "yanky-picker-paste")
-    vim.mode = VimMode.Normal
+    vim.mode = VimMode.normal
     vim.clear_transient()
     sync_world_from_vim(world, vim)
 
@@ -788,61 +788,60 @@ pub fn register_yanky_extension(kernel: SystemKernel) -> !String Unit {
 
             k.add_hook("vim-yank", ext_id, |kern: SystemKernel, _payload: Any| -> Unit {
                 let w_opt = kern.service("lava.document.world")
-                let s_opt = kern.service(SERVICE_YANKY)
-                if w_opt == null or s_opt == null {
+                if w_opt == null {
                     return
                 }
-                apply_yank_highlight(w_opt.as(EditorWorld), s_opt.as(YankyService))
+                apply_yank_highlight(w_opt.as(EditorWorld), svc)
             })
 
             k.add_hook("cursor-moved", ext_id, |kern: SystemKernel, _payload: Any| -> Unit {
+                if svc.highlight_row < 0 {
+                    return
+                }
                 let w_opt = kern.service("lava.document.world")
-                let s_opt = kern.service(SERVICE_YANKY)
-                if w_opt == null or s_opt == null {
+                if w_opt == null {
                     return
                 }
                 let w = w_opt.as(EditorWorld)
-                let ys = s_opt.as(YankyService)
-                if ys.highlight_row < 0 {
+                if w.in_key_burst {
                     return
                 }
                 let cur = w.active_buffer()
                 var moved_away = true
-                ys.highlight_buf_id match {
+                svc.highlight_buf_id match {
                     hbid? => {
-                        if hbid == cur.id and ys.highlight_origin_pos == cur.point {
+                        if hbid == cur.id and svc.highlight_origin_pos == cur.point {
                             moved_away = false
                         }
                     },
                     null => (),
                 }
                 if moved_away {
-                    clear_yank_highlights(w, ys)
+                    clear_yank_highlights(w, svc)
                 }
             })
 
             k.add_hook("buffer-modified", ext_id, |kern: SystemKernel, _payload: Any| -> Unit {
-                let w_opt = kern.service("lava.document.world")
-                let s_opt = kern.service(SERVICE_YANKY)
-                if w_opt == null or s_opt == null {
+                if svc.highlight_row < 0 {
                     return
                 }
-                let ys = s_opt.as(YankyService)
-                if ys.highlight_row >= 0 {
-                    clear_yank_highlights(w_opt.as(EditorWorld), ys)
+                let w_opt = kern.service("lava.document.world")
+                if w_opt != null {
+                    clear_yank_highlights(w_opt.as(EditorWorld), svc)
                 }
             })
 
             k.add_hook("mode-changed", ext_id, |kern: SystemKernel, _payload: Any| -> Unit {
+                if svc.highlight_row < 0 {
+                    return
+                }
                 let w_opt = kern.service("lava.document.world")
-                let s_opt = kern.service(SERVICE_YANKY)
-                if w_opt == null or s_opt == null {
+                if w_opt == null {
                     return
                 }
                 let w = w_opt.as(EditorWorld)
-                let ys = s_opt.as(YankyService)
-                if ys.highlight_row >= 0 and w.mode_name != "NORMAL" {
-                    clear_yank_highlights(w, ys)
+                if w.mode_name != "NORMAL" {
+                    clear_yank_highlights(w, svc)
                 }
             })
 

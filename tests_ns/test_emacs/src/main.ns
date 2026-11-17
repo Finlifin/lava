@@ -204,9 +204,9 @@ fn test_filesystem_completion_and_find_file() {
     let file_a = path.join(tmp_dir, "alpine_notes.txt")
     let file_b = path.join(sub_dir, "nested_hello.ns")
 
-    let _ = fs.create_dir_all(sub_dir) ! { _ => panic("failed to create temp dir") }
+    let _ = fs.create_dir(sub_dir, parents = true) ! { _ => panic("failed to create temp dir") }
     defer {
-        let _ = fs.remove_dir_all(tmp_dir) ! { _ => () }
+        let _ = fs.remove_dir(tmp_dir, recursive = true) ! { _ => () }
     }
     let _ = fs.write_string(file_a, "line one\nline two\n") ! { _ => panic("failed write file_a") }
     let _ = fs.write_string(file_b, "fn greet() -> i64 = 42\n") ! { _ => panic("failed write file_b") }
@@ -336,7 +336,7 @@ fn test_kill_ring_consecutive_ck_yank_and_yank_pop() {
     feed_keys(kernel, "<C-z>", clip_cap, log_cap, status_cap)
     assert_true(not world.options.evil_mode, "C-z disabled evil_mode")
     assert_eq_str(world.mode_name, "EMACS", "mode_name is EMACS")
-    assert_true(world.caret_shape == CaretShape.Beam, "caret_shape is Beam in EMACS mode")
+    assert_true(world.caret_shape == CaretShape.beam, "caret_shape is Beam in EMACS mode")
 
     let buf = world.active_buffer()
     buf.set_lines(
@@ -485,7 +485,7 @@ fn test_self_documenting_help_and_kmacros() {
     assert_true(help_p_text.contains("buffer-switched"), "C-h p lists hook topics")
 
     -- 5. Keyboard Macro `<C-x> (` ... `<C-x> )` ... `<C-u> 2 <C-x> e` + `<C-x> <C-b>` `list-buffers`
-    let work = world.create_buffer("macro.txt", BufferKind.Scratch)
+    let work = world.create_buffer("macro.txt", BufferKind.scratch)
     let _ = world.switch_to_buffer(work.id)
     work.set_lines(["a", "b", "c"], record_undo = false)
     work.point = Pos.zero()

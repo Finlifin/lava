@@ -57,10 +57,19 @@ impl Rect {
 }
 
 pub enum SplitAxis {
-    pub Horizontal,
-    pub Vertical,
+    pub horizontal,
+    pub vertical,
 }
-derive Eq, PartialEq, Display for SplitAxis
+derive Eq, PartialEq for SplitAxis
+
+impl Display for SplitAxis {
+    pub fn to_string(self) -> String {
+        self match {
+            SplitAxis.horizontal => "Horizontal",
+            SplitAxis.vertical => "Vertical",
+        }
+    }
+}
 
 pub struct WindowPane {
     pub id: WinId,
@@ -89,8 +98,8 @@ impl WindowPane {
 }
 
 pub enum LayoutNode {
-    pub Leaf(win_id: WinId),
-    pub Split(axis: SplitAxis, ratio: f64, first: LayoutNode, second: LayoutNode),
+    pub leaf(win_id: WinId),
+    pub split(axis: SplitAxis, ratio: f64, first: LayoutNode, second: LayoutNode),
 }
 
 pub struct TabWorkspace {
@@ -624,8 +633,8 @@ pub fn step_visible_row_forward(buf: Buffer, from_row: i64, steps: i64) -> i64 {
 
 fn collect_leaf_ids(node: LayoutNode, out: List) {
     node match {
-        LayoutNode.Leaf(wid) => out.push(wid),
-        LayoutNode.Split(_, _, first, second) => {
+        LayoutNode.leaf(wid) => out.push(wid),
+        LayoutNode.split(_, _, first, second) => {
             collect_leaf_ids(first, out)
             collect_leaf_ids(second, out)
         },
@@ -634,8 +643,8 @@ fn collect_leaf_ids(node: LayoutNode, out: List) {
 
 fn node_contains_win(node: LayoutNode, target: WinId) -> bool {
     node match {
-        LayoutNode.Leaf(wid) => wid == target,
-        LayoutNode.Split(_, _, first, second) => {
+        LayoutNode.leaf(wid) => wid == target,
+        LayoutNode.split(_, _, first, second) => {
             node_contains_win(first, target) or node_contains_win(second, target)
         },
     }
@@ -643,22 +652,22 @@ fn node_contains_win(node: LayoutNode, target: WinId) -> bool {
 
 fn first_leaf_id(node: LayoutNode) -> WinId {
     node match {
-        LayoutNode.Leaf(wid) => wid,
-        LayoutNode.Split(_, _, first, _) => first_leaf_id(first),
+        LayoutNode.leaf(wid) => wid,
+        LayoutNode.split(_, _, first, _) => first_leaf_id(first),
     }
 }
 
 fn split_leaf_in_tree(node: LayoutNode, target: WinId, axis: SplitAxis, new_id: WinId) -> LayoutNode {
     node match {
-        LayoutNode.Leaf(wid) => {
+        LayoutNode.leaf(wid) => {
             if wid == target {
-                LayoutNode.Split(axis, 0.5, LayoutNode.Leaf(wid), LayoutNode.Leaf(new_id))
+                LayoutNode.split(axis, 0.5, LayoutNode.leaf(wid), LayoutNode.leaf(new_id))
             } else {
                 node
             }
         },
-        LayoutNode.Split(ax, ratio, first, second) => {
-            LayoutNode.Split(
+        LayoutNode.split(ax, ratio, first, second) => {
+            LayoutNode.split(
                 ax,
                 ratio,
                 split_leaf_in_tree(first, target, axis, new_id),
@@ -671,14 +680,14 @@ fn split_leaf_in_tree(node: LayoutNode, target: WinId, axis: SplitAxis, new_id: 
 -- Remove `target` leaf from tree. Returns `(updated_subtree_or_null, replacement_focus_win_opt)`.
 fn remove_leaf_from_tree(node: LayoutNode, target: WinId) -> (?LayoutNode, ?WinId) {
     node match {
-        LayoutNode.Leaf(wid) => {
+        LayoutNode.leaf(wid) => {
             if wid == target {
                 (null, null)
             } else {
                 (node, null)
             }
         },
-        LayoutNode.Split(ax, ratio, first, second) => {
+        LayoutNode.split(ax, ratio, first, second) => {
             if node_contains_win(first, target) {
                 let (new_first_opt, focus_opt) = remove_leaf_from_tree(first, target)
                 if new_first_opt == null {
@@ -686,7 +695,7 @@ fn remove_leaf_from_tree(node: LayoutNode, target: WinId) -> (?LayoutNode, ?WinI
                     return (second, focus)
                 }
                 return (
-                    LayoutNode.Split(ax, ratio, new_first_opt.as(LayoutNode), second),
+                    LayoutNode.split(ax, ratio, new_first_opt.as(LayoutNode), second),
                     focus_opt,
                 )
             }
@@ -697,7 +706,7 @@ fn remove_leaf_from_tree(node: LayoutNode, target: WinId) -> (?LayoutNode, ?WinI
                     return (first, focus)
                 }
                 return (
-                    LayoutNode.Split(ax, ratio, first, new_second_opt.as(LayoutNode)),
+                    LayoutNode.split(ax, ratio, first, new_second_opt.as(LayoutNode)),
                     focus_opt,
                 )
             }
@@ -716,24 +725,24 @@ fn clamp_ratio(r: f64) -> f64 {
     }
 }
 
--- Adjust the nearest enclosing `Split` around `target` so `target`'s share changes by `delta`.
+-- Adjust the nearest enclosing `split` around `target` so `target`'s share changes by `delta`.
 fn adjust_ratio_in_tree(node: LayoutNode, target: WinId, delta: f64) -> (LayoutNode, bool) {
     node match {
-        LayoutNode.Leaf(_) => (node, false),
-        LayoutNode.Split(ax, ratio, first, second) => {
+        LayoutNode.leaf(_) => (node, false),
+        LayoutNode.split(ax, ratio, first, second) => {
             if node_contains_win(first, target) {
                 let (updated_first, handled) = adjust_ratio_in_tree(first, target, delta)
                 if handled {
-                    return (LayoutNode.Split(ax, ratio, updated_first, second), true)
+                    return (LayoutNode.split(ax, ratio, updated_first, second), true)
                 }
-                return (LayoutNode.Split(ax, clamp_ratio(ratio + delta), first, second), true)
+                return (LayoutNode.split(ax, clamp_ratio(ratio + delta), first, second), true)
             }
             if node_contains_win(second, target) {
                 let (updated_second, handled) = adjust_ratio_in_tree(second, target, delta)
                 if handled {
-                    return (LayoutNode.Split(ax, ratio, first, updated_second), true)
+                    return (LayoutNode.split(ax, ratio, first, updated_second), true)
                 }
-                return (LayoutNode.Split(ax, clamp_ratio(ratio - delta), first, second), true)
+                return (LayoutNode.split(ax, clamp_ratio(ratio - delta), first, second), true)
             }
             (node, false)
         },
@@ -742,32 +751,32 @@ fn adjust_ratio_in_tree(node: LayoutNode, target: WinId, delta: f64) -> (LayoutN
 
 fn balance_tree(node: LayoutNode) -> LayoutNode {
     node match {
-        LayoutNode.Leaf(wid) => LayoutNode.Leaf(wid),
-        LayoutNode.Split(ax, _, first, second) => {
-            LayoutNode.Split(ax, 0.5, balance_tree(first), balance_tree(second))
+        LayoutNode.leaf(wid) => LayoutNode.leaf(wid),
+        LayoutNode.split(ax, _, first, second) => {
+            LayoutNode.split(ax, 0.5, balance_tree(first), balance_tree(second))
         },
     }
 }
 
 fn compute_node_rects(node: LayoutNode, area: Rect, panes: HashMap) {
     node match {
-        LayoutNode.Leaf(wid) => {
+        LayoutNode.leaf(wid) => {
             let p_opt = panes.get(wid)
             if p_opt != null {
                 let pane = p_opt.as(WindowPane)
                 pane.rect = area
             }
         },
-        LayoutNode.Split(ax, ratio, first, second) => {
+        LayoutNode.split(ax, ratio, first, second) => {
             let r = clamp_ratio(ratio)
             ax match {
-                SplitAxis.Horizontal => {
+                SplitAxis.horizontal => {
                     let h1 = (area.h * r).floor()
                     let h2 = if area.h - h1 > 0.0 { area.h - h1 } else { 0.0 }
                     compute_node_rects(first, Rect.new(area.x, area.y, area.w, h1), panes)
                     compute_node_rects(second, Rect.new(area.x, area.y + h1, area.w, h2), panes)
                 },
-                SplitAxis.Vertical => {
+                SplitAxis.vertical => {
                     let w1 = (area.w * r).floor()
                     let w2 = if area.w - w1 > 0.0 { area.w - w1 } else { 0.0 }
                     compute_node_rects(first, Rect.new(area.x, area.y, w1, area.h), panes)
@@ -805,7 +814,7 @@ impl WindowManager {
         let tab = TabWorkspace {
             id: 1,
             title: "Tab 1",
-            root: LayoutNode.Leaf(first_win_id),
+            root: LayoutNode.leaf(first_win_id),
             active_win_id: first_win_id,
         }
         let tabs = List()
@@ -1175,7 +1184,7 @@ impl WindowManager {
         self.sync_from_world(world)
         let tab = self.active_tab()
         tab.root match {
-            LayoutNode.Leaf(_) => {
+            LayoutNode.leaf(_) => {
                 return false
             },
             _ => (),
@@ -1209,7 +1218,7 @@ impl WindowManager {
                 let _ = self.panes.remove(wid)
             }
         }
-        tab.root = LayoutNode.Leaf(keep_id)
+        tab.root = LayoutNode.leaf(keep_id)
         self.sync_to_world(world)
     }
 
@@ -1349,7 +1358,7 @@ impl WindowManager {
         let tab = TabWorkspace {
             id: tab_num,
             title: "Tab " ++ tab_num.to_string(),
-            root: LayoutNode.Leaf(win_id),
+            root: LayoutNode.leaf(win_id),
             active_win_id: win_id,
         }
         self.tabs.push(tab)
@@ -1370,11 +1379,6 @@ impl WindowManager {
         }
         self.active_tab_idx = next_idx
         self.sync_to_world(world)
-    }
-
-    -- Alias matching exact capitalized spelling in specification (`tab_Switch`).
-    pub fn tab_Switch(self, delta: i64, world: EditorWorld) {
-        self.tab_switch(delta, world)
     }
 
     pub fn tab_close(self, world: EditorWorld) -> bool {
@@ -1516,7 +1520,7 @@ pub fn register_window_extension(kernel: SystemKernel) -> !String Unit {
                 |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
                     let w = require_editor_world(kern)!
                     let mgr = require_window_manager(kern)!
-                    let wid = mgr.split_active(SplitAxis.Horizontal, w)
+                    let wid = mgr.split_active(SplitAxis.horizontal, w)
                     log_event("info", "ext_window", "Split horizontal -> " ++ wid.to_string())#
                     status_emit("Split window below (" ++ mgr.visible_panes().len().to_string() ++ " windows)")#
                     ()
@@ -1530,7 +1534,7 @@ pub fn register_window_extension(kernel: SystemKernel) -> !String Unit {
                 |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
                     let w = require_editor_world(kern)!
                     let mgr = require_window_manager(kern)!
-                    let wid = mgr.split_active(SplitAxis.Vertical, w)
+                    let wid = mgr.split_active(SplitAxis.vertical, w)
                     log_event("info", "ext_window", "Split vertical -> " ++ wid.to_string())#
                     status_emit("Split window right (" ++ mgr.visible_panes().len().to_string() ++ " windows)")#
                     ()

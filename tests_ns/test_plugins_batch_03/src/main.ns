@@ -69,7 +69,7 @@ fn boot_with_batch03() -> SystemKernel {
 
 fn setup_workspace(tmp_dir: String) {
     let src_dir = path.join(tmp_dir, "src")
-    let _ = fs.create_dir_all(src_dir) ! { e => panic(e.to_string()) }
+    let _ = fs.create_dir(src_dir, parents = true) ! { e => panic(e.to_string()) }
 
     let _ = fs.write_string(
         path.join(tmp_dir, ".hidden_env"),
@@ -102,8 +102,8 @@ fn setup_workspace(tmp_dir: String) {
     ) ! { e => panic(e.to_string()) }
 
     -- Initialize a real Git repo in `tmp_dir` so `@lava_accel.accel_git_status` exercises `[A]` and `[?]` badges!
-    let _ = process.exec("git", args = ["init", "-q"], cwd = tmp_dir) ! { _ => return }
-    let _ = process.exec("git", args = ["add", "README.md"], cwd = tmp_dir) ! { _ => return }
+    let _ = process.run("git", args = ["init", "-q"], cwd = tmp_dir) ! { _ => return }
+    let _ = process.run("git", args = ["add", "README.md"], cwd = tmp_dir) ! { _ => return }
 }
 
 fn test_telescope_plugin(kernel: SystemKernel, world: EditorWorld, tmp_dir: String) {
@@ -316,7 +316,7 @@ fn test_neotree_plugin(kernel: SystemKernel, world: EditorWorld, tmp_dir: String
     app_feed_keys(kernel, "dy")# ! { e => panic(e) }
     check_true(not fs.exists(renamed_path), "Neo-tree `d` + `y` deleted renamed_feature.ns")
 
-    -- Unfocus with `<Escape>`, then test BOTH `"sidebar-clicked"` hook AND real `RawUiEvent.MouseButton`!
+    -- Unfocus with `<Escape>`, then test BOTH `"sidebar-clicked"` hook AND real `RawUiEvent.mouse_button`!
     app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
     let alpha_row = find_line_index_containing(world.left_sidebar.lines, "alpha.ns")
     check_true(alpha_row >= 0, "alpha.ns row in sidebar")
@@ -333,7 +333,7 @@ fn test_neotree_plugin(kernel: SystemKernel, world: EditorWorld, tmp_dir: String
     let readme_row = find_line_index_containing(world.left_sidebar.lines, "README.md")
     check_true(readme_row >= 0, "README.md row in sidebar")
     let click_y = (cell_h + 8.0) + (readme_row.as(f64)) * cell_h + 4.0
-    let _ = app_step_event(kernel, RawUiEvent.MouseButton(true, 1, 40.0, click_y, 0, 1))# ! { e => panic(e) }
+    let _ = app_step_event(kernel, RawUiEvent.mouse_button(true, 1, 40.0, click_y, 0, 1))# ! { e => panic(e) }
     check_eq_str(
         world.active_buffer().file_path,
         path.normalize(path.join(tmp_dir, "README.md")),
@@ -595,7 +595,7 @@ fn main() {
     world.cwd = path.normalize(tmp_dir)
 
     handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let boot_cap = AppHostCap.new(world)
-    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+    let _ = app_step_event(kernel, RawUiEvent.resize(1280, 800, 1))# ! { e => panic(e) }
     check_eq_i64(wm.pixel_width, 1280, "viewport width")
     let _ = boot_cap
 
@@ -611,6 +611,6 @@ fn main() {
     test_vim_which_key_and_icons(kernel, world, tmp_dir)
     println("  [PASS] Vim Which-Key & Nerd Font Icons")
 
-    let _ = fs.remove_dir_all(tmp_dir) ! { _ => () }
+    let _ = fs.remove_dir(tmp_dir, recursive = true) ! { _ => () }
     println("test_plugins_batch_03: ALL PASSED")
 }

@@ -80,26 +80,44 @@ fn record_insert_change(vim: VimState, stroke: KeyStroke) {
     }
 }
 
+fn is_autopairs_relevant_char(ch: String) -> bool {
+    ch == " "
+        or ch == "("
+        or ch == ")"
+        or ch == "["
+        or ch == "]"
+        or ch == "{{"
+        or ch == "}}"
+        or ch == "\""
+        or ch == "'"
+        or ch == "`"
+}
+
 fn autopairs_insert_handler(
     kernel: SystemKernel,
     stroke: KeyStroke,
 ) -> #ServiceEffects !String bool {
+    if stroke.ctrl or stroke.alt or stroke.super_mod {
+        return false
+    }
+    let is_bs = stroke.key == "BackSpace"
+    let ch = if is_bs { "" } else { stroke_printable(stroke) }
+    if (not is_bs) and (not is_autopairs_relevant_char(ch)) {
+        return false
+    }
+
     let world = require_editor_world(kernel)!
     if not world.options.autopairs {
         return false
     }
 
     let vim = require_vim_state(kernel)!
-    if vim.mode != VimMode.Insert or vim.block_insert_active {
+    if vim.mode != VimMode.insert or vim.block_insert_active {
         return false
     }
 
     let buf = world.active_buffer()
     if buf.read_only {
-        return false
-    }
-
-    if stroke.ctrl or stroke.alt or stroke.super_mod {
         return false
     }
 
@@ -110,11 +128,11 @@ fn autopairs_insert_handler(
     let llen = line.char_len()
     let prev_ch = if col > 0 { line.slice(col - 1, col) } else { "" }
     let next_ch = if col < llen { line.slice(col, col + 1) } else { "" }
-    let prev2_ch = if col > 1 { line.slice(col - 2, col - 1) } else { "" }
-    let next2_ch = if col + 1 < llen { line.slice(col + 1, col + 2) } else { "" }
 
     -- 1. `<BackSpace>` inside `( | )` -> `(|)`, or inside adjacent empty pair `(|)` / `"|"` -> empty
-    if stroke.key == "BackSpace" {
+    if is_bs {
+        let prev2_ch = if col > 1 { line.slice(col - 2, col - 1) } else { "" }
+        let next2_ch = if col + 1 < llen { line.slice(col + 1, col + 2) } else { "" }
         if prev_ch == " " and next_ch == " " and is_bracket_pair(prev2_ch, next2_ch) {
             let _ = buf.delete_span(Span.normalized(Pos.new(row, col - 1), Pos.new(row, col + 1)))!
             buf.point = Pos.new(row, col - 1)
@@ -129,11 +147,6 @@ fn autopairs_insert_handler(
             record_insert_change(vim, stroke)
             return true
         }
-        return false
-    }
-
-    let ch = stroke_printable(stroke)
-    if ch == "" {
         return false
     }
 

@@ -91,7 +91,7 @@ Dirvish 维护独立的跨目录 **File Ring（文件传输环）**，支持在�
 | `uy` | `dirvish-clear-ring` | 清空文件传输环，取消待执行的复制/剪切队列 |
 | `pp` | `dirvish-paste` | 将传输环中的文件/目录递归复制或移动到当前目录；**若遇到同名目标自动追加 `_copy` 安全去重，绝不静默覆盖已有数据！** |
 | `po` | `dirvish-paste-overwrite` | 强制覆盖粘贴到当前目录（显式替换同名目标） |
-| `dD` / `D` | `dirvish-delete` | 弹出 `PromptKind.Confirm`（`y/n`）安全确认提示，确认后递归删除已标记（或当前）文件/目录，并同步清理关联的已打开 Buffer |
+| `dD` / `D` | `dirvish-delete` | 弹出 `PromptKind.confirm`（`y/n`）安全确认提示，确认后递归删除已标记（或当前）文件/目录，并同步清理关联的已打开 Buffer |
 
 ### 四种精细重命名与新建文件/目录 *dirvish-rename-create*
 

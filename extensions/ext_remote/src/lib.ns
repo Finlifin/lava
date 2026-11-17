@@ -22,7 +22,7 @@ use @lava_remote.{
     remote_copy, remote_deploy_server, remote_disconnect,
     remote_discover_ssh_hosts, remote_exec, remote_find_root,
     remote_host_available, remote_list_connections, remote_mkdir, remote_port_forward_list,
-    remote_port_forward_start, remote_port_forward_stop, remote_read_lines,
+    remote_port_forward_start, remote_port_forward_stop, remote_probe_tcp, remote_read_lines,
     remote_readdir, remote_remove, remote_rename, remote_search_files,
     remote_search_grep, remote_stat, remote_write_lines, ssh_uri_basename
 }
@@ -108,7 +108,7 @@ private fn ensure_vim_normal(kernel: SystemKernel, _world: EditorWorld) {
     let v_opt = kernel.service(SERVICE_VIM)
     if v_opt != null {
         let vs = v_opt.as(VimState)
-        vs.mode = VimMode.Normal
+        vs.mode = VimMode.normal
         vs.clear_transient()
     }
 }
@@ -817,7 +817,7 @@ fn cmd_remote_connect(kernel: SystemKernel, args: List) -> #InteractiveEffects !
     let req = if cands.is_empty() {
         PromptRequest.text("Remote SSH Connect (ssh://user@host[:port]/path): ", "ssh://")
     } else {
-        PromptRequest.with_candidates("Remote SSH Connect: ", "", PromptKind.Choice, cands)
+        PromptRequest.with_candidates("Remote SSH Connect: ", "", PromptKind.choice, cands)
     }
     let ans? = ask_prompt(req)# else {
         return ()
@@ -857,7 +857,7 @@ fn cmd_remote_disconnect(kernel: SystemKernel, args: List) -> #InteractiveEffect
                 let c = conns.get(i.as(usize)).as(RemoteConnectionInfo)
                 cands.push((c.prefix, "[" ++ c.mode ++ "] " ++ c.hostname))
             }
-            let ans? = ask_prompt(PromptRequest.with_candidates("Disconnect SSH session: ", "", PromptKind.Choice, cands))# else {
+            let ans? = ask_prompt(PromptRequest.with_candidates("Disconnect SSH session: ", "", PromptKind.choice, cands))# else {
                 return ()
             }
             target = ans.trim()
@@ -925,7 +925,7 @@ fn cmd_remote_status_stop_row(kernel: SystemKernel, _args: List) -> #Interactive
     if hit_opt != null {
         let (kind, val) = hit_opt.as((String, String))
         if kind == "tunnel" {
-            let tid_opt = val.parse_i64()
+            let tid_opt = val.try_parse(i64)
             if tid_opt != null {
                 let tid = tid_opt.as(i64)
                 let _ = remote_port_forward_stop(tid)
@@ -954,7 +954,7 @@ fn cmd_remote_browse(kernel: SystemKernel, args: List) -> #InteractiveEffects !S
         let req = if cands.is_empty() {
             PromptRequest.text("Remote Browse URI (ssh://user@host/dir): ", "ssh://")
         } else {
-            PromptRequest.with_candidates("Remote Browse: ", "", PromptKind.Choice, cands)
+            PromptRequest.with_candidates("Remote Browse: ", "", PromptKind.choice, cands)
         }
         let ans? = ask_prompt(req)# else {
             return ()
@@ -1181,7 +1181,7 @@ fn cmd_remote_dirvish_delete(kernel: SystemKernel, args: List) -> #InteractiveEf
         let ans? = ask_prompt(PromptRequest.with_candidates(
             "Delete remote " ++ kind_lbl ++ " `" ++ item.name ++ "`? (y/n) ",
             "",
-            PromptKind.Confirm,
+            PromptKind.confirm,
             List(),
         ))# else {
             status_emit("Delete cancelled")#
@@ -1446,7 +1446,7 @@ fn cmd_remote_files(kernel: SystemKernel, args: List) -> #InteractiveEffects !St
     let ans? = ask_prompt(PromptRequest.with_candidates(
         "Remote Files (" ++ root_uri ++ "): ",
         "",
-        PromptKind.Choice,
+        PromptKind.choice,
         files,
     ))# else {
         return ()
@@ -1649,20 +1649,20 @@ private fn parse_port_forward_spec(raw_spec: String) -> !String (String, i64, St
         let spec_tok = toks.get(idx).as(String)
         let parts = spec_tok.split(":")
         if parts.len() == 2 {
-            let lp? = parts.get(0).as(String).parse_i64() else {
+            let lp? = parts.get(0).as(String).try_parse(i64) else {
                 return error ("invalid local port in '" ++ spec_tok ++ "'")
             }
-            let rp? = parts.get(1).as(String).parse_i64() else {
+            let rp? = parts.get(1).as(String).try_parse(i64) else {
                 return error ("invalid remote port in '" ++ spec_tok ++ "'")
             }
             return (dir, lp, "127.0.0.1", rp)
         }
         if parts.len() == 3 {
-            let lp? = parts.get(0).as(String).parse_i64() else {
+            let lp? = parts.get(0).as(String).try_parse(i64) else {
                 return error ("invalid local port in '" ++ spec_tok ++ "'")
             }
             let rhost = parts.get(1).as(String).trim()
-            let rp? = parts.get(2).as(String).parse_i64() else {
+            let rp? = parts.get(2).as(String).try_parse(i64) else {
                 return error ("invalid remote port in '" ++ spec_tok ++ "'")
             }
             return (dir, lp, if rhost == "" { "127.0.0.1" } else { rhost }, rp)
@@ -1670,19 +1670,19 @@ private fn parse_port_forward_spec(raw_spec: String) -> !String (String, i64, St
         return error ("invalid port-forward spec: " ++ spec_tok)
     }
     let lp_str = toks.get(idx).as(String)
-    let lp? = lp_str.parse_i64() else {
+    let lp? = lp_str.try_parse(i64) else {
         return error ("invalid local port: " ++ lp_str)
     }
     let rhs = toks.get((idx.as(i64) + 1).as(usize)).as(String)
     if rhs.contains(":") {
         let sp = rhs.split_once(":").as((String, String))
         let (rh, rp_s) = sp
-        let rp? = rp_s.parse_i64() else {
+        let rp? = rp_s.try_parse(i64) else {
             return error ("invalid remote port: " ++ rp_s)
         }
         return (dir, lp, if rh.trim() == "" { "127.0.0.1" } else { rh.trim() }, rp)
     }
-    let rp? = rhs.parse_i64() else {
+    let rp? = rhs.try_parse(i64) else {
         return error ("invalid remote port: " ++ rhs)
     }
     (dir, lp, "127.0.0.1", rp)
@@ -1738,7 +1738,7 @@ fn cmd_remote_port_forward_stop(kernel: SystemKernel, args: List) -> #Interactiv
                     ++ " -> " ++ t.remote_host ++ ":" ++ t.remote_port.to_string(),
             ))
         }
-        let ans? = ask_prompt(PromptRequest.with_candidates("Stop SSH Port Forward ID: ", "", PromptKind.Choice, cands))# else {
+        let ans? = ask_prompt(PromptRequest.with_candidates("Stop SSH Port Forward ID: ", "", PromptKind.choice, cands))# else {
             return ()
         }
         id_str = ans.trim()
@@ -1746,7 +1746,7 @@ fn cmd_remote_port_forward_stop(kernel: SystemKernel, args: List) -> #Interactiv
     if id_str.starts_with("#") {
         id_str = id_str.drop(1)
     }
-    let tid? = id_str.parse_i64() else {
+    let tid? = id_str.try_parse(i64) else {
         return error ("invalid tunnel id: " ++ id_str)
     }
     let ok = remote_port_forward_stop(tid)
@@ -1805,6 +1805,67 @@ fn cmd_remote_deploy(kernel: SystemKernel, args: List) -> #InteractiveEffects !S
     refresh_remote_status_if_open(world, svc)
     status_emit("Deployed lava-server to " ++ info.authority ++ " [" ++ info.mode ++ " v" ++ info.server_version ++ "]")#
     ()
+}
+
+fn cmd_remote_probe(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let svc = require_remote_service(kernel)!
+    var raw_spec = ""
+    if args.len() >= 2 {
+        raw_spec = args.get(0).as(String).trim() ++ ":" ++ args.get(1).as(String).trim()
+    } else if args.len() == 1 {
+        raw_spec = args.get(0).as(String).trim()
+    }
+    if raw_spec == "" {
+        var default_spec = "127.0.0.1:22"
+        let active_uri = resolve_active_remote_uri(world, svc, "")
+        if active_uri != "" {
+            let pt_res = parse_ssh_uri(active_uri)
+            pt_res match {
+                pt! => {
+                    let pnum = if pt.port > 0 { pt.port } else { 22 }
+                    default_spec = pt.host ++ ":" ++ pnum.to_string()
+                },
+                error _ => (),
+            }
+        }
+        let ans? = ask_prompt(PromptRequest.text("Remote TCP Probe (host:port): ", default_spec))# else {
+            return ()
+        }
+        raw_spec = ans.trim()
+    }
+    if raw_spec == "" {
+        return ()
+    }
+    var host = ""
+    var port: i64 = 22
+    if is_ssh_uri(raw_spec) {
+        let pt = parse_ssh_uri(raw_spec)!
+        host = pt.host
+        port = if pt.port > 0 { pt.port } else { 22 }
+    } else if raw_spec.contains(":") {
+        let sp? = raw_spec.rsplit_once(":") else {
+            return error ("invalid host:port specification: " ++ raw_spec)
+        }
+        let (h_part, p_part) = sp
+        host = h_part.trim()
+        let parsed_p? = p_part.trim().try_parse(i64) else {
+            return error ("invalid TCP port in '" ++ raw_spec ++ "'")
+        }
+        port = parsed_p
+    } else {
+        host = raw_spec
+    }
+    if host == "" {
+        return error "missing host for RemoteProbe"
+    }
+    if port <= 0 or port > 65535 {
+        return error ("out-of-range TCP port: " ++ port.to_string())
+    }
+    let ms = remote_probe_tcp(host, port)!
+    let port_str = port.to_string()
+    status_emit("TCP reachable: " ++ host ++ ":" ++ port_str ++ " (" ++ ms.to_string() ++ " ms)")#
+    ms
 }
 
 -- ============================================================================
@@ -1870,6 +1931,9 @@ pub fn register_remote_extension(kernel: SystemKernel) -> !String Unit {
 
             k.register_command("remote-deploy", ext_id, "Deploy local lava-server binary to remote SSH host (`:RemoteDeploy`).", cmd_remote_deploy)
             k.register_command("ex:RemoteDeploy", ext_id, ":RemoteDeploy [target [local_lava_server_bin]]", cmd_remote_deploy, interactive = false)
+
+            k.register_command("remote-probe", ext_id, "Probe non-blocking TCP reachability of a remote host:port (`:RemoteProbe host:port`).", cmd_remote_probe)
+            k.register_command("ex:RemoteProbe", ext_id, ":RemoteProbe [host[:port]]", cmd_remote_probe, interactive = false)
 
             -- Internal buffer mode action commands
             k.register_command("remote-status-enter", ext_id, "Connect or browse selected item in *Remote*.", cmd_remote_status_enter, interactive = false)

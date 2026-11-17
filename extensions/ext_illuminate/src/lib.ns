@@ -31,6 +31,7 @@ pub struct IlluminateService {
     pub current_word: String,
     pub occurrences: List,
     pub last_buf_id: BufferId,
+    pub last_ver: i64,
     pub last_edit_ver: i64,
     pub last_word: String,
     pub last_win_start: i64,
@@ -45,6 +46,7 @@ impl IlluminateService {
             current_word: "",
             occurrences: List(),
             last_buf_id: BufferId(0),
+            last_ver: -1,
             last_edit_ver: -1,
             last_word: "",
             last_win_start: 0,
@@ -56,6 +58,7 @@ impl IlluminateService {
         self.current_word = ""
         self.occurrences = List()
         self.last_buf_id = BufferId(0)
+        self.last_ver = -1
         self.last_edit_ver = -1
         self.last_word = ""
         self.last_win_start = 0
@@ -106,7 +109,7 @@ fn is_pure_digits(word: String) -> bool {
 }
 
 fn is_illuminatable_buffer(buf: Buffer) -> bool {
-    buf.kind != BufferKind.Special and buf.kind != BufferKind.Directory
+    buf.kind != BufferKind.special and buf.kind != BufferKind.directory
 }
 
 pub fn extract_symbol_at_point(buf: Buffer, min_len: i64) -> String {
@@ -189,7 +192,7 @@ pub fn refresh_buffer_illuminate(world: EditorWorld, service: IlluminateService,
     let word = extract_symbol_at_point(buf, service.min_word_len)
 
     if buf.id == service.last_buf_id
-        and buf.edit_version == service.last_edit_ver
+        and buf.edit_version == service.last_ver
         and word == service.last_word {
         if word == "" or lcount <= 400 {
             return
@@ -201,18 +204,22 @@ pub fn refresh_buffer_illuminate(world: EditorWorld, service: IlluminateService,
         }
     }
 
-    buf.clear_owner_decors(OWNER_ILLUMINATE)
-
     if word == "" {
+        if service.current_word != "" or service.last_buf_id != buf.id {
+            buf.clear_owner_decors(OWNER_ILLUMINATE)
+        }
         service.current_word = ""
         service.occurrences = List()
         service.last_buf_id = buf.id
+        service.last_ver = buf.edit_version
         service.last_edit_ver = buf.edit_version
         service.last_word = ""
         service.last_win_start = 0
         service.last_win_end = lcount - 1
         return
     }
+
+    buf.clear_owner_decors(OWNER_ILLUMINATE)
 
     var occs = List()
     var win_lo: i64 = 0
@@ -248,6 +255,7 @@ pub fn refresh_buffer_illuminate(world: EditorWorld, service: IlluminateService,
     service.current_word = word
     service.occurrences = occs
     service.last_buf_id = buf.id
+    service.last_ver = buf.edit_version
     service.last_edit_ver = buf.edit_version
     service.last_word = word
     service.last_win_start = win_lo
@@ -352,7 +360,7 @@ fn jump_symbol_reference(kernel: SystemKernel, forward: bool) -> #InteractiveEff
     world.jumps.record(buf.id, buf.file_path, buf.point)
     buf.point = buf.clamp_pos(target.start, insert_mode = false)
     buf.preferred_col = buf.point.col
-    vim.mode = VimMode.Normal
+    vim.mode = VimMode.normal
     vim.clear_transient()
     sync_world_from_vim(world, vim)
     refresh_buffer_illuminate(world, service, buf)
@@ -378,6 +386,20 @@ fn on_illuminate_sync_hook(kern: SystemKernel, _payload: Any) {
     refresh_buffer_illuminate(world, service, world.active_buffer())
 }
 
+fn on_illuminate_burst_guarded_hook(kern: SystemKernel, _payload: Any) {
+    let w_opt = kern.service("lava.document.world")
+    let s_opt = kern.service(SERVICE_ILLUMINATE)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    if world.in_key_burst {
+        return
+    }
+    let service = s_opt.as(IlluminateService)
+    refresh_buffer_illuminate(world, service, world.active_buffer())
+}
+
 fn on_illuminate_insert_hook(kern: SystemKernel, _payload: Any) {
     let w_opt = kern.service("lava.document.world")
     let s_opt = kern.service(SERVICE_ILLUMINATE)
@@ -385,6 +407,9 @@ fn on_illuminate_insert_hook(kern: SystemKernel, _payload: Any) {
         return
     }
     let world = w_opt.as(EditorWorld)
+    if world.in_key_burst {
+        return
+    }
     let buf = world.active_buffer()
     if buf.line_count() > 2000 {
         return
@@ -500,11 +525,11 @@ pub fn register_illuminate_extension(kernel: SystemKernel) -> !String Unit {
                 },
             )
 
-            k.add_hook("cursor-moved", ext_id, on_illuminate_sync_hook)
+            k.add_hook("cursor-moved", ext_id, on_illuminate_burst_guarded_hook)
             k.add_hook("mode-changed", ext_id, on_illuminate_sync_hook)
             k.add_hook("buffer-switched", ext_id, on_illuminate_switch_hook)
             k.add_hook("buffer-opened", ext_id, on_illuminate_switch_hook)
-            k.add_hook("buffer-modified", ext_id, on_illuminate_sync_hook)
+            k.add_hook("buffer-modified", ext_id, on_illuminate_burst_guarded_hook)
             k.add_hook("after-insert-stroke", ext_id, on_illuminate_insert_hook)
 
             let w_opt = k.service("lava.document.world")

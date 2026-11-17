@@ -84,7 +84,7 @@ fn run_interactive_no_prompts(
         r
     })
     turn match {
-        PromptTurn.Completed(val) => {
+        PromptTurn.completed(val) => {
             val match {
                 s: String => {
                     if s.starts_with("__ERR__:") {
@@ -94,7 +94,7 @@ fn run_interactive_no_prompts(
                 _ => (),
             }
         },
-        PromptTurn.Suspended(req, _k) => {
+        PromptTurn.suspended(req, _k) => {
             fail_test(ctx ++ " unexpectedly suspended on prompt: " ++ req.label)
         },
     }
@@ -111,7 +111,7 @@ fn run_interactive_expect_error(
         "__OK__"
     })
     turn match {
-        PromptTurn.Completed(val) => {
+        PromptTurn.completed(val) => {
             val match {
                 s: String => {
                     if s.starts_with("__ERR__:") {
@@ -122,7 +122,7 @@ fn run_interactive_expect_error(
             }
             fail_test(ctx ++ " succeeded unexpectedly when an error was expected")
         },
-        PromptTurn.Suspended(req, _k) => {
+        PromptTurn.suspended(req, _k) => {
             fail_test(ctx ++ " unexpectedly suspended on prompt: " ++ req.label)
         },
     }
@@ -143,7 +143,7 @@ fn run_interactive_with_answers(
     while true {
         var finished = false
         turn match {
-            PromptTurn.Completed(val) => {
+            PromptTurn.completed(val) => {
                 val match {
                     s: String => {
                         if s.starts_with("__ERR__:") {
@@ -154,7 +154,7 @@ fn run_interactive_with_answers(
                 }
                 finished = true
             },
-            PromptTurn.Suspended(req, cont) => {
+            PromptTurn.suspended(req, cont) => {
                 if idx >= answers.len() {
                     fail_test(ctx ++ " ran out of scripted answers at prompt: " ++ req.label)
                 }
@@ -186,7 +186,7 @@ fn make_diff_kernel() -> !String (SystemKernel, EditorWorld, WindowManager, VimS
 }
 
 fn create_mem_buffer(world: EditorWorld, name: String, lines: List) -> Buffer {
-    let b = world.create_buffer(name, BufferKind.Scratch, initial_lines = lines)
+    let b = world.create_buffer(name, BufferKind.scratch, initial_lines = lines)
     b.read_only = false
     b.modified = false
     b.point = Pos.zero()
@@ -231,7 +231,7 @@ fn test_extension_lifecycle_and_presets() -> #ServiceEffects !String Unit {
     register_diff_preset(
         diff,
         "strip-pid",
-        DiffStageKind.Mapper,
+        DiffStageKind.mapper,
         "sed -E 's/pid=[0-9]+/pid=<PID>/g'",
         description = "Mask process IDs in logs",
     )
@@ -602,10 +602,10 @@ fn test_layouts_intraline_and_hunk_patching() -> #ServiceEffects !String Unit {
 -- ============================================================================
 
 fn run_git_checked(cwd: String, args: List, ctx: String) {
-    let out = process.exec("git", args = args, cwd = cwd) ! {
+    let out = process.run("git", args = args, cwd = cwd) ! {
         e => fail_test(ctx ++ " failed to exec git: " ++ e.to_string()),
     }
-    if not out.success() {
+    if not out.is_success() {
         fail_test(ctx ++ " git exited " ++ out.status.to_string() ++ ": " ++ out.stderr)
     }
 }
@@ -615,10 +615,10 @@ fn test_all_entry_sources_git_dirs_selection_and_export() -> #ServiceEffects !St
 
     let tmp_root = "/tmp/lava_test_diff_plugin_" ++ process.pid().to_string()
     if fs.exists(tmp_root) {
-        let _ = fs.remove_dir_all(tmp_root) ! { _ => () }
+        let _ = fs.remove_dir(tmp_root, recursive = true) ! { _ => () }
     }
-    let _ = fs.create_dir_all(tmp_root) ! {
-        e => fail_test("create_dir_all tmp_root failed: " ++ e.to_string()),
+    let _ = fs.create_dir(tmp_root, parents = true) ! {
+        e => fail_test("create_dir tmp_root failed: " ++ e.to_string()),
     }
 
     -- 1. `:DiffFiles` comparing two disk files
@@ -668,7 +668,7 @@ fn test_all_entry_sources_git_dirs_selection_and_export() -> #ServiceEffects !St
 
     -- 4. `:DiffHead` & `:DiffView` inside a real temporary Git repository!
     let repo_dir = path.join(tmp_root, "repo")
-    let _ = fs.create_dir_all(repo_dir) ! { _ => () }
+    let _ = fs.create_dir(repo_dir, parents = true) ! { _ => () }
     run_git_checked(repo_dir, ["init"], "git init")
     run_git_checked(repo_dir, ["config", "user.email", "test@lava.org"], "git config email")
     run_git_checked(repo_dir, ["config", "user.name", "Lava Test"], "git config name")
@@ -709,8 +709,8 @@ fn test_all_entry_sources_git_dirs_selection_and_export() -> #ServiceEffects !St
     -- 5. `:DiffDirs` recursive directory comparison (`[MODIFIED]`, `[ONLY LEFT]`, `[ONLY RIGHT]`)
     let dir_l = path.join(tmp_root, "dir_left")
     let dir_r = path.join(tmp_root, "dir_right")
-    let _ = fs.create_dir_all(path.join(dir_l, "sub")) ! { _ => () }
-    let _ = fs.create_dir_all(path.join(dir_r, "sub")) ! { _ => () }
+    let _ = fs.create_dir(path.join(dir_l, "sub"), parents = true) ! { _ => () }
+    let _ = fs.create_dir(path.join(dir_r, "sub"), parents = true) ! { _ => () }
 
     let _ = fs.write_string(path.join(dir_l, "same.txt"), "identical\n") ! { _ => () }
     let _ = fs.write_string(path.join(dir_r, "same.txt"), "identical\n") ! { _ => () }
@@ -774,7 +774,7 @@ fn test_all_entry_sources_git_dirs_selection_and_export() -> #ServiceEffects !St
     feed_keys_ok(kernel, "q", "close Selection diff")#
 
     -- Cleanup temporary directory
-    let _ = fs.remove_dir_all(tmp_root) ! { _ => () }
+    let _ = fs.remove_dir(tmp_root, recursive = true) ! { _ => () }
     ()
 }
 

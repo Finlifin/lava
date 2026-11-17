@@ -7,23 +7,32 @@ use std.process
 use @lava_accel.{DiffHunk, accel_diff_lines}
 
 pub enum DiffStageKind {
-    pub Filter,
-    pub Mapper,
+    pub filter,
+    pub mapper,
 }
-derive Eq, PartialEq, Display for DiffStageKind
+derive Eq, PartialEq for DiffStageKind
+
+impl Display for DiffStageKind {
+    pub fn to_string(self) -> String {
+        self match {
+            DiffStageKind.filter => "Filter",
+            DiffStageKind.mapper => "Mapper",
+        }
+    }
+}
 
 impl DiffStageKind {
     pub fn badge(self) -> String {
         self match {
-            DiffStageKind.Filter => "F",
-            DiffStageKind.Mapper => "M",
+            DiffStageKind.filter => "F",
+            DiffStageKind.mapper => "M",
         }
     }
 
     pub fn name(self) -> String {
         self match {
-            DiffStageKind.Filter => "Filter",
-            DiffStageKind.Mapper => "Mapper",
+            DiffStageKind.filter => "Filter",
+            DiffStageKind.mapper => "Mapper",
         }
     }
 }
@@ -114,7 +123,7 @@ pub fn summarize_stage_label(cmd: String) -> String {
 pub fn has_any_active_mapper(stages: List) -> bool {
     for i in 0..stages.len() {
         let st = stages.get(i.as(usize)).as(DiffPipelineStage)
-        if st.enabled and st.kind == DiffStageKind.Mapper {
+        if st.enabled and st.kind == DiffStageKind.mapper {
             return true
         }
     }
@@ -378,7 +387,7 @@ pub fn run_single_stage(
     let eff_cwd: ?String = if cwd != "" and fs.is_dir(cwd) { cwd } else { null }
 
     var spawn_err = ""
-    let out = process.shell(cmd, stdin_data = payload, cwd = eff_cwd) ! {
+    let out = process.shell(cmd, stdin = payload, cwd = eff_cwd) ! {
         io_err => {
             spawn_err = "Failed to spawn shell for " ++ stage.kind.name() ++ ": " ++ io_err.to_string()
             process.CommandOutput { status: -1, stdout: "", stderr: "" }
@@ -390,7 +399,7 @@ pub fn run_single_stage(
 
     let err_trim = out.stderr.trim()
     stage.kind match {
-        DiffStageKind.Filter => {
+        DiffStageKind.filter => {
             if out.status == 0 {
                 let out_lines = split_stdio_output_lines(out.stdout)
                 return align_filtered_lines(tracked, out_lines)
@@ -402,7 +411,7 @@ pub fn run_single_stage(
             let detail = if err_trim != "" { err_trim } else { "command exited with status " ++ out.status.to_string() }
             return error ("Filter error (`" ++ cmd ++ "`, exit " ++ out.status.to_string() ++ "): " ++ detail)
         },
-        DiffStageKind.Mapper => {
+        DiffStageKind.mapper => {
             if out.status != 0 {
                 let detail = if err_trim != "" { err_trim } else { "command exited with status " ++ out.status.to_string() }
                 return error ("Mapper error (`" ++ cmd ++ "`, exit " ++ out.status.to_string() ++ "): " ++ detail)
@@ -433,55 +442,55 @@ pub fn default_diff_presets() -> List {
     [
         DiffPreset {
             name: "strip-timestamps",
-            kind: DiffStageKind.Mapper,
+            kind: DiffStageKind.mapper,
             command: "sed -E 's/[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}[T ][0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}}(\\.[0-9]+)?(Z|[+-][0-9:]+)?/<TIMESTAMP>/g'",
             description: "Mask ISO-8601 / log timestamps as <TIMESTAMP>",
         },
         DiffPreset {
             name: "strip-hex-addr",
-            kind: DiffStageKind.Mapper,
+            kind: DiffStageKind.mapper,
             command: "sed -E 's/0x[0-9a-fA-F]+/0xADDR/g'",
             description: "Mask hexadecimal memory addresses (0x...) as 0xADDR",
         },
         DiffPreset {
             name: "strip-uuid",
-            kind: DiffStageKind.Mapper,
+            kind: DiffStageKind.mapper,
             command: "sed -E 's/[0-9a-fA-F]{{8}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{12}}/<UUID>/g'",
             description: "Mask standard 8-4-4-4-12 UUIDs as <UUID>",
         },
         DiffPreset {
             name: "strip-numbers",
-            kind: DiffStageKind.Mapper,
+            kind: DiffStageKind.mapper,
             command: "sed -E 's/[0-9]+/<NUM>/g'",
             description: "Mask integer numbers as <NUM>",
         },
         DiffPreset {
             name: "normalize-ws",
-            kind: DiffStageKind.Mapper,
+            kind: DiffStageKind.mapper,
             command: "awk '{{$1=$1; print}}'",
             description: "Collapse runs of whitespace into single spaces via awk",
         },
         DiffPreset {
             name: "strip-ansi",
-            kind: DiffStageKind.Mapper,
+            kind: DiffStageKind.mapper,
             command: "sed -E 's/\\x1b\\[[0-9;]*[a-zA-Z]//g'",
             description: "Strip ANSI SGR terminal color escape sequences",
         },
         DiffPreset {
             name: "drop-blank",
-            kind: DiffStageKind.Filter,
+            kind: DiffStageKind.filter,
             command: "rg '\\S'",
             description: "Drop blank / whitespace-only lines via ripgrep",
         },
         DiffPreset {
             name: "drop-comments",
-            kind: DiffStageKind.Filter,
+            kind: DiffStageKind.filter,
             command: "rg -v '^\\s*(#|//|--)'",
             description: "Drop #, //, and -- comment lines via ripgrep",
         },
         DiffPreset {
             name: "only-errors",
-            kind: DiffStageKind.Filter,
+            kind: DiffStageKind.filter,
             command: "rg 'ERROR|WARN|FATAL|panic'",
             description: "Retain only ERROR / WARN / FATAL / panic lines",
         },

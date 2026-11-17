@@ -7,9 +7,7 @@
 -- 5. Live `*scratch*` Single-VM expression, session variable, option mutation & kernel introspection evaluator.
 
 use std.fs
-use std.io
 use std.path
-use std.process.{assert, assert_eq}
 use @lava_sys.{RawUiEvent, host_poll_events, mock_enable}
 use @lava_core.{
     HostClipboardCap, KeyStroke, LogCollectorCap, PromptKind, PromptRequest,
@@ -81,11 +79,11 @@ fn run_all_tests() -> !String Unit {
         return error "failed generating temp_file_path"
     }
     let tmp_root = tmp_base ++ "_dir"
-    let _! = fs.create_dir_all(tmp_root) else {
+    let _! = fs.create_dir(tmp_root, parents = true) else {
         return error ("failed creating temp dir: " ++ tmp_root)
     }
     defer {
-        let _ = fs.remove_dir_all(tmp_root) ! { _ => () }
+        let _ = fs.remove_dir(tmp_root, recursive = true) ! { _ => () }
     }
 
     world.cwd = tmp_root
@@ -94,7 +92,7 @@ fn run_all_tests() -> !String Unit {
     -- Test 1: Emacs Dired (listing, + mkdir, C copy, R rename, d+x confirm delete, <Return>, ^)
     -- ========================================================================
     let docs_dir = path.join(tmp_root, "docs")
-    let _! = fs.create_dir_all(docs_dir) else {
+    let _! = fs.create_dir(docs_dir, parents = true) else {
         return error "failed creating docs dir"
     }
     let alpha_path = path.join(tmp_root, "alpha.ns")
@@ -111,10 +109,10 @@ fn run_all_tests() -> !String Unit {
     }
 
     let t_dired = tools_dispatch_command(kernel, "dired", [tmp_root]).use(logs).use(status).use(clip)!
-    assert(t_dired matches PromptTurn.Completed(_), message = "dired should complete immediately with path arg")
+    assert(t_dired matches PromptTurn.completed(_), message = "dired should complete immediately with path arg")
 
     let dired_buf = world.active_buffer()
-    assert_eq(dired_buf.kind, BufferKind.Directory, message = "dired buffer kind")
+    assert_eq(dired_buf.kind, BufferKind.directory, message = "dired buffer kind")
     assert_eq(dired_buf.major_mode, "dired", message = "dired major_mode")
     assert(dired_buf.read_only, message = "dired buffer must be read_only")
     assert(dired_buf.line_at(0).contains(tmp_root ++ ":"), message = "dired header contains directory path")
@@ -172,7 +170,7 @@ fn run_all_tests() -> !String Unit {
         return error "x should suspend for confirmation"
     }
     let (typed_req, _) = pending
-    assert_eq(typed_req.kind, PromptKind.Confirm, message = "x uses PromptKind.Confirm")
+    assert_eq(typed_req.kind, PromptKind.confirm, message = "x uses PromptKind.confirm")
     assert_eq(typed_req.label, "Delete 1 flagged item(s)? (y/n)", message = "exact delete confirm label")
     let _ = kernel.submit_prompt_answer("n").use(logs).use(status).use(clip)!
     assert(fs.exists(beta_renamed_path), message = "answering 'n' preserves flagged file")
@@ -199,14 +197,14 @@ fn run_all_tests() -> !String Unit {
     assert_eq(world.active_buffer().file_path, alpha_path, message = "<Return> on file opens alpha.ns")
     assert_eq(world.active_buffer().major_mode, "nessa", message = "alpha.ns opened in nessa mode")
     assert(switched_count.get(0).as(i64) > switches_before, message = "buffer-switched hook emitted")
-    io.println("  [ok] Test 1 (Dired) complete")
+    println("  [ok] Test 1 (Dired) complete")
 
     -- ========================================================================
     -- Test 2: `occur`, 4-Shard `async effect` `project-search`, `grep`, & Quickfix
     -- ========================================================================
     -- `occur` on active `alpha.ns` buffer via continuation prompt
     let t_occur = tools_dispatch_command(kernel, "occur", []).use(logs).use(status).use(clip)!
-    assert(t_occur matches PromptTurn.Suspended(_, _), message = "occur without args suspends for pattern")
+    assert(t_occur matches PromptTurn.suspended(_, _), message = "occur without args suspends for pattern")
     let _ = kernel.submit_prompt_answer("let x").use(logs).use(status).use(clip)!
     assert_eq(world.active_buffer().name, "*Occur*", message = "occur switches to *Occur*")
     assert_eq(world.active_buffer().major_mode, "grep", message = "*Occur* uses grep major_mode")
@@ -221,9 +219,9 @@ fn run_all_tests() -> !String Unit {
     let src_dir = path.join(tmp_root, "src")
     let git_dir = path.join(tmp_root, ".git")
     let target_dir = path.join(tmp_root, "target")
-    let _! = fs.create_dir_all(src_dir) else { return error "mkdir src failed" }
-    let _! = fs.create_dir_all(git_dir) else { return error "mkdir .git failed" }
-    let _! = fs.create_dir_all(target_dir) else { return error "mkdir target failed" }
+    let _! = fs.create_dir(src_dir, parents = true) else { return error "mkdir src failed" }
+    let _! = fs.create_dir(git_dir, parents = true) else { return error "mkdir .git failed" }
+    let _! = fs.create_dir(target_dir, parents = true) else { return error "mkdir target failed" }
 
     let f1 = path.join(src_dir, "m1.ns")
     let f2 = path.join(src_dir, "m2.ns")
@@ -237,7 +235,7 @@ fn run_all_tests() -> !String Unit {
     let _! = fs.write_string(path.join(target_dir, "ignored.ns"), "SHARD_NEEDLE\n") else { return error "write target" }
 
     let t_psearch = tools_dispatch_command(kernel, "project-search", ["SHARD_NEEDLE", tmp_root]).use(logs).use(status).use(clip)!
-    assert(t_psearch matches PromptTurn.Completed(_), message = "project-search completes synchronously via async effect futures")
+    assert(t_psearch matches PromptTurn.completed(_), message = "project-search completes synchronously via async effect futures")
     assert_eq(world.active_buffer().name, "*Grep*", message = "project-search opens *Grep*")
     assert_eq(world.quickfix.len(), 3, message = "project-search found exactly 3 matches (skipping .git and target)")
 
@@ -269,7 +267,7 @@ fn run_all_tests() -> !String Unit {
     let polled = host_poll_events()
     assert_eq(polled.len(), 1, message = "mock host queued AsyncJobDone for grep")
     polled.get(0).as(RawUiEvent) match {
-        RawUiEvent.AsyncJobDone(jid, ok, code, out, err) => {
+        RawUiEvent.async_job_done(jid, ok, code, out, err) => {
             let claimed = tools_on_async_job_done(kernel, jid, ok, code, out, err).use(logs).use(status)!
             assert(claimed, message = "tools_on_async_job_done claimed grep job")
         },
@@ -277,7 +275,7 @@ fn run_all_tests() -> !String Unit {
     }
     assert(world.active_jobs.is_empty(), message = "active_jobs cleared after grep finished")
     assert(world.quickfix.len() >= 3, message = "background grep populated world.quickfix")
-    io.println("  [ok] Test 2 (Occur + Async Project Search + Grep + Quickfix) complete")
+    println("  [ok] Test 2 (Occur + Async Project Search + Grep + Quickfix) complete")
 
     -- ========================================================================
     -- Test 3: `compile` + `tools_on_async_job_done` jumping to `src/demo.ns:3:5` + Shell & C-g
@@ -332,7 +330,7 @@ fn run_all_tests() -> !String Unit {
     let cg_handled = tools_handle_key(kernel, ctrl_g).use(logs).use(status).use(clip)!
     assert(cg_handled, message = "<C-g> cancels running background job in compilation buffer")
     assert(world.active_jobs.is_empty(), message = "active_jobs empty after <C-g>")
-    io.println("  [ok] Test 3 (Compile + Shell + C-g) complete")
+    println("  [ok] Test 3 (Compile + Shell + C-g) complete")
 
     -- ========================================================================
     -- Test 4: Org-Mode `<Tab>` Subtree Fold/Unfold & `C-c C-t` `org-todo` Cycling
@@ -371,7 +369,7 @@ fn run_all_tests() -> !String Unit {
 
     let _ = tools_dispatch_command(kernel, "org-todo", []).use(logs).use(status).use(clip)!
     assert_eq(org_buf.line_at(0), "* Engine Roadmap", message = "3rd org-todo -> clean title")
-    io.println("  [ok] Test 4 (Org-Outline) complete")
+    println("  [ok] Test 4 (Org-Outline) complete")
 
     -- ========================================================================
     -- Test 5: Live `*scratch*` Evaluator (`eval-scratch-line` & `eval-expression`)
@@ -414,18 +412,18 @@ fn run_all_tests() -> !String Unit {
     assert_eq(scratch_buf.line_at(5), "set tabstop = 2 -- => tabstop = 2", message = "scratch set tabstop annotation")
 
     let t_eval = tools_dispatch_command(kernel, "eval-expression", ["call next-buffer"]).use(logs).use(status).use(clip)!
-    assert(t_eval matches PromptTurn.Completed(_), message = "eval-expression `call next-buffer` succeeded")
+    assert(t_eval matches PromptTurn.completed(_), message = "eval-expression `call next-buffer` succeeded")
     assert(world.active_buffer_id != BufferId(1), message = "call next-buffer switched active buffer in live VM")
-    io.println("  [ok] Test 5 (Live *scratch* & eval-expression) complete")
+    println("  [ok] Test 5 (Live *scratch* & eval-expression) complete")
 
-    io.println("PASS: all ext_tools integration tests succeeded!")
+    println("PASS: all ext_tools integration tests succeeded!")
     ()
 }
 
 fn main() {
     run_all_tests() ! {
         err => {
-            io.println("FAIL: " ++ err)
+            println("FAIL: " ++ err)
             assert(false, message = err)
         },
     }

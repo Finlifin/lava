@@ -382,7 +382,7 @@ pub fn register_comment_extension(kernel: SystemKernel) -> !String Unit {
                     let buf = world.active_buffer()
                     var count = vim.effective_count()
                     if not args.is_empty() {
-                        let parsed = args.get(0).as(String).trim().parse_i64()
+                        let parsed = args.get(0).as(String).trim().try_parse(i64)
                         if parsed != null and parsed.as(i64) > 0 {
                             count = parsed.as(i64)
                         }
@@ -390,7 +390,7 @@ pub fn register_comment_extension(kernel: SystemKernel) -> !String Unit {
                     let start_r = buf.point.row
                     let end_r = start_r + count - 1
                     toggle_line_comments_range(buf, start_r, end_r, "comment-toggle-line")!
-                    vim.mode = VimMode.Normal
+                    vim.mode = VimMode.normal
                     vim.clear_transient()
                     sync_world_from_vim(world, vim)
                     ()
@@ -415,7 +415,7 @@ pub fn register_comment_extension(kernel: SystemKernel) -> !String Unit {
                     let r1 = if a.row <= b.row { a.row } else { b.row }
                     let r2 = if a.row <= b.row { b.row } else { a.row }
 
-                    vim.mode = VimMode.Normal
+                    vim.mode = VimMode.normal
                     vim.visual_dollar = false
                     vim.recording_change = false
                     vim.tentative_visual_change = false
@@ -437,7 +437,7 @@ pub fn register_comment_extension(kernel: SystemKernel) -> !String Unit {
                     let vim = require_vim_state(kern)!
                     let buf = world.active_buffer()
                     toggle_block_comment_line(buf, buf.point.row)!
-                    vim.mode = VimMode.Normal
+                    vim.mode = VimMode.normal
                     vim.clear_transient()
                     sync_world_from_vim(world, vim)
                     ()
@@ -459,7 +459,7 @@ pub fn register_comment_extension(kernel: SystemKernel) -> !String Unit {
                     buf.named_marks.insert("<", norm_marks.start)
                     buf.named_marks.insert(">", norm_marks.end)
 
-                    let sp = if vim.mode == VimMode.VisualLine {
+                    let sp = if vim.mode == VimMode.visual_line {
                         let r1 = if a.row <= b.row { a.row } else { b.row }
                         let r2 = if a.row <= b.row { b.row } else { a.row }
                         Span.normalized(
@@ -473,7 +473,7 @@ pub fn register_comment_extension(kernel: SystemKernel) -> !String Unit {
                         Span.normalized(lo, Pos.new(hi.row, if hi.col < hlen { hi.col + 1 } else { hlen }))
                     }
 
-                    vim.mode = VimMode.Normal
+                    vim.mode = VimMode.normal
                     vim.visual_dollar = false
                     vim.recording_change = false
                     vim.tentative_visual_change = false

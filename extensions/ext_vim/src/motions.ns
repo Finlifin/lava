@@ -5,11 +5,21 @@
 use @ext_document.{Buffer, EditorWorld, Pos}
 
 pub enum MotionShape {
-    pub Exclusive,
-    pub Inclusive,
-    pub Linewise,
+    pub exclusive,
+    pub inclusive,
+    pub linewise,
 }
-derive Eq, PartialEq, Display for MotionShape
+derive Eq, PartialEq for MotionShape
+
+impl Display for MotionShape {
+    pub fn to_string(self) -> String {
+        self match {
+            MotionShape.exclusive => "Exclusive",
+            MotionShape.inclusive => "Inclusive",
+            MotionShape.linewise => "Linewise",
+        }
+    }
+}
 
 pub struct MotionTarget {
     pub pos: Pos,
@@ -24,7 +34,7 @@ impl MotionTarget {
     pub fn invalid() -> MotionTarget {
         MotionTarget {
             pos: Pos.zero(),
-            shape: MotionShape.Exclusive,
+            shape: MotionShape.exclusive,
             is_jump: false,
             valid: false,
             preserve_pref_col: false,
@@ -165,10 +175,10 @@ pub fn motion_word_forward(
 
         if llen == 0 {
             if r >= max_r {
-                return MotionTarget.ok(Pos.new(r, 0), MotionShape.Exclusive)
+                return MotionTarget.ok(Pos.new(r, 0), MotionShape.exclusive)
             }
             if for_operator and step_idx == steps - 1 {
-                return MotionTarget.ok(Pos.new(r, 0), MotionShape.Exclusive)
+                return MotionTarget.ok(Pos.new(r, 0), MotionShape.exclusive)
             }
             r += 1
             c = buf.first_non_blank_col(r)
@@ -178,7 +188,7 @@ pub fn motion_word_forward(
         if c >= llen {
             if r >= max_r {
                 let end_c = if for_operator { llen } else { llen - 1 }
-                return MotionTarget.ok(Pos.new(r, end_c), MotionShape.Exclusive)
+                return MotionTarget.ok(Pos.new(r, end_c), MotionShape.exclusive)
             }
             r += 1
             c = buf.first_non_blank_col(r)
@@ -203,13 +213,13 @@ pub fn motion_word_forward(
         if for_operator {
             -- In Vim, `dw`/`yw` does not cross newline from mid-line to eat next line's indent
             if r >= max_r or step_idx == steps - 1 {
-                return MotionTarget.ok(Pos.new(r, llen), MotionShape.Exclusive)
+                return MotionTarget.ok(Pos.new(r, llen), MotionShape.exclusive)
             }
         }
 
         if r >= max_r {
             let end_c = if for_operator { llen } else if llen > 0 { llen - 1 } else { 0 }
-            return MotionTarget.ok(Pos.new(r, end_c), MotionShape.Exclusive)
+            return MotionTarget.ok(Pos.new(r, end_c), MotionShape.exclusive)
         }
 
         -- Advance to next line; empty line itself is a word stop in Vim!
@@ -224,7 +234,7 @@ pub fn motion_word_forward(
         }
     }
 
-    MotionTarget.ok(Pos.new(r, c), MotionShape.Exclusive)
+    MotionTarget.ok(Pos.new(r, c), MotionShape.exclusive)
 }
 
 -- Backward word (`b` / `B`).
@@ -247,7 +257,7 @@ pub fn motion_word_backward(buf: Buffer, from: Pos, count: i64, big_word: bool) 
             }
             c = prev_len - 1
         } else {
-            return MotionTarget.ok(Pos.new(min_r, 0), MotionShape.Exclusive)
+            return MotionTarget.ok(Pos.new(min_r, 0), MotionShape.exclusive)
         }
 
         -- Skip blanks backward across lines, stopping on empty lines
@@ -295,7 +305,7 @@ pub fn motion_word_backward(buf: Buffer, from: Pos, count: i64, big_word: bool) 
         }
     }
 
-    MotionTarget.ok(Pos.new(r, c), MotionShape.Exclusive)
+    MotionTarget.ok(Pos.new(r, c), MotionShape.exclusive)
 }
 
 -- End of word (`e` / `E`) — Inclusive!
@@ -314,7 +324,7 @@ pub fn motion_word_end(buf: Buffer, from: Pos, count: i64, big_word: bool) -> Mo
             c = 0
         } else {
             let end_c = if cur_len > 0 { cur_len - 1 } else { 0 }
-            return MotionTarget.ok(Pos.new(r, end_c), MotionShape.Inclusive)
+            return MotionTarget.ok(Pos.new(r, end_c), MotionShape.inclusive)
         }
 
         -- Skip blanks across lines
@@ -338,7 +348,7 @@ pub fn motion_word_end(buf: Buffer, from: Pos, count: i64, big_word: bool) -> Mo
         }
 
         if at_end {
-            return MotionTarget.ok(Pos.new(r, c), MotionShape.Inclusive)
+            return MotionTarget.ok(Pos.new(r, c), MotionShape.inclusive)
         }
 
         let line = buf.line_at(r)
@@ -349,7 +359,7 @@ pub fn motion_word_end(buf: Buffer, from: Pos, count: i64, big_word: bool) -> Mo
         }
     }
 
-    MotionTarget.ok(Pos.new(r, c), MotionShape.Inclusive)
+    MotionTarget.ok(Pos.new(r, c), MotionShape.inclusive)
 }
 
 -- Backward end of word (`ge`) — Inclusive!
@@ -380,7 +390,7 @@ pub fn motion_word_end_backward(buf: Buffer, from: Pos, count: i64, big_word: bo
             let plen = buf.line_char_len(r)
             c = if plen > 0 { plen - 1 } else { 0 }
         } else {
-            return MotionTarget.ok(Pos.new(min_r, 0), MotionShape.Inclusive)
+            return MotionTarget.ok(Pos.new(min_r, 0), MotionShape.inclusive)
         }
 
         -- Skip blanks backward across lines
@@ -399,7 +409,7 @@ pub fn motion_word_end_backward(buf: Buffer, from: Pos, count: i64, big_word: bo
                 }
             }
             if r <= min_r {
-                return MotionTarget.ok(Pos.new(min_r, 0), MotionShape.Inclusive)
+                return MotionTarget.ok(Pos.new(min_r, 0), MotionShape.inclusive)
             }
             r -= 1
             let plen = buf.line_char_len(r)
@@ -407,7 +417,7 @@ pub fn motion_word_end_backward(buf: Buffer, from: Pos, count: i64, big_word: bo
         }
     }
 
-    MotionTarget.ok(Pos.new(r, c), MotionShape.Inclusive)
+    MotionTarget.ok(Pos.new(r, c), MotionShape.inclusive)
 }
 
 -- Single-line character find (`f`, `F`, `t`, `T`).
@@ -450,7 +460,7 @@ pub fn motion_find_char_in_line(
             return MotionTarget.invalid()
         }
         let dest_col = if kind == "t" { found_col - 1 } else { found_col }
-        return MotionTarget.ok(Pos.new(from.row, dest_col), MotionShape.Inclusive)
+        return MotionTarget.ok(Pos.new(from.row, dest_col), MotionShape.inclusive)
     }
 
     if kind == "F" or kind == "T" {
@@ -474,7 +484,7 @@ pub fn motion_find_char_in_line(
             return MotionTarget.invalid()
         }
         let dest_col = if kind == "T" { found_col + 1 } else { found_col }
-        return MotionTarget.ok(Pos.new(from.row, dest_col), MotionShape.Exclusive)
+        return MotionTarget.ok(Pos.new(from.row, dest_col), MotionShape.exclusive)
     }
 
     MotionTarget.invalid()
@@ -506,7 +516,7 @@ pub fn motion_paragraph_prev(buf: Buffer, from: Pos, count: i64) -> MotionTarget
             r -= 1
         }
     }
-    MotionTarget.ok(Pos.new(r, 0), MotionShape.Exclusive, is_jump = true)
+    MotionTarget.ok(Pos.new(r, 0), MotionShape.exclusive, is_jump = true)
 }
 
 pub fn motion_paragraph_next(buf: Buffer, from: Pos, count: i64) -> MotionTarget {
@@ -524,7 +534,7 @@ pub fn motion_paragraph_next(buf: Buffer, from: Pos, count: i64) -> MotionTarget
             r += 1
         }
     }
-    MotionTarget.ok(Pos.new(r, 0), MotionShape.Exclusive, is_jump = true)
+    MotionTarget.ok(Pos.new(r, 0), MotionShape.exclusive, is_jump = true)
 }
 
 fn bracket_partner(ch: String) -> ?(String, bool) {
@@ -584,7 +594,7 @@ pub fn motion_match_bracket(buf: Buffer, from: Pos) -> MotionTarget {
                 } else if ch == partner_ch {
                     depth -= 1
                     if depth == 0 {
-                        return MotionTarget.ok(Pos.new(r, col), MotionShape.Inclusive, is_jump = true)
+                        return MotionTarget.ok(Pos.new(r, col), MotionShape.inclusive, is_jump = true)
                     }
                 }
                 col += 1
@@ -607,7 +617,7 @@ pub fn motion_match_bracket(buf: Buffer, from: Pos) -> MotionTarget {
             } else if ch == partner_ch {
                 depth -= 1
                 if depth == 0 {
-                    return MotionTarget.ok(Pos.new(r, col), MotionShape.Inclusive, is_jump = true)
+                    return MotionTarget.ok(Pos.new(r, col), MotionShape.inclusive, is_jump = true)
                 }
             }
             col -= 1
@@ -655,7 +665,7 @@ pub fn motion_viewport_line(world: EditorWorld, buf: Buffer, which: String, coun
     }
     MotionTarget.ok(
         Pos.new(target_r, buf.first_non_blank_col(target_r)),
-        MotionShape.Linewise,
+        MotionShape.linewise,
         is_jump = true,
     )
 }
@@ -767,7 +777,7 @@ pub fn motion_indent_prev_boundary(
 
     MotionTarget.ok(
         Pos.new(r, buf.first_non_blank_col(r)),
-        MotionShape.Exclusive,
+        MotionShape.exclusive,
         is_jump = true,
     )
 }
@@ -854,7 +864,7 @@ pub fn motion_indent_next_boundary(
 
     MotionTarget.ok(
         Pos.new(r, buf.first_non_blank_col(r)),
-        MotionShape.Exclusive,
+        MotionShape.exclusive,
         is_jump = true,
     )
 }
@@ -913,8 +923,8 @@ pub fn file_target_under_cursor(buf: Buffer, pos: Pos) -> ?(String, i64, i64) {
     if plen >= 3 {
         let last_s = parts.get((plen - 1).as(usize)).as(String)
         let prev_s = parts.get((plen - 2).as(usize)).as(String)
-        let l_opt = prev_s.parse_i64()
-        let c_opt = last_s.parse_i64()
+        let l_opt = prev_s.try_parse(i64)
+        let c_opt = last_s.try_parse(i64)
         if l_opt != null and c_opt != null and l_opt.as(i64) > 0 {
             line_num = l_opt.as(i64)
             col_num = if c_opt.as(i64) > 0 { c_opt.as(i64) } else { 1 }
@@ -927,7 +937,7 @@ pub fn file_target_under_cursor(buf: Buffer, pos: Pos) -> ?(String, i64, i64) {
     }
     if line_num == 0 and plen >= 2 {
         let last_s = parts.get((plen - 1).as(usize)).as(String)
-        let l_opt = last_s.parse_i64()
+        let l_opt = last_s.try_parse(i64)
         if l_opt != null and l_opt.as(i64) > 0 {
             line_num = l_opt.as(i64)
             let prefix_parts = List()

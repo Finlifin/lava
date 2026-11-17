@@ -9,6 +9,7 @@ use std.collections.{HashMap, Set}
 use std.fs
 use std.path
 use std.process
+
 use @lava_sys.{host_cancel_job, host_spawn_job}
 use @lava_core.{
     CommandSpec, ExtId, ExtState, ExtensionRecord, InteractiveEffects, KeyStroke, PromptKind,
@@ -47,14 +48,8 @@ pub fn scan_shard_sync(files: List, pattern: String, ignore_case: bool) -> List 
         if raw.contains("\x00") {
             continue
         }
-        let normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
-        let lines = normalized.split("\n")
-        if lines.len() > 1 and normalized.ends_with("\n") {
-            let _ = lines.pop()
-        }
-        let line_count = lines.len()
-        for r in 0..line_count {
-            let line = lines.get(r.as(usize)).as(String)
+        var r: i64 = 0
+        for line in raw.lines_iter() {
             let hay = if ignore_case { line.to_lower() } else { line }
             let col_opt = hay.find(needle)
             if col_opt != null {
@@ -66,6 +61,7 @@ pub fn scan_shard_sync(files: List, pattern: String, ignore_case: bool) -> List 
                     text: line,
                 })
             }
+            r += 1
         }
     }
     results
@@ -106,22 +102,25 @@ private fn walk_dir_recursive(cur_dir: String, out: List, depth: i64) {
     if depth > 24 or out.len() >= 10000 {
         return
     }
-    let names! = fs.read_dir(cur_dir) else {
+    let entries! = fs.read_dir_entries(cur_dir) else {
         return
     }
-    names.sort()
-    let n = names.len()
-    for i in 0..n {
-        let name = names.get(i.as(usize)).as(String)
+    entries.sort_by(|a: Any, b: Any| {
+        a.as(fs.DirEntry).name.cmp(b.as(fs.DirEntry).name)
+    })
+    for entry_any in entries.iter() {
+        let entry = entry_any.as(fs.DirEntry)
+        let name = entry.name
         if name == "" or name == "." or name == ".." {
             continue
         }
-        let full = path.join(cur_dir, name)
-        if fs.is_dir(full) {
+        let full = entry.path
+        let is_sym = entry.is_symlink()
+        if entry.is_dir() or (is_sym and fs.is_dir(full)) {
             if not should_skip_walk_dir(name) {
                 walk_dir_recursive(full, out, depth + 1)
             }
-        } else if fs.is_file(full) {
+        } else if entry.is_file() or (is_sym and fs.is_file(full)) {
             out.push(full)
         }
     }
@@ -311,34 +310,23 @@ private fn render_dired_entry_line(entry: DiredEntry) -> String {
 }
 
 private fn build_dired_listing(dir_path: String, preserved_marks: HashMap) -> !String (List, List) {
-    let names! = fs.read_dir(dir_path) else {
+    let dir_iter! = fs.iter_dir(dir_path) else {
         return error ("cannot read directory: " ++ dir_path)
     }
-    names.sort()
     let parent_opt = path.parent(dir_path)
     let parent_dir = if parent_opt != null { parent_opt.as(String) } else { dir_path }
 
     let subdirs = List()
     let reg_files = List()
-    let n = names.len()
-    for i in 0..n {
-        let nm = names.get(i.as(usize)).as(String)
+    for de in dir_iter {
+        let nm = de.name
         if nm == "" or nm == "." or nm == ".." {
             continue
         }
         let full = path.join(dir_path, nm)
-        var sz: i64 = 0
-        var is_d = fs.is_dir(full)
-        var is_sym = false
-        let meta_res = fs.metadata(full)
-        meta_res match {
-            m! => {
-                sz = m.size
-                is_d = m.is_dir
-                is_sym = m.is_symlink
-            },
-            error _ => (),
-        }
+        let is_sym = de.is_symlink()
+        let is_d = de.is_dir() or (is_sym and fs.is_dir(full))
+        let sz = de.size
         let prev_mark_opt = preserved_marks.get(full)
         let mflag = if prev_mark_opt != null { prev_mark_opt.as(String) } else { " " }
         let item = DiredEntry {
@@ -356,6 +344,12 @@ private fn build_dired_listing(dir_path: String, preserved_marks: HashMap) -> !S
             reg_files.push(item)
         }
     }
+    subdirs.sort_by(|a: Any, b: Any| {
+        a.as(DiredEntry).name.cmp(b.as(DiredEntry).name)
+    })
+    reg_files.sort_by(|a: Any, b: Any| {
+        a.as(DiredEntry).name.cmp(b.as(DiredEntry).name)
+    })
 
     let entries = List()
     let up_entry = DiredEntry {
@@ -402,7 +396,7 @@ private fn find_dired_buffer_for_dir(world: EditorWorld, dir_path: String) -> ?B
     for i in 0..n {
         let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
         let b = world.buffers.get(bid).as(Buffer)
-        if b.kind == BufferKind.Directory and b.file_path == dir_path {
+        if b.kind == BufferKind.directory and b.file_path == dir_path {
             return b
         }
     }
@@ -450,7 +444,7 @@ pub fn refresh_dired_buffer(
 
     buf.read_only = false
     buf.major_mode = "dired"
-    buf.kind = BufferKind.Directory
+    buf.kind = BufferKind.directory
     buf.file_path = dir_path
     buf.set_lines(lines, record_undo = false)
     buf.modified = false
@@ -532,7 +526,7 @@ pub fn open_dired(
     let dir_label = if base_opt != null { base_opt.as(String) } else { resolved }
     let buf = world.create_buffer(
         "*Dired: " ++ dir_label ++ "*",
-        BufferKind.Directory,
+        BufferKind.directory,
         file_path = resolved,
         major_mode = "dired",
         initial_lines = lines,
@@ -1701,16 +1695,16 @@ pub fn org_todo_at_point(kernel: SystemKernel) -> #status_emit !String String {
 -- ============================================================================
 
 private enum ExprTok {
-    pub IntLit(val: i64),
-    pub FloatLit(val: f64),
-    pub StrLit(val: String),
-    pub Ident(name: String),
-    pub Op(sym: String),
-    pub LParen,
-    pub RParen,
-    pub LBracket,
-    pub RBracket,
-    pub Comma,
+    pub int_lit(val: i64),
+    pub float_lit(val: f64),
+    pub str_lit(val: String),
+    pub ident(name: String),
+    pub op(sym: String),
+    pub l_paren,
+    pub r_paren,
+    pub l_bracket,
+    pub r_bracket,
+    pub comma,
 }
 
 private struct ExprStream {
@@ -1768,27 +1762,27 @@ private fn tokenize_expr(src: String) -> !String List {
             continue
         }
         if ch == "(" {
-            tokens.push(ExprTok.LParen)
+            tokens.push(ExprTok.l_paren)
             i += 1
             continue
         }
         if ch == ")" {
-            tokens.push(ExprTok.RParen)
+            tokens.push(ExprTok.r_paren)
             i += 1
             continue
         }
         if ch == "[" {
-            tokens.push(ExprTok.LBracket)
+            tokens.push(ExprTok.l_bracket)
             i += 1
             continue
         }
         if ch == "]" {
-            tokens.push(ExprTok.RBracket)
+            tokens.push(ExprTok.r_bracket)
             i += 1
             continue
         }
         if ch == "," {
-            tokens.push(ExprTok.Comma)
+            tokens.push(ExprTok.comma)
             i += 1
             continue
         }
@@ -1821,20 +1815,20 @@ private fn tokenize_expr(src: String) -> !String List {
             if not closed {
                 return error "unterminated string literal"
             }
-            tokens.push(ExprTok.StrLit(buf))
+            tokens.push(ExprTok.str_lit(buf))
             i = j
             continue
         }
         if i + 1 < n {
             let two = src.slice(i, i + 2)
             if two == "++" or two == "==" or two == "!=" or two == "<=" or two == ">=" {
-                tokens.push(ExprTok.Op(two))
+                tokens.push(ExprTok.op(two))
                 i += 2
                 continue
             }
         }
         if ch == "+" or ch == "-" or ch == "*" or ch == "/" or ch == "%" or ch == "<" or ch == ">" {
-            tokens.push(ExprTok.Op(ch))
+            tokens.push(ExprTok.op(ch))
             i += 1
             continue
         }
@@ -1854,15 +1848,15 @@ private fn tokenize_expr(src: String) -> !String List {
             }
             let num_txt = src.slice(i, j)
             if has_dot {
-                let fv? = num_txt.parse_f64() else {
+                let fv? = num_txt.try_parse(f64) else {
                     return error ("invalid float literal: " ++ num_txt)
                 }
-                tokens.push(ExprTok.FloatLit(fv))
+                tokens.push(ExprTok.float_lit(fv))
             } else {
-                let iv? = num_txt.parse_i64() else {
+                let iv? = num_txt.try_parse(i64) else {
                     return error ("invalid integer literal: " ++ num_txt)
                 }
-                tokens.push(ExprTok.IntLit(iv))
+                tokens.push(ExprTok.int_lit(iv))
             }
             i = j
             continue
@@ -1888,9 +1882,9 @@ private fn tokenize_expr(src: String) -> !String List {
             }
             let ident = src.slice(i, j)
             if ident == "and" or ident == "or" or ident == "not" {
-                tokens.push(ExprTok.Op(ident))
+                tokens.push(ExprTok.op(ident))
             } else {
-                tokens.push(ExprTok.Ident(ident))
+                tokens.push(ExprTok.ident(ident))
             }
             i = j
             continue
@@ -1991,7 +1985,7 @@ private fn parse_int_val(v: Any) -> !String i64 {
         return v.as(i64)
     }
     let s = format_eval_value(v).trim()
-    let parsed? = s.parse_i64() else {
+    let parsed? = s.try_parse(i64) else {
         return error ("expected integer value, got: " ++ s)
     }
     parsed
@@ -2046,10 +2040,10 @@ private fn inspect_symbol(kernel: SystemKernel, world: EditorWorld, mgr: ToolsMa
             let id = kernel.ext_order.get(i.as(usize)).as(ExtId)
             let rec = kernel.extensions.get(id).as(ExtensionRecord)
             let st_label = rec.state match {
-                ExtState.Registered => "Registered",
-                ExtState.Active => "Active",
-                ExtState.Disabled => "Disabled",
-                ExtState.Failed(reason) => "Failed(" ++ reason ++ ")",
+                ExtState.registered => "Registered",
+                ExtState.active => "Active",
+                ExtState.disabled => "Disabled",
+                ExtState.failed(reason) => "Failed(" ++ reason ++ ")",
             }
             parts.push(id.raw() ++ "[" ++ st_label ++ "]")
         }
@@ -2151,7 +2145,7 @@ private fn match_op(st: ExprStream, sym: String) -> bool {
         return false
     }
     t match {
-        ExprTok.Op(s) => {
+        ExprTok.op(s) => {
             if s == sym {
                 st.pos += 1
                 true
@@ -2213,7 +2207,7 @@ private fn eval_cmp_expr(
             break
         }
         let op_sym = t match {
-            ExprTok.Op(s) => {
+            ExprTok.op(s) => {
                 if s == "==" or s == "!=" or s == "<" or s == "<=" or s == ">" or s == ">=" {
                     s
                 } else {
@@ -2386,33 +2380,33 @@ private fn eval_primary_expr(
     }
     st.pos += 1
     tok match {
-        ExprTok.IntLit(n) => n,
-        ExprTok.FloatLit(f) => f,
-        ExprTok.StrLit(s) => s,
-        ExprTok.LParen => {
+        ExprTok.int_lit(n) => n,
+        ExprTok.float_lit(f) => f,
+        ExprTok.str_lit(s) => s,
+        ExprTok.l_paren => {
             let inner = eval_or_expr(st, kernel, world, mgr)!
             let close_opt = peek_tok(st)
-            if close_opt == null or (not (close_opt.as(ExprTok) matches ExprTok.RParen)) {
+            if close_opt == null or (not (close_opt.as(ExprTok) matches ExprTok.r_paren)) {
                 return error "expected ')'"
             }
             st.pos += 1
             inner
         },
-        ExprTok.LBracket => {
+        ExprTok.l_bracket => {
             let items = List()
             let next_opt = peek_tok(st)
-            if next_opt != null and (next_opt.as(ExprTok) matches ExprTok.RBracket) {
+            if next_opt != null and (next_opt.as(ExprTok) matches ExprTok.r_bracket) {
                 st.pos += 1
                 return items
             }
             while true {
                 items.push(eval_or_expr(st, kernel, world, mgr)!)
                 let sep_opt = peek_tok(st)
-                if sep_opt != null and (sep_opt.as(ExprTok) matches ExprTok.Comma) {
+                if sep_opt != null and (sep_opt.as(ExprTok) matches ExprTok.comma) {
                     st.pos += 1
                     continue
                 }
-                if sep_opt != null and (sep_opt.as(ExprTok) matches ExprTok.RBracket) {
+                if sep_opt != null and (sep_opt.as(ExprTok) matches ExprTok.r_bracket) {
                     st.pos += 1
                     break
                 }
@@ -2420,24 +2414,24 @@ private fn eval_primary_expr(
             }
             items
         },
-        ExprTok.Ident(name) => {
+        ExprTok.ident(name) => {
             let next_opt = peek_tok(st)
-            if next_opt != null and (next_opt.as(ExprTok) matches ExprTok.LParen) {
+            if next_opt != null and (next_opt.as(ExprTok) matches ExprTok.l_paren) {
                 st.pos += 1
                 let call_args = List()
                 let after_lp = peek_tok(st)
-                if after_lp != null and (after_lp.as(ExprTok) matches ExprTok.RParen) {
+                if after_lp != null and (after_lp.as(ExprTok) matches ExprTok.r_paren) {
                     st.pos += 1
                     return eval_builtin_call(kernel, world, name, call_args)!
                 }
                 while true {
                     call_args.push(eval_or_expr(st, kernel, world, mgr)!)
                     let sep_opt = peek_tok(st)
-                    if sep_opt != null and (sep_opt.as(ExprTok) matches ExprTok.Comma) {
+                    if sep_opt != null and (sep_opt.as(ExprTok) matches ExprTok.comma) {
                         st.pos += 1
                         continue
                     }
-                    if sep_opt != null and (sep_opt.as(ExprTok) matches ExprTok.RParen) {
+                    if sep_opt != null and (sep_opt.as(ExprTok) matches ExprTok.r_paren) {
                         st.pos += 1
                         break
                     }
@@ -2566,14 +2560,14 @@ pub fn eval_lava_expression(
         }
         let turn = tools_dispatch_command(kernel, cmd_name, cmd_args)#!
         return turn match {
-            PromptTurn.Completed(v) => {
+            PromptTurn.completed(v) => {
                 if v == () or v == null {
                     "ok (" ++ cmd_name ++ ")"
                 } else {
                     format_eval_value(v)
                 }
             },
-            PromptTurn.Suspended(req, _) => "suspended (" ++ req.label ++ ")",
+            PromptTurn.suspended(req, _) => "suspended (" ++ req.label ++ ")",
         }
     }
 
@@ -2964,7 +2958,7 @@ private fn cmd_dired_do_flagged_delete(kern: SystemKernel, _args: List) -> #Inte
     let ans? = ask_prompt(PromptRequest {
         label: prompt_label,
         initial: "",
-        kind: PromptKind.Confirm,
+        kind: PromptKind.confirm,
         candidates: ["y", "n"],
     })# else {
         status_emit("Deletion cancelled")#
@@ -2979,7 +2973,7 @@ private fn cmd_dired_do_flagged_delete(kern: SystemKernel, _args: List) -> #Inte
     for i in 0..flagged.len() {
         let item = flagged.get(i.as(usize)).as(DiredEntry)
         if item.is_dir {
-            let res = fs.remove_dir_all(item.full_path)
+            let res = fs.remove_dir(item.full_path, recursive = true)
             res match {
                 _! => { deleted += 1 },
                 error err => {
@@ -3015,7 +3009,7 @@ private fn cmd_dired_create_directory(kern: SystemKernel, args: List) -> #Intera
         let ans? = ask_prompt(PromptRequest {
             label: "Create directory: ",
             initial: "",
-            kind: PromptKind.FilePath,
+            kind: PromptKind.file_path,
             candidates: List(),
         })# else {
             status_emit("Quit")#
@@ -3028,10 +3022,10 @@ private fn cmd_dired_create_directory(kern: SystemKernel, args: List) -> #Intera
         return ()
     }
     let target = resolve_in_dir(dstate.dir_path, raw_name)
-    let res = fs.create_dir_all(target)
+    let res = fs.create_dir(target, parents = true)
     res match {
         _! => (),
-        error err => return error ("create_dir_all failed: " ++ err.to_string()),
+        error err => return error ("create_dir failed: " ++ err.to_string()),
     }
     let fn_opt = path.file_name(target)
     let focus = if fn_opt != null { fn_opt.as(String) } else { "" }
@@ -3065,7 +3059,7 @@ private fn cmd_dired_do_rename(kern: SystemKernel, args: List) -> #InteractiveEf
         let ans? = ask_prompt(PromptRequest {
             label: prompt_lbl,
             initial: if targets.len() == 1 { first.name } else { "" },
-            kind: PromptKind.FilePath,
+            kind: PromptKind.file_path,
             candidates: List(),
         })# else {
             status_emit("Quit")#
@@ -3135,7 +3129,7 @@ private fn cmd_dired_do_copy(kern: SystemKernel, args: List) -> #InteractiveEffe
         let ans? = ask_prompt(PromptRequest {
             label: "Copy " ++ first.name ++ " to: ",
             initial: "",
-            kind: PromptKind.FilePath,
+            kind: PromptKind.file_path,
             candidates: List(),
         })# else {
             status_emit("Quit")#
@@ -3595,7 +3589,7 @@ private fn cmd_markdown_preview(kern: SystemKernel, _args: List) -> #Interactive
     } else {
         let nb = world.create_buffer(
             prev_name,
-            BufferKind.Special,
+            BufferKind.special,
             major_mode = "markdown",
             initial_lines = rendered,
         )

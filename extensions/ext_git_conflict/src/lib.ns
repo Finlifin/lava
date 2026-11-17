@@ -59,6 +59,10 @@ impl ConflictBlock {
 pub struct GitConflictState {
     pub conflicts_by_buf: HashMap,
     pub last_ver_by_buf: HashMap,
+    pub last_lcount_by_buf: HashMap,
+    pub last_scan_buf_id: BufferId,
+    pub last_scan_ver: i64,
+    pub last_conflict_count: i64,
 }
 
 impl GitConflictState {
@@ -66,6 +70,10 @@ impl GitConflictState {
         GitConflictState {
             conflicts_by_buf: HashMap.new(),
             last_ver_by_buf: HashMap.new(),
+            last_lcount_by_buf: HashMap.new(),
+            last_scan_buf_id: BufferId(0),
+            last_scan_ver: -1,
+            last_conflict_count: 0,
         }
     }
 
@@ -268,15 +276,55 @@ fn decorate_conflict_blocks(buf: Buffer, blocks: List) {
     }
 }
 
+fn line_starts_conflict_marker(line: String) -> bool {
+    line.starts_with("<<<<<<<")
+        or line.starts_with("=======")
+        or line.starts_with(">>>>>>>")
+        or line.starts_with("|||||||")
+}
+
 pub fn refresh_buffer_conflicts(state: GitConflictState, buf: Buffer, .force: bool = false) {
     buf.sync_external_lines()
+    let lcount = buf.line_count()
     if not force {
+        if state.last_scan_buf_id == buf.id and state.last_scan_ver == buf.edit_version {
+            return
+        }
         let prev_ver_opt = state.last_ver_by_buf.get(buf.id)
         if prev_ver_opt != null and prev_ver_opt.as(i64) == buf.edit_version {
+            state.last_scan_buf_id = buf.id
+            state.last_scan_ver = buf.edit_version
+            state.last_conflict_count = state.conflict_count(buf.id)
             return
+        }
+        let prev_cnt = if state.last_scan_buf_id == buf.id {
+            state.last_conflict_count
+        } else {
+            state.conflict_count(buf.id)
+        }
+        let prev_lcount_opt = state.last_lcount_by_buf.get(buf.id)
+        if prev_ver_opt != null and prev_cnt == 0 and prev_lcount_opt != null {
+            let ldelta = lcount - prev_lcount_opt.as(i64)
+            if ldelta == 0 or ldelta == 1 {
+                let cur_line = buf.line_at(buf.point.row)
+                let prev_ok = if ldelta == 1 and buf.point.row > 0 {
+                    not line_starts_conflict_marker(buf.line_at(buf.point.row - 1))
+                } else {
+                    true
+                }
+                if (not line_starts_conflict_marker(cur_line)) and prev_ok {
+                    state.last_ver_by_buf.insert(buf.id, buf.edit_version)
+                    state.last_lcount_by_buf.insert(buf.id, lcount)
+                    state.last_scan_buf_id = buf.id
+                    state.last_scan_ver = buf.edit_version
+                    state.last_conflict_count = 0
+                    return
+                }
+            }
         }
     }
     state.last_ver_by_buf.insert(buf.id, buf.edit_version)
+    state.last_lcount_by_buf.insert(buf.id, lcount)
     let raw_hits = accel_doc_scan_conflicts(buf.doc_id, 500)
     let blocks = List()
     for i in 0..raw_hits.len() {
@@ -297,6 +345,9 @@ pub fn refresh_buffer_conflicts(state: GitConflictState, buf: Buffer, .force: bo
         })
     }
     state.conflicts_by_buf.insert(buf.id, blocks)
+    state.last_scan_buf_id = buf.id
+    state.last_scan_ver = buf.edit_version
+    state.last_conflict_count = blocks.len()
     decorate_conflict_blocks(buf, blocks)
 }
 
@@ -588,6 +639,10 @@ pub fn register_git_conflict_extension(kernel: SystemKernel) -> !String Unit {
                 "buffer-modified",
                 ext_id,
                 |kern: SystemKernel, payload: Any| {
+                    let w_opt = kern.service("lava.document.world")
+                    if w_opt != null and w_opt.as(EditorWorld).in_key_burst {
+                        return ()
+                    }
                     sync_payload_or_active(kern, payload, false)
                 },
             )
@@ -602,6 +657,10 @@ pub fn register_git_conflict_extension(kernel: SystemKernel) -> !String Unit {
                 "cursor-moved",
                 ext_id,
                 |kern: SystemKernel, payload: Any| {
+                    let w_opt = kern.service("lava.document.world")
+                    if w_opt != null and w_opt.as(EditorWorld).in_key_burst {
+                        return ()
+                    }
                     sync_payload_or_active(kern, payload, false)
                 },
             )
@@ -617,8 +676,11 @@ pub fn register_git_conflict_extension(kernel: SystemKernel) -> !String Unit {
                 ext_id,
                 |kern: SystemKernel, _payload: Any| {
                     let w_opt = kern.service("lava.document.world")
-                    if w_opt != null and w_opt.as(EditorWorld).active_buffer().line_count() > 2000 {
-                        return
+                    if w_opt != null {
+                        let w = w_opt.as(EditorWorld)
+                        if w.in_key_burst or w.active_buffer().line_count() > 2000 {
+                            return ()
+                        }
                     }
                     sync_payload_or_active(kern, (), false)
                 },

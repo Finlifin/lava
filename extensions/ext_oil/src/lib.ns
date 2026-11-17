@@ -133,7 +133,7 @@ fn parse_oil_id_prefix(trimmed_line: String) -> ?(i64, String) {
             return null
         }
     }
-    let num_opt = trimmed_line.slice(1, j).parse_i64()
+    let num_opt = trimmed_line.slice(1, j).try_parse(i64)
     if num_opt == null {
         return null
     }
@@ -177,7 +177,7 @@ fn populate_oil_buffer(
         if (not state.show_hidden) and e.name.starts_with(".") {
             continue
         }
-        if e.is_dir {
+        if e.is_dir() {
             dirs.push(e)
         } else {
             files.push(e)
@@ -216,7 +216,7 @@ fn populate_oil_buffer(
             name: d.name,
             full_path: path.normalize(d.path),
             is_dir: true,
-            is_symlink: d.is_symlink,
+            is_symlink: d.is_symlink(),
         }
         entries_by_id.insert(id, oe)
         entry_order.push(id)
@@ -235,7 +235,7 @@ fn populate_oil_buffer(
             name: f.name,
             full_path: path.normalize(f.path),
             is_dir: false,
-            is_symlink: f.is_symlink,
+            is_symlink: f.is_symlink(),
         }
         entries_by_id.insert(id, oe)
         entry_order.push(id)
@@ -255,14 +255,14 @@ fn populate_oil_buffer(
     let buf = if existing_opt != null {
         let b = existing_opt.as(Buffer)
         b.read_only = false
-        b.kind = BufferKind.Directory
+        b.kind = BufferKind.directory
         b.major_mode = "oil"
         b.set_lines(lines, record_undo = false)
         b
     } else {
         world.create_buffer(
             buf_name,
-            BufferKind.Directory,
+            BufferKind.directory,
             major_mode = "oil",
             initial_lines = lines,
         )
@@ -310,7 +310,7 @@ pub fn open_oil_directory(
     let vim_opt = kernel.service("lava.vim.state")
     if vim_opt != null {
         let vs = vim_opt.as(VimState)
-        vs.mode = VimMode.Normal
+        vs.mode = VimMode.normal
         vs.clear_transient()
         sync_world_from_vim(world, vs)
     }
@@ -325,7 +325,7 @@ fn ensure_parent_dirs(full_path: String) -> !String Unit {
     if p_opt != null {
         let pdir = p_opt.as(String)
         if pdir != "" and (not fs.exists(pdir)) {
-            let res = fs.create_dir_all(pdir)
+            let res = fs.create_dir(pdir, parents = true)
             res match {
                 _! => (),
                 error err => return error ("Oil mkdir failed for " ++ pdir ++ ": " ++ err.to_string()),
@@ -427,10 +427,10 @@ fn apply_oil_buffer_changes(kernel: SystemKernel, buf: Buffer) -> #[log_event, s
             continue
         }
         if ent.is_dir {
-            let rm_res = fs.remove_dir_all(ent.full_path)
+            let rm_res = fs.remove_dir(ent.full_path, recursive = true)
             rm_res match {
                 _! => { deleted_count += 1 },
-                error err => return error ("Oil remove_dir_all failed (" ++ ent.full_path ++ "): " ++ err.to_string()),
+                error err => return error ("Oil remove_dir failed (" ++ ent.full_path ++ "): " ++ err.to_string()),
             }
         } else {
             let rm_res = fs.remove_file(ent.full_path)
@@ -502,10 +502,10 @@ fn apply_oil_buffer_changes(kernel: SystemKernel, buf: Buffer) -> #[log_event, s
         }
         let target_full = resolve_oil_child_path(snap.dir_path, clean_spec)
         if is_dir_spec {
-            let mk_res = fs.create_dir_all(target_full)
+            let mk_res = fs.create_dir(target_full, parents = true)
             mk_res match {
                 _! => { created_count += 1 },
-                error err => return error ("Oil create_dir_all failed (" ++ target_full ++ "): " ++ err.to_string()),
+                error err => return error ("Oil create_dir failed (" ++ target_full ++ "): " ++ err.to_string()),
             }
         } else {
             ensure_parent_dirs(target_full)!

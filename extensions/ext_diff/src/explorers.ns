@@ -56,10 +56,10 @@ pub fn split_file_text_lines(raw: String) -> List {
 }
 
 fn verify_git_rev(repo_root: String, rev: String) -> bool {
-    let out! = process.exec("git", args = ["rev-parse", "--verify", rev], cwd = repo_root) else {
+    let out! = process.run("git", args = ["rev-parse", "--verify", rev], cwd = repo_root) else {
         return false
     }
-    out.success()
+    out.is_success()
 }
 
 pub fn fetch_git_revision_lines(
@@ -102,10 +102,10 @@ pub fn fetch_git_revision_lines(
         return error ("Unknown Git revision: " ++ target_rev)
     }
 
-    let out! = process.exec("git", args = ["show", target_rev ++ ":" ++ rel], cwd = st.root) else {
+    let out! = process.run("git", args = ["show", target_rev ++ ":" ++ rel], cwd = st.root) else {
         return (st.root, rel, List())
     }
-    if out.success() {
+    if out.is_success() {
         return (st.root, rel, split_stdio_output_lines(out.stdout))
     }
     (st.root, rel, List())
@@ -153,14 +153,14 @@ pub fn scan_git_diffview_entries(
     let seen = Set.new()
 
     if rev.trim() != "" and rev.trim() != "HEAD" {
-        let out = process.exec(
+        let out = process.run(
             "git",
             args = ["diff", "--name-status", target_rev],
             cwd = st.root,
         ) ! {
             _ => process.CommandOutput { status: -1, stdout: "", stderr: "" },
         }
-        if out.success() {
+        if out.is_success() {
             let lines = split_stdio_output_lines(out.stdout)
             for i in 0..lines.len() {
                 let ln = lines.get(i.as(usize)).as(String)

@@ -98,7 +98,7 @@ fn test_ext_surround() -> #[log_event, status_emit, clipboard_get, clipboard_set
     let buf = setup_buffer(world, "nessa", ["let greeting = hello"])
     vim_feed_keys(kernel, "$bysiw\"")#!
     assert_str_eq(buf.line_at(0), "let greeting = \"hello\"", "ysiw\" wraps identifier")
-    assert_true(vim.mode == VimMode.Normal, "ysiw\" returns to Normal mode")
+    assert_true(vim.mode == VimMode.normal, "ysiw\" returns to Normal mode")
     vim_feed_keys(kernel, "u")#!
     assert_str_eq(buf.line_at(0), "let greeting = hello", "single u undoes ysiw\"")
     vim_feed_keys(kernel, "<C-r>")#!
@@ -140,7 +140,7 @@ fn test_ext_surround() -> #[log_event, status_emit, clipboard_get, clipboard_set
     let vbuf = setup_buffer(world, "nessa", ["first target_token last"])
     vim_feed_keys(kernel, "wviwS]")#!
     assert_str_eq(vbuf.line_at(0), "first [target_token] last", "Visual viwS] wraps selection")
-    assert_true(vim.mode == VimMode.Normal, "Visual S returns to Normal mode")
+    assert_true(vim.mode == VimMode.normal, "Visual S returns to Normal mode")
     vim_feed_keys(kernel, "u")#!
     assert_str_eq(vbuf.line_at(0), "first target_token last", "single u undoes viwS]")
 
@@ -251,7 +251,7 @@ fn test_ext_comment() -> #[log_event, status_emit, clipboard_get, clipboard_set]
         "    done();"
     ])
     vim_feed_keys(kernel, "ggV3jgc")#!
-    assert_true(vim.mode == VimMode.Normal, "Visual gc returns to Normal mode")
+    assert_true(vim.mode == VimMode.normal, "Visual gc returns to Normal mode")
     assert_str_eq(vbuf.line_at(0), "    // if ready {{", "Visual gc row 0 at col 4")
     assert_str_eq(vbuf.line_at(1), "    //     run_step();", "Visual gc row 1 preserves relative indent")
     assert_str_eq(vbuf.line_at(2), "", "Visual gc leaves blank line untouched")

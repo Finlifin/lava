@@ -9,6 +9,7 @@ use std.fs
 use std.path
 use std.process
 use std.time
+
 use @lava_core.{
     ExtId, InteractiveEffects, KeyBindingEntry, Keymap, SystemKernel, log_event, status_emit
 }
@@ -180,16 +181,16 @@ fn builtin_formatter_name(mode: String) -> String {
 -- ============================================================================
 
 enum JsonTokKind {
-    LBrace,
-    RBrace,
-    LBracket,
-    RBracket,
-    Colon,
-    Comma,
-    Str,
-    Num,
-    BoolLit,
-    NullLit,
+    l_brace,
+    r_brace,
+    l_bracket,
+    r_bracket,
+    colon,
+    comma,
+    str,
+    num,
+    bool_lit,
+    null_lit,
 }
 derive Eq, PartialEq for JsonTokKind
 
@@ -201,9 +202,9 @@ struct JsonToken {
 }
 
 enum JsonNode {
-    Obj(entries: List),
-    Arr(items: List),
-    Scalar(raw: String),
+    obj(entries: List),
+    arr(items: List),
+    scalar(raw: String),
 }
 
 struct JsonProp {
@@ -253,37 +254,37 @@ fn tokenize_json(src: String) -> !String List {
             continue
         }
         if ch == "{{" {
-            tokens.push(JsonToken { kind: JsonTokKind.LBrace, raw: "{{", line: line, col: col })
+            tokens.push(JsonToken { kind: JsonTokKind.l_brace, raw: "{{", line: line, col: col })
             i += 1
             col += 1
             continue
         }
         if ch == "}}" {
-            tokens.push(JsonToken { kind: JsonTokKind.RBrace, raw: "}}", line: line, col: col })
+            tokens.push(JsonToken { kind: JsonTokKind.r_brace, raw: "}}", line: line, col: col })
             i += 1
             col += 1
             continue
         }
         if ch == "[" {
-            tokens.push(JsonToken { kind: JsonTokKind.LBracket, raw: "[", line: line, col: col })
+            tokens.push(JsonToken { kind: JsonTokKind.l_bracket, raw: "[", line: line, col: col })
             i += 1
             col += 1
             continue
         }
         if ch == "]" {
-            tokens.push(JsonToken { kind: JsonTokKind.RBracket, raw: "]", line: line, col: col })
+            tokens.push(JsonToken { kind: JsonTokKind.r_bracket, raw: "]", line: line, col: col })
             i += 1
             col += 1
             continue
         }
         if ch == ":" {
-            tokens.push(JsonToken { kind: JsonTokKind.Colon, raw: ":", line: line, col: col })
+            tokens.push(JsonToken { kind: JsonTokKind.colon, raw: ":", line: line, col: col })
             i += 1
             col += 1
             continue
         }
         if ch == "," {
-            tokens.push(JsonToken { kind: JsonTokKind.Comma, raw: ",", line: line, col: col })
+            tokens.push(JsonToken { kind: JsonTokKind.comma, raw: ",", line: line, col: col })
             i += 1
             col += 1
             continue
@@ -360,7 +361,7 @@ fn tokenize_json(src: String) -> !String List {
                 )
             }
             tokens.push(JsonToken {
-                kind: JsonTokKind.Str,
+                kind: JsonTokKind.str,
                 raw: src.slice(start_i, i),
                 line: start_line,
                 col: start_col,
@@ -437,7 +438,7 @@ fn tokenize_json(src: String) -> !String List {
                 )
             }
             tokens.push(JsonToken {
-                kind: JsonTokKind.Num,
+                kind: JsonTokKind.num,
                 raw: src.slice(start_i, i),
                 line: line,
                 col: start_col,
@@ -448,21 +449,21 @@ fn tokenize_json(src: String) -> !String List {
         -- Keywords `true`, `false`, `null`
         if i + 4 <= n and src.slice(i, i + 4) == "true"
             and (i + 4 == n or is_json_delim_or_ws(src.slice(i + 4, i + 5))) {
-            tokens.push(JsonToken { kind: JsonTokKind.BoolLit, raw: "true", line: line, col: col })
+            tokens.push(JsonToken { kind: JsonTokKind.bool_lit, raw: "true", line: line, col: col })
             i += 4
             col += 4
             continue
         }
         if i + 5 <= n and src.slice(i, i + 5) == "false"
             and (i + 5 == n or is_json_delim_or_ws(src.slice(i + 5, i + 6))) {
-            tokens.push(JsonToken { kind: JsonTokKind.BoolLit, raw: "false", line: line, col: col })
+            tokens.push(JsonToken { kind: JsonTokKind.bool_lit, raw: "false", line: line, col: col })
             i += 5
             col += 5
             continue
         }
         if i + 4 <= n and src.slice(i, i + 4) == "null"
             and (i + 4 == n or is_json_delim_or_ws(src.slice(i + 4, i + 5))) {
-            tokens.push(JsonToken { kind: JsonTokKind.NullLit, raw: "null", line: line, col: col })
+            tokens.push(JsonToken { kind: JsonTokKind.null_lit, raw: "null", line: line, col: col })
             i += 4
             col += 4
             continue
@@ -483,19 +484,19 @@ fn parse_json_value(tokens: List, cur: JsonCursor) -> !String JsonNode {
     let tok = tokens.get(cur.pos.as(usize)).as(JsonToken)
     cur.pos += 1
 
-    if tok.kind == JsonTokKind.Str
-        or tok.kind == JsonTokKind.Num
-        or tok.kind == JsonTokKind.BoolLit
-        or tok.kind == JsonTokKind.NullLit {
-        return JsonNode.Scalar(tok.raw)
+    if tok.kind == JsonTokKind.str
+        or tok.kind == JsonTokKind.num
+        or tok.kind == JsonTokKind.bool_lit
+        or tok.kind == JsonTokKind.null_lit {
+        return JsonNode.scalar(tok.raw)
     }
 
-    if tok.kind == JsonTokKind.LBrace {
+    if tok.kind == JsonTokKind.l_brace {
         let entries = List()
         if cur.pos < tokens.len()
-            and tokens.get(cur.pos.as(usize)).as(JsonToken).kind == JsonTokKind.RBrace {
+            and tokens.get(cur.pos.as(usize)).as(JsonToken).kind == JsonTokKind.r_brace {
             cur.pos += 1
-            return JsonNode.Obj(entries)
+            return JsonNode.obj(entries)
         }
         while true {
             if cur.pos >= tokens.len() {
@@ -505,7 +506,7 @@ fn parse_json_value(tokens: List, cur: JsonCursor) -> !String JsonNode {
                 )
             }
             let key_tok = tokens.get(cur.pos.as(usize)).as(JsonToken)
-            if key_tok.kind != JsonTokKind.Str {
+            if key_tok.kind != JsonTokKind.str {
                 return error (
                     "Malformed JSON at line " ++ key_tok.line.to_string()
                     ++ ", col " ++ key_tok.col.to_string()
@@ -517,7 +518,7 @@ fn parse_json_value(tokens: List, cur: JsonCursor) -> !String JsonNode {
                 return error "Malformed JSON: expected ':' after object key"
             }
             let colon_tok = tokens.get(cur.pos.as(usize)).as(JsonToken)
-            if colon_tok.kind != JsonTokKind.Colon {
+            if colon_tok.kind != JsonTokKind.colon {
                 return error (
                     "Malformed JSON at line " ++ colon_tok.line.to_string()
                     ++ ", col " ++ colon_tok.col.to_string()
@@ -535,14 +536,14 @@ fn parse_json_value(tokens: List, cur: JsonCursor) -> !String JsonNode {
                 )
             }
             let sep_tok = tokens.get(cur.pos.as(usize)).as(JsonToken)
-            if sep_tok.kind == JsonTokKind.RBrace {
+            if sep_tok.kind == JsonTokKind.r_brace {
                 cur.pos += 1
                 break
             }
-            if sep_tok.kind == JsonTokKind.Comma {
+            if sep_tok.kind == JsonTokKind.comma {
                 cur.pos += 1
                 if cur.pos < tokens.len()
-                    and tokens.get(cur.pos.as(usize)).as(JsonToken).kind == JsonTokKind.RBrace {
+                    and tokens.get(cur.pos.as(usize)).as(JsonToken).kind == JsonTokKind.r_brace {
                     let rb = tokens.get(cur.pos.as(usize)).as(JsonToken)
                     return error (
                         "Malformed JSON at line " ++ rb.line.to_string()
@@ -557,15 +558,15 @@ fn parse_json_value(tokens: List, cur: JsonCursor) -> !String JsonNode {
                 ++ ": expected ',' or '}}' in object, got '" ++ sep_tok.raw ++ "'"
             )
         }
-        return JsonNode.Obj(entries)
+        return JsonNode.obj(entries)
     }
 
-    if tok.kind == JsonTokKind.LBracket {
+    if tok.kind == JsonTokKind.l_bracket {
         let items = List()
         if cur.pos < tokens.len()
-            and tokens.get(cur.pos.as(usize)).as(JsonToken).kind == JsonTokKind.RBracket {
+            and tokens.get(cur.pos.as(usize)).as(JsonToken).kind == JsonTokKind.r_bracket {
             cur.pos += 1
-            return JsonNode.Arr(items)
+            return JsonNode.arr(items)
         }
         while true {
             let item = parse_json_value(tokens, cur)!
@@ -577,14 +578,14 @@ fn parse_json_value(tokens: List, cur: JsonCursor) -> !String JsonNode {
                 )
             }
             let sep_tok = tokens.get(cur.pos.as(usize)).as(JsonToken)
-            if sep_tok.kind == JsonTokKind.RBracket {
+            if sep_tok.kind == JsonTokKind.r_bracket {
                 cur.pos += 1
                 break
             }
-            if sep_tok.kind == JsonTokKind.Comma {
+            if sep_tok.kind == JsonTokKind.comma {
                 cur.pos += 1
                 if cur.pos < tokens.len()
-                    and tokens.get(cur.pos.as(usize)).as(JsonToken).kind == JsonTokKind.RBracket {
+                    and tokens.get(cur.pos.as(usize)).as(JsonToken).kind == JsonTokKind.r_bracket {
                     let rb = tokens.get(cur.pos.as(usize)).as(JsonToken)
                     return error (
                         "Malformed JSON at line " ++ rb.line.to_string()
@@ -599,7 +600,7 @@ fn parse_json_value(tokens: List, cur: JsonCursor) -> !String JsonNode {
                 ++ ": expected ',' or ']' in array, got '" ++ sep_tok.raw ++ "'"
             )
         }
-        return JsonNode.Arr(items)
+        return JsonNode.arr(items)
     }
 
     error (
@@ -618,10 +619,10 @@ fn render_json_node(
 ) {
     let pad = unit.repeat(depth)
     node match {
-        JsonNode.Scalar(raw) => {
+        JsonNode.scalar(raw) => {
             out_lines.push(pad ++ prefix ++ raw ++ suffix)
         },
-        JsonNode.Obj(entries) => {
+        JsonNode.obj(entries) => {
             if entries.is_empty() {
                 out_lines.push(pad ++ prefix ++ "{{}}" ++ suffix)
             } else {
@@ -642,7 +643,7 @@ fn render_json_node(
                 out_lines.push(pad ++ "}}" ++ suffix)
             }
         },
-        JsonNode.Arr(items) => {
+        JsonNode.arr(items) => {
             if items.is_empty() {
                 out_lines.push(pad ++ prefix ++ "[]" ++ suffix)
             } else {
@@ -1052,21 +1053,17 @@ fn run_external_formatter(spec: ExternalFormatterSpec, lines: List, cwd: String)
             full_args.push(a)
         }
     }
-    let exec_res = process.exec(spec.command, args = full_args, cwd = cwd)
+    let exec_res = process.run(spec.command, args = full_args, cwd = cwd)
     let _ = fs.remove_file(tmp_path) ! { _ => () }
     exec_res match {
         out! => {
-            if out.status != 0 {
+            if not out.is_success() {
                 return error (
                     spec.name ++ " exited with status " ++ out.status.to_string()
                     ++ ": " ++ out.stderr.trim()
                 )
             }
-            let norm = out.stdout.replace("\r\n", "\n").replace("\r", "\n")
-            let parts = norm.split("\n")
-            if parts.len() > 1 and norm.ends_with("\n") {
-                let _ = parts.pop()
-            }
+            let parts = out.stdout.lines()
             if parts.is_empty() {
                 parts.push("")
             }
@@ -1168,7 +1165,7 @@ fn apply_format_to_buffer_pure(
     start_row: i64,
     end_row: i64,
 ) -> !String bool {
-    if buf.kind == BufferKind.Directory or buf.kind == BufferKind.Special or buf.read_only {
+    if buf.kind == BufferKind.directory or buf.kind == BufferKind.special or buf.read_only {
         return error ("Buffer '" ++ buf.name ++ "' is not a writable document buffer")
     }
     buf.ensure_writable()!
@@ -1288,21 +1285,21 @@ fn execute_conform_command(kern: SystemKernel, args: List) -> #InteractiveEffect
 
     var lo = buf.min_row()
     var hi = buf.max_row()
-    let in_visual = vim.mode == VimMode.VisualChar
-        or vim.mode == VimMode.VisualLine
-        or vim.mode == VimMode.VisualBlock
+    let in_visual = vim.mode == VimMode.visual_char
+        or vim.mode == VimMode.visual_line
+        or vim.mode == VimMode.visual_block
 
     if in_visual {
         let r1 = vim.visual_anchor.row
         let r2 = buf.point.row
         lo = if r1 <= r2 { r1 } else { r2 }
         hi = if r1 <= r2 { r2 } else { r1 }
-        vim.mode = VimMode.Normal
+        vim.mode = VimMode.normal
         vim.clear_transient()
         sync_world_from_vim(world, vim)
     } else if args.len() >= 2 {
-        let a0_opt = args.get(0).as(String).trim().parse_i64()
-        let a1_opt = args.get(1).as(String).trim().parse_i64()
+        let a0_opt = args.get(0).as(String).trim().try_parse(i64)
+        let a1_opt = args.get(1).as(String).trim().try_parse(i64)
         if a0_opt != null and a1_opt != null {
             let r1 = a0_opt.as(i64) - 1
             let r2 = a1_opt.as(i64) - 1
@@ -1335,7 +1332,7 @@ fn on_buffer_will_save(k: SystemKernel, payload: Any) {
     let buf? = world.buffer(bid) else {
         return
     }
-    if buf.kind == BufferKind.Directory or buf.kind == BufferKind.Special or buf.read_only {
+    if buf.kind == BufferKind.directory or buf.kind == BufferKind.special or buf.read_only {
         return
     }
     -- Catch formatting errors (e.g. malformed JSON) cleanly so disk save never corrupts `buf.lines`
@@ -1453,7 +1450,7 @@ pub fn register_conform_extension(kernel: SystemKernel) -> !String Unit {
                         read_only = true,
                     )
                     let _ = world.switch_to_buffer(ibuf.id)
-                    vim.mode = VimMode.Normal
+                    vim.mode = VimMode.normal
                     vim.clear_transient()
                     sync_world_from_vim(world, vim)
                     kern.emit_hook("buffer-switched", ibuf.id)
@@ -1480,7 +1477,7 @@ pub fn register_conform_extension(kernel: SystemKernel) -> !String Unit {
                     } else {
                         let _ = world.cycle_buffer(-1)
                     }
-                    vim.mode = VimMode.Normal
+                    vim.mode = VimMode.normal
                     vim.clear_transient()
                     sync_world_from_vim(world, vim)
                     kern.emit_hook("buffer-switched", world.active_buffer_id)

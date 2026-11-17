@@ -1,12 +1,12 @@
 -- Standalone verification suite for `lava_sys`, `lava_core`, and `ext_document`.
 
-use std.process.{assert, assert_eq}
 use @lava_sys.{mock_enable}
 use @lava_core.{
-    ExtId, ExtState, HostClipboardCap, InteractiveEffects, KeyLookup, KeyStroke,
-    LogCollectorCap, PromptKind, PromptRequest, PromptTurn, StatusCollectorCap, SystemKernel,
-    ask_prompt, clipboard_get, clipboard_set, format_chord, log_event, parse_key_sequence,
-    status_emit
+    BgJobResult, BgJobSpec, ExtId, ExtState, HostClipboardCap, InteractiveEffects, KeyLookup,
+    KeyStroke, LogCollectorCap, PromptKind, PromptRequest, PromptTurn, StatusCollectorCap,
+    SystemKernel, ask_prompt, clipboard_get, clipboard_set, format_chord, log_event,
+    parse_key_sequence, run_bg_jobs_parallel, sleep_ticks, spawn_bg_job, status_emit,
+    with_libuv_async
 }
 use @ext_document.{
     BufferId, BufferKind, Pos, QuickfixEntry, RegisterValue, Span, ext_document_id,
@@ -94,7 +94,7 @@ fn test_continuation_prompts_and_capabilities() {
             let second? = ask_prompt(PromptRequest {
                 label: "Second (" ++ first ++ "): ",
                 initial: "",
-                kind: PromptKind.FreeText,
+                kind: PromptKind.free_text,
                 candidates: List(),
             })# else {
                 status_emit("Cancelled at 2")#
@@ -111,26 +111,26 @@ fn test_continuation_prompts_and_capabilities() {
 
     let t1 = k.dispatch_command("rename-pair", [])# ! { e => panic(e) }
     t1 match {
-        PromptTurn.Suspended(req1, _) => assert_eq(req1.label, "First: "),
+        PromptTurn.suspended(req1, _) => assert_eq(req1.label, "First: "),
         _ => panic("expected first suspension"),
     }
 
     let t2 = k.submit_prompt_answer("alpha")# ! { e => panic(e) }
     t2 match {
-        PromptTurn.Suspended(req2, _) => assert_eq(req2.label, "Second (alpha): "),
+        PromptTurn.suspended(req2, _) => assert_eq(req2.label, "Second (alpha): "),
         _ => panic("expected second suspension"),
     }
 
     let t3 = k.submit_prompt_answer("omega")# ! { e => panic(e) }
     t3 match {
-        PromptTurn.Completed(val) => assert_eq(val.as(String), "alpha:omega"),
+        PromptTurn.completed(val) => assert_eq(val.as(String), "alpha:omega"),
         _ => panic("expected completion"),
     }
     assert_eq(status.latest, "Joined: alpha->omega")
 
     -- Also verify synchronous non-suspending `dispatch_command` (`next-buffer`, `undo`) and error propagation!
     let sync_turn = k.dispatch_command("next-buffer", [])# ! { e => panic(e) }
-    assert(sync_turn matches PromptTurn.Completed(_))
+    assert(sync_turn matches PromptTurn.completed(_))
     let err_res = k.dispatch_command("nonexistent-cmd", [])# ! { _ => error "missing_caught" } ! { e => e }
     assert_eq(err_res, "missing_caught")
     let _ = logger
@@ -146,7 +146,7 @@ fn test_buffer_undo_tree_narrowing_and_registers() {
 
     let buf = world.create_buffer(
         "demo.ns",
-        BufferKind.File,
+        BufferKind.file,
         major_mode = "nessa",
         initial_lines = ["fn alpha() {{", "    let x = 1", "}}"],
     )
@@ -200,9 +200,9 @@ fn test_buffer_undo_tree_narrowing_and_registers() {
     let km = k.ensure_keymap("global")
     km.bind("<C-x> <C-f>", "find-file", ext_document_id())
     let pfx = km.lookup([seq.get(0).as(KeyStroke)])
-    assert(pfx matches KeyLookup.Prefix(_))
+    assert(pfx matches KeyLookup.prefix(_))
     let exact = km.lookup(seq)
-    assert(exact matches KeyLookup.Exact(_, _))
+    assert(exact matches KeyLookup.exact(_, _))
 
     let qf = parse_quickfix_line("src/main.ns:12:5: undefined symbol").as(QuickfixEntry)
     assert_eq(qf.file_path, "src/main.ns")
@@ -210,10 +210,39 @@ fn test_buffer_undo_tree_narrowing_and_registers() {
     assert_eq(qf.col, 4)
 }
 
+fn test_libuv_async_effects_and_parallel_bg_jobs() {
+    let ts_val = with_libuv_async(|| -> #[spawn_bg_job, sleep_ticks] Any {
+        let tick_fut = sleep_ticks(5)#
+        let job_fut = spawn_bg_job(BgJobSpec {
+            command: "printf 'libuv_async_ok'",
+            cwd: "",
+            stdin_text: "",
+        })#
+        let tick_ms = tick_fut.await
+        let job_res = job_fut.await
+        assert(tick_ms > 0)
+        assert(job_res.ok)
+        assert_eq(job_res.stdout, "libuv_async_ok")
+        tick_ms
+    }).as(i64)
+    assert(ts_val > 0)
+
+    let batch = run_bg_jobs_parallel([
+        BgJobSpec { command: "printf 'alpha'", cwd: "", stdin_text: "" },
+        BgJobSpec { command: "cat", cwd: "", stdin_text: "beta_stdin" },
+    ], timeout_ms = 5000)
+    assert_eq(batch.len(), 2)
+    let r0 = batch.get(0).as(BgJobResult)
+    let r1 = batch.get(1).as(BgJobResult)
+    assert(r0.ok and r0.stdout == "alpha")
+    assert(r1.ok and r1.stdout == "beta_stdin")
+}
+
 fn main() -> i64 {
     test_extension_dag_and_lifecycle()
     test_continuation_prompts_and_capabilities()
     test_buffer_undo_tree_narrowing_and_registers()
+    test_libuv_async_effects_and_parallel_bg_jobs()
     println("test_core_doc: ALL PASSED")
     0
 }

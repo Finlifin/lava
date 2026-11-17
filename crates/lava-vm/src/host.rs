@@ -1,9 +1,10 @@
 //! [`LavaHostHandler`] implementing [`interpreter::HostHandler`] for all 12 `lava_sys` ops,
 //! plus cooperative single-VM suspension/wakeup driving.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::sync::atomic::{AtomicBool, Ordering, fence};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,11 +16,12 @@ use lava_remote::{
 };
 use lava_term::PtyManager;
 use runtime::TaskId;
+use scheduler::Scheduler;
 
-use crate::jobs::JobManager;
+use crate::jobs::{JobManager, schedule_deadline_callback};
 use crate::wire::{
     expect_bool, expect_f64, expect_i64, expect_list, expect_str, parse_commit_frame_args,
-    ui_event_to_native,
+    parse_commit_frame_bytes_args, parse_commit_frame_flat_args, ui_event_to_native,
 };
 
 /// Host font-measurement callback signature (`(family, size_pt) -> FontMetrics`).
@@ -175,6 +177,81 @@ impl HostConfig {
     }
 }
 
+struct ParkedUiWaiter {
+    task_id: TaskId,
+    token: u64,
+    deadline: Option<Instant>,
+    counted_in_scheduler: bool,
+}
+
+struct HostWaitInner {
+    scheduler: Option<Scheduler>,
+    next_token: u64,
+    parked: Vec<ParkedUiWaiter>,
+    woken_tasks: HashSet<TaskId>,
+}
+
+impl HostWaitInner {
+    fn new() -> Self {
+        Self {
+            scheduler: None,
+            next_token: 1,
+            parked: Vec::new(),
+            woken_tasks: HashSet::new(),
+        }
+    }
+}
+
+fn wake_waiters_on_event_or_quit(wait_inner: &Mutex<HostWaitInner>, event_queue: &EventQueue) {
+    let quit_requested = event_queue.quit_code().is_some();
+    let (sched_opt, to_wake) = {
+        let mut guard = wait_inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sched_opt = guard.scheduler.clone();
+        let popped: Vec<ParkedUiWaiter> = if quit_requested {
+            std::mem::take(&mut guard.parked)
+        } else if !guard.parked.is_empty() {
+            vec![guard.parked.remove(0)]
+        } else {
+            Vec::new()
+        };
+        for w in &popped {
+            guard.woken_tasks.insert(w.task_id);
+        }
+        (sched_opt, popped)
+    };
+    if let Some(sched) = sched_opt {
+        for w in to_wake {
+            let _ = sched.wake(w.task_id);
+            if w.counted_in_scheduler {
+                sched.dec_active_io();
+            }
+        }
+    }
+}
+
+fn wake_waiter_on_deadline(wait_inner: &Mutex<HostWaitInner>, token: u64) {
+    let (sched_opt, popped_opt) = {
+        let mut guard = wait_inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(idx) = guard.parked.iter().position(|w| w.token == token) {
+            let w = guard.parked.remove(idx);
+            guard.woken_tasks.insert(w.task_id);
+            (guard.scheduler.clone(), Some(w))
+        } else {
+            (None, None)
+        }
+    };
+    if let (Some(sched), Some(w)) = (sched_opt, popped_opt) {
+        let _ = sched.wake(w.task_id);
+        if w.counted_in_scheduler {
+            sched.dec_active_io();
+        }
+    }
+}
+
 /// Shared wakeup coordination handle between [`LavaHostHandler`] and the outer VM run loop.
 #[derive(Clone)]
 pub struct HostWaitController {
@@ -183,9 +260,56 @@ pub struct HostWaitController {
     ptys: Arc<PtyManager>,
     lsps: Arc<LspManager>,
     remotes: Arc<RemoteManager>,
-    waiting_tasks: Arc<Mutex<Vec<WaitingTaskEntry>>>,
-    pending_events: Arc<Mutex<VecDeque<UiEvent>>>,
-    woken_tasks: Arc<Mutex<HashSet<TaskId>>>,
+    wait_inner: Arc<Mutex<HostWaitInner>>,
+}
+
+impl HostWaitController {
+    fn attach_scheduler(&self, scheduler: Scheduler) {
+        {
+            let mut guard = self
+                .wait_inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for w in &mut guard.parked {
+                if !w.counted_in_scheduler {
+                    scheduler.inc_active_io();
+                    w.counted_in_scheduler = true;
+                }
+            }
+            guard.scheduler = Some(scheduler);
+        }
+        let wait_inner = Arc::clone(&self.wait_inner);
+        let eq = Arc::clone(&self.event_queue);
+        self.event_queue.set_push_waker(Some(Arc::new(move || {
+            wake_waiters_on_event_or_quit(&wait_inner, &eq);
+        })));
+        if self.event_queue.has_pending_or_quit() {
+            wake_waiters_on_event_or_quit(&self.wait_inner, &self.event_queue);
+        }
+    }
+
+    fn detach_scheduler(&self) {
+        self.event_queue.set_push_waker(None);
+        let (sched_opt, remaining_counted) = {
+            let mut guard = self
+                .wait_inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let sched_opt = guard.scheduler.take();
+            let count = guard
+                .parked
+                .drain(..)
+                .filter(|w| w.counted_in_scheduler)
+                .count();
+            guard.woken_tasks.clear();
+            (sched_opt, count)
+        };
+        if let Some(sched) = sched_opt {
+            for _ in 0..remaining_counted {
+                sched.dec_active_io();
+            }
+        }
+    }
 }
 
 /// Flat host bridge implementing all `lava_sys` operations for a single Nessa VM.
@@ -199,17 +323,14 @@ pub struct LavaHostHandler {
     srv_stdin_reader: Mutex<Option<BufReader<std::io::Stdin>>>,
     callbacks: HostCallbacks,
     boot_runtime: Option<BootRuntimeArgs>,
-    waiting_tasks: Arc<Mutex<Vec<WaitingTaskEntry>>>,
-    pending_events: Arc<Mutex<VecDeque<UiEvent>>>,
-    woken_tasks: Arc<Mutex<HashSet<TaskId>>>,
+    mock_mode: AtomicBool,
+    wait_inner: Arc<Mutex<HostWaitInner>>,
 }
 
 impl LavaHostHandler {
     /// Construct a [`LavaHostHandler`] and its paired [`HostWaitController`] from [`HostConfig`].
     pub fn from_config(config: HostConfig) -> (Self, HostWaitController, Vec<String>) {
-        let waiting_tasks = Arc::new(Mutex::new(Vec::new()));
-        let pending_events = Arc::new(Mutex::new(VecDeque::new()));
-        let woken_tasks = Arc::new(Mutex::new(HashSet::new()));
+        let wait_inner = Arc::new(Mutex::new(HostWaitInner::new()));
 
         let eq_for_pty = Arc::clone(&config.event_queue);
         config.ptys.set_waker(Arc::new(move || {
@@ -241,9 +362,7 @@ impl LavaHostHandler {
             ptys: Arc::clone(&config.ptys),
             lsps: Arc::clone(&config.lsps),
             remotes: Arc::clone(&config.remotes),
-            waiting_tasks: Arc::clone(&waiting_tasks),
-            pending_events: Arc::clone(&pending_events),
-            woken_tasks: Arc::clone(&woken_tasks),
+            wait_inner: Arc::clone(&wait_inner),
         };
 
         let handler = Self {
@@ -256,9 +375,8 @@ impl LavaHostHandler {
             srv_stdin_reader: Mutex::new(None),
             callbacks: config.callbacks,
             boot_runtime: config.boot_runtime,
-            waiting_tasks,
-            pending_events,
-            woken_tasks,
+            mock_mode: AtomicBool::new(false),
+            wait_inner,
         };
 
         (handler, controller, config.script_args)
@@ -276,20 +394,23 @@ impl LavaHostHandler {
         &self.jobs
     }
 
-    pub fn waiting_tasks(&self) -> &Arc<Mutex<Vec<WaitingTaskEntry>>> {
-        &self.waiting_tasks
+    pub fn waiting_tasks_snapshot(&self) -> Vec<WaitingTaskEntry> {
+        let guard = self
+            .wait_inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .parked
+            .iter()
+            .map(|w| (w.task_id, w.deadline))
+            .collect()
     }
 
     fn drain_all_available_events(&self) -> Vec<NativeValue> {
-        let fresh = self.event_queue.drain();
-        let mut pending = self
-            .pending_events
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        pending.extend(fresh);
-        pending
-            .drain(..)
-            .map(|ev| ui_event_to_native(&ev))
+        self.event_queue
+            .drain()
+            .iter()
+            .map(ui_event_to_native)
             .collect()
     }
 
@@ -305,17 +426,31 @@ impl LavaHostHandler {
             Err(err) => return HostCallOutcome::Error(err),
         };
 
-        let was_woken = self
-            .woken_tasks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&task_id);
-        {
-            let mut waiting = self
-                .waiting_tasks
+        let (was_woken, sched_opt, stale_counted) = {
+            let mut guard = self
+                .wait_inner
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            waiting.retain(|(tid, _)| *tid != task_id);
+            let woken = guard.woken_tasks.remove(&task_id);
+            let mut stale = 0usize;
+            guard.parked.retain(|w| {
+                if w.task_id == task_id {
+                    if w.counted_in_scheduler {
+                        stale += 1;
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+            (woken, guard.scheduler.clone(), stale)
+        };
+        if stale_counted > 0
+            && let Some(ref sched) = sched_opt
+        {
+            for _ in 0..stale_counted {
+                sched.dec_active_io();
+            }
         }
 
         let available = self.drain_all_available_events();
@@ -323,24 +458,76 @@ impl LavaHostHandler {
             return HostCallOutcome::Return(NativeValue::List(available));
         }
 
-        if timeout_ms <= 0 || was_woken {
+        if timeout_ms == 0 || was_woken {
             return HostCallOutcome::Return(NativeValue::List(Vec::new()));
         }
 
-        let clamped_ms = (timeout_ms as u64).min(86_400_000);
-        let deadline = Instant::now().checked_add(Duration::from_millis(clamped_ms));
-        {
-            let mut waiting = self
-                .waiting_tasks
+        let deadline = if timeout_ms < 0 {
+            None
+        } else {
+            let clamped_ms = (timeout_ms as u64).min(86_400_000);
+            Instant::now().checked_add(Duration::from_millis(clamped_ms))
+        };
+
+        let (token, counted) = {
+            let mut guard = self
+                .wait_inner
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            waiting.push((task_id, deadline));
+            let tok = guard.next_token;
+            guard.next_token = guard.next_token.wrapping_add(1);
+            let is_counted = if let Some(ref sched) = guard.scheduler {
+                sched.inc_active_io();
+                true
+            } else {
+                false
+            };
+            guard.parked.push(ParkedUiWaiter {
+                task_id,
+                token: tok,
+                deadline,
+                counted_in_scheduler: is_counted,
+            });
+            (tok, is_counted)
+        };
+
+        fence(Ordering::SeqCst);
+        if self.event_queue.has_pending_or_quit() {
+            wake_waiters_on_event_or_quit(&self.wait_inner, &self.event_queue);
+            return HostCallOutcome::SuspendRetry;
+        }
+
+        if counted && let Some(dl) = deadline {
+            let wait_arc = Arc::clone(&self.wait_inner);
+            schedule_deadline_callback(dl, move || {
+                wake_waiter_on_deadline(&wait_arc, token);
+            });
         }
         HostCallOutcome::SuspendRetry
     }
 
     fn handle_commit_frame(&self, args: &[NativeValue]) -> HostCallOutcome {
         match parse_commit_frame_args(args) {
+            Ok(frame) => {
+                let generation = self.frame_slot.commit(frame);
+                HostCallOutcome::Return(NativeValue::I64(generation as i64))
+            }
+            Err(err) => HostCallOutcome::Error(err),
+        }
+    }
+
+    fn handle_commit_frame_bytes(&self, args: &[NativeValue]) -> HostCallOutcome {
+        match parse_commit_frame_bytes_args(args) {
+            Ok(frame) => {
+                let generation = self.frame_slot.commit(frame);
+                HostCallOutcome::Return(NativeValue::I64(generation as i64))
+            }
+            Err(err) => HostCallOutcome::Error(err),
+        }
+    }
+
+    fn handle_commit_frame_flat(&self, args: &[NativeValue]) -> HostCallOutcome {
+        match parse_commit_frame_flat_args(args) {
             Ok(frame) => {
                 let generation = self.frame_slot.commit(frame);
                 HostCallOutcome::Return(NativeValue::I64(generation as i64))
@@ -579,6 +766,8 @@ impl HostHandler for LavaHostHandler {
             }
             "ui_wait_events" => self.handle_wait_events(args, task_id),
             "ui_commit_frame" => self.handle_commit_frame(args),
+            "ui_commit_frame_bytes" => self.handle_commit_frame_bytes(args),
+            "ui_commit_frame_flat" => self.handle_commit_frame_flat(args),
             "ui_set_anim_hints" => self.handle_set_anim_hints(args),
             "ui_measure_font" => self.handle_measure_font(args),
             "ui_clipboard_get" => {
@@ -592,6 +781,21 @@ impl HostHandler for LavaHostHandler {
             }
             "ui_clipboard_set" => self.handle_clipboard_set(args),
             "ui_request_quit" => self.handle_request_quit(args),
+            "sys_set_mock_mode" => {
+                if args.len() != 1 {
+                    return HostCallOutcome::Error(format!(
+                        "sys_set_mock_mode expects 1 argument, got {}",
+                        args.len()
+                    ));
+                }
+                match expect_bool(&args[0], op) {
+                    Ok(enabled) => {
+                        self.mock_mode.store(enabled, Ordering::SeqCst);
+                        HostCallOutcome::Return(NativeValue::Unit)
+                    }
+                    Err(msg) => HostCallOutcome::Error(msg),
+                }
+            }
             "sys_spawn_job" => self.handle_spawn_job(args),
             "sys_cancel_job" => self.handle_cancel_job(args),
             "sys_schedule_timer" => self.handle_schedule_timer(args),
@@ -649,7 +853,9 @@ impl HostHandler for LavaHostHandler {
             "accel_ts_highlight_snippet" => handle_accel_ts_highlight_snippet(args),
             "accel_ts_inspect_node" => handle_accel_ts_inspect_node(args),
             "accel_ts_status" => handle_accel_ts_status(args),
-            "pty_available" => HostCallOutcome::Return(NativeValue::Bool(true)),
+            "pty_available" => {
+                HostCallOutcome::Return(NativeValue::Bool(!self.mock_mode.load(Ordering::SeqCst)))
+            }
             "pty_spawn" => handle_pty_spawn(&self.ptys, args),
             "pty_write" => handle_pty_write(&self.ptys, args),
             "pty_send_key" => handle_pty_send_key(&self.ptys, args),
@@ -680,7 +886,9 @@ impl HostHandler for LavaHostHandler {
             "lsp_stop" => handle_lsp_stop(&self.lsps, args),
             "srv_rpc_recv" => handle_srv_rpc_recv(&self.srv_stdin_reader, args),
             "srv_rpc_send" => handle_srv_rpc_send(args),
-            "remote_available" => HostCallOutcome::Return(NativeValue::Bool(true)),
+            "remote_available" => {
+                HostCallOutcome::Return(NativeValue::Bool(!self.mock_mode.load(Ordering::SeqCst)))
+            }
             "remote_register_profile" => handle_remote_register_profile(&self.remotes, args),
             "remote_ssh_hosts" => handle_remote_ssh_hosts(args),
             "remote_connect" => handle_remote_connect(&self.remotes, args),
@@ -3631,123 +3839,25 @@ fn handle_remote_port_forward_list(
     HostCallOutcome::Return(NativeValue::List(list))
 }
 
-/// Cooperatively drive `vm` to completion, keeping concurrent Nessa tasks running whenever
-/// a task suspends on `ui_wait_events` and sleeping on [`EventQueue`] only when no ready
-/// Nessa tasks remain.
+/// Drive `vm` inside a single continuous Nessa `Scheduler` + `libuv` session, waking
+/// `ui_wait_events` directly through [`Scheduler::wake`] whenever [`EventQueue`] or the
+/// shared deadline timer wheel fires.
 pub fn drive_vm_loop(vm: &mut Vm, controller: &HostWaitController) -> Result<i32, String> {
-    loop {
-        match vm.run() {
-            VmResult::Error(err) => {
-                controller.jobs.cancel_all();
-                controller.ptys.kill_all();
-                controller.lsps.stop_all();
-                controller.remotes.disconnect_all();
-                return Err(format!("VM runtime error: {err}"));
-            }
-            VmResult::Finished => {}
-        }
+    controller.attach_scheduler(vm.scheduler_snapshot_handle());
+    let run_res = vm.run();
+    controller.detach_scheduler();
+    controller.jobs.cancel_all();
+    controller.ptys.kill_all();
+    controller.lsps.stop_all();
+    controller.remotes.disconnect_all();
 
-        if vm.has_ready_tasks() {
-            continue;
-        }
-
-        // Wait until at least one suspended host-wait task can be resumed, or all work is done.
-        loop {
-            let fresh = controller.event_queue.drain();
-            if !fresh.is_empty() {
-                let mut pending = controller
-                    .pending_events
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                pending.extend(fresh);
-            }
-
-            let has_pending_events = !controller
-                .pending_events
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_empty();
-            let quit_requested = controller.event_queue.quit_code().is_some();
-
-            let mut tasks_to_wake = Vec::new();
-            let mut next_timeout: Option<Option<Duration>> = None;
-
-            {
-                let mut waiting = controller
-                    .waiting_tasks
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-                if waiting.is_empty() {
-                    controller.jobs.cancel_all();
-                    controller.ptys.kill_all();
-                    controller.lsps.stop_all();
-                    controller.remotes.disconnect_all();
-                    if vm.has_suspended_tasks() {
-                        return Err(
-                            "VM halted with suspended tasks and no pending host event waiters"
-                                .to_string(),
-                        );
-                    }
-                    return Ok(controller.event_queue.quit_code().unwrap_or(0));
-                }
-
-                if quit_requested {
-                    tasks_to_wake.extend(waiting.drain(..).map(|(tid, _)| tid));
-                } else if has_pending_events {
-                    let (first_tid, _) = waiting.remove(0);
-                    tasks_to_wake.push(first_tid);
-                } else {
-                    let now = Instant::now();
-                    let mut remaining_waiters = Vec::with_capacity(waiting.len());
-                    for (tid, deadline) in waiting.drain(..) {
-                        if deadline.is_some_and(|d| now >= d) {
-                            tasks_to_wake.push(tid);
-                        } else {
-                            remaining_waiters.push((tid, deadline));
-                        }
-                    }
-                    *waiting = remaining_waiters;
-
-                    if tasks_to_wake.is_empty() {
-                        let earliest = waiting.iter().filter_map(|(_, d)| *d).min();
-                        next_timeout =
-                            Some(earliest.map(|d| d.saturating_duration_since(Instant::now())));
-                    }
-                }
-            }
-
-            if !tasks_to_wake.is_empty() {
-                let mut woke_any = false;
-                let mut woken_set = controller
-                    .woken_tasks
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                for tid in tasks_to_wake {
-                    woken_set.insert(tid);
-                    if vm.wake_task(tid) {
-                        woke_any = true;
-                    } else {
-                        woken_set.remove(&tid);
-                    }
-                }
-                drop(woken_set);
-
-                if woke_any {
-                    break;
-                }
-                continue;
-            }
-
-            if let Some(wait_dur) = next_timeout {
-                let arrived = controller.event_queue.wait_for_events(wait_dur);
-                if !arrived.is_empty() {
-                    let mut pending = controller
-                        .pending_events
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    pending.extend(arrived);
-                }
+    match run_res {
+        VmResult::Error(err) => Err(format!("VM runtime error: {err}")),
+        VmResult::Finished => {
+            if vm.has_suspended_tasks() {
+                Err("VM halted with suspended tasks and no pending host event waiters".to_string())
+            } else {
+                Ok(controller.event_queue.quit_code().unwrap_or(0))
             }
         }
     }

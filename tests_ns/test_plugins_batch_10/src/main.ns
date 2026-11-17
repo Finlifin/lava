@@ -4,7 +4,6 @@
 --   30. `ext_lazy`   (`lava.org/ext_lazy`   — `*Lazy*` live Single-VM extension manager, `"lazy-detail"` 78x20 float inspector, `x` hot enable/disable & core dependency guard, `:CheckHealth`)
 
 use std.fs
-use std.io
 use std.path
 use std.time
 use @lava_sys.{DrawCmd, RawUiEvent, mock_enable, mock_last_frame_cmds}
@@ -90,7 +89,7 @@ fn frame_has_text_substr(cmds: List, needle: String) -> bool {
     for i in 0..cmds.len() {
         let cmd = cmds.get(i.as(usize)).as(DrawCmd)
         cmd match {
-            DrawCmd.TextRun(_, _, txt, _, _, _, _, _, _) => {
+            DrawCmd.text_run(_, _, txt, _, _, _, _, _, _) => {
                 if txt.contains(needle) {
                     return true
                 }
@@ -107,7 +106,7 @@ fn is_ext_in_state_active(kernel: SystemKernel, target_name: String) -> bool {
         let rec = exts.get(i.as(usize)).as(ExtensionRecord)
         if rec.name == target_name {
             return rec.state match {
-                ExtState.Active => true,
+                ExtState.active => true,
                 _ => false,
             }
         }
@@ -121,7 +120,7 @@ fn is_ext_in_state_disabled(kernel: SystemKernel, target_name: String) -> bool {
         let rec = exts.get(i.as(usize)).as(ExtensionRecord)
         if rec.name == target_name {
             return rec.state match {
-                ExtState.Disabled => true,
+                ExtState.disabled => true,
                 _ => false,
             }
         }
@@ -142,7 +141,7 @@ fn run_batch10_suite() {
     mock_enable(true)
 
     let tmp_dir = "/tmp/lava_batch10_" ++ time.unix_millis().to_string()
-    let _ = fs.create_dir_all(tmp_dir) ! { e => panic(e.to_string()) }
+    let _ = fs.create_dir(tmp_dir, parents = true) ! { e => panic(e.to_string()) }
 
     let kernel = boot_batch10_kernel()
     check_eq_i64(kernel.list_extensions().len(), 11, "11 registered extensions (8 core + 3 batch10)")
@@ -158,7 +157,7 @@ fn run_batch10_suite() {
 
     world.cwd = tmp_dir
     handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
-    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+    let _ = app_step_event(kernel, RawUiEvent.resize(1280, 800, 1))# ! { e => panic(e) }
 
     -- ========================================================================
     -- PART 1: `ext_yanky` (`lava.org/ext_yanky`)
@@ -300,7 +299,7 @@ fn run_batch10_suite() {
     app_feed_keys(kernel, "u")# ! { e => panic(e) }
     check_eq_str(ybuf.line_at(2), "anchor=(word_item)", "u cleanly undid [y transition in 1 undo step")
 
-    io.println("  [PASS] Part 1: ext_yanky ([y / ]y charwise/linewise cycling, post-yank highlight, yanky-picker float)")
+    println("  [PASS] Part 1: ext_yanky ([y / ]y charwise/linewise cycling, post-yank highlight, yanky-picker float)")
 
     -- ========================================================================
     -- PART 2: `ext_treesj` (`lava.org/ext_treesj`)
@@ -465,7 +464,7 @@ fn run_batch10_suite() {
     check_eq_str(dbuf.line_at(2), "row_B", "VisualLine <M-j> block line 2 == row_B")
     check_eq_str(dbuf.line_at(3), "row_D", "VisualLine <M-j> line 3 == row_D")
     let still_vline_down = vim.mode match {
-        VimMode.VisualLine => true,
+        VimMode.visual_line => true,
         _ => false,
     }
     check_true(still_vline_down, "VisualLine selection remained active after <M-j>")
@@ -478,7 +477,7 @@ fn run_batch10_suite() {
     check_eq_str(dbuf.line_at(1), "row_B", "VisualLine <M-k> moved row_B back to 1")
     check_eq_str(dbuf.line_at(2), "row_C", "VisualLine <M-k> moved row_C back to 2")
     let still_vline_up = vim.mode match {
-        VimMode.VisualLine => true,
+        VimMode.visual_line => true,
         _ => false,
     }
     check_true(still_vline_up, "VisualLine selection remained active after <M-k>")
@@ -487,7 +486,7 @@ fn run_batch10_suite() {
     check_true(treesj_svc.dial_count >= 9, "treesj_svc tracked dial operations")
     check_true(treesj_svc.move_count >= 4, "treesj_svc tracked move operations")
 
-    io.println("  [PASS] Part 2: ext_treesj (structural split/join, dial.nvim token cycling, mini.move Normal & VisualLine)")
+    println("  [PASS] Part 2: ext_treesj (structural split/join, dial.nvim token cycling, mini.move Normal & VisualLine)")
 
     -- ========================================================================
     -- PART 3: `ext_lazy` (`lava.org/ext_lazy`)
@@ -533,11 +532,11 @@ fn run_batch10_suite() {
     check_true(world.get_floating_window(FLOAT_ID_LAZY_DETAIL) == null, "q closed lazy-detail float")
     check_eq_str(world.active_buffer().name, LAZY_BUF_NAME, "*Lazy* stays open after closing detail float")
 
-    -- 3C. Press `x` on leaf plugin `ext_yanky` -> deactivates it (`ExtState.Disabled`)!
+    -- 3C. Press `x` on leaf plugin `ext_yanky` -> deactivates it (`ExtState.disabled`)!
     let yanky_row_before = find_row_with_substr(lbuf, "[lava.org/ext_yanky]")
     lbuf.point = Pos.new(yanky_row_before, 2)
     app_feed_keys(kernel, "x")# ! { e => panic(e) }
-    check_true(is_ext_in_state_disabled(kernel, "ext_yanky"), "x deactivated ext_yanky -> ExtState.Disabled")
+    check_true(is_ext_in_state_disabled(kernel, "ext_yanky"), "x deactivated ext_yanky -> ExtState.disabled")
     check_true(kernel.service(SERVICE_YANKY) == null, "ext_yanky service removed upon deactivation")
     check_true(
         lbuf.line_at(0).contains("Active: 10 | Disabled: 1"),
@@ -548,12 +547,12 @@ fn run_batch10_suite() {
         "*Lazy* lists ext_yanky under Disabled section",
     )
 
-    -- Press `x` again -> re-activates `ext_yanky` (`ExtState.Active`)!
+    -- Press `x` again -> re-activates `ext_yanky` (`ExtState.active`)!
     let yanky_disabled_row = find_row_with_substr(lbuf, "[lava.org/ext_yanky]")
     check_true(yanky_disabled_row >= 0, "found disabled ext_yanky row in *Lazy*")
     lbuf.point = Pos.new(yanky_disabled_row, 2)
     app_feed_keys(kernel, "x")# ! { e => panic(e) }
-    check_true(is_ext_in_state_active(kernel, "ext_yanky"), "second x re-activated ext_yanky -> ExtState.Active")
+    check_true(is_ext_in_state_active(kernel, "ext_yanky"), "second x re-activated ext_yanky -> ExtState.active")
     check_true(kernel.service(SERVICE_YANKY) != null, "ext_yanky service restored upon re-activation")
     check_true(
         lbuf.line_at(0).contains("Active: 11 | Disabled: 0"),
@@ -612,8 +611,8 @@ fn run_batch10_suite() {
 
     let _ = SERVICE_TREESJ
     let _ = SERVICE_LAZY
-    io.println("  [PASS] Part 3: ext_lazy (*Lazy* introspection, 78x20 detail float, hot enable/disable, dependency guard, *CheckHealth*)")
-    io.println("ALL BATCH 10 PLUGIN TESTS PASSED! (Plugins 28-30 of 30)")
+    println("  [PASS] Part 3: ext_lazy (*Lazy* introspection, 78x20 detail float, hot enable/disable, dependency guard, *CheckHealth*)")
+    println("ALL BATCH 10 PLUGIN TESTS PASSED! (Plugins 28-30 of 30)")
 }
 
 fn main() {

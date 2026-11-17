@@ -19,6 +19,7 @@ use std.fs
 use std.json
 use std.path
 use std.process
+use std.time
 use @server_sys.{mock_drain_rpc_responses, mock_enable, mock_push_rpc_request}
 use @server_core.{
     RPC_INVALID_PARAMS, RPC_METHOD_NOT_FOUND, RPC_PARSE_ERROR, ServerKernel, SrvExtId
@@ -102,9 +103,9 @@ fn call_rpc_err(kernel: ServerKernel, id: Any, method: String, params: Any) -> M
 fn make_temp_test_root() -> String {
     let dir = "/tmp/lava_server_test_" ++ process.pid().to_string()
     if fs.exists(dir) {
-        let _ = fs.remove_dir_all(dir)
+        let _ = fs.remove_dir(dir, recursive = true)
     }
-    fs.create_dir_all(dir) match {
+    fs.create_dir(dir, parents = true) match {
         _! => (),
         error err => panic("failed to create temp test dir: " ++ err.to_string()),
     }
@@ -329,7 +330,7 @@ fn test_2_fs_operations(kernel: ServerKernel, tmp_root: String) {
     -- `fs/find_root` finding `compile_commands.json` and `Cargo.toml`
     let cpp_proj = path.join(fs_root, "projects/cpp_engine")
     let cpp_deep = path.join(cpp_proj, "src/render/shader.cpp")
-    let _ = fs.create_dir_all(path.join(cpp_proj, "src/render"))
+    let _ = fs.create_dir(path.join(cpp_proj, "src/render"), parents = true)
     let _ = fs.write_string(path.join(cpp_proj, "compile_commands.json"), "[]\n")
     let _ = fs.write_string(cpp_deep, "int main() {{ return 0; }}\n")
 
@@ -342,7 +343,7 @@ fn test_2_fs_operations(kernel: ServerKernel, tmp_root: String) {
 
     let rust_proj = path.join(fs_root, "projects/rust_crate")
     let rust_deep = path.join(rust_proj, "crates/core/src/lib.rs")
-    let _ = fs.create_dir_all(path.join(rust_proj, "crates/core/src"))
+    let _ = fs.create_dir(path.join(rust_proj, "crates/core/src"), parents = true)
     let _ = fs.write_string(path.join(rust_proj, "Cargo.toml"), "[workspace]\n")
     let _ = fs.write_string(rust_deep, "pub fn init() {{}}\n")
 
@@ -356,9 +357,9 @@ fn test_2_fs_operations(kernel: ServerKernel, tmp_root: String) {
 
 fn test_3_search_grep_and_symbols(kernel: ServerKernel, tmp_root: String) {
     let ws = path.join(tmp_root, "search_ws")
-    let _ = fs.create_dir_all(path.join(ws, "cpp"))
-    let _ = fs.create_dir_all(path.join(ws, "rust"))
-    let _ = fs.create_dir_all(path.join(ws, "nessa"))
+    let _ = fs.create_dir(path.join(ws, "cpp"), parents = true)
+    let _ = fs.create_dir(path.join(ws, "rust"), parents = true)
+    let _ = fs.create_dir(path.join(ws, "nessa"), parents = true)
 
     let cpp_file = path.join(ws, "cpp/physics_engine.cpp")
     let _ = fs.write_string(
@@ -403,7 +404,7 @@ fn test_3_search_grep_and_symbols(kernel: ServerKernel, tmp_root: String) {
             "}}",
             "",
             "pub enum StageState {{",
-            "    pub Ready,",
+            "    pub ready,",
             "}}",
             "",
             "pub fn execute_stage(cfg: StageConfig) -> i64 {{",
@@ -488,18 +489,18 @@ fn test_3_search_grep_and_symbols(kernel: ServerKernel, tmp_root: String) {
 }
 
 fn run_git_checked(repo_dir: String, args: List) {
-    let out = process.exec("git", args = args, cwd = repo_dir) match {
+    let out = process.run("git", args = args, cwd = repo_dir) match {
         v! => v,
         error err => panic("git failed to run: " ++ err.to_string()),
     }
-    if not out.success() {
+    if not out.is_success() {
         panic("git " ++ args.join(" ") ++ " failed: " ++ out.stderr)
     }
 }
 
 fn test_4_git_operations(kernel: ServerKernel, tmp_root: String) {
     let repo = path.join(tmp_root, "git_repo")
-    let _ = fs.create_dir_all(repo)
+    let _ = fs.create_dir(repo, parents = true)
 
     run_git_checked(repo, ["init"])
     run_git_checked(repo, ["config", "user.name", "Lava Bot"])
@@ -622,12 +623,13 @@ fn test_5_exec_and_lsp(kernel: ServerKernel, tmp_root: String) {
         check_eq_str(w_clangd.get("path").as(String), "", "missing clangd returns empty path")
     }
 
-    -- Custom executable in `extra_dirs`
+    -- Custom executable in `extra_dirs` (speaks minimal JSON-RPC 2.0 LSP over stdio so live `LspManager` stays alive and emits real events)
     let bin_dir = path.join(tmp_root, "custom_bins")
-    let _ = fs.create_dir_all(bin_dir)
+    let _ = fs.create_dir(bin_dir, parents = true)
     let mock_lsp_bin = path.join(bin_dir, "mock-clangd-srv")
-    let _ = fs.write_string(mock_lsp_bin, "#!/bin/sh\nexit 0\n")
-    let _ = process.exec("chmod", args = ["+x", mock_lsp_bin])
+    let mock_lsp_py = "#!/usr/bin/env python3\nimport json, sys\ndef read_msg():\n    hdrs = dict()\n    while True:\n        line = sys.stdin.buffer.readline()\n        if not line:\n            return None\n        s = line.decode('utf-8', 'replace').strip()\n        if s == '':\n            break\n        if ':' in s:\n            k, v = s.split(':', 1)\n            hdrs[k.strip().lower()] = v.strip()\n    n = int(hdrs.get('content-length', '0'))\n    if n <= 0:\n        return None\n    body = sys.stdin.buffer.read(n)\n    return json.loads(body.decode('utf-8'))\ndef send_msg(obj):\n    raw = json.dumps(obj).encode('utf-8')\n    hdr = ('Content-Length: %d\\r\\n\\r\\n' % len(raw)).encode('ascii')\n    sys.stdout.buffer.write(hdr + raw)\n    sys.stdout.buffer.flush()\nwhile True:\n    msg = read_msg()\n    if msg is None:\n        break\n    m = msg.get('method')\n    mid = msg.get('id')\n    if m == 'initialize':\n        send_msg(dict(jsonrpc='2.0', id=mid, result=dict(capabilities=dict(documentSymbolProvider=True), serverInfo=dict(name='mock-clangd-srv', version='1.0'))))\n    elif m == 'textDocument/didOpen':\n        uri = msg.get('params', dict()).get('textDocument', dict()).get('uri', '')\n        send_msg(dict(jsonrpc='2.0', method='textDocument/publishDiagnostics', params=dict(uri=uri, diagnostics=[])))\n    elif m == 'textDocument/documentSymbol':\n        send_msg(dict(jsonrpc='2.0', id=mid, result=[dict(name='compute_answer', kind=12, location=dict(uri='file:///sample.ns', range=dict(start=dict(line=0, character=0), end=dict(line=2, character=1))))]))\n    elif m == 'shutdown':\n        send_msg(dict(jsonrpc='2.0', id=mid, result=None))\n        break\n"
+    let _ = fs.write_string(mock_lsp_bin, mock_lsp_py)
+    let _ = process.run("chmod", args = ["+x", mock_lsp_bin])
 
     let p_which_custom = Map()
     p_which_custom.set("bin", "mock-clangd-srv")
@@ -687,8 +689,20 @@ fn test_5_exec_and_lsp(kernel: ServerKernel, tmp_root: String) {
     let req_out = call_rpc_ok(kernel, 61, "lsp/request", p_req)
     check_true(req_out.get("req_id").as(i64) >= 1, "lsp/request returned positive req_id")
 
-    let polled = call_rpc_ok(kernel, 62, "lsp/poll_events", p_status)
-    check_true(polled.get("events").as(List).len() >= 2, "lsp/poll_events drained session events")
+    let collected_events = List()
+    var poll_tries: i64 = 0
+    while collected_events.len() < 2 and poll_tries < 60 {
+        let polled = call_rpc_ok(kernel, 62 + poll_tries, "lsp/poll_events", p_status)
+        let batch = polled.get("events").as(List)
+        for i in 0..batch.len() {
+            collected_events.push(batch.get(i.as(usize)))
+        }
+        if collected_events.len() < 2 {
+            time.sleep_ms(5)
+        }
+        poll_tries += 1
+    }
+    check_true(collected_events.len() >= 2, "lsp/poll_events drained session events")
 
     let p_close = Map()
     p_close.set("session_id", sid)
@@ -777,7 +791,7 @@ fn main() {
     let tmp_root = make_temp_test_root()
     defer {
         if fs.exists(tmp_root) {
-            let _ = fs.remove_dir_all(tmp_root)
+            let _ = fs.remove_dir(tmp_root, recursive = true)
         }
     }
 

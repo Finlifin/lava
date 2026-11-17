@@ -1,6 +1,5 @@
 -- Standalone Integration & Scene Verification Suite for `ext_window` and `ext_render`.
 
-use std.io
 use @lava_sys.{CaretShape, DrawCmd, host_commit_frame, mock_enable, mock_frame_generation}
 use @lava_core.{
     HostClipboardCap, KeyBindingEntry, LogCollectorCap, PromptTurn, StatusCollectorCap,
@@ -147,28 +146,28 @@ fn audit_draw_cmds(cmds: List, label: String) -> (i64, i64, i64, i64, i64, List)
         let wire = cmd.to_wire()
         assert_true(not wire.is_empty(), label ++ " wire cmd non-empty")
         cmd match {
-            DrawCmd.ClipPush(_, _, w, h) => {
+            DrawCmd.clip_push(_, _, w, h) => {
                 assert_true(w > 0.0 and h > 0.0, label ++ " positive clip bounds")
                 clip_depth += 1
                 clip_pushes += 1
             },
-            DrawCmd.ClipPop => {
+            DrawCmd.clip_pop => {
                 clip_depth -= 1
                 assert_true(clip_depth >= 0, label ++ " ClipPop never underflows")
             },
-            DrawCmd.FillRect(_, _, _, _, _, _) => {
+            DrawCmd.fill_rect(_, _, _, _, _, _) => {
                 fill_rects += 1
             },
-            DrawCmd.StrokeRect(_, _, _, _, _, _, _) => {
+            DrawCmd.stroke_rect(_, _, _, _, _, _, _) => {
                 stroke_rects += 1
             },
-            DrawCmd.Line(_, _, _, _, _, _) => {
+            DrawCmd.line(_, _, _, _, _, _) => {
                 lines_cnt += 1
             },
-            DrawCmd.TextRun(_, _, txt, _, _, _, _, _, _) => {
+            DrawCmd.text_run(_, _, txt, _, _, _, _, _, _) => {
                 text_blobs.push(txt)
             },
-            DrawCmd.CursorCaret(_, _, _, _, _, _) => {
+            DrawCmd.cursor_caret(_, _, _, _, _, _) => {
                 carets_cnt += 1
             },
         }
@@ -192,7 +191,7 @@ fn count_caret_shape(cmds: List, target_shape: CaretShape) -> i64 {
     for i in 0..cmds.len() {
         let cmd = cmds.get(i.as(usize)).as(DrawCmd)
         cmd match {
-            DrawCmd.CursorCaret(_, _, _, _, shape, _) => {
+            DrawCmd.cursor_caret(_, _, _, _, shape, _) => {
                 if shape == target_shape {
                     cnt += 1
                 }
@@ -208,7 +207,7 @@ fn count_fill_color(cmds: List, target_color: i64) -> i64 {
     for i in 0..cmds.len() {
         let cmd = cmds.get(i.as(usize)).as(DrawCmd)
         cmd match {
-            DrawCmd.FillRect(_, _, _, _, color, _) => {
+            DrawCmd.fill_rect(_, _, _, _, color, _) => {
                 if color == target_color {
                     cnt += 1
                 }
@@ -256,7 +255,7 @@ fn main() {
     ]
     let code_buf = world.create_buffer(
         "demo.ns",
-        BufferKind.File,
+        BufferKind.file,
         file_path = "/tmp/demo.ns",
         major_mode = "nessa",
         initial_lines = code_lines,
@@ -268,7 +267,7 @@ fn main() {
 
     let org_buf = world.create_buffer(
         "roadmap.org",
-        BufferKind.File,
+        BufferKind.file,
         file_path = "/tmp/roadmap.org",
         major_mode = "org",
         initial_lines = [
@@ -375,7 +374,7 @@ fn main() {
     let _ = run_cmd(kernel, "scroll-bottom", [], logs, statuses, clip)
     assert_eq_i64(wm.active_pane().top_row, 0, "scroll-bottom clamped to min_row")
 
-    -- Tabs (`tab-new`, `tab-previous`, `tab-next`, `tab_Switch`, `tab-close`)
+    -- Tabs (`tab-new`, `tab-previous`, `tab-next`, `tab_switch`, `tab-close`)
     let _ = run_cmd(kernel, "tab-new", [], logs, statuses, clip)
     assert_eq_i64(wm.tabs.len(), 2, "2 tabs after tab-new")
     assert_eq_i64(wm.active_tab_idx, 1, "switched to new tab 2")
@@ -385,8 +384,8 @@ fn main() {
     assert_eq_i64(wm.active_tab_idx, 0, "tab-previous back to tab 1")
     assert_eq_i64(wm.visible_panes().len(), 3, "tab 1 preserved its 3 split panes")
 
-    wm.tab_Switch(1, world)
-    assert_eq_i64(wm.active_tab_idx, 1, "tab_Switch alias switched to tab 2")
+    wm.tab_switch(1, world)
+    assert_eq_i64(wm.active_tab_idx, 1, "tab_switch alias switched to tab 2")
     let _ = run_cmd(kernel, "tab-close", [], logs, statuses, clip)
     assert_eq_i64(wm.tabs.len(), 1, "tab-close returned to 1 tab")
     assert_eq_i64(wm.visible_panes().len(), 3, "tab 1 active again with 3 panes")
@@ -412,9 +411,9 @@ fn main() {
 
     -- Interactive continuation prompt on `set-theme` with no args
     let suspended_turn = run_cmd(kernel, "set-theme", [], logs, statuses, clip)
-    assert_true(suspended_turn matches PromptTurn.Suspended(_, _), "set-theme suspends when no arg")
+    assert_true(suspended_turn matches PromptTurn.suspended(_, _), "set-theme suspends when no arg")
     let resumed_turn = submit_prompt(kernel, "one-dark", logs, statuses, clip)
-    assert_true(resumed_turn matches PromptTurn.Completed(_), "set-theme resumed cleanly")
+    assert_true(resumed_turn matches PromptTurn.completed(_), "set-theme resumed cleanly")
     assert_eq_str(world.options.theme_name, "one-dark", "set-theme applied one-dark")
     assert_eq_str(renderer.active_theme_name, "one-dark", "renderer tracks one-dark")
 
@@ -480,9 +479,9 @@ fn main() {
     assert_true(wm.active_pane().id == win1, "win1 focused for Scene A")
     code_buf.point = Pos.new(3, 6)
     world.mode_name = "V-BLOCK"
-    world.caret_shape = CaretShape.Block
+    world.caret_shape = CaretShape.block
     world.visual = VisualSelection {
-        kind: VisualKind.Block,
+        kind: VisualKind.block,
         anchor: Pos.new(1, 4),
         cursor: Pos.new(3, 10),
     }
@@ -525,8 +524,8 @@ fn main() {
     assert_true(strokes_a >= 1, "Scene A has Which-Key popup border StrokeRect")
     assert_true(lines_a >= 4, "Scene A has split divider lines and mode-line borders")
     assert_true(carets_a == 3, "Scene A has 1 focused Block caret + 2 unfocused HollowBlock carets")
-    assert_eq_i64(count_caret_shape(cmds_a, CaretShape.Block), 1, "Scene A 1 Block caret")
-    assert_eq_i64(count_caret_shape(cmds_a, CaretShape.HollowBlock), 2, "Scene A 2 HollowBlock carets")
+    assert_eq_i64(count_caret_shape(cmds_a, CaretShape.block), 1, "Scene A 1 Block caret")
+    assert_eq_i64(count_caret_shape(cmds_a, CaretShape.hollow_block), 2, "Scene A 2 HollowBlock carets")
     assert_true(count_fill_color(cmds_a, pal.bg_selection) >= 3, "Scene A 3-row visual-block selection rects")
     assert_true(count_fill_color(cmds_a, pal.bg_search) >= 2, "Scene A search match highlight rects")
     assert_true(any_text_contains(texts_a, "V-BLOCK"), "Scene A mode pill V-BLOCK")
@@ -576,8 +575,8 @@ fn main() {
     assert_true(any_text_contains(texts_b, "Completions (7/12)"), "Scene B completion header")
     assert_true(any_text_contains(texts_b, "Summary detail #6"), "Scene B right-aligned candidate detail")
     assert_true(any_text_contains(texts_b, "[Narrow L2-L6]"), "Scene B narrow badge in mode-line")
-    assert_eq_i64(count_caret_shape(cmds_b, CaretShape.Beam), 1, "Scene B Beam caret in minibuffer")
-    assert_eq_i64(count_caret_shape(cmds_b, CaretShape.HollowBlock), 3, "Scene B all 3 panes show HollowBlock while minibuffer focused")
+    assert_eq_i64(count_caret_shape(cmds_b, CaretShape.beam), 1, "Scene B Beam caret in minibuffer")
+    assert_eq_i64(count_caret_shape(cmds_b, CaretShape.hollow_block), 3, "Scene B all 3 panes show HollowBlock while minibuffer focused")
 
     -- Finally verify `delete-other-windows` (`C-x 1` / `only`) and `delete-window` on sole window
     world.minibuffer_view = MinibufferView.inactive()
@@ -588,5 +587,5 @@ fn main() {
     let (_, cmds_c) = compose_frame(kernel, world, wm)
     let _ = audit_draw_cmds(cmds_c, "Scene C single-pane")
 
-    io.println("PASS: test_window_render — all window split-tree, tab, hit-test, 4 themes, multi-language syntax, and 2D DrawCmd compositor checks succeeded!")
+    println("PASS: test_window_render — all window split-tree, tab, hit-test, 4 themes, multi-language syntax, and 2D DrawCmd compositor checks succeeded!")
 }

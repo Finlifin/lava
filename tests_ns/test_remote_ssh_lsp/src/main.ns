@@ -8,6 +8,7 @@
 --   6. `ext_minibuffer` `ssh://` & `/ssh:` host discovery, cached remote directory completion, `<Tab>`, and `<C-l>` up-dir.
 
 use std.fs
+use std.net.TcpListener
 use std.path
 use std.process
 use std.time
@@ -19,7 +20,7 @@ use @lava_core.{
 use @lava_remote.{
     RemoteTunnelInfo, is_ssh_uri, join_ssh_uri, normalize_ssh_uri,
     parent_ssh_uri, parse_ssh_uri, remote_connect, remote_list_connections,
-    remote_port_forward_list, remote_register_mock_mount, remote_stat,
+    remote_port_forward_list, remote_probe_tcp, remote_register_mock_mount, remote_stat,
     remote_which, ssh_uri_basename
 }
 use @ext_document.{
@@ -183,6 +184,8 @@ fn boot_remote_kernel() -> (
     check_true(kernel.service(SERVICE_LSP) != null, "SERVICE_LSP published")
     check_true(kernel.service(SERVICE_LSPCONFIG) != null, "SERVICE_LSPCONFIG published")
     check_true(kernel.service(SERVICE_REMOTE) != null, "SERVICE_REMOTE published")
+    check_true(kernel.get_command("remote-probe") != null, "remote-probe registered")
+    check_true(kernel.get_command("ex:RemoteProbe") != null, "ex:RemoteProbe registered")
 
     let world = require_editor_world(kernel) ! { e => panic(e) }
     let wm = require_window_manager(kernel) ! { e => panic(e) }
@@ -202,9 +205,9 @@ fn setup_remote_cpp_fixture() -> (String, String, String) {
     let src_dir = path.join(remote_root, "src")
     let mock_bin = path.join(base, "mock_bin")
 
-    let _ = fs.create_dir_all(inc_dir) ! { e => panic("mkdir include: " ++ e.to_string()) }
-    let _ = fs.create_dir_all(src_dir) ! { e => panic("mkdir src: " ++ e.to_string()) }
-    let _ = fs.create_dir_all(mock_bin) ! { e => panic("mkdir mock_bin: " ++ e.to_string()) }
+    let _ = fs.create_dir(inc_dir, parents = true) ! { e => panic("mkdir include: " ++ e.to_string()) }
+    let _ = fs.create_dir(src_dir, parents = true) ! { e => panic("mkdir src: " ++ e.to_string()) }
+    let _ = fs.create_dir(mock_bin, parents = true) ! { e => panic("mkdir mock_bin: " ++ e.to_string()) }
 
     -- Ensure a mock `clangd` binary exists in `mock_bin` in case host machine lacks `/usr/bin/clangd`
     let mock_clangd = path.join(mock_bin, "clangd")
@@ -519,7 +522,7 @@ fn main() {
         -- ====================================================================
         feed(kernel, "<C-x><C-f>")#
         check_true(world.minibuffer_view.active, "C-x C-f opened FilePath minibuffer")
-        check_true(mb.request.kind == PromptKind.FilePath, "PromptKind.FilePath active")
+        check_true(mb.request.kind == PromptKind.file_path, "PromptKind.file_path active")
 
         -- Clear initial local dir and type `ssh://` -> suggests `ssh://devbox/` with `[CONN]` badge!
         feed(kernel, "<C-u>ssh://")#
@@ -579,7 +582,21 @@ fn main() {
         check_true(main_buf.to_text().contains("calc_sum(20, 22)"), "main.cpp updated across remote workspace by LspRename")
         println("  [PASS] 6. Minibuffer ssh:// [CONN] host completion, cached remote readdir, <Tab>, <C-l> & remote LspRename")
 
+    -- Live `std.net` + `libuv` non-blocking TCP preflight probe (`remote_probe_tcp`)
+    let listener = TcpListener.bind("127.0.0.1", 0) ! {
+        e => panic("TcpListener.bind failed: " ++ e.to_string())
+    }
+    let listen_port = (listener.local_addr() ! {
+        e => panic("TcpListener.local_addr failed: " ++ e.to_string())
+    }).port
+    let probe_ms = remote_probe_tcp("127.0.0.1", listen_port, timeout_ms = 1000) ! {
+        e => panic("remote_probe_tcp live listener failed: " ++ e)
+    }
+    listener.close()
+    check_true(probe_ms >= 0 and probe_ms < 1000, "remote_probe_tcp connected over libuv std.net")
+    println("  [PASS] 7. Live std.net TcpListener + libuv non-blocking remote_probe_tcp verified")
+
     -- Clean up temporary fixture directory
-    let _ = fs.remove_dir_all(tmp_base) ! { _ => () }
+    let _ = fs.remove_dir(tmp_base, recursive = true) ! { _ => () }
     println("ALL REMOTE SSH + SERVER-SIDE LSP + MINIBUFFER TESTS PASSED!")
 }

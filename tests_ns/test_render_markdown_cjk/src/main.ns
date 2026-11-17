@@ -3,7 +3,7 @@
 -- 2. CJK + Inline Span Non-Overlapping X-Coordinates & Wide Cursor Caret Placement
 -- 3. Multi-Line Fenced Code Blocks & Rich Inline Markdown Syntax Highlighting
 -- 4. Continuous Alignment Vertical Indent Guides (Bridging Blank Lines) + Active Scope Highlight
--- 5. Unified Regular Font Weight Invariant (`bold == false` across 100% of `DrawCmd.TextRun`s)
+-- 5. Unified Regular Font Weight Invariant (`bold == false` across 100% of `DrawCmd.text_run`s)
 
 use @lava_sys.{CaretShape, DrawCmd, mock_enable, rgb, rgba}
 use @lava_core.{KeyBindingEntry, SystemKernel}
@@ -107,7 +107,7 @@ fn test_cjk_inline_code_x_alignment_and_caret() {
 
     let md_buf = world.create_buffer(
         "cjk_align.md",
-        BufferKind.File,
+        BufferKind.file,
         file_path = "/tmp/cjk_align.md",
         major_mode = "markdown",
         initial_lines = [
@@ -122,7 +122,7 @@ fn test_cjk_inline_code_x_alignment_and_caret() {
     let pane = wm.active_pane()
     pane.cursor = Pos.new(0, 2)
     md_buf.point = Pos.new(0, 2)
-    world.caret_shape = CaretShape.Block
+    world.caret_shape = CaretShape.block
 
     let (_, cmds) = compose_frame(kernel, world, wm)
     let pane_after = wm.active_pane()
@@ -144,7 +144,7 @@ fn test_cjk_inline_code_x_alignment_and_caret() {
     for i in 0..cmds.len() {
         let cmd = cmds.get(i.as(usize)).as(DrawCmd)
         cmd match {
-            DrawCmd.TextRun(tx, ty, txt, _, _, col, bold, _, _) => {
+            DrawCmd.text_run(tx, ty, txt, _, _, col, bold, _, _) => {
                 assert_true(not bold, "no bold in CJK markdown alignment frame")
                 if tx >= text_x0 - 0.5 and ty >= row0_y - 0.5 and ty < pane_bottom_y {
                     let w_px = str_display_width(txt).as(f64) * cell_w
@@ -160,7 +160,7 @@ fn test_cjk_inline_code_x_alignment_and_caret() {
                     item_x_row1 = tx
                 }
             },
-            DrawCmd.CursorCaret(cx, cy, cw, _, _, _) => {
+            DrawCmd.cursor_caret(cx, cy, cw, _, _, _) => {
                 if (cy - row0_y).abs() < 0.5 {
                     caret_x = cx
                     caret_w = cw
@@ -230,12 +230,12 @@ fn test_cjk_inline_code_x_alignment_and_caret() {
     for i in 0..fcmds.len() {
         let cmd = fcmds.get(i.as(usize)).as(DrawCmd)
         cmd match {
-            DrawCmd.FillRect(rx, _, _, _, col, _) => {
+            DrawCmd.fill_rect(rx, _, _, _, col, _) => {
                 if col == span_bg {
                     float_bg_x = rx
                 }
             },
-            DrawCmd.TextRun(tx, _, txt, _, _, col, _, _, ul) => {
+            DrawCmd.text_run(tx, _, txt, _, _, col, _, _, ul) => {
                 if txt == "中文 $ " {
                     float_prefix_x = tx
                 }
@@ -269,7 +269,7 @@ fn test_markdown_fenced_blocks_and_rich_inline() {
     ]
     let md_buf = world.create_buffer(
         "guide.md",
-        BufferKind.File,
+        BufferKind.file,
         file_path = "/tmp/guide.md",
         major_mode = "markdown",
         initial_lines = md_lines,
@@ -312,12 +312,12 @@ fn test_markdown_fenced_blocks_and_rich_inline() {
     for i in 0..cmds.len() {
         let cmd = cmds.get(i.as(usize)).as(DrawCmd)
         cmd match {
-            DrawCmd.FillRect(rx, ry, _, _, col, _) => {
+            DrawCmd.fill_rect(rx, ry, _, _, col, _) => {
                 if (rx - text_x0).abs() < 0.5 and (ry - y_rust_code).abs() < 0.5 and col == theme.bg_alt {
                     saw_fence_bg_row1 = true
                 }
             },
-            DrawCmd.TextRun(tx, ty, txt, _, _, col, bold, italic, ul) => {
+            DrawCmd.text_run(tx, ty, txt, _, _, col, bold, italic, ul) => {
                 assert_true(not bold, "Markdown scene TextRun must never be bold")
                 if tx >= text_x0 - 0.5 {
                     if (ty - y_fence_open).abs() < 0.5 and txt == "rust" and col == theme.syn_operator {
@@ -407,7 +407,7 @@ fn test_continuous_indent_guides_and_active_scope() {
 
     let code_buf = world.create_buffer(
         "guides.ns",
-        BufferKind.File,
+        BufferKind.file,
         file_path = "/tmp/guides.ns",
         major_mode = "nessa",
         initial_lines = [
@@ -455,7 +455,7 @@ fn test_continuous_indent_guides_and_active_scope() {
     for i in 0..cmds.len() {
         let cmd = cmds.get(i.as(usize)).as(DrawCmd)
         cmd match {
-            DrawCmd.Line(x1, y1, x2, y2, col, _) => {
+            DrawCmd.line(x1, y1, x2, y2, col, _) => {
                 if (x1 - x2).abs() < 0.1 and ((y2 - y1) - cell_h).abs() < 0.5 {
                     if (x1 - gx_outer).abs() < 0.5 and (y1 - y_row1).abs() < 0.5 and col == theme.border {
                         row1_outer_inactive = true
@@ -491,7 +491,7 @@ fn test_continuous_indent_guides_and_active_scope() {
     -- Verify tab-indented lines also render continuous guides across blank lines
     let tab_buf = world.create_buffer(
         "tabs.go",
-        BufferKind.File,
+        BufferKind.file,
         file_path = "/tmp/tabs.go",
         major_mode = "go",
         initial_lines = [
@@ -516,7 +516,7 @@ fn test_continuous_indent_guides_and_active_scope() {
     for i in 0..tab_cmds.len() {
         let cmd = tab_cmds.get(i.as(usize)).as(DrawCmd)
         cmd match {
-            DrawCmd.Line(x1, y1, x2, y2, col, _) => {
+            DrawCmd.line(x1, y1, x2, y2, col, _) => {
                 if (x1 - x2).abs() < 0.1 and (x1 - tab_gx_inner).abs() < 0.5 and (y1 - tab_blank_y).abs() < 0.5 and ((y2 - y1) - cell_h).abs() < 0.5 and col == theme.accent {
                     saw_tab_blank_active = true
                 }
@@ -533,7 +533,7 @@ fn test_continuous_indent_guides_and_active_scope() {
     for i in 0..dired_cmds.len() {
         let cmd = dired_cmds.get(i.as(usize)).as(DrawCmd)
         cmd match {
-            DrawCmd.Line(x1, y1, x2, y2, _, _) => {
+            DrawCmd.line(x1, y1, x2, y2, _, _) => {
                 if (x1 - x2).abs() < 0.1 and x1 >= tab_pane.rect.x + 20.0 and ((y2 - y1) - cell_h).abs() < 0.5 {
                     dired_guide_lines += 1
                 }
@@ -551,7 +551,7 @@ fn test_global_no_bold_invariant_across_all_surfaces() {
 
     let rich_buf = world.create_buffer(
         "scene.md",
-        BufferKind.File,
+        BufferKind.file,
         file_path = "/tmp/scene.md",
         major_mode = "markdown",
         initial_lines = [
@@ -664,10 +664,10 @@ fn test_global_no_bold_invariant_across_all_surfaces() {
     for i in 0..cmds.len() {
         let cmd = cmds.get(i.as(usize)).as(DrawCmd)
         cmd match {
-            DrawCmd.TextRun(_, _, txt, _, _, _, bold, italic, ul) => {
+            DrawCmd.text_run(_, _, txt, _, _, _, bold, italic, ul) => {
                 total_text_runs += 1
                 if bold {
-                    panic("Unexpected bold == true on DrawCmd.TextRun: '" ++ txt ++ "'")
+                    panic("Unexpected bold == true on DrawCmd.text_run: '" ++ txt ++ "'")
                 }
                 if italic {
                     italic_runs += 1
@@ -733,7 +733,7 @@ fn test_global_no_bold_invariant_across_all_surfaces() {
     for i in 0..cmds2.len() {
         let cmd = cmds2.get(i.as(usize)).as(DrawCmd)
         cmd match {
-            DrawCmd.TextRun(_, _, txt, _, _, _, bold, _, _) => {
+            DrawCmd.text_run(_, _, txt, _, _, _, bold, _, _) => {
                 runs2 += 1
                 if bold {
                     panic("Unexpected bold == true in popup/which-key frame: '" ++ txt ++ "'")
@@ -766,7 +766,7 @@ fn test_markdown_bugfixes_frontmatter_escapes_tables_and_ghost() {
     ]
     let md_buf = world.create_buffer(
         "bugs.md",
-        BufferKind.File,
+        BufferKind.file,
         file_path = "/tmp/bugs.md",
         major_mode = "gfm",
         initial_lines = md_lines,
@@ -818,7 +818,7 @@ fn test_markdown_bugfixes_frontmatter_escapes_tables_and_ghost() {
     for i in 0..cmds.len() {
         let cmd = cmds.get(i.as(usize)).as(DrawCmd)
         cmd match {
-            DrawCmd.TextRun(tx, ty, txt, _, _, col, bold, italic, ul) => {
+            DrawCmd.text_run(tx, ty, txt, _, _, col, bold, italic, ul) => {
                 assert_true(not bold, "GFM scene TextRun must never be bold")
                 if tx >= text_x0 - 0.5 {
                     if (ty - y_fm_cmt).abs() < 0.5 and txt.contains("yaml comment") and col == theme.syn_comment {

@@ -1920,6 +1920,129 @@ fn extract_quoted_first_arg(s: &str) -> Option<String> {
     }
 }
 
+type CachedFileSymbols = Arc<Vec<(i64, SymbolDefEntry)>>;
+type FileSymbolCacheMap = HashMap<PathBuf, (u64, u128, CachedFileSymbols)>;
+
+fn file_symbol_cache() -> &'static Mutex<FileSymbolCacheMap> {
+    static CACHE: OnceLock<Mutex<FileSymbolCacheMap>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn parse_ns_file_symbols_cached(file_path: &Path) -> CachedFileSymbols {
+    let meta_opt = fs::metadata(file_path).ok();
+    let (flen, mtime_ns) = meta_opt
+        .as_ref()
+        .map(|m| {
+            let ns = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            (m.len(), ns)
+        })
+        .unwrap_or((0, 0));
+
+    if meta_opt.is_some()
+        && let Ok(guard) = file_symbol_cache().lock()
+        && let Some((c_len, c_ns, entries)) = guard.get(file_path)
+        && *c_len == flen
+        && *c_ns == mtime_ns
+    {
+        return Arc::clone(entries);
+    }
+
+    let Ok(content) = fs::read_to_string(file_path) else {
+        return Arc::new(Vec::new());
+    };
+    let lines: Vec<String> = content.lines().map(str::to_string).collect();
+    let fp_str = file_path.to_string_lossy().to_string();
+    let kw_table: &[(&str, &str)] = &[
+        ("fn ", "fn"),
+        ("struct ", "struct"),
+        ("enum ", "enum"),
+        ("trait ", "trait"),
+        ("effect ", "effect"),
+        ("const ", "const"),
+        ("type ", "type"),
+    ];
+    let mut parsed: Vec<(i64, SymbolDefEntry)> = Vec::new();
+
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("--") {
+            continue;
+        }
+
+        if let Some(rc_pos) = trimmed.find("register_command(") {
+            let after_rc = &trimmed[rc_pos + "register_command(".len()..];
+            let cmd_opt = extract_quoted_first_arg(after_rc).or_else(|| {
+                lines
+                    .get(idx + 1)
+                    .and_then(|next_ln| extract_quoted_first_arg(next_ln.trim()))
+            });
+            if let Some(cmd_name) = cmd_opt {
+                let doc = collect_preceding_doc_comment(&lines, idx);
+                parsed.push((
+                    500,
+                    SymbolDefEntry {
+                        symbol: cmd_name,
+                        kind: "command".to_string(),
+                        file_path: fp_str.clone(),
+                        row: idx as i64,
+                        signature: trimmed.chars().take(120).collect(),
+                        doc_comment: doc,
+                    },
+                ));
+            }
+        }
+
+        let mut rest = trimmed;
+        for vis in ["pub(crate) ", "pub ", "private ", "async "] {
+            if let Some(s) = rest.strip_prefix(vis) {
+                rest = s.trim_start();
+            }
+        }
+        for (kw, kind) in kw_table {
+            if let Some(after_kw) = rest.strip_prefix(kw) {
+                let sym: String = after_kw
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !sym.is_empty() {
+                    let pub_bonus = if trimmed.starts_with("pub ") { 250 } else { 0 };
+                    let doc = collect_preceding_doc_comment(&lines, idx);
+                    parsed.push((
+                        pub_bonus,
+                        SymbolDefEntry {
+                            symbol: sym,
+                            kind: (*kind).to_string(),
+                            file_path: fp_str.clone(),
+                            row: idx as i64,
+                            signature: trimmed.chars().take(120).collect(),
+                            doc_comment: doc,
+                        },
+                    ));
+                }
+                break;
+            }
+        }
+    }
+
+    let arc_entries = Arc::new(parsed);
+    if meta_opt.is_some()
+        && let Ok(mut guard) = file_symbol_cache().lock()
+    {
+        if guard.len() > 1024 {
+            guard.clear();
+        }
+        guard.insert(
+            file_path.to_path_buf(),
+            (flen, mtime_ns, Arc::clone(&arc_entries)),
+        );
+    }
+    arc_entries
+}
+
 pub fn find_symbol_defs(code_roots: &[String], query: &str, limit: usize) -> Vec<SymbolDefEntry> {
     let cap = if limit == 0 { 50 } else { limit.min(300) };
     let q_trim = query.trim();
@@ -1945,95 +2068,18 @@ pub fn find_symbol_defs(code_roots: &[String], query: &str, limit: usize) -> Vec
         let mut found = Vec::new();
         collect_files_with_ext(root, "ns", &mut found);
         for f in found {
-            let canon = fs::canonicalize(&f).unwrap_or_else(|_| f.clone());
-            if seen.insert(canon) {
+            if seen.insert(f.clone()) {
                 ns_files.push(f);
             }
         }
     }
 
     let mut scored: Vec<(i64, SymbolDefEntry)> = Vec::new();
-    let kw_table: &[(&str, &str)] = &[
-        ("fn ", "fn"),
-        ("struct ", "struct"),
-        ("enum ", "enum"),
-        ("trait ", "trait"),
-        ("effect ", "effect"),
-        ("const ", "const"),
-        ("type ", "type"),
-    ];
-
     for file_path in ns_files {
-        let Ok(content) = fs::read_to_string(&file_path) else {
-            continue;
-        };
-        let lines: Vec<String> = content.lines().map(str::to_string).collect();
-        let fp_str = file_path.to_string_lossy().to_string();
-
-        for (idx, line) in lines.iter().enumerate() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with("--") {
-                continue;
-            }
-
-            // 1. Check `register_command("cmd-name", ...)`
-            if let Some(rc_pos) = trimmed.find("register_command(") {
-                let after_rc = &trimmed[rc_pos + "register_command(".len()..];
-                let cmd_opt = extract_quoted_first_arg(after_rc).or_else(|| {
-                    lines
-                        .get(idx + 1)
-                        .and_then(|next_ln| extract_quoted_first_arg(next_ln.trim()))
-                });
-                if let Some(cmd_name) = cmd_opt
-                    && let Some(sc) = fuzzy_score_one(q_trim, &q_lower, &cmd_name)
-                {
-                    let doc = collect_preceding_doc_comment(&lines, idx);
-                    scored.push((
-                        sc + 500,
-                        SymbolDefEntry {
-                            symbol: cmd_name,
-                            kind: "command".to_string(),
-                            file_path: fp_str.clone(),
-                            row: idx as i64,
-                            signature: trimmed.chars().take(120).collect(),
-                            doc_comment: doc,
-                        },
-                    ));
-                }
-            }
-
-            // 2. Check Nessa top-level / method / effect / type declarations
-            let mut rest = trimmed;
-            for vis in ["pub(crate) ", "pub ", "private ", "async "] {
-                if let Some(s) = rest.strip_prefix(vis) {
-                    rest = s.trim_start();
-                }
-            }
-            for (kw, kind) in kw_table {
-                if let Some(after_kw) = rest.strip_prefix(kw) {
-                    let sym: String = after_kw
-                        .chars()
-                        .take_while(|c| c.is_alphanumeric() || *c == '_')
-                        .collect();
-                    if !sym.is_empty()
-                        && let Some(sc) = fuzzy_score_one(q_trim, &q_lower, &sym)
-                    {
-                        let pub_bonus = if trimmed.starts_with("pub ") { 250 } else { 0 };
-                        let doc = collect_preceding_doc_comment(&lines, idx);
-                        scored.push((
-                            sc + pub_bonus,
-                            SymbolDefEntry {
-                                symbol: sym,
-                                kind: (*kind).to_string(),
-                                file_path: fp_str.clone(),
-                                row: idx as i64,
-                                signature: trimmed.chars().take(120).collect(),
-                                doc_comment: doc,
-                            },
-                        ));
-                    }
-                    break;
-                }
+        let entries = parse_ns_file_symbols_cached(&file_path);
+        for (bonus, entry) in entries.iter() {
+            if let Some(sc) = fuzzy_score_one(q_trim, &q_lower, &entry.symbol) {
+                scored.push((sc + *bonus, entry.clone()));
             }
         }
     }

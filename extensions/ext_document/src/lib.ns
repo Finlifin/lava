@@ -90,13 +90,25 @@ pub struct NarrowRegion {
 derive Eq, PartialEq for NarrowRegion
 
 pub enum BufferKind {
-    pub File,
-    pub Scratch,
-    pub Special,
-    pub Directory,
-    pub Results,
+    pub file,
+    pub scratch,
+    pub special,
+    pub directory,
+    pub results,
 }
-derive Eq, PartialEq, Display for BufferKind
+derive Eq, PartialEq for BufferKind
+
+impl Display for BufferKind {
+    pub fn to_string(self) -> String {
+        self match {
+            BufferKind.file => "File",
+            BufferKind.scratch => "Scratch",
+            BufferKind.special => "Special",
+            BufferKind.directory => "Directory",
+            BufferKind.results => "Results",
+        }
+    }
+}
 
 -- ============================================================================
 -- 2. Branching UndoTree
@@ -725,7 +737,7 @@ pub fn parse_quickfix_line(line: String) -> ?QuickfixEntry {
         return null
     }
     let (line_str, rest2) = second_split
-    let line_num? = line_str.trim().parse_i64() else {
+    let line_num? = line_str.trim().try_parse(i64) else {
         return null
     }
     if line_num < 1 {
@@ -735,7 +747,7 @@ pub fn parse_quickfix_line(line: String) -> ?QuickfixEntry {
     let third_opt = rest2.split_once(":")
     if third_opt != null {
         let (col_str, msg) = third_opt.as((String, String))
-        let col_num_opt = col_str.trim().parse_i64()
+        let col_num_opt = col_str.trim().try_parse(i64)
         if col_num_opt != null {
             let cnum = col_num_opt.as(i64)
             let safe_col = if cnum > 0 { cnum - 1 } else { 0 }
@@ -839,6 +851,7 @@ pub struct Buffer {
     pub doc_id: i64,
     pub edit_version: i64,
     pub native_large: bool,
+    pub cached_doc_line_count: i64,
     pub lines: List,
     pub crlf: bool,
     pub modified: bool,
@@ -852,10 +865,16 @@ pub struct Buffer {
     pub narrow: ?NarrowRegion,
     pub folded_rows: Set,
     pub undo_tree: UndoTree,
-    pub vars: HashMap,
+    pub vars: Map,
     pub signs: List,
     pub inline_decors: List,
     pub virt_texts: List,
+    pub cleared_sign_owners: Map,
+    pub cleared_inline_owners: Map,
+    pub cleared_vt_owners: Map,
+    pub tracked_sign_len: i64,
+    pub tracked_inline_len: i64,
+    pub tracked_vt_len: i64,
 }
 
 impl Buffer {
@@ -869,21 +888,26 @@ impl Buffer {
     ) -> Buffer {
         var doc_id: i64 = 0
         var is_large = false
+        var init_count: i64 = 1
         var mirror = List()
         if initial_lines != null {
             let l = initial_lines.as(List)
             if l.is_empty() {
                 mirror = [""]
+                init_count = 1
                 doc_id = accel_doc_new(mirror)
             } else if l.len() > SMALL_MIRROR_LIMIT {
                 is_large = true
+                init_count = l.len()
                 doc_id = accel_doc_new(l)
             } else {
                 mirror = clone_string_list(l)
+                init_count = mirror.len()
                 doc_id = accel_doc_new(mirror)
             }
         } else {
             mirror = [""]
+            init_count = 1
             doc_id = accel_doc_new(mirror)
         }
         let p0 = Pos.zero()
@@ -896,6 +920,7 @@ impl Buffer {
             doc_id: doc_id,
             edit_version: 1,
             native_large: is_large,
+            cached_doc_line_count: init_count,
             lines: mirror,
             crlf: false,
             modified: false,
@@ -909,10 +934,16 @@ impl Buffer {
             narrow: null,
             folded_rows: Set.new(),
             undo_tree: UndoTree.new_doc(doc_id, p0),
-            vars: HashMap.new(),
+            vars: Map.new(),
             signs: List(),
             inline_decors: List(),
             virt_texts: List(),
+            cleared_sign_owners: Map.new(),
+            cleared_inline_owners: Map.new(),
+            cleared_vt_owners: Map.new(),
+            tracked_sign_len: 0,
+            tracked_inline_len: 0,
+            tracked_vt_len: 0,
         }
     }
 
@@ -926,13 +957,19 @@ impl Buffer {
         .file_path: String = "",
         .major_mode: String = "text",
     ) -> Buffer {
-        let eff_count = if line_count > 0 { line_count } else { accel_doc_line_count(doc_id) }
+        let raw_count = if line_count > 0 { line_count } else { accel_doc_line_count(doc_id) }
+        let eff_count = if raw_count > 0 { raw_count } else { 1 }
         let is_large = eff_count > SMALL_MIRROR_LIMIT
         let mirror = if is_large {
             List()
         } else {
-            accel_doc_slice_lines(doc_id, 0, eff_count)
+            let sliced = accel_doc_slice_lines(doc_id, 0, eff_count)
+            if sliced.is_empty() {
+                sliced.push("")
+            }
+            sliced
         }
+        let init_count = if is_large { eff_count } else { mirror.len() }
         let p0 = Pos.zero()
         Buffer {
             id: id,
@@ -943,6 +980,7 @@ impl Buffer {
             doc_id: doc_id,
             edit_version: 1,
             native_large: is_large,
+            cached_doc_line_count: init_count,
             lines: mirror,
             crlf: crlf,
             modified: false,
@@ -956,10 +994,16 @@ impl Buffer {
             narrow: null,
             folded_rows: Set.new(),
             undo_tree: UndoTree.new_doc(doc_id, p0),
-            vars: HashMap.new(),
+            vars: Map.new(),
             signs: List(),
             inline_decors: List(),
             virt_texts: List(),
+            cleared_sign_owners: Map.new(),
+            cleared_inline_owners: Map.new(),
+            cleared_vt_owners: Map.new(),
+            tracked_sign_len: 0,
+            tracked_inline_len: 0,
+            tracked_vt_len: 0,
         }
     }
 
@@ -969,18 +1013,20 @@ impl Buffer {
 
     pub fn sync_external_lines(self) {
         if not self.native_large {
-            let doc_cnt = accel_doc_line_count(self.doc_id)
-            if self.lines.len() != doc_cnt {
-                if self.lines.is_empty() {
-                    self.lines.push("")
-                }
-                accel_doc_clone_from_lines(self.doc_id, self.lines)
-                if self.lines.len() > SMALL_MIRROR_LIMIT {
-                    self.native_large = true
-                    self.lines = List()
-                }
-                self.edit_version += 1
+            if self.lines.len() == self.cached_doc_line_count {
+                return
             }
+            if self.lines.is_empty() {
+                self.lines.push("")
+            }
+            let new_len = self.lines.len()
+            accel_doc_clone_from_lines(self.doc_id, self.lines)
+            self.cached_doc_line_count = new_len
+            if new_len > SMALL_MIRROR_LIMIT {
+                self.native_large = true
+                self.lines = List()
+            }
+            self.edit_version += 1
         }
     }
 
@@ -989,15 +1035,24 @@ impl Buffer {
         if count > SMALL_MIRROR_LIMIT {
             self.native_large = true
             self.lines = List()
+            self.cached_doc_line_count = count
         } else {
             self.native_large = false
             self.lines = accel_doc_slice_lines(self.doc_id, 0, count)
+            if self.lines.is_empty() {
+                self.lines.push("")
+            }
+            self.cached_doc_line_count = self.lines.len()
         }
     }
 
     pub fn line_count(self) -> i64 {
         self.sync_external_lines()
-        let c = accel_doc_line_count(self.doc_id)
+        let c = if self.native_large {
+            self.cached_doc_line_count
+        } else {
+            self.lines.len()
+        }
         if c <= 0 { 1 } else { c }
     }
 
@@ -1048,8 +1103,13 @@ impl Buffer {
 
     pub fn line_at(self, row: i64) -> String {
         self.sync_external_lines()
-        let count = accel_doc_line_count(self.doc_id)
-        if row < 0 or row >= count {
+        if not self.native_large {
+            if row < 0 or row >= self.lines.len() {
+                return ""
+            }
+            return self.lines.get(row.as(usize)).as(String)
+        }
+        if row < 0 or row >= self.cached_doc_line_count {
             return ""
         }
         accel_doc_line_at(self.doc_id, row)
@@ -1057,8 +1117,13 @@ impl Buffer {
 
     pub fn line_char_len(self, row: i64) -> i64 {
         self.sync_external_lines()
-        let count = accel_doc_line_count(self.doc_id)
-        if row < 0 or row >= count {
+        if not self.native_large {
+            if row < 0 or row >= self.lines.len() {
+                return 0
+            }
+            return self.lines.get(row.as(usize)).as(String).char_len()
+        }
+        if row < 0 or row >= self.cached_doc_line_count {
             return 0
         }
         accel_doc_line_char_len(self.doc_id, row)
@@ -1071,7 +1136,11 @@ impl Buffer {
 
     pub fn set_line_at(self, row: i64, text: String) {
         self.sync_external_lines()
-        let count = accel_doc_line_count(self.doc_id)
+        let count = if self.native_large {
+            self.cached_doc_line_count
+        } else {
+            self.lines.len()
+        }
         if row < 0 or row >= count {
             return
         }
@@ -1084,25 +1153,39 @@ impl Buffer {
 
     pub fn insert_line_at(self, row: i64, text: String) {
         self.sync_external_lines()
-        let count = accel_doc_line_count(self.doc_id)
+        let count = if self.native_large {
+            self.cached_doc_line_count
+        } else {
+            self.lines.len()
+        }
         let r = if row < 0 { 0 } else if row > count { count } else { row }
         accel_doc_insert_line(self.doc_id, r, text)
         let new_count = accel_doc_line_count(self.doc_id)
         if new_count > SMALL_MIRROR_LIMIT {
             self.native_large = true
             self.lines = List()
+            self.cached_doc_line_count = new_count
         } else if self.native_large {
             self.native_large = false
             self.lines = accel_doc_slice_lines(self.doc_id, 0, new_count)
+            if self.lines.is_empty() {
+                self.lines.push("")
+            }
+            self.cached_doc_line_count = self.lines.len()
         } else {
             self.lines.insert(r.as(usize), text)
+            self.cached_doc_line_count = self.lines.len()
         }
         self.edit_version += 1
     }
 
     pub fn remove_line_at(self, row: i64) -> String {
         self.sync_external_lines()
-        let count = accel_doc_line_count(self.doc_id)
+        let count = if self.native_large {
+            self.cached_doc_line_count
+        } else {
+            self.lines.len()
+        }
         if row < 0 or row >= count {
             return ""
         }
@@ -1111,9 +1194,14 @@ impl Buffer {
         if new_count > SMALL_MIRROR_LIMIT {
             self.native_large = true
             self.lines = List()
+            self.cached_doc_line_count = new_count
         } else if self.native_large {
             self.native_large = false
             self.lines = accel_doc_slice_lines(self.doc_id, 0, new_count)
+            if self.lines.is_empty() {
+                self.lines.push("")
+            }
+            self.cached_doc_line_count = self.lines.len()
         } else {
             if row < self.lines.len() {
                 let _ = self.lines.remove(row.as(usize))
@@ -1121,6 +1209,7 @@ impl Buffer {
             if self.lines.is_empty() {
                 self.lines.push("")
             }
+            self.cached_doc_line_count = self.lines.len()
         }
         self.edit_version += 1
         removed
@@ -1186,15 +1275,18 @@ impl Buffer {
             accel_doc_clone_from_lines(self.doc_id, fallback)
             self.native_large = false
             self.lines = fallback
+            self.cached_doc_line_count = 1
         } else if new_lines.len() > SMALL_MIRROR_LIMIT {
             accel_doc_clone_from_lines(self.doc_id, new_lines)
             self.native_large = true
             self.lines = List()
+            self.cached_doc_line_count = new_lines.len()
         } else {
             let clean = clone_string_list(new_lines)
             accel_doc_clone_from_lines(self.doc_id, clean)
             self.native_large = false
             self.lines = clean
+            self.cached_doc_line_count = clean.len()
         }
         self.edit_version += 1
         self.point = self.clamp_pos(self.point, insert_mode = true)
@@ -1236,9 +1328,14 @@ impl Buffer {
         if count <= SMALL_MIRROR_LIMIT {
             self.native_large = false
             self.lines = accel_doc_slice_lines(self.doc_id, 0, count)
+            if self.lines.is_empty() {
+                self.lines.push("")
+            }
+            self.cached_doc_line_count = self.lines.len()
         } else {
             self.native_large = true
             self.lines = List()
+            self.cached_doc_line_count = count
         }
         self.modified = self.undo_tree.current_id != 0
         let p = self.clamp_pos(cur, insert_mode = true)
@@ -1289,13 +1386,35 @@ impl Buffer {
         } else {
             text
         }
-        let old_count = accel_doc_line_count(self.doc_id)
+        let old_count = if self.native_large {
+            self.cached_doc_line_count
+        } else {
+            self.lines.len()
+        }
         let (end_row, end_col) = accel_doc_insert_text(self.doc_id, p.row, p.col, normalized)
-        let new_count = accel_doc_line_count(self.doc_id)
+        let new_count = if normalized.contains("\n") {
+            accel_doc_line_count(self.doc_id)
+        } else {
+            old_count
+        }
         let added_rows = new_count - old_count
+        self.cached_doc_line_count = if new_count > 0 { new_count } else { 1 }
         if added_rows == 0 {
             if (not self.native_large) and p.row < self.lines.len() {
                 self.lines.set(p.row.as(usize), accel_doc_line_at(self.doc_id, p.row))
+            }
+        } else if added_rows == 1 and (not self.native_large) and new_count <= SMALL_MIRROR_LIMIT {
+            if p.row < self.lines.len() {
+                self.lines.set(p.row.as(usize), accel_doc_line_at(self.doc_id, p.row))
+            }
+            self.lines.insert((p.row + 1).as(usize), accel_doc_line_at(self.doc_id, p.row + 1))
+            self.cached_doc_line_count = self.lines.len()
+            if self.narrow != null {
+                let nr = self.narrow.as(NarrowRegion)
+                self.narrow = NarrowRegion {
+                    start_row: nr.start_row,
+                    end_row: nr.end_row + 1,
+                }
             }
         } else {
             self.refresh_mirror_from_doc()
@@ -1383,8 +1502,27 @@ impl Buffer {
             return deleted
         }
         if p.row < self.max_row() {
+            let old_count = if self.native_large {
+                self.cached_doc_line_count
+            } else {
+                self.lines.len()
+            }
             let _ = accel_doc_delete_span(self.doc_id, p.row, llen, p.row + 1, 0)
-            self.refresh_mirror_from_doc()
+            let new_count = accel_doc_line_count(self.doc_id)
+            if old_count - new_count == 1 and (not self.native_large) {
+                if p.row < self.lines.len() {
+                    self.lines.set(p.row.as(usize), accel_doc_line_at(self.doc_id, p.row))
+                }
+                if p.row + 1 < self.lines.len() {
+                    let _ = self.lines.remove((p.row + 1).as(usize))
+                }
+                if self.lines.is_empty() {
+                    self.lines.push("")
+                }
+                self.cached_doc_line_count = self.lines.len()
+            } else {
+                self.refresh_mirror_from_doc()
+            }
             if self.narrow != null {
                 let nr = self.narrow.as(NarrowRegion)
                 if nr.end_row > nr.start_row {
@@ -1443,20 +1581,51 @@ impl Buffer {
         if s == e {
             return (s, "")
         }
-        let rows_removed = e.row - s.row
+        let old_count = if self.native_large {
+            self.cached_doc_line_count
+        } else {
+            self.lines.len()
+        }
         let removed = accel_doc_delete_span(self.doc_id, s.row, s.col, e.row, e.col)
-        if rows_removed == 0 {
+        let new_count = if s.row == e.row {
+            old_count
+        } else {
+            accel_doc_line_count(self.doc_id)
+        }
+        let removed_rows = old_count - new_count
+        self.cached_doc_line_count = if new_count > 0 { new_count } else { 1 }
+        if removed_rows == 0 {
             if (not self.native_large) and s.row < self.lines.len() {
                 self.lines.set(s.row.as(usize), accel_doc_line_at(self.doc_id, s.row))
+            }
+        } else if removed_rows == 1 and (not self.native_large) {
+            if s.row < self.lines.len() {
+                self.lines.set(s.row.as(usize), accel_doc_line_at(self.doc_id, s.row))
+            }
+            if s.row + 1 < self.lines.len() {
+                let _ = self.lines.remove((s.row + 1).as(usize))
+            }
+            if self.lines.is_empty() {
+                self.lines.push("")
+            }
+            self.cached_doc_line_count = self.lines.len()
+            if self.narrow != null {
+                let nr = self.narrow.as(NarrowRegion)
+                let next_end = if nr.end_row - 1 < nr.start_row {
+                    nr.start_row
+                } else {
+                    nr.end_row - 1
+                }
+                self.narrow = NarrowRegion { start_row: nr.start_row, end_row: next_end }
             }
         } else {
             self.refresh_mirror_from_doc()
             if self.narrow != null {
                 let nr = self.narrow.as(NarrowRegion)
-                let next_end = if nr.end_row - rows_removed < nr.start_row {
+                let next_end = if nr.end_row - removed_rows < nr.start_row {
                     nr.start_row
                 } else {
-                    nr.end_row - rows_removed
+                    nr.end_row - removed_rows
                 }
                 self.narrow = NarrowRegion { start_row: nr.start_row, end_row: next_end }
             }
@@ -1481,7 +1650,11 @@ impl Buffer {
         if hi < lo {
             return (self.point, "")
         }
-        let total_before = accel_doc_line_count(self.doc_id)
+        let total_before = if self.native_large {
+            self.cached_doc_line_count
+        } else {
+            self.lines.len()
+        }
         let count = hi - lo + 1
         let raw_removed = accel_doc_delete_lines(self.doc_id, lo, hi)
         let removed_text = if raw_removed.ends_with("\n") {
@@ -1654,62 +1827,68 @@ impl Buffer {
 
     pub fn clear_owner_decors(self, owner: String) {
         if not self.signs.is_empty() {
-            var has_sign = false
-            for i in 0..self.signs.len() {
-                if self.signs.get(i.as(usize)).as(GutterSign).owner == owner {
-                    has_sign = true
-                    break
-                }
+            let old_len = self.signs.len()
+            if old_len != self.tracked_sign_len {
+                self.cleared_sign_owners.clear()
+                self.tracked_sign_len = old_len
             }
-            if has_sign {
+            if not self.cleared_sign_owners.contains(owner) {
                 let next_signs = List()
-                for i in 0..self.signs.len() {
+                for i in 0..old_len {
                     let s = self.signs.get(i.as(usize)).as(GutterSign)
                     if s.owner != owner {
                         next_signs.push(s)
                     }
                 }
-                self.signs = next_signs
+                if next_signs.len() != old_len {
+                    self.signs = next_signs
+                }
+                self.tracked_sign_len = self.signs.len()
+                self.cleared_sign_owners.set(owner, true)
             }
         }
 
         if not self.inline_decors.is_empty() {
-            var has_inline = false
-            for i in 0..self.inline_decors.len() {
-                if self.inline_decors.get(i.as(usize)).as(InlineSpanDecor).owner == owner {
-                    has_inline = true
-                    break
-                }
+            let old_len = self.inline_decors.len()
+            if old_len != self.tracked_inline_len {
+                self.cleared_inline_owners.clear()
+                self.tracked_inline_len = old_len
             }
-            if has_inline {
+            if not self.cleared_inline_owners.contains(owner) {
                 let next_inline = List()
-                for i in 0..self.inline_decors.len() {
+                for i in 0..old_len {
                     let d = self.inline_decors.get(i.as(usize)).as(InlineSpanDecor)
                     if d.owner != owner {
                         next_inline.push(d)
                     }
                 }
-                self.inline_decors = next_inline
+                if next_inline.len() != old_len {
+                    self.inline_decors = next_inline
+                }
+                self.tracked_inline_len = self.inline_decors.len()
+                self.cleared_inline_owners.set(owner, true)
             }
         }
 
         if not self.virt_texts.is_empty() {
-            var has_vt = false
-            for i in 0..self.virt_texts.len() {
-                if self.virt_texts.get(i.as(usize)).as(VirtualTextDecor).owner == owner {
-                    has_vt = true
-                    break
-                }
+            let old_len = self.virt_texts.len()
+            if old_len != self.tracked_vt_len {
+                self.cleared_vt_owners.clear()
+                self.tracked_vt_len = old_len
             }
-            if has_vt {
+            if not self.cleared_vt_owners.contains(owner) {
                 let next_vt = List()
-                for i in 0..self.virt_texts.len() {
+                for i in 0..old_len {
                     let vt = self.virt_texts.get(i.as(usize)).as(VirtualTextDecor)
                     if vt.owner != owner {
                         next_vt.push(vt)
                     }
                 }
-                self.virt_texts = next_vt
+                if next_vt.len() != old_len {
+                    self.virt_texts = next_vt
+                }
+                self.tracked_vt_len = self.virt_texts.len()
+                self.cleared_vt_owners.set(owner, true)
             }
         }
     }
@@ -1718,6 +1897,12 @@ impl Buffer {
         self.signs = List()
         self.inline_decors = List()
         self.virt_texts = List()
+        self.cleared_sign_owners.clear()
+        self.cleared_inline_owners.clear()
+        self.cleared_vt_owners.clear()
+        self.tracked_sign_len = 0
+        self.tracked_inline_len = 0
+        self.tracked_vt_len = 0
     }
 
     pub fn add_sign(
@@ -1728,6 +1913,10 @@ impl Buffer {
         fg_rgba: i64,
         .priority: i64 = 10,
     ) {
+        if self.signs.len() != self.tracked_sign_len {
+            self.cleared_sign_owners.clear()
+        }
+        let _ = self.cleared_sign_owners.remove(owner)
         self.signs.push(GutterSign {
             owner: owner,
             row: row,
@@ -1735,6 +1924,7 @@ impl Buffer {
             fg_rgba: fg_rgba,
             priority: priority,
         })
+        self.tracked_sign_len = self.signs.len()
     }
 
     pub fn add_inline_decor(
@@ -1748,6 +1938,10 @@ impl Buffer {
         .underline: bool = false,
         .replace_label: String = "",
     ) {
+        if self.inline_decors.len() != self.tracked_inline_len {
+            self.cleared_inline_owners.clear()
+        }
+        let _ = self.cleared_inline_owners.remove(owner)
         self.inline_decors.push(InlineSpanDecor {
             owner: owner,
             row: row,
@@ -1758,6 +1952,7 @@ impl Buffer {
             underline: underline,
             replace_label: replace_label,
         })
+        self.tracked_inline_len = self.inline_decors.len()
     }
 
     pub fn add_virt_text(
@@ -1768,6 +1963,10 @@ impl Buffer {
         fg_rgba: i64,
         .italic: bool = true,
     ) {
+        if self.virt_texts.len() != self.tracked_vt_len {
+            self.cleared_vt_owners.clear()
+        }
+        let _ = self.cleared_vt_owners.remove(owner)
         self.virt_texts.push(VirtualTextDecor {
             owner: owner,
             row: row,
@@ -1775,6 +1974,7 @@ impl Buffer {
             fg_rgba: fg_rgba,
             italic: italic,
         })
+        self.tracked_vt_len = self.virt_texts.len()
     }
 
     pub fn compute_smart_indent(self, row: i64, shiftwidth: i64, expandtab: bool) -> String {
@@ -2049,12 +2249,23 @@ pub struct ActiveBgJob {
 }
 
 pub enum VisualKind {
-    pub None,
-    pub Char,
-    pub Line,
-    pub Block,
+    pub none,
+    pub char,
+    pub line,
+    pub block,
 }
-derive Eq, PartialEq, Display for VisualKind
+derive Eq, PartialEq for VisualKind
+
+impl Display for VisualKind {
+    pub fn to_string(self) -> String {
+        self match {
+            VisualKind.none => "None",
+            VisualKind.char => "Char",
+            VisualKind.line => "Line",
+            VisualKind.block => "Block",
+        }
+    }
+}
 
 pub struct VisualSelection {
     pub kind: VisualKind,
@@ -2065,7 +2276,7 @@ pub struct VisualSelection {
 impl VisualSelection {
     pub fn none() -> VisualSelection {
         VisualSelection {
-            kind: VisualKind.None,
+            kind: VisualKind.none,
             anchor: Pos.zero(),
             cursor: Pos.zero(),
         }
@@ -2155,6 +2366,8 @@ pub struct EditorWorld {
     pub minibuffer_hint_bar: String,
     pub floating_window_spans: HashMap,
     pub floating_window_cursor: HashMap,
+    pub in_key_burst: bool,
+    pub lsp_tick_dirty: bool,
 }
 
 impl EditorWorld {
@@ -2173,7 +2386,7 @@ impl EditorWorld {
         let scratch = Buffer.new(
             scratch_id,
             "*scratch*",
-            BufferKind.Scratch,
+            BufferKind.scratch,
             major_mode = "nessa",
             initial_lines = scratch_lines,
         )
@@ -2184,7 +2397,7 @@ impl EditorWorld {
         let messages = Buffer.new(
             messages_id,
             "*Messages*",
-            BufferKind.Special,
+            BufferKind.special,
             major_mode = "messages",
             initial_lines = ["[Lava] Runtime initialized."],
         )
@@ -2211,7 +2424,7 @@ impl EditorWorld {
             last_search_forward: true,
             search_highlight_active: false,
             mode_name: "NORMAL",
-            caret_shape: CaretShape.Block,
+            caret_shape: CaretShape.block,
             visual: VisualSelection.none(),
             minibuffer_view: MinibufferView.inactive(),
             viewport_rows: 36,
@@ -2242,6 +2455,8 @@ impl EditorWorld {
             minibuffer_hint_bar: "",
             floating_window_spans: HashMap.new(),
             floating_window_cursor: HashMap.new(),
+            in_key_burst: false,
+            lsp_tick_dirty: false,
         }
     }
 
@@ -2388,7 +2603,7 @@ impl EditorWorld {
         }
         let b = self.create_buffer(
             name,
-            BufferKind.Special,
+            BufferKind.special,
             major_mode = major_mode,
             initial_lines = lines,
         )
@@ -2452,7 +2667,7 @@ impl EditorWorld {
                 let (file_lines, crlf) = remote_read_lines(full_path)!
                 let buf = self.create_buffer(
                     rbase,
-                    BufferKind.File,
+                    BufferKind.file,
                     file_path = full_path,
                     major_mode = rmode,
                     initial_lines = file_lines,
@@ -2469,7 +2684,7 @@ impl EditorWorld {
             }
             let buf = self.create_buffer(
                 rbase,
-                BufferKind.File,
+                BufferKind.file,
                 file_path = full_path,
                 major_mode = rmode,
                 initial_lines = [""],
@@ -2491,7 +2706,7 @@ impl EditorWorld {
             let (doc_id, lcount, crlf) = accel_doc_open_file(full_path)!
             let buf = self.create_buffer_from_doc(
                 base_name,
-                BufferKind.File,
+                BufferKind.file,
                 doc_id,
                 lcount,
                 crlf,
@@ -2509,7 +2724,7 @@ impl EditorWorld {
         -- New unsaved file buffer
         let buf = self.create_buffer(
             base_name,
-            BufferKind.File,
+            BufferKind.file,
             file_path = full_path,
             major_mode = mode,
             initial_lines = [""],
@@ -2545,7 +2760,7 @@ impl EditorWorld {
             }
             let written = remote_write_lines(target, ssh_lines, buf.crlf)!
             buf.file_path = target
-            buf.kind = BufferKind.File
+            buf.kind = BufferKind.file
             buf.name = ssh_uri_basename(target)
             buf.major_mode = detect_major_mode(target)
             buf.modified = false
@@ -2559,12 +2774,12 @@ impl EditorWorld {
         if parent_opt != null {
             let pdir = parent_opt.as(String)
             if pdir != "" and (not fs.exists(pdir)) {
-                let _ = fs.create_dir_all(pdir) ! { _ => () }
+                let _ = fs.create_dir(pdir, parents = true) ! { _ => () }
             }
         }
         let written = accel_doc_save_file(buf.doc_id, target, buf.crlf)!
         buf.file_path = target
-        buf.kind = BufferKind.File
+        buf.kind = BufferKind.file
         let base_opt = path.file_name(target)
         if base_opt != null {
             buf.name = base_opt.as(String)
@@ -2614,7 +2829,7 @@ impl EditorWorld {
         if id == self.messages_id {
             return error "cannot kill *Messages* buffer"
         }
-        if buf.modified and (not force) and buf.kind == BufferKind.File {
+        if buf.modified and (not force) and buf.kind == BufferKind.file {
             return error ("buffer " ++ buf.name ++ " has unsaved changes (use force to discard)")
         }
         if self.buffer_order.len() <= 1 or (id == self.scratch_id and self.buffer_order.len() <= 2) {
@@ -2643,7 +2858,7 @@ impl EditorWorld {
         for i in 0..self.buffer_order.len() {
             let bid = self.buffer_order.get(i.as(usize)).as(BufferId)
             let b = self.buffers.get(bid).as(Buffer)
-            if b.modified and b.kind == BufferKind.File {
+            if b.modified and b.kind == BufferKind.file {
                 out.push(b)
             }
         }
@@ -2810,7 +3025,7 @@ pub fn register_document_extension(kernel: SystemKernel) -> !String Unit {
                         let ans? = ask_prompt(PromptRequest {
                             label: "Write file: ",
                             initial: w.cwd ++ "/",
-                            kind: PromptKind.FilePath,
+                            kind: PromptKind.file_path,
                             candidates: List(),
                         })# else {
                             status_emit("Quit")#

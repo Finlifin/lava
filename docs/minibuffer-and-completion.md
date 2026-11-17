@@ -17,7 +17,7 @@ Lava 的底部交互中枢（`ext_minibuffer`，发布服务 `"lava.minibuffer.c
   - 当多项共享更长的公共前缀时，优先补全最长公共前缀（LCP）；
   - 在文件路径提示符中，选中目录按 `<Tab>` 直接深入子目录刷新文件列表！
 - **目录层级一键回退（`vertico-directory-up`）**：在 `C-x C-f`（`<Space>ff`）或 `:e path/to/dir/` 等路径上下文中，按 **`<C-l>`** 或 **`<M-BackSpace>`** 无需逐字退格，直接一次性弹出整段父目录（如从 `crates/lava-vm/src/` 瞬间退至 `crates/lava-vm/`）！
-- **单键确认模式（`PromptKind.Confirm`）**：对于 `y/n` 或 `query-replace`（`y`/`n`/`!`/`q`）等确认型提示符，无需按 `<Return>`，敲击对应单键立即提交，按其他无效键自动回显合法按键提示。
+- **单键确认模式（`PromptKind.confirm`）**：对于 `y/n` 或 `query-replace`（`y`/`n`/`!`/`q`）等确认型提示符，无需按 `<Return>`，敲击对应单键立即提交，按其他无效键自动回显合法按键提示。
 
 ---
 

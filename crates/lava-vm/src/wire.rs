@@ -434,6 +434,480 @@ pub fn parse_commit_frame_args(args: &[NativeValue]) -> Result<RenderFrame, Stri
     })
 }
 
+fn next_flat_val<'a>(
+    items: &'a [NativeValue],
+    cur: &mut usize,
+    ctx: &str,
+) -> Result<&'a NativeValue, String> {
+    let v = items
+        .get(*cur)
+        .ok_or_else(|| format!("unexpected end of flat DrawCmd stream reading {ctx} at {cur}"))?;
+    *cur += 1;
+    Ok(v)
+}
+
+/// Parse `"ui_commit_frame_flat"` arguments `[title, width, height, bg_rgba, pointer_code, flat_list]`
+/// into a [`RenderFrame`] with a single reused Nessa `List` (zero per-command child `List`s or byte loops).
+pub fn parse_commit_frame_flat_args(args: &[NativeValue]) -> Result<RenderFrame, String> {
+    if args.len() != 6 {
+        return Err(format!(
+            "ui_commit_frame_flat expects 6 arguments, got {}",
+            args.len()
+        ));
+    }
+    let title = expect_str(&args[0], "ui_commit_frame_flat.title")?;
+    let raw_width = expect_i64(&args[1], "ui_commit_frame_flat.width")?;
+    let raw_height = expect_i64(&args[2], "ui_commit_frame_flat.height")?;
+    let bg_rgba = unpack_rgba(expect_i64(&args[3], "ui_commit_frame_flat.bg_rgba")?);
+    let pointer_code = expect_i64(&args[4], "ui_commit_frame_flat.pointer_code")?;
+    let items = expect_list(&args[5], "ui_commit_frame_flat.flat_list")?;
+
+    let width = raw_width.clamp(1, i64::from(i32::MAX)) as i32;
+    let height = raw_height.clamp(1, i64::from(i32::MAX)) as i32;
+
+    let mut commands = Vec::with_capacity(items.len() / 6);
+    let mut cur = 0usize;
+    let mut last_fam = String::new();
+
+    while cur < items.len() {
+        let tag = expect_i64(
+            next_flat_val(items, &mut cur, "DrawCmd.tag")?,
+            "DrawCmd.tag",
+        )?;
+        match tag {
+            0 => {
+                let x = expect_f64(next_flat_val(items, &mut cur, "ClipPush.x")?, "ClipPush.x")?;
+                let y = expect_f64(next_flat_val(items, &mut cur, "ClipPush.y")?, "ClipPush.y")?;
+                let w = expect_f64(next_flat_val(items, &mut cur, "ClipPush.w")?, "ClipPush.w")?;
+                let h = expect_f64(next_flat_val(items, &mut cur, "ClipPush.h")?, "ClipPush.h")?;
+                commands.push(DrawCmd::ClipPush { x, y, w, h });
+            }
+            1 => commands.push(DrawCmd::ClipPop),
+            2 => {
+                let x = expect_f64(next_flat_val(items, &mut cur, "FillRect.x")?, "FillRect.x")?;
+                let y = expect_f64(next_flat_val(items, &mut cur, "FillRect.y")?, "FillRect.y")?;
+                let w = expect_f64(next_flat_val(items, &mut cur, "FillRect.w")?, "FillRect.w")?;
+                let h = expect_f64(next_flat_val(items, &mut cur, "FillRect.h")?, "FillRect.h")?;
+                let color = unpack_rgba(expect_i64(
+                    next_flat_val(items, &mut cur, "FillRect.c")?,
+                    "FillRect.c",
+                )?);
+                let radius =
+                    expect_f64(next_flat_val(items, &mut cur, "FillRect.r")?, "FillRect.r")?;
+                commands.push(DrawCmd::FillRect {
+                    x,
+                    y,
+                    w,
+                    h,
+                    color,
+                    radius,
+                });
+            }
+            3 => {
+                let x = expect_f64(
+                    next_flat_val(items, &mut cur, "StrokeRect.x")?,
+                    "StrokeRect.x",
+                )?;
+                let y = expect_f64(
+                    next_flat_val(items, &mut cur, "StrokeRect.y")?,
+                    "StrokeRect.y",
+                )?;
+                let w = expect_f64(
+                    next_flat_val(items, &mut cur, "StrokeRect.w")?,
+                    "StrokeRect.w",
+                )?;
+                let h = expect_f64(
+                    next_flat_val(items, &mut cur, "StrokeRect.h")?,
+                    "StrokeRect.h",
+                )?;
+                let color = unpack_rgba(expect_i64(
+                    next_flat_val(items, &mut cur, "StrokeRect.c")?,
+                    "StrokeRect.c",
+                )?);
+                let line_width = expect_f64(
+                    next_flat_val(items, &mut cur, "StrokeRect.lw")?,
+                    "StrokeRect.lw",
+                )?;
+                let radius = expect_f64(
+                    next_flat_val(items, &mut cur, "StrokeRect.r")?,
+                    "StrokeRect.r",
+                )?;
+                commands.push(DrawCmd::StrokeRect {
+                    x,
+                    y,
+                    w,
+                    h,
+                    color,
+                    line_width,
+                    radius,
+                });
+            }
+            4 => {
+                let x1 = expect_f64(next_flat_val(items, &mut cur, "Line.x1")?, "Line.x1")?;
+                let y1 = expect_f64(next_flat_val(items, &mut cur, "Line.y1")?, "Line.y1")?;
+                let x2 = expect_f64(next_flat_val(items, &mut cur, "Line.x2")?, "Line.x2")?;
+                let y2 = expect_f64(next_flat_val(items, &mut cur, "Line.y2")?, "Line.y2")?;
+                let color = unpack_rgba(expect_i64(
+                    next_flat_val(items, &mut cur, "Line.c")?,
+                    "Line.c",
+                )?);
+                let line_width = expect_f64(next_flat_val(items, &mut cur, "Line.lw")?, "Line.lw")?;
+                commands.push(DrawCmd::Line {
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    color,
+                    line_width,
+                });
+            }
+            5 => {
+                let x = expect_f64(next_flat_val(items, &mut cur, "TextRun.x")?, "TextRun.x")?;
+                let y = expect_f64(next_flat_val(items, &mut cur, "TextRun.y")?, "TextRun.y")?;
+                let font_size_pt =
+                    expect_f64(next_flat_val(items, &mut cur, "TextRun.sz")?, "TextRun.sz")?;
+                let color = unpack_rgba(expect_i64(
+                    next_flat_val(items, &mut cur, "TextRun.c")?,
+                    "TextRun.c",
+                )?);
+                let flags = expect_i64(
+                    next_flat_val(items, &mut cur, "TextRun.flags")?,
+                    "TextRun.flags",
+                )?;
+                let text = expect_str(
+                    next_flat_val(items, &mut cur, "TextRun.text")?,
+                    "TextRun.text",
+                )?;
+                let font_family = expect_str(
+                    next_flat_val(items, &mut cur, "TextRun.fam")?,
+                    "TextRun.fam",
+                )?;
+                last_fam.clone_from(&font_family);
+                commands.push(DrawCmd::TextRun {
+                    x,
+                    y,
+                    text,
+                    font_family,
+                    font_size_pt,
+                    color,
+                    bold: (flags & 1) != 0,
+                    italic: (flags & 2) != 0,
+                    underline: (flags & 4) != 0,
+                });
+            }
+            7 => {
+                let x = expect_f64(
+                    next_flat_val(items, &mut cur, "TextRunCached.x")?,
+                    "TextRunCached.x",
+                )?;
+                let y = expect_f64(
+                    next_flat_val(items, &mut cur, "TextRunCached.y")?,
+                    "TextRunCached.y",
+                )?;
+                let font_size_pt = expect_f64(
+                    next_flat_val(items, &mut cur, "TextRunCached.sz")?,
+                    "TextRunCached.sz",
+                )?;
+                let color = unpack_rgba(expect_i64(
+                    next_flat_val(items, &mut cur, "TextRunCached.c")?,
+                    "TextRunCached.c",
+                )?);
+                let flags = expect_i64(
+                    next_flat_val(items, &mut cur, "TextRunCached.flags")?,
+                    "TextRunCached.flags",
+                )?;
+                let text = expect_str(
+                    next_flat_val(items, &mut cur, "TextRunCached.text")?,
+                    "TextRunCached.text",
+                )?;
+                commands.push(DrawCmd::TextRun {
+                    x,
+                    y,
+                    text,
+                    font_family: last_fam.clone(),
+                    font_size_pt,
+                    color,
+                    bold: (flags & 1) != 0,
+                    italic: (flags & 2) != 0,
+                    underline: (flags & 4) != 0,
+                });
+            }
+            6 => {
+                let x = expect_f64(
+                    next_flat_val(items, &mut cur, "CursorCaret.x")?,
+                    "CursorCaret.x",
+                )?;
+                let y = expect_f64(
+                    next_flat_val(items, &mut cur, "CursorCaret.y")?,
+                    "CursorCaret.y",
+                )?;
+                let w = expect_f64(
+                    next_flat_val(items, &mut cur, "CursorCaret.w")?,
+                    "CursorCaret.w",
+                )?;
+                let h = expect_f64(
+                    next_flat_val(items, &mut cur, "CursorCaret.h")?,
+                    "CursorCaret.h",
+                )?;
+                let shape_code = expect_i64(
+                    next_flat_val(items, &mut cur, "CursorCaret.shape")?,
+                    "CursorCaret.shape",
+                )?;
+                let color = unpack_rgba(expect_i64(
+                    next_flat_val(items, &mut cur, "CursorCaret.c")?,
+                    "CursorCaret.c",
+                )?);
+                commands.push(DrawCmd::CursorCaret {
+                    x,
+                    y,
+                    w,
+                    h,
+                    shape: CaretShape::from_code(shape_code),
+                    color,
+                });
+            }
+            other => {
+                return Err(format!(
+                    "unknown flat DrawCmd tag {other} at index {}",
+                    cur - 1
+                ));
+            }
+        }
+    }
+
+    Ok(RenderFrame {
+        generation: 0,
+        window: WindowConfig {
+            title,
+            width,
+            height,
+            background: bg_rgba,
+            pointer: PointerStyle::from_code(pointer_code),
+        },
+        commands,
+    })
+}
+
+#[inline]
+fn read_u8(buf: &[u8], cur: &mut usize, ctx: &str) -> Result<u8, String> {
+    let b = *buf
+        .get(*cur)
+        .ok_or_else(|| format!("unexpected EOF reading u8 for {ctx} at offset {}", *cur))?;
+    *cur += 1;
+    Ok(b)
+}
+
+#[inline]
+fn read_u32_le(buf: &[u8], cur: &mut usize, ctx: &str) -> Result<u32, String> {
+    let end = cur
+        .checked_add(4)
+        .ok_or_else(|| format!("offset overflow reading u32 for {ctx}"))?;
+    let slice = buf
+        .get(*cur..end)
+        .ok_or_else(|| format!("unexpected EOF reading u32 for {ctx} at offset {}", *cur))?;
+    *cur = end;
+    Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+#[inline]
+fn read_f64_le(buf: &[u8], cur: &mut usize, ctx: &str) -> Result<f64, String> {
+    let end = cur
+        .checked_add(8)
+        .ok_or_else(|| format!("offset overflow reading f64 for {ctx}"))?;
+    let slice = buf
+        .get(*cur..end)
+        .ok_or_else(|| format!("unexpected EOF reading f64 for {ctx} at offset {}", *cur))?;
+    *cur = end;
+    let bits = u64::from_le_bytes([
+        slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+    ]);
+    Ok(f64::from_bits(bits))
+}
+
+#[inline]
+fn read_utf8_str(buf: &[u8], cur: &mut usize, ctx: &str) -> Result<String, String> {
+    let byte_len = read_u32_le(buf, cur, ctx)? as usize;
+    let end = cur
+        .checked_add(byte_len)
+        .ok_or_else(|| format!("offset overflow reading string for {ctx}"))?;
+    let slice = buf
+        .get(*cur..end)
+        .ok_or_else(|| format!("unexpected EOF reading string for {ctx} at offset {}", *cur))?;
+    *cur = end;
+    std::str::from_utf8(slice)
+        .map(str::to_owned)
+        .map_err(|e| format!("invalid UTF-8 in {ctx}: {e}"))
+}
+
+/// Parse `"ui_commit_frame_bytes"` arguments `[title, width, height, bg_rgba, pointer_code, bytes]`
+/// into a [`RenderFrame`] without per-command GC `List` or `Vec<NativeValue>` allocations.
+pub fn parse_commit_frame_bytes_args(args: &[NativeValue]) -> Result<RenderFrame, String> {
+    if args.len() != 6 {
+        return Err(format!(
+            "ui_commit_frame_bytes expects 6 arguments, got {}",
+            args.len()
+        ));
+    }
+    let title = expect_str(&args[0], "ui_commit_frame_bytes.title")?;
+    let raw_width = expect_i64(&args[1], "ui_commit_frame_bytes.width")?;
+    let raw_height = expect_i64(&args[2], "ui_commit_frame_bytes.height")?;
+    let bg_rgba = unpack_rgba(expect_i64(&args[3], "ui_commit_frame_bytes.bg_rgba")?);
+    let pointer_code = expect_i64(&args[4], "ui_commit_frame_bytes.pointer_code")?;
+    let raw_bytes = match &args[5] {
+        NativeValue::Bytes(b) => b.as_slice(),
+        other => {
+            return Err(format!(
+                "expected Bytes for ui_commit_frame_bytes.wire_bytes, got {other:?}"
+            ));
+        }
+    };
+
+    let width = raw_width.clamp(1, i64::from(i32::MAX)) as i32;
+    let height = raw_height.clamp(1, i64::from(i32::MAX)) as i32;
+
+    let mut commands = Vec::with_capacity(raw_bytes.len() / 36);
+    let mut cur = 0usize;
+    let mut last_fam = String::new();
+
+    while cur < raw_bytes.len() {
+        let tag = read_u8(raw_bytes, &mut cur, "DrawCmd.tag")?;
+        match tag {
+            0 => {
+                let x = read_f64_le(raw_bytes, &mut cur, "ClipPush.x")?;
+                let y = read_f64_le(raw_bytes, &mut cur, "ClipPush.y")?;
+                let w = read_f64_le(raw_bytes, &mut cur, "ClipPush.w")?;
+                let h = read_f64_le(raw_bytes, &mut cur, "ClipPush.h")?;
+                commands.push(DrawCmd::ClipPush { x, y, w, h });
+            }
+            1 => commands.push(DrawCmd::ClipPop),
+            2 => {
+                let x = read_f64_le(raw_bytes, &mut cur, "FillRect.x")?;
+                let y = read_f64_le(raw_bytes, &mut cur, "FillRect.y")?;
+                let w = read_f64_le(raw_bytes, &mut cur, "FillRect.w")?;
+                let h = read_f64_le(raw_bytes, &mut cur, "FillRect.h")?;
+                let color = ColorRgba::from_u32(read_u32_le(raw_bytes, &mut cur, "FillRect.c")?);
+                let radius = read_f64_le(raw_bytes, &mut cur, "FillRect.r")?;
+                commands.push(DrawCmd::FillRect {
+                    x,
+                    y,
+                    w,
+                    h,
+                    color,
+                    radius,
+                });
+            }
+            3 => {
+                let x = read_f64_le(raw_bytes, &mut cur, "StrokeRect.x")?;
+                let y = read_f64_le(raw_bytes, &mut cur, "StrokeRect.y")?;
+                let w = read_f64_le(raw_bytes, &mut cur, "StrokeRect.w")?;
+                let h = read_f64_le(raw_bytes, &mut cur, "StrokeRect.h")?;
+                let color = ColorRgba::from_u32(read_u32_le(raw_bytes, &mut cur, "StrokeRect.c")?);
+                let line_width = read_f64_le(raw_bytes, &mut cur, "StrokeRect.lw")?;
+                let radius = read_f64_le(raw_bytes, &mut cur, "StrokeRect.r")?;
+                commands.push(DrawCmd::StrokeRect {
+                    x,
+                    y,
+                    w,
+                    h,
+                    color,
+                    line_width,
+                    radius,
+                });
+            }
+            4 => {
+                let x1 = read_f64_le(raw_bytes, &mut cur, "Line.x1")?;
+                let y1 = read_f64_le(raw_bytes, &mut cur, "Line.y1")?;
+                let x2 = read_f64_le(raw_bytes, &mut cur, "Line.x2")?;
+                let y2 = read_f64_le(raw_bytes, &mut cur, "Line.y2")?;
+                let color = ColorRgba::from_u32(read_u32_le(raw_bytes, &mut cur, "Line.c")?);
+                let line_width = read_f64_le(raw_bytes, &mut cur, "Line.lw")?;
+                commands.push(DrawCmd::Line {
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    color,
+                    line_width,
+                });
+            }
+            5 => {
+                let x = read_f64_le(raw_bytes, &mut cur, "TextRun.x")?;
+                let y = read_f64_le(raw_bytes, &mut cur, "TextRun.y")?;
+                let font_size_pt = read_f64_le(raw_bytes, &mut cur, "TextRun.sz")?;
+                let color = ColorRgba::from_u32(read_u32_le(raw_bytes, &mut cur, "TextRun.c")?);
+                let flags = read_u8(raw_bytes, &mut cur, "TextRun.flags")?;
+                let text = read_utf8_str(raw_bytes, &mut cur, "TextRun.text")?;
+                let font_family = read_utf8_str(raw_bytes, &mut cur, "TextRun.fam")?;
+                last_fam.clone_from(&font_family);
+                commands.push(DrawCmd::TextRun {
+                    x,
+                    y,
+                    text,
+                    font_family,
+                    font_size_pt,
+                    color,
+                    bold: (flags & 1) != 0,
+                    italic: (flags & 2) != 0,
+                    underline: (flags & 4) != 0,
+                });
+            }
+            7 => {
+                let x = read_f64_le(raw_bytes, &mut cur, "TextRunCached.x")?;
+                let y = read_f64_le(raw_bytes, &mut cur, "TextRunCached.y")?;
+                let font_size_pt = read_f64_le(raw_bytes, &mut cur, "TextRunCached.sz")?;
+                let color =
+                    ColorRgba::from_u32(read_u32_le(raw_bytes, &mut cur, "TextRunCached.c")?);
+                let flags = read_u8(raw_bytes, &mut cur, "TextRunCached.flags")?;
+                let text = read_utf8_str(raw_bytes, &mut cur, "TextRunCached.text")?;
+                commands.push(DrawCmd::TextRun {
+                    x,
+                    y,
+                    text,
+                    font_family: last_fam.clone(),
+                    font_size_pt,
+                    color,
+                    bold: (flags & 1) != 0,
+                    italic: (flags & 2) != 0,
+                    underline: (flags & 4) != 0,
+                });
+            }
+            6 => {
+                let x = read_f64_le(raw_bytes, &mut cur, "CursorCaret.x")?;
+                let y = read_f64_le(raw_bytes, &mut cur, "CursorCaret.y")?;
+                let w = read_f64_le(raw_bytes, &mut cur, "CursorCaret.w")?;
+                let h = read_f64_le(raw_bytes, &mut cur, "CursorCaret.h")?;
+                let shape_code = i64::from(read_u8(raw_bytes, &mut cur, "CursorCaret.shape")?);
+                let color = ColorRgba::from_u32(read_u32_le(raw_bytes, &mut cur, "CursorCaret.c")?);
+                commands.push(DrawCmd::CursorCaret {
+                    x,
+                    y,
+                    w,
+                    h,
+                    shape: CaretShape::from_code(shape_code),
+                    color,
+                });
+            }
+            other => {
+                return Err(format!(
+                    "unknown binary DrawCmd tag {other} at offset {cur}"
+                ));
+            }
+        }
+    }
+
+    Ok(RenderFrame {
+        generation: 0,
+        window: WindowConfig {
+            title,
+            width,
+            height,
+            background: bg_rgba,
+            pointer: PointerStyle::from_code(pointer_code),
+        },
+        commands,
+    })
+}
+
 pub(crate) fn require_min_len(
     items: &[NativeValue],
     expected: usize,

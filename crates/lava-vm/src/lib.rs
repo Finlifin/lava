@@ -23,8 +23,8 @@ pub use host::{
 };
 pub use jobs::JobManager;
 pub use wire::{
-    draw_cmd_to_native, native_to_ui_event, pack_rgba, parse_commit_frame_args, parse_draw_cmd,
-    ui_event_to_native, unpack_rgba,
+    draw_cmd_to_native, native_to_ui_event, pack_rgba, parse_commit_frame_args,
+    parse_commit_frame_bytes_args, parse_draw_cmd, ui_event_to_native, unpack_rgba,
 };
 
 #[cfg(test)]
@@ -265,6 +265,145 @@ mod tests {
         assert_eq!(frame.window.background, bg);
         assert_eq!(frame.window.pointer, PointerStyle::Text);
         assert_eq!(frame.commands, commands);
+
+        // Verify binary `ui_commit_frame_bytes` protocol (including cached font-family tag 7)
+        let mut bin = Vec::new();
+        let push_f64 = |b: &mut Vec<u8>, v: f64| b.extend_from_slice(&v.to_bits().to_le_bytes());
+        let push_u32 = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+        let push_str = |b: &mut Vec<u8>, s: &str| {
+            b.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            b.extend_from_slice(s.as_bytes());
+        };
+        let mut expected_bin_cmds = commands.clone();
+        expected_bin_cmds.push(DrawCmd::TextRun {
+            x: 24.0,
+            y: 38.0,
+            text: "café".to_string(),
+            font_family: "JetBrains Mono".to_string(),
+            font_size_pt: 13.5,
+            color: ColorRgba::from_rgba(250, 179, 135, 255),
+            bold: false,
+            italic: true,
+            underline: false,
+        });
+        let mut prev_fam = String::new();
+        for cmd in &expected_bin_cmds {
+            match cmd {
+                DrawCmd::ClipPush { x, y, w, h } => {
+                    bin.push(0);
+                    for &v in &[x, y, w, h] {
+                        push_f64(&mut bin, *v);
+                    }
+                }
+                DrawCmd::ClipPop => bin.push(1),
+                DrawCmd::FillRect {
+                    x,
+                    y,
+                    w,
+                    h,
+                    color,
+                    radius,
+                } => {
+                    bin.push(2);
+                    for &v in &[x, y, w, h] {
+                        push_f64(&mut bin, *v);
+                    }
+                    push_u32(&mut bin, color.0);
+                    push_f64(&mut bin, *radius);
+                }
+                DrawCmd::StrokeRect {
+                    x,
+                    y,
+                    w,
+                    h,
+                    color,
+                    line_width,
+                    radius,
+                } => {
+                    bin.push(3);
+                    for &v in &[x, y, w, h] {
+                        push_f64(&mut bin, *v);
+                    }
+                    push_u32(&mut bin, color.0);
+                    push_f64(&mut bin, *line_width);
+                    push_f64(&mut bin, *radius);
+                }
+                DrawCmd::Line {
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    color,
+                    line_width,
+                } => {
+                    bin.push(4);
+                    for &v in &[x1, y1, x2, y2] {
+                        push_f64(&mut bin, *v);
+                    }
+                    push_u32(&mut bin, color.0);
+                    push_f64(&mut bin, *line_width);
+                }
+                DrawCmd::TextRun {
+                    x,
+                    y,
+                    text,
+                    font_family,
+                    font_size_pt,
+                    color,
+                    bold,
+                    italic,
+                    underline,
+                } => {
+                    let flags =
+                        u8::from(*bold) | (u8::from(*italic) << 1) | (u8::from(*underline) << 2);
+                    if !prev_fam.is_empty() && prev_fam == *font_family {
+                        bin.push(7);
+                        push_f64(&mut bin, *x);
+                        push_f64(&mut bin, *y);
+                        push_f64(&mut bin, *font_size_pt);
+                        push_u32(&mut bin, color.0);
+                        bin.push(flags);
+                        push_str(&mut bin, text);
+                    } else {
+                        prev_fam.clone_from(font_family);
+                        bin.push(5);
+                        push_f64(&mut bin, *x);
+                        push_f64(&mut bin, *y);
+                        push_f64(&mut bin, *font_size_pt);
+                        push_u32(&mut bin, color.0);
+                        bin.push(flags);
+                        push_str(&mut bin, text);
+                        push_str(&mut bin, font_family);
+                    }
+                }
+                DrawCmd::CursorCaret {
+                    x,
+                    y,
+                    w,
+                    h,
+                    shape,
+                    color,
+                } => {
+                    bin.push(6);
+                    for &v in &[x, y, w, h] {
+                        push_f64(&mut bin, *v);
+                    }
+                    bin.push(*shape as u8);
+                    push_u32(&mut bin, color.0);
+                }
+            }
+        }
+        let bin_frame = parse_commit_frame_bytes_args(&[
+            NativeValue::Str("Lava Binary Frame".to_string()),
+            NativeValue::I64(1440),
+            NativeValue::I64(900),
+            NativeValue::I64(pack_rgba(bg)),
+            NativeValue::I64(PointerStyle::Text as i64),
+            NativeValue::Bytes(bin),
+        ])
+        .expect("parse_commit_frame_bytes_args");
+        assert_eq!(bin_frame.window.title, "Lava Binary Frame");
+        assert_eq!(bin_frame.commands, expected_bin_cmds);
     }
 
     #[test]
@@ -494,7 +633,7 @@ fn await_key_and_bg_job(
         width: 1024,
         height: 768,
         bg_rgba: rgba(24, 24, 37, 255),
-        pointer: PointerHint.Default,
+        pointer: PointerHint.default,
     }
     let _ = host_commit_frame(ready_spec, List())
 
@@ -502,10 +641,10 @@ fn await_key_and_bg_job(
     -- While suspended here, the VM scheduler MUST run `bg_future` concurrently in the same VM!
     var got_key = ""
     while got_key == "" {
-        let batch = host_wait_events(5000)
+        let batch = host_wait_events(-1)
         for item in batch {
             item.as(RawUiEvent) match {
-                RawUiEvent.Key(k, _mods, _txt) => {
+                RawUiEvent.key(k, _mods, _txt) => {
                     got_key = k
                 },
                 _ => (),
@@ -528,7 +667,7 @@ fn await_key_and_bg_job(
         let batch = host_wait_events(2000)
         for item in batch {
             item.as(RawUiEvent) match {
-                RawUiEvent.AsyncJobDone(jid, ok, code, stdout, stderr) => {
+                RawUiEvent.async_job_done(jid, ok, code, stdout, stderr) => {
                     if jid == job_id {
                         if not ok or code != 0 {
                             return error ("background job failed: " ++ stderr)
@@ -563,18 +702,18 @@ fn await_key_and_bg_job(
 
     -- Commit a RenderFrame containing DrawCmds to `FrameSlot`!
     let cmds = List()
-    cmds.push(DrawCmd.ClipPush(0.0, 0.0, 1024.0, 768.0))
-    cmds.push(DrawCmd.FillRect(0.0, 0.0, 1024.0, 28.0, rgba(30, 30, 46, 255), 0.0))
-    cmds.push(DrawCmd.TextRun(12.0, 20.0, line0, "Monospace", 14.0, rgba(166, 227, 161, 255), true, false, false))
-    cmds.push(DrawCmd.CursorCaret(12.0, 4.0, 8.4, 19.0, CaretShape.Block, rgba(245, 224, 220, 255)))
-    cmds.push(DrawCmd.ClipPop)
+    cmds.push(DrawCmd.clip_push(0.0, 0.0, 1024.0, 768.0))
+    cmds.push(DrawCmd.fill_rect(0.0, 0.0, 1024.0, 28.0, rgba(30, 30, 46, 255), 0.0))
+    cmds.push(DrawCmd.text_run(12.0, 20.0, line0, "Monospace", 14.0, rgba(166, 227, 161, 255), true, false, false))
+    cmds.push(DrawCmd.cursor_caret(12.0, 4.0, 8.4, 19.0, CaretShape.block, rgba(245, 224, 220, 255)))
+    cmds.push(DrawCmd.clip_pop)
 
     let spec = WindowSpec {
         title: "Lava Single-VM: " ++ line0,
         width: 1024,
         height: 768,
         bg_rgba: rgba(24, 24, 37, 255),
-        pointer: PointerHint.Text,
+        pointer: PointerHint.text,
     }
     let gen = host_commit_frame(spec, cmds)
     if gen < 1 {
@@ -758,13 +897,13 @@ fn main() {
         return
     }
     let cmds = List()
-    cmds.push(DrawCmd.FillRect(0.0, 0.0, 320.0, 200.0, rgba(40, 50, 60, 255), 2.0))
+    cmds.push(DrawCmd.fill_rect(0.0, 0.0, 320.0, 200.0, rgba(40, 50, 60, 255), 2.0))
     let spec = WindowSpec {
         title: "MiniExe",
         width: 320,
         height: 200,
         bg_rgba: rgba(10, 10, 15, 255),
-        pointer: PointerHint.Pointer,
+        pointer: PointerHint.pointer,
     }
     let _ = host_commit_frame(spec, cmds)
     host_request_quit(7)
@@ -823,7 +962,7 @@ pub fn run_session(_kernel: SystemKernel, startup_files: List, headless_keys: St
         width: 200,
         height: 100,
         bg_rgba: rgba(0, 0, 0, 255),
-        pointer: PointerHint.Default,
+        pointer: PointerHint.default,
     }
     let _ = host_commit_frame(spec, List())
     host_request_quit(0)

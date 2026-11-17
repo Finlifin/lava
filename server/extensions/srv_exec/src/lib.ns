@@ -24,9 +24,9 @@ private fn detect_hostname() -> String {
             error _ => (),
         }
     }
-    process.exec("uname", args = ["-n"]) match {
+    process.run("uname", args = ["-n"]) match {
         u! => {
-            if u.success() and u.stdout.trim() != "" {
+            if u.is_success() and u.stdout.trim() != "" {
                 return u.stdout.trim()
             }
         },
@@ -44,9 +44,9 @@ private fn detect_username() -> String {
     if from_logname != "" {
         return from_logname
     }
-    process.exec("id", args = ["-un"]) match {
+    process.run("id", args = ["-un"]) match {
         u! => {
-            if u.success() and u.stdout.trim() != "" {
+            if u.is_success() and u.stdout.trim() != "" {
                 return u.stdout.trim()
             }
         },
@@ -76,7 +76,7 @@ private fn rpc_exec_run(_k: ServerKernel, params: JsonValue) -> !String JsonValu
         null
     }
 
-    let cmd_out = process.shell(cmd, stdin_data = stdin_opt, cwd = cwd_opt) match {
+    let cmd_out = process.shell(cmd, stdin = stdin_opt, cwd = cwd_opt) match {
         v! => v,
         error err => return error ("shell command failed to spawn: " ++ err.to_string()),
     }

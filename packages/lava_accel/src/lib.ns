@@ -1,6 +1,6 @@
 -- lava_accel: High-Performance Native Accelerator Library for Lava.
 -- Bridges `lava-accel` Rust hot-paths via `std.runtime.host_call` when running inside Lava,
--- and provides deterministic Nessa fallbacks (using `std.fs.walk_dir` and `std.process.exec`)
+-- and provides deterministic Nessa fallbacks (using `std.fs.walk_dir` and `std.process.run`)
 -- so standalone `nessa run` plugin test suites run identically without GTK/Host wiring.
 
 use std.collections.{HashMap, Set}
@@ -884,13 +884,13 @@ pub fn accel_diff_lines(old_lines: List, new_lines: List) -> List {
 
 pub fn accel_git_status(cwd: String) -> GitStatusSummary {
     let raw! = runtime.host_call("accel_git_status", [cwd]) else {
-        let top! = process.exec("git", args = ["rev-parse", "--show-toplevel"], cwd = cwd) else {
+        let top! = process.run("git", args = ["rev-parse", "--show-toplevel"], cwd = cwd) else {
             return (GitStatusSummary {
                 is_repo: false, root: "", branch: "", staged_count: 0,
                 modified_count: 0, untracked_count: 0, entries: List(),
             })
         }
-        if not top.success() {
+        if not top.is_success() {
             return (GitStatusSummary {
                 is_repo: false, root: "", branch: "", staged_count: 0,
                 modified_count: 0, untracked_count: 0, entries: List(),
@@ -898,10 +898,10 @@ pub fn accel_git_status(cwd: String) -> GitStatusSummary {
         }
         let root = top.stdout.trim()
         var branch = "HEAD"
-        let br_res = process.exec("git", args = ["symbolic-ref", "--short", "HEAD"], cwd = root)
+        let br_res = process.run("git", args = ["symbolic-ref", "--short", "HEAD"], cwd = root)
         br_res match {
             b! => {
-                if b.success() and b.stdout.trim() != "" {
+                if b.is_success() and b.stdout.trim() != "" {
                     branch = b.stdout.trim()
                 }
             },
@@ -911,10 +911,10 @@ pub fn accel_git_status(cwd: String) -> GitStatusSummary {
         var modified: i64 = 0
         var untracked: i64 = 0
         let entries = List()
-        let st_res = process.exec("git", args = ["status", "--porcelain=v1", "-uall"], cwd = root)
+        let st_res = process.run("git", args = ["status", "--porcelain=v1", "-uall"], cwd = root)
         st_res match {
             st! => {
-                if st.success() {
+                if st.is_success() {
                     let lines = st.stdout.split("\n")
                     for i in 0..lines.len() {
                         let l = lines.get(i.as(usize)).as(String)
@@ -986,10 +986,10 @@ pub fn accel_git_head_lines(cwd: String, file_path: String) -> ?List {
             return null
         }
         let rel = full.drop(root_prefix.char_len())
-        let out! = process.exec("git", args = ["show", "HEAD:" ++ rel], cwd = st.root) else {
+        let out! = process.run("git", args = ["show", "HEAD:" ++ rel], cwd = st.root) else {
             return null
         }
-        if not out.success() {
+        if not out.is_success() {
             return null
         }
         let norm = out.stdout.replace("\r\n", "\n")
@@ -1013,14 +1013,14 @@ pub fn accel_git_blame_line(cwd: String, file_path: String, row_0based: i64) -> 
     let raw! = runtime.host_call("accel_git_blame_line", [cwd, file_path, row_0based]) else {
         let line_1 = (row_0based + 1).to_string()
         let range = line_1 ++ "," ++ line_1
-        let out! = process.exec(
+        let out! = process.run(
             "git",
             args = ["blame", "-L", range, "--porcelain", "--", file_path],
             cwd = cwd,
         ) else {
             return null
         }
-        if not out.success() {
+        if not out.is_success() {
             return null
         }
         let lines = out.stdout.split("\n")

@@ -36,6 +36,7 @@ pub struct ScannedSymbolSpan {
 struct CachedSymbolOutline {
     major_mode: String,
     edit_version: i64,
+    line_count: i64,
     symbols: List,
     spans: List,
 }
@@ -45,6 +46,8 @@ pub struct AerialService {
     pub active_symbols: List,
     pub active_spans: List,
     pub sidebar_symbols: List,
+    pub last_scan_buf_id: BufferId,
+    pub last_scan_ver: i64,
     cache_by_buf: HashMap,
     last_ctx_buf_id: BufferId,
     last_ctx_ver: i64,
@@ -60,6 +63,8 @@ impl AerialService {
             active_symbols: List(),
             active_spans: List(),
             sidebar_symbols: List(),
+            last_scan_buf_id: BufferId(0),
+            last_scan_ver: -1,
             cache_by_buf: HashMap.new(),
             last_ctx_buf_id: BufferId(0),
             last_ctx_ver: -1,
@@ -123,24 +128,84 @@ fn display_buffer_title(buf: Buffer) -> String {
 }
 
 fn is_outline_candidate_buffer(buf: Buffer) -> bool {
-    if buf.kind == BufferKind.Directory {
+    if buf.kind == BufferKind.directory {
         return false
     }
-    if buf.kind == BufferKind.Special {
+    if buf.kind == BufferKind.special {
         return false
     }
     true
 }
 
-fn ensure_scanned(service: AerialService, buf: Buffer, force: bool) -> (List, List) {
+fn row_has_cached_symbol(spans: List, row: i64) -> bool {
+    let n = spans.len()
+    var lo: i64 = 0
+    var hi: i64 = n
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        let mid_r = spans.get(mid.as(usize)).as(ScannedSymbolSpan).item.row
+        if mid_r < row {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    lo < n and spans.get(lo.as(usize)).as(ScannedSymbolSpan).item.row == row
+}
+
+fn line_may_affect_outline(line: String) -> bool {
+    let t = line.trim_start()
+    if t == "" or t.starts_with("//") or t.starts_with("--") {
+        return false
+    }
+    t.contains("{{")
+        or t.contains("}}")
+        or t.contains("fn ")
+        or t.contains("struct ")
+        or t.contains("enum ")
+        or t.contains("trait ")
+        or t.contains("impl ")
+        or t.contains("class ")
+        or t.contains("def ")
+        or t.contains("const ")
+        or t.contains("mod ")
+        or t.contains("newtype ")
+        or t.contains("typealias ")
+        or t.contains("interface ")
+        or t.starts_with("#")
+        or t.starts_with("*")
+}
+
+fn ensure_scanned(
+    service: AerialService,
+    buf: Buffer,
+    force: bool,
+    .allow_fast_reuse: bool = false,
+) -> (List, List) {
     buf.sync_external_lines()
+    let lcount = buf.line_count()
     if (not force) and service.cache_by_buf.contains_key(buf.id) {
         let cached = service.cache_by_buf.get(buf.id).as(CachedSymbolOutline)
-        if cached.major_mode == buf.major_mode and cached.edit_version == buf.edit_version {
-            service.active_buf_id = buf.id
-            service.active_symbols = cached.symbols
-            service.active_spans = cached.spans
-            return (cached.symbols, cached.spans)
+        if cached.major_mode == buf.major_mode {
+            if cached.edit_version == buf.edit_version
+                or (service.last_scan_buf_id == buf.id and service.last_scan_ver == buf.edit_version) {
+                service.active_buf_id = buf.id
+                service.active_symbols = cached.symbols
+                service.active_spans = cached.spans
+                return (cached.symbols, cached.spans)
+            }
+            if allow_fast_reuse
+                and cached.line_count == lcount
+                and (not row_has_cached_symbol(cached.spans, buf.point.row))
+                and (not line_may_affect_outline(buf.line_at(buf.point.row))) {
+                cached.edit_version = buf.edit_version
+                service.last_scan_buf_id = buf.id
+                service.last_scan_ver = buf.edit_version
+                service.active_buf_id = buf.id
+                service.active_symbols = cached.symbols
+                service.active_spans = cached.spans
+                return (cached.symbols, cached.spans)
+            }
         }
     }
     let raw_spans = accel_doc_scan_symbol_spans(buf.doc_id, buf.major_mode, 4000)
@@ -163,10 +228,13 @@ fn ensure_scanned(service: AerialService, buf: Buffer, force: bool) -> (List, Li
         CachedSymbolOutline {
             major_mode: buf.major_mode,
             edit_version: buf.edit_version,
+            line_count: lcount,
             symbols: symbols,
             spans: spans,
         },
     )
+    service.last_scan_buf_id = buf.id
+    service.last_scan_ver = buf.edit_version
     service.active_buf_id = buf.id
     service.active_symbols = symbols
     service.active_spans = spans
@@ -253,7 +321,8 @@ pub fn update_aerial(world: EditorWorld, service: AerialService, .force: bool = 
         return
     }
 
-    let (symbols, spans) = ensure_scanned(service, buf, force)
+    let can_fast_reuse = (not force) and (not world.right_sidebar.visible)
+    let (symbols, spans) = ensure_scanned(service, buf, force, allow_fast_reuse = can_fast_reuse)
     let (chain_indices, selected_idx) = resolve_aerial_context(spans, buf.point.row)
     service.last_ctx_buf_id = buf.id
     service.last_ctx_ver = buf.edit_version
@@ -313,8 +382,8 @@ fn move_cursor_to_symbol_pure(
     let v_opt = kernel.service("lava.vim.state")
     if v_opt != null {
         let vim = v_opt.as(VimState)
-        if vim.mode != VimMode.Normal {
-            vim.mode = VimMode.Normal
+        if vim.mode != VimMode.normal {
+            vim.mode = VimMode.normal
             vim.clear_transient()
         }
         sync_world_from_vim(world, vim)
@@ -446,6 +515,19 @@ fn on_aerial_cursor_hook(k: SystemKernel, _payload: Any) {
     update_aerial(w_opt.as(EditorWorld), s_opt.as(AerialService), force = false)
 }
 
+fn on_aerial_burst_guarded_hook(k: SystemKernel, _payload: Any) {
+    let w_opt = k.service("lava.document.world")
+    let s_opt = k.service(SERVICE_AERIAL)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    if world.in_key_burst {
+        return
+    }
+    update_aerial(world, s_opt.as(AerialService), force = false)
+}
+
 fn on_aerial_insert_hook(k: SystemKernel, _payload: Any) {
     let w_opt = k.service("lava.document.world")
     let s_opt = k.service(SERVICE_AERIAL)
@@ -453,7 +535,7 @@ fn on_aerial_insert_hook(k: SystemKernel, _payload: Any) {
         return
     }
     let world = w_opt.as(EditorWorld)
-    if world.active_buffer().line_count() > 2000 {
+    if world.in_key_burst or world.active_buffer().line_count() > 2000 {
         return
     }
     update_aerial(world, s_opt.as(AerialService), force = false)
@@ -637,7 +719,7 @@ pub fn register_aerial_extension(kernel: SystemKernel) -> !String Unit {
                             PromptRequest.with_candidates(
                                 "Aerial symbol: ",
                                 "",
-                                PromptKind.Choice,
+                                PromptKind.choice,
                                 candidates,
                             ),
                         )# else {
@@ -657,9 +739,9 @@ pub fn register_aerial_extension(kernel: SystemKernel) -> !String Unit {
 
             k.add_hook("buffer-opened", ext_id, on_aerial_force_hook)
             k.add_hook("buffer-switched", ext_id, on_aerial_cursor_hook)
-            k.add_hook("buffer-modified", ext_id, on_aerial_cursor_hook)
+            k.add_hook("buffer-modified", ext_id, on_aerial_burst_guarded_hook)
             k.add_hook("buffer-saved", ext_id, on_aerial_cursor_hook)
-            k.add_hook("cursor-moved", ext_id, on_aerial_cursor_hook)
+            k.add_hook("cursor-moved", ext_id, on_aerial_burst_guarded_hook)
             k.add_hook("mode-changed", ext_id, on_aerial_cursor_hook)
             k.add_hook("after-insert-stroke", ext_id, on_aerial_insert_hook)
             k.add_hook("sidebar-clicked", ext_id, on_aerial_sidebar_clicked)

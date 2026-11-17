@@ -4,9 +4,12 @@
 use std.collections.HashMap
 use std.env
 use std.fs
+use std.net.TcpStream
 use std.path
 use std.process
 use std.runtime
+use std.task
+use std.time
 
 pub struct RemoteTarget {
     pub authority: String,
@@ -142,7 +145,7 @@ private fn parse_authority_str(raw_auth: String, port_sep: String) -> !String (S
         let cand_host = host_port.slice(0, last_sep).trim()
         let cand_port = host_port.slice(last_sep + 1, host_port.char_len()).trim()
         if cand_port != "" and (not cand_host.contains(":")) {
-            let parsed_p? = cand_port.parse_i64() else {
+            let parsed_p? = cand_port.try_parse(i64) else {
                 return error ("invalid SSH port '" ++ cand_port ++ "'")
             }
             if parsed_p <= 0 or parsed_p > 65535 {
@@ -556,7 +559,7 @@ pub fn remote_write_lines(uri: String, lines: List, crlf: bool) -> !String i64 {
         if p_opt != null {
             let pd = p_opt.as(String)
             if pd != "" and (not fs.exists(pd)) {
-                let _ = fs.create_dir_all(pd) ! { _ => () }
+                let _ = fs.create_dir(pd, parents = true) ! { _ => () }
             }
         }
         let sep = if crlf { "\r\n" } else { "\n" }
@@ -630,7 +633,7 @@ pub fn remote_mkdir(uri: String) -> !String Unit {
     let parsed = parse_ssh_uri(uri)!
     let local_opt = resolve_mock_local_path(parsed)
     if local_opt != null {
-        let _! = fs.create_dir_all(local_opt.as(String)) else {
+        let _! = fs.create_dir(local_opt.as(String), parents = true) else {
             return error ("cannot mkdir: " ++ parsed.canonical_uri())
         }
         return ()
@@ -645,14 +648,8 @@ pub fn remote_remove(uri: String, .recursive: bool = false) -> !String Unit {
     if local_opt != null {
         let lp = local_opt.as(String)
         if fs.is_dir(lp) {
-            if recursive {
-                let _! = fs.remove_dir_all(lp) else {
-                    return error ("cannot remove dir: " ++ parsed.canonical_uri())
-                }
-            } else {
-                let _! = fs.remove_dir(lp) else {
-                    return error ("cannot remove dir: " ++ parsed.canonical_uri())
-                }
+            let _! = fs.remove_dir(lp, recursive = recursive) else {
+                return error ("cannot remove dir: " ++ parsed.canonical_uri())
             }
         } else {
             let _! = fs.remove_file(lp) else {
@@ -851,7 +848,8 @@ pub fn remote_exec(
     let parsed = parse_ssh_uri(target)!
     let local_opt = resolve_mock_local_path(parsed)
     if local_opt != null {
-        let out! = process.shell(cmd, stdin_data = stdin_data, cwd = local_opt.as(String)) else {
+        let stdin_opt: ?String = if stdin_data == "" { null } else { stdin_data }
+        let out! = process.shell(cmd, stdin = stdin_opt, cwd = local_opt.as(String)) else {
             return error ("remote shell failed: " ++ cmd)
         }
         return (out.status, out.stdout, out.stderr)
@@ -859,6 +857,32 @@ pub fn remote_exec(
     let raw = runtime.host_call("remote_exec", [target, cmd, cwd, stdin_data])!
     let tup = raw.as(List)
     (tup.get(0).as(i64), tup.get(1).as(String), tup.get(2).as(String))
+}
+
+pub fn remote_probe_tcp(host: String, port: i64, .timeout_ms: i64 = 1500) -> !String i64 {
+    let clean_host = host.trim()
+    if clean_host == "" {
+        return error "empty TCP target host"
+    }
+    if port <= 0 or port > 65535 {
+        return error ("invalid TCP port: " ++ port.to_string())
+    }
+    let eff_timeout = if timeout_ms > 0 { timeout_ms } else { 1500 }
+    let t0 = time.monotonic_nanos()
+    let latency_ms = task.with_timeout(eff_timeout, || -> !IoError i64 {
+        let stream = TcpStream.connect(clean_host, port)!
+        defer { stream.close() }
+        let dt_ns = time.monotonic_nanos() - t0
+        if dt_ns > 0 { dt_ns / 1000000 } else { 0 }
+    }) ! {
+        err => {
+            return error (
+                "TCP probe to " ++ clean_host ++ ":" ++ port.to_string()
+                ++ " failed: " ++ error_message(err)
+            )
+        },
+    }
+    latency_ms
 }
 
 pub fn remote_deploy_server(target: String, local_server_bin: String) -> !String RemoteConnectionInfo {

@@ -5,6 +5,7 @@
 
 use std.collections.{HashMap, Set}
 use std.fs
+use std.io.{File, IoError, SeekFrom}
 use std.path
 use @lava_core.{
     CommandSpec, ExtId, InteractiveEffects, KeyBindingEntry, KeyStroke, Keymap, ServiceEffects,
@@ -845,12 +846,32 @@ fn recompute_filtered_items(world: EditorWorld, state: TelescopeState) {
     }
 }
 
+fn stream_preview_file_lines(file_path: String, max_preview_lines: i64) -> !IoError List {
+    let raw = File.with_open(file_path, mode = .read) do |f| {
+        let sample = f.read_bytes(max_bytes = 8192)!
+        for i in 0..sample.len() {
+            if sample.get(i.as(usize)).as(i64) == 0 {
+                return error IoError.InvalidInput("binary file")
+            }
+        }
+        let _ = f.seek(SeekFrom.start(0))!
+        let _ = f.read_chars(4096)!
+        let _ = f.seek(SeekFrom.start(0))!
+        f.lines().take(max_preview_lines.as(usize)).collect()
+    }!
+    raw.as(List)
+}
+
 fn load_preview_source_lines(world: EditorWorld, state: TelescopeState, item: PickerItem) -> ?List {
+    let needed_end = if item.end_row > item.row { item.end_row + 32 } else { item.row + 32 }
+    let min_lines = if needed_end > 300 { needed_end } else { 300 }
+    let max_preview_lines = ((min_lines + 299) / 300) * 300
+
     if item.buf_id.raw() > 0 {
         let b_opt = world.buffer(item.buf_id)
         if b_opt != null {
             let b = b_opt.as(Buffer)
-            let lim = if b.line_count() < 300 { b.line_count() } else { 300 }
+            let lim = if b.line_count() < max_preview_lines { b.line_count() } else { max_preview_lines }
             return b.slice_lines(0, lim)
         }
     }
@@ -861,23 +882,49 @@ fn load_preview_source_lines(world: EditorWorld, state: TelescopeState, item: Pi
     let open_opt = world.find_buffer_by_path(full)
     if open_opt != null {
         let b = open_opt.as(Buffer)
-        let lim = if b.line_count() < 300 { b.line_count() } else { 300 }
+        let lim = if b.line_count() < max_preview_lines { b.line_count() } else { max_preview_lines }
         return b.slice_lines(0, lim)
     }
-    if state.preview_cache_key == full and state.preview_cache_lines != null {
+    let cache_key = full ++ ":" ++ max_preview_lines.to_string()
+    if state.preview_cache_key == cache_key and state.preview_cache_lines != null {
         return state.preview_cache_lines
     }
-    let raw! = fs.read_to_string(full) else {
+
+    let streamed_opt: ?List = stream_preview_file_lines(full, max_preview_lines) match {
+        lines! => lines,
+        error _ => {
+            let meta_opt: ?fs.FileMetadata = fs.metadata(full) ! { _ => null }
+            if meta_opt != null and meta_opt.as(fs.FileMetadata).size <= 262144 {
+                fs.read_to_string(full) match {
+                    raw! => {
+                        let norm = raw.replace("\r\n", "\n").replace("\r", "\n")
+                        let parts = norm.split("\n")
+                        if parts.len() > 1 and norm.ends_with("\n") {
+                            let _ = parts.pop()
+                        }
+                        let capped = List()
+                        let n = if parts.len() < max_preview_lines { parts.len() } else { max_preview_lines }
+                        for i in 0..n {
+                            capped.push(parts.get(i.as(usize)).as(String))
+                        }
+                        capped
+                    },
+                    error _ => null,
+                }
+            } else {
+                null
+            }
+        },
+    }
+    let parts? = streamed_opt else {
         state.preview_cache_key = ""
         state.preview_cache_lines = null
         return null
     }
-    let norm = raw.replace("\r\n", "\n").replace("\r", "\n")
-    let parts = norm.split("\n")
-    if parts.len() > 1 and norm.ends_with("\n") {
-        let _ = parts.pop()
+    if parts.is_empty() {
+        parts.push("")
     }
-    state.preview_cache_key = full
+    state.preview_cache_key = cache_key
     state.preview_cache_lines = parts
     parts
 }
@@ -1692,7 +1739,7 @@ pub fn open_telescope_picker(
     let vim = require_vim_state(kernel)!
     let state = require_telescope_state(kernel)!
 
-    vim.mode = VimMode.Normal
+    vim.mode = VimMode.normal
     vim.clear_transient()
 
     if resume_last and state.has_history {

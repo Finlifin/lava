@@ -189,7 +189,7 @@ pub fn open_dashboard_buffer(kernel: SystemKernel, world: EditorWorld, svc: Pers
     let vim_opt = kernel.service("lava.vim.state")
     if vim_opt != null {
         let vs = vim_opt.as(VimState)
-        vs.mode = VimMode.Normal
+        vs.mode = VimMode.normal
         vs.clear_transient()
         attach_dashboard_interceptor(vs)
         sync_world_from_vim(world, vs)
@@ -243,7 +243,7 @@ fn dashboard_modal_interceptor(kernel: SystemKernel, stroke: KeyStroke) -> #Serv
     }
 
     -- Never interfere with active `<Space>` leader sequences, prefixes, plugin chords, or non-Normal modes
-    if vim.mode != VimMode.Normal
+    if vim.mode != VimMode.normal
         or (not vim.leader_strokes.is_empty())
         or vim.pending_prefix != ""
         or (not vim.plugin_strokes.is_empty())
@@ -253,7 +253,7 @@ fn dashboard_modal_interceptor(kernel: SystemKernel, stroke: KeyStroke) -> #Serv
 
     let plain = (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod)
     if plain and stroke.key.char_len() == 1 and stroke.key.is_ascii_digit() {
-        let d_opt = stroke.key.parse_i64()
+        let d_opt = stroke.key.try_parse(i64)
         if d_opt != null {
             let d = d_opt.as(i64)
             if d >= 1 and d <= 5 {
@@ -307,12 +307,12 @@ fn cmd_new_empty_buffer(kernel: SystemKernel, _args: List) -> #InteractiveEffect
     if vim_opt != null {
         detach_dashboard_interceptor(vim_opt.as(VimState))
     }
-    let nbuf = world.create_buffer("Untitled", BufferKind.Scratch, major_mode = "text", initial_lines = [""])
+    let nbuf = world.create_buffer("Untitled", BufferKind.scratch, major_mode = "text", initial_lines = [""])
     nbuf.modified = false
     let _ = world.switch_to_buffer(nbuf.id)
     if vim_opt != null {
         let vs = vim_opt.as(VimState)
-        vs.mode = VimMode.Insert
+        vs.mode = VimMode.insert
         vs.clear_transient()
         sync_world_from_vim(world, vs)
     }
@@ -410,7 +410,7 @@ pub fn serialize_session_lines(world: EditorWorld, svc: PersistenceService) -> L
     out.push("zen_mode\t" ++ (if world.options.zen_mode { "true" } else { "false" }))
 
     let active_buf = world.active_buffer()
-    let active_fp = if active_buf.kind == BufferKind.File and active_buf.file_path != "" {
+    let active_fp = if active_buf.kind == BufferKind.file and active_buf.file_path != "" {
         world.resolve_path(active_buf.file_path)
     } else {
         ""
@@ -420,7 +420,7 @@ pub fn serialize_session_lines(world: EditorWorld, svc: PersistenceService) -> L
     for i in 0..world.buffer_order.len() {
         let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
         let b = world.buffers.get(bid).as(Buffer)
-        if b.kind == BufferKind.File and b.file_path != "" {
+        if b.kind == BufferKind.file and b.file_path != "" {
             let norm_fp = world.resolve_path(b.file_path)
             svc.record_recent_file(norm_fp)
             out.push(
@@ -449,7 +449,7 @@ pub fn save_workspace_session(kernel: SystemKernel, custom_path: String) -> #[lo
     if parent_opt != null {
         let pdir = parent_opt.as(String)
         if pdir != "" and (not fs.exists(pdir)) {
-            let _ = fs.create_dir_all(pdir) ! { _ => () }
+            let _ = fs.create_dir(pdir, parents = true) ! { _ => () }
         }
     }
 
@@ -509,8 +509,8 @@ pub fn restore_workspace_session(kernel: SystemKernel, custom_path: String) -> #
             has_zen = true
             saved_zen = parts.get(1).as(String).trim() == "true"
         } else if tag == "window_size" and parts.len() >= 3 {
-            let w_opt = parts.get(1).as(String).trim().parse_i64()
-            let h_opt = parts.get(2).as(String).trim().parse_i64()
+            let w_opt = parts.get(1).as(String).trim().try_parse(i64)
+            let h_opt = parts.get(2).as(String).trim().try_parse(i64)
             if w_opt != null and h_opt != null {
                 saved_win_w = w_opt.as(i64)
                 saved_win_h = h_opt.as(i64)
@@ -518,8 +518,8 @@ pub fn restore_workspace_session(kernel: SystemKernel, custom_path: String) -> #
         } else if tag == "active_file" {
             saved_active_file = parts.get(1).as(String).trim()
         } else if tag == "file" and parts.len() >= 4 {
-            let r_opt = parts.get(1).as(String).trim().parse_i64()
-            let c_opt = parts.get(2).as(String).trim().parse_i64()
+            let r_opt = parts.get(1).as(String).trim().try_parse(i64)
+            let c_opt = parts.get(2).as(String).trim().try_parse(i64)
             let fp = parts.get(3).as(String).trim()
             if fp != "" {
                 let r_val = if r_opt != null and r_opt.as(i64) >= 0 { r_opt.as(i64) } else { 0 }
@@ -607,7 +607,7 @@ pub fn restore_workspace_session(kernel: SystemKernel, custom_path: String) -> #
 
     if vim_opt != null {
         let vs = vim_opt.as(VimState)
-        vs.mode = VimMode.Normal
+        vs.mode = VimMode.normal
         vs.clear_transient()
         sync_world_from_vim(world, vs)
     }
@@ -689,7 +689,7 @@ fn track_buffer_in_mru(kernel: SystemKernel, payload: Any) {
             let b_opt = world.buffer(bid)
             if b_opt != null {
                 let b = b_opt.as(Buffer)
-                if b.kind == BufferKind.File and b.file_path != "" {
+                if b.kind == BufferKind.file and b.file_path != "" {
                     svc.record_recent_file(world.resolve_path(b.file_path))
                 }
             }

@@ -4,7 +4,6 @@
 --   21. `ext_zen`     (`lava.org/ext_zen`     — `:ZenMode [width]` chrome snapshot/restore & centered viewport, `:Twilight`, `:ZenNarrow`)
 
 use std.fs
-use std.io
 use std.path
 use std.process
 use std.time
@@ -47,7 +46,7 @@ fn check_eq_i64(actual: i64, expected: i64, label: String) {
 }
 
 fn run_git_checked(cwd: String, args: List) -> String {
-    let out_res = process.exec("git", args = args, cwd = cwd)
+    let out_res = process.run("git", args = args, cwd = cwd)
     out_res match {
         out! => {
             if out.status != 0 {
@@ -66,7 +65,7 @@ fn frame_has_text_substr(cmds: List, needle: String) -> bool {
     for i in 0..cmds.len() {
         let cmd = cmds.get(i.as(usize)).as(DrawCmd)
         cmd match {
-            DrawCmd.TextRun(_, _, txt, _, _, _, _, _, _) => {
+            DrawCmd.text_run(_, _, txt, _, _, _, _, _, _) => {
                 if txt.contains(needle) {
                     return true
                 }
@@ -81,7 +80,7 @@ fn find_text_color_for_substr(cmds: List, needle: String) -> i64 {
     for i in 0..cmds.len() {
         let cmd = cmds.get(i.as(usize)).as(DrawCmd)
         cmd match {
-            DrawCmd.TextRun(_, _, txt, _, _, color, _, _, _) => {
+            DrawCmd.text_run(_, _, txt, _, _, color, _, _, _) => {
                 if txt.contains(needle) {
                     return color
                 }
@@ -115,7 +114,7 @@ fn run_batch07_suite() {
 
     -- 1. Create a deterministic temporary Git repository with initial commit + staged + modified + untracked files.
     let tmp_dir = "/tmp/lava_batch07_" ++ time.unix_millis().to_string()
-    let _ = fs.create_dir_all(tmp_dir) ! { e => panic(e.to_string()) }
+    let _ = fs.create_dir(tmp_dir, parents = true) ! { e => panic(e.to_string()) }
 
     let _ = run_git_checked(tmp_dir, ["init"])
     let _ = run_git_checked(tmp_dir, ["config", "user.email", "batch07@lava.org"])
@@ -176,7 +175,7 @@ fn run_batch07_suite() {
 
     world.cwd = tmp_dir
     handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
-    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+    let _ = app_step_event(kernel, RawUiEvent.resize(1280, 800, 1))# ! { e => panic(e) }
 
     -- ========================================================================
     -- PART 1: `ext_lualine` (`lava.org/ext_lualine`)
@@ -332,13 +331,13 @@ fn run_batch07_suite() {
     check_eq_str(theme_toast.title, "Colorscheme", "Colorscheme toast title")
     check_eq_str(theme_toast.message, "Switched to gruvbox-dark", "Colorscheme toast message")
 
-    -- 2d. `RawUiEvent.Tick` ages out `ttl_ticks` until active toasts expire while history persists!
+    -- 2d. `RawUiEvent.tick` ages out `ttl_ticks` until active toasts expire while history persists!
     let ttl_initial = world.notifications.get(0).as(ToastNotification).ttl_ticks
-    let _ = app_step_event(kernel, RawUiEvent.Tick(1, 100))# ! { e => panic(e) }
+    let _ = app_step_event(kernel, RawUiEvent.tick(1, 100))# ! { e => panic(e) }
     let ttl_after_one = world.notifications.get(0).as(ToastNotification).ttl_ticks
     check_eq_i64(ttl_after_one, ttl_initial - 1, "Tick decremented ttl_ticks by 1")
     for tick_i in 0..10 {
-        let _ = app_step_event(kernel, RawUiEvent.Tick(1, 200 + tick_i * 100))# ! { e => panic(e) }
+        let _ = app_step_event(kernel, RawUiEvent.tick(1, 200 + tick_i * 100))# ! { e => panic(e) }
     }
     check_eq_i64(world.notifications.len(), 0, "all toasts aged out after TTL ticks")
     check_eq_i64(world.notification_history.len(), 3, "notification_history preserved after TTL expiry")
@@ -513,8 +512,8 @@ fn run_batch07_suite() {
     check_true(world.statusline_left_extra.contains("git:"), "re-activating ext_lualine restored statusline")
 
     -- Clean up temporary git repository
-    let _ = process.exec("rm", args = ["-rf", tmp_dir])
-    io.println("[PASS] Batch 07 plugins (ext_lualine, ext_noice, ext_zen) passed all E2E assertions.")
+    let _ = process.run("rm", args = ["-rf", tmp_dir])
+    println("[PASS] Batch 07 plugins (ext_lualine, ext_noice, ext_zen) passed all E2E assertions.")
 }
 
 fn main() {

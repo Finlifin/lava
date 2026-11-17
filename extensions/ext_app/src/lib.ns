@@ -173,7 +173,7 @@ fn should_try_special_tools_first(
         return true
     }
     let vs = vim_opt.as(VimState)
-    vs.mode == VimMode.Normal
+    vs.mode == VimMode.normal
         and vs.pending_prefix == ""
         and vs.leader_strokes.is_empty()
         and vs.plugin_strokes.is_empty()
@@ -237,7 +237,7 @@ private fn handle_stroke_with_world(
         },
     }
     sync_prompt_view(kernel, world)
-    if wm_opt != null {
+    if (not world.in_key_burst) and wm_opt != null {
         wm_opt.as(WindowManager).sync_from_world(world)
     }
     ()
@@ -263,13 +263,23 @@ pub fn app_feed_keys(
     }
     let world = require_editor_world(kernel)!
     let wm_opt = kernel.service("lava.window.manager")
-    for i in 0..strokes.len() {
+    defer {
+        world.in_key_burst = false
+    }
+    let n = strokes.len()
+    for i in 0..n {
         let stroke = strokes.get(i.as(usize)).as(KeyStroke)
+        world.in_key_burst = i + 1 < n
         handle_stroke_with_world(kernel, world, wm_opt, stroke)#
         if world.quit_requested {
+            world.in_key_burst = false
+            if wm_opt != null {
+                wm_opt.as(WindowManager).sync_from_world(world)
+            }
             break
         }
     }
+    world.in_key_burst = false
     ()
 }
 
@@ -458,7 +468,7 @@ fn yank_terminal_visual_selection_if_any(kernel: SystemKernel, world: EditorWorl
         return ()
     }
     let vs = vim_opt.as(VimState)
-    if vs.mode == VimMode.VisualChar {
+    if vs.mode == VimMode.visual_char {
         let a = vs.visual_anchor
         let b = buf.point
         let lo = if a <= b { a } else { b }
@@ -470,7 +480,7 @@ fn yank_terminal_visual_selection_if_any(kernel: SystemKernel, world: EditorWorl
             world.registers.yank_store(RegisterValue.chars(selected), reg = "")#
             status_emit("Yanked " ++ selected.char_len().to_string() ++ " char(s) to clipboard")#
         }
-    } else if vs.mode == VimMode.VisualLine {
+    } else if vs.mode == VimMode.visual_line {
         let a = vs.visual_anchor
         let b = buf.point
         let r1 = if a.row <= b.row { a.row } else { b.row }
@@ -576,26 +586,26 @@ fn handle_mouse_click(
             let vs = vim_opt.as(VimState)
             let is_term_buf = buf.major_mode == "terminal" or buf.major_mode == "toggleterm"
             if click_count == 2 {
-                if is_term_buf and vs.mode == VimMode.Insert {
+                if is_term_buf and vs.mode == VimMode.insert {
                     kernel.emit_hook("terminal-enter-normal-for-selection", target_pos)
                 }
                 let (w_start, w_end) = select_word_at(buf, target_pos)
                 vs.visual_anchor = w_start
                 buf.point = w_end
                 pane.cursor = w_end
-                vs.mode = VimMode.VisualChar
+                vs.mode = VimMode.visual_char
                 sync_world_from_vim(world, vs)
             } else if click_count >= 3 {
-                if is_term_buf and vs.mode == VimMode.Insert {
+                if is_term_buf and vs.mode == VimMode.insert {
                     kernel.emit_hook("terminal-enter-normal-for-selection", target_pos)
                 }
                 vs.visual_anchor = Pos.new(target_pos.row, 0)
                 buf.point = Pos.new(target_pos.row, 0)
                 pane.cursor = buf.point
-                vs.mode = VimMode.VisualLine
+                vs.mode = VimMode.visual_line
                 sync_world_from_vim(world, vs)
-            } else if vs.mode == VimMode.VisualChar or vs.mode == VimMode.VisualLine or vs.mode == VimMode.VisualBlock {
-                vs.mode = VimMode.Normal
+            } else if vs.mode == VimMode.visual_char or vs.mode == VimMode.visual_line or vs.mode == VimMode.visual_block {
+                vs.mode = VimMode.normal
                 sync_world_from_vim(world, vs)
             }
         } else if click_count == 2 {
@@ -603,7 +613,7 @@ fn handle_mouse_click(
             buf.point = w_end
             pane.cursor = w_end
             world.visual = VisualSelection {
-                kind: VisualKind.Char,
+                kind: VisualKind.char,
                 anchor: w_start,
                 cursor: w_end,
             }
@@ -661,14 +671,14 @@ fn handle_mouse_drag(
     let vim_opt = kernel.service("lava.vim.state")
     if vim_opt != null and world.options.evil_mode {
         let vs = vim_opt.as(VimState)
-        if vs.mode == VimMode.Insert and (buf.major_mode == "terminal" or buf.major_mode == "toggleterm") {
+        if vs.mode == VimMode.insert and (buf.major_mode == "terminal" or buf.major_mode == "toggleterm") {
             let anchor = buf.point
             kernel.emit_hook("terminal-enter-normal-for-selection", anchor)
             vs.visual_anchor = anchor
-            vs.mode = VimMode.VisualChar
-        } else if vs.mode == VimMode.Normal or vs.mode == VimMode.Insert {
+            vs.mode = VimMode.visual_char
+        } else if vs.mode == VimMode.normal or vs.mode == VimMode.insert {
             vs.visual_anchor = buf.point
-            vs.mode = VimMode.VisualChar
+            vs.mode = VimMode.visual_char
         }
         buf.point = target_pos
         buf.preferred_col = target_pos.col
@@ -740,16 +750,16 @@ pub fn app_step_event(
     let wm = require_window_manager(kernel)!
 
     ev match {
-        RawUiEvent.Key(key, modifiers, text) => {
+        RawUiEvent.key(key, modifiers, text) => {
             let stroke = KeyStroke.from_raw_event(key, modifiers, text)
             app_handle_stroke(kernel, stroke)#!
             true
         },
-        RawUiEvent.Resize(width, height, _scale) => {
+        RawUiEvent.resize(width, height, _scale) => {
             wm.resize_viewport(width, height, world)
             true
         },
-        RawUiEvent.MouseButton(is_press, button, x, y, _mods, count) => {
+        RawUiEvent.mouse_button(is_press, button, x, y, _mods, count) => {
             if button == 1 {
                 if is_press {
                     kernel.publish_service("lava.app.mouse_down", ext_app_id(), true)
@@ -788,7 +798,7 @@ pub fn app_step_event(
             }
             false
         },
-        RawUiEvent.MouseMove(x, y, _mods) => {
+        RawUiEvent.mouse_move(x, y, _mods) => {
             let down_opt = kernel.service("lava.app.mouse_down")
             if down_opt != null and down_opt.as(bool) {
                 let moved = handle_mouse_drag(kernel, world, wm, x, y)
@@ -799,23 +809,25 @@ pub fn app_step_event(
             }
             false
         },
-        RawUiEvent.MouseScroll(_dx, dy, x, y, _mods) => {
+        RawUiEvent.mouse_scroll(_dx, dy, x, y, _mods) => {
             handle_mouse_scroll(kernel, world, wm, dy, x, y)
             true
         },
-        RawUiEvent.Focus(_focused) => false,
-        RawUiEvent.Tick(timer_id, _now_ms) => {
+        RawUiEvent.focus(_focused) => false,
+        RawUiEvent.tick(timer_id, _now_ms) => {
+            world.lsp_tick_dirty = false
             let prev_n = world.notifications.len()
             world.tick_notifications()
             let expired = world.notifications.len() < prev_n
             kernel.emit_hook("timer-tick", timer_id)
             let pty_tick = timer_id == 1347705088
-            let lsp_tick = timer_id == 1280528384
+            let lsp_dirty = world.lsp_tick_dirty
+            world.lsp_tick_dirty = false
             let term_visible = world.active_buffer().major_mode == "terminal"
                 or world.floating_window_spans.contains_key("toggleterm")
-            expired or pty_tick or lsp_tick or term_visible
+            expired or pty_tick or lsp_dirty or term_visible
         },
-        RawUiEvent.AsyncJobDone(job_id, ok, exit_code, stdout, stderr) => {
+        RawUiEvent.async_job_done(job_id, ok, exit_code, stdout, stderr) => {
             let res = tools_on_async_job_done(kernel, job_id, ok, exit_code, stdout, stderr)#
             res match {
                 handled! => handled,
@@ -826,7 +838,7 @@ pub fn app_step_event(
                 },
             }
         },
-        RawUiEvent.CloseRequested => {
+        RawUiEvent.close_requested => {
             world.quit_requested = true
             host_request_quit(world.exit_code)
             true
@@ -930,7 +942,7 @@ fn save_last_window_state(world: EditorWorld, wm: WindowManager) {
     if parent_opt != null {
         let pdir = parent_opt.as(String)
         if pdir != "" and (not fs.exists(pdir)) {
-            let _ = fs.create_dir_all(pdir) ! { _ => () }
+            let _ = fs.create_dir(pdir, parents = true) ! { _ => () }
         }
     }
     let rem = if world.options.remember_window_size { "true" } else { "false" }
@@ -938,6 +950,47 @@ fn save_last_window_state(world: EditorWorld, wm: WindowManager) {
     let h_val = if wm.pixel_height >= 64 { wm.pixel_height } else { 800 }
     let content = "width=" ++ w_val.to_string() ++ "\nheight=" ++ h_val.to_string() ++ "\nremember=" ++ rem ++ "\n"
     let _ = fs.write_string(target, content) ! { _ => () }
+}
+
+fn is_raw_key_event(ev: RawUiEvent) -> bool {
+    ev match {
+        RawUiEvent.key(_, _, _) => true,
+        _ => false,
+    }
+}
+
+fn step_event_batch(
+    kernel: SystemKernel,
+    world: EditorWorld,
+    wm: WindowManager,
+    batch: List,
+) -> #ServiceEffects !String bool {
+    defer {
+        world.in_key_burst = false
+    }
+    var needs_redraw = false
+    let n = batch.len()
+    var last_key_idx: i64 = -1
+    for ki in 0..n {
+        if is_raw_key_event(batch.get(ki.as(usize)).as(RawUiEvent)) {
+            last_key_idx = ki
+        }
+    }
+    for idx in 0..n {
+        let ev = batch.get(idx.as(usize)).as(RawUiEvent)
+        world.in_key_burst = idx < last_key_idx
+        let step_dirty = app_step_event(kernel, ev)#!
+        if step_dirty {
+            needs_redraw = true
+        }
+        if session_should_exit(world) {
+            world.in_key_burst = false
+            break
+        }
+    }
+    world.in_key_burst = false
+    wm.sync_from_world(world)
+    needs_redraw
 }
 
 fn run_session_with_caps(
@@ -952,7 +1005,7 @@ fn run_session_with_caps(
     wm.metrics = host_measure_font(world.options.font_family, world.options.font_size_pt)
     wm.sync_from_world(world)
 
-    -- 2. Drain any initial platform events (e.g. initial window `Resize(width, height)`).
+    -- 2. Drain any initial platform events (e.g. initial window `resize(width, height, scale)`).
     let init_events = host_poll_events()
     for i in 0..init_events.len() {
         let ev = init_events.get(i.as(usize)).as(RawUiEvent)
@@ -1072,20 +1125,29 @@ fn run_session_with_caps(
 
     -- 7. Interactive event loop: suspend VM task via `host_wait_events` until UI/job wakeup.
     while not session_should_exit(world) {
-        let wait_ms = if world.active_jobs.is_empty() { 250 } else { 50 }
+        let wait_ms = if not world.active_jobs.is_empty() {
+            50
+        } else if not world.notifications.is_empty() {
+            250
+        } else {
+            -1
+        }
         let events = host_wait_events(wait_ms)
         if not events.is_empty() {
-            var needs_redraw = false
+            let batch = List()
             for i in 0..events.len() {
-                let ev = events.get(i.as(usize)).as(RawUiEvent)
-                let step_dirty = app_step_event(kernel, ev)#!
-                if step_dirty {
-                    needs_redraw = true
-                }
-                if session_should_exit(world) {
+                batch.push(events.get(i.as(usize)).as(RawUiEvent))
+            }
+            while batch.len() < 64 {
+                let more = host_poll_events()
+                if more.is_empty() {
                     break
                 }
+                for j in 0..more.len() {
+                    batch.push(more.get(j.as(usize)).as(RawUiEvent))
+                }
             }
+            let needs_redraw = step_event_batch(kernel, world, wm, batch)#!
             if needs_redraw {
                 let _ = app_commit_frame(kernel)!
             }

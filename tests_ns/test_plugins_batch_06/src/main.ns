@@ -96,7 +96,7 @@ fn test_batch_06_plugins() {
     mock_enable(true)
 
     let tmp_dir = "/tmp/lava_batch06_" ++ time.unix_millis().to_string()
-    let _ = fs.create_dir_all(tmp_dir) ! { e => panic(e.to_string()) }
+    let _ = fs.create_dir(tmp_dir, parents = true) ! { e => panic(e.to_string()) }
 
     let kernel = boot_batch06_kernel()
     check_eq_str(ext_snippets_id().raw(), "lava.org/ext_snippets", "ext_snippets_id")
@@ -111,7 +111,7 @@ fn test_batch_06_plugins() {
     let spec_svc: SpectreService = (require_spectre_service(kernel) ! { e => panic(e) }).as(SpectreService)
 
     handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
-    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+    let _ = app_step_event(kernel, RawUiEvent.resize(1280, 800, 1))# ! { e => panic(e) }
 
     -- ========================================================================
     -- PART A: Plugin 16 — `ext_snippets`
@@ -126,7 +126,7 @@ fn test_batch_06_plugins() {
     -- A1: Indented multi-line `fn` expansion + `<C-k>` tabstop traversal preserving defaults
     let sbuf1 = world.create_buffer(
         "snip_indent.ns",
-        BufferKind.File,
+        BufferKind.file,
         major_mode = "nessa",
         initial_lines = ["    "],
     )
@@ -160,7 +160,7 @@ fn test_batch_06_plugins() {
     -- A2: Typing over armed placeholders, dynamic same-row column shift, `<C-j>` prev jump, undo
     let sbuf2 = world.create_buffer(
         "snip_edit.ns",
-        BufferKind.File,
+        BufferKind.file,
         major_mode = "nessa",
         initial_lines = [""],
     )
@@ -199,7 +199,7 @@ fn test_batch_06_plugins() {
     snip_svc.register_snippet("nessa", "ceq", "check_eq(${{1:lhs}}, ${{2:rhs}})", "Custom equality check")
     let sbuf3 = world.create_buffer(
         "snip_undo.ns",
-        BufferKind.File,
+        BufferKind.file,
         major_mode = "nessa",
         initial_lines = [""],
     )
@@ -227,7 +227,7 @@ fn test_batch_06_plugins() {
 
     -- Create path-completion fixtures in `tmp_dir`
     let cmp_dir = path.join(tmp_dir, "cmp_ws")
-    let _ = fs.create_dir_all(path.join(cmp_dir, "subpkg")) ! { e => panic(e.to_string()) }
+    let _ = fs.create_dir(path.join(cmp_dir, "subpkg"), parents = true) ! { e => panic(e.to_string()) }
     let _ = fs.write_string(path.join(cmp_dir, "config_dev.toml"), "port = 8080\n") ! {
         e => panic(e.to_string())
     }
@@ -235,14 +235,14 @@ fn test_batch_06_plugins() {
     -- Open a background buffer to verify cross-buffer identifier completion
     let _bg_buf = world.create_buffer(
         "helpers.ns",
-        BufferKind.File,
+        BufferKind.file,
         major_mode = "nessa",
         initial_lines = ["let pub_cross_buffer_token = 99"],
     )
 
     let cbuf = world.create_buffer(
         "cmp_target.ns",
-        BufferKind.File,
+        BufferKind.file,
         file_path = path.join(cmp_dir, "cmp_target.ns"),
         major_mode = "nessa",
         initial_lines = [
@@ -373,7 +373,7 @@ fn test_batch_06_plugins() {
     -- B6: `<M-n>`/`<M-p>` navigation (Buffer + Minibuffer), Doc Popup, Auto-Parens, Signature Help & Shadow Ghost Text
     let fn_buf = world.create_buffer(
         "cmp_fn_ux.ns",
-        BufferKind.File,
+        BufferKind.file,
         file_path = path.join(cmp_dir, "cmp_fn_ux.ns"),
         major_mode = "nessa",
         initial_lines = [
@@ -459,7 +459,7 @@ fn test_batch_06_plugins() {
     println("PART C: testing ext_spectre...")
 
     let proj_dir = path.join(tmp_dir, "spectre_proj")
-    let _ = fs.create_dir_all(proj_dir) ! { e => panic(e.to_string()) }
+    let _ = fs.create_dir(proj_dir, parents = true) ! { e => panic(e.to_string()) }
     let alpha_path = path.join(proj_dir, "alpha.ns")
     let beta_path = path.join(proj_dir, "beta.ns")
     let notes_path = path.join(proj_dir, "notes.md")
@@ -625,7 +625,7 @@ fn test_batch_06_plugins() {
     check_eq_str(world.active_buffer().name, "beta.ns", "q closed *Spectre* back to beta.ns")
 
     let _ = cap
-    let _ = fs.remove_dir_all(tmp_dir) ! { _ => () }
+    let _ = fs.remove_dir(tmp_dir, recursive = true) ! { _ => () }
 }
 
 fn main() {

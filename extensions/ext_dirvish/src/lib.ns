@@ -16,7 +16,7 @@ use std.collections.{HashMap, Set}
 use std.env
 use std.fs
 use std.fs.DirEntry
-use std.io.File
+use std.io.{File, SeekFrom}
 use std.path
 use @lava_sys.{rgb, rgba}
 use @lava_core.{
@@ -64,6 +64,12 @@ pub struct DirvishEntry {
 }
 derive Eq, PartialEq for DirvishEntry
 
+pub struct DirvishPreviewCacheEntry {
+    pub kind: String,
+    pub major_mode: String,
+    pub lines: List,
+}
+
 pub struct DirvishState {
     pub current_dir: String,
     pub origin_buf_id: ?BufferId,
@@ -80,6 +86,8 @@ pub struct DirvishState {
     pub entries: List,
     pub parent_entries: List,
     pub cursor_by_dir: HashMap,
+    pub preview_cache: HashMap,
+    pub preview_cache_order: List,
 }
 
 impl DirvishState {
@@ -100,6 +108,8 @@ impl DirvishState {
             entries: List(),
             parent_entries: List(),
             cursor_by_dir: HashMap.new(),
+            preview_cache: HashMap.new(),
+            preview_cache_order: List(),
         }
     }
 
@@ -257,6 +267,13 @@ fn entry_extension_lower(name: String) -> String {
     ext.to_lower()
 }
 
+fn read_file_magic_bytes(full_path: String) -> !IoError List {
+    let raw = File.with_open(full_path, mode = .read) do |f| {
+        f.read_bytes(max_bytes = 4)!
+    }!
+    raw.as(List)
+}
+
 fn looks_executable_file(full_path: String, name: String, size: i64) -> bool {
     let low = name.to_lower()
     if (
@@ -272,12 +289,7 @@ fn looks_executable_file(full_path: String, name: String, size: i64) -> bool {
     if size < 2 {
         return false
     }
-    let f_maybe: ?File = File.open(full_path, mode = "rb") ! { _ => null }
-    let f_opt? = f_maybe else {
-        return false
-    }
-    let hdr = f_opt.read_bytes(max_bytes = 4) ! { _ => List() }
-    let _ = f_opt.close()
+    let hdr = read_file_magic_bytes(full_path) ! { _ => return false }
     if hdr.len() >= 2 {
         let b0 = hdr.get(0).as(i64)
         let b1 = hdr.get(1).as(i64)
@@ -492,13 +504,13 @@ fn scan_directory_entries(
             continue
         }
         let full_p = clean_dir_path(path.join(dir_path, de.name), dir_path)
-        let is_dir_real = de.is_dir or (de.is_symlink and fs.is_dir(full_p))
-        let is_exec = if (not is_dir_real) and (not de.is_symlink) {
+        let is_dir_real = de.is_dir() or (de.is_symlink() and fs.is_dir(full_p))
+        let is_exec = if (not is_dir_real) and (not de.is_symlink()) {
             looks_executable_file(full_p, de.name, de.size)
         } else {
             false
         }
-        let perms = if de.is_symlink {
+        let perms = if de.is_symlink() {
             "lrwxrwxrwx"
         } else if is_dir_real {
             "drwxr-xr-x"
@@ -508,7 +520,7 @@ fn scan_directory_entries(
             "-rw-r--r--"
         }
         var sym_target = ""
-        if de.is_symlink {
+        if de.is_symlink() {
             let canon_opt = fs.canonicalize(full_p) ! { _ => "" }
             sym_target = canon_opt
         }
@@ -519,7 +531,7 @@ fn scan_directory_entries(
             name: de.name,
             full_path: full_p,
             is_dir: is_dir_real,
-            is_symlink: de.is_symlink,
+            is_symlink: de.is_symlink(),
             is_exec: is_exec,
             size: de.size,
             modified_unix_secs: de.modified_unix_secs,
@@ -591,7 +603,7 @@ fn render_parent_buffer(world: EditorWorld, state: DirvishState) -> Buffer {
     let parent_buf = ensure_dirvish_buffer(
         world,
         DIRVISH_PARENT_BUF_NAME,
-        BufferKind.Directory,
+        BufferKind.directory,
         "dirvish-parent",
         "",
     )
@@ -777,7 +789,7 @@ fn render_center_buffer(
     let buf = ensure_dirvish_buffer(
         world,
         DIRVISH_BUF_NAME,
-        BufferKind.Directory,
+        BufferKind.directory,
         "dirvish",
         state.current_dir,
     )
@@ -1003,11 +1015,71 @@ fn entry_at_cursor(state: DirvishState, center_buf: Buffer) -> ?DirvishEntry {
     state.entries.get(idx.as(usize)).as(DirvishEntry)
 }
 
+fn inspect_preview_file_single_open(full_path: String) -> !IoError (String, List) {
+    let raw = File.with_open(full_path, mode = .read) do |f| {
+        let sample_bytes = f.read_bytes(max_bytes = 8192)!
+        var has_null_byte = false
+        for i in 0..sample_bytes.len() {
+            if sample_bytes.get(i.as(usize)).as(i64) == 0 {
+                has_null_byte = true
+                break
+            }
+        }
+        if has_null_byte {
+            ("binary", List())
+        } else {
+            let _ = f.seek(SeekFrom.start(0))!
+            var utf8_failed = false
+            let chunk_opt: ?String = f.read_chars(8192) ! {
+                _ => {
+                    utf8_failed = true
+                    null
+                }
+            }
+            if utf8_failed {
+                ("binary", List())
+            } else {
+                let raw_text = if chunk_opt != null { chunk_opt.as(String) } else { "" }
+                let normalized = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+                let raw_lines = if normalized == "" {
+                    [""]
+                } else {
+                    normalized.split("\n")
+                }
+                if raw_lines.len() > 1 and normalized.ends_with("\n") {
+                    let _ = raw_lines.pop()
+                }
+                let capped = List()
+                let max_lines = if raw_lines.len() > 120 { 120 } else { raw_lines.len() }
+                for i in 0..max_lines {
+                    capped.push(raw_lines.get(i.as(usize)).as(String))
+                }
+                if capped.is_empty() {
+                    capped.push("")
+                }
+                ("text", capped)
+            }
+        }
+    }!
+    raw.as((String, List))
+}
+
+fn cache_dirvish_preview(state: DirvishState, key: String, entry: DirvishPreviewCacheEntry) {
+    if not state.preview_cache.contains_key(key) {
+        if state.preview_cache_order.len() >= 64 {
+            let oldest = state.preview_cache_order.remove(0).as(String)
+            let _ = state.preview_cache.remove(oldest)
+        }
+        state.preview_cache_order.push(key)
+    }
+    state.preview_cache.insert(key, entry)
+}
+
 fn render_preview_buffer(world: EditorWorld, state: DirvishState, center_buf: Buffer) -> Buffer {
     let preview_buf = ensure_dirvish_buffer(
         world,
         DIRVISH_PREVIEW_BUF_NAME,
-        BufferKind.Special,
+        BufferKind.special,
         "dirvish-preview",
         "",
     )
@@ -1126,97 +1198,58 @@ fn render_preview_buffer(world: EditorWorld, state: DirvishState, center_buf: Bu
         "100644"
     }
 
-    let rb_maybe: ?File = File.open(ent.full_path, mode = "rb") ! { _ => null }
-    let rb_file_opt? = rb_maybe else {
-        preview_buf.major_mode = "text"
-        preview_buf.set_lines(["[Unable to read file]"], record_undo = false)
-        preview_buf.point = Pos.zero()
-        preview_buf.modified = false
-        preview_buf.read_only = true
-        return preview_buf
+    let meta_opt: ?fs.FileMetadata = fs.metadata(ent.full_path) ! { _ => null }
+    let (eff_mtime, eff_size) = if meta_opt != null {
+        let m = meta_opt.as(fs.FileMetadata)
+        (m.modified_unix_secs, m.size)
+    } else {
+        (ent.modified_unix_secs, ent.size)
     }
-    let sample_bytes = rb_file_opt.read_bytes(max_bytes = 8192) ! { _ => List() }
-    let _ = rb_file_opt.close()
-
-    var has_null_byte = false
-    for i in 0..sample_bytes.len() {
-        if sample_bytes.get(i.as(usize)).as(i64) == 0 {
-            has_null_byte = true
-            break
+    let cache_key = ent.full_path ++ "\n" ++ eff_mtime.to_string() ++ ":" ++ eff_size.to_string()
+    let cached_opt = state.preview_cache.get(cache_key)
+    let resolved_preview = if cached_opt != null {
+        cached_opt.as(DirvishPreviewCacheEntry)
+    } else {
+        let built = inspect_preview_file_single_open(ent.full_path) match {
+            res! => {
+                let (pkind, plines) = res
+                if pkind == "binary" {
+                    let bin_msg = "[Binary file — " ++ format_human_size(eff_size).trim() ++ ", mode " ++ mode_oct ++ "]"
+                    DirvishPreviewCacheEntry {
+                        kind: "binary",
+                        major_mode: "text",
+                        lines: [bin_msg],
+                    }
+                } else {
+                    DirvishPreviewCacheEntry {
+                        kind: "text",
+                        major_mode: detect_major_mode(ent.full_path),
+                        lines: plines,
+                    }
+                }
+            },
+            error _ => DirvishPreviewCacheEntry {
+                kind: "unreadable",
+                major_mode: "text",
+                lines: ["[Unable to read file]"],
+            },
         }
+        cache_dirvish_preview(state, cache_key, built)
+        built
     }
-    if has_null_byte {
-        preview_buf.major_mode = "text"
-        let bin_msg = "[Binary file — " ++ format_human_size(ent.size).trim() ++ ", mode " ++ mode_oct ++ "]"
-        preview_buf.set_lines([bin_msg], record_undo = false)
+
+    preview_buf.major_mode = resolved_preview.major_mode
+    preview_buf.set_lines(resolved_preview.lines, record_undo = false)
+    if resolved_preview.kind == "binary" and (not resolved_preview.lines.is_empty()) {
+        let bin_hdr = resolved_preview.lines.get(0).as(String)
         preview_buf.add_inline_decor(
             DIRVISH_DECOR_OWNER,
             0,
             0,
-            bin_msg.char_len(),
+            bin_hdr.char_len(),
             fg_rgba = color_mark_yellow(),
         )
-        preview_buf.point = Pos.zero()
-        preview_buf.modified = false
-        preview_buf.read_only = true
-        return preview_buf
     }
-
-    let txt_maybe: ?File = File.open(ent.full_path, mode = "r") ! { _ => null }
-    let txt_file_opt? = txt_maybe else {
-        preview_buf.major_mode = "text"
-        preview_buf.set_lines(
-            ["[Binary file — " ++ format_human_size(ent.size).trim() ++ ", mode " ++ mode_oct ++ "]"],
-            record_undo = false,
-        )
-        preview_buf.point = Pos.zero()
-        preview_buf.modified = false
-        preview_buf.read_only = true
-        return preview_buf
-    }
-    var utf8_failed = false
-    let chunk_opt: ?String = txt_file_opt.read_chars(8192) ! {
-        _ => {
-            utf8_failed = true
-            null
-        }
-    }
-    let _ = txt_file_opt.close()
-    if utf8_failed {
-        preview_buf.major_mode = "text"
-        preview_buf.set_lines(
-            ["[Binary file — " ++ format_human_size(ent.size).trim() ++ ", mode " ++ mode_oct ++ "]"],
-            record_undo = false,
-        )
-        preview_buf.point = Pos.zero()
-        preview_buf.modified = false
-        preview_buf.read_only = true
-        return preview_buf
-    }
-
-    let raw_text = if chunk_opt != null { chunk_opt.as(String) } else { "" }
-    let normalized = raw_text.replace("\r\n", "\n").replace("\r", "\n")
-    let raw_lines = if normalized == "" {
-        [""]
-    } else {
-        normalized.split("\n")
-    }
-    if raw_lines.len() > 1 and normalized.ends_with("\n") {
-        let _ = raw_lines.pop()
-    }
-
-    let capped = List()
-    let max_lines = if raw_lines.len() > 120 { 120 } else { raw_lines.len() }
-    for i in 0..max_lines {
-        capped.push(raw_lines.get(i.as(usize)).as(String))
-    }
-    if capped.is_empty() {
-        capped.push("")
-    }
-
-    -- Set language `major_mode` so `ext_render` performs full lexical syntax highlighting!
-    preview_buf.major_mode = detect_major_mode(ent.full_path)
-    preview_buf.set_lines(capped, record_undo = false)
     preview_buf.point = Pos.zero()
     preview_buf.modified = false
     preview_buf.read_only = true
@@ -1229,8 +1262,8 @@ fn render_preview_buffer(world: EditorWorld, state: DirvishState, center_buf: Bu
 
 fn collect_tree_leaves(node: LayoutNode, out: List) {
     node match {
-        LayoutNode.Leaf(wid) => out.push(wid),
-        LayoutNode.Split(_, _, first, second) => {
+        LayoutNode.leaf(wid) => out.push(wid),
+        LayoutNode.split(_, _, first, second) => {
             collect_tree_leaves(first, out)
             collect_tree_leaves(second, out)
         },
@@ -1239,8 +1272,8 @@ fn collect_tree_leaves(node: LayoutNode, out: List) {
 
 fn tree_contains_leaf(node: LayoutNode, target: WinId) -> bool {
     node match {
-        LayoutNode.Leaf(wid) => wid == target,
-        LayoutNode.Split(_, _, first, second) => {
+        LayoutNode.leaf(wid) => wid == target,
+        LayoutNode.split(_, _, first, second) => {
             tree_contains_leaf(first, target) or tree_contains_leaf(second, target)
         },
     }
@@ -1248,34 +1281,34 @@ fn tree_contains_leaf(node: LayoutNode, target: WinId) -> bool {
 
 fn leftmost_leaf(node: LayoutNode) -> WinId {
     node match {
-        LayoutNode.Leaf(wid) => wid,
-        LayoutNode.Split(_, _, first, _) => leftmost_leaf(first),
+        LayoutNode.leaf(wid) => wid,
+        LayoutNode.split(_, _, first, _) => leftmost_leaf(first),
     }
 }
 
 fn prune_leaf_from_layout(node: LayoutNode, target: WinId) -> ?LayoutNode {
     node match {
-        LayoutNode.Leaf(wid) => {
+        LayoutNode.leaf(wid) => {
             if wid == target {
                 null
             } else {
                 node
             }
         },
-        LayoutNode.Split(ax, ratio, first, second) => {
+        LayoutNode.split(ax, ratio, first, second) => {
             if tree_contains_leaf(first, target) {
                 let next_first = prune_leaf_from_layout(first, target)
                 let nf? = next_first else {
                     return second
                 }
-                return LayoutNode.Split(ax, ratio, nf, second)
+                return LayoutNode.split(ax, ratio, nf, second)
             }
             if tree_contains_leaf(second, target) {
                 let next_second = prune_leaf_from_layout(second, target)
                 let ns? = next_second else {
                     return first
                 }
-                return LayoutNode.Split(ax, ratio, first, ns)
+                return LayoutNode.split(ax, ratio, first, ns)
             }
             node
         },
@@ -1284,15 +1317,15 @@ fn prune_leaf_from_layout(node: LayoutNode, target: WinId) -> ?LayoutNode {
 
 fn replace_leaf_in_layout(node: LayoutNode, target: WinId, replacement: LayoutNode) -> LayoutNode {
     node match {
-        LayoutNode.Leaf(wid) => {
+        LayoutNode.leaf(wid) => {
             if wid == target {
                 replacement
             } else {
                 node
             }
         },
-        LayoutNode.Split(ax, ratio, first, second) => {
-            LayoutNode.Split(
+        LayoutNode.split(ax, ratio, first, second) => {
+            LayoutNode.split(
                 ax,
                 ratio,
                 replace_leaf_in_layout(first, target, replacement),
@@ -1400,7 +1433,7 @@ fn ensure_vim_normal(kernel: SystemKernel, world: EditorWorld) {
     let vim_res? = vim_maybe else {
         return
     }
-    vim_res.mode = VimMode.Normal
+    vim_res.mode = VimMode.normal
     vim_res.count1 = 0
     vim_res.count2 = 0
     vim_res.active_reg = ""
@@ -1524,14 +1557,14 @@ fn remove_path_any(target: String) -> !String Unit {
         return ()
     }
     let meta_opt: ?fs.FileMetadata = fs.metadata(target) ! { _ => null }
-    if meta_opt != null and meta_opt.as(fs.FileMetadata).is_symlink {
+    if meta_opt != null and meta_opt.as(fs.FileMetadata).is_symlink() {
         (fs.remove_file(target) ! {
             err => error ("Failed removing symlink '" ++ target ++ "': " ++ err.to_string())
         })!
         return ()
     }
     if fs.is_dir(target) {
-        (fs.remove_dir_all(target) ! {
+        (fs.remove_dir(target, recursive = true) ! {
             err => error ("Failed removing directory '" ++ target ++ "': " ++ err.to_string())
         })!
     } else {
@@ -1549,7 +1582,7 @@ fn copy_recursive(src: String, dst: String) -> !String Unit {
         if clean_dst == clean_src or clean_dst.starts_with(clean_src ++ "/") {
             return error ("Cannot copy directory into itself: " ++ src)
         }
-        (fs.create_dir_all(dst) ! {
+        (fs.create_dir(dst, parents = true) ! {
             err => error ("Cannot create directory '" ++ dst ++ "': " ++ err.to_string())
         })!
         let children = (fs.read_dir_entries(src) ! {
@@ -1568,7 +1601,7 @@ fn copy_recursive(src: String, dst: String) -> !String Unit {
     }
     let p_opt = path.parent(dst)
     if p_opt != null and p_opt.as(String) != "" {
-        let _ = fs.create_dir_all(p_opt.as(String)) ! { _ => () }
+        let _ = fs.create_dir(p_opt.as(String), parents = true) ! { _ => () }
     }
     let _ = (fs.copy(src, dst) ! {
         err => error ("Cannot copy '" ++ src ++ "' -> '" ++ dst ++ "': " ++ err.to_string())
@@ -1580,9 +1613,9 @@ fn move_entry(src: String, dst: String) -> !String Unit {
     if clean_dir_path(src, "/") == clean_dir_path(dst, "/") {
         return ()
     }
-    let renamed_ok = (fs.rename(src, dst) ! { _ => error "fallback" }) match {
-        !_ => false,
-        _ => true,
+    let renamed_ok = fs.rename(src, dst) match {
+        _! => true,
+        error _ => false,
     }
     if renamed_ok {
         return ()
@@ -1599,7 +1632,7 @@ fn sync_renamed_buffers(world: EditorWorld, old_path: String, new_path: String) 
     for i in 0..n {
         let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
         let b = world.buffers.get(bid).as(Buffer)
-        if b.kind != BufferKind.File {
+        if b.kind != BufferKind.file {
             continue
         }
         if b.file_path == old_clean {
@@ -1623,7 +1656,7 @@ fn purge_deleted_buffers(world: EditorWorld, deleted_path: String) {
         let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
         let b = world.buffers.get(bid).as(Buffer)
         if (
-            b.kind == BufferKind.File
+            b.kind == BufferKind.file
             and (b.file_path == del_clean or b.file_path.starts_with(del_clean ++ "/"))
         ) {
             to_kill.push(bid)
@@ -2081,7 +2114,7 @@ fn cmd_dirvish_delete(kernel: SystemKernel, _args: List) -> #InteractiveEffects 
     let req = PromptRequest.with_candidates(
         "Delete " ++ targets.len().to_string() ++ " item(s)? (y/n): ",
         "",
-        PromptKind.Confirm,
+        PromptKind.confirm,
         ["y", "n"],
     )
     let ans_opt = ask_prompt(req)#
@@ -2135,7 +2168,7 @@ fn apply_entry_rename(
     }
     let p_opt = path.parent(dst)
     if p_opt != null and p_opt.as(String) != "" {
-        let _ = fs.create_dir_all(p_opt.as(String)) ! { _ => () }
+        let _ = fs.create_dir(p_opt.as(String), parents = true) ! { _ => () }
     }
     move_entry(ent.full_path, dst)!
     sync_renamed_buffers(world, ent.full_path, dst)
@@ -2240,7 +2273,7 @@ fn cmd_dirvish_create_file(kernel: SystemKernel, _args: List) -> #InteractiveEff
     }
     let p_opt = path.parent(target)
     if p_opt != null and p_opt.as(String) != "" {
-        (fs.create_dir_all(p_opt.as(String)) ! {
+        (fs.create_dir(p_opt.as(String), parents = true) ! {
             err => error ("Failed creating parent directories: " ++ err.to_string())
         })!
     }
@@ -2286,7 +2319,7 @@ fn cmd_dirvish_mkdir(kernel: SystemKernel, _args: List) -> #InteractiveEffects !
     } else {
         path.normalize(path.join(state.current_dir, clean_rel))
     }
-    (fs.create_dir_all(target) ! {
+    (fs.create_dir(target, parents = true) ! {
         err => error ("Failed creating directory '" ++ target ++ "': " ++ err.to_string())
     })!
 
@@ -2472,6 +2505,8 @@ fn cmd_dirvish_refresh(kernel: SystemKernel, _args: List) -> #InteractiveEffects
     let world = require_editor_world(kernel)!
     let wm = require_window_manager(kernel)!
     let state = require_dirvish_state(kernel)!
+    state.preview_cache.clear()
+    state.preview_cache_order = List()
     let cur_opt = entry_at_cursor(state, world.active_buffer())
     let keep_name = if cur_opt != null { cur_opt.as(DirvishEntry).name } else { "" }
     refresh_dirvish_all(kernel, world, wm, state, focus_name = keep_name)#!

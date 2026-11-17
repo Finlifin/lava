@@ -4,7 +4,9 @@
 
 use std.collections.{HashMap, Set}
 use std.fs
+use std.io.{File, OpenMode}
 use std.path
+
 use @lava_core.{
     CommandSpec, ExtId, ExtensionRecord, HookListener, InteractiveEffects, KeyBindingEntry,
     KeyStroke, Keymap, PromptKind, PromptRequest, ServiceEntry, SystemKernel, ask_prompt,
@@ -254,7 +256,7 @@ private fn ensure_normal_modal_state(kernel: SystemKernel, world: EditorWorld) {
     let vim_opt = kernel.service(SERVICE_VIM)
     if vim_opt != null {
         let vs = vim_opt.as(VimState)
-        vs.mode = VimMode.Normal
+        vs.mode = VimMode.normal
         vs.clear_transient()
         sync_world_from_vim(world, vs)
     }
@@ -368,7 +370,7 @@ private fn open_file_at_row(
         let file_lines = split_text_lines_clean(content)
         let created = world.create_buffer(
             base_name,
-            BufferKind.File,
+            BufferKind.file,
             file_path = full_path,
             major_mode = mode,
             initial_lines = file_lines,
@@ -853,19 +855,23 @@ private fn read_source_snippet_lines(file_path: String, def_row: i64, max_lines:
     if file_path == "" or (not fs.exists(file_path)) {
         return out
     }
-    let content! = fs.read_to_string(file_path) else {
+    let f! = File.open(file_path, mode = OpenMode.read) else {
         return out
     }
-    let lines = split_text_lines_clean(content)
+    defer { let _ = f.close() }
     let start_r = if def_row < 0 { 0 } else { def_row }
-    if start_r >= lines.len() {
-        return out
-    }
-    let end_r = if start_r + max_lines < lines.len() { start_r + max_lines } else { lines.len() }
-    for r in start_r..end_r {
-        let num_str = (r + 1).to_string().pad_start(5, " ")
-        let marker = if r == def_row { " > " } else { " | " }
-        out.push("  " ++ num_str ++ marker ++ lines.get(r.as(usize)).as(String))
+    let end_r_excl = start_r + max_lines
+    var r: i64 = 0
+    for line in f.lines() {
+        if r >= end_r_excl {
+            break
+        }
+        if r >= start_r {
+            let num_str = (r + 1).to_string().pad_start(5, " ")
+            let marker = if r == def_row { " > " } else { " | " }
+            out.push("  " ++ num_str ++ marker ++ line)
+        }
+        r += 1
     }
     out
 }
@@ -1262,7 +1268,7 @@ private fn toggle_bool_option(kernel: SystemKernel, world: EditorWorld, name: St
             let vim_opt = kernel.service(SERVICE_VIM)
             if vim_opt != null {
                 let vs = vim_opt.as(VimState)
-                vs.mode = VimMode.Normal
+                vs.mode = VimMode.normal
                 vs.clear_transient()
                 sync_world_from_vim(world, vs)
             }
@@ -1282,7 +1288,7 @@ private fn apply_option_value_str(
     let trimmed = raw_val.trim()
     let opts = world.options
     if meta.val_type == "i64" {
-        let parsed? = trimmed.parse_i64() else {
+        let parsed? = trimmed.try_parse(i64) else {
             return error ("Invalid integer for " ++ meta.name ++ ": " ++ trimmed)
         }
         when {
@@ -1311,7 +1317,7 @@ private fn apply_option_value_str(
         return parsed.to_string()
     }
     if meta.val_type == "f64" {
-        let parsed_f? = trimmed.parse_f64() else {
+        let parsed_f? = trimmed.try_parse(f64) else {
             return error ("Invalid float for " ++ meta.name ++ ": " ++ trimmed)
         }
         if meta.name == "font_size_pt" {
@@ -1349,7 +1355,7 @@ private fn parse_source_target(spec: String) -> (String, i64) {
     let pair_opt = trimmed.rsplit_once(":")
     if pair_opt != null {
         let (p, line_s) = pair_opt.as((String, String))
-        let num_opt = line_s.trim().parse_i64()
+        let num_opt = line_s.trim().try_parse(i64)
         if num_opt != null {
             let line_1 = num_opt.as(i64)
             return (p.trim(), if line_1 > 0 { line_1 - 1 } else { 0 })
@@ -1924,19 +1930,26 @@ private fn render_info_node_lines(nodes: List, idx: i64, focus_file_row: i64) ->
     let body_start_buf_row = lines.len()
     var target_buf_row: i64 = 0
     if fs.exists(nd.file_path) {
-        let raw_res = fs.read_to_string(nd.file_path)
-        raw_res match {
-            content! => {
-                let file_lines = content.replace("\r\n", "\n").split("\n")
+        let open_res = File.open(nd.file_path, mode = OpenMode.read)
+        open_res match {
+            f! => {
+                defer { let _ = f.close() }
                 let sr = if nd.start_row < 0 { 0 } else { nd.start_row }
-                let er = if nd.end_row >= file_lines.len() { file_lines.len() - 1 } else { nd.end_row }
-                if sr <= er {
-                    for r in sr..(er + 1) {
-                        lines.push(file_lines.get(r.as(usize)).as(String))
+                let er = nd.end_row
+                var r: i64 = 0
+                var last_pushed_r: i64 = -1
+                for line in f.lines() {
+                    if r > er {
+                        break
                     }
-                    if focus_file_row >= sr and focus_file_row <= er {
-                        target_buf_row = body_start_buf_row + (focus_file_row - sr)
+                    if r >= sr {
+                        lines.push(line)
+                        last_pushed_r = r
                     }
+                    r += 1
+                }
+                if last_pushed_r >= sr and focus_file_row >= sr and focus_file_row <= last_pushed_r {
+                    target_buf_row = body_start_buf_row + (focus_file_row - sr)
                 }
             },
             error _ => {
@@ -2067,17 +2080,22 @@ private fn find_tag_row_in_node(nd: DocNode, tag: String) -> i64 {
     if not fs.exists(nd.file_path) {
         return nd.start_row
     }
-    let content! = fs.read_to_string(nd.file_path) else {
+    let f! = File.open(nd.file_path, mode = OpenMode.read) else {
         return nd.start_row
     }
-    let lines = content.replace("\r\n", "\n").split("\n")
+    defer { let _ = f.close() }
     let sr = if nd.start_row < 0 { 0 } else { nd.start_row }
-    let er = if nd.end_row >= lines.len() { lines.len() - 1 } else { nd.end_row }
+    let er = nd.end_row
     let star_needle = "*" ++ tag.to_lower() ++ "*"
-    for r in sr..(er + 1) {
-        if lines.get(r.as(usize)).as(String).to_lower().contains(star_needle) {
+    var r: i64 = 0
+    for line in f.lines() {
+        if r > er {
+            break
+        }
+        if r >= sr and line.to_lower().contains(star_needle) {
             return r
         }
+        r += 1
     }
     nd.start_row
 }
@@ -3617,7 +3635,7 @@ private fn cmd_info_goto_node(kernel: SystemKernel, args: List) -> #InteractiveE
         let ans? = ask_prompt(PromptRequest.with_candidates(
             "Goto Info node: ",
             "",
-            PromptKind.Choice,
+            PromptKind.choice,
             cands,
         ))# else {
             emit_help_status(world, "Quit")#
@@ -3666,7 +3684,7 @@ private fn cmd_info_menu(kernel: SystemKernel, args: List) -> #InteractiveEffect
         let ans? = ask_prompt(PromptRequest.with_candidates(
             "Info menu item: ",
             "",
-            PromptKind.Choice,
+            PromptKind.choice,
             cands,
         ))# else {
             emit_help_status(world, "Quit")#
@@ -3718,7 +3736,7 @@ private fn cmd_info_index(kernel: SystemKernel, args: List) -> #InteractiveEffec
         let ans? = ask_prompt(PromptRequest.with_candidates(
             "Info index lookup: ",
             "",
-            PromptKind.Choice,
+            PromptKind.choice,
             cands,
         ))# else {
             emit_help_status(world, "Quit")#
@@ -4070,7 +4088,7 @@ private fn cmd_describe_function(kernel: SystemKernel, args: List) -> #Interacti
         let ans? = ask_prompt(PromptRequest {
             label: "Describe command: ",
             initial: "",
-            kind: PromptKind.CommandName,
+            kind: PromptKind.command_name,
             candidates: List(),
         })# else {
             emit_help_status(world, "Quit")#
@@ -4137,7 +4155,7 @@ private fn cmd_describe_variable(kernel: SystemKernel, args: List) -> #Interacti
         let ans? = ask_prompt(PromptRequest.with_candidates(
             "Describe variable: ",
             "",
-            PromptKind.Choice,
+            PromptKind.choice,
             cands,
         ))# else {
             emit_help_status(world, "Quit")#
@@ -4198,7 +4216,7 @@ private fn cmd_where_is(kernel: SystemKernel, args: List) -> #InteractiveEffects
         let ans? = ask_prompt(PromptRequest {
             label: "Where is command: ",
             initial: "",
-            kind: PromptKind.CommandName,
+            kind: PromptKind.command_name,
             candidates: List(),
         })# else {
             emit_help_status(world, "Quit")#

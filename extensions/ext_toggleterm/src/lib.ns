@@ -6,8 +6,8 @@
 --     in standalone `nessa run` tests (`pty_available() == false`).
 --   - 4 layout views per numbered session (`1..9`):
 --       1. `"float"`      : `<C-\>`, `<Space>tf`, `:ToggleTerm [id_or_cmd]` (`FloatingWindow` + spans + cursor)
---       2. `"horizontal"` : `<Space>th`, `:TermSplit` (`SplitAxis.Horizontal` bottom split)
---       3. `"vertical"`   : `<Space>tv`, `:TermVSplit` (`SplitAxis.Vertical` right split)
+--       2. `"horizontal"` : `<Space>th`, `:TermSplit` (`SplitAxis.horizontal` bottom split)
+--       3. `"vertical"`   : `<Space>tv`, `:TermVSplit` (`SplitAxis.vertical` right split)
 --       4. `"buffer"`     : `:term`, `:terminal`, `:vterm`, `<Space>tt`, `<Space>tb`, `terminal-here`
 --   - Authentic `TERM-INSERT` vs `TERM-NORMAL` modal key routing (`<C-\><C-n>`, `<F7>`, `<M-Escape>`
 --     to enter `TERM-NORMAL` for Vim scrollback navigation/search/yank; `i`/`a`/`I`/`A`/`<Return>`
@@ -83,7 +83,7 @@ pub fn is_terminal_buffer_mode(major_mode: String) -> bool {
 fn parse_terminal_buffer_id(buf_name: String) -> i64 {
     if buf_name.starts_with("*terminal-") and buf_name.ends_with("*") {
         let inner = buf_name.slice(10, buf_name.char_len() - 1)
-        let parsed = inner.parse_i64()
+        let parsed = inner.try_parse(i64)
         if parsed != null and parsed.as(i64) > 0 {
             return parsed.as(i64)
         }
@@ -951,8 +951,8 @@ fn sync_statusline_badge(world: EditorWorld, svc: ToggleTermService) {
 fn sync_modal_interceptor_attachment(world: EditorWorld, vim: VimState, svc: ToggleTermService) {
     svc.pending_ctrl_backslash = false
     if svc.float_visible {
-        if vim.mode != VimMode.Normal {
-            vim.mode = VimMode.Normal
+        if vim.mode != VimMode.normal {
+            vim.mode = VimMode.normal
         }
         vim.set_interceptor(OWNER_TOGGLETERM, terminal_modal_interceptor)
         sync_world_from_vim(world, vim)
@@ -967,7 +967,7 @@ fn sync_modal_interceptor_attachment(world: EditorWorld, vim: VimState, svc: Tog
             let _ = svc.switch_session(parsed_id, world.cwd)
         }
         if svc.term_insert_mode {
-            vim.mode = VimMode.Insert
+            vim.mode = VimMode.insert
             vim.clear_transient()
             vim.set_interceptor(OWNER_TOGGLETERM, terminal_modal_interceptor)
             sync_world_from_vim(world, vim)
@@ -980,8 +980,8 @@ fn sync_modal_interceptor_attachment(world: EditorWorld, vim: VimState, svc: Tog
                 vim.clear_interceptor()
             }
         }
-        if vim.mode == VimMode.Insert {
-            vim.mode = VimMode.Normal
+        if vim.mode == VimMode.insert {
+            vim.mode = VimMode.normal
         }
         sync_world_from_vim(world, vim)
         sync_statusline_badge(world, svc)
@@ -1013,8 +1013,8 @@ pub fn hide_toggleterm_float(world: EditorWorld, vim: VimState, svc: ToggleTermS
             vim.clear_interceptor()
         }
     }
-    if vim.mode != VimMode.Normal and (not is_terminal_buffer_mode(world.active_buffer().major_mode)) {
-        vim.mode = VimMode.Normal
+    if vim.mode != VimMode.normal and (not is_terminal_buffer_mode(world.active_buffer().major_mode)) {
+        vim.mode = VimMode.normal
     }
     sync_modal_interceptor_attachment(world, vim, svc)
     sync_world_from_vim(world, vim)
@@ -1030,8 +1030,8 @@ pub fn open_toggleterm_float(world: EditorWorld, vim: VimState, svc: ToggleTermS
     svc.float_sel_anchor = null
     svc.float_sel_cursor = null
     svc.float_scroll_offset = 0
-    if vim.mode != VimMode.Normal {
-        vim.mode = VimMode.Normal
+    if vim.mode != VimMode.normal {
+        vim.mode = VimMode.normal
     }
     vim.clear_transient()
     refresh_toggleterm_float(world, svc)
@@ -1102,8 +1102,8 @@ fn close_exited_terminal_session(
             if b_opt != null and b_opt.as(Buffer).id != world.active_buffer_id {
                 let _ = world.kill_buffer(b_opt.as(Buffer).id, force = true) ! { _ => world.active_buffer_id }
             }
-            if (not is_terminal_buffer_mode(world.active_buffer().major_mode)) and vim.mode == VimMode.Insert {
-                vim.mode = VimMode.Normal
+            if (not is_terminal_buffer_mode(world.active_buffer().major_mode)) and vim.mode == VimMode.insert {
+                vim.mode = VimMode.normal
             }
             sync_modal_interceptor_attachment(world, vim, svc)
             sync_world_from_vim(world, vim)
@@ -1143,8 +1143,8 @@ fn close_exited_terminal_session(
     if wm_raw != null {
         wm_raw.as(WindowManager).sync_from_world(world)
     }
-    if (not is_terminal_buffer_mode(world.active_buffer().major_mode)) and vim.mode == VimMode.Insert {
-        vim.mode = VimMode.Normal
+    if (not is_terminal_buffer_mode(world.active_buffer().major_mode)) and vim.mode == VimMode.insert {
+        vim.mode = VimMode.normal
     }
     sync_modal_interceptor_attachment(world, vim, svc)
     sync_world_from_vim(world, vim)
@@ -1174,7 +1174,7 @@ fn enter_term_normal_mode(kernel: SystemKernel, world: EditorWorld, vim: VimStat
             wm.active_pane().cursor = abuf.point
         }
     }
-    vim.mode = VimMode.Normal
+    vim.mode = VimMode.normal
     vim.clear_transient()
     sync_modal_interceptor_attachment(world, vim, svc)
 }
@@ -1447,7 +1447,7 @@ fn terminal_modal_interceptor(kernel: SystemKernel, stroke: KeyStroke) -> #Servi
 
         -- `<M-1>`..`<M-9>` switches numbered session in both PTY and fallback float
         if alt_only and k.char_len() == 1 and k.is_ascii_digit() {
-            let d_opt = k.parse_i64()
+            let d_opt = k.try_parse(i64)
             if d_opt != null and d_opt.as(i64) >= 1 {
                 let sess = svc.switch_session(d_opt.as(i64), world.cwd)
                 refresh_toggleterm_float(world, svc)
@@ -1482,7 +1482,7 @@ fn terminal_modal_interceptor(kernel: SystemKernel, stroke: KeyStroke) -> #Servi
 
         -- Fallback float shortcuts (`1`..`9` when input empty, `<Tab>`/`<C-n>`/`<C-p>` cycle)
         if plain and svc.input_line == "" and k.char_len() == 1 and k.is_ascii_digit() {
-            let d_opt = k.parse_i64()
+            let d_opt = k.try_parse(i64)
             if d_opt != null {
                 let d = d_opt.as(i64)
                 if d >= 1 and d <= 9 {
@@ -1558,7 +1558,7 @@ fn terminal_modal_interceptor(kernel: SystemKernel, stroke: KeyStroke) -> #Servi
 
     -- `<M-1>`..`<M-9>` switches numbered terminal session in-place
     if alt_only and k.char_len() == 1 and k.is_ascii_digit() {
-        let d_opt = k.parse_i64()
+        let d_opt = k.try_parse(i64)
         if d_opt != null and d_opt.as(i64) >= 1 {
             let next_sess = svc.switch_session(d_opt.as(i64), world.cwd)
             let tbuf = sync_terminal_buffer_with_wm(kernel, world, svc, next_sess, abuf.major_mode, true)
@@ -1702,7 +1702,7 @@ fn open_or_toggle_split_terminal(
     var initial_cmd = ""
     if not args.is_empty() {
         let raw_arg = args.get(0).as(String).trim()
-        let parsed_id = raw_arg.parse_i64()
+        let parsed_id = raw_arg.try_parse(i64)
         if parsed_id != null and parsed_id.as(i64) > 0 {
             target_id = parsed_id.as(i64)
         } else {
@@ -1746,7 +1746,7 @@ fn open_or_toggle_split_terminal(
     }
 
     let new_win_id = wm.split_active(axis, world)
-    if axis == SplitAxis.Horizontal {
+    if axis == SplitAxis.horizontal {
         wm.adjust_split_ratio(0.15)
     }
 
@@ -1776,7 +1776,7 @@ fn cmd_toggleterm_toggle(kernel: SystemKernel, args: List) -> #InteractiveEffect
 
     let raw_arg = if not args.is_empty() { args.get(0).as(String).trim() } else { "" }
     if raw_arg != "" {
-        let parsed_id = raw_arg.parse_i64()
+        let parsed_id = raw_arg.try_parse(i64)
         if parsed_id != null and parsed_id.as(i64) > 0 {
             let target_id = parsed_id.as(i64)
             if svc.visible_mode == "float" and svc.float_visible and svc.current_id == target_id {
@@ -1817,7 +1817,7 @@ fn cmd_toggleterm_buffer(kernel: SystemKernel, args: List) -> #InteractiveEffect
 
     var target_id = svc.current_id
     if not args.is_empty() {
-        let parsed_opt = args.get(0).as(String).trim().parse_i64()
+        let parsed_opt = args.get(0).as(String).trim().try_parse(i64)
         if parsed_opt != null and parsed_opt.as(i64) > 0 {
             target_id = parsed_opt.as(i64)
         }
@@ -1841,7 +1841,7 @@ fn cmd_terminal_buffer(kernel: SystemKernel, args: List) -> #InteractiveEffects 
     if not args.is_empty() {
         let raw_arg = args.join(" ").trim()
         if raw_arg != "" {
-            let parsed_id = raw_arg.parse_i64()
+            let parsed_id = raw_arg.try_parse(i64)
             if parsed_id != null and parsed_id.as(i64) > 0 and parsed_id.as(i64) <= 9 {
                 target_id = parsed_id.as(i64)
             } else {
@@ -1911,11 +1911,11 @@ fn cmd_terminal_here(kernel: SystemKernel, args: List) -> #InteractiveEffects !S
 }
 
 fn cmd_terminal_split(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
-    open_or_toggle_split_terminal(kernel, SplitAxis.Horizontal, "horizontal", args)#!
+    open_or_toggle_split_terminal(kernel, SplitAxis.horizontal, "horizontal", args)#!
 }
 
 fn cmd_terminal_vsplit(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
-    open_or_toggle_split_terminal(kernel, SplitAxis.Vertical, "vertical", args)#!
+    open_or_toggle_split_terminal(kernel, SplitAxis.vertical, "vertical", args)#!
 }
 
 fn cmd_terminal_normal_mode(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
@@ -1944,7 +1944,7 @@ fn cmd_toggleterm_buffer_input(kernel: SystemKernel, _args: List) -> #Interactiv
     let ans? = ask_prompt(PromptRequest {
         label: "Terminal #" ++ session.id.to_string() ++ " (" ++ session.cwd ++ ") $ ",
         initial: "",
-        kind: PromptKind.FreeText,
+        kind: PromptKind.free_text,
         candidates: session.history,
     })# else {
         status_emit("Cancelled")#
@@ -2078,13 +2078,13 @@ fn cmd_term_exec(kernel: SystemKernel, args: List) -> #InteractiveEffects !Strin
 
 fn extract_lines_to_send(buf: Buffer, vim: VimState) -> List {
     let lines = List()
-    let is_vis = vim.mode == VimMode.VisualChar
-        or vim.mode == VimMode.VisualLine
-        or vim.mode == VimMode.VisualBlock
+    let is_vis = vim.mode == VimMode.visual_char
+        or vim.mode == VimMode.visual_line
+        or vim.mode == VimMode.visual_block
     if is_vis {
         let a = vim.visual_anchor
         let b = buf.point
-        if vim.mode == VimMode.VisualChar {
+        if vim.mode == VimMode.visual_char {
             let lo = if a <= b { a } else { b }
             let hi = if a <= b { b } else { a }
             let hlen = buf.line_char_len(hi.row)
@@ -2123,8 +2123,8 @@ fn cmd_term_send(kernel: SystemKernel, _args: List) -> #InteractiveEffects !Stri
     let buf = world.active_buffer()
 
     let cmds = extract_lines_to_send(buf, vim)
-    if vim.mode != VimMode.Normal {
-        vim.mode = VimMode.Normal
+    if vim.mode != VimMode.normal {
+        vim.mode = VimMode.normal
         vim.visual_dollar = false
         vim.clear_transient()
         sync_world_from_vim(world, vim)

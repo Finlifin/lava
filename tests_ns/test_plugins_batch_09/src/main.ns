@@ -104,10 +104,10 @@ fn test_batch_09_plugins() {
     mock_enable(true)
 
     let raw_tmp = "/tmp/lava_batch09_" ++ time.unix_millis().to_string()
-    let _ = fs.create_dir_all(raw_tmp) ! { e => panic(e.to_string()) }
+    let _ = fs.create_dir(raw_tmp, parents = true) ! { e => panic(e.to_string()) }
     let tmp_dir = fs.canonicalize(raw_tmp) ! { _ => raw_tmp }
     let subdir = path.join(tmp_dir, "subdir")
-    let _ = fs.create_dir_all(subdir) ! { e => panic(e.to_string()) }
+    let _ = fs.create_dir(subdir, parents = true) ! { e => panic(e.to_string()) }
 
     let kernel = boot_batch09_kernel()
     check_eq_i64(kernel.list_extensions().len(), 11, "11 active extensions (8 core + 3 batch09)")
@@ -120,7 +120,7 @@ fn test_batch_09_plugins() {
     let persist_svc: PersistenceService = (require_persistence_service(kernel) ! { e => panic(e) }).as(PersistenceService)
 
     handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
-    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+    let _ = app_step_event(kernel, RawUiEvent.resize(1280, 800, 1))# ! { e => panic(e) }
 
     -- ========================================================================
     -- PART 1: Plugin 25 — `ext_toggleterm` (`toggleterm.nvim` / `vterm`)
@@ -229,7 +229,7 @@ fn test_batch_09_plugins() {
 
     let proj_dir = path.join(tmp_dir, "overseer_proj")
     let proj_src_dir = path.join(proj_dir, "src")
-    let _ = fs.create_dir_all(proj_src_dir) ! { e => panic(e.to_string()) }
+    let _ = fs.create_dir(proj_src_dir, parents = true) ! { e => panic(e.to_string()) }
     let app_ns_path = path.join(proj_src_dir, "app.ns")
     let _ = fs.write_string(
         app_ns_path,
@@ -465,7 +465,7 @@ fn test_batch_09_plugins() {
     check_true(frame_gen >= 1, "app_commit_frame succeeded after Batch 09 workflows")
 
     let _ = cap
-    let _ = fs.remove_dir_all(tmp_dir) ! { _ => () }
+    let _ = fs.remove_dir(tmp_dir, recursive = true) ! { _ => () }
     println("ALL BATCH 09 PLUGIN TESTS PASSED!")
 }
 

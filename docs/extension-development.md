@@ -38,7 +38,7 @@ type = "lib"
 调用 `kernel.register_extension(id, domain, name, version, description, deps, activate_fn, deactivate_fn)` 注册扩展后，`SystemKernel` 提供严格的生命周期保障：
 
 1. **DFS 环检测与拓扑排序**：`activate_extension` 先递归激活 `deps: List`（元素为 `ExtId`）中声明的所有前置扩展；若检测到循环依赖则立即返回可读错误诊断。
-2. **反向依赖守卫**：在 `*Lazy*` 管理器（`<Space>l`）或代码里调用 `kernel.deactivate_extension(ext_id)` 时，若仍有其他处于 `Active` 状态的扩展依赖当前扩展，内核会拒绝停用以维持单 VM 不变量。
+2. **反向依赖守卫**：在 `*Lazy*` 管理器（`<Space>l`）或代码里调用 `kernel.deactivate_extension(ext_id)` 时，若仍有其他处于 `ExtState.active` 状态的扩展依赖当前扩展，内核会拒绝停用以维持单 VM 不变量。
 3. **资源按所有者自动回收**：一旦停用成功，内核无需插件手动逐条删除，**自动卸载该 `ExtId` 名下发布的所有 Services、Commands、Hooks 以及所有 Keymap 中的按键绑定**！插件的 `deactivate` 回调只需负责清理它在 `EditorWorld` 中挂载的 UI 装饰（例如调用 `world.clear_owner_ui("ext_wordcount")`）。
 
 ---
@@ -138,7 +138,7 @@ fn cmd_goto_tagged_heading(kern: SystemKernel, _args: List) -> #InteractiveEffec
 
     let colon_pair? = picked.split_once(":") else { return () }
     let (line_s, _) = colon_pair
-    let row_1? = line_s.parse_i64() else { return () }
+    let row_1? = line_s.try_parse(i64) else { return () }
     buf.point = buf.clamp_pos(Pos.new(row_1 - 1, 0), insert_mode = false)
     if confirm == "y" {
         let _ = kern.dispatch_command("scroll-center", List())#!

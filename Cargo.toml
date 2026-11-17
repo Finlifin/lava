@@ -27,6 +27,7 @@ nsbc = { git = "https://github.com/Finlifin/nessa.git", branch = "main" }
 nsbc_io = { git = "https://github.com/Finlifin/nessa.git", branch = "main" }
 pkg_manager = { git = "https://github.com/Finlifin/nessa.git", branch = "main" }
 runtime = { git = "https://github.com/Finlifin/nessa.git", branch = "main" }
+scheduler = { git = "https://github.com/Finlifin/nessa.git", branch = "main" }
 lava-accel = { path = "crates/lava-accel" }
 lava-lsp = { path = "crates/lava-lsp" }
 lava-remote = { path = "crates/lava-remote" }
@@ -39,9 +40,21 @@ lava-vm = { path = "crates/lava-vm" }
 debug = 0
 incremental = false
 
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.lava-accel]
+opt-level = 2
+
 [profile.test]
 debug = 0
 incremental = false
+
+[profile.test.package."*"]
+opt-level = 2
+
+[profile.test.package.lava-accel]
+opt-level = 2
 
 [profile.release]
 opt-level = 3

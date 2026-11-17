@@ -4,8 +4,10 @@
 -- `1..9`/`<Return>` jump, `q`/`<Escape>` close), cycle (`<Space>hn`/`<Space>hp`), and JSON persistence.
 
 use std.fs
+use std.io.{File, OpenMode}
 use std.path
-use @lava_sys.{host_read_file_lines, host_write_file_lines, rgb}
+
+use @lava_sys.rgb
 use @lava_core.{
     ExtId, InteractiveEffects, KeyStroke, PromptKind, PromptRequest, ServiceEffects, SystemKernel,
     ask_prompt, log_event, status_emit
@@ -198,7 +200,7 @@ fn parse_json_int_after(line: String, key: String) -> ?i64 {
     if j <= i {
         return null
     }
-    line.slice(i, j).parse_i64()
+    line.slice(i, j).try_parse(i64)
 }
 
 pub fn harpoon_serialize_lines(state: HarpoonState) -> List {
@@ -219,45 +221,55 @@ pub fn harpoon_serialize_lines(state: HarpoonState) -> List {
     out
 }
 
+fn parse_harpoon_line_entry(raw_line: String) -> ?HarpoonEntry {
+    let ln = raw_line.trim()
+    if ln == "" or ln == "[" or ln == "]" {
+        return null
+    }
+    if ln.starts_with("{{") {
+        let fp_opt = parse_json_string_after(ln, "file_path")
+        let bn_opt = parse_json_string_after(ln, "buf_name")
+        let r_opt = parse_json_int_after(ln, "row")
+        let c_opt = parse_json_int_after(ln, "col")
+        if fp_opt != null and bn_opt != null {
+            let r_val = if r_opt != null { r_opt.as(i64) } else { 0 }
+            let c_val = if c_opt != null { c_opt.as(i64) } else { 0 }
+            return (HarpoonEntry {
+                file_path: fp_opt.as(String),
+                buf_name: bn_opt.as(String),
+                row: if r_val >= 0 { r_val } else { 0 },
+                col: if c_val >= 0 { c_val } else { 0 },
+            })
+        }
+        return null
+    }
+    if ln.contains("\t") {
+        -- Fallback tab-separated line format: `file_path\tbuf_name\trow\tcol`
+        let parts = ln.split("\t")
+        if parts.len() >= 4 {
+            let fp = parts.get(0).as(String)
+            let bn = parts.get(1).as(String)
+            let r_opt = parts.get(2).as(String).try_parse(i64)
+            let c_opt = parts.get(3).as(String).try_parse(i64)
+            let r_val = if r_opt != null { r_opt.as(i64) } else { 0 }
+            let c_val = if c_opt != null { c_opt.as(i64) } else { 0 }
+            return (HarpoonEntry {
+                file_path: fp,
+                buf_name: bn,
+                row: if r_val >= 0 { r_val } else { 0 },
+                col: if c_val >= 0 { c_val } else { 0 },
+            })
+        }
+    }
+    null
+}
+
 pub fn harpoon_deserialize_lines(state: HarpoonState, lines: List) -> i64 {
     let loaded = List()
-    for i in 0..lines.len() {
-        let ln = lines.get(i.as(usize)).as(String).trim()
-        if ln == "" or ln == "[" or ln == "]" {
-            continue
-        }
-        if ln.starts_with("{{") {
-            let fp_opt = parse_json_string_after(ln, "file_path")
-            let bn_opt = parse_json_string_after(ln, "buf_name")
-            let r_opt = parse_json_int_after(ln, "row")
-            let c_opt = parse_json_int_after(ln, "col")
-            if fp_opt != null and bn_opt != null {
-                let r_val = if r_opt != null { r_opt.as(i64) } else { 0 }
-                let c_val = if c_opt != null { c_opt.as(i64) } else { 0 }
-                loaded.push(HarpoonEntry {
-                    file_path: fp_opt.as(String),
-                    buf_name: bn_opt.as(String),
-                    row: if r_val >= 0 { r_val } else { 0 },
-                    col: if c_val >= 0 { c_val } else { 0 },
-                })
-            }
-        } else if ln.contains("\t") {
-            -- Fallback tab-separated line format: `file_path\tbuf_name\trow\tcol`
-            let parts = ln.split("\t")
-            if parts.len() >= 4 {
-                let fp = parts.get(0).as(String)
-                let bn = parts.get(1).as(String)
-                let r_opt = parts.get(2).as(String).parse_i64()
-                let c_opt = parts.get(3).as(String).parse_i64()
-                let r_val = if r_opt != null { r_opt.as(i64) } else { 0 }
-                let c_val = if c_opt != null { c_opt.as(i64) } else { 0 }
-                loaded.push(HarpoonEntry {
-                    file_path: fp,
-                    buf_name: bn,
-                    row: if r_val >= 0 { r_val } else { 0 },
-                    col: if c_val >= 0 { c_val } else { 0 },
-                })
-            }
+    for line_any in lines.iter() {
+        let entry_opt = parse_harpoon_line_entry(line_any.as(String))
+        if entry_opt != null {
+            loaded.push(entry_opt.as(HarpoonEntry))
         }
     }
     state.entries = loaded
@@ -272,17 +284,47 @@ pub fn harpoon_save_state(state: HarpoonState, target_path: String) -> !String U
     if parent_opt != null {
         let pdir = parent_opt.as(String)
         if pdir != "" and (not fs.exists(pdir)) {
-            let _ = fs.create_dir_all(pdir) ! { _ => () }
+            let _ = fs.create_dir(pdir, parents = true) ! { _ => () }
         }
     }
-    let lines = harpoon_serialize_lines(state)
-    let _ = host_write_file_lines(target_path, lines, true)!
+    let f! = File.open(target_path, mode = OpenMode.write) else {
+        return error ("cannot write Harpoon state file: " ++ target_path)
+    }
+    defer { let _ = f.close() }
+    f.write_line("[") ! { err => return error err.to_string() }
+    let n = state.entries.len()
+    for i in 0..n {
+        let e = state.entries.get(i.as(usize)).as(HarpoonEntry)
+        let comma = if i + 1 < n { "," } else { "" }
+        let line = "  {{\"file_path\": \"" ++ json_escape(e.file_path)
+            ++ "\", \"buf_name\": \"" ++ json_escape(e.buf_name)
+            ++ "\", \"row\": " ++ e.row.to_string()
+            ++ ", \"col\": " ++ e.col.to_string()
+            ++ "}}" ++ comma
+        f.write_line(line) ! { err => return error err.to_string() }
+    }
+    f.write_line("]") ! { err => return error err.to_string() }
+    f.close() ! { err => return error err.to_string() }
     ()
 }
 
 pub fn harpoon_load_state(state: HarpoonState, target_path: String) -> !String i64 {
-    let (lines, _) = host_read_file_lines(target_path)!
-    harpoon_deserialize_lines(state, lines)
+    let f! = File.open(target_path, mode = OpenMode.read) else {
+        return error ("cannot read Harpoon state file: " ++ target_path)
+    }
+    defer { let _ = f.close() }
+    let loaded = List()
+    for raw_line in f.lines() {
+        let entry_opt = parse_harpoon_line_entry(raw_line)
+        if entry_opt != null {
+            loaded.push(entry_opt.as(HarpoonEntry))
+        }
+    }
+    state.entries = loaded
+    state.active_idx = 0
+    state.selected_row = 0
+    state.clamp_selection()
+    loaded.len()
 }
 
 pub fn harpoon_save(kernel: SystemKernel, file_path: String) -> !String Unit {
@@ -453,8 +495,8 @@ fn jump_to_harpoon_slot(
 
     state.active_idx = slot_idx
     state.selected_row = slot_idx
-    if vim.mode != VimMode.Normal {
-        vim.mode = VimMode.Normal
+    if vim.mode != VimMode.normal {
+        vim.mode = VimMode.normal
     }
     vim.clear_transient()
     sync_world_from_vim(world, vim)
@@ -554,15 +596,12 @@ fn harpoon_menu_interceptor(
         return true
     }
 
-    if plain and k.char_len() == 1 and k.is_ascii_digit() {
-        let d_opt = k.parse_i64()
-        if d_opt != null {
-            let d = d_opt.as(i64)
-            if d >= 1 and d <= 9 {
-                close_harpoon_menu(world, vim, state)
-                jump_to_harpoon_slot(kernel, d - 1)#!
-                return true
-            }
+    if plain and k.len() == 1 and k.is_ascii_digit() {
+        let d = k.byte_at(0) - 48
+        if d >= 1 and d <= 9 {
+            close_harpoon_menu(world, vim, state)
+            jump_to_harpoon_slot(kernel, d - 1)#!
+            return true
         }
     }
 
@@ -660,7 +699,7 @@ fn cmd_harpoon_save(kernel: SystemKernel, args: List) -> #InteractiveEffects !St
         let ans? = ask_prompt(PromptRequest {
             label: "Save Harpoon marks to: ",
             initial: default_p,
-            kind: PromptKind.FilePath,
+            kind: PromptKind.file_path,
             candidates: List(),
         })# else {
             status_emit("Cancelled")#
@@ -684,7 +723,7 @@ fn cmd_harpoon_load(kernel: SystemKernel, args: List) -> #InteractiveEffects !St
         let ans? = ask_prompt(PromptRequest {
             label: "Load Harpoon marks from: ",
             initial: default_p,
-            kind: PromptKind.FilePath,
+            kind: PromptKind.file_path,
             candidates: List(),
         })# else {
             status_emit("Cancelled")#

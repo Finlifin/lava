@@ -3,7 +3,7 @@
 --   Exercising real keystrokes through `ext_vim` + `ext_emacs` + `SystemKernel`.
 
 use std.fs
-use std.io.File
+use std.io.{File, OpenMode}
 use std.path
 use std.process
 use std.time
@@ -122,8 +122,8 @@ fn setup_fixture_tree() -> String {
     let deep_dir = path.join(nested_dir, "deep")
     let backup_dir = path.join(root, "backup")
 
-    let _ = fs.create_dir_all(deep_dir) ! { e => panic("mkdir deep: " ++ e.to_string()) }
-    let _ = fs.create_dir_all(backup_dir) ! { e => panic("mkdir backup: " ++ e.to_string()) }
+    let _ = fs.create_dir(deep_dir, parents = true) ! { e => panic("mkdir deep: " ++ e.to_string()) }
+    let _ = fs.create_dir(backup_dir, parents = true) ! { e => panic("mkdir backup: " ++ e.to_string()) }
 
     let _ = fs.write_string(
         path.join(root, "README.md"),
@@ -157,7 +157,7 @@ fn setup_fixture_tree() -> String {
 
     -- Binary file containing `\0` null bytes
     let bin_path = path.join(src_dir, "blob.dat")
-    let bf: File = (File.open(bin_path, mode = "wb") ! { e => panic("open blob.dat: " ++ e.to_string()) }).as(File)
+    let bf: File = (File.open(bin_path, mode = OpenMode.write) ! { e => panic("open blob.dat: " ++ e.to_string()) }).as(File)
     let _ = bf.write_bytes([137, 80, 78, 71, 0, 1, 2, 0, 255]) ! {
         e => panic("write blob.dat: " ++ e.to_string())
     }
@@ -174,12 +174,12 @@ fn setup_fixture_tree() -> String {
     ) ! { e => panic("write leaf.txt: " ++ e.to_string()) }
 
     -- Optional git repo in fixture so Dirvish Git column (`A` / `?`) is exercised end-to-end
-    let git_ok: bool = (process.exec("git", args = ["init", "-q"], cwd = root) ! { _ => error "no-git" }) match {
+    let git_ok: bool = (process.run("git", args = ["init", "-q"], cwd = root) ! { _ => error "no-git" }) match {
         !_ => false,
         _ => true,
     }
     if git_ok {
-        let _ = process.exec("git", args = ["add", "src/main.ns"], cwd = root) ! { _ => error "ignore" }
+        let _ = process.run("git", args = ["add", "src/main.ns"], cwd = root) ! { _ => error "ignore" }
     }
 
     root
@@ -250,7 +250,7 @@ fn run_dirvish_ranger_suite(root: String) {
     let fcmds = mock_last_frame_cmds()
     check_true(fcmds.len() > 10, "3-pane frame rendered cleanly through ext_render")
 
-    -- Regression check: NO two `DrawCmd.TextRun`s inside the center Dirvish pane content area
+    -- Regression check: NO two `DrawCmd.text_run`s inside the center Dirvish pane content area
     -- may ever overlap horizontally on the same row `y` (prevents double-drawn filename text!).
     let parent_w = (p_single.rect.w * 0.16).floor()
     let center_w = (p_single.rect.w * 0.40).floor()
@@ -261,7 +261,7 @@ fn run_dirvish_ranger_suite(root: String) {
     let center_runs = List()
     for ci in 0..fcmds.len() {
         fcmds.get(ci.as(usize)).as(DrawCmd) match {
-            DrawCmd.TextRun(tx, ty, tstr, _, _, _, _, _, _) => {
+            DrawCmd.text_run(tx, ty, tstr, _, _, _, _, _, _) => {
                 if tx >= mid_left and tx < mid_right and ty >= p_single.rect.y and ty < mid_bottom {
                     center_runs.push((ty, tx, tx + tstr.char_len().as(f64) * cw, tstr))
                 }
@@ -622,6 +622,6 @@ fn main() {
     println("=== test_dirvish_ranger ===")
     let root = setup_fixture_tree()
     run_dirvish_ranger_suite(root)
-    let _ = fs.remove_dir_all(root) ! { _ => () }
+    let _ = fs.remove_dir(root, recursive = true) ! { _ => () }
     println("test_dirvish_ranger: ALL PASSED")
 }

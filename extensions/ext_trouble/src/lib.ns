@@ -59,6 +59,8 @@ pub struct TroubleService {
     pub filter_mode: String,
     pub source_buf_id: BufferId,
     pub panel_row_map: HashMap,
+    pub last_scan_buf_id: BufferId,
+    pub last_scan_ver: i64,
 }
 
 impl TroubleService {
@@ -70,6 +72,8 @@ impl TroubleService {
             filter_mode: "all",
             source_buf_id: BufferId(1),
             panel_row_map: HashMap.new(),
+            last_scan_buf_id: BufferId(0),
+            last_scan_ver: -1,
         }
     }
 
@@ -115,7 +119,7 @@ fn is_analyzable_buffer(buf: Buffer) -> bool {
     if buf.name == TROUBLE_BUF_NAME or buf.name == "*Messages*" {
         return false
     }
-    buf.kind == BufferKind.File or buf.kind == BufferKind.Scratch
+    buf.kind == BufferKind.file or buf.kind == BufferKind.scratch
 }
 
 fn quickfix_matches_buffer(world: EditorWorld, qf_path: String, buf_path: String) -> bool {
@@ -327,6 +331,8 @@ pub fn analyze_buffer(world: EditorWorld, service: TroubleService, buf: Buffer) 
             win_end: win_end,
         },
     )
+    service.last_scan_buf_id = buf.id
+    service.last_scan_ver = buf.edit_version
     render_buffer_diagnostics(buf, diags, win_start, win_end)
     diags
 }
@@ -341,8 +347,10 @@ fn ensure_buffer_analyzed(world: EditorWorld, service: TroubleService, buf: Buff
         let cached = cached_opt.as(CachedBufState)
         if cached.major_mode == buf.major_mode
             and cached.file_path == buf.file_path
-            and cached.qf_sig == compute_qf_signature(world, buf.file_path)
-            and cached.edit_version == buf.edit_version {
+            and cached.edit_version == buf.edit_version
+            and cached.qf_sig == compute_qf_signature(world, buf.file_path) {
+            service.last_scan_buf_id = buf.id
+            service.last_scan_ver = buf.edit_version
             let diags = service.buffer_diagnostics(buf.id)
             let lcount = buf.line_count()
             if viewport_escaped_trouble_window(world, lcount, cached.win_start, cached.win_end) {
@@ -599,7 +607,7 @@ fn jump_diagnostic_in_buffer(
     world.jumps.record(buf.id, buf.file_path, buf.point)
     buf.point = buf.clamp_pos(Pos.new(target.row, target.col), insert_mode = false)
     buf.preferred_col = buf.point.col
-    vim.mode = VimMode.Normal
+    vim.mode = VimMode.normal
     vim.clear_transient()
     sync_world_from_vim(world, vim)
     kernel.emit_hook("cursor-moved", buf.id)
@@ -630,7 +638,7 @@ fn close_trouble_panel(
         }
     }
     let _ = world.switch_to_buffer(dest_id)
-    vim.mode = VimMode.Normal
+    vim.mode = VimMode.normal
     vim.clear_transient()
     sync_world_from_vim(world, vim)
     kernel.emit_hook("buffer-switched", dest_id)
@@ -652,7 +660,7 @@ fn open_trouble_panel(
     tbuf.point = tbuf.clamp_pos(Pos.new(first_row, 0), insert_mode = false)
     tbuf.preferred_col = 0
     let _ = world.switch_to_buffer(tbuf.id)
-    vim.mode = VimMode.Normal
+    vim.mode = VimMode.normal
     vim.clear_transient()
     sync_world_from_vim(world, vim)
     kernel.emit_hook("buffer-switched", tbuf.id)
@@ -723,6 +731,23 @@ fn on_trouble_sync_hook(kern: SystemKernel, payload: Any) {
     }
 }
 
+fn on_trouble_burst_guarded_hook(kern: SystemKernel, payload: Any) {
+    let w_opt = kern.service("lava.document.world")
+    let t_opt = kern.service(SERVICE_TROUBLE)
+    if w_opt == null or t_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    if world.in_key_burst {
+        return
+    }
+    let service = t_opt.as(TroubleService)
+    let buf = resolve_hook_buffer(world, payload)
+    if is_analyzable_buffer(buf) {
+        let _ = ensure_buffer_analyzed(world, service, buf)
+    }
+}
+
 fn on_trouble_insert_hook(kern: SystemKernel, payload: Any) {
     let w_opt = kern.service("lava.document.world")
     let t_opt = kern.service(SERVICE_TROUBLE)
@@ -730,8 +755,14 @@ fn on_trouble_insert_hook(kern: SystemKernel, payload: Any) {
         return
     }
     let world = w_opt.as(EditorWorld)
+    if world.in_key_burst {
+        return
+    }
     let service = t_opt.as(TroubleService)
     let buf = resolve_hook_buffer(world, payload)
+    if service.last_scan_buf_id == buf.id and service.last_scan_ver == buf.edit_version {
+        return
+    }
     if buf.line_count() > 2000 {
         return
     }
@@ -896,7 +927,7 @@ pub fn register_trouble_extension(kernel: SystemKernel) -> !String Unit {
                     }
                     tb.point = tb.clamp_pos(Pos.new(diag.row, diag.col), insert_mode = false)
                     tb.preferred_col = tb.point.col
-                    vim.mode = VimMode.Normal
+                    vim.mode = VimMode.normal
                     vim.clear_transient()
                     sync_world_from_vim(world, vim)
                     kern.emit_hook("buffer-switched", tb.id)
@@ -959,9 +990,9 @@ pub fn register_trouble_extension(kernel: SystemKernel) -> !String Unit {
 
             k.add_hook("buffer-opened", ext_id, on_trouble_force_hook)
             k.add_hook("buffer-switched", ext_id, on_trouble_sync_hook)
-            k.add_hook("buffer-modified", ext_id, on_trouble_sync_hook)
+            k.add_hook("buffer-modified", ext_id, on_trouble_burst_guarded_hook)
             k.add_hook("buffer-saved", ext_id, on_trouble_sync_hook)
-            k.add_hook("cursor-moved", ext_id, on_trouble_sync_hook)
+            k.add_hook("cursor-moved", ext_id, on_trouble_burst_guarded_hook)
             k.add_hook("mode-changed", ext_id, on_trouble_sync_hook)
             k.add_hook("after-insert-stroke", ext_id, on_trouble_insert_hook)
 
