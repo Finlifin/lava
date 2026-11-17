@@ -141,19 +141,59 @@ pub fn safe_tabstop(options: EditorOptions) -> i64 {
 }
 
 pub fn codepoint_display_width(cp: i64) -> i64 {
+    if cp < 0x20 or cp == 0x7F {
+        return 0
+    }
     if cp < 0x0300 {
         return 1
     }
     if (cp >= 0x0300 and cp <= 0x036F)
+        or (cp >= 0x1160 and cp <= 0x11FF)
+        or (cp >= 0x1AB0 and cp <= 0x1AFF)
+        or (cp >= 0x1DC0 and cp <= 0x1DFF)
         or (cp >= 0x200B and cp <= 0x200D)
-        or (cp >= 0xFE00 and cp <= 0xFE0F) {
+        or (cp >= 0x20D0 and cp <= 0x20FF)
+        or (cp >= 0xFE00 and cp <= 0xFE0F)
+        or (cp >= 0xFE20 and cp <= 0xFE2F)
+        or (cp >= 0x1F3FB and cp <= 0x1F3FF) {
         return 0
     }
     if cp < 0x1100 {
         return 1
     }
     if (cp >= 0x1100 and cp <= 0x115F)
+        or (cp >= 0x231A and cp <= 0x231B)
         or (cp >= 0x2329 and cp <= 0x232A)
+        or (cp >= 0x23E9 and cp <= 0x23F3)
+        or (cp >= 0x25FD and cp <= 0x25FE)
+        or (cp >= 0x2614 and cp <= 0x2615)
+        or (cp >= 0x2648 and cp <= 0x2653)
+        or cp == 0x267F
+        or cp == 0x2693
+        or cp == 0x26A1
+        or (cp >= 0x26AA and cp <= 0x26AB)
+        or (cp >= 0x26BD and cp <= 0x26BE)
+        or (cp >= 0x26C4 and cp <= 0x26C5)
+        or cp == 0x26CE
+        or cp == 0x26D4
+        or cp == 0x26EA
+        or (cp >= 0x26F2 and cp <= 0x26F3)
+        or cp == 0x26F5
+        or cp == 0x26FA
+        or cp == 0x26FD
+        or cp == 0x2705
+        or (cp >= 0x270A and cp <= 0x270B)
+        or cp == 0x2728
+        or cp == 0x274C
+        or cp == 0x274E
+        or (cp >= 0x2753 and cp <= 0x2755)
+        or cp == 0x2757
+        or (cp >= 0x2795 and cp <= 0x2797)
+        or cp == 0x27B0
+        or cp == 0x27BF
+        or (cp >= 0x2B1B and cp <= 0x2B1C)
+        or cp == 0x2B50
+        or cp == 0x2B55
         or (cp >= 0x2E80 and cp <= 0x303E)
         or (cp >= 0x3040 and cp <= 0x33FF)
         or (cp >= 0x3400 and cp <= 0x4DBF)
@@ -165,6 +205,7 @@ pub fn codepoint_display_width(cp: i64) -> i64 {
         or (cp >= 0xFE30 and cp <= 0xFE6F)
         or (cp >= 0xFF01 and cp <= 0xFF60)
         or (cp >= 0xFFE0 and cp <= 0xFFE6)
+        or (cp >= 0x1F1E6 and cp <= 0x1F251)
         or (cp >= 0x1F300 and cp <= 0x1FAFF)
         or (cp >= 0x20000 and cp <= 0x3FFFD) {
         return 2
@@ -323,6 +364,91 @@ pub fn visual_col_to_char_col(line: String, target_vcol: i64, tabstop: i64) -> i
     cidx
 }
 
+pub fn is_markdown_mode_name(mode: String) -> bool {
+    let m = mode.to_lower()
+    m == "markdown" or m == "md" or m == "gfm"
+}
+
+fn md_strip_blockquote_and_indent(line: String) -> (String, i64) {
+    let blen = line.len()
+    var pos: i64 = 0
+    var leading_sp: i64 = 0
+    while pos < blen and leading_sp < 4 and line.byte_at(pos) == 32 {
+        pos += 1
+        leading_sp += 1
+    }
+    var saw_quote = false
+    while pos < blen and line.byte_at(pos) == 62 {
+        saw_quote = true
+        pos += 1
+        while pos < blen and (line.byte_at(pos) == 32 or line.byte_at(pos) == 9) {
+            pos += 1
+        }
+    }
+    if saw_quote {
+        return (line.drop(pos), 0)
+    }
+    (line, leading_sp)
+}
+
+pub fn md_try_fence_open(line: String) -> ?(i64, i64) {
+    let (s, _) = md_strip_blockquote_and_indent(line)
+    let blen = s.len()
+    var sp: i64 = 0
+    while sp < blen and sp < 12 and (s.byte_at(sp) == 32 or s.byte_at(sp) == 9) {
+        sp += 1
+    }
+    if sp + 3 > blen {
+        return null
+    }
+    let fc = s.byte_at(sp)
+    if fc != 96 and fc != 126 {
+        return null
+    }
+    var flen: i64 = 0
+    while sp + flen < blen and s.byte_at(sp + flen) == fc {
+        flen += 1
+    }
+    if flen < 3 {
+        return null
+    }
+    if fc == 96 {
+        var k = sp + flen
+        while k < blen {
+            if s.byte_at(k) == 96 {
+                return null
+            }
+            k += 1
+        }
+    }
+    (fc, flen)
+}
+
+pub fn md_is_fence_close(line: String, fence_byte: i64, min_len: i64) -> bool {
+    let (s, _) = md_strip_blockquote_and_indent(line)
+    let blen = s.len()
+    var sp: i64 = 0
+    while sp < blen and sp < 12 and (s.byte_at(sp) == 32 or s.byte_at(sp) == 9) {
+        sp += 1
+    }
+    var flen: i64 = 0
+    while sp + flen < blen and s.byte_at(sp + flen) == fence_byte {
+        flen += 1
+    }
+    if flen < min_len {
+        return false
+    }
+    var k = sp + flen
+    while k < blen {
+        let b = s.byte_at(k)
+        if b != 32 and b != 9 {
+            return false
+        }
+        k += 1
+    }
+    true
+}
+
 -- Compute heading level for Org (`* ...`) or Markdown (`# ...`) folding. Returns 0 if not a heading.
 pub fn heading_fold_level(line: String, major_mode: String) -> i64 {
     if major_mode == "org" {
@@ -336,14 +462,27 @@ pub fn heading_fold_level(line: String, major_mode: String) -> i64 {
         }
         return 0
     }
-    if major_mode == "markdown" {
-        let n = line.char_len()
+    if is_markdown_mode_name(major_mode) {
+        let blen = line.len()
+        var sp: i64 = 0
+        while sp < blen and sp < 4 and line.byte_at(sp) == 32 {
+            sp += 1
+        }
+        if sp >= 4 or sp >= blen {
+            return 0
+        }
         var hashes: i64 = 0
-        while hashes < n and line.slice(hashes, hashes + 1) == "#" {
+        while sp + hashes < blen and line.byte_at(sp + hashes) == 35 {
             hashes += 1
         }
-        if hashes > 0 and hashes < n and line.slice(hashes, hashes + 1) == " " {
-            return hashes
+        if hashes >= 1 and hashes <= 6 {
+            if sp + hashes == blen {
+                return hashes
+            }
+            let next_b = line.byte_at(sp + hashes)
+            if next_b == 32 or next_b == 9 {
+                return hashes
+            }
         }
         return 0
     }
@@ -351,7 +490,7 @@ pub fn heading_fold_level(line: String, major_mode: String) -> i64 {
 }
 
 -- Collect up to `max_rows` visible buffer row numbers starting from `start_row`,
--- honoring buffer narrowing (`min_row`..`max_row`) and folded Org/Markdown subtrees.
+-- honoring buffer narrowing (`min_row`..`max_row`), YAML frontmatter, fenced code blocks, and folded subtrees.
 pub fn visible_buffer_rows(buf: Buffer, start_row: i64, max_rows: i64) -> List {
     let out = List()
     if max_rows <= 0 {
@@ -366,6 +505,15 @@ pub fn visible_buffer_rows(buf: Buffer, start_row: i64, max_rows: i64) -> List {
     } else {
         start_row
     }
+    let is_md = is_markdown_mode_name(buf.major_mode)
+    let has_folds = not buf.folded_rows.is_empty()
+    if not has_folds {
+        while r <= hi and out.len() < max_rows {
+            out.push(r)
+            r += 1
+        }
+        return out
+    }
     while r <= hi and out.len() < max_rows {
         if buf.folded_rows.contains(r) {
             let lvl = heading_fold_level(buf.line_at(r), buf.major_mode)
@@ -373,8 +521,31 @@ pub fn visible_buffer_rows(buf: Buffer, start_row: i64, max_rows: i64) -> List {
             if lvl > 0 and (not body_row_marked) {
                 out.push(r)
                 var next_r = r + 1
+                var in_fence = false
+                var f_byte: i64 = 0
+                var f_len: i64 = 0
                 while next_r <= hi {
-                    let next_lvl = heading_fold_level(buf.line_at(next_r), buf.major_mode)
+                    let nline = buf.line_at(next_r)
+                    if is_md {
+                        if not in_fence {
+                            let f_opt = md_try_fence_open(nline)
+                            if f_opt != null {
+                                let (fb, fl) = f_opt.as((i64, i64))
+                                in_fence = true
+                                f_byte = fb
+                                f_len = fl
+                                next_r += 1
+                                continue
+                            }
+                        } else {
+                            if md_is_fence_close(nline, f_byte, f_len) {
+                                in_fence = false
+                            }
+                            next_r += 1
+                            continue
+                        }
+                    }
+                    let next_lvl = heading_fold_level(nline, buf.major_mode)
                     if next_lvl > 0 and next_lvl <= lvl {
                         break
                     }
@@ -391,6 +562,60 @@ pub fn visible_buffer_rows(buf: Buffer, start_row: i64, max_rows: i64) -> List {
         r += 1
     }
     out
+}
+
+fn is_hidden_fold_body_row(buf: Buffer, r: i64) -> bool {
+    if not buf.folded_rows.contains(r) {
+        return false
+    }
+    let lvl = heading_fold_level(buf.line_at(r), buf.major_mode)
+    let hi = buf.max_row()
+    let body_row_marked = r + 1 <= hi and buf.folded_rows.contains(r + 1)
+    return not (lvl > 0 and (not body_row_marked))
+}
+
+pub fn step_visible_row_backward(buf: Buffer, from_row: i64, steps: i64) -> i64 {
+    let lo = buf.min_row()
+    let hi = buf.max_row()
+    var cur = if from_row < lo { lo } else if from_row > hi { hi } else { from_row }
+    if buf.folded_rows.is_empty() {
+        let raw = cur - steps
+        return if raw < lo { lo } else if raw > hi { hi } else { raw }
+    }
+    while cur > lo and is_hidden_fold_body_row(buf, cur) {
+        cur -= 1
+    }
+    var rem = steps
+    while rem > 0 and cur > lo {
+        var prev = cur - 1
+        while prev > lo and is_hidden_fold_body_row(buf, prev) {
+            prev -= 1
+        }
+        cur = prev
+        rem -= 1
+    }
+    cur
+}
+
+pub fn step_visible_row_forward(buf: Buffer, from_row: i64, steps: i64) -> i64 {
+    let lo = buf.min_row()
+    let hi = buf.max_row()
+    var cur = if from_row < lo { lo } else if from_row > hi { hi } else { from_row }
+    if buf.folded_rows.is_empty() {
+        let raw = cur + steps
+        return if raw < lo { lo } else if raw > hi { hi } else { raw }
+    }
+    if steps <= 0 {
+        while cur > lo and is_hidden_fold_body_row(buf, cur) {
+            cur -= 1
+        }
+        return cur
+    }
+    let vis = visible_buffer_rows(buf, cur, steps + 1)
+    if vis.is_empty() {
+        return cur
+    }
+    vis.get((vis.len() - 1).as(usize)).as(i64)
 }
 
 -- ============================================================================
@@ -741,9 +966,9 @@ impl WindowManager {
             raw_so
         }
 
-        if pane.cursor.row < pane.top_row + so {
-            let target_top = pane.cursor.row - so
-            pane.top_row = if target_top < lo { lo } else { target_top }
+        let min_top_for_so = step_visible_row_backward(buf, pane.cursor.row, so)
+        if pane.cursor.row < pane.top_row or (so > 0 and pane.top_row > min_top_for_so) {
+            pane.top_row = min_top_for_so
         } else {
             let vis = visible_buffer_rows(buf, pane.top_row, rows)
             var found_idx: i64 = -1
@@ -754,14 +979,7 @@ impl WindowManager {
                 }
             }
             if found_idx < 0 or (so > 0 and found_idx > rows - 1 - so) {
-                let candidate = pane.cursor.row - (rows - 1 - so)
-                pane.top_row = if candidate < lo {
-                    lo
-                } else if candidate > hi {
-                    hi
-                } else {
-                    candidate
-                }
+                pane.top_row = step_visible_row_backward(buf, pane.cursor.row, rows - 1 - so)
             }
         }
 
@@ -876,21 +1094,24 @@ impl WindowManager {
         self.sync_from_world(world)
     }
 
+    pub fn pane_at_pixel(self, x: f64, y: f64) -> ?WindowPane {
+        let vis = self.visible_panes()
+        for i in 0..vis.len() {
+            let p = vis.get(i.as(usize)).as(WindowPane)
+            let r = p.rect
+            if x >= r.x and x <= r.x + r.w and y >= r.y and y <= r.y + r.h {
+                return p
+            }
+        }
+        null
+    }
+
     pub fn scroll_cursor_center(self, world: EditorWorld) {
         self.sync_from_world(world)
         let ap = self.active_pane()
         let buf = world.active_buffer()
         let rows = self.pane_rows(ap)
-        let lo = buf.min_row()
-        let hi = buf.max_row()
-        let target = ap.cursor.row - (rows / 2)
-        ap.top_row = if target < lo {
-            lo
-        } else if target > hi {
-            hi
-        } else {
-            target
-        }
+        ap.top_row = step_visible_row_backward(buf, ap.cursor.row, rows / 2)
         ap.explicit_scroll = true
         ap.prev_cursor = ap.cursor
         world.viewport_top_row = ap.top_row
@@ -919,16 +1140,7 @@ impl WindowManager {
         let ap = self.active_pane()
         let buf = world.active_buffer()
         let rows = self.pane_rows(ap)
-        let lo = buf.min_row()
-        let hi = buf.max_row()
-        let target = ap.cursor.row - (rows - 1)
-        ap.top_row = if target < lo {
-            lo
-        } else if target > hi {
-            hi
-        } else {
-            target
-        }
+        ap.top_row = step_visible_row_backward(buf, ap.cursor.row, rows - 1)
         ap.explicit_scroll = true
         ap.prev_cursor = ap.cursor
         world.viewport_top_row = ap.top_row

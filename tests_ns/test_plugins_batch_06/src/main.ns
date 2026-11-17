@@ -370,6 +370,89 @@ fn test_batch_06_plugins() {
     app_feed_keys(kernel, "<Escape>:CmpToggle<Return>")# ! { e => panic(e) }
     check_true(cmp_svc.enabled, ":CmpToggle re-enabled cmp")
 
+    -- B6: `<M-n>`/`<M-p>` navigation (Buffer + Minibuffer), Doc Popup, Auto-Parens, Signature Help & Shadow Ghost Text
+    let fn_buf = world.create_buffer(
+        "cmp_fn_ux.ns",
+        BufferKind.File,
+        file_path = path.join(cmp_dir, "cmp_fn_ux.ns"),
+        major_mode = "nessa",
+        initial_lines = [
+            "-- Blends two integer metrics with an optional weight.",
+            "pub fn compute_blend(lhs: i64, rhs: i64, .weight: f64 = 0.5) -> i64 {{",
+            "    lhs + rhs",
+            "}}",
+            "",
+            "-- Returns zero-argument health ping.",
+            "pub fn compute_zero() -> i64 = 1",
+            "",
+        ],
+    )
+    let _ = world.switch_to_buffer(fn_buf.id)
+    kernel.emit_hook("buffer-switched", fn_buf.id)
+
+    -- 1-char prefix inline shadow ghost preview (`c` -> `ompute_...`) before popup opens
+    app_feed_keys(kernel, "G0ic")# ! { e => panic(e) }
+    check_true(not world.completion_popup.active, "1-char prefix does not open full popup yet")
+    check_true(world.inline_ghost.active, "1-char prefix activates inline shadow ghost text")
+    check_true(world.inline_ghost.text.starts_with("ompute_"), "ghost text previews function suffix")
+
+    -- Typing `ompute_` opens popup + doc window + live shadow ghost text; `<M-n>`/`<M-p>` cycles & updates doc!
+    app_feed_keys(kernel, "ompute_")# ! { e => panic(e) }
+    check_true(world.completion_popup.active, "popup opened on 'compute_'")
+    check_true(not world.completion_popup.doc_lines.is_empty(), "selected candidate populates doc_lines")
+    check_true(world.inline_ghost.active, "inline shadow ghost active alongside popup")
+
+    let idx_before_alt = world.completion_popup.selected_idx
+    app_feed_keys(kernel, "<M-n>")# ! { e => panic(e) }
+    check_true(world.completion_popup.selected_idx != idx_before_alt, "<M-n> moved buffer completion selection")
+    check_true(not world.completion_popup.doc_lines.is_empty(), "doc_lines updated on <M-n>")
+    app_feed_keys(kernel, "<M-p>")# ! { e => panic(e) }
+    check_eq_i64(world.completion_popup.selected_idx, idx_before_alt, "<M-p> moved buffer completion selection back")
+
+    -- Render frame with active completion + doc popup + shadow ghost text
+    let gen_doc = app_commit_frame(kernel) ! { e => panic(e) }
+    check_true(gen_doc > gen_cmp, "frame committed with doc window + shadow ghost text")
+
+    -- Auto-parens for multi-arg function `compute_blend`: inserts `compute_blend()`, places cursor inside `(|)`, and opens Signature Help!
+    let blend_idx = popup_find_item_idx(world, "compute_blend", "Function")
+    check_true(blend_idx >= 0, "compute_blend classified as Function with full signature detail")
+    while world.completion_popup.selected_idx != blend_idx {
+        app_feed_keys(kernel, "<M-n>")# ! { e => panic(e) }
+    }
+    app_feed_keys(kernel, "<Tab>")# ! { e => panic(e) }
+    check_eq_str(fn_buf.line_at(7), "compute_blend()", "auto-inserted () on completing compute_blend")
+    check_eq_i64(fn_buf.point.col, 14, "cursor placed inside compute_blend(|) for multi-arg function")
+    check_true(world.signature_help.active, "Signature Help auto-opened inside compute_blend(|)")
+    check_eq_i64(world.signature_help.active_param, 0, "Signature Help highlights param 0 (lhs)")
+
+    -- Typing `10, ` advances Signature Help `active_param` to 1 (`rhs`), and `weight = ` highlights param 2 (`.weight`)!
+    app_feed_keys(kernel, "10, ")# ! { e => panic(e) }
+    check_true(world.signature_help.active, "Signature Help stays active after first comma")
+    check_eq_i64(world.signature_help.active_param, 1, "Signature Help advanced to param 1 (rhs)")
+    let gen_sig = app_commit_frame(kernel) ! { e => panic(e) }
+    check_true(gen_sig > gen_doc, "frame committed with active Signature Help popup")
+
+    app_feed_keys(kernel, "20, weight = ")# ! { e => panic(e) }
+    check_eq_i64(world.signature_help.active_param, 2, "Signature Help matched named param .weight (idx 2)")
+    app_feed_keys(kernel, "0.8<Right><Escape>")# ! { e => panic(e) }
+    check_true(not world.signature_help.active, "leaving Insert mode dismissed Signature Help")
+
+    -- Auto-parens for 0-arg function `compute_zero`: inserts `compute_zero()` and places cursor AFTER `)`!
+    app_feed_keys(kernel, "ocompute_ze")# ! { e => panic(e) }
+    check_true(world.completion_popup.active, "popup opened on 'compute_ze'")
+    app_feed_keys(kernel, "<Tab><Escape>")# ! { e => panic(e) }
+    check_eq_str(fn_buf.line_at(8), "compute_zero()", "auto-inserted () on 0-arg compute_zero")
+
+    -- Minibuffer `<M-n>` / `<M-p>` candidate navigation
+    app_feed_keys(kernel, ":set ")# ! { e => panic(e) }
+    check_true(world.minibuffer_view.active, "minibuffer opened for :set ")
+    check_eq_i64(world.minibuffer_view.selected_idx, 0, "minibuffer starts at idx 0")
+    app_feed_keys(kernel, "<M-n>")# ! { e => panic(e) }
+    check_eq_i64(world.minibuffer_view.selected_idx, 1, "<M-n> moved minibuffer candidate to 1")
+    app_feed_keys(kernel, "<M-p>")# ! { e => panic(e) }
+    check_eq_i64(world.minibuffer_view.selected_idx, 0, "<M-p> moved minibuffer candidate back to 0")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
     -- ========================================================================
     -- PART C: Plugin 18 — `ext_spectre`
     -- ========================================================================

@@ -1434,8 +1434,7 @@ fn cmd_diff_selection(kernel: SystemKernel, args: List) -> #InteractiveEffects !
         var clip_text = ""
         let reg_opt = world.registers.get_reg("\"")#
         if reg_opt != null {
-            let r? = reg_opt else { return () }
-            clip_text = r.text
+            clip_text = reg_opt.as(RegisterValue).text
         } else {
             clip_text = clipboard_get()#
         }
@@ -2427,7 +2426,7 @@ fn cmd_cycle_explorer_entry(kernel: SystemKernel, delta: i64) -> #InteractiveEff
 
 fn find_fallback_restore_buffer(world: EditorWorld, preferred: ?BufferId) -> BufferId {
     if preferred != null {
-        let pid? = preferred else { return world.scratch_id }
+        let pid = preferred.as(BufferId)
         let b_opt = world.buffer(pid)
         if b_opt != null and (not is_internal_diff_buffer_name(b_opt.as(Buffer).name)) {
             return pid

@@ -9,8 +9,8 @@ use @lava_sys.{CaretShape, DrawCmd, mock_enable, rgb, rgba}
 use @lava_core.{KeyBindingEntry, SystemKernel}
 use @ext_document.{
     ActiveBgJob, BufferKind, CompletionItem, EditorWorld, FloatingWindow, GutterSign,
-    InlineSpanDecor, MinibufferRichItem, Pos, ToastNotification, VirtualTextDecor,
-    register_document_extension, require_editor_world
+    InlineGhostText, InlineSpanDecor, MinibufferRichItem, Pos, SignatureHelpPopup,
+    ToastNotification, VirtualTextDecor, register_document_extension, require_editor_world
 }
 use @ext_window.{
     WindowManager, compute_gutter_width, register_window_extension, require_window_manager
@@ -695,12 +695,38 @@ fn test_global_no_bold_invariant_across_all_surfaces() {
     world.completion_popup.active = true
     world.completion_popup.replace_start_col = 0
     world.completion_popup.selected_idx = 0
+    world.completion_popup.doc_title = "compose_frame · fn"
+    world.completion_popup.doc_lines = [
+        "```nessa",
+        "pub fn compose_frame(kernel: SystemKernel, world: EditorWorld, wm: WindowManager) -> (WindowSpec, List)",
+        "```",
+        "Composes full 2D DrawCmd scene.",
+    ]
     world.completion_popup.items = [CompletionItem {
         label: "compose_frame",
         insert_text: "compose_frame",
         kind: "fn",
-        detail: "ext_render",
+        detail: "fn(kernel: SystemKernel, world: EditorWorld, wm: WindowManager) -> (WindowSpec, List)",
     }]
+    world.signature_help = SignatureHelpPopup {
+        active: true,
+        anchor_pos: Pos.zero(),
+        label: "fn compose_frame(kernel: SystemKernel, world: EditorWorld, wm: WindowManager) -> (WindowSpec, List)",
+        parameters: ["kernel: SystemKernel", "world: EditorWorld", "wm: WindowManager"],
+        active_param: 1,
+        doc_summary: "Composes full 2D DrawCmd scene.",
+        owner: "ext_cmp",
+    }
+    world.inline_ghost = InlineGhostText {
+        active: true,
+        row: world.active_buffer().point.row,
+        col: world.active_buffer().point.col,
+        text: "ame(kernel, world, wm)",
+        accept_text: "compose_frame()",
+        replace_start_col: 0,
+        cursor_inside_parens: true,
+        owner: "ext_cmp",
+    }
 
     let (_, cmds2) = compose_frame(kernel, world, wm)
     var runs2: i64 = 0
@@ -720,10 +746,150 @@ fn test_global_no_bold_invariant_across_all_surfaces() {
     println("[PASS] test_global_no_bold_invariant_across_all_surfaces")
 }
 
+fn test_markdown_bugfixes_frontmatter_escapes_tables_and_ghost() {
+    let (kernel, world, wm) = new_test_harness()
+    let theme = theme_by_name(world.options.theme_name)
+
+    let md_lines = [
+        "---",
+        "title: Lava Markdown",
+        "# yaml comment not h1",
+        "---",
+        "Calls foo__bar__baz and snake_case_id and _italic_ and ***both*** and ~~strike~~ and $a*b + x_1$",
+        "Escaped \\*not italic\\* and [`compose_frame`](https://en.wikipedia.org/wiki/Rust_(programming_language) \"Wiki\")",
+        "Prose pipe a | b and array arr[x] = 1",
+        "| Col | Val |",
+        "| :- | -: |",
+        "| \\|esc | *em | next* |",
+        "> [!WARNING] Watch out",
+        "Hello comp world",
+    ]
+    let md_buf = world.create_buffer(
+        "bugs.md",
+        BufferKind.File,
+        file_path = "/tmp/bugs.md",
+        major_mode = "gfm",
+        initial_lines = md_lines,
+    )
+    let _ = world.switch_to_buffer(md_buf.id)
+    kernel.emit_hook("buffer-switched", md_buf.id)
+
+    -- Place cursor mid-line on row 11 ("Hello comp world", col 10 right after "comp") with inline ghost
+    let pane = wm.active_pane()
+    pane.cursor = Pos.new(11, 10)
+    md_buf.point = pane.cursor
+    world.inline_ghost = InlineGhostText {
+        active: true,
+        row: 11,
+        col: 10,
+        text: "ose_frame",
+        accept_text: "compose_frame",
+        replace_start_col: 6,
+        cursor_inside_parens: false,
+        owner: "ext_cmp",
+    }
+
+    let (_, cmds) = compose_frame(kernel, world, wm)
+    let cell_h = wm.metrics.cell_height
+    let gutter_w = compute_gutter_width(md_buf, world.options, wm.metrics)
+    let text_x0 = pane.rect.x + gutter_w
+
+    let y_fm_cmt = pane.rect.y + 2.0 * cell_h
+    let y_em_line = pane.rect.y + 4.0 * cell_h
+    let y_esc_link = pane.rect.y + 5.0 * cell_h
+    let y_prose_pipe = pane.rect.y + 6.0 * cell_h
+    let y_tbl_sep = pane.rect.y + 8.0 * cell_h
+    let y_alert = pane.rect.y + 10.0 * cell_h
+    let y_ghost = pane.rect.y + 11.0 * cell_h
+
+    var fm_cmt_not_h1 = false
+    var init_stayed_plain = false
+    var saw_underscore_italic = false
+    var saw_bold_italic = false
+    var saw_code_link = false
+    var saw_paren_url_ul = false
+    var prose_pipe_highlighted = false
+    var prose_arr_x_checkbox = false
+    var saw_1dash_sep = false
+    var saw_warning_alert = false
+    var ghost_x: f64 = -1.0
+    var world_x: f64 = -1.0
+
+    for i in 0..cmds.len() {
+        let cmd = cmds.get(i.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.TextRun(tx, ty, txt, _, _, col, bold, italic, ul) => {
+                assert_true(not bold, "GFM scene TextRun must never be bold")
+                if tx >= text_x0 - 0.5 {
+                    if (ty - y_fm_cmt).abs() < 0.5 and txt.contains("yaml comment") and col == theme.syn_comment {
+                        fm_cmt_not_h1 = true
+                    }
+                    if (ty - y_em_line).abs() < 0.5 {
+                        if txt.contains("foo__bar__baz") and col == theme.fg {
+                            init_stayed_plain = true
+                        }
+                        if txt.contains("_italic_") and col == theme.syn_type and italic {
+                            saw_underscore_italic = true
+                        }
+                        if txt.contains("***both***") and col == theme.syn_number and italic {
+                            saw_bold_italic = true
+                        }
+                    }
+                    if (ty - y_esc_link).abs() < 0.5 {
+                        if txt == "`compose_frame`" and col == theme.syn_string {
+                            saw_code_link = true
+                        }
+                        if txt.contains("Rust_(programming_language)") and ul {
+                            saw_paren_url_ul = true
+                        }
+                    }
+                    if (ty - y_prose_pipe).abs() < 0.5 {
+                        if txt == "|" and col == theme.accent {
+                            prose_pipe_highlighted = true
+                        }
+                        if txt == "[x]" and col == theme.syn_string {
+                            prose_arr_x_checkbox = true
+                        }
+                    }
+                    if (ty - y_tbl_sep).abs() < 0.5 and txt == "|" and col == theme.accent {
+                        saw_1dash_sep = true
+                    }
+                    if (ty - y_alert).abs() < 0.5 and txt == "[!WARNING]" and col == theme.diag_warn {
+                        saw_warning_alert = true
+                    }
+                    if (ty - y_ghost).abs() < 0.5 {
+                        if txt == "ose_frame" {
+                            ghost_x = tx
+                        }
+                        if txt.contains("world") {
+                            world_x = tx
+                        }
+                    }
+                }
+            },
+            _ => (),
+        }
+    }
+
+    assert_true(fm_cmt_not_h1, "YAML frontmatter '# yaml comment' highlighted as YAML comment, not H1")
+    assert_true(init_stayed_plain, "intraword '__init__' NOT falsely bolded")
+    assert_true(saw_underscore_italic, "'_italic_' highlighted as italic")
+    assert_true(saw_bold_italic, "'***both***' highlighted as bold+italic")
+    assert_true(saw_code_link, "link label with inline code [`compose_frame`](...) highlighted")
+    assert_true(saw_paren_url_ul, "link URL with balanced parens and title underlined")
+    assert_true(not prose_pipe_highlighted, "single '|' in prose NOT treated as table pipe")
+    assert_true(not prose_arr_x_checkbox, "'arr[x]' in prose NOT treated as task checkbox")
+    assert_true(saw_1dash_sep, "1-dash '| :- | -: |' GFM table separator recognized")
+    assert_true(saw_warning_alert, "GitHub '[!WARNING]' alert badge highlighted")
+    assert_true(ghost_x > 0.0 and world_x > ghost_x, "inline ghost inserted at cursor BEFORE ' world' in Markdown")
+    println("[PASS] test_markdown_bugfixes_frontmatter_escapes_tables_and_ghost")
+}
+
 fn main() {
     test_display_width_and_column_mapping()
     test_cjk_inline_code_x_alignment_and_caret()
     test_markdown_fenced_blocks_and_rich_inline()
+    test_markdown_bugfixes_frontmatter_escapes_tables_and_ghost()
     test_continuous_indent_guides_and_active_scope()
     test_global_no_bold_invariant_across_all_surfaces()
     println("ALL RENDER MARKDOWN + CJK WIDTH + INDENT GUIDES + NO-BOLD TESTS PASSED!")

@@ -8,12 +8,12 @@ use std.fs
 use std.path
 use @lava_sys.{CaretShape}
 use @lava_accel.{
-    accel_doc_clone_from_lines, accel_doc_delete_lines, accel_doc_delete_span,
+    SymbolOutlineSpan, accel_doc_clone_from_lines, accel_doc_delete_lines, accel_doc_delete_span,
     accel_doc_extract_span, accel_doc_find_backward, accel_doc_find_forward,
     accel_doc_find_matching_bracket, accel_doc_free, accel_doc_insert_line,
     accel_doc_insert_lines, accel_doc_insert_text, accel_doc_line_at, accel_doc_line_char_len,
     accel_doc_line_count, accel_doc_new, accel_doc_open_file, accel_doc_remove_line,
-    accel_doc_save_file, accel_doc_set_line, accel_doc_slice_lines,
+    accel_doc_save_file, accel_doc_scan_symbol_spans, accel_doc_set_line, accel_doc_slice_lines,
     accel_doc_snapshot_matches, accel_doc_snapshot_restore, accel_doc_snapshot_take,
     accel_doc_to_text_capped
 }
@@ -1813,6 +1813,17 @@ impl Buffer {
         Pos.new(r, c)
     }
 
+    pub fn scan_symbol_blocks(self, .max_items: i64 = 1200) -> List {
+        self.sync_external_lines()
+        let spans = accel_doc_scan_symbol_spans(self.doc_id, self.major_mode, max_items)
+        let out = List()
+        for i in 0..spans.len() {
+            let sp = spans.get(i.as(usize)).as(SymbolOutlineSpan)
+            out.push((sp.name, sp.kind, sp.row, sp.end_row))
+        }
+        out
+    }
+
     pub fn find_matching_bracket(self, pos: Pos) -> ?Pos {
         self.find_matching_bracket_bounded(pos, 0)
     }
@@ -1853,6 +1864,11 @@ pub struct EditorOptions {
     pub cursor_blink: bool,
     pub evil_mode: bool,
     pub show_tab_bar: bool,
+    pub remember_window_size: bool,
+    pub shadow_text: bool,
+    pub smooth_scroll: bool,
+    pub cursor_anim: bool,
+    pub treesitter: bool,
 }
 
 impl EditorOptions {
@@ -1883,11 +1899,16 @@ impl EditorOptions {
             twilight_mode: false,
             format_on_save: false,
             theme_name: "catppuccin-mocha",
-            font_family: "Monospace",
+            font_family: "Fira Code",
             font_size_pt: 13.0,
             cursor_blink: true,
             evil_mode: true,
             show_tab_bar: false,
+            remember_window_size: true,
+            shadow_text: true,
+            smooth_scroll: true,
+            cursor_anim: true,
+            treesitter: true,
         }
     }
 }
@@ -1951,6 +1972,8 @@ pub struct CompletionPopup {
     pub items: List,
     pub selected_idx: i64,
     pub owner: String,
+    pub doc_title: String,
+    pub doc_lines: List,
 }
 
 impl CompletionPopup {
@@ -1962,6 +1985,58 @@ impl CompletionPopup {
             prefix: "",
             items: List(),
             selected_idx: 0,
+            owner: "",
+            doc_title: "",
+            doc_lines: List(),
+        }
+    }
+}
+
+pub struct SignatureHelpPopup {
+    pub active: bool,
+    pub anchor_pos: Pos,
+    pub label: String,
+    pub parameters: List,
+    pub active_param: i64,
+    pub doc_summary: String,
+    pub owner: String,
+}
+
+impl SignatureHelpPopup {
+    pub fn inactive() -> SignatureHelpPopup {
+        SignatureHelpPopup {
+            active: false,
+            anchor_pos: Pos.zero(),
+            label: "",
+            parameters: List(),
+            active_param: 0,
+            doc_summary: "",
+            owner: "",
+        }
+    }
+}
+
+pub struct InlineGhostText {
+    pub active: bool,
+    pub row: i64,
+    pub col: i64,
+    pub text: String,
+    pub accept_text: String,
+    pub replace_start_col: i64,
+    pub cursor_inside_parens: bool,
+    pub owner: String,
+}
+
+impl InlineGhostText {
+    pub fn inactive() -> InlineGhostText {
+        InlineGhostText {
+            active: false,
+            row: 0,
+            col: 0,
+            text: "",
+            accept_text: "",
+            replace_start_col: 0,
+            cursor_inside_parens: false,
             owner: "",
         }
     }
@@ -2069,6 +2144,8 @@ pub struct EditorWorld {
     pub notification_history: List,
     pub next_notification_id: i64,
     pub completion_popup: CompletionPopup,
+    pub signature_help: SignatureHelpPopup,
+    pub inline_ghost: InlineGhostText,
     pub statusline_left_extra: String,
     pub statusline_right_extra: String,
     pub winbar_text: String,
@@ -2154,6 +2231,8 @@ impl EditorWorld {
             notification_history: List(),
             next_notification_id: 1,
             completion_popup: CompletionPopup.inactive(),
+            signature_help: SignatureHelpPopup.inactive(),
+            inline_ghost: InlineGhostText.inactive(),
             statusline_left_extra: "",
             statusline_right_extra: "",
             winbar_text: "",
@@ -2668,6 +2747,12 @@ impl EditorWorld {
         }
         if self.completion_popup.owner == owner {
             self.completion_popup = CompletionPopup.inactive()
+        }
+        if self.signature_help.owner == owner {
+            self.signature_help = SignatureHelpPopup.inactive()
+        }
+        if self.inline_ghost.owner == owner {
+            self.inline_ghost = InlineGhostText.inactive()
         }
         let next_floats = List()
         for i in 0..self.floating_windows.len() {

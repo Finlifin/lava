@@ -12,8 +12,8 @@ use @lava_core.{
 }
 use @lava_accel.{FuzzyHit, accel_doc_collect_words, accel_fuzzy_rank}
 use @ext_document.{
-    Buffer, BufferId, CompletionItem, CompletionPopup, EditorWorld, Pos, Span, ext_document_id,
-    require_editor_world
+    Buffer, BufferId, CompletionItem, CompletionPopup, EditorWorld, InlineGhostText, Pos,
+    SignatureHelpPopup, Span, ext_document_id, require_editor_world
 }
 use @ext_vim.{
     SERVICE_VIM, VimMode, VimState, ext_vim_id, require_vim_state
@@ -32,13 +32,52 @@ pub struct CmpCustomSource {
     pub provider: fn(Buffer, String) -> List,
 }
 
+pub struct CmpDocProvider {
+    pub name: String,
+    pub provider: fn(EditorWorld, Buffer, CompletionItem) -> ?(String, List),
+}
+
+pub struct CmpSigProvider {
+    pub name: String,
+    pub provider: fn(EditorWorld, Buffer, String, i64, i64, i64, String, bool) -> ?(String, List, i64, String),
+}
+
 pub struct CmpService {
     pub enabled: bool,
     pub min_chars: i64,
     pub max_items: i64,
     pub custom_sources: List,
+    pub doc_providers: List,
+    pub sig_providers: List,
+    pub doc_cache: HashMap,
     pub suppress_next_hook: bool,
 }
+
+struct CallSiteContext {
+    callee: String,
+    open_row: i64,
+    open_col: i64,
+    active_param: i64,
+    named_arg: String,
+    is_method_call: bool,
+}
+
+struct BufSymMeta {
+    name: String,
+    kind: String,
+    sig: String,
+    doc: String,
+    row: i64,
+}
+
+struct CachedBufSymIndex {
+    doc_id: i64,
+    edit_version: i64,
+    by_name: HashMap,
+    ordered: List,
+}
+
+private global _cmp_buf_sym_cache: ?HashMap = null
 
 struct PrefixContext {
     kind: String,
@@ -325,6 +364,875 @@ fn scan_buffer_words(
     }
 }
 
+fn ensure_cmp_sym_cache() -> HashMap {
+    let existing? = _cmp_buf_sym_cache else {
+        let m = HashMap.new()
+        _cmp_buf_sym_cache = m
+        return m
+    }
+    existing
+}
+
+pub fn clean_decl_header_at(buf: Buffer, row: i64) -> String {
+    let total = buf.line_count()
+    if row < 0 or row >= total {
+        return ""
+    }
+    let first = buf.line_at(row).trim()
+    if first == "" {
+        return ""
+    }
+    var joined = first
+    if first.contains("(") and (not first.contains(")")) {
+        let limit_r = if row + 10 < total { row + 10 } else { total - 1 }
+        var r = row + 1
+        while r <= limit_r {
+            let part = buf.line_at(r).trim()
+            if part != "" and (not part.starts_with("--")) and (not part.starts_with("//")) and (not part.starts_with("#")) {
+                joined = joined ++ " " ++ part
+            }
+            if part.contains(")") {
+                break
+            }
+            r += 1
+        }
+    }
+    -- Strip trailing block `{` or single-expr `= ...` after closing `)` or type
+    var cleaned = joined
+    if cleaned.ends_with("{{") {
+        cleaned = cleaned.slice(0, cleaned.char_len() - 1).trim_end()
+    }
+    let close_hits = cleaned.find_indices(")")
+    if not close_hits.is_empty() {
+        let last_close = close_hits.get((close_hits.len() - 1).as(usize)).as(i64)
+        let tail = cleaned.slice(last_close + 1, cleaned.char_len())
+        let brace_hits = tail.find_indices("{{")
+        if not brace_hits.is_empty() {
+            let b0 = brace_hits.get(0).as(i64)
+            cleaned = cleaned.slice(0, last_close + 1 + b0).trim_end()
+        } else {
+            let eq_hits = tail.find_indices(" = ")
+            if not eq_hits.is_empty() {
+                let e0 = eq_hits.get(0).as(i64)
+                cleaned = cleaned.slice(0, last_close + 1 + e0).trim_end()
+            }
+        }
+    }
+    while cleaned.ends_with(":") {
+        cleaned = cleaned.slice(0, cleaned.char_len() - 1).trim_end()
+    }
+    if cleaned.starts_with("pub ") {
+        cleaned = cleaned.drop(4).trim_start()
+    } else if cleaned.starts_with("private ") {
+        cleaned = cleaned.drop(8).trim_start()
+    } else if cleaned.starts_with("pub(crate) ") {
+        cleaned = cleaned.drop(11).trim_start()
+    }
+    cleaned.replace(", )", ")")
+}
+
+fn extract_doc_comments_above_row(buf: Buffer, row: i64) -> String {
+    let collected = List()
+    var r = row - 1
+    while r >= 0 and row - r <= 12 {
+        let trimmed = buf.line_at(r).trim()
+        if trimmed.starts_with("///") {
+            collected.push(trimmed.drop(3).trim())
+        } else if trimmed.starts_with("//!") {
+            collected.push(trimmed.drop(3).trim())
+        } else if trimmed.starts_with("//") {
+            collected.push(trimmed.drop(2).trim())
+        } else if trimmed.starts_with("--") {
+            collected.push(trimmed.drop(2).trim())
+        } else if trimmed.starts_with("#") and (not trimmed.starts_with("#[")) and (not trimmed.starts_with("#!")) {
+            collected.push(trimmed.drop(1).trim())
+        } else if trimmed.starts_with("#[") or trimmed.starts_with("@") {
+            ()
+        } else {
+            break
+        }
+        r -= 1
+    }
+    if collected.is_empty() {
+        return ""
+    }
+    let rev = List()
+    var i = collected.len() - 1
+    while i >= 0 {
+        rev.push(collected.get(i.as(usize)).as(String))
+        i -= 1
+    }
+    rev.join("\n")
+}
+
+fn normalize_sym_kind(raw_kind: String, sig: String) -> String {
+    let low = raw_kind.to_lower()
+    if low == "fn" or low == "def" or low == "func" or low == "function" {
+        if sig.contains("(self") or sig.contains("(&self") or sig.contains("(&mut self") {
+            return "Method"
+        }
+        return "Function"
+    }
+    if low == "method" {
+        return "Method"
+    }
+    if low == "struct" or low == "newtype" {
+        return "Struct"
+    }
+    if low == "enum" {
+        return "Enum"
+    }
+    if low == "trait" or low == "interface" {
+        return "Interface"
+    }
+    if low == "class" {
+        return "Class"
+    }
+    if low == "const" or low == "constant" {
+        return "Constant"
+    }
+    if low == "mod" or low == "module" {
+        return "Module"
+    }
+    if raw_kind != "" {
+        return raw_kind
+    }
+    "Symbol"
+}
+
+fn get_cached_buf_sym_index(buf: Buffer) -> CachedBufSymIndex {
+    let cache = ensure_cmp_sym_cache()
+    let prev_opt = cache.get(buf.id)
+    if prev_opt != null {
+        let prev = prev_opt.as(CachedBufSymIndex)
+        if prev.doc_id == buf.doc_id and prev.edit_version == buf.edit_version {
+            return prev
+        }
+    }
+    let by_name = HashMap.new()
+    let ordered = List()
+    let blocks = buf.scan_symbol_blocks(max_items = 600)
+    for i in 0..blocks.len() {
+        let (sname, skind, srow, _erow) = blocks.get(i.as(usize)).as((String, String, i64, i64))
+        if sname != "" and skind.to_lower() != "impl" and (not by_name.contains_key(sname)) {
+            let sig = clean_decl_header_at(buf, srow)
+            let norm_k = normalize_sym_kind(skind, sig)
+            let doc = extract_doc_comments_above_row(buf, srow)
+            let meta = BufSymMeta {
+                name: sname,
+                kind: norm_k,
+                sig: sig,
+                doc: doc,
+                row: srow,
+            }
+            by_name.insert(sname, meta)
+            ordered.push(meta)
+        }
+    }
+    if cache.len() > 48 {
+        cache.clear()
+    }
+    let idx = CachedBufSymIndex {
+        doc_id: buf.doc_id,
+        edit_version: buf.edit_version,
+        by_name: by_name,
+        ordered: ordered,
+    }
+    cache.insert(buf.id, idx)
+    idx
+}
+
+pub fn split_signature_params(sig: String) -> List {
+    let out = List()
+    let n = sig.char_len()
+    if n == 0 {
+        return out
+    }
+    var i: i64 = 0
+    var angle_depth: i64 = 0
+    var open_idx: i64 = -1
+    -- Skip Go receiver `func (r *Recv) Name(...)` if present
+    let trimmed = sig.trim_start()
+    var start_scan: i64 = 0
+    if trimmed.starts_with("func (") {
+        let close_opt = sig.find_indices(")")
+        if not close_opt.is_empty() {
+            start_scan = close_opt.get(0).as(i64) + 1
+        }
+    }
+    i = start_scan
+    while i < n {
+        let ch = sig.slice(i, i + 1)
+        if ch == "<" {
+            angle_depth += 1
+        } else if ch == ">" and angle_depth > 0 {
+            angle_depth -= 1
+        } else if ch == "(" and angle_depth == 0 {
+            open_idx = i
+            break
+        }
+        i += 1
+    }
+    if open_idx < 0 {
+        return out
+    }
+    var depth: i64 = 1
+    var seg_start = open_idx + 1
+    var k = open_idx + 1
+    var in_quote = ""
+    while k < n and depth > 0 {
+        let ch = sig.slice(k, k + 1)
+        if in_quote != "" {
+            if ch == "\\" and k + 1 < n {
+                k += 2
+                continue
+            }
+            if ch == in_quote {
+                in_quote = ""
+            }
+            k += 1
+            continue
+        }
+        if ch == "\"" or ch == "'" {
+            in_quote = ch
+            k += 1
+            continue
+        }
+        if ch == "(" or ch == "[" or ch == "{{" or ch == "<" {
+            depth += 1
+        } else if ch == ")" {
+            depth -= 1
+            if depth == 0 {
+                let last_p = sig.slice(seg_start, k).trim()
+                if last_p != "" {
+                    out.push(last_p)
+                }
+                break
+            }
+        } else if (ch == "]" or ch == "}}" or ch == ">") and depth > 1 {
+            depth -= 1
+        } else if ch == "," and depth == 1 {
+            let p_str = sig.slice(seg_start, k).trim()
+            if p_str != "" {
+                out.push(p_str)
+            }
+            seg_start = k + 1
+        }
+        k += 1
+    }
+    out
+}
+
+fn is_receiver_self_param(param: String) -> bool {
+    let t = param.trim()
+    t == "self"
+        or t == "&self"
+        or t == "&mut self"
+        or t == "mut self"
+        or t == "cls"
+        or t.starts_with("self:")
+        or t.starts_with("mut self:")
+}
+
+fn extract_param_short_name(param: String) -> String {
+    var t = param.trim()
+    if t.starts_with(".") {
+        t = t.drop(1).trim_start()
+    }
+    if t.starts_with("mut ") {
+        t = t.drop(4).trim_start()
+    }
+    let colon_sp = t.split_once(":")
+    if colon_sp != null {
+        let (lhs, _) = colon_sp.as((String, String))
+        return lhs.trim()
+    }
+    let eq_sp = t.split_once("=")
+    if eq_sp != null {
+        let (lhs, _) = eq_sp.as((String, String))
+        t = lhs.trim()
+    }
+    -- C/Go style `int count` or `count string`
+    let parts = t.split(" ")
+    if not parts.is_empty() {
+        return parts.get((parts.len() - 1).as(usize)).as(String).trim()
+    }
+    t
+}
+
+pub fn is_callable_kind(kind: String) -> bool {
+    kind == "Function" or kind == "Method" or kind == "Constructor" or kind == "fn"
+}
+
+fn lookup_sym_meta_across_open_buffers(world: EditorWorld, buf: Buffer, ident: String) -> ?(BufSymMeta, String) {
+    let cur_idx = get_cached_buf_sym_index(buf)
+    let cur_hit = cur_idx.by_name.get(ident)
+    if cur_hit != null {
+        return (cur_hit.as(BufSymMeta), buf.name)
+    }
+    var scanned: i64 = 0
+    var bi = world.buffer_order.len() - 1
+    while bi >= 0 and scanned < 6 {
+        let bid = world.buffer_order.get(bi.as(usize)).as(BufferId)
+        bi -= 1
+        if bid == buf.id or bid == world.messages_id {
+            continue
+        }
+        let other = world.buffers.get(bid).as(Buffer)
+        if other.name.starts_with("*") and other.id != world.scratch_id {
+            continue
+        }
+        let o_idx = get_cached_buf_sym_index(other)
+        let o_hit = o_idx.by_name.get(ident)
+        if o_hit != null {
+            return (o_hit.as(BufSymMeta), other.name)
+        }
+        scanned += 1
+    }
+    null
+}
+
+fn format_snippet_preview(body: String) -> List {
+    -- Replace `${1:placeholder}` -> `placeholder`, `$1` / `$0` -> ``
+    let n = body.char_len()
+    var out = ""
+    var i: i64 = 0
+    while i < n {
+        let ch = body.slice(i, i + 1)
+        if ch == "$" and i + 1 < n {
+            let nxt = body.slice(i + 1, i + 2)
+            if nxt.is_ascii_digit() {
+                var j = i + 1
+                while j < n and body.slice(j, j + 1).is_ascii_digit() {
+                    j += 1
+                }
+                i = j
+                continue
+            }
+            if nxt == "{{" and i + 2 < n {
+                var j = i + 2
+                while j < n and body.slice(j, j + 1).is_ascii_digit() {
+                    j += 1
+                }
+                if j > i + 2 and j < n {
+                    let sep = body.slice(j, j + 1)
+                    if sep == "}}" {
+                        i = j + 1
+                        continue
+                    }
+                    if sep == ":" {
+                        var k = j + 1
+                        var depth: i64 = 1
+                        var inner = ""
+                        while k < n and depth > 0 {
+                            let dc = body.slice(k, k + 1)
+                            if dc == "{{" {
+                                depth += 1
+                                inner = inner ++ dc
+                            } else if dc == "}}" {
+                                depth -= 1
+                                if depth > 0 {
+                                    inner = inner ++ dc
+                                }
+                            } else {
+                                inner = inner ++ dc
+                            }
+                            k += 1
+                        }
+                        out = out ++ inner
+                        i = k
+                        continue
+                    }
+                }
+            }
+        }
+        if ch == "\t" {
+            out = out ++ "    "
+        } else {
+            out = out ++ ch
+        }
+        i += 1
+    }
+    out.split("\n")
+}
+
+fn cmp_char_cols(ch: String) -> i64 {
+    if ch.len() >= 3 { 2 } else { 1 }
+}
+
+fn cmp_str_cols(s: String) -> i64 {
+    if s.is_ascii() {
+        return s.len()
+    }
+    let n = s.char_len()
+    var w: i64 = 0
+    for i in 0..n {
+        w += cmp_char_cols(s.slice(i, i + 1))
+    }
+    w
+}
+
+fn wrap_long_cjk_or_word(word: String, max_width: i64, out: List) -> String {
+    if cmp_str_cols(word) <= max_width {
+        return word
+    }
+    let n = word.char_len()
+    var chunk = ""
+    var cw: i64 = 0
+    for i in 0..n {
+        let ch = word.slice(i, i + 1)
+        let w = cmp_char_cols(ch)
+        if cw + w > max_width and chunk != "" {
+            out.push(chunk)
+            chunk = ch
+            cw = w
+        } else {
+            chunk = chunk ++ ch
+            cw += w
+        }
+    }
+    chunk
+}
+
+fn wrap_doc_lines(raw_text: String, max_width: i64) -> List {
+    let lines = List()
+    let raw_rows = raw_text.replace("\r\n", "\n").split("\n")
+    var in_code = false
+    var fence_ch = ""
+    var fence_len: i64 = 0
+    for ri in 0..raw_rows.len() {
+        let ln = raw_rows.get(ri.as(usize)).as(String)
+        let trimmed = ln.trim()
+        if not in_code {
+            if trimmed.starts_with("```") or trimmed.starts_with("~~~") {
+                let fc = trimmed.slice(0, 1)
+                var fl: i64 = 0
+                while fl < trimmed.char_len() and trimmed.slice(fl, fl + 1) == fc {
+                    fl += 1
+                }
+                if fc != "`" or (not trimmed.drop(fl).contains("`")) {
+                    in_code = true
+                    fence_ch = fc
+                    fence_len = fl
+                    lines.push(trimmed)
+                    continue
+                }
+            }
+        } else {
+            var fl: i64 = 0
+            while fl < trimmed.char_len() and trimmed.slice(fl, fl + 1) == fence_ch {
+                fl += 1
+            }
+            if fl >= fence_len and trimmed.drop(fl).trim() == "" {
+                in_code = false
+                lines.push(trimmed)
+                continue
+            }
+        }
+        if in_code or cmp_str_cols(ln) <= max_width {
+            lines.push(ln)
+            continue
+        }
+        -- Soft-wrap prose lines at word boundaries and CJK display-column width
+        let words = ln.split(" ")
+        var cur = ""
+        var cur_w: i64 = 0
+        for wi in 0..words.len() {
+            let w = words.get(wi.as(usize)).as(String)
+            let ww = cmp_str_cols(w)
+            if cur == "" {
+                cur = wrap_long_cjk_or_word(w, max_width, lines)
+                cur_w = cmp_str_cols(cur)
+            } else if cur_w + 1 + ww <= max_width {
+                cur = cur ++ " " ++ w
+                cur_w += 1 + ww
+            } else {
+                lines.push(cur)
+                cur = wrap_long_cjk_or_word(w, max_width, lines)
+                cur_w = cmp_str_cols(cur)
+            }
+        }
+        if cur != "" {
+            lines.push(cur)
+        }
+    }
+    lines
+}
+
+fn build_builtin_item_doc(world: EditorWorld, buf: Buffer, item: CompletionItem) -> (String, List) {
+    let title = item.label ++ " · " ++ item.kind
+    let lines = List()
+    let mode_lang = if buf.major_mode != "" { buf.major_mode } else { "text" }
+
+    if item.kind == "Snippet" {
+        if item.detail != "" {
+            lines.push(item.detail)
+            lines.push("────────────────────────────────────────")
+        }
+        lines.push("```" ++ mode_lang)
+        let prev_lines = format_snippet_preview(item.insert_text)
+        let cap = if prev_lines.len() > 8 { 8 } else { prev_lines.len() }
+        for i in 0..cap {
+            lines.push(prev_lines.get(i.as(usize)).as(String))
+        }
+        lines.push("```")
+        return (title, lines)
+    }
+
+    if item.kind == "Path" {
+        lines.push("Path entry: `" ++ item.label ++ "`  " ++ item.detail)
+        return (title, lines)
+    }
+
+    let sym_hit_opt = lookup_sym_meta_across_open_buffers(world, buf, item.label)
+    if sym_hit_opt != null {
+        let (meta, src_name) = sym_hit_opt.as((BufSymMeta, String))
+        if meta.sig != "" {
+            lines.push("```" ++ mode_lang)
+            lines.push(meta.sig)
+            lines.push("```")
+        }
+        if meta.doc != "" {
+            let wrapped = wrap_doc_lines(meta.doc, 52)
+            for i in 0..wrapped.len() {
+                lines.push(wrapped.get(i.as(usize)).as(String))
+            }
+        }
+        lines.push("Defined in " ++ src_name ++ ":" ++ (meta.row + 1).to_string())
+        return (title, lines)
+    }
+
+    if item.detail != "" and item.detail != "[Buf]" and item.detail != "[Kw]" and item.detail != "[LSP]" {
+        let clean_det = if item.detail.starts_with("[LSP] ") {
+            item.detail.drop(6)
+        } else {
+            item.detail
+        }
+        lines.push("```" ++ mode_lang)
+        lines.push(clean_det)
+        lines.push("```")
+        return (title, lines)
+    }
+
+    if item.kind == "Identifier" {
+        -- Check nearest local binding (`let` / `var` / `const`) in active buffer for context
+        let max_scan = if buf.point.row < 200 { buf.point.row } else { 200 }
+        var r = buf.point.row - 1
+        var steps: i64 = 0
+        while r >= 0 and steps < max_scan {
+            let ln = buf.line_at(r).trim()
+            if (ln.starts_with("let ") or ln.starts_with("var ") or ln.starts_with("const "))
+                and ln.contains(item.label) {
+                lines.push("```" ++ mode_lang)
+                lines.push(ln)
+                lines.push("```")
+                lines.push("Local binding at line " ++ (r + 1).to_string())
+                return (title, lines)
+            }
+            r -= 1
+            steps += 1
+        }
+    }
+
+    (title, lines)
+}
+
+fn strip_line_comment_prefix(line: String, mode: String) -> String {
+    let n = line.char_len()
+    if n == 0 {
+        return line
+    }
+    var in_q = ""
+    var i: i64 = 0
+    while i < n {
+        let ch = line.slice(i, i + 1)
+        if in_q != "" {
+            if ch == "\\" and i + 1 < n {
+                i += 2
+                continue
+            }
+            if ch == in_q {
+                in_q = ""
+            }
+            i += 1
+            continue
+        }
+        if ch == "\"" or ch == "'" or ch == "`" {
+            in_q = ch
+            i += 1
+            continue
+        }
+        if (mode == "nessa" or mode == "lua") and ch == "-" and i + 1 < n and line.slice(i + 1, i + 2) == "-" {
+            return line.slice(0, i)
+        }
+        if (mode == "rust" or mode == "c" or mode == "cpp" or mode == "go" or mode == "javascript" or mode == "typescript" or mode == "java")
+            and ch == "/" and i + 1 < n and line.slice(i + 1, i + 2) == "/" {
+            return line.slice(0, i)
+        }
+        if (mode == "python" or mode == "shell") and ch == "#" {
+            return line.slice(0, i)
+        }
+        i += 1
+    }
+    line
+}
+
+fn is_non_call_keyword(word: String) -> bool {
+    word == "if" or word == "while" or word == "for" or word == "match" or word == "when"
+        or word == "switch" or word == "catch" or word == "return" or word == "sizeof"
+        or word == "typeof" or word == "elif" or word == "handles"
+}
+
+fn is_decl_header_before_callee(line: String, callee_start: i64) -> bool {
+    if callee_start <= 0 {
+        return false
+    }
+    let before = line.slice(0, callee_start).trim_end()
+    before.ends_with("fn")
+        or before.ends_with("def")
+        or before.ends_with("func")
+        or before.ends_with("function")
+        or before.ends_with("effect")
+}
+
+fn extract_named_arg_from_segment(seg: String) -> String {
+    let trimmed = seg.trim_start()
+    if trimmed == "" {
+        return ""
+    }
+    var end_id: i64 = 0
+    let n = trimmed.char_len()
+    while end_id < n and is_ident_char(trimmed.slice(end_id, end_id + 1)) {
+        end_id += 1
+    }
+    if end_id == 0 {
+        return ""
+    }
+    let rest = trimmed.drop(end_id).trim_start()
+    if rest.starts_with("=") and (not rest.starts_with("==")) and (not rest.starts_with("=>")) {
+        return trimmed.slice(0, end_id)
+    }
+    ""
+}
+
+fn detect_enclosing_call(buf: Buffer, row: i64, col: i64) -> ?CallSiteContext {
+    let min_r = if row > 7 { row - 7 } else { 0 }
+    var paren_depth: i64 = 0
+    var bracket_depth: i64 = 0
+    var brace_depth: i64 = 0
+    var commas: i64 = 0
+    var cur_arg_accum = ""
+    var captured_arg_seg = false
+
+    var r = row
+    while r >= min_r {
+        let raw = buf.line_at(r)
+        let clean = strip_line_comment_prefix(raw, buf.major_mode)
+        let max_c = if r == row {
+            if col < clean.char_len() { col } else { clean.char_len() }
+        } else {
+            clean.char_len()
+        }
+        let prefix_part = clean.slice(0, max_c)
+        -- Tokenize forward on `prefix_part` to mask string literals accurately, then scan backward
+        let n = prefix_part.char_len()
+        let in_str_mask = List()
+        var q = ""
+        var fi: i64 = 0
+        while fi < n {
+            let ch = prefix_part.slice(fi, fi + 1)
+            if q != "" {
+                in_str_mask.push(true)
+                if ch == "\\" and fi + 1 < n {
+                    in_str_mask.push(true)
+                    fi += 2
+                    continue
+                }
+                if ch == q {
+                    q = ""
+                }
+                fi += 1
+                continue
+            }
+            if ch == "\"" or ch == "'" or ch == "`" {
+                q = ch
+                in_str_mask.push(true)
+                fi += 1
+                continue
+            }
+            in_str_mask.push(false)
+            fi += 1
+        }
+        -- If cursor itself is inside an unclosed string literal on the current row, still allow signature help!
+        var c = n - 1
+        while c >= 0 {
+            let masked = in_str_mask.get(c.as(usize)).as(bool)
+            let ch = prefix_part.slice(c, c + 1)
+            if not masked {
+                if ch == ")" {
+                    paren_depth += 1
+                } else if ch == "]" {
+                    bracket_depth += 1
+                } else if ch == "}}" {
+                    brace_depth += 1
+                } else if ch == "[" {
+                    if bracket_depth > 0 {
+                        bracket_depth -= 1
+                    } else {
+                        return null
+                    }
+                } else if ch == "{{" {
+                    if brace_depth > 0 {
+                        brace_depth -= 1
+                    } else {
+                        return null
+                    }
+                } else if ch == ";" and paren_depth == 0 and bracket_depth == 0 and brace_depth == 0 {
+                    return null
+                } else if ch == "," and paren_depth == 0 and bracket_depth == 0 and brace_depth == 0 {
+                    if not captured_arg_seg {
+                        captured_arg_seg = true
+                    }
+                    commas += 1
+                } else if ch == "(" {
+                    if paren_depth > 0 {
+                        paren_depth -= 1
+                    } else {
+                        -- Found the innermost unclosed `(` at `(r, c)`!
+                        var kw_end = c
+                        while kw_end > 0 {
+                            let sp = prefix_part.slice(kw_end - 1, kw_end)
+                            if sp == " " or sp == "\t" {
+                                kw_end -= 1
+                            } else {
+                                break
+                            }
+                        }
+                        -- Skip optional generic `<...>` / turbofish `::<...>` before `(`
+                        if kw_end > 0 and prefix_part.slice(kw_end - 1, kw_end) == ">" {
+                            var gdepth: i64 = 1
+                            kw_end -= 1
+                            while kw_end > 0 and gdepth > 0 {
+                                let gc = prefix_part.slice(kw_end - 1, kw_end)
+                                if gc == ">" {
+                                    gdepth += 1
+                                } else if gc == "<" {
+                                    gdepth -= 1
+                                }
+                                kw_end -= 1
+                            }
+                            if kw_end >= 2 and prefix_part.slice(kw_end - 2, kw_end) == "::" {
+                                kw_end -= 2
+                            }
+                        }
+                        var id_start = kw_end
+                        while id_start > 0 and is_ident_char(prefix_part.slice(id_start - 1, id_start)) {
+                            id_start -= 1
+                        }
+                        if id_start >= kw_end {
+                            return null
+                        }
+                        let callee = prefix_part.slice(id_start, kw_end)
+                        if is_non_call_keyword(callee) or is_decl_header_before_callee(prefix_part, id_start) {
+                            return null
+                        }
+                        var is_meth = false
+                        if id_start >= 1 and prefix_part.slice(id_start - 1, id_start) == "." {
+                            is_meth = true
+                        } else if id_start >= 2 and prefix_part.slice(id_start - 2, id_start) == "->" {
+                            is_meth = true
+                        }
+                        let named = extract_named_arg_from_segment(cur_arg_accum)
+                        return (CallSiteContext {
+                            callee: callee,
+                            open_row: r,
+                            open_col: c,
+                            active_param: commas,
+                            named_arg: named,
+                            is_method_call: is_meth,
+                        })
+                    }
+                }
+            }
+            if (not captured_arg_seg) and paren_depth == 0 and bracket_depth == 0 and brace_depth == 0 {
+                cur_arg_accum = ch ++ cur_arg_accum
+            }
+            c -= 1
+        }
+        if not captured_arg_seg {
+            cur_arg_accum = " " ++ cur_arg_accum
+        }
+        r -= 1
+    }
+    null
+}
+
+fn compact_call_hint_for_ghost(sig_or_detail: String, is_method_call: bool) -> String {
+    let raw_params = split_signature_params(sig_or_detail)
+    let call_params = List()
+    for i in 0..raw_params.len() {
+        let p = raw_params.get(i.as(usize)).as(String)
+        if i == 0 and is_method_call and is_receiver_self_param(p) {
+            continue
+        }
+        call_params.push(extract_param_short_name(p))
+    }
+    if call_params.is_empty() {
+        if sig_or_detail.contains("()") {
+            return "()"
+        }
+        if raw_params.len() == 1 and is_method_call and is_receiver_self_param(raw_params.get(0).as(String)) {
+            return "()"
+        }
+        if sig_or_detail.contains("(") {
+            return "()"
+        }
+        return "(…)"
+    }
+    let joined = call_params.join(", ")
+    if joined.char_len() > 28 {
+        "(" ++ joined.slice(0, 26) ++ "…)"
+    } else {
+        "(" ++ joined ++ ")"
+    }
+}
+
+fn is_import_statement_prefix(line_before_ident: String) -> bool {
+    let t = line_before_ident.trim_start()
+    t.starts_with("use ")
+        or t.starts_with("pub use ")
+        or t.starts_with("import ")
+        or t.starts_with("from ")
+        or t.starts_with("#include")
+}
+
+fn is_zero_arity_callable_item(
+    world: EditorWorld,
+    buf: Buffer,
+    item: CompletionItem,
+    is_method_call: bool,
+) -> bool {
+    var sig = item.detail
+    if (not sig.contains("(")) {
+        let sym_opt = lookup_sym_meta_across_open_buffers(world, buf, item.label)
+        if sym_opt != null {
+            let (meta, _) = sym_opt.as((BufSymMeta, String))
+            sig = meta.sig
+        }
+    }
+    if not sig.contains("(") {
+        return false
+    }
+    let params = split_signature_params(sig)
+    if params.is_empty() {
+        return sig.contains("()")
+    }
+    if params.len() == 1 and is_method_call and is_receiver_self_param(params.get(0).as(String)) {
+        return true
+    }
+    false
+}
+
 pub fn collect_candidates(
     kernel: SystemKernel,
     world: EditorWorld,
@@ -337,24 +1245,7 @@ pub fn collect_candidates(
     let labels = List()
     let seen_non_snippet = Set.new()
 
-    -- 1. Snippets from `SnippetService` (`"lava.snippets.registry"`)
-    let snip_opt = kernel.service(SERVICE_SNIPPETS)
-    if snip_opt != null {
-        let snip_svc = snip_opt.as(SnippetService)
-        let snips = snip_svc.snippets_for_mode(buf.major_mode)
-        for i in 0..snips.len() {
-            let s = snips.get(i.as(usize)).as(SnippetSpec)
-            raw_items.push(CompletionItem {
-                label: s.trigger,
-                insert_text: s.body,
-                kind: "Snippet",
-                detail: s.description,
-            })
-            labels.push(s.trigger)
-        }
-    }
-
-    -- 2. Custom registered completion sources on `CmpService`
+    -- 1. Custom registered completion sources on `CmpService` (e.g. LSP) take priority
     let cmp_opt = kernel.service(SERVICE_CMP)
     if cmp_opt != null {
         let cmp = cmp_opt.as(CmpService)
@@ -369,6 +1260,23 @@ pub fn collect_candidates(
                     seen_non_snippet.insert(item.label)
                 }
             }
+        }
+    }
+
+    -- 2. Snippets from `SnippetService` (`"lava.snippets.registry"`)
+    let snip_opt = kernel.service(SERVICE_SNIPPETS)
+    if snip_opt != null {
+        let snip_svc = snip_opt.as(SnippetService)
+        let snips = snip_svc.snippets_for_mode(buf.major_mode)
+        for i in 0..snips.len() {
+            let s = snips.get(i.as(usize)).as(SnippetSpec)
+            raw_items.push(CompletionItem {
+                label: s.trigger,
+                insert_text: s.body,
+                kind: "Snippet",
+                detail: s.description,
+            })
+            labels.push(s.trigger)
         }
     }
 
@@ -410,16 +1318,42 @@ pub fn collect_candidates(
         other_scanned += 1
     }
 
+    let cur_sym_idx = get_cached_buf_sym_index(buf)
+    for si in 0..cur_sym_idx.ordered.len() {
+        let meta = cur_sym_idx.ordered.get(si.as(usize)).as(BufSymMeta)
+        if (not kw_set.contains(meta.name)) and (not seen_non_snippet.contains(meta.name)) {
+            seen_non_snippet.insert(meta.name)
+            raw_items.push(CompletionItem {
+                label: meta.name,
+                insert_text: meta.name,
+                kind: meta.kind,
+                detail: if meta.sig != "" { meta.sig } else { "Symbol" },
+            })
+            labels.push(meta.name)
+        }
+    }
+
     for i in 0..words.len() {
         let w = words.get(i.as(usize)).as(String)
         if (not kw_set.contains(w)) and (not seen_non_snippet.contains(w)) {
             seen_non_snippet.insert(w)
-            raw_items.push(CompletionItem {
-                label: w,
-                insert_text: w,
-                kind: "Identifier",
-                detail: "[Buf]",
-            })
+            let cross_sym_opt = lookup_sym_meta_across_open_buffers(world, buf, w)
+            if cross_sym_opt != null {
+                let (cmeta, src_bname) = cross_sym_opt.as((BufSymMeta, String))
+                raw_items.push(CompletionItem {
+                    label: w,
+                    insert_text: w,
+                    kind: cmeta.kind,
+                    detail: if cmeta.sig != "" { cmeta.sig } else { src_bname },
+                })
+            } else {
+                raw_items.push(CompletionItem {
+                    label: w,
+                    insert_text: w,
+                    kind: "Identifier",
+                    detail: "Buffer identifier",
+                })
+            }
             labels.push(w)
         }
     }
@@ -432,7 +1366,7 @@ pub fn collect_candidates(
                 label: kw,
                 insert_text: kw,
                 kind: "Keyword",
-                detail: "[Kw]",
+                detail: "Keyword (" ++ buf.major_mode ++ ")",
             })
             labels.push(kw)
         }
@@ -451,6 +1385,21 @@ pub fn collect_candidates(
     ranked
 }
 
+fn has_member_trigger_before(buf: Buffer, row: i64, col: i64) -> bool {
+    let line = buf.line_at(row)
+    let safe_col = if col < 0 { 0 } else if col > line.char_len() { line.char_len() } else { col }
+    if safe_col >= 1 and line.slice(safe_col - 1, safe_col) == "." {
+        return true
+    }
+    if safe_col >= 2 {
+        let two = line.slice(safe_col - 2, safe_col)
+        if two == "::" or two == "->" {
+            return true
+        }
+    }
+    false
+}
+
 impl CmpService {
     pub fn new() -> CmpService {
         CmpService {
@@ -458,6 +1407,9 @@ impl CmpService {
             min_chars: 2,
             max_items: 15,
             custom_sources: List(),
+            doc_providers: List(),
+            sig_providers: List(),
+            doc_cache: HashMap.new(),
             suppress_next_hook: false,
         }
     }
@@ -488,10 +1440,327 @@ impl CmpService {
         self.custom_sources = kept
     }
 
+    pub fn register_doc_provider(
+        self,
+        name: String,
+        provider: fn(EditorWorld, Buffer, CompletionItem) -> ?(String, List),
+    ) {
+        let entry = CmpDocProvider {
+            name: name,
+            provider: provider,
+        }
+        for i in 0..self.doc_providers.len() {
+            let cur = self.doc_providers.get(i.as(usize)).as(CmpDocProvider)
+            if cur.name == name {
+                self.doc_providers.set(i.as(usize), entry)
+                return
+            }
+        }
+        self.doc_providers.push(entry)
+    }
+
+    pub fn register_signature_provider(
+        self,
+        name: String,
+        provider: fn(EditorWorld, Buffer, String, i64, i64, i64, String, bool) -> ?(String, List, i64, String),
+    ) {
+        let entry = CmpSigProvider {
+            name: name,
+            provider: provider,
+        }
+        for i in 0..self.sig_providers.len() {
+            let cur = self.sig_providers.get(i.as(usize)).as(CmpSigProvider)
+            if cur.name == name {
+                self.sig_providers.set(i.as(usize), entry)
+                return
+            }
+        }
+        self.sig_providers.push(entry)
+    }
+
+    pub fn resolve_item_doc(self, world: EditorWorld, buf: Buffer, item: CompletionItem) -> (String, List) {
+        let ckey = item.label ++ "\t" ++ item.kind ++ "\t" ++ item.detail
+        let cached_opt = self.doc_cache.get(ckey)
+        if cached_opt != null {
+            return cached_opt.as((String, List))
+        }
+        for i in 0..self.doc_providers.len() {
+            let dp = self.doc_providers.get(i.as(usize)).as(CmpDocProvider)
+            let provided_opt = (dp.provider)(world, buf, item)
+            if provided_opt != null {
+                let pair = provided_opt.as((String, List))
+                let (_, plines) = pair
+                if not plines.is_empty() {
+                    if self.doc_cache.len() > 64 {
+                        self.doc_cache.clear()
+                    }
+                    self.doc_cache.insert(ckey, pair)
+                    return pair
+                }
+            }
+        }
+        let fallback = build_builtin_item_doc(world, buf, item)
+        if self.doc_cache.len() > 64 {
+            self.doc_cache.clear()
+        }
+        self.doc_cache.insert(ckey, fallback)
+        fallback
+    }
+
+    pub fn sync_selected_overlays(self, world: EditorWorld) {
+        let cp = world.completion_popup
+        let buf = world.active_buffer()
+        if cp.active and (not cp.items.is_empty()) {
+            let n = cp.items.len()
+            let idx = if cp.selected_idx < 0 {
+                0
+            } else if cp.selected_idx >= n {
+                n - 1
+            } else {
+                cp.selected_idx
+            }
+            let item = cp.items.get(idx.as(usize)).as(CompletionItem)
+            let (dtitle, dlines) = self.resolve_item_doc(world, buf, item)
+            cp.doc_title = dtitle
+            cp.doc_lines = dlines
+        }
+        self.update_inline_ghost(world)
+    }
+
+    pub fn update_inline_ghost(self, world: EditorWorld) {
+        if (not self.enabled) or (not world.options.shadow_text) {
+            if world.inline_ghost.owner == OWNER_CMP or world.inline_ghost.owner == "" {
+                world.inline_ghost = InlineGhostText.inactive()
+            }
+            return
+        }
+        let buf = world.active_buffer()
+        if buf.read_only {
+            world.inline_ghost = InlineGhostText.inactive()
+            return
+        }
+        let p = buf.clamp_pos(buf.point, insert_mode = true)
+        let cur_line = buf.line_at(p.row)
+        let after_cursor = cur_line.slice(p.col, cur_line.char_len())
+        -- Do not show inline ghost completion right inside the middle of an existing identifier
+        if after_cursor != "" and is_ident_char(after_cursor.slice(0, 1)) {
+            world.inline_ghost = InlineGhostText.inactive()
+            return
+        }
+
+        let cp = world.completion_popup
+        if cp.active and cp.owner == OWNER_CMP and (not cp.items.is_empty()) {
+            let n = cp.items.len()
+            let idx = if cp.selected_idx < 0 { 0 } else if cp.selected_idx >= n { n - 1 } else { cp.selected_idx }
+            let item = cp.items.get(idx.as(usize)).as(CompletionItem)
+            let rep_col = if cp.replace_start_col >= 0 and cp.replace_start_col <= p.col {
+                cp.replace_start_col
+            } else {
+                p.col
+            }
+            let typed = cur_line.slice(rep_col, p.col)
+            if item.label.to_lower().starts_with(typed.to_lower()) {
+                let rem_name = item.label.drop(typed.char_len())
+                let is_meth = has_member_trigger_before(buf, p.row, rep_col)
+                let before_rep = cur_line.slice(0, rep_col)
+                let is_call = is_callable_kind(item.kind)
+                    and (not item.insert_text.contains("("))
+                    and (not after_cursor.starts_with("("))
+                    and (not is_import_statement_prefix(before_rep))
+                let ghost_suffix = if is_call {
+                    rem_name ++ compact_call_hint_for_ghost(item.detail, is_meth)
+                } else {
+                    rem_name
+                }
+                if ghost_suffix != "" {
+                    let zero_ar = if is_call {
+                        is_zero_arity_callable_item(world, buf, item, is_meth)
+                    } else {
+                        true
+                    }
+                    world.inline_ghost = InlineGhostText {
+                        active: true,
+                        row: p.row,
+                        col: p.col,
+                        text: ghost_suffix,
+                        accept_text: if is_call { item.insert_text ++ "()" } else { item.insert_text },
+                        replace_start_col: rep_col,
+                        cursor_inside_parens: is_call and (not zero_ar),
+                        owner: OWNER_CMP,
+                    }
+                    return
+                }
+            }
+            world.inline_ghost = InlineGhostText.inactive()
+            return
+        }
+
+        -- Lightweight 1-char prefix inline ghost preview from cached buffer symbols (before popup opens)
+        let ctx = extract_prefix_context(world, buf, p.row, p.col)
+        if ctx.kind == "ident" and ctx.prefix.char_len() >= 1 and ctx.prefix.char_len() < self.min_chars {
+            let p_low = ctx.prefix.to_lower()
+            let sym_idx = get_cached_buf_sym_index(buf)
+            for i in 0..sym_idx.ordered.len() {
+                let meta = sym_idx.ordered.get(i.as(usize)).as(BufSymMeta)
+                if meta.name.char_len() > ctx.prefix.char_len() and meta.name.to_lower().starts_with(p_low) {
+                    let rem = meta.name.drop(ctx.prefix.char_len())
+                    let is_meth = has_member_trigger_before(buf, p.row, ctx.replace_start_col)
+                    let before_rep = cur_line.slice(0, ctx.replace_start_col)
+                    let is_call = is_callable_kind(meta.kind)
+                        and (not after_cursor.starts_with("("))
+                        and (not is_import_statement_prefix(before_rep))
+                    let ghost_txt = if is_call {
+                        rem ++ compact_call_hint_for_ghost(meta.sig, is_meth)
+                    } else {
+                        rem
+                    }
+                    let fake_item = CompletionItem {
+                        label: meta.name,
+                        insert_text: meta.name,
+                        kind: meta.kind,
+                        detail: meta.sig,
+                    }
+                    let zero_ar = if is_call {
+                        is_zero_arity_callable_item(world, buf, fake_item, is_meth)
+                    } else {
+                        true
+                    }
+                    world.inline_ghost = InlineGhostText {
+                        active: true,
+                        row: p.row,
+                        col: p.col,
+                        text: ghost_txt,
+                        accept_text: if is_call { meta.name ++ "()" } else { meta.name },
+                        replace_start_col: ctx.replace_start_col,
+                        cursor_inside_parens: is_call and (not zero_ar),
+                        owner: OWNER_CMP,
+                    }
+                    return
+                }
+            }
+        }
+        if world.inline_ghost.owner == OWNER_CMP or world.inline_ghost.owner == "" {
+            world.inline_ghost = InlineGhostText.inactive()
+        }
+    }
+
+    pub fn update_signature_help(self, _kernel: SystemKernel, world: EditorWorld) {
+        if not self.enabled {
+            if world.signature_help.owner == OWNER_CMP or world.signature_help.owner == "" {
+                world.signature_help = SignatureHelpPopup.inactive()
+            }
+            return
+        }
+        let buf = world.active_buffer()
+        if buf.read_only {
+            world.signature_help = SignatureHelpPopup.inactive()
+            return
+        }
+        let p = buf.clamp_pos(buf.point, insert_mode = true)
+        let call_opt = detect_enclosing_call(buf, p.row, p.col)
+        if call_opt == null {
+            if world.signature_help.owner == OWNER_CMP or world.signature_help.owner == "" {
+                world.signature_help = SignatureHelpPopup.inactive()
+            }
+            return
+        }
+        let call_ctx = call_opt.as(CallSiteContext)
+
+        -- 1. Query registered signature providers (`ext_lsp` live + workspace symbol resolver)
+        for i in 0..self.sig_providers.len() {
+            let sp = self.sig_providers.get(i.as(usize)).as(CmpSigProvider)
+            let hit_opt = (sp.provider)(
+                world,
+                buf,
+                call_ctx.callee,
+                p.row,
+                p.col,
+                call_ctx.active_param,
+                call_ctx.named_arg,
+                call_ctx.is_method_call,
+            )
+            if hit_opt != null {
+                let (slabel, sparams, act_idx, sdoc) = hit_opt.as((String, List, i64, String))
+                if slabel != "" {
+                    world.signature_help = SignatureHelpPopup {
+                        active: true,
+                        anchor_pos: Pos.new(call_ctx.open_row, call_ctx.open_col),
+                        label: slabel,
+                        parameters: sparams,
+                        active_param: act_idx,
+                        doc_summary: sdoc,
+                        owner: OWNER_CMP,
+                    }
+                    return
+                }
+            }
+        }
+
+        -- 2. Builtin open-buffer symbol index fallback
+        let sym_opt = lookup_sym_meta_across_open_buffers(world, buf, call_ctx.callee)
+        if sym_opt != null {
+            let (meta, _) = sym_opt.as((BufSymMeta, String))
+            if meta.sig != "" and meta.sig.contains("(") {
+                let raw_params = split_signature_params(meta.sig)
+                let call_params = List()
+                for pi in 0..raw_params.len() {
+                    let rp = raw_params.get(pi.as(usize)).as(String)
+                    if pi == 0 and call_ctx.is_method_call and is_receiver_self_param(rp) {
+                        continue
+                    }
+                    call_params.push(rp)
+                }
+                var eff_idx = call_ctx.active_param
+                if call_ctx.named_arg != "" {
+                    for pi in 0..call_params.len() {
+                        let pname = extract_param_short_name(call_params.get(pi.as(usize)).as(String))
+                        if pname == call_ctx.named_arg {
+                            eff_idx = pi
+                            break
+                        }
+                    }
+                }
+                if (not call_params.is_empty()) and eff_idx >= call_params.len() {
+                    eff_idx = call_params.len() - 1
+                }
+                let doc_first = if meta.doc != "" {
+                    meta.doc.split("\n").get(0).as(String).trim()
+                } else {
+                    ""
+                }
+                world.signature_help = SignatureHelpPopup {
+                    active: true,
+                    anchor_pos: Pos.new(call_ctx.open_row, call_ctx.open_col),
+                    label: meta.sig,
+                    parameters: call_params,
+                    active_param: eff_idx,
+                    doc_summary: doc_first,
+                    owner: OWNER_CMP,
+                }
+                return
+            }
+        }
+
+        if world.signature_help.owner == OWNER_CMP or world.signature_help.owner == "" {
+            world.signature_help = SignatureHelpPopup.inactive()
+        }
+    }
+
     pub fn dismiss(self, world: EditorWorld) -> bool {
         let was_active = world.completion_popup.active
         if world.completion_popup.owner == OWNER_CMP or world.completion_popup.owner == "" {
             world.completion_popup = CompletionPopup.inactive()
+        }
+        if world.inline_ghost.owner == OWNER_CMP or world.inline_ghost.owner == "" {
+            world.inline_ghost = InlineGhostText.inactive()
+        }
+        was_active
+    }
+
+    pub fn dismiss_all(self, world: EditorWorld) -> bool {
+        let was_active = self.dismiss(world)
+        if world.signature_help.owner == OWNER_CMP or world.signature_help.owner == "" {
+            world.signature_help = SignatureHelpPopup.inactive()
         }
         was_active
     }
@@ -503,6 +1772,7 @@ impl CmpService {
         }
         let n = cp.items.len()
         cp.selected_idx = (cp.selected_idx + 1) % n
+        self.sync_selected_overlays(world)
         true
     }
 
@@ -513,6 +1783,7 @@ impl CmpService {
         }
         let n = cp.items.len()
         cp.selected_idx = (cp.selected_idx - 1 + n) % n
+        self.sync_selected_overlays(world)
         true
     }
 
@@ -520,7 +1791,7 @@ impl CmpService {
         let world = require_editor_world(kernel)!
         let buf = world.active_buffer()
         if buf.read_only {
-            let _ = self.dismiss(world)
+            let _ = self.dismiss_all(world)
             return false
         }
         let p = buf.clamp_pos(buf.point, insert_mode = true)
@@ -532,6 +1803,7 @@ impl CmpService {
                 let _ = self.dismiss(world)
                 return false
             }
+            self.doc_cache.clear()
             world.completion_popup = CompletionPopup {
                 active: true,
                 anchor_pos: Pos.new(p.row, ctx.replace_start_col),
@@ -540,14 +1812,21 @@ impl CmpService {
                 items: items,
                 selected_idx: 0,
                 owner: OWNER_CMP,
+                doc_title: "",
+                doc_lines: List(),
             }
+            self.sync_selected_overlays(world)
             return true
         }
 
-        if (not manual) and ctx.prefix.char_len() < self.min_chars {
+        let member_trigger = (not self.custom_sources.is_empty()) and has_member_trigger_before(buf, p.row, p.col)
+        if (not manual) and ctx.prefix.char_len() < self.min_chars and (not member_trigger) {
             let _ = self.dismiss(world)
+            self.update_inline_ghost(world)
             return false
         }
+
+        kernel.emit_hook("cmp-before-collect", manual)
 
         let items = collect_candidates(
             kernel,
@@ -562,6 +1841,7 @@ impl CmpService {
             return false
         }
 
+        self.doc_cache.clear()
         world.completion_popup = CompletionPopup {
             active: true,
             anchor_pos: Pos.new(p.row, ctx.replace_start_col),
@@ -570,7 +1850,109 @@ impl CmpService {
             items: items,
             selected_idx: 0,
             owner: OWNER_CMP,
+            doc_title: "",
+            doc_lines: List(),
         }
+        self.sync_selected_overlays(world)
+        true
+    }
+
+    pub fn refresh_from_lsp(self, kernel: SystemKernel) -> !String bool {
+        let world = require_editor_world(kernel)!
+        if not self.enabled {
+            return false
+        }
+        let buf = world.active_buffer()
+        if buf.read_only {
+            return false
+        }
+        let vim_opt = kernel.service(SERVICE_VIM)
+        if vim_opt != null and world.options.evil_mode {
+            let vim = vim_opt.as(VimState)
+            if vim.mode != VimMode.Insert or vim.block_insert_active {
+                return false
+            }
+        }
+        let p = buf.clamp_pos(buf.point, insert_mode = true)
+        let ctx = extract_prefix_context(world, buf, p.row, p.col)
+        if ctx.kind == "path" {
+            return false
+        }
+        let was_active = world.completion_popup.active and world.completion_popup.owner == OWNER_CMP
+        let member_trigger = (not self.custom_sources.is_empty()) and has_member_trigger_before(buf, p.row, p.col)
+        if (not was_active) and ctx.prefix.char_len() < self.min_chars and (not member_trigger) {
+            return false
+        }
+        let items = collect_candidates(
+            kernel,
+            world,
+            buf,
+            ctx.prefix,
+            replace_start_col = ctx.replace_start_col,
+            limit = self.max_items,
+        )
+        if items.is_empty() {
+            return false
+        }
+        let prev_sel = if was_active and world.completion_popup.selected_idx < items.len() {
+            world.completion_popup.selected_idx
+        } else {
+            0
+        }
+        self.doc_cache.clear()
+        world.completion_popup = CompletionPopup {
+            active: true,
+            anchor_pos: Pos.new(p.row, ctx.replace_start_col),
+            replace_start_col: ctx.replace_start_col,
+            prefix: ctx.prefix,
+            items: items,
+            selected_idx: prev_sel,
+            owner: OWNER_CMP,
+            doc_title: "",
+            doc_lines: List(),
+        }
+        self.sync_selected_overlays(world)
+        true
+    }
+
+    pub fn accept_inline_ghost(self, kernel: SystemKernel) -> !String bool {
+        let world = require_editor_world(kernel)!
+        let ig = world.inline_ghost
+        if (not ig.active) or ig.accept_text == "" {
+            return false
+        }
+        let buf = world.active_buffer()
+        if buf.read_only {
+            world.inline_ghost = InlineGhostText.inactive()
+            return false
+        }
+        let p = buf.clamp_pos(buf.point, insert_mode = true)
+        if p.row != ig.row or p.col != ig.col {
+            world.inline_ghost = InlineGhostText.inactive()
+            return false
+        }
+        let safe_start = if ig.replace_start_col < 0 {
+            0
+        } else if ig.replace_start_col > p.col {
+            p.col
+        } else {
+            ig.replace_start_col
+        }
+        let text_to_insert = ig.accept_text
+        let inside_parens = ig.cursor_inside_parens
+        world.inline_ghost = InlineGhostText.inactive()
+        buf.checkpoint(p, "cmp-ghost-accept")
+        let (end_pos, _) = buf.replace_span(
+            Span.normalized(Pos.new(p.row, safe_start), Pos.new(p.row, p.col)),
+            text_to_insert,
+        )!
+        if inside_parens and end_pos.col > 0 {
+            buf.point = Pos.new(end_pos.row, end_pos.col - 1)
+        } else {
+            buf.point = end_pos
+        }
+        buf.preferred_col = buf.point.col
+        self.update_signature_help(kernel, world)
         true
     }
 
@@ -596,18 +1978,21 @@ impl CmpService {
         let item = cp.items.get(idx.as(usize)).as(CompletionItem)
         let rep_col = cp.replace_start_col
         world.completion_popup = CompletionPopup.inactive()
+        world.inline_ghost = InlineGhostText.inactive()
 
-        if item.kind == "Snippet" {
+        if item.kind == "Snippet" or item.insert_text.contains("$1") or item.insert_text.contains("${{") {
             let snip_opt = kernel.service(SERVICE_SNIPPETS)
             if snip_opt != null {
                 let snip_svc = snip_opt.as(SnippetService)
-                return snip_svc.expand_snippet_body(
+                let ok = snip_svc.expand_snippet_body(
                     buf,
                     rep_col,
                     item.insert_text,
                     world.options.shiftwidth,
                     world.options.expandtab,
-                )
+                )!
+                self.update_signature_help(kernel, world)
+                return ok
             }
         }
 
@@ -619,13 +2004,44 @@ impl CmpService {
         } else {
             rep_col
         }
+        let cur_line = buf.line_at(p.row)
+        let after_cursor = cur_line.slice(p.col, cur_line.char_len())
+        let before_rep = cur_line.slice(0, safe_start)
+        let is_meth = has_member_trigger_before(buf, p.row, safe_start)
+        let auto_parens = is_callable_kind(item.kind)
+            and (not item.insert_text.contains("("))
+            and (not after_cursor.starts_with("("))
+            and (not is_import_statement_prefix(before_rep))
+
+        let text_to_insert = if auto_parens {
+            item.insert_text ++ "()"
+        } else {
+            item.insert_text
+        }
+        let place_inside_parens = if auto_parens {
+            not is_zero_arity_callable_item(world, buf, item, is_meth)
+        } else {
+            false
+        }
+
         buf.checkpoint(p, "cmp-pre-accept")
         let (end_pos, _) = buf.replace_span(
             Span.normalized(Pos.new(p.row, safe_start), Pos.new(p.row, p.col)),
-            item.insert_text,
+            text_to_insert,
         )!
-        buf.point = end_pos
-        buf.preferred_col = end_pos.col
+        if place_inside_parens and end_pos.col > 0 {
+            buf.point = Pos.new(end_pos.row, end_pos.col - 1)
+        } else if (not auto_parens) and is_callable_kind(item.kind) and after_cursor.starts_with("(") {
+            if not is_zero_arity_callable_item(world, buf, item, is_meth) {
+                buf.point = Pos.new(end_pos.row, end_pos.col + 1)
+            } else {
+                buf.point = end_pos
+            }
+        } else {
+            buf.point = end_pos
+        }
+        buf.preferred_col = buf.point.col
+        self.update_signature_help(kernel, world)
         true
     }
 }
@@ -671,21 +2087,27 @@ fn cmp_insert_interceptor(
     }
 
     let ctrl_only = stroke.ctrl and (not stroke.alt) and (not stroke.super_mod)
+    let alt_only = stroke.alt and (not stroke.ctrl) and (not stroke.super_mod)
     let plain = (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod)
     let cp = world.completion_popup
 
     if cp.active and cp.owner == OWNER_CMP and (not cp.items.is_empty()) {
-        if (ctrl_only and stroke.key == "n") or (plain and stroke.key == "Down") {
+        if (alt_only and stroke.key == "n") or (ctrl_only and stroke.key == "n") or (plain and stroke.key == "Down") {
             let _ = cmp.select_next(world)
             cmp.suppress_next_hook = true
             return true
         }
-        if (ctrl_only and stroke.key == "p") or (plain and stroke.key == "Up") {
+        if (alt_only and stroke.key == "p")
+            or (ctrl_only and stroke.key == "p")
+            or (plain and stroke.key == "Up")
+            or ((not stroke.ctrl) and (not stroke.alt) and stroke.shift_mod and stroke.key == "Tab")
+            or stroke.key == "BackTab"
+            or stroke.key == "ISO_Left_Tab" {
             let _ = cmp.select_prev(world)
             cmp.suppress_next_hook = true
             return true
         }
-        if (ctrl_only and stroke.key == "y") or (plain and stroke.key == "Tab") {
+        if (ctrl_only and stroke.key == "y") or (plain and (not stroke.shift_mod) and stroke.key == "Tab") {
             let ok = cmp.accept(kernel)!
             cmp.suppress_next_hook = true
             return ok
@@ -697,19 +2119,39 @@ fn cmp_insert_interceptor(
         }
     }
 
+    -- Accept standalone 1-char inline ghost shadow preview via `<C-y>` or `<End>`
+    if (not cp.active) and world.inline_ghost.active and world.inline_ghost.owner == OWNER_CMP {
+        if (ctrl_only and stroke.key == "y") or (plain and stroke.key == "End") {
+            let accepted = cmp.accept_inline_ghost(kernel)!
+            if accepted {
+                cmp.suppress_next_hook = true
+                return true
+            }
+        }
+        if ctrl_only and stroke.key == "e" {
+            world.inline_ghost = InlineGhostText.inactive()
+            cmp.suppress_next_hook = true
+            return true
+        }
+    }
+
     -- Manual popup trigger when popup is currently inactive
     if ctrl_only and (stroke.key == "Space" or stroke.key == " " or stroke.key == "@") {
         let _ = cmp.trigger(kernel, manual = true)!
+        cmp.update_signature_help(kernel, world)
         cmp.suppress_next_hook = true
         return true
     }
 
-    if cmp.enabled and ctrl_only and stroke.key == "n" {
+    if cmp.enabled and ((ctrl_only and stroke.key == "n") or (alt_only and (stroke.key == "n" or stroke.key == "p"))) {
         let p = buf.clamp_pos(buf.point, insert_mode = true)
         let ctx = extract_prefix_context(world, buf, p.row, p.col)
-        if ctx.kind == "path" or ctx.prefix.char_len() >= 1 {
+        if ctx.kind == "path" or ctx.prefix.char_len() >= 1 or has_member_trigger_before(buf, p.row, p.col) {
             let opened = cmp.trigger(kernel, manual = true)!
             if opened {
+                if alt_only and stroke.key == "p" {
+                    let _ = cmp.select_prev(world)
+                }
                 cmp.suppress_next_hook = true
                 return true
             }
@@ -728,6 +2170,16 @@ fn cmd_cmp_complete(kern: SystemKernel, _args: List) -> #InteractiveEffects !Str
     opened
 }
 
+fn cmd_cmp_signature(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let cmp = require_cmp_service(kern)!
+    cmp.update_signature_help(kern, world)
+    if not world.signature_help.active {
+        status_emit("No active function call signature at cursor")#
+    }
+    world.signature_help.active
+}
+
 fn cmd_cmp_confirm(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
     let cmp = require_cmp_service(kern)!
     cmp.accept(kern)!
@@ -736,7 +2188,7 @@ fn cmd_cmp_confirm(kern: SystemKernel, _args: List) -> #InteractiveEffects !Stri
 fn cmd_cmp_abort(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
     let world = require_editor_world(kern)!
     let cmp = require_cmp_service(kern)!
-    cmp.dismiss(world)
+    cmp.dismiss_all(world)
 }
 
 fn cmd_cmp_toggle(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
@@ -744,7 +2196,7 @@ fn cmd_cmp_toggle(kern: SystemKernel, _args: List) -> #InteractiveEffects !Strin
     let cmp = require_cmp_service(kern)!
     cmp.enabled = not cmp.enabled
     if not cmp.enabled {
-        let _ = cmp.dismiss(world)
+        let _ = cmp.dismiss_all(world)
     }
     let state_s = if cmp.enabled { "enabled" } else { "disabled" }
     status_emit("Completion " ++ state_s)#
@@ -758,7 +2210,7 @@ pub fn register_cmp_extension(kernel: SystemKernel) -> !String Unit {
         "lava.org",
         "ext_cmp",
         "0.1.0",
-        "Multi-source fuzzy completion popup engine (snippets, buffer identifiers, language keywords, file paths).",
+        "Multi-source fuzzy completion popup engine, doc window, signature help, auto-parens, and shadow ghost text.",
         [ext_document_id(), ext_vim_id(), ext_snippets_id()],
         |k: SystemKernel| -> !String Unit {
             let cmp = CmpService.new()
@@ -770,8 +2222,14 @@ pub fn register_cmp_extension(kernel: SystemKernel) -> !String Unit {
             k.register_command(
                 "cmp-complete",
                 ext_id,
-                "Trigger completion popup at cursor (`<C-Space>`).",
+                "Trigger completion popup at cursor (`<C-Space>` / `<M-n>`).",
                 cmd_cmp_complete,
+            )
+            k.register_command(
+                "cmp-signature-help",
+                ext_id,
+                "Show function signature help popup inside call parentheses.",
+                cmd_cmp_signature,
             )
             k.register_command(
                 "cmp-confirm",
@@ -817,14 +2275,40 @@ pub fn register_cmp_extension(kernel: SystemKernel) -> !String Unit {
                     let w = w_opt.as(EditorWorld)
                     let vs = v_opt.as(VimState)
                     if (not c.enabled) or vs.mode != VimMode.Insert or vs.block_insert_active {
-                        let _ = c.dismiss(w)
+                        let _ = c.dismiss_all(w)
                         return
                     }
                     let stroke = payload.as(KeyStroke)
-                    if not is_editing_insert_stroke(stroke) {
+                    if is_editing_insert_stroke(stroke) {
+                        let _ = c.trigger(kern, manual = false) ! { _ => false }
+                    } else {
+                        c.update_inline_ghost(w)
+                    }
+                    c.update_signature_help(kern, w)
+                },
+            )
+
+            k.add_hook(
+                "cursor-moved",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| -> Unit {
+                    let cmp_opt = kern.service(SERVICE_CMP)
+                    let w_opt = kern.service("lava.document.world")
+                    let v_opt = kern.service(SERVICE_VIM)
+                    if cmp_opt == null or w_opt == null or v_opt == null {
                         return
                     }
-                    let _ = c.trigger(kern, manual = false) ! { _ => false }
+                    let c = cmp_opt.as(CmpService)
+                    let w = w_opt.as(EditorWorld)
+                    let vs = v_opt.as(VimState)
+                    if vs.mode == VimMode.Insert and (not vs.block_insert_active) {
+                        let b = w.active_buffer()
+                        let ig = w.inline_ghost
+                        if ig.active and (b.point.row != ig.row or b.point.col != ig.col) {
+                            w.inline_ghost = InlineGhostText.inactive()
+                        }
+                        c.update_signature_help(kern, w)
+                    }
                 },
             )
 
@@ -838,7 +2322,7 @@ pub fn register_cmp_extension(kernel: SystemKernel) -> !String Unit {
                     if cmp_opt != null and w_opt != null and v_opt != null {
                         let vs = v_opt.as(VimState)
                         if vs.mode != VimMode.Insert {
-                            let _ = cmp_opt.as(CmpService).dismiss(w_opt.as(EditorWorld))
+                            let _ = cmp_opt.as(CmpService).dismiss_all(w_opt.as(EditorWorld))
                         }
                     }
                 },
@@ -851,7 +2335,7 @@ pub fn register_cmp_extension(kernel: SystemKernel) -> !String Unit {
                     let cmp_opt = kern.service(SERVICE_CMP)
                     let w_opt = kern.service("lava.document.world")
                     if cmp_opt != null and w_opt != null {
-                        let _ = cmp_opt.as(CmpService).dismiss(w_opt.as(EditorWorld))
+                        let _ = cmp_opt.as(CmpService).dismiss_all(w_opt.as(EditorWorld))
                     }
                 },
             )

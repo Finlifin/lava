@@ -8,7 +8,7 @@ use std.path
 use std.process
 use std.time
 use @lava_sys.{RawUiEvent, mock_enable, mock_last_frame_cmds}
-use @lava_core.{SystemKernel, clipboard_get, clipboard_set, log_event, status_emit}
+use @lava_core.{KeyBindingEntry, SystemKernel, clipboard_get, clipboard_set, log_event, status_emit}
 use @ext_document.{EditorWorld, FloatingWindow, QuickfixEntry, require_editor_world}
 use @ext_window.{WindowManager, require_window_manager}
 use @ext_app.{
@@ -252,19 +252,19 @@ fn test_neotree_plugin(kernel: SystemKernel, world: EditorWorld, tmp_dir: String
     check_eq_str(world.left_sidebar.owner, "ext_neotree", "Neo-tree owner == ext_neotree")
 
     let initial_tree = join_lines(world.left_sidebar.lines)
-    check_true(initial_tree.contains("▸ src/"), "collapsed src/ chevron present: " ++ initial_tree)
+    check_true(initial_tree.contains(" src/"), "collapsed src/ folder icon present: " ++ initial_tree)
     check_true(not initial_tree.contains(".hidden_env"), "dotfiles hidden by default")
     check_true(initial_tree.contains("[A]"), "Neo-tree displays staged Git badge [A]: " ++ initial_tree)
     check_true(initial_tree.contains("[?]"), "Neo-tree displays untracked Git badge [?]: " ++ initial_tree)
 
-    -- 2. Select `src/` (row 0) and press `l` to expand subfolder (`▾ src/`)
+    -- 2. Select `src/` (row 0) and press `l` to expand subfolder (` src/`)
     let src_row = find_line_index_containing(world.left_sidebar.lines, "src/")
     check_true(src_row >= 0, "found src/ row in Neo-tree")
     world.left_sidebar.selected_row = src_row
     app_feed_keys(kernel, "l")# ! { e => panic(e) }
 
     let expanded_tree = join_lines(world.left_sidebar.lines)
-    check_true(expanded_tree.contains("▾ src/"), "expanded src/ chevron: " ++ expanded_tree)
+    check_true(expanded_tree.contains(" src/"), "expanded src/ folder icon: " ++ expanded_tree)
     check_true(expanded_tree.contains("engine.ns"), "expanded src/ shows engine.ns: " ++ expanded_tree)
 
     -- 3. Create a new file inside `src/` via `a` prompt (`new_feature.ns<Return>`)
@@ -332,7 +332,7 @@ fn test_neotree_plugin(kernel: SystemKernel, world: EditorWorld, tmp_dir: String
     let cell_h = if wm_local.metrics.cell_height > 1.0 { wm_local.metrics.cell_height } else { 19.0 }
     let readme_row = find_line_index_containing(world.left_sidebar.lines, "README.md")
     check_true(readme_row >= 0, "README.md row in sidebar")
-    let click_y = cell_h + (readme_row.as(f64)) * cell_h + 4.0
+    let click_y = (cell_h + 8.0) + (readme_row.as(f64)) * cell_h + 4.0
     let _ = app_step_event(kernel, RawUiEvent.MouseButton(true, 1, 40.0, click_y, 0, 1))# ! { e => panic(e) }
     check_eq_str(
         world.active_buffer().file_path,
@@ -462,6 +462,122 @@ fn test_oil_plugin(kernel: SystemKernel, world: EditorWorld, tmp_dir: String) {
     let _ = cap
 }
 
+fn wk_has_text(items: List, needle: String) -> bool {
+    for i in 0..items.len() {
+        let it = items.get(i.as(usize))
+        if it matches _: KeyBindingEntry {
+            let kb = it.as(KeyBindingEntry)
+            if kb.chord.contains(needle)
+                or kb.command_name.contains(needle)
+                or kb.description.contains(needle) {
+                return true
+            }
+        } else if it matches _: (String, String) {
+            let (c, d) = it.as((String, String))
+            if c.contains(needle) or d.contains(needle) {
+                return true
+            }
+        }
+    }
+    false
+}
+
+fn test_vim_which_key_and_icons(kernel: SystemKernel, world: EditorWorld, tmp_dir: String) {
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
+
+    let alpha_path = path.normalize(path.join(tmp_dir, "alpha.ns"))
+    app_feed_keys(kernel, ":e<Space>" ++ alpha_path ++ "<Return>")# ! { e => panic(e) }
+    check_true(world.which_key_items.is_empty(), "Normal mode idle starts with empty which_key_items")
+
+    -- Verify Telescope Nerd Font prompt (` `) & selection (` `) & file icon (``)
+    app_feed_keys(kernel, "<Space> s f")# ! { e => panic(e) }
+    let pk = world.get_floating_window("telescope-picker").as(FloatingWindow)
+    check_true(pk.lines.get(0).as(String).starts_with(" "), "Telescope prompt uses  icon")
+    let pk_joined = join_lines(pk.lines)
+    check_true(pk_joined.contains(" "), "Telescope selected row uses  chevron")
+    check_true(pk_joined.contains(" "), "Telescope file item displays  Nessa icon")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    -- Verify Vim prefix Which-Key (`g`, `z`, `Z`, `[`, `]`, `<C-w>`, `"`, `m`, `'`, `q`, `@`, `f`, `r`)
+    app_feed_keys(kernel, "g")# ! { e => panic(e) }
+    check_eq_str(world.pending_keys_display, "g", "g sets pending_keys_display")
+    check_true(wk_has_text(world.which_key_items, "gg") and wk_has_text(world.which_key_items, "gv"), "g populates built-in g hints")
+    let _ = app_commit_frame(kernel) ! { e => panic(e) }
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+    check_true(world.which_key_items.is_empty(), "Escape clears g hints")
+
+    app_feed_keys(kernel, "z")# ! { e => panic(e) }
+    check_eq_str(world.pending_keys_display, "z", "z sets pending_keys_display")
+    check_true(wk_has_text(world.which_key_items, "zz") and wk_has_text(world.which_key_items, "zt"), "z populates scroll hints")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    app_feed_keys(kernel, "Z")# ! { e => panic(e) }
+    check_true(wk_has_text(world.which_key_items, "ZZ") and wk_has_text(world.which_key_items, "ZQ"), "Z populates quit hints")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    app_feed_keys(kernel, "[")# ! { e => panic(e) }
+    check_true(wk_has_text(world.which_key_items, "[q") and wk_has_text(world.which_key_items, "[i"), "[ populates bracket hints")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    app_feed_keys(kernel, "]")# ! { e => panic(e) }
+    check_true(wk_has_text(world.which_key_items, "]q") and wk_has_text(world.which_key_items, "]i"), "] populates bracket hints")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    app_feed_keys(kernel, "<C-w>")# ! { e => panic(e) }
+    check_true(wk_has_text(world.which_key_items, "quit-window"), "<C-w> includes quit-window")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    -- OperatorPending (`d`) + Text Objects (`di`, `da`)
+    app_feed_keys(kernel, "d")# ! { e => panic(e) }
+    check_eq_str(world.pending_keys_display, "d", "d sets OperatorPending display")
+    check_true(wk_has_text(world.which_key_items, "dd") and wk_has_text(world.which_key_items, "inner text-obj"), "d populates op-pending hints")
+    app_feed_keys(kernel, "i")# ! { e => panic(e) }
+    check_eq_str(world.pending_keys_display, "di", "di sets text-object display")
+    check_true(wk_has_text(world.which_key_items, "inner word") and wk_has_text(world.which_key_items, "braces"), "di populates text-object hints")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+    check_true(world.which_key_items.is_empty(), "Escape cancels di and clears hints")
+
+    -- Register (`"`), Mark (`m` + live `'a`), Macro (`q`/`@`), Find/Replace (`f`/`r`)
+    app_feed_keys(kernel, "\"")# ! { e => panic(e) }
+    check_true(wk_has_text(world.which_key_items, "unnamed") and wk_has_text(world.which_key_items, "clipboard"), "\" populates register hints")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    app_feed_keys(kernel, "m")# ! { e => panic(e) }
+    check_true(wk_has_text(world.which_key_items, "buffer mark"), "m populates mark hints")
+    app_feed_keys(kernel, "a")# ! { e => panic(e) }
+    check_true(world.which_key_items.is_empty(), "ma completes and clears hints")
+
+    app_feed_keys(kernel, "'")# ! { e => panic(e) }
+    check_true(wk_has_text(world.which_key_items, "last jump") and wk_has_text(world.which_key_items, "line "), "' shows live named mark")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    app_feed_keys(kernel, "@")# ! { e => panic(e) }
+    check_true(wk_has_text(world.which_key_items, "@@"), "@ shows repeat macro hint")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    app_feed_keys(kernel, "f")# ! { e => panic(e) }
+    check_true(wk_has_text(world.which_key_items, "<char>"), "f shows target char hint")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    app_feed_keys(kernel, "r")# ! { e => panic(e) }
+    check_true(wk_has_text(world.which_key_items, "<char>"), "r shows replacement char hint")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    -- Visual (`v`) and VisualBlock (`<C-v>`) Which-Key hints + clean reset to Normal
+    app_feed_keys(kernel, "v")# ! { e => panic(e) }
+    check_eq_str(world.pending_keys_display, "", "v sets empty pending_keys_display when no count/reg")
+    check_true(wk_has_text(world.which_key_items, "delete") and wk_has_text(world.which_key_items, "swap end"), "v populates Visual hints")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+    check_true(world.which_key_items.is_empty(), "returning from v to Normal clears which_key_items")
+
+    app_feed_keys(kernel, "<C-v>")# ! { e => panic(e) }
+    check_true(wk_has_text(world.which_key_items, "block insert") and wk_has_text(world.which_key_items, "block append"), "<C-v> includes I/A block hints")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+    check_true(world.which_key_items.is_empty(), "returning from <C-v> to Normal clears which_key_items")
+
+    let _ = cap
+}
+
 fn main() {
     mock_enable(true)
 
@@ -491,6 +607,9 @@ fn main() {
 
     test_oil_plugin(kernel, world, tmp_dir)
     println("  [PASS] Plugin 09: ext_oil")
+
+    test_vim_which_key_and_icons(kernel, world, tmp_dir)
+    println("  [PASS] Vim Which-Key & Nerd Font Icons")
 
     let _ = fs.remove_dir_all(tmp_dir) ! { _ => () }
     println("test_plugins_batch_03: ALL PASSED")

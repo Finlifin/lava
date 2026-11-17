@@ -168,9 +168,13 @@ fn test_mx_continuation_and_abort() {
     assert_eq_i64(buf.point.row, 0, "mark-whole-buffer moved point to top")
     assert_eq_i64(buf.mark.as(Pos).row, 2, "mark-whole-buffer placed mark on last row")
 
-    -- 4. History `<M-p>` recalls `"mark-whole-buffer"` in `M-x`!
-    feed_keys(kernel, "<M-x> <M-p>", clip_cap, log_cap, status_cap)
-    assert_eq_str(mb.input_text, "mark-whole-buffer", "M-p recalls previous CommandName history")
+    -- 4. `<M-n>` / `<M-p>` navigates candidates in `M-x`, while `<M-Up>` recalls CommandName history!
+    feed_keys(kernel, "<M-x> <M-n>", clip_cap, log_cap, status_cap)
+    assert_eq_i64(mb.selected_idx, 1, "M-n advances candidate selection in M-x")
+    feed_keys(kernel, "<M-p>", clip_cap, log_cap, status_cap)
+    assert_eq_i64(mb.selected_idx, 0, "M-p moves candidate selection back in M-x")
+    feed_keys(kernel, "<M-Up>", clip_cap, log_cap, status_cap)
+    assert_eq_str(mb.input_text, "mark-whole-buffer", "M-Up recalls previous CommandName history")
     feed_keys(kernel, "<Escape>", clip_cap, log_cap, status_cap)
     assert_true(kernel.active_prompt == null, "Escape cancels M-x cleanly")
 

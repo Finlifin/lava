@@ -539,10 +539,11 @@ struct SurroundSession {
     checkpoint_label: String,
     tag_commit: TagCommitKind,
     tag_buf: String,
+    prefix_display: String,
 }
 
 impl SurroundSession {
-    fn new(phase: SurroundPhase, checkpoint_label: String) -> SurroundSession {
+    fn new(phase: SurroundPhase, checkpoint_label: String, .prefix_display: String = "ys") -> SurroundSession {
         SurroundSession {
             phase: phase,
             count: 0,
@@ -556,6 +557,7 @@ impl SurroundSession {
             checkpoint_label: checkpoint_label,
             tag_commit: TagCommitKind.WrapSpan,
             tag_buf: "",
+            prefix_display: prefix_display,
         }
     }
 
@@ -564,7 +566,139 @@ impl SurroundSession {
     }
 }
 
+fn surround_wrap_delim_hints() -> List {
+    [
+        (") / b", "wrap (text)"),
+        ("(", "wrap ( text )"),
+        ("]", "wrap [text]"),
+        ("[", "wrap [ text ]"),
+        ("}} / B", "wrap {{text}}"),
+        ("{{", "wrap {{ text }}"),
+        (">", "wrap <text>"),
+        ("<", "wrap < text >"),
+        ("\"", "wrap \"text\""),
+        ("'", "wrap 'text'"),
+        ("`", "wrap `text`"),
+        ("t", "wrap <tag>...</tag>"),
+        ("<Esc>", "cancel"),
+    ]
+}
+
+fn surround_target_delim_hints(verb: String) -> List {
+    [
+        (") / b", verb ++ " ()"),
+        ("(", verb ++ " ( ) + space"),
+        ("]", verb ++ " []"),
+        ("[", verb ++ " [ ] + space"),
+        ("}} / B", verb ++ " {{}}"),
+        ("{{", verb ++ " {{ }} + space"),
+        (">", verb ++ " <>"),
+        ("\"", verb ++ " \"\""),
+        ("'", verb ++ " ''"),
+        ("`", verb ++ " ``"),
+        ("t", verb ++ " <tag>"),
+        ("<Esc>", "cancel"),
+    ]
+}
+
+fn surround_motion_hints() -> List {
+    [
+        ("s", "surround line (yss)"),
+        ("i", "inner text-obj"),
+        ("a", "around text-obj"),
+        ("w", "word"),
+        ("W", "WORD"),
+        ("e", "word end"),
+        ("b", "word back"),
+        ("$", "to line end"),
+        ("0", "to line start"),
+        ("^", "to first non-blank"),
+        ("f", "find char"),
+        ("t", "till char"),
+        ("<Esc>", "cancel"),
+    ]
+}
+
+fn surround_text_object_hints(around: bool) -> List {
+    let pfx = if around { "around " } else { "inner " }
+    [
+        ("w", pfx ++ "word"),
+        ("W", pfx ++ "WORD"),
+        ("p", pfx ++ "paragraph"),
+        ("i", pfx ++ "indent block"),
+        ("I", pfx ++ "indent + header"),
+        ("\"", pfx ++ "double quotes"),
+        ("'", pfx ++ "single quotes"),
+        ("`", pfx ++ "backticks"),
+        (") / b", pfx ++ "parens ()"),
+        ("]", pfx ++ "brackets []"),
+        ("}} / B", pfx ++ "braces {{}}"),
+        (">", pfx ++ "angle <>"),
+        ("t", pfx ++ "HTML/XML <tag>"),
+        ("<Esc>", "cancel"),
+    ]
+}
+
+fn sync_surround_which_key(world: EditorWorld, vim: VimState, session: SurroundSession) {
+    vim.vim_owns_which_key = false
+    let cnt_str = if session.count > 0 { session.count.to_string() } else { "" }
+    session.phase match {
+        SurroundPhase.AddAwaitMotion => {
+            world.pending_keys_display = "ys" ++ cnt_str
+            world.which_key_items = surround_motion_hints()
+        },
+        SurroundPhase.AddAwaitTextObj => {
+            let scope_ch = if session.around { "a" } else { "i" }
+            world.pending_keys_display = "ys" ++ cnt_str ++ scope_ch
+            world.which_key_items = surround_text_object_hints(session.around)
+        },
+        SurroundPhase.AddAwaitFindChar => {
+            world.pending_keys_display = "ys" ++ cnt_str ++ session.find_kind
+            world.which_key_items = [
+                ("<char>", "target character"),
+                ("<Esc>", "cancel"),
+            ]
+        },
+        SurroundPhase.AddAwaitDelim => {
+            world.pending_keys_display = session.prefix_display
+            world.which_key_items = surround_wrap_delim_hints()
+        },
+        SurroundPhase.VisualAwaitDelim => {
+            world.pending_keys_display = session.prefix_display
+            world.which_key_items = surround_wrap_delim_hints()
+        },
+        SurroundPhase.DeleteAwaitTarget => {
+            world.pending_keys_display = "ds"
+            world.which_key_items = surround_target_delim_hints("delete")
+        },
+        SurroundPhase.ChangeAwaitOld => {
+            world.pending_keys_display = "cs"
+            world.which_key_items = surround_target_delim_hints("change")
+        },
+        SurroundPhase.ChangeAwaitNew => {
+            world.pending_keys_display = "cs" ++ session.old_delim
+            world.which_key_items = surround_wrap_delim_hints()
+        },
+        SurroundPhase.ReadTag => {
+            world.pending_keys_display = session.prefix_display ++ "<" ++ session.tag_buf
+            world.which_key_items = [
+                ("<tag>", "HTML/XML tag name"),
+                ("<Ret> / >", "confirm tag"),
+                ("<Esc>", "cancel"),
+            ]
+        },
+    }
+}
+
+fn clear_surround_which_key(world: EditorWorld, vim: VimState) {
+    vim.clear_interceptor()
+    world.pending_keys_display = ""
+    world.which_key_items = List()
+    vim.vim_owns_which_key = false
+}
+
 fn finish_with_delim(
+    world: EditorWorld,
     session: SurroundSession,
     buf: Buffer,
     vim: VimState,
@@ -574,23 +708,28 @@ fn finish_with_delim(
         session.tag_buf = ""
         if session.phase == SurroundPhase.ChangeAwaitNew {
             session.tag_commit = TagCommitKind.ChangeExisting
+            session.prefix_display = "cs" ++ session.old_delim ++ delim
         } else if session.phase == SurroundPhase.VisualAwaitDelim and session.visual_linewise {
             session.tag_commit = TagCommitKind.WrapLines
+            session.prefix_display = session.prefix_display ++ delim
         } else {
             session.tag_commit = TagCommitKind.WrapSpan
+            session.prefix_display = session.prefix_display ++ delim
         }
         session.phase = SurroundPhase.ReadTag
+        sync_surround_which_key(world, vim, session)
         status_emit("Tag name: <")#
         return true
     }
 
     let pair? = resolve_wrap_pair(delim) else {
-        vim.clear_interceptor()
+        clear_surround_which_key(world, vim)
         return true
     }
 
     if session.phase == SurroundPhase.ChangeAwaitNew {
         let _ = apply_surround_change(buf, vim, session.old_delim, pair)#!
+        clear_surround_which_key(world, vim)
         return true
     }
     if session.phase == SurroundPhase.VisualAwaitDelim and session.visual_linewise {
@@ -602,25 +741,26 @@ fn finish_with_delim(
             pair,
             session.checkpoint_label,
         )!
+        clear_surround_which_key(world, vim)
         return true
     }
     apply_surround_wrap_span(buf, vim, session.target_span, pair, session.checkpoint_label)!
+    clear_surround_which_key(world, vim)
     true
 }
 
-fn install_surround_interceptor(vim: VimState, session: SurroundSession) {
+fn install_surround_interceptor(world: EditorWorld, vim: VimState, session: SurroundSession) {
     vim.set_interceptor(
         "ext_surround",
         |kern: SystemKernel, stroke: KeyStroke| -> #ServiceEffects !String bool {
-            let world = require_editor_world(kern)!
+            let w = require_editor_world(kern)!
             let v = require_vim_state(kern)!
-            let buf = world.active_buffer()
+            let buf = w.active_buffer()
 
             if is_cancel_stroke(stroke) {
-                v.clear_interceptor()
                 v.mode = VimMode.Normal
                 v.clear_transient()
-                world.pending_keys_display = ""
+                clear_surround_which_key(w, v)
                 return true
             }
 
@@ -631,6 +771,7 @@ fn install_surround_interceptor(vim: VimState, session: SurroundSession) {
                     if tlen > 0 {
                         session.tag_buf = session.tag_buf.slice(0, tlen - 1)
                     }
+                    sync_surround_which_key(w, v, session)
                     status_emit("Tag name: <" ++ session.tag_buf)#
                     return true
                 }
@@ -638,9 +779,9 @@ fn install_surround_interceptor(vim: VimState, session: SurroundSession) {
                 if stroke.key == "Return" or (stroke.ctrl and stroke.key == "m") or ch == ">" {
                     let tag_pair? = build_tag_pair(session.tag_buf) else {
                         status_emit("Surround tag cancelled")#
-                        v.clear_interceptor()
                         v.mode = VimMode.Normal
                         v.clear_transient()
+                        clear_surround_which_key(w, v)
                         return true
                     }
                     session.tag_commit match {
@@ -667,6 +808,7 @@ fn install_surround_interceptor(vim: VimState, session: SurroundSession) {
                             )!
                         },
                     }
+                    clear_surround_which_key(w, v)
                     return true
                 }
                 if ch != "" {
@@ -674,6 +816,7 @@ fn install_surround_interceptor(vim: VimState, session: SurroundSession) {
                         return true
                     }
                     session.tag_buf = session.tag_buf ++ ch
+                    sync_surround_which_key(w, v, session)
                     status_emit("Tag name: <" ++ session.tag_buf ++ ">")#
                 }
                 return true
@@ -681,26 +824,31 @@ fn install_surround_interceptor(vim: VimState, session: SurroundSession) {
 
             let ch = stroke_char(stroke)
             if ch == "" {
-                v.clear_interceptor()
+                clear_surround_which_key(w, v)
                 return true
             }
 
             if session.phase == SurroundPhase.DeleteAwaitTarget {
                 let _ = apply_surround_delete(buf, v, ch)#!
+                clear_surround_which_key(w, v)
                 return true
             }
 
             if session.phase == SurroundPhase.ChangeAwaitOld {
                 session.old_delim = ch
+                session.prefix_display = "cs" ++ ch
                 session.phase = SurroundPhase.ChangeAwaitNew
+                sync_surround_which_key(w, v, session)
                 return true
             }
 
             if session.phase == SurroundPhase.ChangeAwaitNew
                 or session.phase == SurroundPhase.AddAwaitDelim
                 or session.phase == SurroundPhase.VisualAwaitDelim {
-                return finish_with_delim(session, buf, v, ch)#!
+                return finish_with_delim(w, session, buf, v, ch)#!
             }
+
+            let cnt_str = if session.count > 0 { session.count.to_string() } else { "" }
 
             if session.phase == SurroundPhase.AddAwaitFindChar {
                 let tgt = motion_find_char_in_line(
@@ -713,7 +861,7 @@ fn install_surround_interceptor(vim: VimState, session: SurroundSession) {
                 )
                 if not tgt.valid {
                     status_emit("Surround motion target not found")#
-                    v.clear_interceptor()
+                    clear_surround_which_key(w, v)
                     return true
                 }
                 let sp = if tgt.shape == MotionShape.Exclusive {
@@ -725,15 +873,18 @@ fn install_surround_interceptor(vim: VimState, session: SurroundSession) {
                     Span.normalized(lo, Pos.new(hi.row, if hi.col < hlen { hi.col + 1 } else { hlen }))
                 }
                 session.target_span = sp
+                session.prefix_display = "ys" ++ cnt_str ++ session.find_kind ++ ch
                 session.phase = SurroundPhase.AddAwaitDelim
+                sync_surround_which_key(w, v, session)
                 return true
             }
 
             if session.phase == SurroundPhase.AddAwaitTextObj {
+                let scope_ch = if session.around { "a" } else { "i" }
                 if ch == "t" or ch == "T" {
                     let tm? = find_enclosing_tag(buf, buf.point) else {
                         status_emit("Surround tag not found")#
-                        v.clear_interceptor()
+                        clear_surround_which_key(w, v)
                         return true
                     }
                     session.target_span = if session.around {
@@ -741,16 +892,20 @@ fn install_surround_interceptor(vim: VimState, session: SurroundSession) {
                     } else {
                         Span.normalized(tm.open_end, tm.close_start)
                     }
+                    session.prefix_display = "ys" ++ cnt_str ++ scope_ch ++ ch
                     session.phase = SurroundPhase.AddAwaitDelim
+                    sync_surround_which_key(w, v, session)
                     return true
                 }
                 let tr? = resolve_text_object(buf, buf.point, session.around, ch, session.eff_count()) else {
                     status_emit("Surround text object not found")#
-                    v.clear_interceptor()
+                    clear_surround_which_key(w, v)
                     return true
                 }
                 session.target_span = tr.span
+                session.prefix_display = "ys" ++ cnt_str ++ scope_ch ++ ch
                 session.phase = SurroundPhase.AddAwaitDelim
+                sync_surround_which_key(w, v, session)
                 return true
             }
 
@@ -759,6 +914,7 @@ fn install_surround_interceptor(vim: VimState, session: SurroundSession) {
                 let d = ch.parse_i64().as(i64)
                 if d > 0 or session.count > 0 {
                     session.count = session.count * 10 + d
+                    sync_surround_which_key(w, v, session)
                     return true
                 }
             }
@@ -767,19 +923,23 @@ fn install_surround_interceptor(vim: VimState, session: SurroundSession) {
             if ch == "s" {
                 let end_r = buf.point.row + eff - 1
                 session.target_span = line_non_blank_span(buf, buf.point.row, end_r)
+                session.prefix_display = "ys" ++ cnt_str ++ "s"
                 session.phase = SurroundPhase.AddAwaitDelim
+                sync_surround_which_key(w, v, session)
                 return true
             }
 
             if ch == "i" or ch == "a" {
                 session.around = ch == "a"
                 session.phase = SurroundPhase.AddAwaitTextObj
+                sync_surround_which_key(w, v, session)
                 return true
             }
 
             if ch == "f" or ch == "F" or ch == "t" or ch == "T" {
                 session.find_kind = ch
                 session.phase = SurroundPhase.AddAwaitFindChar
+                sync_surround_which_key(w, v, session)
                 return true
             }
 
@@ -790,20 +950,26 @@ fn install_surround_interceptor(vim: VimState, session: SurroundSession) {
                     buf.max_row()
                 }
                 session.target_span = Span.normalized(buf.point, Pos.new(tr, buf.line_char_len(tr)))
+                session.prefix_display = "ys" ++ cnt_str ++ "$"
                 session.phase = SurroundPhase.AddAwaitDelim
+                sync_surround_which_key(w, v, session)
                 return true
             }
 
             if ch == "0" {
                 session.target_span = Span.normalized(Pos.new(buf.point.row, 0), buf.point)
+                session.prefix_display = "ys" ++ cnt_str ++ "0"
                 session.phase = SurroundPhase.AddAwaitDelim
+                sync_surround_which_key(w, v, session)
                 return true
             }
 
             if ch == "^" {
                 let fnb = buf.first_non_blank_col(buf.point.row)
                 session.target_span = Span.normalized(Pos.new(buf.point.row, fnb), buf.point)
+                session.prefix_display = "ys" ++ cnt_str ++ "^"
                 session.phase = SurroundPhase.AddAwaitDelim
+                sync_surround_which_key(w, v, session)
                 return true
             }
 
@@ -822,7 +988,9 @@ fn install_surround_interceptor(vim: VimState, session: SurroundSession) {
                     let tgt = motion_word_forward(buf, buf.point, eff, big, true)
                     session.target_span = Span.normalized(buf.point, tgt.pos)
                 }
+                session.prefix_display = "ys" ++ cnt_str ++ ch
                 session.phase = SurroundPhase.AddAwaitDelim
+                sync_surround_which_key(w, v, session)
                 return true
             }
 
@@ -831,22 +999,27 @@ fn install_surround_interceptor(vim: VimState, session: SurroundSession) {
                 let hlen = buf.line_char_len(tgt.pos.row)
                 let ec = if tgt.pos.col < hlen { tgt.pos.col + 1 } else { hlen }
                 session.target_span = Span.normalized(buf.point, Pos.new(tgt.pos.row, ec))
+                session.prefix_display = "ys" ++ cnt_str ++ ch
                 session.phase = SurroundPhase.AddAwaitDelim
+                sync_surround_which_key(w, v, session)
                 return true
             }
 
             if ch == "b" or ch == "B" {
                 let tgt = motion_word_backward(buf, buf.point, eff, ch == "B")
                 session.target_span = Span.normalized(tgt.pos, buf.point)
+                session.prefix_display = "ys" ++ cnt_str ++ ch
                 session.phase = SurroundPhase.AddAwaitDelim
+                sync_surround_which_key(w, v, session)
                 return true
             }
 
             status_emit("Unsupported surround motion: " ++ ch)#
-            v.clear_interceptor()
+            clear_surround_which_key(w, v)
             true
         },
     )
+    sync_surround_which_key(world, vim, session)
 }
 
 -- ============================================================================
@@ -922,8 +1095,8 @@ pub fn register_surround_extension(kernel: SystemKernel) -> !String Unit {
                         sync_world_from_vim(world, vim)
                         return ()
                     }
-                    let session = SurroundSession.new(SurroundPhase.AddAwaitMotion, "surround-add")
-                    install_surround_interceptor(vim, session)
+                    let session = SurroundSession.new(SurroundPhase.AddAwaitMotion, "surround-add", prefix_display = "ys")
+                    install_surround_interceptor(world, vim, session)
                     sync_world_from_vim(world, vim)
                     ()
                 },
@@ -957,9 +1130,9 @@ pub fn register_surround_extension(kernel: SystemKernel) -> !String Unit {
                         sync_world_from_vim(world, vim)
                         return ()
                     }
-                    let session = SurroundSession.new(SurroundPhase.AddAwaitDelim, "surround-add")
+                    let session = SurroundSession.new(SurroundPhase.AddAwaitDelim, "surround-add", prefix_display = "yss")
                     session.target_span = sp
-                    install_surround_interceptor(vim, session)
+                    install_surround_interceptor(world, vim, session)
                     sync_world_from_vim(world, vim)
                     ()
                 },
@@ -981,8 +1154,8 @@ pub fn register_surround_extension(kernel: SystemKernel) -> !String Unit {
                         }
                         return ()
                     }
-                    let session = SurroundSession.new(SurroundPhase.DeleteAwaitTarget, "surround-delete")
-                    install_surround_interceptor(vim, session)
+                    let session = SurroundSession.new(SurroundPhase.DeleteAwaitTarget, "surround-delete", prefix_display = "ds")
+                    install_surround_interceptor(world, vim, session)
                     sync_world_from_vim(world, vim)
                     ()
                 },
@@ -1029,8 +1202,8 @@ pub fn register_surround_extension(kernel: SystemKernel) -> !String Unit {
                         }
                         return ()
                     }
-                    let session = SurroundSession.new(SurroundPhase.ChangeAwaitOld, "surround-change")
-                    install_surround_interceptor(vim, session)
+                    let session = SurroundSession.new(SurroundPhase.ChangeAwaitOld, "surround-change", prefix_display = "cs")
+                    install_surround_interceptor(world, vim, session)
                     sync_world_from_vim(world, vim)
                     ()
                 },
@@ -1083,12 +1256,12 @@ pub fn register_surround_extension(kernel: SystemKernel) -> !String Unit {
                         return ()
                     }
 
-                    let session = SurroundSession.new(SurroundPhase.VisualAwaitDelim, "surround-visual")
+                    let session = SurroundSession.new(SurroundPhase.VisualAwaitDelim, "surround-visual", prefix_display = "S")
                     session.visual_linewise = linewise
                     session.visual_r1 = r1
                     session.visual_r2 = r2
                     session.target_span = char_span
-                    install_surround_interceptor(vim, session)
+                    install_surround_interceptor(world, vim, session)
                     sync_world_from_vim(world, vim)
                     ()
                 },
@@ -1098,11 +1271,16 @@ pub fn register_surround_extension(kernel: SystemKernel) -> !String Unit {
         |k: SystemKernel| -> !String Unit {
             unbind_owner_from_keymaps(k, ext_id)
             let vim_opt = k.service(SERVICE_VIM)
+            let w_opt = k.service("lava.document.world")
             if vim_opt != null {
                 let vim = vim_opt.as(VimState)
                 if vim.modal_interceptor != null
                     and vim.modal_interceptor.as(ModalInterceptor).owner == "ext_surround" {
-                    vim.clear_interceptor()
+                    if w_opt != null {
+                        clear_surround_which_key(w_opt.as(EditorWorld), vim)
+                    } else {
+                        vim.clear_interceptor()
+                    }
                 }
             }
             ()

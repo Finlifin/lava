@@ -6,7 +6,9 @@ pub mod motions
 pub mod text_objects
 pub mod ex_cmd
 
+use std.collections.HashMap
 use std.fs
+use std.path
 use @lava_sys.CaretShape
 use @lava_core.{
     ExtId, InteractiveEffects, KeyBindingEntry, KeyLookup, KeyStroke, Keymap, PromptKind,
@@ -128,6 +130,9 @@ pub struct VimState {
     pub last_expand_mode: VimMode,
     pub last_expand_anchor: Pos,
     pub last_expand_point: Pos,
+    pub plugin_hint_cache: HashMap,
+    pub plugin_hint_cache_sig: String,
+    pub vim_owns_which_key: bool,
 }
 
 impl VimState {
@@ -180,6 +185,9 @@ impl VimState {
             last_expand_mode: VimMode.Normal,
             last_expand_anchor: Pos.zero(),
             last_expand_point: Pos.zero(),
+            plugin_hint_cache: HashMap.new(),
+            plugin_hint_cache_sig: "",
+            vim_owns_which_key: false,
         }
     }
 
@@ -295,6 +303,412 @@ fn abort_change(vim: VimState) {
     vim.change_strokes = List()
 }
 
+fn compact_vim_chord(chord: String) -> String {
+    let trimmed = chord.trim()
+    if not trimmed.contains(" ") {
+        return trimmed
+    }
+    let parts = trimmed.split(" ")
+    var all_single = true
+    for i in 0..parts.len() {
+        let p = parts.get(i.as(usize)).as(String)
+        if p.char_len() != 1 {
+            all_single = false
+            break
+        }
+    }
+    if all_single {
+        parts.join("")
+    } else {
+        trimmed
+    }
+}
+
+fn merge_hint_pairs(base: List, extra: List) -> List {
+    let out = List()
+    let seen = HashMap.new()
+    for i in 0..base.len() {
+        let (ch, desc) = base.get(i.as(usize)).as((String, String))
+        if not seen.contains_key(ch) {
+            seen.insert(ch, true)
+            out.push((ch, desc))
+        }
+    }
+    for i in 0..extra.len() {
+        let (ch, desc) = extra.get(i.as(usize)).as((String, String))
+        if not seen.contains_key(ch) {
+            seen.insert(ch, true)
+            out.push((ch, desc))
+        }
+    }
+    out
+}
+
+fn cached_plugin_hints(vim: VimState, key: String) -> List {
+    let opt = vim.plugin_hint_cache.get(key)
+    if opt != null {
+        opt.as(List)
+    } else {
+        List()
+    }
+}
+
+fn collect_prefix_hints_from_keymaps(
+    kernel: SystemKernel,
+    km_names: List,
+    prefix_key: String,
+) -> List {
+    let pairs = List()
+    let seen = HashMap.new()
+    for ki in 0..km_names.len() {
+        let km_name = km_names.get(ki.as(usize)).as(String)
+        let km_opt = kernel.keymaps.get(km_name)
+        if km_opt != null {
+            km_opt.as(Keymap).lookup([KeyStroke.plain(prefix_key)]) match {
+                KeyLookup.Prefix(hints) => {
+                    let sorted = sort_key_hints(hints)
+                    for hi in 0..sorted.len() {
+                        let e = sorted.get(hi.as(usize)).as(KeyBindingEntry)
+                        if kernel.is_extension_active(e.owner) {
+                            let c = compact_vim_chord(e.chord)
+                            if not seen.contains_key(c) {
+                                seen.insert(c, true)
+                                let d = if e.description != "" { e.description } else { e.command_name }
+                                pairs.push((c, d))
+                            }
+                        }
+                    }
+                },
+                _ => (),
+            }
+        }
+    }
+    pairs
+}
+
+fn collect_visual_keymap_hints(kernel: SystemKernel) -> List {
+    let pairs = List()
+    let seen = HashMap.new()
+    let km_opt = kernel.keymaps.get(KEYMAP_VIM_VISUAL)
+    if km_opt == null {
+        return pairs
+    }
+    let entries = km_opt.as(Keymap).all_entries()
+    entries.sort_by(|a: Any, b: Any| {
+        a.as(KeyBindingEntry).chord.cmp(b.as(KeyBindingEntry).chord)
+    })
+    for i in 0..entries.len() {
+        let e = entries.get(i.as(usize)).as(KeyBindingEntry)
+        if kernel.is_extension_active(e.owner) {
+            let c = compact_vim_chord(e.chord)
+            -- Skip internal boundary/meta bindings already covered or better shown under `[`/`]`/`<Space>`
+            if c != "[i" and c != "]i" and (not c.starts_with("<M-")) and (not c.starts_with("<Space>")) {
+                if not seen.contains_key(c) {
+                    seen.insert(c, true)
+                    let d = if e.description != "" { e.description } else { e.command_name }
+                    pairs.push((c, d))
+                }
+            }
+        }
+    }
+    pairs
+}
+
+fn keymap_len(kernel: SystemKernel, name: String) -> i64 {
+    let km_opt = kernel.keymaps.get(name)
+    if km_opt == null {
+        0
+    } else {
+        km_opt.as(Keymap).bindings.len().as(i64)
+    }
+}
+
+pub fn refresh_plugin_hint_cache(kernel: SystemKernel, world: EditorWorld, vim: VimState) {
+    let buf = world.active_buffer()
+    let mode_km = "mode:" ++ buf.major_mode
+    let sig = mode_km
+        ++ ":" ++ keymap_len(kernel, mode_km).to_string()
+        ++ ":" ++ keymap_len(kernel, KEYMAP_VIM_NORMAL).to_string()
+        ++ ":" ++ keymap_len(kernel, KEYMAP_VIM_VISUAL).to_string()
+    if vim.plugin_hint_cache_sig == sig {
+        return
+    }
+    vim.plugin_hint_cache_sig = sig
+    let norm_kms = [mode_km, KEYMAP_VIM_NORMAL]
+    let vis_kms = [KEYMAP_VIM_VISUAL]
+    vim.plugin_hint_cache.insert("g:normal", collect_prefix_hints_from_keymaps(kernel, norm_kms, "g"))
+    vim.plugin_hint_cache.insert("g:visual", collect_prefix_hints_from_keymaps(kernel, vis_kms, "g"))
+    vim.plugin_hint_cache.insert("[:normal", collect_prefix_hints_from_keymaps(kernel, norm_kms, "["))
+    vim.plugin_hint_cache.insert("[:visual", collect_prefix_hints_from_keymaps(kernel, vis_kms, "["))
+    vim.plugin_hint_cache.insert("]:normal", collect_prefix_hints_from_keymaps(kernel, norm_kms, "]"))
+    vim.plugin_hint_cache.insert("]:visual", collect_prefix_hints_from_keymaps(kernel, vis_kms, "]"))
+    vim.plugin_hint_cache.insert("z:normal", collect_prefix_hints_from_keymaps(kernel, norm_kms, "z"))
+    vim.plugin_hint_cache.insert("z:visual", collect_prefix_hints_from_keymaps(kernel, vis_kms, "z"))
+    vim.plugin_hint_cache.insert("op:y", collect_prefix_hints_from_keymaps(kernel, [KEYMAP_VIM_NORMAL], "y"))
+    vim.plugin_hint_cache.insert("op:d", collect_prefix_hints_from_keymaps(kernel, [KEYMAP_VIM_NORMAL], "d"))
+    vim.plugin_hint_cache.insert("op:c", collect_prefix_hints_from_keymaps(kernel, [KEYMAP_VIM_NORMAL], "c"))
+    vim.plugin_hint_cache.insert("visual:all", collect_visual_keymap_hints(kernel))
+}
+
+fn build_text_object_which_key_hints(around: bool) -> List {
+    let pfx = if around { "around " } else { "inner " }
+    [
+        ("w", pfx ++ "word"),
+        ("W", pfx ++ "WORD"),
+        ("p", pfx ++ "paragraph"),
+        ("i", pfx ++ "indent block"),
+        ("I", pfx ++ "indent + header"),
+        ("\"", pfx ++ "double quotes"),
+        ("'", pfx ++ "single quotes"),
+        ("`", pfx ++ "backticks"),
+        (") / b", pfx ++ "parens ()"),
+        ("(", pfx ++ "parens ( )"),
+        ("]", pfx ++ "brackets []"),
+        ("[", pfx ++ "brackets [ ]"),
+        ("}} / B", pfx ++ "braces {{}}"),
+        ("{{", pfx ++ "braces {{ }}"),
+        (">", pfx ++ "angle <>"),
+        ("<", pfx ++ "angle < >"),
+    ]
+}
+
+fn build_mark_jump_which_key_hints(world: EditorWorld, buf: Buffer, pfx: String) -> List {
+    let items = List()
+    items.push((pfx ++ pfx, "last jump"))
+    items.push((".", "last change"))
+    items.push(("^", "last insert"))
+    items.push(("<", "visual start"))
+    items.push((">", "visual end"))
+
+    let local_keys = buf.named_marks.keys()
+    local_keys.sort()
+    var has_local = false
+    for i in 0..local_keys.len() {
+        let mk = local_keys.get(i.as(usize)).as(String)
+        if mk.char_len() == 1 and mk.is_ascii_alphabetic() {
+            has_local = true
+            let mp = buf.named_marks.get(mk).as(Pos)
+            items.push((mk, "line " ++ (mp.row + 1).to_string()))
+        }
+    }
+    if not has_local {
+        items.push(("a-z", "buffer mark"))
+    }
+
+    let glob_keys = world.global_marks.keys()
+    glob_keys.sort()
+    var has_glob = false
+    for i in 0..glob_keys.len() {
+        let gk = glob_keys.get(i.as(usize)).as(String)
+        has_glob = true
+        let je = world.global_marks.get(gk).as(JumpEntry)
+        let fname_opt = if je.file_path != "" { path.file_name(je.file_path) } else { null }
+        let fname = if fname_opt != null { fname_opt.as(String) } else { "buf" }
+        items.push((gk, fname ++ ":" ++ (je.pos.row + 1).to_string()))
+    }
+    if not has_glob {
+        items.push(("A-Z", "global file mark"))
+    }
+    items
+}
+
+fn build_prefix_which_key_hints(world: EditorWorld, buf: Buffer, vim: VimState, pfx: String) -> List {
+    let vis = is_visual_mode(vim.mode)
+    if pfx == "<C-w>" {
+        return build_window_which_key_hints()
+    }
+    if pfx == "g" {
+        let base = List()
+        base.push(("gg", "first line"))
+        base.push(("ge", "prev word end"))
+        base.push(("gE", "prev WORD end"))
+        base.push(("g_", "last non-blank"))
+        if vim.mode == VimMode.Normal {
+            base.push(("gu", "lowercase operator"))
+            base.push(("gU", "uppercase operator"))
+            base.push(("g~", "toggle case operator"))
+            base.push(("gv", "reselect visual"))
+            base.push(("gi", "last insert"))
+            base.push(("gf", "goto file"))
+            base.push(("gJ", "join no-space"))
+            base.push(("g-", "undo time branch"))
+            base.push(("g+", "redo time branch"))
+        } else if vis {
+            base.push(("gv", "reselect visual"))
+            base.push(("gf", "goto file"))
+            base.push(("gJ", "join no-space"))
+        } else {
+            vim.mode match {
+                VimMode.OperatorPending(op) => {
+                    if op == "gu" {
+                        base.push(("gu", "lowercase line"))
+                    } else if op == "gU" {
+                        base.push(("gU", "uppercase line"))
+                    } else if op == "g~" {
+                        base.push(("g~", "toggle case line"))
+                    }
+                },
+                _ => (),
+            }
+        }
+        return merge_hint_pairs(base, cached_plugin_hints(vim, if vis { "g:visual" } else { "g:normal" }))
+    }
+    if pfx == "z" {
+        let base = [
+            ("zz", "center cursor"),
+            ("zt", "cursor to top"),
+            ("zb", "cursor to bottom"),
+        ]
+        return merge_hint_pairs(base, cached_plugin_hints(vim, if vis { "z:visual" } else { "z:normal" }))
+    }
+    if pfx == "Z" {
+        return [
+            ("ZZ", "save & quit"),
+            ("ZQ", "quit without saving"),
+        ]
+    }
+    if pfx == "[" or pfx == "]" {
+        let base = if pfx == "[" {
+            [
+                ("[q", "prev quickfix"),
+                ("[i", "top of indent edge"),
+            ]
+        } else {
+            [
+                ("]q", "next quickfix"),
+                ("]i", "bottom of indent edge"),
+            ]
+        }
+        let cache_key = pfx ++ (if vis { ":visual" } else { ":normal" })
+        return merge_hint_pairs(base, cached_plugin_hints(vim, cache_key))
+    }
+    if pfx == "i" or pfx == "a" {
+        return build_text_object_which_key_hints(pfx == "a")
+    }
+    if pfx == "\"" {
+        return [
+            ("\"", "unnamed register"),
+            ("+ / *", "system clipboard"),
+            ("0-9", "yank/delete history"),
+            ("a-z", "named register"),
+            ("A-Z", "append register"),
+            ("_", "black hole"),
+            ("/", "last search"),
+            (":", "last ex cmd"),
+        ]
+    }
+    if pfx == "m" {
+        return [
+            ("a-z", "buffer mark"),
+            ("A-Z", "global file mark"),
+        ]
+    }
+    if pfx == "'" or pfx == "`" {
+        return build_mark_jump_which_key_hints(world, buf, pfx)
+    }
+    if pfx == "q" {
+        return [
+            ("a-z", "record macro register"),
+            ("<Esc>", "cancel"),
+        ]
+    }
+    if pfx == "@" {
+        return [
+            ("@@", "repeat last macro"),
+            ("a-z", "play macro register"),
+            ("<Esc>", "cancel"),
+        ]
+    }
+    if pfx == "f" or pfx == "F" or pfx == "t" or pfx == "T" {
+        let desc = when {
+            pfx == "f" => "find char forward",
+            pfx == "F" => "find char backward",
+            pfx == "t" => "till char forward",
+            else => "till char backward",
+        }
+        return [
+            ("<char>", desc),
+            ("<Esc>", "cancel"),
+        ]
+    }
+    if pfx == "r" {
+        if vis {
+            return [
+                ("<char>", "replace selection char"),
+                ("<Esc>", "cancel"),
+            ]
+        }
+        return [
+            ("<char>", "replacement char"),
+            ("<Ret>", "replace with newline"),
+            ("<Esc>", "cancel"),
+        ]
+    }
+    List()
+}
+
+fn build_operator_pending_which_key_hints(vim: VimState, op: String) -> List {
+    let base = List()
+    when {
+        op == "d" => { base.push(("dd", "delete line")) },
+        op == "c" => { base.push(("cc", "change line")) },
+        op == "y" => { base.push(("yy", "yank line")) },
+        op == ">" => { base.push((">>", "indent line")) },
+        op == "<" => { base.push(("<<", "outdent line")) },
+        op == "=" => { base.push(("==", "auto-indent line")) },
+        op == "gu" => { base.push(("guu", "lowercase line")) },
+        op == "gU" => { base.push(("gUU", "uppercase line")) },
+        op == "g~" => { base.push(("g~~", "toggle case line")) },
+        else => (),
+    }
+    let with_plugins = merge_hint_pairs(base, cached_plugin_hints(vim, "op:" ++ op))
+    let motions = [
+        ("i", "inner text-obj"),
+        ("a", "around text-obj"),
+        ("w", "next word"),
+        ("b", "prev word"),
+        ("e", "word end"),
+        ("0", "line start"),
+        ("^", "first non-blank"),
+        ("$", "line end"),
+        ("f", "find char"),
+        ("t", "till char"),
+        ("gg", "first line"),
+        ("G", "last line"),
+        ("%", "match bracket"),
+        ("{{ / }}", "paragraph"),
+        ("<Esc>", "cancel"),
+    ]
+    merge_hint_pairs(with_plugins, motions)
+}
+
+fn build_visual_which_key_hints(vim: VimState) -> List {
+    let base = List()
+    base.push(("d", "delete"))
+    base.push(("c", "change"))
+    base.push(("y", "yank"))
+    base.push(("i", "inner text-obj"))
+    base.push(("a", "around text-obj"))
+    if vim.mode == VimMode.VisualBlock {
+        base.push(("I", "block insert"))
+        base.push(("A", "block append"))
+    }
+    base.push((">", "indent"))
+    base.push(("<", "outdent"))
+    base.push(("=", "auto-indent"))
+    base.push(("u", "lowercase"))
+    base.push(("U", "uppercase"))
+    base.push(("~", "toggle case"))
+    base.push(("r", "replace char"))
+    base.push(("J", "join lines"))
+    base.push(("o", "swap end"))
+    let with_plugins = merge_hint_pairs(base, cached_plugin_hints(vim, "visual:all"))
+    merge_hint_pairs(with_plugins, [
+        ("<Space>", "leader"),
+        (":", "ex command"),
+    ])
+}
+
 pub fn sync_world_from_vim(world: EditorWorld, vim: VimState) {
     let buf = world.active_buffer()
     if not world.options.evil_mode {
@@ -303,6 +717,7 @@ pub fn sync_world_from_vim(world: EditorWorld, vim: VimState) {
         world.visual = VisualSelection.none()
         world.pending_keys_display = ""
         world.which_key_items = List()
+        vim.vim_owns_which_key = false
         return
     }
 
@@ -356,33 +771,75 @@ pub fn sync_world_from_vim(world: EditorWorld, vim: VimState) {
         },
     }
 
-    if not vim.leader_strokes.is_empty() {
-        world.pending_keys_display = format_chord(vim.leader_strokes)
-    } else if not vim.plugin_strokes.is_empty() {
-        world.pending_keys_display = format_chord(vim.plugin_strokes)
-    } else {
-        var disp = ""
-        if vim.active_reg != "" {
-            disp = disp ++ "\"" ++ vim.active_reg
-        }
-        if vim.count1 > 0 {
-            disp = disp ++ vim.count1.to_string()
-        }
-        vim.mode match {
-            VimMode.OperatorPending(op) => { disp = disp ++ op },
-            _ => (),
-        }
-        if vim.count2 > 0 {
-            disp = disp ++ vim.count2.to_string()
-        }
-        if vim.pending_prefix != "" {
-            disp = disp ++ vim.pending_prefix
-        }
-        world.pending_keys_display = disp
-        if vim.pending_prefix != "<C-w>" {
+    -- If a modal interceptor owns input (other than Dashboard's passthrough digit listener),
+    -- preserve any `pending_keys_display` / `which_key_items` set by that interceptor!
+    if vim.modal_interceptor != null {
+        let mi_owner = vim.modal_interceptor.as(ModalInterceptor).owner
+        if mi_owner != "ext_persistence" {
+            if (not vim.vim_owns_which_key)
+                and (world.pending_keys_display != "" or (not world.which_key_items.is_empty())) {
+                return
+            }
+            world.pending_keys_display = ""
             world.which_key_items = List()
+            vim.vim_owns_which_key = false
+            return
         }
     }
+
+    if not vim.leader_strokes.is_empty() {
+        world.pending_keys_display = format_chord(vim.leader_strokes)
+        vim.vim_owns_which_key = true
+        return
+    }
+    if not vim.plugin_strokes.is_empty() {
+        world.pending_keys_display = format_chord(vim.plugin_strokes)
+        vim.vim_owns_which_key = true
+        return
+    }
+
+    var disp = ""
+    if vim.active_reg != "" {
+        disp = disp ++ "\"" ++ vim.active_reg
+    }
+    if vim.count1 > 0 {
+        disp = disp ++ vim.count1.to_string()
+    }
+    vim.mode match {
+        VimMode.OperatorPending(op) => { disp = disp ++ op },
+        _ => (),
+    }
+    if vim.count2 > 0 {
+        disp = disp ++ vim.count2.to_string()
+    }
+    if vim.pending_prefix != "" {
+        disp = disp ++ vim.pending_prefix
+    }
+    world.pending_keys_display = disp
+
+    if vim.pending_prefix != "" {
+        world.which_key_items = build_prefix_which_key_hints(world, buf, vim, vim.pending_prefix)
+        vim.vim_owns_which_key = true
+        return
+    }
+
+    vim.mode match {
+        VimMode.OperatorPending(op) => {
+            world.which_key_items = build_operator_pending_which_key_hints(vim, op)
+            vim.vim_owns_which_key = true
+            return
+        },
+        _ => (),
+    }
+
+    if is_visual_mode(vim.mode) {
+        world.which_key_items = build_visual_which_key_hints(vim)
+        vim.vim_owns_which_key = true
+        return
+    }
+
+    world.which_key_items = List()
+    vim.vim_owns_which_key = false
 }
 
 fn is_visual_mode(mode: VimMode) -> bool {
@@ -475,6 +932,7 @@ fn build_window_which_key_hints() -> List {
         KeyBindingEntry { chord: "<C-w> k", command_name: "window-focus-up", owner: eid, description: "Focus window up" },
         KeyBindingEntry { chord: "<C-w> l", command_name: "window-focus-right", owner: eid, description: "Focus window right" },
         KeyBindingEntry { chord: "<C-w> o", command_name: "delete-other-windows", owner: eid, description: "Keep only active window" },
+        KeyBindingEntry { chord: "<C-w> q", command_name: "quit-window", owner: eid, description: "Quit active window" },
         KeyBindingEntry { chord: "<C-w> s", command_name: "split-window-below", owner: eid, description: "Split window horizontally" },
         KeyBindingEntry { chord: "<C-w> v", command_name: "split-window-right", owner: eid, description: "Split window vertically" },
         KeyBindingEntry { chord: "<C-w> w", command_name: "other-window", owner: eid, description: "Cycle focus to next window" },
@@ -2498,46 +2956,87 @@ fn handle_pending_prefix(
                 }
             }
         }
-        -- Fallback to plugin bindings under `g<key>` in `KEYMAP_VIM_NORMAL` / `KEYMAP_VIM_VISUAL`
-        let km_name = if is_visual_mode(vim.mode) { KEYMAP_VIM_VISUAL } else { KEYMAP_VIM_NORMAL }
-        let km_opt = kernel.keymaps.get(km_name)
-        if km_opt != null {
-            let seq = [KeyStroke.plain("g"), stroke]
-            km_opt.as(Keymap).lookup(seq) match {
-                KeyLookup.Exact(cmd_name, _) => {
-                    vim.clear_transient()
-                    abort_change(vim)
-                    let _ = dispatch_optional_cmd(kernel, cmd_name, List())#!
-                    return true
-                },
-                KeyLookup.Prefix(hints) => {
-                    vim.plugin_strokes = seq
-                    world.which_key_items = sort_key_hints(hints)
-                    return true
-                },
-                KeyLookup.Unbound => (),
+        -- Fallback to plugin bindings under `g<key>` in `mode:<major_mode>` / `KEYMAP_VIM_NORMAL` / `KEYMAP_VIM_VISUAL`
+        let seq = [KeyStroke.plain("g"), stroke]
+        let kms = if is_visual_mode(vim.mode) {
+            [KEYMAP_VIM_VISUAL]
+        } else {
+            ["mode:" ++ buf.major_mode, KEYMAP_VIM_NORMAL]
+        }
+        for ki in 0..kms.len() {
+            let km_opt = kernel.keymaps.get(kms.get(ki.as(usize)).as(String))
+            if km_opt != null {
+                km_opt.as(Keymap).lookup(seq) match {
+                    KeyLookup.Exact(cmd_name, _) => {
+                        vim.clear_transient()
+                        world.which_key_items = List()
+                        world.pending_keys_display = ""
+                        vim.vim_owns_which_key = false
+                        abort_change(vim)
+                        let _ = dispatch_optional_cmd(kernel, cmd_name, List())#!
+                        return true
+                    },
+                    KeyLookup.Prefix(hints) => {
+                        vim.plugin_strokes = seq
+                        world.which_key_items = sort_key_hints(hints)
+                        return true
+                    },
+                    KeyLookup.Unbound => (),
+                }
             }
         }
         vim.clear_transient()
         return true
     }
 
-    -- 10. `z` scroll prefix (`zz`, `zt`, `zb`)
+    -- 10. `z` scroll prefix (`zz`, `zt`, `zb` + mode/plugin `z*` bindings)
     if pfx == "z" {
         vim.pending_prefix = ""
         let k = stroke.key
         let vrows = if world.viewport_rows > 1 { world.viewport_rows } else { 1 }
-        if k == "z" {
-            let new_top = if buf.point.row - vrows / 2 > 0 { buf.point.row - vrows / 2 } else { 0 }
-            world.viewport_top_row = new_top
-            let _ = dispatch_optional_cmd(kernel, "scroll-center", List())#!
-        } else if k == "t" {
-            world.viewport_top_row = buf.point.row
-            let _ = dispatch_optional_cmd(kernel, "scroll-top", List())#!
-        } else if k == "b" {
-            let new_top = if buf.point.row - vrows + 1 > 0 { buf.point.row - vrows + 1 } else { 0 }
-            world.viewport_top_row = new_top
-            let _ = dispatch_optional_cmd(kernel, "scroll-bottom", List())#!
+        if (not stroke.ctrl) and (not stroke.alt) and (k == "z" or k == "t" or k == "b") {
+            if k == "z" {
+                let new_top = if buf.point.row - vrows / 2 > 0 { buf.point.row - vrows / 2 } else { 0 }
+                world.viewport_top_row = new_top
+                let _ = dispatch_optional_cmd(kernel, "scroll-center", List())#!
+            } else if k == "t" {
+                world.viewport_top_row = buf.point.row
+                let _ = dispatch_optional_cmd(kernel, "scroll-top", List())#!
+            } else {
+                let new_top = if buf.point.row - vrows + 1 > 0 { buf.point.row - vrows + 1 } else { 0 }
+                world.viewport_top_row = new_top
+                let _ = dispatch_optional_cmd(kernel, "scroll-bottom", List())#!
+            }
+            vim.clear_transient()
+            return true
+        }
+        let seq = [KeyStroke.plain("z"), stroke]
+        let kms = if is_visual_mode(vim.mode) {
+            [KEYMAP_VIM_VISUAL]
+        } else {
+            ["mode:" ++ buf.major_mode, KEYMAP_VIM_NORMAL]
+        }
+        for ki in 0..kms.len() {
+            let km_opt = kernel.keymaps.get(kms.get(ki.as(usize)).as(String))
+            if km_opt != null {
+                km_opt.as(Keymap).lookup(seq) match {
+                    KeyLookup.Exact(cmd_name, _) => {
+                        vim.clear_transient()
+                        world.which_key_items = List()
+                        world.pending_keys_display = ""
+                        vim.vim_owns_which_key = false
+                        abort_change(vim)
+                        let _ = dispatch_optional_cmd(kernel, cmd_name, List())#!
+                        return true
+                    },
+                    KeyLookup.Prefix(hints) => {
+                        vim.plugin_strokes = seq
+                        world.which_key_items = sort_key_hints(hints)
+                        return true
+                    },
+                    KeyLookup.Unbound => (),
+                }
+            }
         }
         vim.clear_transient()
         return true
@@ -2610,23 +3109,32 @@ fn handle_pending_prefix(
             return true
         }
         -- Fallback to plugin navigation bindings (`]c`/`[c`, `]d`/`[d`, `]x`/`[x`, `]r`/`[r`, `[y`/`]y`, etc.)
-        let km_name = if is_visual_mode(vim.mode) { KEYMAP_VIM_VISUAL } else { KEYMAP_VIM_NORMAL }
-        let km_opt = kernel.keymaps.get(km_name)
-        if km_opt != null {
-            let seq = [KeyStroke.plain(pfx), stroke]
-            km_opt.as(Keymap).lookup(seq) match {
-                KeyLookup.Exact(cmd_name, _) => {
-                    vim.clear_transient()
-                    abort_change(vim)
-                    let _ = dispatch_optional_cmd(kernel, cmd_name, List())#!
-                    return true
-                },
-                KeyLookup.Prefix(hints) => {
-                    vim.plugin_strokes = seq
-                    world.which_key_items = sort_key_hints(hints)
-                    return true
-                },
-                KeyLookup.Unbound => (),
+        let seq = [KeyStroke.plain(pfx), stroke]
+        let kms = if is_visual_mode(vim.mode) {
+            [KEYMAP_VIM_VISUAL]
+        } else {
+            ["mode:" ++ buf.major_mode, KEYMAP_VIM_NORMAL]
+        }
+        for ki in 0..kms.len() {
+            let km_opt = kernel.keymaps.get(kms.get(ki.as(usize)).as(String))
+            if km_opt != null {
+                km_opt.as(Keymap).lookup(seq) match {
+                    KeyLookup.Exact(cmd_name, _) => {
+                        vim.clear_transient()
+                        world.which_key_items = List()
+                        world.pending_keys_display = ""
+                        vim.vim_owns_which_key = false
+                        abort_change(vim)
+                        let _ = dispatch_optional_cmd(kernel, cmd_name, List())#!
+                        return true
+                    },
+                    KeyLookup.Prefix(hints) => {
+                        vim.plugin_strokes = seq
+                        world.which_key_items = sort_key_hints(hints)
+                        return true
+                    },
+                    KeyLookup.Unbound => (),
+                }
             }
         }
         vim.clear_transient()
@@ -2866,6 +3374,9 @@ fn handle_visual_specific_key(
             vkm_opt.as(Keymap).lookup([stroke]) match {
                 KeyLookup.Exact(cmd_name, owner) => {
                     if kernel.is_extension_active(owner) {
+                        world.which_key_items = List()
+                        world.pending_keys_display = ""
+                        vim.vim_owns_which_key = false
                         let _ = dispatch_optional_cmd(kernel, cmd_name, List())#!
                         return true
                     }
@@ -3158,6 +3669,7 @@ fn try_plugin_keymap_step(
             vim.plugin_strokes = List()
             world.which_key_items = List()
             world.pending_keys_display = ""
+            vim.vim_owns_which_key = false
             vim.clear_transient()
             let _ = dispatch_optional_cmd(kernel, cmd_name, List())#!
             2
@@ -3166,6 +3678,7 @@ fn try_plugin_keymap_step(
             vim.plugin_strokes = clone_stroke_list(seq)
             world.which_key_items = sort_key_hints(hints)
             world.pending_keys_display = format_chord(vim.plugin_strokes)
+            vim.vim_owns_which_key = true
             1
         },
         KeyLookup.Unbound => 0,
@@ -3193,6 +3706,7 @@ fn vim_dispatch_stroke_core(
     vim: VimState,
     stroke: KeyStroke,
 ) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String bool {
+    refresh_plugin_hint_cache(kernel, world, vim)
     let buf = world.active_buffer()
 
     -- 0. Active modal interceptor (e.g. Flash jump label, Surround target char, Oil/Magit prompt)
@@ -3200,6 +3714,7 @@ fn vim_dispatch_stroke_core(
         let mi = vim.modal_interceptor.as(ModalInterceptor)
         let intercepted = (mi.handler)(kernel, stroke)#!
         if intercepted {
+            refresh_plugin_hint_cache(kernel, world, vim)
             sync_world_from_vim(world, vim)
             return true
         }
@@ -3226,11 +3741,43 @@ fn vim_dispatch_stroke_core(
             matched_step = try_plugin_keymap_step(kernel, world, vim, target_km, seq)#!
         }
         if matched_step == 0 {
+            -- If a mode keymap captured `z` (e.g. `mode:dirvish` `zh`/`zp`/`zf`/`zi`) and the user
+            -- pressed built-in `zz` / `zt` / `zb`, execute the scroll cleanly instead of erroring!
+            if seq.len() == 2 {
+                let first_s = seq.get(0).as(KeyStroke)
+                let k = stroke.key
+                if first_s.key == "z"
+                    and (not first_s.ctrl)
+                    and (not first_s.alt)
+                    and (not stroke.ctrl)
+                    and (not stroke.alt)
+                    and (k == "z" or k == "t" or k == "b") {
+                    let vrows = if world.viewport_rows > 1 { world.viewport_rows } else { 1 }
+                    if k == "z" {
+                        let new_top = if buf.point.row - vrows / 2 > 0 { buf.point.row - vrows / 2 } else { 0 }
+                        world.viewport_top_row = new_top
+                        let _ = dispatch_optional_cmd(kernel, "scroll-center", List())#!
+                    } else if k == "t" {
+                        world.viewport_top_row = buf.point.row
+                        let _ = dispatch_optional_cmd(kernel, "scroll-top", List())#!
+                    } else {
+                        let new_top = if buf.point.row - vrows + 1 > 0 { buf.point.row - vrows + 1 } else { 0 }
+                        world.viewport_top_row = new_top
+                        let _ = dispatch_optional_cmd(kernel, "scroll-bottom", List())#!
+                    }
+                    vim.plugin_strokes = List()
+                    world.which_key_items = List()
+                    vim.clear_transient()
+                    sync_world_from_vim(world, vim)
+                    return true
+                }
+            }
             let chord_s = format_chord(seq)
             vim.plugin_strokes = List()
             world.which_key_items = List()
             status_emit("Unbound chord: " ++ chord_s)#
         }
+        refresh_plugin_hint_cache(kernel, world, vim)
         sync_world_from_vim(world, vim)
         return true
     }
@@ -4176,6 +4723,9 @@ fn is_emacs_passthrough_chord(
         if has_mode_keymap_binding(kernel, KEYMAP_VIM_INSERT, stroke) {
             return false
         }
+        if stroke.alt and (not stroke.ctrl) and (stroke.key == "n" or stroke.key == "p") {
+            return false
+        }
     } else if vim.mode == VimMode.Normal {
         if has_mode_keymap_binding(kernel, "mode:" ++ buf.major_mode, stroke)
             or has_mode_keymap_binding(kernel, KEYMAP_VIM_NORMAL, stroke) {
@@ -4267,6 +4817,10 @@ pub fn vim_handle_key(
     let handled = vim_dispatch_stroke_core(kernel, world, vim, stroke)#!
 
     let cur_buf = world.active_buffer()
+    if cur_buf.id != prev_buf_id {
+        refresh_plugin_hint_cache(kernel, world, vim)
+        sync_world_from_vim(world, vim)
+    }
     -- Ensure plugin-triggered exits from Visual mode (`ext_surround`, `ext_comment`, etc.) also record `last_visual_*`!
     if is_visual_mode(prev_mode) and (not is_visual_mode(vim.mode)) and cur_buf.id == prev_buf_id {
         if not vim.has_last_visual {

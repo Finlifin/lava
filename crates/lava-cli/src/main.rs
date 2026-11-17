@@ -7,12 +7,12 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use lava_gtk::{
     GtkAppConfig, get_system_clipboard, is_display_available, measure_monospace_font,
-    render_frame_to_png, run_gtk_app, set_system_clipboard,
+    render_frame_to_png, run_gtk_app_with_final_size, set_system_clipboard,
 };
 use lava_proto::{EventQueue, FrameSlot, UiEvent};
 use lava_vm::{
@@ -43,6 +43,8 @@ struct CliOptions {
     dump_frame_png: Option<PathBuf>,
     width: i32,
     height: i32,
+    width_overridden: bool,
+    height_overridden: bool,
     startup_files: Vec<String>,
 }
 
@@ -60,6 +62,8 @@ impl Default for CliOptions {
             dump_frame_png: None,
             width: 1280,
             height: 800,
+            width_overridden: false,
+            height_overridden: false,
             startup_files: Vec::new(),
         }
     }
@@ -176,6 +180,7 @@ where
                     return Err("`--width` must be at least 64".to_string());
                 }
                 opts.width = parsed;
+                opts.width_overridden = true;
                 i += 2;
             }
             "--height" => {
@@ -189,6 +194,7 @@ where
                     return Err("`--height` must be at least 64".to_string());
                 }
                 opts.height = parsed;
+                opts.height_overridden = true;
                 i += 2;
             }
             flag if flag.starts_with('-') => {
@@ -325,6 +331,59 @@ fn resolve_user_init_script(opts: &CliOptions) -> Result<Option<PathBuf>, String
     Ok(None)
 }
 
+fn resolve_window_state_path() -> Option<PathBuf> {
+    if let Ok(explicit) = env::var("LAVA_WINDOW_STATE_FILE")
+        && !explicit.trim().is_empty()
+    {
+        return Some(PathBuf::from(explicit.trim()));
+    }
+    if let Ok(xdg) = env::var("XDG_CONFIG_HOME")
+        && !xdg.is_empty()
+    {
+        return Some(PathBuf::from(xdg).join("lava").join("window_state.txt"));
+    }
+    if let Ok(home) = env::var("HOME")
+        && !home.is_empty()
+    {
+        return Some(
+            PathBuf::from(home)
+                .join(".config")
+                .join("lava")
+                .join("window_state.txt"),
+        );
+    }
+    None
+}
+
+fn parse_saved_window_size(raw: &str) -> Option<(i32, i32)> {
+    let mut width: Option<i32> = None;
+    let mut height: Option<i32> = None;
+    let mut remember = true;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(v) = trimmed.strip_prefix("width=") {
+            width = v.trim().parse::<i32>().ok();
+        } else if let Some(v) = trimmed.strip_prefix("height=") {
+            height = v.trim().parse::<i32>().ok();
+        } else if let Some(v) = trimmed.strip_prefix("remember=") {
+            remember = v.trim() != "false";
+        }
+    }
+    if !remember {
+        return None;
+    }
+    match (width, height) {
+        (Some(w), Some(h)) if w >= 64 && h >= 64 => Some((w, h)),
+        _ => None,
+    }
+}
+
+fn load_saved_window_size() -> Option<(i32, i32)> {
+    let path = resolve_window_state_path()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    parse_saved_window_size(&raw)
+}
+
 fn make_gtk_host_callbacks() -> HostCallbacks {
     HostCallbacks::new()
         .with_measure_font(measure_monospace_font)
@@ -432,11 +491,18 @@ fn run_cli(opts: CliOptions) -> Result<i32, String> {
             // upfront so any syntax/type error reports cleanly before opening a native window.
             let artifact = workspace.compile_boot(&boot_opts)?;
 
+            let (init_width, init_height) =
+                if !use_headless && !opts.width_overridden && !opts.height_overridden {
+                    load_saved_window_size().unwrap_or((opts.width, opts.height))
+                } else {
+                    (opts.width, opts.height)
+                };
+
             let frame_slot = Arc::new(FrameSlot::new());
             let event_queue = Arc::new(EventQueue::new());
             event_queue.push(UiEvent::Resize {
-                width: opts.width,
-                height: opts.height,
+                width: init_width,
+                height: init_height,
                 scale_factor: 1,
             });
 
@@ -477,13 +543,18 @@ fn run_cli(opts: CliOptions) -> Result<i32, String> {
                     })
                     .map_err(|err| format!("failed to spawn Nessa VM thread: {err}"))?;
 
+                let final_window_size = Arc::new(Mutex::new(None));
                 let gtk_cfg = GtkAppConfig {
                     initial_title: "Lava".to_string(),
-                    initial_width: opts.width,
-                    initial_height: opts.height,
+                    initial_width: init_width,
+                    initial_height: init_height,
                 };
-                let ui_res =
-                    run_gtk_app(gtk_cfg, Arc::clone(&frame_slot), Arc::clone(&event_queue));
+                let ui_res = run_gtk_app_with_final_size(
+                    gtk_cfg,
+                    Arc::clone(&frame_slot),
+                    Arc::clone(&event_queue),
+                    Some(Arc::clone(&final_window_size)),
+                );
                 // Ensure VM wakes up if the GTK loop exited first.
                 if event_queue.quit_code().is_none() {
                     event_queue.request_quit(0);
@@ -492,7 +563,27 @@ fn run_cli(opts: CliOptions) -> Result<i32, String> {
                     .join()
                     .map_err(|_| "Nessa VM thread panicked".to_string())?;
                 ui_res?;
-                vm_res?
+                let exit_val = vm_res?;
+                if let Some((win_w, win_h)) = *final_window_size
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    && let Some(state_path) = resolve_window_state_path()
+                {
+                    let remember = std::fs::read_to_string(&state_path)
+                        .map(|raw| {
+                            !raw.lines()
+                                .any(|l| l.trim() == "remember=false")
+                        })
+                        .unwrap_or(true);
+                    if remember && win_w >= 64 && win_h >= 64 {
+                        if let Some(parent) = state_path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let content = format!("width={win_w}\nheight={win_h}\nremember=true\n");
+                        let _ = std::fs::write(&state_path, content);
+                    }
+                }
+                exit_val
             };
 
             if let Some(png_path) = &opts.dump_frame_png {
@@ -574,5 +665,22 @@ mod tests {
 
         assert!(parse_cli_args(["--unknown-flag"]).is_err());
         assert!(parse_cli_args(["--width", "20"]).is_err());
+    }
+
+    #[test]
+    fn saved_window_size_parses_and_respects_remember_flag() {
+        assert_eq!(
+            parse_saved_window_size("width=1600\nheight=960\nremember=true\n"),
+            Some((1600, 960))
+        );
+        assert_eq!(
+            parse_saved_window_size("width=1600\nheight=960\nremember=false\n"),
+            None
+        );
+        assert_eq!(
+            parse_saved_window_size("width=32\nheight=960\nremember=true\n"),
+            None
+        );
+        assert_eq!(parse_saved_window_size("invalid"), None);
     }
 }

@@ -41,7 +41,7 @@ use @ext_window.{SERVICE_WINDOW_MANAGER, WindowManager}
 use @ext_vim.{
     KEYMAP_VIM_LEADER, KEYMAP_VIM_NORMAL, ModalInterceptor, SERVICE_VIM, VimState, ext_vim_id
 }
-use @ext_cmp.{CmpService, SERVICE_CMP}
+use @ext_cmp.{CmpService, SERVICE_CMP, clean_decl_header_at, split_signature_params}
 
 pub const SERVICE_LSP: String = "lava.lsp.service"
 pub const OWNER_LSP: String = "ext_lsp"
@@ -111,6 +111,24 @@ pub struct FallbackCodeAction {
     pub live_edits: List,
 }
 
+pub struct LspCompletionCacheEntry {
+    pub client_id: i64,
+    pub req_id: i64,
+    pub buf_id: BufferId,
+    pub row: i64,
+    pub col: i64,
+    pub edit_version: i64,
+    pub items: List,
+}
+
+pub struct LspCompletionReqMeta {
+    pub client_id: i64,
+    pub buf_id: BufferId,
+    pub row: i64,
+    pub col: i64,
+    pub edit_version: i64,
+}
+
 pub struct LspService {
     pub specs: HashMap,
     pub spec_order: List,
@@ -122,6 +140,15 @@ pub struct LspService {
     pub diagnostics_by_path: HashMap,
     pub hover_cache: HashMap,
     pub completion_cache: HashMap,
+    pub completion_req_meta: HashMap,
+    pub completion_last_req: HashMap,
+    pub completion_doc_map: HashMap,
+    pub signature_cache: HashMap,
+    pub signature_req_meta: HashMap,
+    pub signature_last_req: HashMap,
+    pub ws_sig_cache: HashMap,
+    pub pending_cmp_refresh_buf_id: i64,
+    pub pending_sig_refresh_buf_id: i64,
     pub locations_cache: HashMap,
     pub symbols_cache: HashMap,
     pub code_actions_cache: HashMap,
@@ -1332,6 +1359,15 @@ impl LspService {
             diagnostics_by_path: HashMap.new(),
             hover_cache: HashMap.new(),
             completion_cache: HashMap.new(),
+            completion_req_meta: HashMap.new(),
+            completion_last_req: HashMap.new(),
+            completion_doc_map: HashMap.new(),
+            signature_cache: HashMap.new(),
+            signature_req_meta: HashMap.new(),
+            signature_last_req: HashMap.new(),
+            ws_sig_cache: HashMap.new(),
+            pending_cmp_refresh_buf_id: -1,
+            pending_sig_refresh_buf_id: -1,
             locations_cache: HashMap.new(),
             symbols_cache: HashMap.new(),
             code_actions_cache: HashMap.new(),
@@ -1950,8 +1986,55 @@ impl LspService {
                             LspWireEvent.Symbols(req_id, items) => {
                                 self.symbols_cache.insert(req_id, items)
                             },
-                            LspWireEvent.Completions(_req_id, items) => {
-                                self.completion_cache.insert(cid, items)
+                            LspWireEvent.Completions(req_id, items) => {
+                                let meta_opt = self.completion_req_meta.remove(req_id)
+                                if meta_opt != null {
+                                    let meta = meta_opt.as(LspCompletionReqMeta)
+                                    let entry = LspCompletionCacheEntry {
+                                        client_id: meta.client_id,
+                                        req_id: req_id,
+                                        buf_id: meta.buf_id,
+                                        row: meta.row,
+                                        col: meta.col,
+                                        edit_version: meta.edit_version,
+                                        items: items,
+                                    }
+                                    self.completion_cache.insert(meta.buf_id, entry)
+                                    let cur_buf = world.active_buffer()
+                                    if cur_buf.id == meta.buf_id and cur_buf.point.row == meta.row {
+                                        self.pending_cmp_refresh_buf_id = meta.buf_id.as(i64)
+                                    }
+                                } else {
+                                    let cur_buf = world.active_buffer()
+                                    let entry = LspCompletionCacheEntry {
+                                        client_id: cid,
+                                        req_id: req_id,
+                                        buf_id: cur_buf.id,
+                                        row: cur_buf.point.row,
+                                        col: cur_buf.point.col,
+                                        edit_version: cur_buf.edit_version,
+                                        items: items,
+                                    }
+                                    self.completion_cache.insert(cur_buf.id, entry)
+                                }
+                            },
+                            LspWireEvent.SignatureHelp(req_id, slbl, sdoc, sparams, sact) => {
+                                let smeta_opt = self.signature_req_meta.remove(req_id)
+                                if smeta_opt != null {
+                                    let (sbuf_id, srow, sver) = smeta_opt.as((BufferId, i64, i64))
+                                    if slbl != "" {
+                                        self.signature_cache.insert(
+                                            sbuf_id,
+                                            (srow, sver, slbl, sdoc, sparams, sact),
+                                        )
+                                    } else {
+                                        let _ = self.signature_cache.remove(sbuf_id)
+                                    }
+                                    let cur_buf = world.active_buffer()
+                                    if cur_buf.id == sbuf_id {
+                                        self.pending_sig_refresh_buf_id = sbuf_id.as(i64)
+                                    }
+                                }
                             },
                             LspWireEvent.WorkspaceEdit(req_id, _lbl, edits) => {
                                 self.workspace_edit_cache.insert(req_id, edits)
@@ -2014,7 +2097,7 @@ impl LspService {
         cache.get(req_id)
     }
 
-    pub fn notify_buffer_changed(self, _world: EditorWorld, buf: Buffer) {
+    pub fn sync_buffer_did_change(self, buf: Buffer) {
         let att_opt = self.buf_attachments.get(buf.id)
         if att_opt == null {
             return
@@ -2032,14 +2115,129 @@ impl LspService {
                     _ => (),
                 }
             }
-            let _ = lsp_request(
+        }
+    }
+
+    pub fn request_completion_for_buffer(self, world: EditorWorld, buf: Buffer, .wait_ms: i64 = 0) {
+        let att_opt = self.buf_attachments.get(buf.id)
+        if att_opt == null {
+            return
+        }
+        let att = att_opt.as(BufferLspAttachment)
+        if (not att.live_rpc) or att.client_id <= 0 or buf.file_path == "" {
+            return
+        }
+        self.sync_buffer_did_change(buf)
+
+        let row = buf.point.row
+        let col = buf.point.col
+        let ver = buf.edit_version
+
+        let cached_opt = self.completion_cache.get(buf.id)
+        if cached_opt != null {
+            let cached = cached_opt.as(LspCompletionCacheEntry)
+            if cached.edit_version == ver and cached.row == row and cached.col == col {
+                return
+            }
+        }
+
+        var target_req_id: i64 = 0
+        let last_opt = self.completion_last_req.get(buf.id)
+        if last_opt != null {
+            let (lr, lc, lver, lreq) = last_opt.as((i64, i64, i64, i64))
+            if lr == row and lc == col and lver == ver and lreq > 0 {
+                target_req_id = lreq
+            }
+        }
+
+        if target_req_id <= 0 {
+            let req_res = lsp_request(
                 att.client_id,
                 "completion",
                 buf.file_path,
-                buf.point.row,
-                buf.point.col,
-            ) ! { _ => 0 }
+                row,
+                col,
+            )
+            req_res match {
+                rid! => {
+                    target_req_id = rid
+                    self.completion_req_meta.insert(
+                        rid,
+                        LspCompletionReqMeta {
+                            client_id: att.client_id,
+                            buf_id: buf.id,
+                            row: row,
+                            col: col,
+                            edit_version: ver,
+                        },
+                    )
+                    self.completion_last_req.insert(buf.id, (row, col, ver, rid))
+                },
+                error _ => return,
+            }
         }
+
+        if wait_ms > 0 and target_req_id > 0 {
+            var max_tries = wait_ms / 5
+            if max_tries < 1 {
+                max_tries = 1
+            }
+            var tries: i64 = 0
+            while tries < max_tries {
+                self.poll_all_clients(world)
+                let cur_opt = self.completion_cache.get(buf.id)
+                if cur_opt != null {
+                    let cur = cur_opt.as(LspCompletionCacheEntry)
+                    if cur.req_id == target_req_id {
+                        self.pending_cmp_refresh_buf_id = -1
+                        return
+                    }
+                }
+                time.sleep_ms(5)
+                tries += 1
+            }
+            self.poll_all_clients(world)
+        }
+    }
+
+    pub fn request_signature_help_for_buffer(self, _world: EditorWorld, buf: Buffer, row: i64, col: i64) {
+        let att_opt = self.buf_attachments.get(buf.id)
+        if att_opt == null {
+            return
+        }
+        let att = att_opt.as(BufferLspAttachment)
+        if (not att.live_rpc) or att.client_id <= 0 or buf.file_path == "" {
+            return
+        }
+        self.sync_buffer_did_change(buf)
+        let ver = buf.edit_version
+        let last_opt = self.signature_last_req.get(buf.id)
+        if last_opt != null {
+            let (lr, lc, lver, lreq) = last_opt.as((i64, i64, i64, i64))
+            if lr == row and lc == col and lver == ver and lreq > 0 {
+                return
+            }
+        }
+        let req_res = lsp_request(att.client_id, "signatureHelp", buf.file_path, row, col)
+        req_res match {
+            rid! => {
+                self.signature_req_meta.insert(rid, (buf.id, row, ver))
+                self.signature_last_req.insert(buf.id, (row, col, ver, rid))
+            },
+            error _ => (),
+        }
+    }
+
+    pub fn notify_buffer_changed(self, world: EditorWorld, buf: Buffer) {
+        let att_opt = self.buf_attachments.get(buf.id)
+        if att_opt == null {
+            return
+        }
+        let att = att_opt.as(BufferLspAttachment)
+        if att.last_edit_version == buf.edit_version {
+            return
+        }
+        self.request_completion_for_buffer(world, buf, wait_ms = 0)
     }
 
     pub fn notify_buffer_saved(self, buf: Buffer) {
@@ -2059,6 +2257,8 @@ impl LspService {
     }
 
     pub fn notify_buffer_closed(self, buf_id: BufferId, file_path: String) {
+        let _ = self.completion_cache.remove(buf_id)
+        let _ = self.completion_last_req.remove(buf_id)
         let att_opt = self.buf_attachments.remove(buf_id)
         if att_opt == null {
             return
@@ -2249,24 +2449,37 @@ private fn try_register_cmp_source(kernel: SystemKernel, svc: LspService) {
             let out = List()
             let seen = Set.new()
             let p_low = prefix.to_lower()
+            var has_live_lsp_items = false
             if _active_lsp_service != null {
                 let lsvc = _active_lsp_service.as(LspService)
-                let att_opt = lsvc.buf_attachments.get(buf.id)
-                if att_opt != null {
-                    let att = att_opt.as(BufferLspAttachment)
-                    let cached_opt = lsvc.completion_cache.get(att.client_id)
-                    if cached_opt != null {
-                        let citems = cached_opt.as(List)
+                let cached_opt = lsvc.completion_cache.get(buf.id)
+                if cached_opt != null {
+                    let entry = cached_opt.as(LspCompletionCacheEntry)
+                    if entry.row == buf.point.row {
+                        let citems = entry.items
                         for i in 0..citems.len() {
                             let ci = citems.get(i.as(usize)).as(LspCompItem)
                             if p_low == "" or ci.label.to_lower().contains(p_low) {
                                 if not seen.contains(ci.label) {
                                     seen.insert(ci.label)
+                                    has_live_lsp_items = true
+                                    let eff_kind = if ci.kind != "" { ci.kind } else { "LSP" }
+                                    let clean_det = if ci.detail != "" {
+                                        ci.detail.replace("\r\n", " ").replace("\n", " ").trim()
+                                    } else {
+                                        "[LSP]"
+                                    }
+                                    if ci.documentation != "" {
+                                        if lsvc.completion_doc_map.len() > 256 {
+                                            lsvc.completion_doc_map.clear()
+                                        }
+                                        lsvc.completion_doc_map.insert(ci.label ++ "\t" ++ eff_kind, ci.documentation)
+                                    }
                                     out.push(CompletionItem {
                                         label: ci.label,
                                         insert_text: if ci.insert_text != "" { ci.insert_text } else { ci.label },
-                                        kind: if ci.kind != "" { ci.kind } else { "LSP" },
-                                        detail: if ci.detail != "" { ci.detail } else { "[LSP]" },
+                                        kind: eff_kind,
+                                        detail: clean_det,
                                     })
                                 }
                             }
@@ -2274,37 +2487,319 @@ private fn try_register_cmp_source(kernel: SystemKernel, svc: LspService) {
                     }
                 }
             }
-            let syms = extract_buffer_symbols(buf)
-            for i in 0..syms.len() {
-                let s = syms.get(i.as(usize)).as(LspSym)
-                if p_low == "" or s.name.to_lower().contains(p_low) {
-                    if not seen.contains(s.name) {
-                        seen.insert(s.name)
-                        out.push(CompletionItem {
-                            label: s.name,
-                            insert_text: s.name,
-                            kind: s.kind,
-                            detail: "[LSP] " ++ s.detail,
-                        })
+            if not has_live_lsp_items {
+                let syms = extract_buffer_symbols(buf)
+                for i in 0..syms.len() {
+                    let s = syms.get(i.as(usize)).as(LspSym)
+                    if s.kind != "Impl" and (p_low == "" or s.name.to_lower().contains(p_low)) {
+                        if not seen.contains(s.name) {
+                            seen.insert(s.name)
+                            let full_hdr = clean_decl_header_at(buf, s.row)
+                            let det_str = if full_hdr != "" { full_hdr } else { s.detail }
+                            let eff_kind = if s.kind == "Function" and (det_str.contains("(self") or det_str.contains("(&self") or det_str.contains("(&mut self")) {
+                                "Method"
+                            } else {
+                                s.kind
+                            }
+                            out.push(CompletionItem {
+                                label: s.name,
+                                insert_text: s.name,
+                                kind: eff_kind,
+                                detail: det_str,
+                            })
+                        }
                     }
                 }
             }
             out
         },
     )
+
+    cmp.register_doc_provider(
+        "lsp-doc",
+        |world: EditorWorld, buf: Buffer, item: CompletionItem| -> ?(String, List) {
+            if _active_lsp_service == null {
+                return null
+            }
+            let lsvc = _active_lsp_service.as(LspService)
+            let lang = infer_language_id(buf)
+            let title = item.label ++ " · " ++ item.kind
+            let live_doc_opt = lsvc.completion_doc_map.get(item.label ++ "\t" ++ item.kind)
+            if live_doc_opt != null {
+                let md = live_doc_opt.as(String).trim()
+                if md != "" {
+                    let lines = List()
+                    if item.detail != "" and item.detail != "[LSP]" {
+                        lines.push("```" ++ lang)
+                        lines.push(item.detail)
+                        lines.push("```")
+                    }
+                    let md_parts = md.replace("\r\n", "\n").split("\n")
+                    for mi in 0..md_parts.len() {
+                        lines.push(md_parts.get(mi.as(usize)).as(String))
+                    }
+                    return (title, lines)
+                }
+            }
+            -- Workspace symbol definition lookup (`accel_find_symbol_defs` cached in `ws_sig_cache`)
+            if item.kind != "Keyword" and item.kind != "Snippet" and item.kind != "Path" {
+                let att_opt = lsvc.buf_attachments.get(buf.id)
+                let root_dir = if att_opt != null {
+                    att_opt.as(BufferLspAttachment).root_dir
+                } else {
+                    world.cwd
+                }
+                if root_dir != "" and (not is_ssh_uri(root_dir)) and fs.exists(root_dir) {
+                    let wkey = root_dir ++ "\t" ++ item.label
+                    var def_opt: ?SymbolDefHit = null
+                    if lsvc.ws_sig_cache.contains_key(wkey) {
+                        let cached_any = lsvc.ws_sig_cache.get(wkey)
+                        if cached_any matches _: SymbolDefHit {
+                            def_opt = cached_any.as(SymbolDefHit)
+                        }
+                    } else {
+                        let defs = accel_find_symbol_defs([root_dir], item.label, limit = 8)
+                        for di in 0..defs.len() {
+                            let d = defs.get(di.as(usize)).as(SymbolDefHit)
+                            if d.symbol == item.label {
+                                def_opt = d
+                                break
+                            }
+                        }
+                        if lsvc.ws_sig_cache.len() > 256 {
+                            lsvc.ws_sig_cache.clear()
+                        }
+                        if def_opt != null {
+                            lsvc.ws_sig_cache.insert(wkey, def_opt.as(SymbolDefHit))
+                        } else {
+                            lsvc.ws_sig_cache.insert(wkey, false)
+                        }
+                    }
+                    if def_opt != null {
+                        let d = def_opt.as(SymbolDefHit)
+                        let lines = List()
+                        if d.signature.trim() != "" {
+                            lines.push("```" ++ lang)
+                            lines.push(d.signature.trim())
+                            lines.push("```")
+                        }
+                        if d.doc_comment.trim() != "" {
+                            let dparts = d.doc_comment.trim().split("\n")
+                            for dpi in 0..dparts.len() {
+                                lines.push(dparts.get(dpi.as(usize)).as(String))
+                            }
+                        }
+                        let fn_opt = path.file_name(d.file_path)
+                        let short_p = if fn_opt != null { fn_opt.as(String) } else { d.file_path }
+                        lines.push("Defined at " ++ short_p ++ ":" ++ (d.row + 1).to_string())
+                        return (title, lines)
+                    }
+                }
+            }
+            null
+        },
+    )
+
+    cmp.register_signature_provider(
+        "lsp-sig",
+        |world: EditorWorld, buf: Buffer, callee: String, row: i64, col: i64, active_param: i64, named_arg: String, is_meth: bool| -> ?(String, List, i64, String) {
+            if _active_lsp_service == null {
+                return null
+            }
+            let lsvc = _active_lsp_service.as(LspService)
+            -- 1. Trigger non-blocking live LSP `textDocument/signatureHelp` & check cache
+            lsvc.request_signature_help_for_buffer(world, buf, row, col)
+            let live_sig_opt = lsvc.signature_cache.get(buf.id)
+            if live_sig_opt != null {
+                let (srow, _sver, slbl, sdoc, sparams, sact) =
+                    live_sig_opt.as((i64, i64, String, String, List, i64))
+                if (srow == row or (row >= srow and row - srow <= 4)) and slbl.contains(callee) {
+                    let eff_p = if sact >= 0 { sact } else { active_param }
+                    let doc_first = if sdoc != "" {
+                        sdoc.replace("\r\n", "\n").split("\n").get(0).as(String).trim()
+                    } else {
+                        ""
+                    }
+                    return (slbl, sparams, eff_p, doc_first)
+                }
+            }
+
+            -- 2. Check live completion cache if `callee` was recently returned by LSP completion
+            let cmp_cached_opt = lsvc.completion_cache.get(buf.id)
+            if cmp_cached_opt != null {
+                let entry = cmp_cached_opt.as(LspCompletionCacheEntry)
+                for ci_i in 0..entry.items.len() {
+                    let ci = entry.items.get(ci_i.as(usize)).as(LspCompItem)
+                    if ci.label == callee and ci.detail.contains("(") {
+                        let sig_lbl = if ci.detail.starts_with("(") {
+                            callee ++ ci.detail
+                        } else {
+                            ci.detail
+                        }
+                        let params = split_signature_params(sig_lbl)
+                        let doc_first = if ci.documentation != "" {
+                            ci.documentation.replace("\r\n", "\n").split("\n").get(0).as(String).trim()
+                        } else {
+                            ""
+                        }
+                        let clamped_idx = if (not params.is_empty()) and active_param >= params.len() {
+                            params.len() - 1
+                        } else {
+                            active_param
+                        }
+                        return (sig_lbl, params, clamped_idx, doc_first)
+                    }
+                }
+            }
+
+            -- 3. Check cached workspace symbol definitions (`accel_find_symbol_defs`) for cross-package functions!
+            let att_opt = lsvc.buf_attachments.get(buf.id)
+            let root_dir = if att_opt != null {
+                att_opt.as(BufferLspAttachment).root_dir
+            } else {
+                world.cwd
+            }
+            if root_dir != "" and (not is_ssh_uri(root_dir)) and fs.exists(root_dir) {
+                let wkey = root_dir ++ "\t" ++ callee
+                var def_opt: ?SymbolDefHit = null
+                if lsvc.ws_sig_cache.contains_key(wkey) {
+                    let cached_any = lsvc.ws_sig_cache.get(wkey)
+                    if cached_any matches _: SymbolDefHit {
+                        def_opt = cached_any.as(SymbolDefHit)
+                    }
+                } else {
+                    let defs = accel_find_symbol_defs([root_dir], callee, limit = 8)
+                    for di in 0..defs.len() {
+                        let d = defs.get(di.as(usize)).as(SymbolDefHit)
+                        if d.symbol == callee and d.signature.contains("(") {
+                            def_opt = d
+                            break
+                        }
+                    }
+                    if lsvc.ws_sig_cache.len() > 256 {
+                        lsvc.ws_sig_cache.clear()
+                    }
+                    if def_opt != null {
+                        lsvc.ws_sig_cache.insert(wkey, def_opt.as(SymbolDefHit))
+                    } else {
+                        lsvc.ws_sig_cache.insert(wkey, false)
+                    }
+                }
+                if def_opt != null {
+                    let d = def_opt.as(SymbolDefHit)
+                    var full_sig = d.signature.trim()
+                    -- If signature on `d.row` is multi-line (`fn foo(` without `)`), read up to 8 lines from `d.file_path`
+                    if full_sig.contains("(") and (not full_sig.contains(")")) and fs.exists(d.file_path) {
+                        let raw_file = fs.read_to_string(d.file_path) ! { _ => "" }
+                        if raw_file != "" {
+                            let flines = raw_file.replace("\r\n", "\n").split("\n")
+                            if d.row >= 0 and d.row < flines.len() {
+                                var acc = flines.get(d.row.as(usize)).as(String).trim()
+                                let max_r = if d.row + 8 < flines.len() { d.row + 8 } else { flines.len() - 1 }
+                                var rr = d.row + 1
+                                while rr <= max_r {
+                                    let p_ln = flines.get(rr.as(usize)).as(String).trim()
+                                    if p_ln != "" {
+                                        acc = acc ++ " " ++ p_ln
+                                    }
+                                    if p_ln.contains(")") {
+                                        break
+                                    }
+                                    rr += 1
+                                }
+                                if acc.ends_with("{{") {
+                                    acc = acc.slice(0, acc.char_len() - 1).trim_end()
+                                }
+                                full_sig = acc.replace(", )", ")")
+                            }
+                        }
+                    }
+                    if full_sig != "" and full_sig.contains("(") {
+                        let raw_params = split_signature_params(full_sig)
+                        let call_params = List()
+                        for pi in 0..raw_params.len() {
+                            let rp = raw_params.get(pi.as(usize)).as(String)
+                            let rt = rp.trim()
+                            let is_self = rt == "self" or rt == "&self" or rt == "&mut self" or rt == "mut self" or rt == "cls"
+                            if pi == 0 and is_meth and is_self {
+                                continue
+                            }
+                            call_params.push(rp)
+                        }
+                        var eff_idx = active_param
+                        if named_arg != "" {
+                            for pi in 0..call_params.len() {
+                                let cp_s = call_params.get(pi.as(usize)).as(String).trim()
+                                if cp_s.starts_with(named_arg ++ ":") or cp_s.starts_with("." ++ named_arg ++ ":") or cp_s.starts_with(named_arg ++ " =") {
+                                    eff_idx = pi
+                                    break
+                                }
+                            }
+                        }
+                        if (not call_params.is_empty()) and eff_idx >= call_params.len() {
+                            eff_idx = call_params.len() - 1
+                        }
+                        let doc_first = if d.doc_comment.trim() != "" {
+                            d.doc_comment.trim().split("\n").get(0).as(String).trim()
+                        } else {
+                            ""
+                        }
+                        return (full_sig, call_params, eff_idx, doc_first)
+                    }
+                }
+            }
+            null
+        },
+    )
+
     svc.cmp_registered = true
+}
+
+private fn lsp_est_display_width(s: String) -> i64 {
+    if s.is_ascii() {
+        return s.len()
+    }
+    let n = s.char_len()
+    var w: i64 = 0
+    for i in 0..n {
+        let ch = s.slice(i, i + 1)
+        w += if ch.len() >= 3 { 2 } else { 1 }
+    }
+    w
+}
+
+private fn lsp_clip_display_cols(s: String, max_cols: i64) -> String {
+    let expanded = s.replace("\t", "    ")
+    if lsp_est_display_width(expanded) <= max_cols {
+        return expanded
+    }
+    let n = expanded.char_len()
+    var used: i64 = 0
+    var i: i64 = 0
+    let budget = if max_cols > 1 { max_cols - 1 } else { 1 }
+    while i < n {
+        let ch = expanded.slice(i, i + 1)
+        let cw = if ch.len() >= 3 { 2 } else { 1 }
+        if used + cw > budget {
+            break
+        }
+        used += cw
+        i += 1
+    }
+    expanded.slice(0, i) ++ "…"
 }
 
 private fn show_hover_float(kernel: SystemKernel, world: EditorWorld, title_sym: String, raw_lines: List) {
     let formatted = List()
     var max_w: i64 = 38
     for i in 0..raw_lines.len() {
-        let part_lines = raw_lines.get(i.as(usize)).as(String).split("\n")
+        let part_lines = raw_lines.get(i.as(usize)).as(String).replace("\r\n", "\n").split("\n")
         for pi in 0..part_lines.len() {
             let ln = part_lines.get(pi.as(usize)).as(String)
-            let clipped = if ln.char_len() > 86 { ln.slice(0, 86) ++ "…" } else { ln }
-            if clipped.char_len() + 4 > max_w {
-                max_w = clipped.char_len() + 4
+            let clipped = lsp_clip_display_cols(ln, 84)
+            let dw = lsp_est_display_width(clipped) + 4
+            if dw > max_w {
+                max_w = dw
             }
             formatted.push(" " ++ clipped)
         }
@@ -2312,7 +2807,7 @@ private fn show_hover_float(kernel: SystemKernel, world: EditorWorld, title_sym:
     if formatted.is_empty() {
         formatted.push(" No hover information available.")
     }
-    let w_cols = if max_w > 92 { 92 } else { max_w }
+    let w_cols = if max_w > 90 { 90 } else { max_w }
     let h_rows = if formatted.len() + 2 > 18 { 18 } else if formatted.len() + 2 < 4 { 4 } else { formatted.len() + 2 }
     world.set_floating_window(FloatingWindow {
         id: LSP_HOVER_FLOAT_ID,
@@ -2322,7 +2817,7 @@ private fn show_hover_float(kernel: SystemKernel, world: EditorWorld, title_sym:
         width_cols: w_cols,
         height_rows: h_rows,
         lines: formatted,
-        selected_row: 0,
+        selected_row: -1,
         border_rgba: rgb(137, 180, 250),
     })
     let vim_opt = kernel.service(SERVICE_VIM)
@@ -2752,6 +3247,23 @@ pub fn register_lsp_extension(kernel: SystemKernel) -> !String Unit {
             )
 
             k.add_hook(
+                "cmp-before-collect",
+                ext_id,
+                |kern: SystemKernel, payload: Any| -> Unit {
+                    let w_opt = kern.service("lava.document.world")
+                    if w_opt == null {
+                        return ()
+                    }
+                    let w = w_opt.as(EditorWorld)
+                    let manual = if payload matches _: bool { payload.as(bool) } else { false }
+                    let wait_ms: i64 = if manual { 120 } else { 0 }
+                    svc.request_completion_for_buffer(w, w.active_buffer(), wait_ms = wait_ms)
+                    ()
+                },
+                priority = 40,
+            )
+
+            k.add_hook(
                 "timer-tick",
                 ext_id,
                 |kern: SystemKernel, payload: Any| -> Unit {
@@ -2767,6 +3279,26 @@ pub fn register_lsp_extension(kernel: SystemKernel) -> !String Unit {
                         }
                     } else {
                         svc.poll_all_clients(w)
+                    }
+                    if svc.pending_cmp_refresh_buf_id >= 0 {
+                        let rbuf_id = svc.pending_cmp_refresh_buf_id
+                        svc.pending_cmp_refresh_buf_id = -1
+                        if w.active_buffer().id.as(i64) == rbuf_id {
+                            let cmp_opt = kern.service(SERVICE_CMP)
+                            if cmp_opt != null {
+                                let _ = cmp_opt.as(CmpService).refresh_from_lsp(kern) ! { _ => false }
+                            }
+                        }
+                    }
+                    if svc.pending_sig_refresh_buf_id >= 0 {
+                        let sbuf_id = svc.pending_sig_refresh_buf_id
+                        svc.pending_sig_refresh_buf_id = -1
+                        if w.active_buffer().id.as(i64) == sbuf_id {
+                            let cmp_opt = kern.service(SERVICE_CMP)
+                            if cmp_opt != null {
+                                cmp_opt.as(CmpService).update_signature_help(kern, w)
+                            }
+                        }
                     }
                     ()
                 },

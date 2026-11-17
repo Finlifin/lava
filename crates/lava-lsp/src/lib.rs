@@ -60,6 +60,7 @@ pub struct LspCompletionItem {
     pub insert_text: String,
     pub kind: String,
     pub detail: String,
+    pub documentation: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +107,13 @@ pub enum LspEvent {
     Completions {
         req_id: i64,
         items: Vec<LspCompletionItem>,
+    },
+    SignatureHelp {
+        req_id: i64,
+        label: String,
+        documentation: String,
+        parameters: Vec<String>,
+        active_param: i64,
     },
     WorkspaceEdit {
         req_id: i64,
@@ -691,6 +699,32 @@ fn decode_symbols(req_id: i64, result: &JsonValue) -> LspEvent {
     LspEvent::Symbols { req_id, items }
 }
 
+fn slice_utf16_range(text: &str, start_u16: usize, end_u16: usize) -> String {
+    if end_u16 <= start_u16 {
+        return String::new();
+    }
+    let mut u16_pos = 0usize;
+    let mut byte_start = None;
+    let mut byte_end = None;
+    for (b_idx, ch) in text.char_indices() {
+        if u16_pos >= start_u16 && byte_start.is_none() {
+            byte_start = Some(b_idx);
+        }
+        if u16_pos >= end_u16 {
+            byte_end = Some(b_idx);
+            break;
+        }
+        u16_pos += ch.len_utf16();
+    }
+    let s = byte_start.unwrap_or(text.len());
+    let e = byte_end.unwrap_or(text.len());
+    if e >= s {
+        text[s..e].to_string()
+    } else {
+        String::new()
+    }
+}
+
 fn decode_completions(req_id: i64, result: &JsonValue) -> LspEvent {
     let raw_list = match result {
         JsonValue::Array(arr) => Some(arr.as_slice()),
@@ -710,16 +744,102 @@ fn decode_completions(req_id: i64, result: &JsonValue) -> LspEvent {
                 .unwrap_or(label)
                 .to_string();
             let kind = completion_kind_name(item.get_i64("kind").unwrap_or(1)).to_string();
-            let detail = item.get_str("detail").unwrap_or("").to_string();
+            let raw_detail = item.get_str("detail").unwrap_or("").trim();
+            let ld_detail = item
+                .get("labelDetails")
+                .and_then(|ld| ld.get_str("detail"))
+                .unwrap_or("")
+                .trim();
+            let ld_desc = item
+                .get("labelDetails")
+                .and_then(|ld| ld.get_str("description"))
+                .unwrap_or("")
+                .trim();
+            let detail = match (
+                !ld_detail.is_empty(),
+                !raw_detail.is_empty(),
+                !ld_desc.is_empty(),
+            ) {
+                (true, true, _) if !raw_detail.contains(ld_detail) => {
+                    format!("{ld_detail}  {raw_detail}")
+                }
+                (true, false, true) => format!("{ld_detail}  {ld_desc}"),
+                (true, false, false) => ld_detail.to_string(),
+                (_, true, true) if !raw_detail.contains(ld_desc) => {
+                    format!("{raw_detail}  ({ld_desc})")
+                }
+                (_, true, _) => raw_detail.to_string(),
+                (false, false, true) => ld_desc.to_string(),
+                _ => String::new(),
+            };
+            let mut doc_parts = Vec::new();
+            if let Some(doc_val) = item.get("documentation") {
+                extract_marked_string(doc_val, &mut doc_parts);
+            }
             items.push(LspCompletionItem {
                 label: label.to_string(),
                 insert_text,
                 kind,
                 detail,
+                documentation: doc_parts.join("\n\n"),
             });
         }
     }
     LspEvent::Completions { req_id, items }
+}
+
+fn decode_signature_help(req_id: i64, result: &JsonValue) -> LspEvent {
+    let Some(sigs) = result.get("signatures").and_then(JsonValue::as_array) else {
+        return LspEvent::SignatureHelp {
+            req_id,
+            label: String::new(),
+            documentation: String::new(),
+            parameters: Vec::new(),
+            active_param: 0,
+        };
+    };
+    if sigs.is_empty() {
+        return LspEvent::SignatureHelp {
+            req_id,
+            label: String::new(),
+            documentation: String::new(),
+            parameters: Vec::new(),
+            active_param: 0,
+        };
+    }
+    let active_sig_idx = result.get_i64("activeSignature").unwrap_or(0).max(0) as usize;
+    let sig = sigs.get(active_sig_idx).unwrap_or_else(|| &sigs[0]);
+    let label = sig.get_str("label").unwrap_or("").to_string();
+    let mut doc_parts = Vec::new();
+    if let Some(doc_val) = sig.get("documentation") {
+        extract_marked_string(doc_val, &mut doc_parts);
+    }
+    let mut parameters = Vec::new();
+    if let Some(parr) = sig.get("parameters").and_then(JsonValue::as_array) {
+        for p in parr {
+            match p.get("label") {
+                Some(JsonValue::Str(ps)) => parameters.push(ps.clone()),
+                Some(JsonValue::Array(pair)) if pair.len() >= 2 => {
+                    let s = pair[0].as_i64().unwrap_or(0).max(0) as usize;
+                    let e = pair[1].as_i64().unwrap_or(0).max(0) as usize;
+                    parameters.push(slice_utf16_range(&label, s, e));
+                }
+                _ => parameters.push(String::new()),
+            }
+        }
+    }
+    let active_param = sig
+        .get_i64("activeParameter")
+        .or_else(|| result.get_i64("activeParameter"))
+        .unwrap_or(0)
+        .max(0);
+    LspEvent::SignatureHelp {
+        req_id,
+        label,
+        documentation: doc_parts.join("\n\n"),
+        parameters,
+        active_param,
+    }
 }
 
 fn collect_workspace_edit_items(edit_obj: &JsonValue) -> Vec<LspTextEditItem> {
@@ -804,6 +924,7 @@ fn summarize_capabilities(caps: &JsonValue) -> String {
         ("typeDefinitionProvider", "typedef"),
         ("documentSymbolProvider", "symbols"),
         ("completionProvider", "cmp"),
+        ("signatureHelpProvider", "sig"),
         ("renameProvider", "rename"),
         ("codeActionProvider", "codeAction"),
         ("documentFormattingProvider", "format"),
@@ -1409,6 +1530,10 @@ impl LspManager {
                 "textDocument/completion",
                 JsonValue::obj([("textDocument", td), ("position", pos)]),
             ),
+            "signatureHelp" => (
+                "textDocument/signatureHelp",
+                JsonValue::obj([("textDocument", td), ("position", pos)]),
+            ),
             "rename" => (
                 "textDocument/rename",
                 JsonValue::obj([
@@ -1680,6 +1805,7 @@ fn handle_incoming_rpc(msg: &JsonValue, shared: &Arc<SessionShared>, tx: &mpsc::
         "textDocument/references" => Some(decode_locations(req_id, "references", result)),
         "textDocument/documentSymbol" => Some(decode_symbols(req_id, result)),
         "textDocument/completion" => Some(decode_completions(req_id, result)),
+        "textDocument/signatureHelp" => Some(decode_signature_help(req_id, result)),
         "textDocument/rename" => {
             let edits = collect_workspace_edit_items(result);
             Some(LspEvent::WorkspaceEdit {
@@ -1751,7 +1877,36 @@ fn build_initialize_request(
             "completion",
             JsonValue::obj([(
                 "completionItem",
-                JsonValue::obj([("snippetSupport", JsonValue::Bool(false))]),
+                JsonValue::obj([
+                    ("snippetSupport", JsonValue::Bool(false)),
+                    ("labelDetailsSupport", JsonValue::Bool(true)),
+                    (
+                        "documentationFormat",
+                        JsonValue::Array(vec![
+                            JsonValue::Str("markdown".to_string()),
+                            JsonValue::Str("plaintext".to_string()),
+                        ]),
+                    ),
+                ]),
+            )]),
+        ),
+        (
+            "signatureHelp",
+            JsonValue::obj([(
+                "signatureInformation",
+                JsonValue::obj([
+                    (
+                        "documentationFormat",
+                        JsonValue::Array(vec![
+                            JsonValue::Str("markdown".to_string()),
+                            JsonValue::Str("plaintext".to_string()),
+                        ]),
+                    ),
+                    (
+                        "parameterInformation",
+                        JsonValue::obj([("labelOffsetSupport", JsonValue::Bool(true))]),
+                    ),
+                ]),
             )]),
         ),
         (
@@ -1830,6 +1985,70 @@ mod tests {
 
         let surrogate = parse_json("{\"emoji\":\"\\uD83D\\uDE80\"}").expect("surrogate pair");
         assert_eq!(surrogate.get_str("emoji"), Some("🚀"));
+    }
+
+    #[test]
+    fn completion_docs_label_details_and_signature_help_decode_cleanly() {
+        let cmp_json = parse_json(
+            r#"{
+                "isIncomplete": false,
+                "items": [{
+                    "label": "clamp_pos",
+                    "kind": 2,
+                    "detail": "fn(self, pos: Pos, insert_mode: bool) -> Pos",
+                    "labelDetails": { "detail": "(pos, insert_mode)", "description": "ext_document" },
+                    "documentation": { "kind": "markdown", "value": "Clamps `pos` into valid buffer bounds." }
+                }]
+            }"#,
+        )
+        .expect("parse completion json");
+        let LspEvent::Completions { req_id, items } = decode_completions(7, &cmp_json) else {
+            panic!("expected Completions event");
+        };
+        assert_eq!(req_id, 7);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "clamp_pos");
+        assert_eq!(items[0].kind, "Method");
+        assert!(
+            items[0]
+                .detail
+                .contains("fn(self, pos: Pos, insert_mode: bool) -> Pos")
+        );
+        assert!(items[0].documentation.contains("Clamps `pos`"));
+
+        let sig_json = parse_json(
+            r#"{
+                "signatures": [{
+                    "label": "fn calc(alpha: i64, beta: String) -> bool",
+                    "documentation": "Computes result.",
+                    "parameters": [
+                        { "label": [8, 18] },
+                        { "label": "beta: String" }
+                    ],
+                    "activeParameter": 1
+                }],
+                "activeSignature": 0
+            }"#,
+        )
+        .expect("parse signatureHelp json");
+        let LspEvent::SignatureHelp {
+            req_id: sreq,
+            label,
+            documentation,
+            parameters,
+            active_param,
+        } = decode_signature_help(9, &sig_json)
+        else {
+            panic!("expected SignatureHelp event");
+        };
+        assert_eq!(sreq, 9);
+        assert_eq!(label, "fn calc(alpha: i64, beta: String) -> bool");
+        assert_eq!(documentation, "Computes result.");
+        assert_eq!(
+            parameters,
+            vec!["alpha: i64".to_string(), "beta: String".to_string()]
+        );
+        assert_eq!(active_param, 1);
     }
 
     #[test]

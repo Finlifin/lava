@@ -738,6 +738,23 @@ pub fn doc_version(doc_id: i64) -> i64 {
     with_store(|store| store.docs.get(&doc_id).map_or(0, |d| d.version))
 }
 
+pub(crate) fn doc_version_and_line_count(doc_id: i64) -> Option<(i64, usize)> {
+    with_store(|store| {
+        let d = store.docs.get(&doc_id)?;
+        Some((d.version, d.total_lines))
+    })
+}
+
+pub(crate) type DocChunkList = Vec<Arc<Vec<String>>>;
+pub(crate) type DocChunkSnapshot = (i64, DocChunkList, usize);
+
+pub(crate) fn doc_snapshot_source_and_offsets(doc_id: i64) -> Option<DocChunkSnapshot> {
+    with_store(|store| {
+        let d = store.docs.get(&doc_id)?;
+        Some((d.version, d.chunks.clone(), d.total_lines))
+    })
+}
+
 pub fn doc_line_at(doc_id: i64, row: i64) -> String {
     if row < 0 {
         return String::new();
@@ -1993,7 +2010,135 @@ fn extract_ident_after(s: &str) -> Option<String> {
     if ident.is_empty() { None } else { Some(ident) }
 }
 
+#[inline]
+pub(crate) fn is_markdown_mode_name(mode_lower: &str) -> bool {
+    matches!(
+        mode_lower,
+        "markdown" | "md" | "gfm" | "markdown-inline" | "markdown_inline"
+    )
+}
+
+/// If row 0 opens a YAML frontmatter block (`---`) and a matching closing `---` or `...` line
+/// exists later in the document, return the 0-based row index of that closing delimiter.
+pub(crate) fn markdown_frontmatter_end_row<'a, I>(mut lines: I) -> Option<usize>
+where
+    I: Iterator<Item = &'a str>,
+{
+    let first = lines.next()?;
+    if first.trim_end() != "---" {
+        return None;
+    }
+    for (offset, line) in lines.enumerate() {
+        let row = offset + 1;
+        let trimmed = line.trim_end();
+        if trimmed == "---" || trimmed == "..." {
+            return Some(row);
+        }
+    }
+    None
+}
+
+fn strip_blockquote_and_fence_indent(line: &str) -> Option<&str> {
+    let mut rest = line.strip_suffix('\r').unwrap_or(line);
+    loop {
+        let sp = rest.bytes().take_while(|&b| b == b' ').count();
+        if sp <= 3 && rest.as_bytes().get(sp) == Some(&b'>') {
+            rest = &rest[sp + 1..];
+            if matches!(rest.as_bytes().first(), Some(b' ' | b'\t')) {
+                rest = &rest[1..];
+            }
+            continue;
+        }
+        if sp > 3 || rest.as_bytes().get(sp) == Some(&b'\t') {
+            return None;
+        }
+        return Some(&rest[sp..]);
+    }
+}
+
+/// Stateful CommonMark / GFM fenced code block tracker supporting `0..=3` leading spaces,
+/// `>` blockquote prefixes, `>= 3` `` ` `` or `~` delimiters, and matching closing fences
+/// (`close_char == open_char && close_len >= open_len` with trailing whitespace only).
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct MarkdownFenceState {
+    open: Option<(u8, usize)>,
+}
+
+impl MarkdownFenceState {
+    pub(crate) fn new() -> Self {
+        Self { open: None }
+    }
+
+    /// Advance fence state on `line`; returns `true` when `line` is a fence delimiter or inside
+    /// an active fenced code block (and therefore excluded from Markdown heading/tag scanning).
+    pub(crate) fn step_line(&mut self, line: &str) -> bool {
+        if let Some((open_ch, open_len)) = self.open {
+            if let Some(after_indent) = strip_blockquote_and_fence_indent(line) {
+                let close_len = after_indent.bytes().take_while(|&b| b == open_ch).count();
+                if close_len >= open_len
+                    && after_indent[close_len..]
+                        .bytes()
+                        .all(|b| b == b' ' || b == b'\t')
+                {
+                    self.open = None;
+                }
+            }
+            return true;
+        }
+
+        if let Some(after_indent) = strip_blockquote_and_fence_indent(line)
+            && let Some(&ch @ (b'`' | b'~')) = after_indent.as_bytes().first()
+        {
+            let open_len = after_indent.bytes().take_while(|&b| b == ch).count();
+            if open_len >= 3 {
+                let info = &after_indent[open_len..];
+                if ch == b'~' || !info.as_bytes().contains(&b'`') {
+                    self.open = Some((ch, open_len));
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Parse a CommonMark ATX heading (`0..=3` spaces, `1..=6` `#`, followed by `' '`, `'\t'`, or EOL),
+/// stripping optional closing `#` runs preceded by whitespace.
+/// Returns `(indent_cols, level, clean_title)`.
+pub(crate) fn parse_markdown_atx_heading(line: &str) -> Option<(i64, i64, String)> {
+    let clean = line.strip_suffix('\r').unwrap_or(line);
+    let lead_spaces = clean.bytes().take_while(|&b| b == b' ').count();
+    if lead_spaces > 3 {
+        return None;
+    }
+    let after_indent = &clean[lead_spaces..];
+    let hashes = after_indent.bytes().take_while(|&b| b == b'#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let raw_rest = match after_indent.as_bytes().get(hashes) {
+        None => "",
+        Some(b' ' | b'\t') => &after_indent[hashes + 1..],
+        Some(_) => return None,
+    };
+    let mut body = raw_rest.trim();
+    if body.ends_with('#') {
+        let tail_start = body.bytes().rposition(|b| b != b'#').map_or(0, |p| p + 1);
+        if tail_start == 0 {
+            body = "";
+        } else if matches!(body.as_bytes()[tail_start - 1], b' ' | b'\t') {
+            body = body[..tail_start - 1].trim_end();
+        }
+    }
+    Some((lead_spaces as i64, hashes as i64, body.to_string()))
+}
+
 fn scan_symbol_in_line(line: &str, mode_lower: &str) -> Option<(String, &'static str, i64, i64)> {
+    if is_markdown_mode_name(mode_lower) {
+        let (indent_cols, level, title) = parse_markdown_atx_heading(line)?;
+        return Some((title, "Heading", indent_cols, level));
+    }
+
     let trimmed = line.trim_start();
     if trimmed.is_empty() {
         return None;
@@ -2001,10 +2146,9 @@ fn scan_symbol_in_line(line: &str, mode_lower: &str) -> Option<(String, &'static
     let indent_bytes = line.len() - trimmed.len();
     let indent_cols = byte_to_char_idx(line, indent_bytes) as i64;
 
-    if mode_lower == "markdown" || mode_lower == "org" {
-        let marker = if mode_lower == "org" { '*' } else { '#' };
-        let lvl = trimmed.chars().take_while(|c| *c == marker).count();
-        if lvl > 0 && trimmed.chars().nth(lvl) == Some(' ') {
+    if mode_lower == "org" {
+        let lvl = trimmed.chars().take_while(|c| *c == '*').count();
+        if lvl > 0 && matches!(trimmed.chars().nth(lvl), Some(' ' | '\t')) {
             let title = trimmed[lvl..].trim().to_string();
             if !title.is_empty() {
                 return Some((title, "Heading", indent_cols, lvl as i64));
@@ -2124,9 +2268,24 @@ pub fn doc_scan_symbol_spans(
     let mode = major_mode.to_ascii_lowercase();
     let max_row = (doc.total_lines as i64 - 1).max(0);
 
-    if mode == "markdown" || mode == "org" {
+    if is_markdown_mode_name(&mode) || mode == "org" {
+        let is_md = is_markdown_mode_name(&mode);
+        let fm_end = if is_md {
+            markdown_frontmatter_end_row(doc.iter_lines())
+        } else {
+            None
+        };
+        let mut fence = MarkdownFenceState::new();
         let mut syms: Vec<SymbolOutlineSpan> = Vec::new();
         for (idx, line) in doc.iter_lines().enumerate() {
+            if is_md {
+                if fm_end.is_some_and(|end| idx <= end) {
+                    continue;
+                }
+                if fence.step_line(line) {
+                    continue;
+                }
+            }
             if let Some((name, kind, col, level)) = scan_symbol_in_line(line, &mode) {
                 syms.push(SymbolOutlineSpan {
                     name,

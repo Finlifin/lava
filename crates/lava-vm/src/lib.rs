@@ -832,12 +832,12 @@ pub fn run_session(_kernel: SystemKernel, startup_files: List, headless_keys: St
 "#;
         fs::write(ext_dir.join("src/lib.ns"), src_v1).unwrap();
 
-        let ws = LavaWorkspace::new(&staged_ws);
+        let cache_dir = staged_ws.join("target/lava-nsbc-cache");
+        let ws = LavaWorkspace::new(&staged_ws).with_cache_dir(&cache_dir);
         let opts = BootOptions::new().with_entry_pkg("lava.org/ext_cache_probe");
 
-        // Cold compile populates `target/lava-nsbc-cache/*.nsbc`.
+        // Cold compile populates `<cache_dir>/*.nsbc`.
         let _cold = ws.compile_boot(&opts).expect("cold compile_boot");
-        let cache_dir = staged_ws.join("target/lava-nsbc-cache");
         let entries_v1: Vec<_> = fs::read_dir(&cache_dir)
             .expect("cache_dir created")
             .filter_map(Result::ok)

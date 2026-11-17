@@ -461,6 +461,9 @@ fn apply_set_options(world: EditorWorld, arg_str: String) -> !String String {
             ++ " ts=" ++ world.options.tabstop.to_string()
             ++ " sw=" ++ world.options.shiftwidth.to_string()
             ++ " et=" ++ world.options.expandtab.to_string()
+            ++ " smooth_scroll=" ++ world.options.smooth_scroll.to_string()
+            ++ " cursor_anim=" ++ world.options.cursor_anim.to_string()
+            ++ " treesitter=" ++ world.options.treesitter.to_string()
         )
     }
     let tokens = trimmed.split_whitespace()
@@ -627,6 +630,51 @@ fn apply_set_options(world: EditorWorld, arg_str: String) -> !String String {
         } else if tok == "noformatonsave" {
             world.options.format_on_save = false
             applied.push("noformatonsave")
+        } else if tok == "remember_window_size" or tok == "rememberwindowsize" {
+            world.options.remember_window_size = true
+            applied.push("remember_window_size")
+        } else if tok == "noremember_window_size" or tok == "norememberwindowsize" {
+            world.options.remember_window_size = false
+            applied.push("noremember_window_size")
+        } else if tok == "remember_window_size!" or tok == "rememberwindowsize!" {
+            world.options.remember_window_size = not world.options.remember_window_size
+            applied.push(if world.options.remember_window_size { "remember_window_size" } else { "noremember_window_size" })
+        } else if tok == "shadow_text" or tok == "shadowtext" {
+            world.options.shadow_text = true
+            applied.push("shadow_text")
+        } else if tok == "noshadow_text" or tok == "noshadowtext" {
+            world.options.shadow_text = false
+            applied.push("noshadow_text")
+        } else if tok == "shadow_text!" or tok == "shadowtext!" {
+            world.options.shadow_text = not world.options.shadow_text
+            applied.push(if world.options.shadow_text { "shadow_text" } else { "noshadow_text" })
+        } else if tok == "smooth_scroll" or tok == "smoothscroll" {
+            world.options.smooth_scroll = true
+            applied.push("smooth_scroll")
+        } else if tok == "nosmooth_scroll" or tok == "nosmoothscroll" {
+            world.options.smooth_scroll = false
+            applied.push("nosmooth_scroll")
+        } else if tok == "smooth_scroll!" or tok == "smoothscroll!" {
+            world.options.smooth_scroll = not world.options.smooth_scroll
+            applied.push(if world.options.smooth_scroll { "smooth_scroll" } else { "nosmooth_scroll" })
+        } else if tok == "cursor_anim" or tok == "cursoranim" {
+            world.options.cursor_anim = true
+            applied.push("cursor_anim")
+        } else if tok == "nocursor_anim" or tok == "nocursoranim" {
+            world.options.cursor_anim = false
+            applied.push("nocursor_anim")
+        } else if tok == "cursor_anim!" or tok == "cursoranim!" {
+            world.options.cursor_anim = not world.options.cursor_anim
+            applied.push(if world.options.cursor_anim { "cursor_anim" } else { "nocursor_anim" })
+        } else if tok == "treesitter" {
+            world.options.treesitter = true
+            applied.push("treesitter")
+        } else if tok == "notreesitter" {
+            world.options.treesitter = false
+            applied.push("notreesitter")
+        } else if tok == "treesitter!" {
+            world.options.treesitter = not world.options.treesitter
+            applied.push(if world.options.treesitter { "treesitter" } else { "notreesitter" })
         } else {
             return error ("E518: Unknown option: " ++ tok)
         }

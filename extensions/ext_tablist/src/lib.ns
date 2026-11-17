@@ -171,7 +171,7 @@ fn activate_tablist_row(
     if entry.kind == "tab" {
         if entry.tab_idx >= 0 and entry.tab_idx < wm.tabs.len() {
             wm.active_tab_idx = entry.tab_idx
-            wm.relayout(world)
+            wm.layout_all()
             wm.sync_to_world(world)
             refresh_tablist(world, wm, svc)
             kern.emit_hook("buffer-switched", world.active_buffer_id)

@@ -19,14 +19,14 @@ edition = "2024"
 [workspace.dependencies]
 libc = "0.2"
 pkg-config = "0.3"
-driver = { path = "/home/fin/nessa2/engine/driver" }
-gc = { path = "/home/fin/nessa2/engine/gc" }
-initialization = { path = "/home/fin/nessa2/engine/initialization" }
-interpreter = { path = "/home/fin/nessa2/engine/interpreter" }
-nsbc = { path = "/home/fin/nessa2/engine/nsbc" }
-nsbc_io = { path = "/home/fin/nessa2/engine/nsbc_io" }
-pkg_manager = { path = "/home/fin/nessa2/engine/pkg_manager" }
-runtime = { path = "/home/fin/nessa2/engine/runtime" }
+driver = { path = "/home/fin/nessa/nessa2/engine/driver" }
+gc = { path = "/home/fin/nessa/nessa2/engine/gc" }
+initialization = { path = "/home/fin/nessa/nessa2/engine/initialization" }
+interpreter = { path = "/home/fin/nessa/nessa2/engine/interpreter" }
+nsbc = { path = "/home/fin/nessa/nessa2/engine/nsbc" }
+nsbc_io = { path = "/home/fin/nessa/nessa2/engine/nsbc_io" }
+pkg_manager = { path = "/home/fin/nessa/nessa2/engine/pkg_manager" }
+runtime = { path = "/home/fin/nessa/nessa2/engine/runtime" }
 lava-accel = { path = "crates/lava-accel" }
 lava-lsp = { path = "crates/lava-lsp" }
 lava-remote = { path = "crates/lava-remote" }

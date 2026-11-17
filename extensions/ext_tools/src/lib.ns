@@ -1350,20 +1350,146 @@ private fn jump_from_results_buffer_row(
 -- 5. Org-Outline Mode (`org-cycle` <Tab> folding & `org-todo` state cycling)
 -- ============================================================================
 
+private fn is_md_mode(mode: String) -> bool {
+    let m = mode.to_lower()
+    m == "markdown" or m == "md" or m == "gfm"
+}
+
+private fn tools_md_fence_open(line: String) -> ?(i64, i64) {
+    let blen = line.len()
+    var sp: i64 = 0
+    while sp < blen and sp < 12 and (line.byte_at(sp) == 32 or line.byte_at(sp) == 9 or line.byte_at(sp) == 62) {
+        sp += 1
+    }
+    if sp + 3 > blen {
+        return null
+    }
+    let fc = line.byte_at(sp)
+    if fc != 96 and fc != 126 {
+        return null
+    }
+    var flen: i64 = 0
+    while sp + flen < blen and line.byte_at(sp + flen) == fc {
+        flen += 1
+    }
+    if flen < 3 {
+        return null
+    }
+    if fc == 96 and line.drop(sp + flen).contains("`") {
+        return null
+    }
+    (fc, flen)
+}
+
+private fn tools_md_fence_close(line: String, fc: i64, min_len: i64) -> bool {
+    let blen = line.len()
+    var sp: i64 = 0
+    while sp < blen and sp < 12 and (line.byte_at(sp) == 32 or line.byte_at(sp) == 9 or line.byte_at(sp) == 62) {
+        sp += 1
+    }
+    var flen: i64 = 0
+    while sp + flen < blen and line.byte_at(sp + flen) == fc {
+        flen += 1
+    }
+    if flen < min_len {
+        return false
+    }
+    var k = sp + flen
+    while k < blen {
+        let b = line.byte_at(k)
+        if b != 32 and b != 9 {
+            return false
+        }
+        k += 1
+    }
+    true
+}
+
+private fn is_row_inside_md_fence_or_frontmatter(buf: Buffer, target_row: i64) -> bool {
+    if not is_md_mode(buf.major_mode) {
+        return false
+    }
+    let total = buf.line_count()
+    if total <= 0 or target_row < 0 or target_row >= total {
+        return false
+    }
+    var start_r: i64 = 0
+    if buf.line_at(0).trim_end() == "---" {
+        var fm_end: i64 = -1
+        for r in 1..total {
+            let t = buf.line_at(r).trim_end()
+            if t == "---" or t == "..." {
+                fm_end = r
+                break
+            }
+        }
+        if fm_end > 0 {
+            if target_row <= fm_end {
+                return true
+            }
+            start_r = fm_end + 1
+        }
+    }
+    var in_fence = false
+    var fc: i64 = 0
+    var flen: i64 = 0
+    for r in start_r..(target_row + 1) {
+        let ln = buf.line_at(r)
+        if not in_fence {
+            let f_opt = tools_md_fence_open(ln)
+            if f_opt != null {
+                let (b, l) = f_opt.as((i64, i64))
+                in_fence = true
+                fc = b
+                flen = l
+                if r == target_row {
+                    return true
+                }
+            }
+        } else {
+            if r == target_row {
+                return true
+            }
+            if tools_md_fence_close(ln, fc, flen) {
+                in_fence = false
+            }
+        }
+    }
+    false
+}
+
 private fn count_leading_marker(line: String, marker: String) -> i64 {
     let n = line.char_len()
+    var sp: i64 = 0
+    if marker == "#" {
+        while sp < n and sp < 4 and line.slice(sp, sp + 1) == " " {
+            sp += 1
+        }
+        if sp >= 4 {
+            return 0
+        }
+    }
     var count: i64 = 0
-    while count < n and line.slice(count, count + 1) == marker {
+    while sp + count < n and line.slice(sp + count, sp + count + 1) == marker {
         count += 1
     }
-    if count > 0 and count < n and line.slice(count, count + 1) == " " {
-        return count
+    if marker == "#" and count > 6 {
+        return 0
+    }
+    if count > 0 {
+        if sp + count == n {
+            return count
+        }
+        let nxt = line.slice(sp + count, sp + count + 1)
+        if nxt == " " or nxt == "\t" {
+            return count
+        }
     }
     0
 }
 
 pub fn heading_level(line: String, major_mode: String) -> i64 {
-    if major_mode == "markdown" {
+    if is_md_mode(major_mode) {
         return count_leading_marker(line, "#")
     }
     if major_mode == "org" {
@@ -1378,9 +1504,33 @@ pub fn heading_level(line: String, major_mode: String) -> i64 {
 
 private fn subtree_end_row_for_heading(buf: Buffer, heading_row: i64, level: i64) -> i64 {
     let total = buf.line_count()
+    let md = is_md_mode(buf.major_mode)
+    var in_fence = false
+    var fc: i64 = 0
+    var flen: i64 = 0
     var r = heading_row + 1
     while r < total {
-        let lvl = heading_level(buf.line_at(r), buf.major_mode)
+        let ln = buf.line_at(r)
+        if md {
+            if not in_fence {
+                let f_opt = tools_md_fence_open(ln)
+                if f_opt != null {
+                    let (b, l) = f_opt.as((i64, i64))
+                    in_fence = true
+                    fc = b
+                    flen = l
+                    r += 1
+                    continue
+                }
+            } else {
+                if tools_md_fence_close(ln, fc, flen) {
+                    in_fence = false
+                }
+                r += 1
+                continue
+            }
+        }
+        let lvl = heading_level(ln, buf.major_mode)
         if lvl > 0 and lvl <= level {
             return r - 1
         }
@@ -1393,6 +1543,9 @@ pub fn org_cycle_at_point(kernel: SystemKernel) -> #status_emit !String bool {
     let world = require_editor_world(kernel)!
     let buf = world.active_buffer()
     let row = buf.point.row
+    if is_row_inside_md_fence_or_frontmatter(buf, row) {
+        return false
+    }
     let level = heading_level(buf.line_at(row), buf.major_mode)
     if level <= 0 {
         return false
@@ -1423,20 +1576,84 @@ pub fn org_cycle_at_point(kernel: SystemKernel) -> #status_emit !String bool {
     true
 }
 
+private fn try_toggle_md_checkbox_line(line: String) -> ?(String, String) {
+    let n = line.char_len()
+    var i: i64 = 0
+    while i < n and (line.slice(i, i + 1) == " " or line.slice(i, i + 1) == "\t" or line.slice(i, i + 1) == ">") {
+        i += 1
+    }
+    if i >= n {
+        return null
+    }
+    let ch = line.slice(i, i + 1)
+    if ch == "-" or ch == "*" or ch == "+" {
+        i += 1
+    } else if ch >= "0" and ch <= "9" {
+        while i < n and line.slice(i, i + 1) >= "0" and line.slice(i, i + 1) <= "9" {
+            i += 1
+        }
+        if i >= n or (line.slice(i, i + 1) != "." and line.slice(i, i + 1) != ")") {
+            return null
+        }
+        i += 1
+    } else {
+        return null
+    }
+    var sp_cnt: i64 = 0
+    while i < n and (line.slice(i, i + 1) == " " or line.slice(i, i + 1) == "\t") {
+        i += 1
+        sp_cnt += 1
+    }
+    if sp_cnt == 0 or i + 3 > n {
+        return null
+    }
+    if line.slice(i, i + 1) != "[" or line.slice(i + 2, i + 3) != "]" {
+        return null
+    }
+    let mid = line.slice(i + 1, i + 2)
+    if mid == " " or mid == "-" {
+        return (line.slice(0, i) ++ "[x]" ++ line.drop(i + 3), "DONE")
+    }
+    if mid == "x" or mid == "X" {
+        return (line.slice(0, i) ++ "[ ]" ++ line.drop(i + 3), "TODO")
+    }
+    null
+}
+
 pub fn org_todo_at_point(kernel: SystemKernel) -> #status_emit !String String {
     let world = require_editor_world(kernel)!
     let buf = world.active_buffer()
     buf.ensure_writable()!
 
+    if is_row_inside_md_fence_or_frontmatter(buf, buf.point.row) {
+        status_emit("Inside code block")#
+        return ""
+    }
+
+    if is_md_mode(buf.major_mode) {
+        let cur_line = buf.line_at(buf.point.row)
+        let cb_opt = try_toggle_md_checkbox_line(cur_line)
+        if cb_opt != null {
+            let (new_line, cb_state) = cb_opt.as((String, String))
+            buf.set_line_at(buf.point.row, new_line)
+            buf.modified = true
+            buf.checkpoint(buf.point, "org-todo")
+            status_emit("Task checkbox -> " ++ cb_state)#
+            return cb_state
+        }
+    }
+
     var target_row: i64 = -1
     var level: i64 = 0
     var scan_r = buf.point.row
     while scan_r >= 0 {
-        let lvl = heading_level(buf.line_at(scan_r), buf.major_mode)
-        if lvl > 0 {
-            target_row = scan_r
-            level = lvl
-            break
+        if not is_row_inside_md_fence_or_frontmatter(buf, scan_r) {
+            let lvl = heading_level(buf.line_at(scan_r), buf.major_mode)
+            if lvl > 0 {
+                target_row = scan_r
+                level = lvl
+                break
+            }
         }
         scan_r -= 1
     }
@@ -1446,8 +1663,12 @@ pub fn org_todo_at_point(kernel: SystemKernel) -> #status_emit !String String {
     }
 
     let line = buf.line_at(target_row)
-    let prefix = line.slice(0, level + 1)
-    let rest = line.drop(level + 1)
+    var sp: i64 = 0
+    while sp < line.char_len() and line.slice(sp, sp + 1) == " " {
+        sp += 1
+    }
+    let prefix = line.slice(0, sp + level + 1)
+    let rest = line.drop(sp + level + 1)
 
     var next_state = ""
     var updated_rest = rest
@@ -2594,6 +2815,7 @@ private fn handle_org_key(
     if mgr.pending_prefix == "C-c" {
         mgr.pending_prefix = ""
         world.pending_keys_display = ""
+        world.which_key_items = List()
         if (stroke.ctrl and stroke.key == "t") or ((not stroke.ctrl) and stroke.key == "t") {
             let _ = org_todo_at_point(kernel)#!
             return true
@@ -2602,19 +2824,32 @@ private fn handle_org_key(
             status_emit("Quit")#
             return true
         }
-        return false
+        status_emit("<C-c> " ++ stroke.key ++ " is undefined")#
+        return true
     }
 
     if stroke.ctrl and (not stroke.alt) and (not stroke.super_mod) and stroke.key == "c" {
         mgr.pending_prefix = "C-c"
         world.pending_keys_display = "<C-c>"
+        world.which_key_items = [
+            ("t", "org-todo (cycle TODO / checkbox)"),
+            ("<C-t>", "org-todo"),
+            ("<Esc>", "cancel"),
+        ]
         status_emit("C-c-")#
         return true
     }
 
     if (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod) {
+        if stroke.key == "q" and buf.read_only and buf.name.starts_with("*Markdown Preview:") {
+            let next_id = world.cycle_buffer(-1)
+            kernel.emit_hook("buffer-switched", next_id)
+            status_emit("Closed " ++ buf.name)#
+            return true
+        }
         if stroke.key == "Tab" or stroke.key == "\t" {
-            if heading_level(buf.line_at(buf.point.row), buf.major_mode) > 0 {
+            if (not is_row_inside_md_fence_or_frontmatter(buf, buf.point.row))
+                and heading_level(buf.line_at(buf.point.row), buf.major_mode) > 0 {
                 return org_cycle_at_point(kernel)#!
             }
         }
@@ -2635,17 +2870,29 @@ pub fn tools_handle_key(
     let mode = buf.major_mode
 
     if mode == "dired" {
-        mgr.pending_prefix = ""
+        if mgr.pending_prefix != "" {
+            mgr.pending_prefix = ""
+            world.pending_keys_display = ""
+            world.which_key_items = List()
+        }
         return handle_dired_key(kernel, world, mgr, buf, stroke)#!
     }
     if mode == "grep" or mode == "compilation" {
-        mgr.pending_prefix = ""
+        if mgr.pending_prefix != "" {
+            mgr.pending_prefix = ""
+            world.pending_keys_display = ""
+            world.which_key_items = List()
+        }
         return handle_results_key(kernel, world, buf, stroke)#!
     }
-    if mode == "org" or mode == "markdown" {
+    if mode == "org" or is_md_mode(mode) {
         return handle_org_key(kernel, world, mgr, buf, stroke)#!
     }
-    mgr.pending_prefix = ""
+    if mgr.pending_prefix != "" {
+        mgr.pending_prefix = ""
+        world.pending_keys_display = ""
+        world.which_key_items = List()
+    }
     false
 }
 
@@ -3072,6 +3319,296 @@ private fn cmd_eval_scratch_line(kern: SystemKernel, _args: List) -> #Interactiv
     eval_scratch_at_point(kern)#!
 }
 
+private fn md_prev_disp_w(s: String) -> i64 {
+    if s.is_ascii() {
+        return s.len()
+    }
+    let n = s.char_len()
+    var w: i64 = 0
+    for i in 0..n {
+        w += if s.slice(i, i + 1).len() >= 3 { 2 } else { 1 }
+    }
+    w
+}
+
+private fn md_prev_pad_cell(text: String, width: i64, align: String) -> String {
+    let w = md_prev_disp_w(text)
+    if w >= width {
+        return text
+    }
+    let rem = width - w
+    if align == "right" {
+        return " ".repeat(rem) ++ text
+    }
+    if align == "center" {
+        let lpad = rem / 2
+        let rpad = rem - lpad
+        return " ".repeat(lpad) ++ text ++ " ".repeat(rpad)
+    }
+    text ++ " ".repeat(rem)
+}
+
+private fn md_prev_split_table_cells(line: String) -> List {
+    let t = line.trim()
+    let s0 = if t.starts_with("|") { t.drop(1) } else { t }
+    let body = if s0.ends_with("|") and (not s0.ends_with("\\|")) {
+        s0.slice(0, s0.char_len() - 1)
+    } else {
+        s0
+    }
+    let cells = List()
+    let n = body.char_len()
+    var cur = ""
+    var in_bt = false
+    var i: i64 = 0
+    while i < n {
+        let ch = body.slice(i, i + 1)
+        if ch == "\\" and i + 1 < n and body.slice(i + 1, i + 2) == "|" {
+            cur = cur ++ "|"
+            i += 2
+            continue
+        }
+        if ch == "`" {
+            in_bt = not in_bt
+            cur = cur ++ ch
+            i += 1
+            continue
+        }
+        if (not in_bt) and ch == "|" {
+            cells.push(cur.trim())
+            cur = ""
+            i += 1
+            continue
+        }
+        cur = cur ++ ch
+        i += 1
+    }
+    cells.push(cur.trim())
+    cells
+}
+
+private fn md_prev_is_sep_row(line: String) -> ?List {
+    let t = line.trim()
+    if (not t.contains("|")) or (not t.contains("-")) {
+        return null
+    }
+    let cells = md_prev_split_table_cells(t)
+    if cells.is_empty() {
+        return null
+    }
+    let aligns = List()
+    for i in 0..cells.len() {
+        let c = cells.get(i.as(usize)).as(String)
+        let n = c.char_len()
+        if n == 0 {
+            return null
+        }
+        let lc = c.starts_with(":")
+        let rc = c.ends_with(":")
+        let mid = c.slice(if lc { 1 } else { 0 }, if rc and n > 1 { n - 1 } else { n })
+        if mid == "" {
+            return null
+        }
+        for k in 0..mid.char_len() {
+            if mid.slice(k, k + 1) != "-" {
+                return null
+            }
+        }
+        if lc and rc {
+            aligns.push("center")
+        } else if rc {
+            aligns.push("right")
+        } else {
+            aligns.push("left")
+        }
+    }
+    aligns
+}
+
+private fn render_markdown_preview_lines(src_buf: Buffer) -> List {
+    src_buf.sync_external_lines()
+    let total = src_buf.line_count()
+    let out = List()
+    var r: i64 = 0
+    var in_fence = false
+    var fc: i64 = 0
+    var flen: i64 = 0
+
+    if total >= 2 and src_buf.line_at(0).trim_end() == "---" {
+        var fm_close: i64 = -1
+        let max_fm = if total < 64 { total } else { 64 }
+        for k in 1..max_fm {
+            let tk = src_buf.line_at(k).trim_end()
+            if tk == "---" or tk == "..." {
+                fm_close = k
+                break
+            }
+        }
+        if fm_close > 0 {
+            r = fm_close + 1
+        }
+    }
+
+    while r < total {
+        let ln = src_buf.line_at(r)
+        if not in_fence {
+            let f_opt = tools_md_fence_open(ln)
+            if f_opt != null {
+                let (b, l) = f_opt.as((i64, i64))
+                in_fence = true
+                fc = b
+                flen = l
+                out.push(ln)
+                r += 1
+                continue
+            }
+        } else {
+            out.push(ln)
+            if tools_md_fence_close(ln, fc, flen) {
+                in_fence = false
+            }
+            r += 1
+            continue
+        }
+
+        if r + 1 < total and ln.contains("|") {
+            let aligns_opt = md_prev_is_sep_row(src_buf.line_at(r + 1))
+            if aligns_opt != null {
+                let aligns = aligns_opt.as(List)
+                let hdr_cells = md_prev_split_table_cells(ln)
+                let ncols = if hdr_cells.len() > aligns.len() { hdr_cells.len() } else { aligns.len() }
+                let body_rows = List()
+                var tr = r + 2
+                while tr < total {
+                    let tln = src_buf.line_at(tr)
+                    if (not tln.contains("|")) or tln.trim() == "" or tools_md_fence_open(tln) != null {
+                        break
+                    }
+                    body_rows.push(md_prev_split_table_cells(tln))
+                    tr += 1
+                }
+                let col_w = List()
+                for ci in 0..ncols {
+                    let htxt = if ci < hdr_cells.len() { hdr_cells.get(ci.as(usize)).as(String) } else { "" }
+                    var mw = md_prev_disp_w(htxt)
+                    if mw < 3 {
+                        mw = 3
+                    }
+                    for bi in 0..body_rows.len() {
+                        let brow = body_rows.get(bi.as(usize)).as(List)
+                        if ci < brow.len() {
+                            let cw = md_prev_disp_w(brow.get(ci.as(usize)).as(String))
+                            if cw > mw {
+                                mw = cw
+                            }
+                        }
+                    }
+                    col_w.push(mw)
+                }
+                let top_parts = List()
+                let mid_parts = List()
+                let bot_parts = List()
+                let hdr_parts = List()
+                for ci in 0..ncols {
+                    let w = col_w.get(ci.as(usize)).as(i64)
+                    let al = if ci < aligns.len() { aligns.get(ci.as(usize)).as(String) } else { "left" }
+                    let htxt = if ci < hdr_cells.len() { hdr_cells.get(ci.as(usize)).as(String) } else { "" }
+                    top_parts.push("─".repeat(w + 2))
+                    mid_parts.push("─".repeat(w + 2))
+                    bot_parts.push("─".repeat(w + 2))
+                    hdr_parts.push(" " ++ md_prev_pad_cell(htxt, w, al) ++ " ")
+                }
+                out.push("┌" ++ top_parts.join("┬") ++ "┐")
+                out.push("│" ++ hdr_parts.join("│") ++ "│")
+                out.push("├" ++ mid_parts.join("┼") ++ "┤")
+                for bi in 0..body_rows.len() {
+                    let brow = body_rows.get(bi.as(usize)).as(List)
+                    let r_parts = List()
+                    for ci in 0..ncols {
+                        let w = col_w.get(ci.as(usize)).as(i64)
+                        let al = if ci < aligns.len() { aligns.get(ci.as(usize)).as(String) } else { "left" }
+                        let ctxt = if ci < brow.len() { brow.get(ci.as(usize)).as(String) } else { "" }
+                        r_parts.push(" " ++ md_prev_pad_cell(ctxt, w, al) ++ " ")
+                    }
+                    out.push("│" ++ r_parts.join("│") ++ "│")
+                }
+                out.push("└" ++ bot_parts.join("┴") ++ "┘")
+                r = tr
+                continue
+            }
+        }
+
+        let trimmed = ln.trim_start()
+        if trimmed == "---" or trimmed == "***" or trimmed == "___" {
+            out.push("────────────────────────────────────────────────────────")
+            r += 1
+            continue
+        }
+        if trimmed.starts_with("> [!") {
+            let rest = trimmed.drop(2)
+            let styled_alert = when {
+                rest.starts_with("[!NOTE]") => ">  NOTE: " ++ rest.drop(7).trim(),
+                rest.starts_with("[!TIP]") => ">  TIP: " ++ rest.drop(6).trim(),
+                rest.starts_with("[!IMPORTANT]") => ">  IMPORTANT: " ++ rest.drop(12).trim(),
+                rest.starts_with("[!WARNING]") => ">  WARNING: " ++ rest.drop(10).trim(),
+                rest.starts_with("[!CAUTION]") => ">  CAUTION: " ++ rest.drop(10).trim(),
+                else => ln,
+            }
+            out.push(styled_alert)
+            r += 1
+            continue
+        }
+        if trimmed.starts_with("- [x] ") or trimmed.starts_with("- [X] ") or trimmed.starts_with("* [x] ") {
+            let lead = ln.slice(0, ln.char_len() - trimmed.char_len())
+            out.push(lead ++ "- [x] ☑ " ++ trimmed.drop(6))
+            r += 1
+            continue
+        }
+        if trimmed.starts_with("- [ ] ") or trimmed.starts_with("* [ ] ") {
+            let lead = ln.slice(0, ln.char_len() - trimmed.char_len())
+            out.push(lead ++ "- [ ] ☐ " ++ trimmed.drop(6))
+            r += 1
+            continue
+        }
+        out.push(ln)
+        r += 1
+    }
+    if out.is_empty() {
+        out.push("")
+    }
+    out
+}
+
+private fn cmd_markdown_preview(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kern)!
+    let src = world.active_buffer()
+    let rendered = render_markdown_preview_lines(src)
+    let prev_name = "*Markdown Preview: " ++ src.name ++ "*"
+    let existing_opt = world.find_buffer_by_name(prev_name)
+    let pbuf = if existing_opt != null {
+        let eb = existing_opt.as(Buffer)
+        eb.read_only = false
+        eb.set_lines(rendered)
+        eb.read_only = true
+        eb.modified = false
+        eb
+    } else {
+        let nb = world.create_buffer(
+            prev_name,
+            BufferKind.Special,
+            major_mode = "markdown",
+            initial_lines = rendered,
+        )
+        nb.read_only = true
+        nb.modified = false
+        nb
+    }
+    let _ = world.switch_to_buffer(pbuf.id)
+    kern.emit_hook("buffer-switched", pbuf.id)
+    status_emit(" Rendered Markdown preview: " ++ prev_name)#
+    pbuf.id
+}
+
 private fn on_tools_activate(k: SystemKernel) -> !String Unit {
     let ext_id = ext_tools_id()
     let mgr = ToolsManager.new()
@@ -3218,7 +3755,15 @@ private fn on_tools_activate(k: SystemKernel) -> !String Unit {
         cmd_cancel_bg_jobs,
     )
 
-    -- 4. Org-Outline & Live `*scratch*` Evaluator
+    -- 4. Org-Outline, Markdown Preview & Live `*scratch*` Evaluator
+    k.register_command(
+        "markdown-preview",
+        ext_id,
+        "Render rich GFM Markdown preview with CJK-aligned box tables and callouts (`:MarkdownPreview`).",
+        cmd_markdown_preview,
+    )
+    k.register_command("ex:MarkdownPreview", ext_id, "Ex `:MarkdownPreview`.", cmd_markdown_preview, interactive = false)
+    k.register_command("ex:MdPreview", ext_id, "Ex `:MdPreview`.", cmd_markdown_preview, interactive = false)
     k.register_command(
         "org-cycle",
         ext_id,

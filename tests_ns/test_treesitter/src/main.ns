@@ -1,0 +1,217 @@
+-- End-to-End Integration Test Suite for:
+--   1. `ext_treesitter` (`:TSStatus`, `:TSInspect` / `<Space> u I`, `:TSToggle` / `<Space> u T`, `accel_ts_*` AST spans)
+--   2. `:MarkdownPreview` / `:MdPreview` (CJK-aligned Unicode box-drawn GFM tables, callouts, checkboxes) & `C-c C-t` checkbox toggle + `<C-c>` Which-Key
+--   3. `:set smooth_scroll`, `:set cursor_anim`, `:set treesitter` & `push_anim_viewport_hints`
+
+use std.fs
+use std.io
+use std.path
+use @lava_sys.{DrawCmd, RawUiEvent, mock_enable}
+use @lava_core.{SystemKernel, clipboard_get, clipboard_set, log_event, status_emit}
+use @lava_accel.{TsSpan, accel_ts_highlight_rows, accel_ts_highlight_snippet, accel_ts_status}
+use @ext_document.{Buffer, EditorWorld, FloatingWindow, Pos, require_editor_world}
+use @ext_window.{require_window_manager}
+use @ext_render.{compose_frame}
+use @ext_app.{AppHostCap, app_commit_frame, app_feed_keys, app_step_event, boot_kernel}
+use @ext_treesitter.{
+    BUF_TREESITTER_STATUS, FLOAT_TREESITTER_INSPECT, TreesitterService,
+    register_treesitter_extension, require_treesitter_service
+}
+
+fn check_true(cond: bool, label: String) {
+    if not cond {
+        panic("FAILED: " ++ label)
+    }
+}
+
+fn check_eq_str(actual: String, expected: String, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual='" ++ actual ++ "' expected='" ++ expected ++ "'")
+    }
+}
+
+fn check_eq_i64(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual=" ++ actual.to_string() ++ " expected=" ++ expected.to_string())
+    }
+}
+
+fn buffer_contains_substr(buf: Buffer, needle: String) -> bool {
+    for i in 0..buf.line_count() {
+        if buf.line_at(i).contains(needle) {
+            return true
+        }
+    }
+    false
+}
+
+fn find_float_by_id(world: EditorWorld, id: String) -> ?FloatingWindow {
+    for i in 0..world.floating_windows.len() {
+        let fw = world.floating_windows.get(i.as(usize)).as(FloatingWindow)
+        if fw.id == id {
+            return fw
+        }
+    }
+    null
+}
+
+fn run_treesitter_suite() {
+    io.println("=== test_treesitter & markdown_preview ===")
+    mock_enable(true)
+
+    let kernel: SystemKernel = (boot_kernel() ! { e => panic(e) }).as(SystemKernel)
+    let _ = register_treesitter_extension(kernel) ! { e => panic(e) }
+    let _ = kernel.activate_all() ! { e => panic(e) }
+
+    let world: EditorWorld = (require_editor_world(kernel) ! { e => panic(e) }).as(EditorWorld)
+    let wm = require_window_manager(kernel) ! { e => panic(e) }
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
+    let _ = cap
+    let _ = app_step_event(kernel, RawUiEvent.Resize(1280, 800, 1))# ! { e => panic(e) }
+
+    -- ----------------------------------------------------------------
+    -- Part 1: Native Tree-sitter Highlighting, Inspector & Status
+    -- ----------------------------------------------------------------
+    let (loaded, abi_ver, grammar_cnt, langs) = accel_ts_status()
+    check_true(langs.len() >= 2, "accel_ts_status reports available languages")
+    if loaded {
+        check_true(abi_ver >= 14, "loaded libtree-sitter ABI >= 14")
+        check_true(grammar_cnt >= 10, "discovered native .so grammars")
+    }
+
+    let tmp_dir = "/tmp/lava_test_treesitter"
+    let _ = fs.create_dir_all(tmp_dir)
+    let rs_path = path.join(tmp_dir, "demo.rs")
+    let rs_code = "pub struct Point {{\n    pub x: i32,\n    pub y: i32,\n}}\n\npub fn origin() -> Point {{\n    Point {{ x: 0, y: 42 }}\n}}\n"
+    let _ = fs.write_string(rs_path, rs_code) ! { e => panic(e.to_string()) }
+
+    app_feed_keys(kernel, ":e!<Space>" ++ rs_path ++ "<Return>")# ! { e => panic(e) }
+    let rbuf = world.active_buffer()
+    check_eq_str(rbuf.major_mode, "rust", "demo.rs major_mode == rust")
+    rbuf.sync_external_lines()
+
+    let rows = accel_ts_highlight_rows(rbuf.doc_id, "rust", 0, 7)
+    check_eq_i64(rows.len(), 8, "accel_ts_highlight_rows returns 8 rows for 0..=7")
+    let row0_spans = rows.get(0).as(List)
+    check_true(row0_spans.len() >= 2, "row 0 ('pub struct Point') has AST highlight spans")
+    let first_span = row0_spans.get(0).as(TsSpan)
+    check_eq_i64(first_span.start_col, 0, "first span starts at col 0 ('pub')")
+    check_eq_i64(first_span.end_col, 3, "first span ends at col 3 ('pub')")
+
+    let snippet_rows = accel_ts_highlight_snippet("pub fn add(a: i64, b: i64) -> i64 = a + b", "nessa")
+    check_eq_i64(snippet_rows.len(), 1, "nessa snippet returns 1 row")
+    check_true(snippet_rows.get(0).as(List).len() >= 4, "nessa snippet highlights pub, fn, add, types")
+
+    -- Place cursor on `Point` (row 0, col 12) and trigger `<Space> u I` (`treesitter-inspect`)
+    rbuf.point = Pos.new(0, 12)
+    app_feed_keys(kernel, "<Space>uI")# ! { e => panic(e) }
+    let fw_opt = find_float_by_id(world, FLOAT_TREESITTER_INSPECT)
+    check_true(fw_opt != null, "<Space> u I opens treesitter_inspect float")
+    let fw = fw_opt.as(FloatingWindow)
+    check_eq_str(fw.anchor, "cursor", "treesitter_inspect float is cursor-anchored")
+    var joined_fw = ""
+    for i in 0..fw.lines.len() {
+        joined_fw = joined_fw ++ fw.lines.get(i.as(usize)).as(String) ++ "\n"
+    }
+    check_true(joined_fw.contains("rust"), "inspector float mentions rust language")
+    check_true(
+        joined_fw.contains("type_identifier") or joined_fw.contains("Point") or joined_fw.contains("Node"),
+        "inspector float displays AST node info under cursor",
+    )
+
+    -- Escape dismisses the inspector float cleanly
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+    check_true(find_float_by_id(world, FLOAT_TREESITTER_INSPECT) == null, "<Escape> dismisses treesitter_inspect float")
+
+    -- Toggle Tree-sitter via `<Space> u T` and `:TSToggle`
+    let ts_svc: TreesitterService = (require_treesitter_service(kernel) ! { e => panic(e) }).as(TreesitterService)
+    check_true(ts_svc.enabled and world.options.treesitter, "treesitter starts enabled")
+    app_feed_keys(kernel, "<Space>uT")# ! { e => panic(e) }
+    check_true((not ts_svc.enabled) and (not world.options.treesitter), "<Space> u T disables treesitter")
+    app_feed_keys(kernel, ":TSToggle<Space>on<Return>")# ! { e => panic(e) }
+    check_true(ts_svc.enabled and world.options.treesitter, ":TSToggle on re-enables treesitter")
+
+    -- Open `:TSStatus` and close with `q`
+    let origin_id = rbuf.id
+    app_feed_keys(kernel, ":TSStatus<Return>")# ! { e => panic(e) }
+    let sbuf = world.active_buffer()
+    check_eq_str(sbuf.name, BUF_TREESITTER_STATUS, ":TSStatus opens *TreeSitter* buffer")
+    check_true(buffer_contains_substr(sbuf, "Lava Tree-Sitter Runtime Status"), "*TreeSitter* header present")
+    check_true(buffer_contains_substr(sbuf, "Highlighting  : ENABLED"), "*TreeSitter* shows ENABLED")
+    app_feed_keys(kernel, "q")# ! { e => panic(e) }
+    check_true(world.active_buffer_id == origin_id, "`q` in *TreeSitter* restores origin buffer")
+
+    io.println("  [PASS] Part 1: ext_treesitter (:TSStatus, <Space>uI AST float, <Space>uT toggle, Rust & Nessa spans)")
+
+    -- ----------------------------------------------------------------
+    -- Part 2: `:MarkdownPreview` CJK GFM Tables, Checkboxes & `<C-c>` Which-Key
+    -- ----------------------------------------------------------------
+    let md_path = path.join(tmp_dir, "notes.md")
+    let md_src = "---\ntitle: Lava Spec\n---\n# 标题 Overview\n\n> [!NOTE]\n> 平滑滚动与光标动画说明\n\n- [ ] 待办任务一\n- [x] 已完成任务\n\n| 模块 | 状态 |\n| :--- | :---: |\n| 语法高亮 | 完成 |\n| Tree-sitter | OK |\n"
+    let _ = fs.write_string(md_path, md_src) ! { e => panic(e.to_string()) }
+
+    app_feed_keys(kernel, ":e!<Space>" ++ md_path ++ "<Return>")# ! { e => panic(e) }
+    let mbuf = world.active_buffer()
+    check_eq_str(mbuf.major_mode, "markdown", "notes.md major_mode == markdown")
+
+    -- Press `C-c` alone and verify Which-Key hints activate for `ext_tools` C-c prefix!
+    mbuf.point = Pos.new(8, 2)
+    app_feed_keys(kernel, "<C-c>")# ! { e => panic(e) }
+    check_eq_str(world.pending_keys_display, "<C-c>", "<C-c> sets pending_keys_display in Markdown")
+    check_true(world.which_key_items.len() >= 2, "<C-c> Which-Key lists C-c sub-bindings")
+    -- Complete `C-t` to toggle `- [ ] 待办任务一` -> `- [x] 待办任务一`
+    app_feed_keys(kernel, "<C-t>")# ! { e => panic(e) }
+    check_eq_str(mbuf.line_at(8), "- [x] 待办任务一", "C-c C-t toggles Markdown checkbox [ ] -> [x]")
+    check_eq_str(world.pending_keys_display, "", "completing C-c C-t clears pending_keys_display")
+    check_true(world.which_key_items.is_empty(), "completing C-c C-t clears Which-Key popup")
+
+    -- Run `:MarkdownPreview` and verify Unicode box-drawn GFM table + callout + checkbox icons
+    let md_buf_id = mbuf.id
+    app_feed_keys(kernel, ":MarkdownPreview<Return>")# ! { e => panic(e) }
+    let pbuf = world.active_buffer()
+    check_true(pbuf.name.starts_with("*Markdown Preview:"), ":MarkdownPreview opens *Markdown Preview:*")
+    check_true(buffer_contains_substr(pbuf, "┌"), "*Markdown Preview* renders top box border ┌")
+    check_true(buffer_contains_substr(pbuf, "┼"), "*Markdown Preview* renders table cross ┼")
+    check_true(buffer_contains_substr(pbuf, "┘"), "*Markdown Preview* renders bottom box border ┘")
+    check_true(buffer_contains_substr(pbuf, "语法高亮"), "*Markdown Preview* preserves CJK table cell text")
+    app_feed_keys(kernel, "q")# ! { e => panic(e) }
+    check_true(world.active_buffer_id == md_buf_id, "`q` closes *Markdown Preview* back to source buffer")
+
+    io.println("  [PASS] Part 2: :MarkdownPreview (CJK box-drawn GFM tables, callouts) & C-c C-t checkbox + Which-Key")
+
+    -- ----------------------------------------------------------------
+    -- Part 3: `:set smooth_scroll` / `:set cursor_anim` / `:set treesitter` & Frame Commit
+    -- ----------------------------------------------------------------
+    check_true(world.options.smooth_scroll, "smooth_scroll defaults to true")
+    check_true(world.options.cursor_anim, "cursor_anim defaults to true")
+    app_feed_keys(kernel, ":set<Space>nosmooth_scroll<Return>")# ! { e => panic(e) }
+    check_true(not world.options.smooth_scroll, ":set nosmooth_scroll disables smooth_scroll")
+    app_feed_keys(kernel, ":set<Space>smooth_scroll<Return>")# ! { e => panic(e) }
+    check_true(world.options.smooth_scroll, ":set smooth_scroll re-enables smooth_scroll")
+
+    app_feed_keys(kernel, ":set<Space>nocursor_anim<Return>")# ! { e => panic(e) }
+    check_true(not world.options.cursor_anim, ":set nocursor_anim disables cursor_anim")
+    app_feed_keys(kernel, ":set<Space>cursor_anim<Return>")# ! { e => panic(e) }
+    check_true(world.options.cursor_anim, ":set cursor_anim re-enables cursor_anim")
+
+    let (_spec, cmds) = compose_frame(kernel, world, wm)
+    check_true(cmds.len() > 10, "compose_frame emits valid DrawCmd list")
+    for i in 0..cmds.len() {
+        let cmd = cmds.get(i.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.TextRun(_, _, _, _, _, _, is_bold, _, _) => {
+                check_true(not is_bold, "no-bold invariant preserved across composed frame")
+            },
+            _ => (),
+        }
+    }
+    let gen: i64 = (app_commit_frame(kernel)# ! { e => panic(e) }).as(i64)
+    check_true(gen >= 1, "app_commit_frame pushes anim hints and commits frame")
+
+    io.println("  [PASS] Part 3: :set smooth_scroll / cursor_anim / treesitter & frame commit invariants")
+    io.println("ALL TREESITTER + MARKDOWN PREVIEW + ANIM OPTIONS TESTS PASSED!")
+}
+
+fn main() {
+    run_treesitter_suite()
+}

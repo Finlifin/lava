@@ -12,6 +12,8 @@ pub(crate) struct CairoT {
     _private: [u8; 0],
 }
 
+pub(crate) const CAIRO_OPERATOR_SOURCE: c_int = 1;
+
 #[repr(C)]
 pub(crate) struct PangoLayout {
     _private: [u8; 0],
@@ -20,6 +22,18 @@ pub(crate) struct PangoLayout {
 #[repr(C)]
 pub(crate) struct PangoFontDescription {
     _private: [u8; 0],
+}
+
+#[repr(C)]
+pub(crate) struct PangoAttrList {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub(crate) struct PangoAttribute {
+    pub(crate) klass: *const c_void,
+    pub(crate) start_index: c_uint,
+    pub(crate) end_index: c_uint,
 }
 
 #[repr(C)]
@@ -48,6 +62,22 @@ pub(crate) struct GdkDisplay {
 
 #[repr(C)]
 pub(crate) struct GdkClipboard {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CairoMatrix {
+    pub(crate) xx: c_double,
+    pub(crate) yx: c_double,
+    pub(crate) xy: c_double,
+    pub(crate) yy: c_double,
+    pub(crate) x0: c_double,
+    pub(crate) y0: c_double,
+}
+
+#[repr(C)]
+pub(crate) struct GdkFrameClock {
     _private: [u8; 0],
 }
 
@@ -117,6 +147,13 @@ pub(crate) type GtkDrawingAreaDrawFunc = Option<
         user_data: *mut c_void,
     ),
 >;
+pub(crate) type GtkTickCallback = Option<
+    unsafe extern "C" fn(
+        widget: *mut GtkWidget,
+        frame_clock: *mut GdkFrameClock,
+        user_data: *mut c_void,
+    ) -> c_int,
+>;
 
 unsafe extern "C" {
     // Cairo
@@ -125,14 +162,30 @@ unsafe extern "C" {
         width: c_int,
         height: c_int,
     ) -> *mut CairoSurfaceT;
+    #[cfg(test)]
+    pub(crate) fn cairo_image_surface_get_data(surface: *mut CairoSurfaceT) -> *mut u8;
+    #[cfg(test)]
+    pub(crate) fn cairo_image_surface_get_stride(surface: *mut CairoSurfaceT) -> c_int;
     pub(crate) fn cairo_surface_destroy(surface: *mut CairoSurfaceT);
     pub(crate) fn cairo_surface_flush(surface: *mut CairoSurfaceT);
     pub(crate) fn cairo_surface_status(surface: *mut CairoSurfaceT) -> c_int;
+    pub(crate) fn cairo_surface_get_device_scale(
+        surface: *mut CairoSurfaceT,
+        x_scale: *mut c_double,
+        y_scale: *mut c_double,
+    );
+    pub(crate) fn cairo_surface_set_device_scale(
+        surface: *mut CairoSurfaceT,
+        x_scale: c_double,
+        y_scale: c_double,
+    );
     pub(crate) fn cairo_surface_write_to_png(
         surface: *mut CairoSurfaceT,
         filename: *const c_char,
     ) -> c_int;
     pub(crate) fn cairo_create(target: *mut CairoSurfaceT) -> *mut CairoT;
+    pub(crate) fn cairo_get_target(cr: *mut CairoT) -> *mut CairoSurfaceT;
+    pub(crate) fn cairo_get_matrix(cr: *mut CairoT, matrix: *mut CairoMatrix);
     pub(crate) fn cairo_destroy(cr: *mut CairoT);
     pub(crate) fn cairo_save(cr: *mut CairoT);
     pub(crate) fn cairo_restore(cr: *mut CairoT);
@@ -164,9 +217,17 @@ unsafe extern "C" {
         blue: c_double,
         alpha: c_double,
     );
+    pub(crate) fn cairo_set_source_surface(
+        cr: *mut CairoT,
+        surface: *mut CairoSurfaceT,
+        x: c_double,
+        y: c_double,
+    );
+    pub(crate) fn cairo_set_operator(cr: *mut CairoT, op: c_int);
     pub(crate) fn cairo_set_line_width(cr: *mut CairoT, width: c_double);
     pub(crate) fn cairo_fill(cr: *mut CairoT);
     pub(crate) fn cairo_stroke(cr: *mut CairoT);
+    pub(crate) fn cairo_paint(cr: *mut CairoT);
 
     // Pango & PangoCairo
     pub(crate) fn pango_cairo_create_layout(cr: *mut CairoT) -> *mut PangoLayout;
@@ -189,17 +250,25 @@ unsafe extern "C" {
         text: *const c_char,
         length: c_int,
     );
-    pub(crate) fn pango_layout_get_pixel_extents(
-        layout: *mut PangoLayout,
-        ink_rect: *mut PangoRectangle,
-        logical_rect: *mut PangoRectangle,
-    );
     pub(crate) fn pango_layout_get_extents(
         layout: *mut PangoLayout,
         ink_rect: *mut PangoRectangle,
         logical_rect: *mut PangoRectangle,
     );
     pub(crate) fn pango_layout_get_baseline(layout: *mut PangoLayout) -> c_int;
+    pub(crate) fn pango_attr_list_new() -> *mut PangoAttrList;
+    pub(crate) fn pango_attr_list_unref(list: *mut PangoAttrList);
+    pub(crate) fn pango_attr_list_insert(list: *mut PangoAttrList, attr: *mut PangoAttribute);
+    pub(crate) fn pango_attr_foreground_new(
+        red: u16,
+        green: u16,
+        blue: u16,
+    ) -> *mut PangoAttribute;
+    pub(crate) fn pango_attr_style_new(style: c_int) -> *mut PangoAttribute;
+    pub(crate) fn pango_layout_set_attributes(
+        layout: *mut PangoLayout,
+        attrs: *mut PangoAttrList,
+    );
     pub(crate) fn g_object_unref(object: *mut c_void);
 
     // GLib & GObject
@@ -243,11 +312,20 @@ unsafe extern "C" {
     pub(crate) fn gtk_widget_set_hexpand(widget: *mut GtkWidget, expand: c_int);
     pub(crate) fn gtk_widget_set_vexpand(widget: *mut GtkWidget, expand: c_int);
     pub(crate) fn gtk_widget_get_scale_factor(widget: *mut GtkWidget) -> c_int;
+    pub(crate) fn gtk_widget_get_width(widget: *mut GtkWidget) -> c_int;
+    pub(crate) fn gtk_widget_get_height(widget: *mut GtkWidget) -> c_int;
     pub(crate) fn gtk_widget_set_cursor_from_name(widget: *mut GtkWidget, name: *const c_char);
     pub(crate) fn gtk_widget_add_controller(
         widget: *mut GtkWidget,
         controller: *mut GtkEventController,
     );
+    pub(crate) fn gtk_widget_add_tick_callback(
+        widget: *mut GtkWidget,
+        callback: GtkTickCallback,
+        user_data: *mut c_void,
+        notify: GDestroyNotify,
+    ) -> c_uint;
+    pub(crate) fn gdk_frame_clock_get_frame_time(frame_clock: *mut GdkFrameClock) -> i64;
 
     pub(crate) fn gtk_drawing_area_new() -> *mut GtkWidget;
     pub(crate) fn gtk_drawing_area_set_draw_func(

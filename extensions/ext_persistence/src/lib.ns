@@ -100,6 +100,27 @@ pub fn require_persistence_service(kernel: SystemKernel) -> !String PersistenceS
 -- 2. Startup Dashboard (`*Dashboard*`, `major_mode = "dashboard"`)
 -- ============================================================================
 
+fn dashboard_file_icon(fp: String) -> String {
+    let low = fp.to_lower()
+    when {
+        low.ends_with(".ns") or low.ends_with(".zig") => "",
+        low.ends_with(".rs") => "",
+        low.ends_with(".lua") => "",
+        low.ends_with(".py") => "",
+        low.ends_with(".c") or low.ends_with(".h") => "",
+        low.ends_with(".cpp") or low.ends_with(".cc") or low.ends_with(".hpp") => "",
+        low.ends_with(".js") or low.ends_with(".jsx") => "",
+        low.ends_with(".ts") or low.ends_with(".tsx") => "",
+        low.ends_with(".go") => "",
+        low.ends_with(".json") => "",
+        low.ends_with(".toml") or low.ends_with(".yaml") or low.ends_with(".yml") => "",
+        low.ends_with(".md") => "",
+        low.ends_with(".txt") or low.ends_with(".org") => "",
+        low.ends_with(".sh") => "",
+        else => "",
+    }
+}
+
 pub fn render_dashboard_lines(kernel: SystemKernel, world: EditorWorld, svc: PersistenceService) -> List {
     let lines = List()
     lines.push("")
@@ -114,19 +135,19 @@ pub fn render_dashboard_lines(kernel: SystemKernel, world: EditorWorld, svc: Per
 
     let ext_count = kernel.list_extensions().len()
     lines.push(
-        "      ⚡ Loaded " ++ ext_count.to_string() ++ " extensions   |   Workspace: " ++ world.cwd
+        "      ⚡ Loaded " ++ ext_count.to_string() ++ " extensions   |    Workspace: " ++ world.cwd
     )
     lines.push("      ──────────────────────────────────────────────────────────")
     lines.push("")
-    lines.push("      Quick Actions:")
-    lines.push("        [f]  Find File                (Telescope / Find File)")
-    lines.push("        [n]  New Empty Buffer         (Create untitled buffer)")
-    lines.push("        [g]  Live Grep                (Telescope / Project Search)")
-    lines.push("        [s]  Restore Session          (Restore saved workspace)")
-    lines.push("        [l]  Extensions               (Lazy plugin manager / list)")
-    lines.push("        [q]  Quit Lava                (Exit editor)")
+    lines.push("       Quick Actions:")
+    lines.push("        [f]   Find File                (Telescope / Find File)")
+    lines.push("        [n]   New Empty Buffer         (Create untitled buffer)")
+    lines.push("        [g]   Live Grep                (Telescope / Project Search)")
+    lines.push("        [s]   Restore Session          (Restore saved workspace)")
+    lines.push("        [l]   Extensions               (Lazy plugin manager / list)")
+    lines.push("        [q]   Quit Lava                (Exit editor)")
     lines.push("")
-    lines.push("      Recent Files:")
+    lines.push("       Recent Files:")
 
     if svc.recent_files.is_empty() {
         lines.push("        (No recent files recorded yet)")
@@ -134,7 +155,7 @@ pub fn render_dashboard_lines(kernel: SystemKernel, world: EditorWorld, svc: Per
         let limit = if svc.recent_files.len() < 5 { svc.recent_files.len() } else { 5 }
         for i in 0..limit {
             let fp = svc.recent_files.get(i.as(usize)).as(String)
-            lines.push("        [" ++ (i + 1).to_string() ++ "]  " ++ fp)
+            lines.push("        [" ++ (i + 1).to_string() ++ "]  " ++ dashboard_file_icon(fp) ++ " " ++ fp)
         }
     }
     lines.push("")
@@ -433,6 +454,15 @@ pub fn save_workspace_session(kernel: SystemKernel, custom_path: String) -> #[lo
     }
 
     let lines = serialize_session_lines(world, svc)
+    if world.options.remember_window_size {
+        let wm_opt = kernel.service("lava.window.manager")
+        if wm_opt != null {
+            let wm = wm_opt.as(WindowManager)
+            if wm.pixel_width >= 64 and wm.pixel_height >= 64 {
+                lines.push("window_size\t" ++ wm.pixel_width.to_string() ++ "\t" ++ wm.pixel_height.to_string())
+            }
+        }
+    }
     let _ = host_write_file_lines(target, lines, true)!
     let _ = world.push_notification("info", "Session", "Saved session to " ++ target)
     log_event("info", OWNER_PERSISTENCE, "Saved session to " ++ target)#
@@ -455,6 +485,8 @@ pub fn restore_workspace_session(kernel: SystemKernel, custom_path: String) -> #
     var saved_theme = ""
     var has_zen = false
     var saved_zen = false
+    var saved_win_w: i64 = 0
+    var saved_win_h: i64 = 0
     var saved_active_file = ""
     let saved_files = List()
     let saved_recents = List()
@@ -476,6 +508,13 @@ pub fn restore_workspace_session(kernel: SystemKernel, custom_path: String) -> #
         } else if tag == "zen_mode" {
             has_zen = true
             saved_zen = parts.get(1).as(String).trim() == "true"
+        } else if tag == "window_size" and parts.len() >= 3 {
+            let w_opt = parts.get(1).as(String).trim().parse_i64()
+            let h_opt = parts.get(2).as(String).trim().parse_i64()
+            if w_opt != null and h_opt != null {
+                saved_win_w = w_opt.as(i64)
+                saved_win_h = h_opt.as(i64)
+            }
         } else if tag == "active_file" {
             saved_active_file = parts.get(1).as(String).trim()
         } else if tag == "file" and parts.len() >= 4 {
@@ -574,7 +613,11 @@ pub fn restore_workspace_session(kernel: SystemKernel, custom_path: String) -> #
     }
     let wm_opt = kernel.service("lava.window.manager")
     if wm_opt != null {
-        wm_opt.as(WindowManager).sync_from_world(world)
+        let wm = wm_opt.as(WindowManager)
+        if world.options.remember_window_size and saved_win_w >= 64 and saved_win_h >= 64 {
+            wm.resize_viewport(saved_win_w, saved_win_h, world)
+        }
+        wm.sync_from_world(world)
     }
     kernel.emit_hook("buffer-switched", world.active_buffer_id)
 
@@ -677,7 +720,6 @@ pub fn register_persistence_extension(kernel: SystemKernel) -> !String Unit {
             let dash_km = k.ensure_keymap("mode:dashboard")
             dash_km.bind("f", "dashboard-find-file", ext_id, description = "Find file")
             dash_km.bind("n", "new-empty-buffer", ext_id, description = "New empty buffer")
-            dash_km.bind("g", "dashboard-live-grep", ext_id, description = "Live grep")
             dash_km.bind("s", "session-restore", ext_id, description = "Restore session")
             dash_km.bind("l", "dashboard-extensions", ext_id, description = "Extensions manager")
             dash_km.bind("q", "dashboard-quit", ext_id, description = "Quit Lava")

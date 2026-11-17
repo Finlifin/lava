@@ -30,7 +30,7 @@ use @ext_vim.{VimMode, VimState, register_vim_extension, vim_handle_key}
 use @ext_emacs.{EmacsState, emacs_handle_key, register_emacs_extension}
 use @ext_tools.{ToolsManager, register_tools_extension, tools_handle_key}
 use @ext_snippets.register_snippets_extension
-use @ext_cmp.{SERVICE_CMP, collect_candidates, register_cmp_extension}
+use @ext_cmp.{CmpService, SERVICE_CMP, collect_candidates, register_cmp_extension}
 use @ext_lazy.register_lazy_extension
 use @ext_help.{HELP_BUF_NAME, register_help_extension, require_help_state}
 use @ext_lsp.{
@@ -598,6 +598,48 @@ fn main() {
         }
     }
     check_true(found_cmp, "`ext_cmp` returns `calc_velocity` from LSP/buffer completion source")
+
+    -- 4k. Live JSON-RPC LSP completion (`ext_cmp` <-> `ext_lsp` roundtrip + empty prefix after `.`)
+    check_eq_str(world.options.font_family, "Fira Code", "default font_family is Fira Code")
+    check_eq_bool(world.options.remember_window_size, true, "remember_window_size defaults to true")
+    let _ = kernel.dispatch_command("evil-ex", ["set noremember_window_size"])#!
+    check_eq_bool(world.options.remember_window_size, false, ":set noremember_window_size disables option")
+    let _ = kernel.dispatch_command("evil-ex", ["set remember_window_size"])#!
+    check_eq_bool(world.options.remember_window_size, true, ":set remember_window_size re-enables option")
+
+    let mock_py_lsp = path.join(bin_dir, "mock-py-lsp")
+    let py_lsp_script = "#!/usr/bin/env python3\nimport json, sys\ndef read_msg():\n    hdrs = dict()\n    while True:\n        line = sys.stdin.buffer.readline()\n        if not line:\n            return None\n        s = line.decode('utf-8', 'replace').strip()\n        if s == '':\n            break\n        if ':' in s:\n            k, v = s.split(':', 1)\n            hdrs[k.strip().lower()] = v.strip()\n    n = int(hdrs.get('content-length', '0'))\n    if n <= 0:\n        return None\n    body = sys.stdin.buffer.read(n)\n    return json.loads(body.decode('utf-8'))\ndef send_msg(obj):\n    raw = json.dumps(obj).encode('utf-8')\n    hdr = ('Content-Length: %d\\r\\n\\r\\n' % len(raw)).encode('ascii')\n    sys.stdout.buffer.write(hdr + raw)\n    sys.stdout.buffer.flush()\nwhile True:\n    msg = read_msg()\n    if msg is None:\n        break\n    m = msg.get('method')\n    mid = msg.get('id')\n    if m == 'initialize':\n        send_msg(dict(jsonrpc='2.0', id=mid, result=dict(capabilities=dict(completionProvider=dict(triggerCharacters=['.'])), serverInfo=dict(name='mock-py-lsp', version='1.0'))))\n    elif m == 'textDocument/completion':\n        send_msg(dict(jsonrpc='2.0', id=mid, result=dict(isIncomplete=False, items=[dict(label='lsp_member_alpha', kind=2, detail='fn() -> i64'), dict(label='lsp_member_beta', kind=5, detail='i64')])))\n    elif m == 'shutdown':\n        send_msg(dict(jsonrpc='2.0', id=mid, result=None))\n        break\n"
+    let _ = fs.write_string(mock_py_lsp, py_lsp_script) ! { e => panic("write mock-py-lsp: " ++ e.to_string()) }
+    let _ = process.shell("chmod +x " ++ mock_py_lsp) ! { e => panic("chmod mock-py-lsp: " ++ e.to_string()) }
+    configure_lsp_server(
+        kernel,
+        "python",
+        "mock-py-lsp",
+        List(),
+        ["pyproject.toml"],
+        "",
+    ) ! { e => panic("configure pyright mock: " ++ e) }
+
+    let py_file = path.join(py_root, "demo.py")
+    let _ = fs.write_string(py_file, "obj = object()\nobj.\n") ! { e => panic("write demo.py: " ++ e.to_string()) }
+    let pybuf = world.open_file(py_file)# ! { e => panic("open demo.py: " ++ e) }
+    kernel.emit_hook("buffer-opened", pybuf.id)
+    pybuf.point = Pos.new(1, 4)
+    let cmp_svc = kernel.service(SERVICE_CMP).as(CmpService)
+    feed(kernel, "i")#
+    pybuf.point = Pos.new(1, 4)
+    let opened_lsp = cmp_svc.trigger(kernel, manual = true) ! { e => panic("cmp.trigger: " ++ e) }
+    check_true(opened_lsp, "manual cmp.trigger after `.` opened popup with live LSP items")
+    var found_live_lsp_item = false
+    for pi in 0..world.completion_popup.items.len() {
+        let pitem = world.completion_popup.items.get(pi.as(usize)).as(CompletionItem)
+        if pitem.label == "lsp_member_alpha" {
+            found_live_lsp_item = true
+        }
+    }
+    check_true(found_live_lsp_item, "completion_popup contains live LSP item `lsp_member_alpha`")
+    feed(kernel, "<Escape>")#
+    lsp_svc.notify_buffer_closed(pybuf.id, py_file)
 
     -- ========================================================================
     -- 5. Harmony Check: `ext_help` + `ext_lsp` + `ext_lspconfig` Together!

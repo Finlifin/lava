@@ -9,11 +9,12 @@ use @lava_core.{
     CommandSpec, ExtId, InteractiveEffects, KeyBindingEntry, PromptKind, PromptRequest,
     SystemKernel, ask_prompt, log_event, status_emit
 }
+use @lava_accel.{TsSpan, accel_ts_highlight_rows, accel_ts_highlight_snippet}
 use @ext_document.{
     ActiveBgJob, Buffer, BufferId, CompletionItem, CompletionPopup, EditorOptions, EditorWorld,
-    FloatingWindow, GutterSign, InlineSpanDecor, MinibufferRichItem, MinibufferView, Pos,
-    SidebarPanel, Span, ToastNotification, VirtualTextDecor, VisualKind, ext_document_id,
-    require_editor_world
+    FloatingWindow, GutterSign, InlineGhostText, InlineSpanDecor, MinibufferRichItem,
+    MinibufferView, Pos, SignatureHelpPopup, SidebarPanel, Span, ToastNotification,
+    VirtualTextDecor, VisualKind, ext_document_id, require_editor_world
 }
 use @ext_window.{
     ECHO_BAR_HEIGHT, Rect, TAB_BAR_HEIGHT, TabWorkspace, WinId, WindowManager, WindowPane,
@@ -624,7 +625,7 @@ fn tokenize_code_line(line: String, mode: String, theme: ThemePalette) -> List {
         return runs
     }
 
-    -- C/C++ preprocessor directive (`#include`, `#define`, ...)
+    -- C/C++ preprocessor directive (`#include`, `#define`, ...) — NOT CSS `#id` or JS `#priv`!
     if mode == "c" and line.trim_start().starts_with("#") {
         push_run(runs, 0, line, theme.accent, false, false)
         return runs
@@ -639,11 +640,11 @@ fn tokenize_code_line(line: String, mode: String, theme: ThemePalette) -> List {
         let c1 = if i + 1 < n { char_at_list(cs, i + 1) } else { '\0' }
 
         -- Line comments
-        if mode == "nessa" and ch == '-' and c1 == '-' {
+        if (mode == "nessa" or mode == "sql") and ch == '-' and c1 == '-' {
             push_run(runs, i, line.slice(i, n), theme.syn_comment, false, true)
             break
         }
-        if (mode == "rust" or mode == "c") and ch == '/' and c1 == '/' {
+        if (mode == "rust" or mode == "c" or mode == "js") and ch == '/' and c1 == '/' {
             push_run(runs, i, line.slice(i, n), theme.syn_comment, false, true)
             break
         }
@@ -652,8 +653,8 @@ fn tokenize_code_line(line: String, mode: String, theme: ThemePalette) -> List {
             break
         }
 
-        -- Inline C `/* ... */` block comment within a line
-        if mode == "c" and ch == '/' and c1 == '*' {
+        -- Inline `/* ... */` block comment within a line
+        if (mode == "c" or mode == "rust" or mode == "js" or mode == "css" or mode == "sql") and ch == '/' and c1 == '*' {
             var end_c = i + 2
             while end_c + 1 < n and not (char_at_list(cs, end_c) == '*' and char_at_list(cs, end_c + 1) == '/') {
                 end_c += 1
@@ -899,48 +900,75 @@ pub fn canonical_fence_mode(info_raw: String) -> String {
         return ""
     }
     let lang = trimmed.slice(s, e).to_lower()
+    if lang == "text" or lang == "txt" or lang == "plain" or lang == "plaintext" or lang == "ascii" {
+        return ""
+    }
     when {
         lang == "rust" or lang == "rs" => "rust",
-        lang == "nessa" or lang == "ns" or lang == "lua" => "nessa",
+        lang == "nessa" or lang == "ns" => "nessa",
+        lang == "lua" => "lua",
         lang == "python" or lang == "py" => "python",
-        lang == "ts" or lang == "tsx" or lang == "typescript" or lang == "js" or lang == "jsx" or lang == "javascript" or lang == "c" or lang == "cpp" or lang == "c++" or lang == "cc" or lang == "h" or lang == "hpp" or lang == "css" or lang == "java" => "c",
-        lang == "go" or lang == "golang" => "rust",
+        lang == "ts" or lang == "typescript" => "typescript",
+        lang == "tsx" => "tsx",
+        lang == "js" or lang == "jsx" or lang == "javascript" or lang == "mjs" => "javascript",
+        lang == "css" or lang == "scss" or lang == "less" => "css",
+        lang == "html" or lang == "htm" or lang == "xml" or lang == "svg" => "html",
+        lang == "c" or lang == "h" => "c",
+        lang == "cpp" or lang == "c++" or lang == "cc" or lang == "cxx" or lang == "hpp" => "cpp",
+        lang == "java" or lang == "kotlin" or lang == "kt" or lang == "cs" or lang == "csharp" => "java",
+        lang == "go" or lang == "golang" => "go",
+        lang == "zig" => "zig",
+        lang == "sql" => "sql",
         lang == "sh" or lang == "bash" or lang == "zsh" or lang == "shell" or lang == "fish" or lang == "console" or lang == "makefile" or lang == "make" => "shell",
         lang == "json" or lang == "jsonc" => "json",
-        lang == "toml" or lang == "yaml" or lang == "yml" or lang == "ini" => "toml",
+        lang == "toml" or lang == "ini" or lang == "conf" => "toml",
+        lang == "yaml" or lang == "yml" => "yaml",
         lang == "diff" or lang == "patch" => "diff",
-        lang == "markdown" or lang == "md" => "markdown",
+        lang == "markdown" or lang == "md" or lang == "gfm" => "markdown",
         lang == "org" => "org",
-        else => "",
+        else => lang,
     }
 }
 
-fn parse_markdown_fence_open(line: String) -> ?(char, i64, String) {
+fn strip_md_quote_and_indent(line: String) -> (String, i64) {
     let blen = line.len()
+    var sp: i64 = 0
+    while sp < blen and sp < 12 and (line.byte_at(sp) == 32 or line.byte_at(sp) == 9) {
+        sp += 1
+    }
+    var pos = sp
+    var saw_q = false
+    while pos < blen and line.byte_at(pos) == 62 {
+        saw_q = true
+        pos += 1
+        while pos < blen and (line.byte_at(pos) == 32 or line.byte_at(pos) == 9) {
+            pos += 1
+        }
+    }
+    if saw_q {
+        return (line.drop(pos), 0)
+    }
+    (line.drop(sp), sp)
+}
+
+fn parse_markdown_fence_open(line: String) -> ?(char, i64, String) {
+    let (s, _) = strip_md_quote_and_indent(line)
+    let blen = s.len()
     if blen < 3 {
         return null
     }
-    var sp: i64 = 0
-    while sp < blen and sp < 4 and line.byte_at(sp) == 32 {
-        sp += 1
-    }
-    if sp >= 4 or sp >= blen {
-        return null
-    }
-    let b_fc = line.byte_at(sp)
+    let b_fc = s.byte_at(0)
     if b_fc != 96 and b_fc != 126 {
         return null
     }
     var flen: i64 = 0
-    while sp + flen < blen and line.byte_at(sp + flen) == b_fc {
+    while flen < blen and s.byte_at(flen) == b_fc {
         flen += 1
     }
     if flen < 3 {
         return null
     }
-    let cs = line.chars()
-    let n = cs.len()
-    let rest = if sp + flen < n { line.slice(sp + flen, n) } else { "" }
+    let rest = s.drop(flen)
     if b_fc == 96 and rest.contains("`") {
         return null
     }
@@ -949,28 +977,22 @@ fn parse_markdown_fence_open(line: String) -> ?(char, i64, String) {
 }
 
 fn is_markdown_fence_close(line: String, fence_char: char, min_len: i64) -> bool {
-    let blen = line.len()
+    let (s, _) = strip_md_quote_and_indent(line)
+    let blen = s.len()
     if blen < min_len {
-        return false
-    }
-    var sp: i64 = 0
-    while sp < blen and sp < 4 and line.byte_at(sp) == 32 {
-        sp += 1
-    }
-    if sp >= 4 or sp >= blen {
         return false
     }
     let target_b: i64 = if fence_char == '`' { 96 } else { 126 }
     var flen: i64 = 0
-    while sp + flen < blen and line.byte_at(sp + flen) == target_b {
+    while flen < blen and s.byte_at(flen) == target_b {
         flen += 1
     }
     if flen < min_len {
         return false
     }
-    var k = sp + flen
+    var k = flen
     while k < blen {
-        let b = line.byte_at(k)
+        let b = s.byte_at(k)
         if b != 32 and b != 9 {
             return false
         }
@@ -986,9 +1008,12 @@ private struct MdFenceCacheEntry {
     buf_name: String,
     line0: String,
     in_fence: bool,
+    in_html_cmt: bool,
+    in_frontmatter: bool,
     fence_ch: char,
     fence_min_len: i64,
     fence_mode: String,
+    fence_open_row: i64,
     states: List,
 }
 
@@ -1003,48 +1028,103 @@ private fn ensure_md_fence_cache() -> HashMap {
     existing
 }
 
+private fn has_valid_frontmatter_close(buf: Buffer, total: i64) -> bool {
+    if total < 2 or buf.line_at(0).trim_end() != "---" {
+        return false
+    }
+    let max_scan = if total < 64 { total } else { 64 }
+    for r in 1..max_scan {
+        let t = buf.line_at(r).trim_end()
+        if t == "---" or t == "..." {
+            return true
+        }
+    }
+    false
+}
+
 private fn extend_markdown_fence_entry(entry: MdFenceCacheEntry, buf: Buffer, limit: i64) {
     let start_r = entry.states.len()
     if start_r > limit {
         return
     }
     var in_fence = entry.in_fence
+    var in_html_cmt = entry.in_html_cmt
+    var in_fm = entry.in_frontmatter
     var fence_ch = entry.fence_ch
     var fence_min_len = entry.fence_min_len
     var fence_mode = entry.fence_mode
+    var fence_open_row = entry.fence_open_row
+
     for r in start_r..(limit + 1) {
         let ln = buf.line_at(r)
-        if not in_fence {
-            let open_opt = parse_markdown_fence_open(ln)
-            if open_opt != null {
-                let (fc, flen, info_str) = open_opt.as((char, i64, String))
-                in_fence = true
-                fence_ch = fc
-                fence_min_len = flen
-                fence_mode = canonical_fence_mode(info_str)
-                entry.states.push((1, fence_mode))
+        if r == 0 and has_valid_frontmatter_close(buf, entry.total_lines) {
+            in_fm = true
+            entry.states.push((3, "", 0))
+            continue
+        }
+        if in_fm {
+            let t = ln.trim_end()
+            if t == "---" or t == "..." {
+                in_fm = false
+                entry.states.push((3, "", 0))
             } else {
-                entry.states.push((0, ""))
+                entry.states.push((4, "yaml", 0))
             }
-        } else {
+            continue
+        }
+        if in_fence {
             if is_markdown_fence_close(ln, fence_ch, fence_min_len) {
-                entry.states.push((1, fence_mode))
+                entry.states.push((1, fence_mode, fence_open_row))
                 in_fence = false
                 fence_mode = ""
+                fence_open_row = -1
             } else {
-                entry.states.push((2, fence_mode))
+                entry.states.push((2, fence_mode, fence_open_row))
             }
+            continue
         }
+        if in_html_cmt {
+            entry.states.push((5, "", -1))
+            if ln.contains("-->") {
+                in_html_cmt = false
+            }
+            continue
+        }
+        let open_opt = parse_markdown_fence_open(ln)
+        if open_opt != null {
+            let (fc, flen, info_str) = open_opt.as((char, i64, String))
+            in_fence = true
+            fence_ch = fc
+            fence_min_len = flen
+            fence_mode = canonical_fence_mode(info_str)
+            fence_open_row = r
+            entry.states.push((1, fence_mode, r))
+            continue
+        }
+        let trimmed_s = ln.trim_start()
+        if trimmed_s.starts_with("<!--") {
+            if not trimmed_s.contains("-->") {
+                in_html_cmt = true
+            }
+            entry.states.push((5, "", -1))
+            continue
+        }
+        entry.states.push((0, "", -1))
     }
     entry.in_fence = in_fence
+    entry.in_html_cmt = in_html_cmt
+    entry.in_frontmatter = in_fm
     entry.fence_ch = fence_ch
     entry.fence_min_len = fence_min_len
     entry.fence_mode = fence_mode
+    entry.fence_open_row = fence_open_row
 }
 
--- Returns per-row `(state_kind: i64, fence_mode: String)` for `0..=end_row`:
--- `0` = normal markdown, `1` = fence delimiter line, `2` = inside fenced code block.
+-- Returns per-row `(state_kind: i64, fence_mode: String, open_row: i64)` for `0..=end_row`:
+-- `0` = normal markdown, `1` = fence delimiter, `2` = fenced code body,
+-- `3` = YAML frontmatter delimiter, `4` = YAML frontmatter body, `5` = HTML block comment.
 fn compute_markdown_fence_states(buf: Buffer, end_row: i64) -> List {
+    buf.sync_external_lines()
     let total = buf.line_count()
     if total <= 0 or end_row < 0 {
         return List()
@@ -1076,9 +1156,12 @@ fn compute_markdown_fence_states(buf: Buffer, end_row: i64) -> List {
         buf_name: buf.name,
         line0: line0,
         in_fence: false,
+        in_html_cmt: false,
+        in_frontmatter: false,
         fence_ch: '`',
         fence_min_len: 3,
         fence_mode: "",
+        fence_open_row: -1,
         states: List(),
     }
     extend_markdown_fence_entry(fresh, buf, limit)
@@ -1094,7 +1177,7 @@ fn tokenize_markdown_fence_delim(line: String, theme: ThemePalette) -> List {
         return runs
     }
     var sp: i64 = 0
-    while sp < n and char_at_list(cs, sp) == ' ' {
+    while sp < n and (char_at_list(cs, sp) == ' ' or char_at_list(cs, sp) == '\t' or char_at_list(cs, sp) == '>') {
         sp += 1
     }
     var f_end = sp
@@ -1136,23 +1219,238 @@ fn is_markdown_hr(cs: List, n: i64) -> bool {
 }
 
 fn is_markdown_table_sep(cs: List, n: i64) -> bool {
+    var i: i64 = 0
+    while i < n and (char_at_list(cs, i) == ' ' or char_at_list(cs, i) == '\t') {
+        i += 1
+    }
+    if i >= n {
+        return false
+    }
     var saw_pipe = false
-    var dash_count: i64 = 0
-    for i in 0..n {
-        let c = char_at_list(cs, i)
-        if c == '|' {
-            saw_pipe = true
-        } else if c == '-' {
-            dash_count += 1
-        } else if c != ':' and c != ' ' and c != '\t' {
+    var valid_cells: i64 = 0
+    if char_at_list(cs, i) == '|' {
+        saw_pipe = true
+        i += 1
+    }
+    while i < n {
+        while i < n and (char_at_list(cs, i) == ' ' or char_at_list(cs, i) == '\t') {
+            i += 1
+        }
+        if i >= n {
+            break
+        }
+        if char_at_list(cs, i) == '|' {
             return false
         }
+        if char_at_list(cs, i) == ':' {
+            i += 1
+        }
+        var dashes: i64 = 0
+        while i < n and char_at_list(cs, i) == '-' {
+            dashes += 1
+            i += 1
+        }
+        if dashes == 0 {
+            return false
+        }
+        if i < n and char_at_list(cs, i) == ':' {
+            i += 1
+        }
+        while i < n and (char_at_list(cs, i) == ' ' or char_at_list(cs, i) == '\t') {
+            i += 1
+        }
+        valid_cells += 1
+        if i < n {
+            if char_at_list(cs, i) == '|' {
+                saw_pipe = true
+                i += 1
+            } else {
+                return false
+            }
+        }
     }
-    saw_pipe and dash_count >= 3
+    saw_pipe and valid_cells >= 1
+}
+
+fn is_probable_markdown_table_line(cs: List, n: i64) -> bool {
+    var i: i64 = 0
+    while i < n and (char_at_list(cs, i) == ' ' or char_at_list(cs, i) == '\t') {
+        i += 1
+    }
+    if i >= n {
+        return false
+    }
+    if char_at_list(cs, i) == '|' {
+        return true
+    }
+    var pipes: i64 = 0
+    var in_bt = false
+    var k = i
+    while k < n {
+        let c = char_at_list(cs, k)
+        if c == '\\' {
+            k += 2
+            continue
+        }
+        if c == '`' {
+            in_bt = not in_bt
+            k += 1
+            continue
+        }
+        if (not in_bt) and c == '|' {
+            if k + 1 < n and char_at_list(cs, k + 1) == '|' {
+                k += 2
+                continue
+            }
+            pipes += 1
+        }
+        k += 1
+    }
+    pipes >= 2
+}
+
+-- Scan matching closing backtick run of exact length `bt_len`, returning index of closing run or `-1`.
+fn scan_md_backtick_close(cs: List, start_after_open: i64, end_idx: i64, bt_len: i64) -> i64 {
+    var k = start_after_open
+    while k + bt_len <= end_idx {
+        if char_at_list(cs, k) == '`' {
+            var run_len: i64 = 1
+            while k + run_len < end_idx and char_at_list(cs, k + run_len) == '`' {
+                run_len += 1
+            }
+            if run_len == bt_len {
+                return k
+            }
+            k += run_len
+            continue
+        }
+        k += 1
+    }
+    -1
+}
+
+-- Scan `[label](dest)` starting at `open_brk` (`cs[open_brk] == '['`), supporting `` `code` ``,
+-- nested `![img](...)`, balanced `(parens)`, and optional `"title"`. Returns `(close_brk, url_start, url_end, close_paren)` or `null`.
+fn scan_md_inline_link(cs: List, open_brk: i64, end_idx: i64) -> ?(i64, i64, i64, i64) {
+    var k = open_brk + 1
+    var brk_depth: i64 = 1
+    while k < end_idx {
+        let c = char_at_list(cs, k)
+        if c == '\\' {
+            k += 2
+            continue
+        }
+        if c == '`' {
+            var bt: i64 = 1
+            while k + bt < end_idx and char_at_list(cs, k + bt) == '`' {
+                bt += 1
+            }
+            let close_bt = scan_md_backtick_close(cs, k + bt, end_idx, bt)
+            if close_bt >= 0 {
+                k = close_bt + bt
+                continue
+            }
+            k += bt
+            continue
+        }
+        if c == '[' {
+            brk_depth += 1
+        } else if c == ']' {
+            brk_depth -= 1
+            if brk_depth == 0 {
+                break
+            }
+        }
+        k += 1
+    }
+    if brk_depth != 0 or k + 1 >= end_idx or char_at_list(cs, k + 1) != '(' {
+        return null
+    }
+    var p = k + 2
+    while p < end_idx and (char_at_list(cs, p) == ' ' or char_at_list(cs, p) == '\t') {
+        p += 1
+    }
+    let url_start = p
+    var url_end = p
+    if p < end_idx and char_at_list(cs, p) == '<' {
+        p += 1
+        while p < end_idx and char_at_list(cs, p) != '>' {
+            if char_at_list(cs, p) == '\\' {
+                p += 2
+                continue
+            }
+            p += 1
+        }
+        if p >= end_idx {
+            return null
+        }
+        p += 1
+        url_end = p
+    } else {
+        var pdepth: i64 = 0
+        while p < end_idx {
+            let pc = char_at_list(cs, p)
+            if pc == '\\' {
+                p += 2
+                url_end = p
+                continue
+            }
+            if pc == '(' {
+                pdepth += 1
+                p += 1
+                url_end = p
+                continue
+            }
+            if pc == ')' {
+                if pdepth == 0 {
+                    break
+                }
+                pdepth -= 1
+                p += 1
+                url_end = p
+                continue
+            }
+            if (pc == ' ' or pc == '\t') and pdepth == 0 {
+                break
+            }
+            p += 1
+            url_end = p
+        }
+    }
+    -- Optional link title `"..."` or `'...'` before closing `)`
+    while p < end_idx and (char_at_list(cs, p) == ' ' or char_at_list(cs, p) == '\t') {
+        p += 1
+    }
+    if p < end_idx and (char_at_list(cs, p) == '"' or char_at_list(cs, p) == '\'') {
+        let qch = char_at_list(cs, p)
+        p += 1
+        while p < end_idx and char_at_list(cs, p) != qch {
+            if char_at_list(cs, p) == '\\' {
+                p += 2
+                continue
+            }
+            p += 1
+        }
+        if p >= end_idx {
+            return null
+        }
+        p += 1
+        while p < end_idx and (char_at_list(cs, p) == ' ' or char_at_list(cs, p) == '\t') {
+            p += 1
+        }
+    }
+    if p < end_idx and char_at_list(cs, p) == ')' {
+        return (k, url_start, url_end, p)
+    }
+    null
+}
+
+fn is_md_word_char(c: char) -> bool {
+    (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_'
 }
 
 fn collect_markdown_link_url_decors(line: String, row: i64, theme: ThemePalette, out: List) {
-    if not line.contains("](") {
+    if (not line.contains("](")) and (not line.contains("<http")) {
         return
     }
     let cs = line.chars()
@@ -1160,57 +1458,64 @@ fn collect_markdown_link_url_decors(line: String, row: i64, theme: ThemePalette,
     var i: i64 = 0
     while i < n {
         let ch = char_at_list(cs, i)
+        if ch == '\\' {
+            i += 2
+            continue
+        }
         if ch == '`' {
             var bt: i64 = 1
             while i + bt < n and char_at_list(cs, i + bt) == '`' {
                 bt += 1
             }
-            var k = i + bt
-            var closed = false
-            while k + bt <= n {
-                var ok = true
-                for b in 0..bt {
-                    if char_at_list(cs, k + b) != '`' {
-                        ok = false
-                        break
-                    }
-                }
-                if ok and (k + bt == n or char_at_list(cs, k + bt) != '`') and char_at_list(cs, k - 1) != '`' {
-                    i = k + bt
-                    closed = true
-                    break
-                }
-                k += 1
-            }
-            if not closed {
+            let close_bt = scan_md_backtick_close(cs, i + bt, n, bt)
+            if close_bt >= 0 {
+                i = close_bt + bt
+            } else {
                 i += bt
             }
             continue
         }
-        if ch == '[' {
-            var k = i + 1
-            while k < n and char_at_list(cs, k) != ']' and char_at_list(cs, k) != '[' and char_at_list(cs, k) != '`' {
-                k += 1
-            }
-            if k < n and char_at_list(cs, k) == ']' and k + 1 < n and char_at_list(cs, k + 1) == '(' {
-                var p = k + 2
-                while p < n and char_at_list(cs, p) != ')' and char_at_list(cs, p) != ' ' {
-                    p += 1
+        if ch == '<' and i + 8 < n {
+            let sub = line.slice(i + 1, if i + 10 < n { i + 10 } else { n })
+            if sub.starts_with("http://") or sub.starts_with("https://") {
+                var e = i + 1
+                while e < n and char_at_list(cs, e) != '>' and char_at_list(cs, e) != ' ' {
+                    e += 1
                 }
-                if p < n and char_at_list(cs, p) == ')' and p > k + 2 {
+                if e < n and char_at_list(cs, e) == '>' {
                     out.push(InlineSpanDecor {
                         owner: "markdown:url",
                         row: row,
-                        start_col: k + 2,
-                        end_col: p,
+                        start_col: i + 1,
+                        end_col: e,
                         bg_rgba: 0,
                         fg_rgba: theme.syn_operator,
                         underline: true,
                         replace_label: "",
                     })
-                    i = p + 1
+                    i = e + 1
                     continue
                 }
+            }
+        }
+        if ch == '[' {
+            let link_opt = scan_md_inline_link(cs, i, n)
+            if link_opt != null {
+                let (_, us, ue, cp) = link_opt.as((i64, i64, i64, i64))
+                if ue > us {
+                    out.push(InlineSpanDecor {
+                        owner: "markdown:url",
+                        row: row,
+                        start_col: us,
+                        end_col: ue,
+                        bg_rgba: 0,
+                        fg_rgba: theme.syn_operator,
+                        underline: true,
+                        replace_label: "",
+                    })
+                }
+                i = cp + 1
+                continue
             }
         }
         i += 1
@@ -1232,31 +1537,57 @@ fn tokenize_markdown_inline(
     while i < end_idx {
         let ch = char_at_list(cs, i)
 
+        -- 0. Backslash escape (`\*`, `` \` ``, `\[`, `\|`, `\\`, `\$`, etc.)
+        if ch == '\\' and i + 1 < end_idx {
+            push_run(runs, i, "\\", theme.fg_muted, false, false)
+            push_run(runs, i + 1, line.slice(i + 1, i + 2), base_color, false, base_italic)
+            i += 2
+            continue
+        }
+
+        -- 0b. Inline HTML comment `<!-- ... -->`
+        if ch == '<' and i + 4 <= end_idx and line.slice(i, i + 4) == "<!--" {
+            var hc = i + 4
+            var close_hc: i64 = -1
+            while hc + 3 <= end_idx {
+                if char_at_list(cs, hc) == '-' and char_at_list(cs, hc + 1) == '-' and char_at_list(cs, hc + 2) == '>' {
+                    close_hc = hc + 3
+                    break
+                }
+                hc += 1
+            }
+            let stop_hc = if close_hc > i { close_hc } else { end_idx }
+            push_run(runs, i, line.slice(i, stop_hc), theme.syn_comment, false, true)
+            i = stop_hc
+            continue
+        }
+
+        -- 0c. Autolink `<https://...>` / `<http://...>`
+        if ch == '<' and i + 8 < end_idx {
+            let sub = line.slice(i + 1, if i + 10 < end_idx { i + 10 } else { end_idx })
+            if sub.starts_with("http://") or sub.starts_with("https://") {
+                var e = i + 1
+                while e < end_idx and char_at_list(cs, e) != '>' and char_at_list(cs, e) != ' ' {
+                    e += 1
+                }
+                if e < end_idx and char_at_list(cs, e) == '>' {
+                    push_run(runs, i, "<", theme.fg_muted, false, false)
+                    push_run(runs, i + 1, line.slice(i + 1, e), theme.syn_operator, false, false)
+                    push_run(runs, e, ">", theme.fg_muted, false, false)
+                    i = e + 1
+                    continue
+                }
+            }
+        }
+
         -- 1. Inline code span `` `...` `` (including multi-backtick spans)
         if ch == '`' {
             var bt_len: i64 = 1
             while i + bt_len < end_idx and char_at_list(cs, i + bt_len) == '`' {
                 bt_len += 1
             }
-            var k = i + bt_len
-            var found_close: i64 = -1
-            while k + bt_len <= end_idx {
-                var all_bt = true
-                for b in 0..bt_len {
-                    if char_at_list(cs, k + b) != '`' {
-                        all_bt = false
-                        break
-                    }
-                }
-                if all_bt
-                    and (k + bt_len == end_idx or char_at_list(cs, k + bt_len) != '`')
-                    and char_at_list(cs, k - 1) != '`' {
-                    found_close = k
-                    break
-                }
-                k += 1
-            }
-            if found_close > i {
+            let found_close = scan_md_backtick_close(cs, i + bt_len, end_idx, bt_len)
+            if found_close >= 0 {
                 push_run(runs, i, line.slice(i, found_close + bt_len), theme.syn_string, false, false)
                 i = found_close + bt_len
                 continue
@@ -1266,85 +1597,235 @@ fn tokenize_markdown_inline(
             continue
         }
 
-        -- 2. Markdown link `[text](url)` or image `![alt](url)` + inline checkboxes
+        -- 1b. Inline LaTeX math `$$...$$` or `$...$`
+        if ch == '$' {
+            let is_dbl = i + 1 < end_idx and char_at_list(cs, i + 1) == '$'
+            let dlen: i64 = if is_dbl { 2 } else { 1 }
+            if i + dlen < end_idx {
+                let after_m = char_at_list(cs, i + dlen)
+                if is_dbl or (after_m != ' ' and after_m != '\t' and after_m != '$') {
+                    var mk = i + dlen
+                    var close_m: i64 = -1
+                    while mk + dlen <= end_idx {
+                        let mc = char_at_list(cs, mk)
+                        if mc == '\\' {
+                            mk += 2
+                            continue
+                        }
+                        if is_table and mc == '|' {
+                            break
+                        }
+                        if mc == '$' {
+                            if is_dbl and char_at_list(cs, mk + 1) == '$' {
+                                close_m = mk + 2
+                                break
+                            }
+                            if (not is_dbl)
+                                and char_at_list(cs, mk - 1) != ' '
+                                and (mk + 1 >= end_idx or (not is_ascii_digit_ch(char_at_list(cs, mk + 1)))) {
+                                close_m = mk + 1
+                                break
+                            }
+                        }
+                        mk += 1
+                    }
+                    if close_m > i + dlen {
+                        push_run(runs, i, line.slice(i, close_m), theme.syn_number, false, true)
+                        i = close_m
+                        continue
+                    }
+                }
+            }
+        }
+
+        -- 2. Markdown link `[text](url)` or image `![alt](url)`
         if ch == '[' or (ch == '!' and i + 1 < end_idx and char_at_list(cs, i + 1) == '[') {
             let open_brk = if ch == '!' { i + 1 } else { i }
-            var k = open_brk + 1
-            while k < end_idx and char_at_list(cs, k) != ']' and char_at_list(cs, k) != '[' and char_at_list(cs, k) != '`' {
-                k += 1
-            }
-            if k < end_idx and char_at_list(cs, k) == ']' and k + 1 < end_idx and char_at_list(cs, k + 1) == '(' {
-                var p = k + 2
-                while p < end_idx and char_at_list(cs, p) != ')' and char_at_list(cs, p) != ' ' {
-                    p += 1
+            let link_opt = scan_md_inline_link(cs, open_brk, end_idx)
+            if link_opt != null {
+                let (close_brk, _us, _ue, close_paren) = link_opt.as((i64, i64, i64, i64))
+                push_run(runs, i, line.slice(i, open_brk + 1), theme.fg_muted, false, base_italic)
+                if close_brk > open_brk + 1 {
+                    tokenize_markdown_inline(line, cs, open_brk + 1, close_brk, theme.accent, base_italic, false, theme, runs)
                 }
-                if p < end_idx and char_at_list(cs, p) == ')' {
-                    push_run(runs, i, line.slice(i, open_brk + 1), theme.fg_muted, false, false)
-                    if k > open_brk + 1 {
-                        push_run(runs, open_brk + 1, line.slice(open_brk + 1, k), theme.accent, false, false)
-                    }
-                    push_run(runs, k, "](", theme.fg_muted, false, false)
-                    if p > k + 2 {
-                        push_run(runs, k + 2, line.slice(k + 2, p), theme.syn_operator, false, false)
-                    }
-                    push_run(runs, p, ")", theme.fg_muted, false, false)
-                    i = p + 1
+                push_run(runs, close_brk, "](", theme.fg_muted, false, base_italic)
+                if close_paren > close_brk + 2 {
+                    push_run(runs, close_brk + 2, line.slice(close_brk + 2, close_paren), theme.syn_operator, false, base_italic)
+                }
+                push_run(runs, close_paren, ")", theme.fg_muted, false, base_italic)
+                i = close_paren + 1
+                continue
+            }
+        }
+
+        -- 2b. GFM Strikethrough `~~...~~`
+        if ch == '~' and i + 3 < end_idx and char_at_list(cs, i + 1) == '~' and char_at_list(cs, i + 2) != ' ' and char_at_list(cs, i + 2) != '~' {
+            var sk = i + 2
+            var close_st: i64 = -1
+            while sk + 1 < end_idx {
+                let sc = char_at_list(cs, sk)
+                if sc == '\\' {
+                    sk += 2
                     continue
                 }
-            }
-            if ch == '[' and i + 3 <= end_idx and char_at_list(cs, i + 2) == ']' {
-                let mid = char_at_list(cs, i + 1)
-                if mid == 'X' or mid == 'x' {
-                    push_run(runs, i, line.slice(i, i + 3), theme.syn_string, false, false)
-                    i += 3
+                if is_table and sc == '|' {
+                    break
+                }
+                if sc == '`' {
+                    var bt: i64 = 1
+                    while sk + bt < end_idx and char_at_list(cs, sk + bt) == '`' {
+                        bt += 1
+                    }
+                    let cb = scan_md_backtick_close(cs, sk + bt, end_idx, bt)
+                    sk = if cb >= 0 { cb + bt } else { sk + bt }
                     continue
                 }
-                if mid == ' ' or mid == '-' {
-                    push_run(runs, i, line.slice(i, i + 3), theme.accent, false, false)
-                    i += 3
+                if sc == '~' and char_at_list(cs, sk + 1) == '~' and char_at_list(cs, sk - 1) != ' ' {
+                    close_st = sk
+                    break
+                }
+                sk += 1
+            }
+            if close_st > i + 2 {
+                push_run(runs, i, line.slice(i, close_st + 2), theme.fg_muted, false, base_italic)
+                i = close_st + 2
+                continue
+            }
+        }
+
+        -- 3a. Bold + Italic `***...***` or `___...___`
+        if i + 5 < end_idx and (ch == '*' or ch == '_') and char_at_list(cs, i + 1) == ch and char_at_list(cs, i + 2) == ch {
+            let prev_ok = ch == '*' or i == 0 or (not is_md_word_char(char_at_list(cs, i - 1)))
+            let after_open = char_at_list(cs, i + 3)
+            if prev_ok and after_open != ' ' and after_open != ch {
+                var k = i + 3
+                var close_bi: i64 = -1
+                while k + 2 < end_idx {
+                    let kc = char_at_list(cs, k)
+                    if kc == '\\' {
+                        k += 2
+                        continue
+                    }
+                    if is_table and kc == '|' {
+                        break
+                    }
+                    if kc == '`' {
+                        var bt: i64 = 1
+                        while k + bt < end_idx and char_at_list(cs, k + bt) == '`' {
+                            bt += 1
+                        }
+                        let cb = scan_md_backtick_close(cs, k + bt, end_idx, bt)
+                        k = if cb >= 0 { cb + bt } else { k + bt }
+                        continue
+                    }
+                    if kc == ch and char_at_list(cs, k + 1) == ch and char_at_list(cs, k + 2) == ch and char_at_list(cs, k - 1) != ' ' {
+                        let next_ok = ch == '*' or k + 3 >= end_idx or (not is_md_word_char(char_at_list(cs, k + 3)))
+                        if next_ok {
+                            close_bi = k
+                            break
+                        }
+                    }
+                    k += 1
+                }
+                if close_bi > i + 3 {
+                    push_run(runs, i, line.slice(i, i + 3), theme.syn_number, false, true)
+                    tokenize_markdown_inline(line, cs, i + 3, close_bi, theme.syn_number, true, is_table, theme, runs)
+                    push_run(runs, close_bi, line.slice(close_bi, close_bi + 3), theme.syn_number, false, true)
+                    i = close_bi + 3
                     continue
                 }
             }
         }
 
-        -- 3. Strong emphasis `**...**` or `__...__` (distinct constant color, no bold weight)
+        -- 3b. Strong emphasis `**...**` or `__...__` (respecting intraword `__init__` boundaries!)
         if i + 3 < end_idx and (ch == '*' or ch == '_') and char_at_list(cs, i + 1) == ch {
+            let prev_ok = ch == '*' or i == 0 or (not is_md_word_char(char_at_list(cs, i - 1)))
             let after_open = char_at_list(cs, i + 2)
-            if after_open != ' ' and after_open != ch {
+            if prev_ok and after_open != ' ' and after_open != ch {
                 var k = i + 2
                 var close_strong: i64 = -1
                 while k + 1 < end_idx {
-                    if char_at_list(cs, k) == ch and char_at_list(cs, k + 1) == ch and char_at_list(cs, k - 1) != ' ' {
-                        close_strong = k
+                    let kc = char_at_list(cs, k)
+                    if kc == '\\' {
+                        k += 2
+                        continue
+                    }
+                    if is_table and kc == '|' {
                         break
+                    }
+                    if kc == '`' {
+                        var bt: i64 = 1
+                        while k + bt < end_idx and char_at_list(cs, k + bt) == '`' {
+                            bt += 1
+                        }
+                        let cb = scan_md_backtick_close(cs, k + bt, end_idx, bt)
+                        k = if cb >= 0 { cb + bt } else { k + bt }
+                        continue
+                    }
+                    if kc == ch and char_at_list(cs, k + 1) == ch and char_at_list(cs, k - 1) != ' ' {
+                        let next_ok = ch == '*' or k + 2 >= end_idx or (not is_md_word_char(char_at_list(cs, k + 2)))
+                        if next_ok {
+                            close_strong = k
+                            break
+                        }
                     }
                     k += 1
                 }
                 if close_strong > i + 2 {
-                    push_run(runs, i, line.slice(i, close_strong + 2), theme.syn_number, false, false)
+                    push_run(runs, i, line.slice(i, i + 2), theme.syn_number, false, base_italic)
+                    tokenize_markdown_inline(line, cs, i + 2, close_strong, theme.syn_number, base_italic, is_table, theme, runs)
+                    push_run(runs, close_strong, line.slice(close_strong, close_strong + 2), theme.syn_number, false, base_italic)
                     i = close_strong + 2
                     continue
                 }
             }
         }
 
-        -- 4. Italic emphasis `*...*` (`italic = true`, `bold = false`)
-        if ch == '*' and i + 2 < end_idx and char_at_list(cs, i + 1) != '*' and char_at_list(cs, i + 1) != ' ' {
-            var k = i + 1
-            var close_em: i64 = -1
-            while k < end_idx {
-                if char_at_list(cs, k) == '*'
-                    and char_at_list(cs, k - 1) != ' '
-                    and (k + 1 >= end_idx or char_at_list(cs, k + 1) != '*') {
-                    close_em = k
-                    break
+        -- 4. Italic emphasis `*...*` or `_..._` (`italic = true`, `bold = false`, intraword-safe for `_`)
+        if (ch == '*' or ch == '_') and i + 2 < end_idx and char_at_list(cs, i + 1) != ch and char_at_list(cs, i + 1) != ' ' {
+            let prev_ok = ch == '*' or i == 0 or (not is_md_word_char(char_at_list(cs, i - 1)))
+            if prev_ok {
+                var k = i + 1
+                var close_em: i64 = -1
+                while k < end_idx {
+                    let kc = char_at_list(cs, k)
+                    if kc == '\\' {
+                        k += 2
+                        continue
+                    }
+                    if is_table and kc == '|' {
+                        break
+                    }
+                    if kc == '`' {
+                        var bt: i64 = 1
+                        while k + bt < end_idx and char_at_list(cs, k + bt) == '`' {
+                            bt += 1
+                        }
+                        let cb = scan_md_backtick_close(cs, k + bt, end_idx, bt)
+                        k = if cb >= 0 { cb + bt } else { k + bt }
+                        continue
+                    }
+                    -- Skip nested `**` or `__` pairs while scanning for single closing `*` or `_`!
+                    if kc == ch and k + 1 < end_idx and char_at_list(cs, k + 1) == ch {
+                        k += 2
+                        continue
+                    }
+                    if kc == ch and char_at_list(cs, k - 1) != ' ' {
+                        let next_ok = ch == '*' or k + 1 >= end_idx or (not is_md_word_char(char_at_list(cs, k + 1)))
+                        if next_ok {
+                            close_em = k
+                            break
+                        }
+                    }
+                    k += 1
                 }
-                k += 1
-            }
-            if close_em > i + 1 {
-                push_run(runs, i, line.slice(i, close_em + 1), theme.syn_type, false, true)
-                i = close_em + 1
-                continue
+                if close_em > i + 1 {
+                    push_run(runs, i, line.slice(i, i + 1), theme.syn_type, false, true)
+                    tokenize_markdown_inline(line, cs, i + 1, close_em, theme.syn_type, true, is_table, theme, runs)
+                    push_run(runs, close_em, line.slice(close_em, close_em + 1), theme.syn_type, false, true)
+                    i = close_em + 1
+                    continue
+                }
             }
         }
 
@@ -1359,7 +1840,16 @@ fn tokenize_markdown_inline(
         var j = i + 1
         while j < end_idx {
             let nc = char_at_list(cs, j)
-            if nc == '`' or nc == '[' or nc == '!' or nc == '*' or nc == '_' or (is_table and nc == '|') {
+            if nc == '\\'
+                or nc == '<'
+                or nc == '`'
+                or nc == '$'
+                or nc == '['
+                or nc == '!'
+                or nc == '~'
+                or nc == '*'
+                or nc == '_'
+                or (is_table and nc == '|') {
                 break
             }
             j += 1
@@ -1380,6 +1870,36 @@ fn tokenize_markdown_line(line: String, theme: ThemePalette) -> List {
     let cs = line.chars()
     let n = cs.len()
 
+    -- Reference link definition `[id]: https://...`
+    let trimmed_s = line.trim_start()
+    if trimmed_s.starts_with("[") and (not trimmed_s.starts_with("[!")) and line.contains("]: ") {
+        let sep_opt = line.find("]: ")
+        if sep_opt != null {
+            let sep_i = sep_opt.as(i64)
+            if not line.slice(0, sep_i).contains("]") {
+                push_run(runs, 0, line.slice(0, sep_i + 2), theme.accent, false, false)
+                push_run(runs, sep_i + 2, line.drop(sep_i + 2), theme.syn_operator, false, false)
+                return runs
+            }
+        }
+    }
+
+    -- Table separator row (`| --- | :---: |` — checked BEFORE `is_markdown_hr` so `| - |` works!)
+    if is_markdown_table_sep(cs, n) {
+        for i in 0..n {
+            let c = char_at_list(cs, i)
+            let col = if c == '|' {
+                theme.accent
+            } else if c == ':' {
+                theme.syn_keyword
+            } else {
+                theme.border
+            }
+            push_run(runs, i, line.slice(i, i + 1), col, false, false)
+        }
+        return runs
+    }
+
     -- Horizontal rule (`---`, `***`, `___`)
     if is_markdown_hr(cs, n) {
         push_run(runs, 0, line, theme.border, false, false)
@@ -1392,19 +1912,21 @@ fn tokenize_markdown_line(line: String, theme: ThemePalette) -> List {
         sp += 1
     }
 
-    -- ATX headings `# `..`###### ` (optional 0..3 leading spaces)
+    -- ATX headings `# `..`###### ` (optional 0..3 leading spaces, space or tab or EOL after `#`)
     if sp <= 3 and sp < n and char_at_list(cs, sp) == '#' {
         var hashes: i64 = 0
         while sp + hashes < n and char_at_list(cs, sp + hashes) == '#' {
             hashes += 1
         }
-        if hashes >= 1 and hashes <= 6 and (sp + hashes == n or char_at_list(cs, sp + hashes) == ' ') {
-            let h_color = if hashes <= 2 {
-                theme.syn_fn
-            } else if hashes <= 4 {
-                theme.syn_type
-            } else {
-                theme.syn_keyword
+        let next_after_h = if sp + hashes < n { char_at_list(cs, sp + hashes) } else { ' ' }
+        if hashes >= 1 and hashes <= 6 and (sp + hashes == n or next_after_h == ' ' or next_after_h == '\t') {
+            let h_color = when {
+                hashes == 1 => theme.syn_fn,
+                hashes == 2 => theme.accent,
+                hashes == 3 => theme.syn_type,
+                hashes == 4 => theme.syn_keyword,
+                hashes == 5 => theme.mode_visual,
+                else => theme.fg_muted,
             }
             let prefix_end = if sp + hashes < n { sp + hashes + 1 } else { n }
             push_run(runs, 0, line.slice(0, prefix_end), h_color, false, false)
@@ -1415,12 +1937,12 @@ fn tokenize_markdown_line(line: String, theme: ThemePalette) -> List {
         }
     }
 
-    -- Blockquote `> ` / `>> ` (optional 0..3 leading spaces)
+    -- Blockquote `> ` / `>> ` (supporting `>\t`, GitHub Alerts `[!NOTE]`..`[!CAUTION]`, and quoted headings!)
     if sp <= 3 and sp < n and char_at_list(cs, sp) == '>' {
         var q = sp
         while q < n {
             let qc = char_at_list(cs, q)
-            if qc == '>' or qc == ' ' {
+            if qc == '>' or qc == ' ' or qc == '\t' {
                 q += 1
             } else {
                 break
@@ -1428,28 +1950,68 @@ fn tokenize_markdown_line(line: String, theme: ThemePalette) -> List {
         }
         push_run(runs, 0, line.slice(0, q), theme.syn_comment, false, true)
         if q < n {
-            tokenize_markdown_inline(line, cs, q, n, theme.syn_comment, true, false, theme, runs)
+            let qrest = line.drop(q)
+            if qrest.starts_with("[!") {
+                let close_al = qrest.find("]")
+                if close_al != null {
+                    let al_end = q + close_al.as(i64) + 1
+                    let tag_up = line.slice(q, al_end).to_upper()
+                    let al_col = when {
+                        tag_up == "[!NOTE]" => theme.accent,
+                        tag_up == "[!TIP]" => theme.diag_ok,
+                        tag_up == "[!IMPORTANT]" => theme.mode_visual,
+                        tag_up == "[!WARNING]" => theme.diag_warn,
+                        tag_up == "[!CAUTION]" => theme.diag_err,
+                        else => theme.accent,
+                    }
+                    push_run(runs, q, line.slice(q, al_end), al_col, false, false)
+                    if al_end < n {
+                        tokenize_markdown_inline(line, cs, al_end, n, theme.fg, true, false, theme, runs)
+                    }
+                    return runs
+                }
+            }
+            if char_at_list(cs, q) == '#' {
+                var qh: i64 = 0
+                while q + qh < n and char_at_list(cs, q + qh) == '#' {
+                    qh += 1
+                }
+                if qh >= 1 and qh <= 6 and (q + qh == n or char_at_list(cs, q + qh) == ' ') {
+                    push_run(runs, q, line.slice(q, n), theme.syn_fn, false, true)
+                    return runs
+                }
+            }
+            let tbl_in_q = is_probable_markdown_table_line(cs, n)
+            tokenize_markdown_inline(line, cs, q, n, theme.syn_comment, true, tbl_in_q, theme, runs)
         }
         return runs
     }
 
     -- Unordered (`- `, `* `, `+ `) & Ordered (`1. `, `1) `) list items + task checkboxes
-    var ws = 0
+    var ws: i64 = 0
     while ws < n and (char_at_list(cs, ws) == ' ' or char_at_list(cs, ws) == '\t') {
         ws += 1
     }
     if ws < n {
         let mc = char_at_list(cs, ws)
         var marker_end: i64 = -1
-        if (mc == '-' or mc == '*' or mc == '+') and ws + 1 < n and char_at_list(cs, ws + 1) == ' ' {
-            marker_end = ws + 2
+        if mc == '-' or mc == '*' or mc == '+' {
+            if ws + 1 == n {
+                marker_end = ws + 1
+            } else if char_at_list(cs, ws + 1) == ' ' or char_at_list(cs, ws + 1) == '\t' {
+                marker_end = ws + 2
+            }
         } else if is_ascii_digit_ch(mc) {
             var d = ws
             while d < n and is_ascii_digit_ch(char_at_list(cs, d)) {
                 d += 1
             }
-            if d < n and (char_at_list(cs, d) == '.' or char_at_list(cs, d) == ')') and d + 1 < n and char_at_list(cs, d + 1) == ' ' {
-                marker_end = d + 2
+            if d < n and (char_at_list(cs, d) == '.' or char_at_list(cs, d) == ')') {
+                if d + 1 == n {
+                    marker_end = d + 1
+                } else if char_at_list(cs, d + 1) == ' ' or char_at_list(cs, d + 1) == '\t' {
+                    marker_end = d + 2
+                }
             }
         }
         if marker_end > ws {
@@ -1458,10 +2020,14 @@ fn tokenize_markdown_line(line: String, theme: ThemePalette) -> List {
             }
             push_run(runs, ws, line.slice(ws, marker_end), theme.accent, false, false)
             var body_start = marker_end
+            while body_start < n and char_at_list(cs, body_start) == ' ' and body_start - marker_end < 3 {
+                push_run(runs, body_start, " ", theme.fg, false, false)
+                body_start += 1
+            }
             if body_start + 3 <= n
                 and char_at_list(cs, body_start) == '['
                 and char_at_list(cs, body_start + 2) == ']'
-                and (body_start + 3 == n or char_at_list(cs, body_start + 3) == ' ') {
+                and (body_start + 3 == n or char_at_list(cs, body_start + 3) == ' ' or char_at_list(cs, body_start + 3) == '\t') {
                 let cb = char_at_list(cs, body_start + 1)
                 if cb == 'x' or cb == 'X' {
                     push_run(runs, body_start, line.slice(body_start, body_start + 3), theme.syn_string, false, false)
@@ -1472,23 +2038,14 @@ fn tokenize_markdown_line(line: String, theme: ThemePalette) -> List {
                 }
             }
             if body_start < n {
-                tokenize_markdown_inline(line, cs, body_start, n, theme.fg, false, line.contains("|"), theme, runs)
+                tokenize_markdown_inline(line, cs, body_start, n, theme.fg, false, false, theme, runs)
             }
             return runs
         }
     }
 
-    -- Table separator row (`| --- | :---: |`)
-    if is_markdown_table_sep(cs, n) {
-        for i in 0..n {
-            let c = char_at_list(cs, i)
-            let col = if c == '|' { theme.accent } else { theme.border }
-            push_run(runs, i, line.slice(i, i + 1), col, false, false)
-        }
-        return runs
-    }
-
-    tokenize_markdown_inline(line, cs, 0, n, theme.fg, false, line.contains("|"), theme, runs)
+    let is_tbl = is_probable_markdown_table_line(cs, n)
+    tokenize_markdown_inline(line, cs, 0, n, theme.fg, false, is_tbl, theme, runs)
     runs
 }
 
@@ -1691,29 +2248,230 @@ pub fn tokenize_line(line: String, major_mode: String, theme: ThemePalette) -> L
     }
     let m = major_mode.to_lower()
     when {
-        m == "nessa" or m == "lua" => tokenize_code_line(line, "nessa", theme),
-        m == "rust" or m == "go" => tokenize_code_line(line, "rust", theme),
-        m == "python" or m == "shell" or m == "makefile" => {
-            let norm_p = if m == "makefile" { "shell" } else { m }
+        m == "nessa" or m == "ns" or m == "lua" => tokenize_code_line(line, "nessa", theme),
+        m == "rust" or m == "rs" or m == "go" or m == "golang" or m == "zig" => tokenize_code_line(line, "rust", theme),
+        m == "python" or m == "py" or m == "shell" or m == "sh" or m == "bash" or m == "zsh" or m == "fish" or m == "makefile" or m == "make" => {
+            let norm_p = if m == "python" or m == "py" { "python" } else { "shell" }
             tokenize_code_line(line, norm_p, theme)
         },
-        m == "c" or m == "cpp" or m == "javascript" or m == "typescript" or m == "css" => {
+        m == "c" or m == "cpp" or m == "c++" or m == "cc" or m == "h" or m == "hpp" or m == "java" => {
             tokenize_code_line(line, "c", theme)
         },
+        m == "javascript" or m == "js" or m == "jsx" or m == "typescript" or m == "ts" or m == "tsx" => {
+            tokenize_code_line(line, "js", theme)
+        },
+        m == "css" or m == "scss" or m == "less" => tokenize_code_line(line, "css", theme),
+        m == "sql" => tokenize_code_line(line, "sql", theme),
+        m == "html" or m == "htm" or m == "xml" or m == "svg" => tokenize_code_line(line, "js", theme),
         m == "org" => tokenize_org_line(line, theme),
-        m == "markdown" or m == "md" => tokenize_markdown_line(line, theme),
-        m == "toml" or m == "json" or m == "yaml" => {
-            let norm_t = if m == "yaml" { "toml" } else { m }
+        m == "markdown" or m == "md" or m == "gfm" or m == "info" or m == "help" => tokenize_markdown_line(line, theme),
+        m == "toml" or m == "json" or m == "jsonc" or m == "yaml" or m == "yml" or m == "ini" => {
+            let norm_t = if m == "json" or m == "jsonc" { "json" } else { "toml" }
             tokenize_toml_or_json(line, norm_t, theme)
         },
         m == "dired" => tokenize_dired_line(line, theme),
         m == "grep" or m == "compilation" or m == "quickfix" => tokenize_grep_line(line, theme),
-        m == "diff" => tokenize_diff_line(line, theme),
+        m == "diff" or m == "patch" => tokenize_diff_line(line, theme),
         else => {
             let runs = List()
             push_run(runs, 0, line, theme.fg, false, false)
             runs
         },
+    }
+}
+
+fn ts_hl_group_style(hl_group: i64, theme: ThemePalette) -> (i64, bool) {
+    when {
+        hl_group == 1 => (theme.syn_keyword, false),
+        hl_group == 2 => (theme.mode_visual, false),
+        hl_group == 3 => (theme.syn_fn, false),
+        hl_group == 4 => (theme.accent, false),
+        hl_group == 5 => (theme.syn_type, false),
+        hl_group == 6 => (theme.syn_type, true),
+        hl_group == 7 => (theme.syn_string, false),
+        hl_group == 8 => (theme.diag_warn, false),
+        hl_group == 9 => (theme.syn_number, false),
+        hl_group == 10 => (theme.syn_number, false),
+        hl_group == 11 => (theme.accent, false),
+        hl_group == 12 => (theme.fg, true),
+        hl_group == 13 => (theme.syn_type, false),
+        hl_group == 14 => (theme.syn_operator, false),
+        hl_group == 15 => (theme.syn_comment, true),
+        hl_group == 16 => (theme.diag_ok, true),
+        hl_group == 17 => (theme.syn_fn, false),
+        hl_group == 18 => (theme.syn_string, false),
+        else => (theme.fg, false),
+    }
+}
+
+fn ts_spans_to_runs(raw_line: String, spans: List, theme: ThemePalette) -> List {
+    let runs = List()
+    let n = raw_line.char_len()
+    if n == 0 {
+        return runs
+    }
+    if spans.is_empty() {
+        push_run(runs, 0, raw_line, theme.fg, false, false)
+        return runs
+    }
+    var pos: i64 = 0
+    for i in 0..spans.len() {
+        let sp = spans.get(i.as(usize)).as(TsSpan)
+        let s0 = if sp.start_col < pos { pos } else if sp.start_col > n { n } else { sp.start_col }
+        let e0 = if sp.end_col > n { n } else { sp.end_col }
+        if s0 > pos {
+            push_run(runs, pos, raw_line.slice(pos, s0), theme.fg, false, false)
+        }
+        if e0 > s0 {
+            let (col, is_it) = ts_hl_group_style(sp.hl_group, theme)
+            push_run(runs, s0, raw_line.slice(s0, e0), col, false, is_it)
+            pos = e0
+        }
+    }
+    if pos < n {
+        push_run(runs, pos, raw_line.slice(pos, n), theme.fg, false, false)
+    }
+    runs
+}
+
+fn split_runs_at_char_col(runs: List, split_col: i64) -> (List, List) {
+    let left = List()
+    let right = List()
+    for i in 0..runs.len() {
+        let (sc, txt, col, bld, it) = runs.get(i.as(usize)).as((i64, String, i64, bool, bool))
+        let tlen = txt.char_len()
+        let ec = sc + tlen
+        if ec <= split_col {
+            left.push((sc, txt, col, bld, it))
+        } else if sc >= split_col {
+            right.push((sc - split_col, txt, col, bld, it))
+        } else {
+            let mid = split_col - sc
+            let lpart = txt.slice(0, mid)
+            let rpart = txt.slice(mid, tlen)
+            if lpart != "" {
+                left.push((sc, lpart, col, bld, it))
+            }
+            if rpart != "" {
+                right.push((0, rpart, col, bld, it))
+            }
+        }
+    }
+    (left, right)
+}
+
+fn ts_lang_for_buffer(buf: Buffer) -> String {
+    let m = buf.major_mode.to_lower()
+    if m != "" and m != "text" and m != "fundamental" and m != "plaintext" {
+        return m
+    }
+    let name_lc = buf.name.to_lower()
+    let dot_hits = name_lc.find_indices(".")
+    if not dot_hits.is_empty() {
+        let last_dot = dot_hits.get((dot_hits.len() - 1).as(usize)).as(i64)
+        return canonical_fence_mode(name_lc.drop(last_dot + 1))
+    }
+    ""
+}
+
+fn is_treesitter_eligible_mode(mode_lc: String) -> bool {
+    mode_lc != ""
+        and mode_lc != "text"
+        and mode_lc != "plaintext"
+        and mode_lc != "fundamental"
+        and mode_lc != "markdown"
+        and mode_lc != "md"
+        and mode_lc != "gfm"
+        and mode_lc != "org"
+        and mode_lc != "info"
+        and mode_lc != "help"
+        and mode_lc != "apropos"
+        and mode_lc != "dired"
+        and mode_lc != "dirvish"
+        and mode_lc != "dirvish-parent"
+        and mode_lc != "dirvish-preview"
+        and mode_lc != "grep"
+        and mode_lc != "compilation"
+        and mode_lc != "quickfix"
+        and mode_lc != "terminal"
+        and mode_lc != "toggleterm"
+}
+
+private global _md_block_ts_cache: ?HashMap = null
+
+private fn get_md_fenced_block_ts_spans(
+    buf: Buffer,
+    md_states: List,
+    open_row: i64,
+    fence_mode: String,
+) -> List {
+    if fence_mode == "" or open_row < 0 {
+        return List()
+    }
+    let cache = if _md_block_ts_cache != null {
+        _md_block_ts_cache.as(HashMap)
+    } else {
+        let m = HashMap.new()
+        _md_block_ts_cache = m
+        m
+    }
+    let key = buf.doc_id.to_string() ++ ":" ++ buf.edit_version.to_string() ++ ":" ++ open_row.to_string()
+    let hit = cache.get(key)
+    if hit != null {
+        return hit.as(List)
+    }
+    if cache.len() > 64 {
+        cache.clear()
+    }
+    let total = buf.line_count()
+    let body_lines = List()
+    var r = open_row + 1
+    while r < total and body_lines.len() < 256 {
+        if r < md_states.len() {
+            let (sk, _, _) = md_states.get(r.as(usize)).as((i64, String, i64))
+            if sk != 2 {
+                break
+            }
+        } else {
+            let ln_chk = buf.line_at(r)
+            if parse_markdown_fence_open(ln_chk) != null {
+                break
+            }
+        }
+        body_lines.push(buf.line_at(r))
+        r += 1
+    }
+    if body_lines.is_empty() {
+        return List()
+    }
+    let res = accel_ts_highlight_snippet(body_lines.join("\n"), fence_mode)
+    cache.insert(key, res)
+    res
+}
+
+fn nerd_icon_for_buffer(buf: Buffer) -> String {
+    let m = buf.major_mode.to_lower()
+    let name_lc = buf.name.to_lower()
+    when {
+        m == "dirvish" or m == "dired" => " ",
+        m == "rust" or name_lc.ends_with(".rs") => " ",
+        m == "python" or name_lc.ends_with(".py") => " ",
+        m == "c" or name_lc.ends_with(".c") or name_lc.ends_with(".h") => " ",
+        m == "cpp" or name_lc.ends_with(".cpp") or name_lc.ends_with(".hpp") => " ",
+        m == "javascript" or name_lc.ends_with(".js") => " ",
+        m == "typescript" or name_lc.ends_with(".ts") or name_lc.ends_with(".tsx") => " ",
+        m == "go" or name_lc.ends_with(".go") => " ",
+        m == "lua" or name_lc.ends_with(".lua") => " ",
+        m == "nessa" or name_lc.ends_with(".ns") => " ",
+        m == "markdown" or m == "md" or m == "gfm" or name_lc.ends_with(".md") => " ",
+        m == "json" or name_lc.ends_with(".json") => " ",
+        m == "toml" or m == "yaml" or name_lc.ends_with(".toml") or name_lc.ends_with(".yaml") or name_lc.ends_with(".yml") => " ",
+        m == "html" or name_lc.ends_with(".html") => " ",
+        m == "css" or name_lc.ends_with(".css") => " ",
+        m == "terminal" or m == "toggleterm" or m == "shell" or name_lc.ends_with(".sh") => " ",
+        m == "help" or m == "info" or m == "org" => " ",
+        name_lc.contains("git") or m == "magit" or m == "diff" => " ",
+        else => " ",
     }
 }
 
@@ -1813,6 +2571,10 @@ fn should_render_indent_guides(major_mode: String) -> bool {
         or m == "dirvish"
         or m == "dirvish-preview"
         or m == "dired"
+        or m == "markdown"
+        or m == "md"
+        or m == "gfm"
+        or m == "org"
         or m == "help"
         or m == "info"
         or m == "apropos"
@@ -2093,7 +2855,7 @@ fn render_top_tab_bar(
                 let b_opt = world.buffer(p.buffer_id)
                 if b_opt != null {
                     let b = b_opt.as(Buffer)
-                    bname = (i + 1).to_string() ++ ": " ++ b.name ++ (if b.modified { " +" } else { "" })
+                    bname = (i + 1).to_string() ++ ": " ++ nerd_icon_for_buffer(b) ++ b.name ++ (if b.modified { " +" } else { "" })
                 }
             }
             let tab_w = (str_display_width(bname) + 3).as(f64) * cell_w
@@ -2129,7 +2891,7 @@ fn render_top_tab_bar(
             }
             let b = b_opt.as(Buffer)
             let is_active = bid == world.active_buffer_id
-            let label = b.name ++ (if b.modified { " [+]" } else { "" })
+            let label = nerd_icon_for_buffer(b) ++ b.name ++ (if b.modified { " [+]" } else { "" })
             let tab_w = (str_display_width(label) + 3).as(f64) * cell_w
             cmds.push(DrawCmd.FillRect(
                 cur_x,
@@ -2361,7 +3123,21 @@ fn render_pane_mode_line(
     ))
     cur_x += pill_w + 8.0
 
-    -- Buffer name + `[+]` / `[RO]` / `[Narrow Lx-Ly]`
+    -- Buffer file-type icon + name + `[+]` / `[RO]` / `[Narrow Lx-Ly]`
+    let bicon = nerd_icon_for_buffer(buf)
+    cmds.push(DrawCmd.TextRun(
+        cur_x,
+        text_y,
+        bicon,
+        font_fam,
+        font_sz,
+        if is_focused { theme.accent } else { theme.fg_muted },
+        false,
+        false,
+        false,
+    ))
+    cur_x += str_display_width(bicon).as(f64) * cell_w
+
     cmds.push(DrawCmd.TextRun(
         cur_x,
         text_y,
@@ -2667,6 +3443,14 @@ fn render_yazi_column(
     } else {
         index_inline_decors_by_row(col_buf.inline_decors)
     }
+    let col_mode_lc = col_buf.major_mode.to_lower()
+    let is_col_md = col_mode_lc == "markdown" or col_mode_lc == "md" or col_mode_lc == "gfm"
+    let col_md_states = if is_col_md and total_lines > 0 {
+        let end_r = if top_row + max_rows < total_lines { top_row + max_rows } else { total_lines - 1 }
+        compute_markdown_fence_states(col_buf, end_r)
+    } else {
+        List()
+    }
 
     var ri: i64 = 0
     while ri < max_rows {
@@ -2675,6 +3459,14 @@ fn render_yazi_column(
             break
         }
         let row_y = y + ri.as(f64) * cell_h
+        let (col_fk, col_fmode, _) = if is_col_md and buf_row < col_md_states.len() {
+            col_md_states.get(buf_row.as(usize)).as((i64, String, i64))
+        } else {
+            (0, "", -1)
+        }
+        if col_fk > 0 and col_fk <= 4 and right_x > text_x0 {
+            cmds.push(DrawCmd.FillRect(text_x0, row_y, right_x - text_x0, cell_h, theme.bg_alt, 0.0))
+        }
         if highlight_active_row and buf_row == active_row {
             cmds.push(DrawCmd.FillRect(x + 2.0, row_y, w - 4.0, cell_h, theme.bg_cursor_line, 3.0))
         }
@@ -2694,7 +3486,25 @@ fn render_yazi_column(
                 fg_decs.push(dec)
             }
         }
-        let runs = tokenize_line(raw_line, col_buf.major_mode, theme)
+        let runs = if is_col_md and col_fk == 1 {
+            tokenize_markdown_fence_delim(raw_line, theme)
+        } else if is_col_md and col_fk == 2 {
+            if col_fmode != "" {
+                tokenize_line(raw_line, col_fmode, theme)
+            } else if raw_line != "" {
+                [(0, raw_line, theme.fg, false, false)]
+            } else {
+                List()
+            }
+        } else if is_col_md and col_fk == 3 {
+            [(0, raw_line, theme.border, false, false)]
+        } else if is_col_md and col_fk == 4 {
+            tokenize_toml_or_json(raw_line, "toml", theme)
+        } else if is_col_md and col_fk == 5 {
+            [(0, raw_line, theme.syn_comment, false, true)]
+        } else {
+            tokenize_line(raw_line, col_buf.major_mode, theme)
+        }
         var cur_vcol: i64 = 0
         if fg_decs.is_empty() {
             for rj in 0..runs.len() {
@@ -2793,6 +3603,70 @@ fn render_yazi_dirvish_pane(
     }
 }
 
+private global _scope_shadow_doc_id: i64 = -1
+private global _scope_shadow_edit_ver: i64 = -1
+private global _scope_shadow_map: ?HashMap = null
+
+fn color_with_alpha(packed_rgba: i64, alpha_byte: i64) -> i64 {
+    let clamped = if alpha_byte < 0 { 0 } else if alpha_byte > 255 { 255 } else { alpha_byte }
+    (packed_rgba / 256) * 256 + clamped
+}
+
+fn is_brace_scope_mode(mode_lc: String) -> bool {
+    mode_lc == "nessa"
+        or mode_lc == "rust"
+        or mode_lc == "c"
+        or mode_lc == "cpp"
+        or mode_lc == "go"
+        or mode_lc == "javascript"
+        or mode_lc == "typescript"
+        or mode_lc == "java"
+        or mode_lc == "zig"
+}
+
+fn short_scope_kind_prefix(raw_kind: String) -> String {
+    let low = raw_kind.to_lower()
+    when {
+        low == "fn" or low == "function" or low == "def" or low == "func" or low == "method" => "fn ",
+        low == "struct" => "struct ",
+        low == "enum" => "enum ",
+        low == "impl" => "impl ",
+        low == "trait" or low == "interface" => "trait ",
+        low == "class" => "class ",
+        else => "",
+    }
+}
+
+fn get_cached_closing_scope_hints(buf: Buffer, mode_lc: String) -> HashMap {
+    if not is_brace_scope_mode(mode_lc) {
+        return HashMap.new()
+    }
+    if _scope_shadow_doc_id == buf.doc_id
+        and _scope_shadow_edit_ver == buf.edit_version
+        and _scope_shadow_map != null {
+        return _scope_shadow_map.as(HashMap)
+    }
+    let m = HashMap.new()
+    let cmt_pfx = if mode_lc == "nessa" or mode_lc == "lua" { "-- " } else { "// " }
+    let blocks = buf.scan_symbol_blocks(max_items = 600)
+    for i in 0..blocks.len() {
+        let (sname, skind, srow, erow) = blocks.get(i.as(usize)).as((String, String, i64, i64))
+        if sname != "" and erow - srow >= 6 and (not m.contains_key(erow)) {
+            let end_trim = buf.line_at(erow).trim()
+            if end_trim == "}}" or end_trim == "}};" or end_trim == "}}," {
+                let kp = short_scope_kind_prefix(skind)
+                if kp != "" {
+                    m.insert(erow, cmt_pfx ++ kp ++ sname)
+                }
+            }
+        }
+    }
+    _scope_shadow_doc_id = buf.doc_id
+    _scope_shadow_edit_ver = buf.edit_version
+    _scope_shadow_map = m
+    m
+}
+
 fn render_window_pane(
     cmds: List,
     kernel: SystemKernel,
@@ -2853,6 +3727,7 @@ fn render_window_pane(
 
     let mode_lc = buf.major_mode.to_lower()
     let is_markdown_buf = mode_lc == "markdown" or mode_lc == "md" or mode_lc == "gfm"
+    let first_vis_row = if row_count > 0 { vis_rows.get(0).as(i64) } else { -1 }
     let last_vis_row = if row_count > 0 {
         vis_rows.get((row_count - 1).as(usize)).as(i64)
     } else {
@@ -2860,6 +3735,17 @@ fn render_window_pane(
     }
     let md_fence_states = if is_markdown_buf and last_vis_row >= 0 {
         compute_markdown_fence_states(buf, last_vis_row)
+    } else {
+        List()
+    }
+    let ts_lang = if world.options.treesitter and is_treesitter_eligible_mode(mode_lc) and buf.doc_id > 0 and row_count > 0 {
+        ts_lang_for_buffer(buf)
+    } else {
+        ""
+    }
+    let ts_viewport_rows = if ts_lang != "" and first_vis_row >= 0 and last_vis_row >= first_vis_row {
+        buf.sync_external_lines()
+        accel_ts_highlight_rows(buf.doc_id, ts_lang, first_vis_row, last_vis_row)
     } else {
         List()
     }
@@ -2879,16 +3765,21 @@ fn render_window_pane(
     } else {
         null
     }
+    let scope_hints_map = if world.options.shadow_text {
+        get_cached_closing_scope_hints(buf, mode_lc)
+    } else {
+        HashMap.new()
+    }
 
     for s_idx in 0..row_count {
         let buf_row = vis_rows.get(s_idx.as(usize)).as(i64)
         let row_y = r.y + s_idx.as(f64) * cell_h
         let raw_line = buf.line_at(buf_row)
         let is_cursor_row = buf_row == pane.cursor.row
-        let (md_fence_kind, md_fence_mode) = if is_markdown_buf and buf_row >= 0 and buf_row < md_fence_states.len() {
-            md_fence_states.get(buf_row.as(usize)).as((i64, String))
+        let (md_fence_kind, md_fence_mode, md_open_row) = if is_markdown_buf and buf_row >= 0 and buf_row < md_fence_states.len() {
+            md_fence_states.get(buf_row.as(usize)).as((i64, String, i64))
         } else {
-            (0, "")
+            (0, "", -1)
         }
         let is_folded = buf.folded_rows.contains(buf_row)
             or (
@@ -2901,8 +3792,13 @@ fn render_window_pane(
             and is_focused
             and abs_i64(buf_row - pane.cursor.row) > 8
 
-        -- 0. Subtle full-row code-block background tint for Markdown fenced blocks
-        if md_fence_kind > 0 and pane_right_x > text_x0 {
+        -- 0. Subtle full-row background tint for Markdown fenced blocks, frontmatter, and table headers
+        let is_md_table_hdr = is_markdown_buf
+            and md_fence_kind == 0
+            and buf_row + 1 <= buf.max_row()
+            and raw_line.contains("|")
+            and is_markdown_table_sep(buf.line_at(buf_row + 1).chars(), buf.line_at(buf_row + 1).char_len())
+        if ((md_fence_kind >= 1 and md_fence_kind <= 4) or is_md_table_hdr) and pane_right_x > text_x0 {
             cmds.push(DrawCmd.FillRect(text_x0, row_y, pane_right_x - text_x0, cell_h, theme.bg_alt, 0.0))
         }
 
@@ -3026,25 +3922,120 @@ fn render_window_pane(
             collect_markdown_link_url_decors(raw_line, buf_row, theme, fg_decs)
         }
 
-        -- 5. Syntax-highlighted `DrawCmd.TextRun` spans (stateful fenced code blocks + non-overlapping `fg_decs`)
-        let runs = if is_markdown_buf and md_fence_kind == 1 {
+        -- 5. Syntax-highlighted `DrawCmd.TextRun` spans (with inline shadow ghost completion split at cursor)
+        let ig = world.inline_ghost
+        let has_row_ghost = is_focused
+            and is_cursor_row
+            and world.options.shadow_text
+            and (not world.minibuffer_view.active)
+            and ig.active
+            and ig.row == buf_row
+            and ig.col == pane.cursor.col
+            and ig.text != ""
+
+        var cur_vcol: i64 = 0
+        let full_runs = if is_markdown_buf and md_fence_kind == 1 {
             tokenize_markdown_fence_delim(raw_line, theme)
         } else if is_markdown_buf and md_fence_kind == 2 {
             if md_fence_mode != "" {
-                tokenize_line(raw_line, md_fence_mode, theme)
-            } else if raw_line.char_len() > 0 {
-                [(0, raw_line, theme.syn_string, false, false)]
+                let block_ts = if world.options.treesitter {
+                    get_md_fenced_block_ts_spans(buf, md_fence_states, md_open_row, md_fence_mode)
+                } else {
+                    List()
+                }
+                let rel_idx = buf_row - (md_open_row + 1)
+                if (not block_ts.is_empty()) and rel_idx >= 0 and rel_idx < block_ts.len() {
+                    ts_spans_to_runs(raw_line, block_ts.get(rel_idx.as(usize)).as(List), theme)
+                } else {
+                    tokenize_line(raw_line, md_fence_mode, theme)
+                }
+            } else if raw_line != "" {
+                [(0, raw_line, theme.fg, false, false)]
             } else {
                 List()
             }
+        } else if is_markdown_buf and md_fence_kind == 3 {
+            [(0, raw_line, theme.border, false, false)]
+        } else if is_markdown_buf and md_fence_kind == 4 {
+            tokenize_toml_or_json(raw_line, "toml", theme)
+        } else if is_markdown_buf and md_fence_kind == 5 {
+            [(0, raw_line, theme.syn_comment, false, true)]
+        } else if (not ts_viewport_rows.is_empty()) and buf_row >= first_vis_row and (buf_row - first_vis_row) < ts_viewport_rows.len() {
+            let row_ts = ts_viewport_rows.get((buf_row - first_vis_row).as(usize)).as(List)
+            ts_spans_to_runs(raw_line, row_ts, theme)
         } else {
             tokenize_line(raw_line, buf.major_mode, theme)
         }
-        var cur_vcol: i64 = 0
-        if fg_decs.is_empty() {
-            for ri in 0..runs.len() {
+
+        if has_row_ghost {
+            let split_col = if pane.cursor.col < 0 {
+                0
+            } else if pane.cursor.col > raw_line.char_len() {
+                raw_line.char_len()
+            } else {
+                pane.cursor.col
+            }
+            let (left_runs, right_runs) = split_runs_at_char_col(full_runs, split_col)
+            for ri in 0..left_runs.len() {
                 let (_, tok_text, tok_color, _tok_bold, tok_italic) =
-                    runs.get(ri.as(usize)).as((i64, String, i64, bool, bool))
+                    left_runs.get(ri.as(usize)).as((i64, String, i64, bool, bool))
+                cur_vcol = emit_single_text_segment(
+                    cmds,
+                    tok_text,
+                    cur_vcol,
+                    tabstop,
+                    pane.left_col,
+                    text_x0,
+                    pane_right_x,
+                    row_y,
+                    cell_w,
+                    font_fam,
+                    font_sz,
+                    if dim_row { theme.fg_muted } else { tok_color },
+                    tok_italic,
+                    false,
+                )
+            }
+            cur_vcol = emit_single_text_segment(
+                cmds,
+                ig.text,
+                cur_vcol,
+                tabstop,
+                pane.left_col,
+                text_x0,
+                pane_right_x,
+                row_y,
+                cell_w,
+                font_fam,
+                font_sz,
+                color_with_alpha(theme.fg_muted, 160),
+                true,
+                false,
+            )
+            for rri in 0..right_runs.len() {
+                let (_, rtok_text, rtok_color, _rtok_bold, rtok_italic) =
+                    right_runs.get(rri.as(usize)).as((i64, String, i64, bool, bool))
+                cur_vcol = emit_single_text_segment(
+                    cmds,
+                    rtok_text,
+                    cur_vcol,
+                    tabstop,
+                    pane.left_col,
+                    text_x0,
+                    pane_right_x,
+                    row_y,
+                    cell_w,
+                    font_fam,
+                    font_sz,
+                    if dim_row { theme.fg_muted } else { rtok_color },
+                    rtok_italic,
+                    false,
+                )
+            }
+        } else if fg_decs.is_empty() {
+            for ri in 0..full_runs.len() {
+                let (_, tok_text, tok_color, _tok_bold, tok_italic) =
+                    full_runs.get(ri.as(usize)).as((i64, String, i64, bool, bool))
                 cur_vcol = emit_single_text_segment(
                     cmds,
                     tok_text,
@@ -3066,7 +4057,7 @@ fn render_window_pane(
             cur_vcol = emit_segmented_row_runs(
                 cmds,
                 raw_line,
-                runs,
+                full_runs,
                 fg_decs,
                 dim_row,
                 tabstop,
@@ -3114,7 +4105,7 @@ fn render_window_pane(
             }
         }
 
-        -- 5c. End-of-line `VirtualTextDecor` (git blame, inline diagnostics, hints)
+        -- 5c. End-of-line `VirtualTextDecor` (git blame, inline diagnostics, hints) + Closing-Scope Shadow Labels
         let row_vts_opt = row_vts_map.get(buf_row)
         if row_vts_opt != null {
             let row_vts = row_vts_opt.as(List)
@@ -3131,6 +4122,28 @@ fn render_window_pane(
                         false, vt.italic, false,
                     ))
                     vt_vcol += str_display_width(vtxt) + 2
+                }
+            }
+        } else if (not has_row_ghost) and world.options.shadow_text {
+            let scope_lbl_opt = scope_hints_map.get(buf_row)
+            if scope_lbl_opt != null {
+                let scope_lbl = scope_lbl_opt.as(String)
+                let sh_vcol = (if cur_vcol < pane.left_col { 0 } else { cur_vcol - pane.left_col }) + 2
+                let sh_x = text_x0 + sh_vcol.as(f64) * cell_w
+                if sh_x < pane_right_x - cell_w * 4.0 {
+                    let max_sh = (((pane_right_x - sh_x) / cell_w).floor().as(i64))
+                    let clipped_sh = clip_str(scope_lbl, max_sh)
+                    cmds.push(DrawCmd.TextRun(
+                        sh_x,
+                        row_y,
+                        clipped_sh,
+                        font_fam,
+                        font_sz,
+                        color_with_alpha(theme.fg_muted, 118),
+                        false,
+                        true,
+                        false,
+                    ))
                 }
             }
         }
@@ -3221,10 +4234,12 @@ fn render_which_key_overlay(
     let font_sz = world.options.font_size_pt
 
     let total = world.which_key_items.len()
-    let max_items = if total > 24 { 24 } else { total }
-    let cols = if win_w >= 960.0 and max_items >= 6 {
+    let max_items = if total > 30 { 30 } else { total }
+    let cols = if win_w >= 1120.0 and max_items >= 12 {
+        4
+    } else if win_w >= 880.0 and max_items >= 6 {
         3
-    } else if win_w >= 640.0 and max_items >= 3 {
+    } else if win_w >= 580.0 and max_items >= 3 {
         2
     } else {
         1
@@ -3245,11 +4260,17 @@ fn render_which_key_overlay(
     cmds.push(DrawCmd.FillRect(box_x, box_y, box_w, box_h, theme.bg_popup, 6.0))
     cmds.push(DrawCmd.StrokeRect(box_x, box_y, box_w, box_h, theme.border, 1.0, 6.0))
 
-    let hdr = "Which-Key " ++ (if world.pending_keys_display != "" {
-        "(" ++ world.pending_keys_display ++ "-)"
+    let pk = world.pending_keys_display
+    let hdr_suffix = if pk != "" {
+        if pk.ends_with("-") {
+            "(" ++ pk ++ ")"
+        } else {
+            "(" ++ pk ++ "-)"
+        }
     } else {
-        "(bindings)"
-    })
+        "(" ++ world.mode_name ++ ")"
+    }
+    let hdr = " Which-Key " ++ hdr_suffix
     cmds.push(DrawCmd.TextRun(box_x + 10.0, box_y + 5.0, hdr, font_fam, font_sz, theme.accent, false, false, false))
 
     let col_w = (box_w - 20.0) / cols.as(f64)
@@ -3703,7 +4724,11 @@ fn render_sidebar_panel(
             cmds.push(DrawCmd.FillRect(x + 2.0, ry, w - 4.0, cell_h, theme.bg_selection, 3.0))
         }
         let clipped = clip_str(ln, max_chars)
-        let is_dir = clipped.ends_with("/") or clipped.contains("▾ ") or clipped.contains("▸ ")
+        let is_dir = clipped.ends_with("/")
+            or clipped.contains("▾ ")
+            or clipped.contains("▸ ")
+            or clipped.contains(" ")
+            or clipped.contains(" ")
         let fg = if is_sel {
             theme.fg
         } else if is_dir {
@@ -3717,6 +4742,59 @@ fn render_sidebar_panel(
     let bx = if is_left { x + w - 1.0 } else { x }
     cmds.push(DrawCmd.Line(bx, y, bx, y + h, theme.border, 1.0))
     cmds.push(DrawCmd.ClipPop)
+}
+
+fn cmp_kind_badge_and_color(kind: String, theme: ThemePalette) -> (String, i64) {
+    let low = kind.to_lower()
+    when {
+        low == "function" or low == "fn" => (" fn", theme.syn_fn),
+        low == "method" => (" mth", theme.syn_fn),
+        low == "constructor" => (" ctr", theme.syn_fn),
+        low == "struct" or low == "class" => (" typ", theme.syn_type),
+        low == "enum" or low == "enummember" => (" enm", theme.syn_type),
+        low == "interface" or low == "trait" => (" trt", theme.syn_type),
+        low == "field" or low == "property" => (" fld", theme.accent),
+        low == "constant" => (" cst", theme.syn_number),
+        low == "keyword" => (" kw", theme.syn_keyword),
+        low == "snippet" => (" snp", theme.diag_ok),
+        low == "module" or low == "namespace" or low == "package" => (" mod", theme.accent),
+        low == "path" => (" pth", theme.accent),
+        low == "variable" or low == "identifier" => (" var", theme.fg_muted),
+        else => (" " ++ clip_str(low, 3), theme.syn_type),
+    }
+}
+
+fn emit_popup_code_line(
+    cmds: List,
+    line_txt: String,
+    mode: String,
+    x0: f64,
+    y: f64,
+    max_cols: i64,
+    cell_w: f64,
+    font_fam: String,
+    font_sz: f64,
+    theme: ThemePalette,
+) {
+    let clipped = clip_str(line_txt, max_cols)
+    if clipped == "" {
+        return
+    }
+    let eff_mode = if mode != "" { mode } else { "nessa" }
+    let runs = tokenize_line(clipped, eff_mode, theme)
+    if runs.is_empty() {
+        cmds.push(DrawCmd.TextRun(x0, y, clipped, font_fam, font_sz, theme.fg, false, false, false))
+        return
+    }
+    var cur_x = x0
+    for ri in 0..runs.len() {
+        let (_, tok_text, tok_color, _tok_bold, tok_italic) =
+            runs.get(ri.as(usize)).as((i64, String, i64, bool, bool))
+        if tok_text != "" {
+            cmds.push(DrawCmd.TextRun(cur_x, y, tok_text, font_fam, font_sz, tok_color, false, tok_italic, false))
+            cur_x += str_display_width(tok_text).as(f64) * cell_w
+        }
+    }
 }
 
 fn render_buffer_completion_popup(
@@ -3741,7 +4819,7 @@ fn render_buffer_completion_popup(
     let gutter_w = compute_gutter_width(buf, world.options, wm.metrics)
 
     let total = cp.items.len()
-    let vis_count = if total > 8 { 8 } else { total }
+    let vis_count = if total > 10 { 10 } else { total }
     let sel = if cp.selected_idx < 0 {
         0
     } else if cp.selected_idx >= total {
@@ -3757,20 +4835,54 @@ fn render_buffer_completion_popup(
         start_i = 0
     }
 
+    -- Adaptive column sizing so both candidate labels AND full signature/description details fit cleanly!
+    var max_lbl_w: i64 = 18
+    var max_det_w: i64 = 16
+    for ri in 0..vis_count {
+        let it = cp.items.get((start_i + ri).as(usize)).as(CompletionItem)
+        let lw = str_display_width(it.label)
+        if lw > max_lbl_w {
+            max_lbl_w = if lw > 38 { 38 } else { lw }
+        }
+        let dw = str_display_width(it.detail)
+        if dw > max_det_w {
+            max_det_w = if dw > 46 { 46 } else { dw }
+        }
+    }
+    let has_doc = not cp.doc_lines.is_empty()
+    let win_cols = (((win_w - 20.0) / cell_w).floor().as(i64))
+    let max_pop_cols = if has_doc and win_cols >= 110 {
+        if win_cols - 48 < 78 { win_cols - 48 } else { 78 }
+    } else if win_cols > 82 {
+        82
+    } else if win_cols > 32 {
+        win_cols
+    } else {
+        32
+    }
+    let desired_cols = 8 + max_lbl_w + 3 + max_det_w + 3
+    let pop_cols = if desired_cols < 54 {
+        if 54 <= max_pop_cols { 54 } else { max_pop_cols }
+    } else if desired_cols > max_pop_cols {
+        max_pop_cols
+    } else {
+        desired_cols
+    }
+
     let raw_line = buf.line_at(pane.cursor.row)
     let vcol = char_col_to_visual_col(raw_line, cp.replace_start_col, tabstop) - pane.left_col
     var pop_x = pane.rect.x + gutter_w + (if vcol > 0 { vcol } else { 0 }).as(f64) * cell_w
-    let pop_w = 42.0 * cell_w
+    let pop_w = pop_cols.as(f64) * cell_w
     if pop_x + pop_w > win_w - 8.0 {
         pop_x = if win_w - pop_w - 8.0 > 8.0 { win_w - pop_w - 8.0 } else { 8.0 }
     }
     let pop_h = vis_count.as(f64) * cell_h + 8.0
     let screen_row = if pane.cursor.row >= pane.top_row { pane.cursor.row - pane.top_row } else { 0 }
+    let top_h = top_bar_height(world)
     let below_y = pane.rect.y + (screen_row + 1).as(f64) * cell_h + 2.0
     let pop_y = if below_y + pop_h <= echo_y - 4.0 {
         below_y
     } else {
-        let top_h = top_bar_height(world)
         let above_y = pane.rect.y + screen_row.as(f64) * cell_h - pop_h - 2.0
         if above_y > top_h { above_y } else { top_h + 4.0 }
     }
@@ -3779,25 +4891,316 @@ fn render_buffer_completion_popup(
     cmds.push(DrawCmd.FillRect(pop_x, pop_y, pop_w, pop_h, theme.bg_popup, 5.0))
     cmds.push(DrawCmd.StrokeRect(pop_x, pop_y, pop_w, pop_h, theme.border, 1.0, 5.0))
 
+    let sb_pad = if total > vis_count { 8.0 } else { 0.0 }
+    let pfx_lc = cp.prefix.to_lower()
+    let max_lbl_clip = if pop_cols - 18 > 16 {
+        if max_lbl_w < pop_cols - 18 { max_lbl_w } else { pop_cols - 18 }
+    } else {
+        16
+    }
+
     for ri in 0..vis_count {
         let idx = start_i + ri
         let iy = pop_y + 4.0 + ri.as(f64) * cell_h
         let item = cp.items.get(idx.as(usize)).as(CompletionItem)
         let is_sel = idx == sel
         if is_sel {
-            cmds.push(DrawCmd.FillRect(pop_x + 3.0, iy, pop_w - 6.0, cell_h, theme.bg_selection, 3.0))
+            cmds.push(DrawCmd.FillRect(pop_x + 3.0, iy, pop_w - 6.0 - sb_pad, cell_h, theme.bg_selection, 3.0))
         }
-        let kind_tag = "[" ++ clip_str(item.kind, 4) ++ "]"
-        cmds.push(DrawCmd.TextRun(pop_x + 8.0, iy, kind_tag, font_fam, font_sz, theme.syn_type, false, false, false))
+        let (kshort, kcol) = cmp_kind_badge_and_color(item.kind, theme)
+        let ktag = "[" ++ kshort ++ "]"
+        cmds.push(DrawCmd.TextRun(pop_x + 8.0, iy, ktag, font_fam, font_sz, kcol, false, false, false))
+
         let lx = pop_x + 8.0 + 7.0 * cell_w
-        cmds.push(DrawCmd.TextRun(lx, iy, clip_str(item.label, 24), font_fam, font_sz, theme.fg, false, false, false))
+        let shown_lbl = clip_str(item.label, max_lbl_clip)
+        if pfx_lc != "" and shown_lbl.to_lower().contains(pfx_lc) {
+            let hits = shown_lbl.to_lower().find_indices(pfx_lc)
+            let h0 = hits.get(0).as(i64)
+            let h1 = h0 + pfx_lc.char_len()
+            let pre = shown_lbl.slice(0, h0)
+            let mid = shown_lbl.slice(h0, h1)
+            let post = shown_lbl.slice(h1, shown_lbl.char_len())
+            var cx = lx
+            if pre != "" {
+                cmds.push(DrawCmd.TextRun(cx, iy, pre, font_fam, font_sz, theme.fg, false, false, false))
+                cx += str_display_width(pre).as(f64) * cell_w
+            }
+            if mid != "" {
+                cmds.push(DrawCmd.TextRun(cx, iy, mid, font_fam, font_sz, theme.accent, false, false, true))
+                cx += str_display_width(mid).as(f64) * cell_w
+            }
+            if post != "" {
+                cmds.push(DrawCmd.TextRun(cx, iy, post, font_fam, font_sz, theme.fg, false, false, false))
+            }
+        } else {
+            cmds.push(DrawCmd.TextRun(lx, iy, shown_lbl, font_fam, font_sz, theme.fg, false, false, false))
+        }
+
         if item.detail != "" {
-            let det = clip_str(item.detail, 10)
-            let dx = pop_x + pop_w - (str_display_width(det).as(f64) * cell_w) - 8.0
-            if dx > lx + 12.0 * cell_w {
-                cmds.push(DrawCmd.TextRun(dx, iy, det, font_fam, font_sz, theme.fg_muted, false, true, false))
+            let used_lbl_w = str_display_width(shown_lbl)
+            let right_edge_x = pop_x + pop_w - 8.0 - sb_pad
+            let min_det_x = lx + (used_lbl_w + 2).as(f64) * cell_w
+            let avail_det_cols = (((right_edge_x - min_det_x) / cell_w).floor().as(i64))
+            if avail_det_cols >= 6 {
+                let det = clip_str(item.detail, avail_det_cols)
+                let dx = right_edge_x - (str_display_width(det).as(f64) * cell_w)
+                if dx >= min_det_x - 1.0 {
+                    cmds.push(DrawCmd.TextRun(dx, iy, det, font_fam, font_sz, theme.fg_muted, false, true, false))
+                }
             }
         }
+    }
+
+    if total > vis_count {
+        let track_x = pop_x + pop_w - 6.0
+        let track_y = pop_y + 4.0
+        let track_h = vis_count.as(f64) * cell_h
+        cmds.push(DrawCmd.FillRect(track_x, track_y, 3.0, track_h, theme.bg_alt, 1.5))
+        let raw_th = track_h * (vis_count.as(f64) / total.as(f64))
+        let thumb_h = if raw_th < 8.0 {
+            if track_h < 8.0 { track_h } else { 8.0 }
+        } else if raw_th > track_h {
+            track_h
+        } else {
+            raw_th
+        }
+        let max_s = if total - vis_count > 0 { total - vis_count } else { 1 }
+        let ty = track_y + (track_h - thumb_h) * (start_i.as(f64) / max_s.as(f64))
+        cmds.push(DrawCmd.FillRect(track_x, ty, 3.0, thumb_h, theme.accent, 1.5))
+    }
+    cmds.push(DrawCmd.ClipPop)
+
+    -- Adjacent Documentation Side Window when navigating candidates (`cp.doc_lines`)
+    if has_doc {
+        -- Filter out ``` / ~~~ fence marker lines while tracking code-block state for syntax coloring
+        let display_rows = List()
+        var in_fence = false
+        var doc_fc = '`'
+        var doc_flen: i64 = 3
+        let b_mode_lc = buf.major_mode.to_lower()
+        let default_code_lang = if b_mode_lc == "markdown" or b_mode_lc == "md" or b_mode_lc == "gfm" {
+            "nessa"
+        } else {
+            buf.major_mode
+        }
+        var fence_lang = default_code_lang
+        var max_doc_line_w = str_display_width(cp.doc_title) + 2
+        for di in 0..cp.doc_lines.len() {
+            if display_rows.len() >= 14 {
+                break
+            }
+            let raw_dl = cp.doc_lines.get(di.as(usize)).as(String)
+            if not in_fence {
+                let f_opt = parse_markdown_fence_open(raw_dl)
+                if f_opt != null {
+                    let (fc, fl, info_s) = f_opt.as((char, i64, String))
+                    doc_fc = fc
+                    doc_flen = fl
+                    let cm = canonical_fence_mode(info_s)
+                    fence_lang = if cm != "" { cm } else { default_code_lang }
+                    in_fence = true
+                    continue
+                }
+            } else if is_markdown_fence_close(raw_dl, doc_fc, doc_flen) {
+                in_fence = false
+                continue
+            }
+            let dw = str_display_width(raw_dl)
+            if dw > max_doc_line_w {
+                max_doc_line_w = dw
+            }
+            display_rows.push((raw_dl, in_fence, fence_lang))
+        }
+        if not display_rows.is_empty() {
+            let desired_doc_cols = if max_doc_line_w + 4 < 38 {
+                38
+            } else if max_doc_line_w + 4 > 62 {
+                62
+            } else {
+                max_doc_line_w + 4
+            }
+            let right_space = win_w - (pop_x + pop_w + 6.0) - 8.0
+            let left_space = pop_x - 6.0 - 8.0
+            var doc_w = desired_doc_cols.as(f64) * cell_w
+            var doc_x = pop_x + pop_w + 6.0
+            var doc_y = pop_y
+            if right_space >= 30.0 * cell_w {
+                if doc_w > right_space {
+                    doc_w = right_space
+                }
+                doc_x = pop_x + pop_w + 6.0
+            } else if left_space >= 30.0 * cell_w {
+                if doc_w > left_space {
+                    doc_w = left_space
+                }
+                doc_x = pop_x - doc_w - 6.0
+            } else {
+                -- Narrow window fallback: stack cleanly below or above completion popup
+                if doc_w > win_w - 16.0 {
+                    doc_w = win_w - 16.0
+                }
+                doc_x = if pop_x + doc_w <= win_w - 8.0 { pop_x } else { 8.0 }
+                let doc_h_est = (display_rows.len() + 1).as(f64) * cell_h + 12.0
+                if pop_y + pop_h + 4.0 + doc_h_est <= echo_y - 4.0 {
+                    doc_y = pop_y + pop_h + 4.0
+                } else if pop_y - doc_h_est - 4.0 > top_h {
+                    doc_y = pop_y - doc_h_est - 4.0
+                } else {
+                    return
+                }
+            }
+            let doc_h = (display_rows.len() + 1).as(f64) * cell_h + 12.0
+            if doc_y + doc_h > echo_y - 4.0 {
+                doc_y = if echo_y - doc_h - 4.0 > top_h { echo_y - doc_h - 4.0 } else { top_h + 4.0 }
+            }
+            let max_doc_chars = (((doc_w - 16.0) / cell_w).floor().as(i64))
+            if max_doc_chars >= 12 {
+                cmds.push(DrawCmd.ClipPush(doc_x, doc_y, doc_w, doc_h))
+                cmds.push(DrawCmd.FillRect(doc_x, doc_y, doc_w, doc_h, theme.bg_popup, 5.0))
+                cmds.push(DrawCmd.StrokeRect(doc_x, doc_y, doc_w, doc_h, theme.border, 1.0, 5.0))
+                let hdr_title = clip_str(if cp.doc_title != "" { cp.doc_title } else { "Documentation" }, max_doc_chars)
+                cmds.push(DrawCmd.TextRun(doc_x + 8.0, doc_y + 4.0, hdr_title, font_fam, font_sz, theme.accent, false, false, false))
+                cmds.push(DrawCmd.Line(doc_x + 6.0, doc_y + cell_h + 6.0, doc_x + doc_w - 6.0, doc_y + cell_h + 6.0, theme.border, 1.0))
+
+                for dri in 0..display_rows.len() {
+                    let dy = doc_y + cell_h + 8.0 + dri.as(f64) * cell_h
+                    let (dtxt, is_code, code_lang) = display_rows.get(dri.as(usize)).as((String, bool, String))
+                    if is_code {
+                        cmds.push(DrawCmd.FillRect(doc_x + 4.0, dy, doc_w - 8.0, cell_h, theme.bg_alt, 2.0))
+                        emit_popup_code_line(cmds, dtxt, code_lang, doc_x + 8.0, dy, max_doc_chars, cell_w, font_fam, font_sz, theme)
+                    } else if dtxt.starts_with("────") or dtxt == "---" {
+                        cmds.push(DrawCmd.Line(doc_x + 8.0, dy + cell_h * 0.5, doc_x + doc_w - 8.0, dy + cell_h * 0.5, theme.border, 1.0))
+                    } else if dtxt.starts_with("Defined ") or dtxt.starts_with("Local binding ") {
+                        cmds.push(DrawCmd.TextRun(doc_x + 8.0, dy, clip_str(dtxt, max_doc_chars), font_fam, font_sz, theme.fg_muted, false, true, false))
+                    } else {
+                        emit_popup_code_line(cmds, dtxt, "markdown", doc_x + 8.0, dy, max_doc_chars, cell_w, font_fam, font_sz, theme)
+                    }
+                }
+                cmds.push(DrawCmd.ClipPop)
+            }
+        }
+    }
+}
+
+fn find_active_param_span_in_sig(sig_label: String, active_param_text: String) -> (i64, i64) {
+    if active_param_text == "" or sig_label == "" {
+        return (-1, -1)
+    }
+    let open_hits = sig_label.find_indices("(")
+    let search_from = if not open_hits.is_empty() { open_hits.get(0).as(i64) } else { 0 }
+    let sub = sig_label.drop(search_from)
+    let hits = sub.find_indices(active_param_text)
+    if not hits.is_empty() {
+        let s = search_from + hits.get(0).as(i64)
+        return (s, s + active_param_text.char_len())
+    }
+    (-1, -1)
+}
+
+fn render_signature_help_popup(
+    cmds: List,
+    world: EditorWorld,
+    wm: WindowManager,
+    theme: ThemePalette,
+    win_w: f64,
+    echo_y: f64,
+) {
+    let sh = world.signature_help
+    if (not sh.active) or sh.label == "" or world.minibuffer_view.active {
+        return
+    }
+    let pane = wm.active_pane()
+    let buf = world.active_buffer()
+    let cell_w = wm.metrics.cell_width
+    let cell_h = wm.metrics.cell_height
+    let font_fam = world.options.font_family
+    let font_sz = world.options.font_size_pt
+    let tabstop = safe_tabstop(world.options)
+    let gutter_w = compute_gutter_width(buf, world.options, wm.metrics)
+
+    let has_doc = sh.doc_summary.trim() != ""
+    let rows_needed = if has_doc { 2 } else { 1 }
+    let max_win_cols = (((win_w - 20.0) / cell_w).floor().as(i64))
+    let max_sig_cols = if max_win_cols > 88 { 88 } else if max_win_cols > 24 { max_win_cols } else { 24 }
+    let lbl_w = str_display_width(sh.label)
+    let doc_w_cells = if has_doc { str_display_width(sh.doc_summary) } else { 0 }
+    let content_cols = if lbl_w > doc_w_cells { lbl_w } else { doc_w_cells }
+    let box_cols = if content_cols + 4 < 34 {
+        if 34 <= max_sig_cols { 34 } else { max_sig_cols }
+    } else if content_cols + 4 > max_sig_cols {
+        max_sig_cols
+    } else {
+        content_cols + 4
+    }
+    let box_w = box_cols.as(f64) * cell_w
+    let box_h = rows_needed.as(f64) * cell_h + (if has_doc { 12.0 } else { 8.0 })
+
+    let anchor_r = if sh.anchor_pos.row >= pane.top_row { sh.anchor_pos.row } else { pane.cursor.row }
+    let anchor_line = buf.line_at(anchor_r)
+    let vcol = char_col_to_visual_col(anchor_line, sh.anchor_pos.col, tabstop) - pane.left_col
+    var box_x = pane.rect.x + gutter_w + (if vcol > 0 { vcol } else { 0 }).as(f64) * cell_w
+    if box_x + box_w > win_w - 8.0 {
+        box_x = if win_w - box_w - 8.0 > 8.0 { win_w - box_w - 8.0 } else { 8.0 }
+    }
+
+    let screen_row = if pane.cursor.row >= pane.top_row { pane.cursor.row - pane.top_row } else { 0 }
+    let top_h = top_bar_height(world)
+    let above_y = pane.rect.y + screen_row.as(f64) * cell_h - box_h - 4.0
+    let below_y = pane.rect.y + (screen_row + 1).as(f64) * cell_h + 2.0
+    let box_y = if above_y >= top_h + 2.0 {
+        above_y
+    } else if (not world.completion_popup.active) and below_y + box_h <= echo_y - 4.0 {
+        below_y
+    } else {
+        top_h + 2.0
+    }
+
+    cmds.push(DrawCmd.ClipPush(box_x, box_y, box_w, box_h))
+    cmds.push(DrawCmd.FillRect(box_x, box_y, box_w, box_h, theme.bg_popup, 5.0))
+    cmds.push(DrawCmd.StrokeRect(box_x, box_y, box_w, box_h, theme.accent, 1.0, 5.0))
+
+    let inner_cols = box_cols - 3
+    let shown_sig = clip_str(sh.label, inner_cols)
+    let act_p_txt = if sh.active_param >= 0 and sh.active_param < sh.parameters.len() {
+        sh.parameters.get(sh.active_param.as(usize)).as(String)
+    } else {
+        ""
+    }
+    let (ps, pe) = find_active_param_span_in_sig(shown_sig, act_p_txt)
+    let sy = box_y + 4.0
+    let sx0 = box_x + 8.0
+    if ps >= 0 and pe > ps and pe <= shown_sig.char_len() {
+        let pre_s = shown_sig.slice(0, ps)
+        let mid_s = shown_sig.slice(ps, pe)
+        let post_s = shown_sig.slice(pe, shown_sig.char_len())
+        let pre_w = str_display_width(pre_s).as(f64) * cell_w
+        let mid_w = str_display_width(mid_s).as(f64) * cell_w
+        cmds.push(DrawCmd.FillRect(sx0 + pre_w - 2.0, sy, mid_w + 4.0, cell_h, theme.bg_selection, 3.0))
+        if pre_s != "" {
+            emit_popup_code_line(cmds, pre_s, buf.major_mode, sx0, sy, inner_cols, cell_w, font_fam, font_sz, theme)
+        }
+        cmds.push(DrawCmd.TextRun(sx0 + pre_w, sy, mid_s, font_fam, font_sz, theme.accent, false, false, true))
+        if post_s != "" {
+            emit_popup_code_line(cmds, post_s, buf.major_mode, sx0 + pre_w + mid_w, sy, inner_cols, cell_w, font_fam, font_sz, theme)
+        }
+    } else {
+        emit_popup_code_line(cmds, shown_sig, buf.major_mode, sx0, sy, inner_cols, cell_w, font_fam, font_sz, theme)
+    }
+
+    if has_doc {
+        let div_y = box_y + cell_h + 6.0
+        cmds.push(DrawCmd.Line(box_x + 6.0, div_y, box_x + box_w - 6.0, div_y, theme.border, 1.0))
+        cmds.push(DrawCmd.TextRun(
+            sx0,
+            div_y + 2.0,
+            clip_str(sh.doc_summary.trim(), inner_cols),
+            font_fam,
+            font_sz,
+            theme.fg_muted,
+            false,
+            true,
+            false,
+        ))
     }
     cmds.push(DrawCmd.ClipPop)
 }
@@ -3930,6 +5333,53 @@ fn render_floating_row_with_spans(
     }
 }
 
+fn floating_cursor_anchor_xy(
+    world: EditorWorld,
+    wm: WindowManager,
+    win_w: f64,
+    echo_y: f64,
+    box_w: f64,
+    box_h: f64,
+    cell_w: f64,
+    cell_h: f64,
+) -> (f64, f64) {
+    let pane = wm.active_pane()
+    let buf = world.active_buffer()
+    let r = pane.rect
+    let gw = compute_gutter_width(buf, world.options, wm.metrics)
+    let ts = safe_tabstop(world.options)
+    let cur_line = buf.line_at(pane.cursor.row)
+    let cur_vcol = char_col_to_visual_col(cur_line, pane.cursor.col, ts) - pane.left_col
+    let cx = r.x + gw + (if cur_vcol > 0 { cur_vcol } else { 0 }).as(f64) * cell_w
+    let vis = visible_buffer_rows(buf, pane.top_row, wm.pane_rows(pane))
+    var s_idx: i64 = 0
+    for i in 0..vis.len() {
+        if vis.get(i.as(usize)).as(i64) == pane.cursor.row {
+            s_idx = i
+            break
+        }
+    }
+    let cy = r.y + s_idx.as(f64) * cell_h
+    var bx = cx.floor()
+    if bx + box_w > win_w - 12.0 {
+        bx = (win_w - box_w - 12.0).floor()
+    }
+    if bx < 12.0 {
+        bx = 12.0
+    }
+    let top_h = top_bar_height(world)
+    let below_y = (cy + cell_h + 4.0).floor()
+    let above_y = (cy - box_h - 4.0).floor()
+    let by = if below_y + box_h <= echo_y - 6.0 {
+        below_y
+    } else if above_y >= top_h + 4.0 {
+        above_y
+    } else {
+        below_y
+    }
+    (bx, by)
+}
+
 fn render_floating_windows(
     cmds: List,
     world: EditorWorld,
@@ -3947,6 +5397,7 @@ fn render_floating_windows(
     let font_fam = world.options.font_family
     let font_sz = world.options.font_size_pt
     let tabstop = safe_tabstop(world.options)
+    let active_buf = world.active_buffer()
 
     for fi in 0..world.floating_windows.len() {
         let fw = world.floating_windows.get(fi.as(usize)).as(FloatingWindow)
@@ -3955,15 +5406,12 @@ fn render_floating_windows(
         let box_w = if raw_w > win_w - 24.0 { win_w - 24.0 } else if raw_w < 160.0 { 160.0 } else { raw_w }
         let max_avail_h = echo_y - top_bar_height(world) - 16.0
         let box_h = if raw_h > max_avail_h { max_avail_h } else if raw_h < cell_h * 3.0 { cell_h * 3.0 } else { raw_h }
-        let box_x = if fw.anchor == "bottom" {
-            16.0
+        let (box_x, box_y) = if fw.anchor == "cursor" {
+            floating_cursor_anchor_xy(world, wm, win_w, echo_y, box_w, box_h, cell_w, cell_h)
+        } else if fw.anchor == "bottom" {
+            (16.0, echo_y - box_h - 8.0)
         } else {
-            ((win_w - box_w) * 0.5).floor()
-        }
-        let box_y = if fw.anchor == "bottom" {
-            echo_y - box_h - 8.0
-        } else {
-            ((win_h - box_h) * 0.45).floor()
+            (((win_w - box_w) * 0.5).floor(), ((win_h - box_h) * 0.45).floor())
         }
         let bcol = if fw.border_rgba != 0 { fw.border_rgba } else { theme.accent }
 
@@ -3975,30 +5423,79 @@ fn render_floating_windows(
 
         let max_rows = (((box_h - cell_h - 12.0) / cell_h).floor().as(i64))
         let max_chars = (((box_w - 20.0) / cell_w).floor().as(i64))
-        let total = fw.lines.len()
-        let count = if total > max_rows { max_rows } else { total }
         let has_spans = world.floating_window_spans.contains_key(fw.id)
         let has_cursor = world.floating_window_cursor.contains_key(fw.id)
         let spans_raw: Any = if has_spans { world.floating_window_spans.get(fw.id) } else { () }
+        let is_md_float = (not has_spans)
+            and (not has_cursor)
+            and (fw.id == "lsp_hover" or fw.owner == "ext_lsp" or fw.id == "treesitter_inspect")
 
-        for li in 0..count {
-            let ly = box_y + cell_h + 9.0 + li.as(f64) * cell_h
-            let is_sel = li == fw.selected_row
-            if is_sel and (not has_cursor) {
-                cmds.push(DrawCmd.FillRect(box_x + 6.0, ly, box_w - 12.0, cell_h, theme.bg_selection, 3.0))
-            } else if is_sel and has_cursor {
-                cmds.push(DrawCmd.FillRect(box_x + 6.0, ly, box_w - 12.0, cell_h, theme.bg_cursor_line, 3.0))
+        if is_md_float {
+            let md_rows = List()
+            var in_f = false
+            var f_ch = '`'
+            var f_len: i64 = 3
+            var f_lang = active_buf.major_mode
+            for ri in 0..fw.lines.len() {
+                if md_rows.len() >= max_rows {
+                    break
+                }
+                let rln = fw.lines.get(ri.as(usize)).as(String)
+                let tr = rln.trim()
+                if not in_f {
+                    let fo = parse_markdown_fence_open(tr)
+                    if fo != null {
+                        let (fc, fl, inf) = fo.as((char, i64, String))
+                        f_ch = fc
+                        f_len = fl
+                        let cm = canonical_fence_mode(inf)
+                        f_lang = if cm != "" { cm } else { active_buf.major_mode }
+                        in_f = true
+                        continue
+                    }
+                } else if is_markdown_fence_close(tr, f_ch, f_len) {
+                    in_f = false
+                    continue
+                }
+                md_rows.push((rln, in_f, f_lang))
             }
-            let txt = clip_str(fw.lines.get(li.as(usize)).as(String), max_chars)
-            if has_spans {
-                let row_decors = collect_floating_row_decors(spans_raw, li)
-                render_floating_row_with_spans(
-                    cmds, txt, row_decors, box_x + 10.0, ly, max_chars, tabstop,
-                    cell_w, cell_h, font_fam, font_sz, theme, is_sel and (not has_cursor),
-                )
-            } else {
-                let (exp_txt, _) = expand_tabs_from_col(txt, 0, tabstop)
-                cmds.push(DrawCmd.TextRun(box_x + 10.0, ly, exp_txt, font_fam, font_sz, theme.fg, false, false, false))
+            for li in 0..md_rows.len() {
+                let ly = box_y + cell_h + 9.0 + li.as(f64) * cell_h
+                let (raw_r, in_code, clang) = md_rows.get(li.as(usize)).as((String, bool, String))
+                let (exp_r, _) = expand_tabs_from_col(raw_r, 0, tabstop)
+                if in_code {
+                    cmds.push(DrawCmd.FillRect(box_x + 6.0, ly, box_w - 12.0, cell_h, theme.bg_alt, 2.0))
+                    emit_popup_code_line(cmds, exp_r, clang, box_x + 10.0, ly, max_chars, cell_w, font_fam, font_sz, theme)
+                } else if exp_r.trim() == "---" or exp_r.trim().starts_with("────") {
+                    cmds.push(DrawCmd.Line(box_x + 10.0, ly + cell_h * 0.5, box_x + box_w - 10.0, ly + cell_h * 0.5, theme.border, 1.0))
+                } else {
+                    emit_popup_code_line(cmds, exp_r, "markdown", box_x + 10.0, ly, max_chars, cell_w, font_fam, font_sz, theme)
+                }
+            }
+        } else {
+            let total = fw.lines.len()
+            let count = if total > max_rows { max_rows } else { total }
+            for li in 0..count {
+                let ly = box_y + cell_h + 9.0 + li.as(f64) * cell_h
+                let is_sel = li == fw.selected_row
+                if is_sel and (not has_cursor) {
+                    cmds.push(DrawCmd.FillRect(box_x + 6.0, ly, box_w - 12.0, cell_h, theme.bg_selection, 3.0))
+                } else if is_sel and has_cursor {
+                    cmds.push(DrawCmd.FillRect(box_x + 6.0, ly, box_w - 12.0, cell_h, theme.bg_cursor_line, 3.0))
+                }
+                let raw_row_s = fw.lines.get(li.as(usize)).as(String)
+                if has_spans {
+                    let txt = clip_str(raw_row_s, max_chars)
+                    let row_decors = collect_floating_row_decors(spans_raw, li)
+                    render_floating_row_with_spans(
+                        cmds, txt, row_decors, box_x + 10.0, ly, max_chars, tabstop,
+                        cell_w, cell_h, font_fam, font_sz, theme, is_sel and (not has_cursor),
+                    )
+                } else {
+                    let (exp_txt, _) = expand_tabs_from_col(raw_row_s, 0, tabstop)
+                    let clipped_exp = clip_str(exp_txt, max_chars)
+                    cmds.push(DrawCmd.TextRun(box_x + 10.0, ly, clipped_exp, font_fam, font_sz, theme.fg, false, false, false))
+                }
             }
         }
 
@@ -4124,7 +5621,8 @@ pub fn compose_frame(
         render_window_pane(cmds, kernel, world, wm, pane, pane.id == focused_id, theme)
     }
 
-    -- 2b. Cursor-anchored Completion Popup (`ext_cmp`) + Floating Windows (`ext_harpoon`, `ext_lazy`, `ext_toggleterm`)
+    -- 2b. Cursor-anchored Signature Help + Completion Popup + Doc Window (`ext_cmp`) + Floating Windows
+    render_signature_help_popup(cmds, world, wm, theme, win_w, echo_y)
     render_buffer_completion_popup(cmds, world, wm, theme, win_w, echo_y)
     render_floating_windows(cmds, world, wm, theme, win_w, win_h, echo_y)
 

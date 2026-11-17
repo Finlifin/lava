@@ -1045,6 +1045,46 @@ pub fn all_option_metas() -> List {
             summary_zh: "启用无干扰禅模式（Zen Mode）居中排版视图。",
         },
         OptionMeta {
+            name: "remember_window_size",
+            short_alias: "",
+            val_type: "bool",
+            set_example: ":set remember_window_size  |  :set noremember_window_size",
+            summary_en: "Remember and restore the window dimensions from the previous session.",
+            summary_zh: "记录并在下次启动时恢复上一次会话的窗口大小。",
+        },
+        OptionMeta {
+            name: "shadow_text",
+            short_alias: "",
+            val_type: "bool",
+            set_example: ":set shadow_text  |  :set noshadow_text",
+            summary_en: "Show inline completion ghost text and end-of-scope function shadow labels.",
+            summary_zh: "显示行内补全幽灵阴影文本与作用域闭合处的函数阴影提示。",
+        },
+        OptionMeta {
+            name: "smooth_scroll",
+            short_alias: "",
+            val_type: "bool",
+            set_example: ":set smooth_scroll  |  :set nosmooth_scroll",
+            summary_en: "Enable Neovide-style VSync sub-pixel smooth viewport scrolling.",
+            summary_zh: "启用类 Neovide 的高帧率平滑视口滚动动画。",
+        },
+        OptionMeta {
+            name: "cursor_anim",
+            short_alias: "",
+            val_type: "bool",
+            set_example: ":set cursor_anim  |  :set nocursor_anim",
+            summary_en: "Enable Neovide-style 4-corner spring cursor trail animation.",
+            summary_zh: "启用类 Neovide 的四角弹簧拖尾光标动画。",
+        },
+        OptionMeta {
+            name: "treesitter",
+            short_alias: "ts",
+            val_type: "bool",
+            set_example: ":set treesitter  |  :set notreesitter",
+            summary_en: "Enable native Tree-sitter incremental AST syntax highlighting.",
+            summary_zh: "启用原生 Tree-sitter 增量语法树高亮。",
+        },
+        OptionMeta {
             name: "zen_width",
             short_alias: "",
             val_type: "i64",
@@ -1161,6 +1201,11 @@ pub fn get_option_value_str(opts: EditorOptions, name: String) -> String {
         name == "font_size_pt" => opts.font_size_pt.to_string(),
         name == "cursor_blink" => opts.cursor_blink.to_string(),
         name == "evil_mode" => opts.evil_mode.to_string(),
+        name == "remember_window_size" => opts.remember_window_size.to_string(),
+        name == "shadow_text" => opts.shadow_text.to_string(),
+        name == "smooth_scroll" => opts.smooth_scroll.to_string(),
+        name == "cursor_anim" => opts.cursor_anim.to_string(),
+        name == "treesitter" => opts.treesitter.to_string(),
         else => "",
     }
 }
@@ -1207,6 +1252,11 @@ private fn toggle_bool_option(kernel: SystemKernel, world: EditorWorld, name: St
         name == "twilight_mode" => { opts.twilight_mode = not opts.twilight_mode; next_val = opts.twilight_mode },
         name == "format_on_save" => { opts.format_on_save = not opts.format_on_save; next_val = opts.format_on_save },
         name == "cursor_blink" => { opts.cursor_blink = not opts.cursor_blink; next_val = opts.cursor_blink },
+        name == "remember_window_size" => { opts.remember_window_size = not opts.remember_window_size; next_val = opts.remember_window_size },
+        name == "shadow_text" => { opts.shadow_text = not opts.shadow_text; next_val = opts.shadow_text },
+        name == "smooth_scroll" => { opts.smooth_scroll = not opts.smooth_scroll; next_val = opts.smooth_scroll },
+        name == "cursor_anim" => { opts.cursor_anim = not opts.cursor_anim; next_val = opts.cursor_anim },
+        name == "treesitter" => { opts.treesitter = not opts.treesitter; next_val = opts.treesitter },
         name == "evil_mode" => {
             opts.evil_mode = not opts.evil_mode
             let vim_opt = kernel.service(SERVICE_VIM)
@@ -1392,34 +1442,97 @@ private fn scan_links_on_line(
 
     var i: i64 = 0
     while i < n {
-        if line.slice(i, i + 1) == "[" {
+        let ch0 = line.slice(i, i + 1)
+        if ch0 == "\\" {
+            i += 2
+            continue
+        }
+        -- Skip inline backtick code spans so `` `[example](foo.md)` `` is not treated as a hyperlink
+        if ch0 == "`" {
+            var ticks: i64 = 0
+            while i + ticks < n and line.slice(i + ticks, i + ticks + 1) == "`" {
+                ticks += 1
+            }
+            var close_t: i64 = -1
+            var k = i + ticks
+            while k < n {
+                if line.slice(k, k + 1) == "`" {
+                    var ct: i64 = 0
+                    while k + ct < n and line.slice(k + ct, k + ct + 1) == "`" {
+                        ct += 1
+                    }
+                    if ct == ticks {
+                        close_t = k + ct
+                        break
+                    }
+                    k += ct
+                    continue
+                }
+                k += 1
+            }
+            if close_t > i {
+                i = close_t
+                continue
+            }
+            i += ticks
+            continue
+        }
+        if ch0 == "[" {
             var close_idx: i64 = -1
             var j = i + 1
+            var in_code = false
             while j < n {
                 let ch = line.slice(j, j + 1)
-                if ch == "[" {
-                    break
+                if ch == "\\" {
+                    j += 2
+                    continue
                 }
-                if ch == "]" {
-                    close_idx = j
-                    break
+                if ch == "`" {
+                    in_code = not in_code
+                    j += 1
+                    continue
+                }
+                if not in_code {
+                    if ch == "[" {
+                        break
+                    }
+                    if ch == "]" {
+                        close_idx = j
+                        break
+                    }
                 }
                 j += 1
             }
             if close_idx > i + 1 {
-                -- Check Markdown link `[label](url)`
+                -- Check Markdown link `[label](url)` (handling balanced parens & optional `"title"`)
                 if close_idx + 2 < n and line.slice(close_idx + 1, close_idx + 2) == "(" {
                     var paren_end: i64 = -1
                     var pj = close_idx + 2
+                    var pdepth: i64 = 1
                     while pj < n {
-                        if line.slice(pj, pj + 1) == ")" {
-                            paren_end = pj
-                            break
+                        let pch = line.slice(pj, pj + 1)
+                        if pch == "\\" {
+                            pj += 2
+                            continue
+                        }
+                        if pch == "(" {
+                            pdepth += 1
+                        } else if pch == ")" {
+                            pdepth -= 1
+                            if pdepth == 0 {
+                                paren_end = pj
+                                break
+                            }
                         }
                         pj += 1
                     }
                     if paren_end > close_idx + 2 {
-                        let md_url = line.slice(close_idx + 2, paren_end).trim()
+                        let raw_url = line.slice(close_idx + 2, paren_end).trim()
+                        var md_url = raw_url
+                        let sp_opt = raw_url.find(" ")
+                        if sp_opt != null {
+                            md_url = raw_url.slice(0, sp_opt.as(i64)).trim()
+                        }
                         if md_url != "" and (not md_url.starts_with("http://")) and (not md_url.starts_with("https://")) {
                             links.push(HelpLink {
                                 row: row,
@@ -1467,12 +1580,80 @@ private fn build_known_doc_sets(nodes: List) -> (Set, Set) {
     (nset, mset)
 }
 
+private fn is_help_row_in_fence(buf: Buffer, target_row: i64) -> bool {
+    var in_fence = false
+    var fc = ""
+    var flen: i64 = 0
+    let limit = if target_row < buf.line_count() { target_row + 1 } else { buf.line_count() }
+    for r in 0..limit {
+        let t = buf.line_at(r).trim_start()
+        if not in_fence {
+            if t.starts_with("```") or t.starts_with("~~~") {
+                let c = t.slice(0, 1)
+                var fl: i64 = 0
+                while fl < t.char_len() and t.slice(fl, fl + 1) == c {
+                    fl += 1
+                }
+                if c != "`" or (not t.drop(fl).contains("`")) {
+                    in_fence = true
+                    fc = c
+                    flen = fl
+                    if r == target_row {
+                        return true
+                    }
+                }
+            }
+        } else {
+            if r == target_row {
+                return true
+            }
+            var fl: i64 = 0
+            while fl < t.char_len() and t.slice(fl, fl + 1) == fc {
+                fl += 1
+            }
+            if fl >= flen and t.drop(fl).trim() == "" {
+                in_fence = false
+            }
+        }
+    }
+    false
+}
+
 private fn collect_all_buffer_links(buf: Buffer, skip_info_row0: bool, nodes: List) -> List {
     let (nset, mset) = build_known_doc_sets(nodes)
     let all = List()
     let start_r: i64 = if skip_info_row0 { 1 } else { 0 }
+    var in_fence = false
+    var fc = ""
+    var flen: i64 = 0
     for r in start_r..buf.line_count() {
-        let row_links = scan_links_on_line(buf.line_at(r), r, false, nset, mset)
+        let ln = buf.line_at(r)
+        let t = ln.trim_start()
+        if not in_fence {
+            if t.starts_with("```") or t.starts_with("~~~") {
+                let c = t.slice(0, 1)
+                var fl: i64 = 0
+                while fl < t.char_len() and t.slice(fl, fl + 1) == c {
+                    fl += 1
+                }
+                if c != "`" or (not t.drop(fl).contains("`")) {
+                    in_fence = true
+                    fc = c
+                    flen = fl
+                    continue
+                }
+            }
+        } else {
+            var fl: i64 = 0
+            while fl < t.char_len() and t.slice(fl, fl + 1) == fc {
+                fl += 1
+            }
+            if fl >= flen and t.drop(fl).trim() == "" {
+                in_fence = false
+            }
+            continue
+        }
+        let row_links = scan_links_on_line(ln, r, false, nset, mset)
         for j in 0..row_links.len() {
             all.push(row_links.get(j.as(usize)))
         }
@@ -1527,8 +1708,11 @@ private fn jump_link_in_buffer(
 }
 
 private fn find_link_at_point(buf: Buffer, is_info_buf: bool, nodes: List) -> ?HelpLink {
-    let (nset, mset) = build_known_doc_sets(nodes)
     let r = buf.point.row
+    if (not (is_info_buf and r == 0)) and is_help_row_in_fence(buf, r) {
+        return null
+    }
+    let (nset, mset) = build_known_doc_sets(nodes)
     let row_links = scan_links_on_line(buf.line_at(r), r, is_info_buf and r == 0, nset, mset)
     if row_links.is_empty() {
         return null

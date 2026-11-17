@@ -186,6 +186,39 @@ impl Default for FontMetrics {
     }
 }
 
+/// Pane viewport geometry and scroll anchor used by GTK4 for smooth sub-pixel scrolling.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollViewport {
+    pub pane_id: i64,
+    pub doc_id: i64,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    pub top_row: i64,
+    pub left_col: i64,
+    pub cell_w: f64,
+    pub cell_h: f64,
+}
+
+/// Optional UI animation hints published alongside committed frames.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnimHints {
+    pub smooth_scroll: bool,
+    pub cursor_anim: bool,
+    pub viewports: Vec<ScrollViewport>,
+}
+
+impl Default for AnimHints {
+    fn default() -> Self {
+        Self {
+            smooth_scroll: true,
+            cursor_anim: true,
+            viewports: Vec::new(),
+        }
+    }
+}
+
 /// Mouse button action kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseAction {
@@ -246,6 +279,7 @@ pub enum UiEvent {
 /// Thread-safe slot holding the most recently committed [`RenderFrame`].
 pub struct FrameSlot {
     inner: Mutex<Arc<RenderFrame>>,
+    anim_hints: Mutex<AnimHints>,
     wakeup: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
@@ -259,6 +293,7 @@ impl FrameSlot {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Arc::new(RenderFrame::default())),
+            anim_hints: Mutex::new(AnimHints::default()),
             wakeup: Mutex::new(None),
         }
     }
@@ -267,6 +302,16 @@ impl FrameSlot {
         if let Ok(mut guard) = self.wakeup.lock() {
             *guard = Some(waker);
         }
+    }
+
+    pub fn set_anim_hints(&self, hints: AnimHints) {
+        let mut guard = self.anim_hints.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = hints;
+    }
+
+    pub fn anim_hints(&self) -> AnimHints {
+        let guard = self.anim_hints.lock().unwrap_or_else(|e| e.into_inner());
+        guard.clone()
     }
 
     pub fn commit(&self, mut frame: RenderFrame) -> u64 {
@@ -469,5 +514,34 @@ mod tests {
                 modifiers: mods::SHIFT
             }
         );
+    }
+
+    #[test]
+    fn frame_slot_anim_hints_defaults_and_roundtrips() {
+        let slot = FrameSlot::new();
+        let default_hints = slot.anim_hints();
+        assert!(default_hints.smooth_scroll);
+        assert!(default_hints.cursor_anim);
+        assert!(default_hints.viewports.is_empty());
+
+        let vp = ScrollViewport {
+            pane_id: 1,
+            doc_id: 42,
+            x: 0.0,
+            y: 26.0,
+            w: 640.0,
+            h: 720.0,
+            top_row: 15,
+            left_col: 0,
+            cell_w: 8.4,
+            cell_h: 19.0,
+        };
+        let custom = AnimHints {
+            smooth_scroll: true,
+            cursor_anim: false,
+            viewports: vec![vp],
+        };
+        slot.set_anim_hints(custom.clone());
+        assert_eq!(slot.anim_hints(), custom);
     }
 }

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use interpreter::{HostCallOutcome, HostHandler, NativeValue, Vm, VmResult};
 use lava_lsp::{LSP_WAKE_TIMER_ID, LspEvent, LspManager, LspTextEditItem};
-use lava_proto::{EventQueue, FontMetrics, FrameSlot, UiEvent};
+use lava_proto::{AnimHints, EventQueue, FontMetrics, FrameSlot, ScrollViewport, UiEvent};
 use lava_remote::{
     RemoteConnInfo, RemoteManager, discover_ssh_config_hosts, read_rpc_frame, write_rpc_frame,
 };
@@ -349,6 +349,75 @@ impl LavaHostHandler {
         }
     }
 
+    fn handle_set_anim_hints(&self, args: &[NativeValue]) -> HostCallOutcome {
+        if args.len() != 3 {
+            return HostCallOutcome::Error(format!(
+                "ui_set_anim_hints expects 3 arguments, got {}",
+                args.len()
+            ));
+        }
+        let smooth_scroll = match expect_bool(&args[0], "ui_set_anim_hints.smooth_scroll") {
+            Ok(v) => v,
+            Err(err) => return HostCallOutcome::Error(err),
+        };
+        let cursor_anim = match expect_bool(&args[1], "ui_set_anim_hints.cursor_anim") {
+            Ok(v) => v,
+            Err(err) => return HostCallOutcome::Error(err),
+        };
+        let raw_vps = match expect_list(&args[2], "ui_set_anim_hints.viewports") {
+            Ok(v) => v,
+            Err(err) => return HostCallOutcome::Error(err),
+        };
+        let mut viewports = Vec::with_capacity(raw_vps.len());
+        for item in raw_vps {
+            if let Ok(fields) = expect_list(item, "ui_set_anim_hints.viewport")
+                && fields.len() >= 10
+                && let (
+                    Ok(pane_id),
+                    Ok(doc_id),
+                    Ok(x),
+                    Ok(y),
+                    Ok(w),
+                    Ok(h),
+                    Ok(top_row),
+                    Ok(left_col),
+                    Ok(cell_w),
+                    Ok(cell_h),
+                ) = (
+                    expect_i64(&fields[0], "vp.pane_id"),
+                    expect_i64(&fields[1], "vp.doc_id"),
+                    expect_f64(&fields[2], "vp.x"),
+                    expect_f64(&fields[3], "vp.y"),
+                    expect_f64(&fields[4], "vp.w"),
+                    expect_f64(&fields[5], "vp.h"),
+                    expect_i64(&fields[6], "vp.top_row"),
+                    expect_i64(&fields[7], "vp.left_col"),
+                    expect_f64(&fields[8], "vp.cell_w"),
+                    expect_f64(&fields[9], "vp.cell_h"),
+                )
+            {
+                viewports.push(ScrollViewport {
+                    pane_id,
+                    doc_id,
+                    x,
+                    y,
+                    w,
+                    h,
+                    top_row,
+                    left_col,
+                    cell_w,
+                    cell_h,
+                });
+            }
+        }
+        self.frame_slot.set_anim_hints(AnimHints {
+            smooth_scroll,
+            cursor_anim,
+            viewports,
+        });
+        HostCallOutcome::Return(NativeValue::Unit)
+    }
+
     fn handle_measure_font(&self, args: &[NativeValue]) -> HostCallOutcome {
         if args.len() != 2 {
             return HostCallOutcome::Error(format!(
@@ -510,6 +579,7 @@ impl HostHandler for LavaHostHandler {
             }
             "ui_wait_events" => self.handle_wait_events(args, task_id),
             "ui_commit_frame" => self.handle_commit_frame(args),
+            "ui_set_anim_hints" => self.handle_set_anim_hints(args),
             "ui_measure_font" => self.handle_measure_font(args),
             "ui_clipboard_get" => {
                 if !args.is_empty() {
@@ -575,6 +645,10 @@ impl HostHandler for LavaHostHandler {
             "accel_doc_find_word_occurrences" => handle_accel_doc_find_word_occurrences(args),
             "accel_doc_collect_words" => handle_accel_doc_collect_words(args),
             "accel_doc_search_preview" => handle_accel_doc_search_preview(args),
+            "accel_ts_highlight_rows" => handle_accel_ts_highlight_rows(args),
+            "accel_ts_highlight_snippet" => handle_accel_ts_highlight_snippet(args),
+            "accel_ts_inspect_node" => handle_accel_ts_inspect_node(args),
+            "accel_ts_status" => handle_accel_ts_status(args),
             "pty_available" => HostCallOutcome::Return(NativeValue::Bool(true)),
             "pty_spawn" => handle_pty_spawn(&self.ptys, args),
             "pty_write" => handle_pty_write(&self.ptys, args),
@@ -2133,6 +2207,111 @@ fn handle_accel_doc_search_preview(args: &[NativeValue]) -> HostCallOutcome {
     ]))
 }
 
+fn encode_ts_highlight_rows(rows: Vec<Vec<lava_accel::TsHighlightSpan>>) -> NativeValue {
+    NativeValue::List(
+        rows.into_iter()
+            .map(|row| {
+                NativeValue::List(
+                    row.into_iter()
+                        .map(|sp| {
+                            NativeValue::List(vec![
+                                NativeValue::I64(sp.start_col),
+                                NativeValue::I64(sp.end_col),
+                                NativeValue::I64(sp.hl_group),
+                            ])
+                        })
+                        .collect(),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn handle_accel_ts_highlight_rows(args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 4 {
+        return HostCallOutcome::Error("accel_ts_highlight_rows expects 4 arguments".to_string());
+    }
+    let doc_id = match expect_i64(&args[0], "accel_ts_highlight_rows.doc_id") {
+        Ok(v) => v,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let lang = match expect_str(&args[1], "accel_ts_highlight_rows.lang") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let start_row = match expect_i64(&args[2], "accel_ts_highlight_rows.start_row") {
+        Ok(v) => v,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let end_row = match expect_i64(&args[3], "accel_ts_highlight_rows.end_row") {
+        Ok(v) => v,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let s = start_row.max(0);
+    if end_row < s {
+        return HostCallOutcome::Return(NativeValue::List(Vec::new()));
+    }
+    let rows = lava_accel::ts_highlight_doc_rows(doc_id, &lang, s as usize, end_row as usize);
+    HostCallOutcome::Return(encode_ts_highlight_rows(rows))
+}
+
+fn handle_accel_ts_highlight_snippet(args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 2 {
+        return HostCallOutcome::Error(
+            "accel_ts_highlight_snippet expects 2 arguments".to_string(),
+        );
+    }
+    let text = match expect_str(&args[0], "accel_ts_highlight_snippet.text") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let lang = match expect_str(&args[1], "accel_ts_highlight_snippet.lang") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let rows = lava_accel::ts_highlight_snippet(&text, &lang);
+    HostCallOutcome::Return(encode_ts_highlight_rows(rows))
+}
+
+fn handle_accel_ts_inspect_node(args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 4 {
+        return HostCallOutcome::Error("accel_ts_inspect_node expects 4 arguments".to_string());
+    }
+    let doc_id = match expect_i64(&args[0], "accel_ts_inspect_node.doc_id") {
+        Ok(v) => v,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let lang = match expect_str(&args[1], "accel_ts_inspect_node.lang") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let row = match expect_i64(&args[2], "accel_ts_inspect_node.row") {
+        Ok(v) => v.max(0) as usize,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let col = match expect_i64(&args[3], "accel_ts_inspect_node.col") {
+        Ok(v) => v.max(0) as usize,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let info = lava_accel::ts_inspect_doc_node(doc_id, &lang, row, col);
+    HostCallOutcome::Return(NativeValue::Str(info))
+}
+
+fn handle_accel_ts_status(args: &[NativeValue]) -> HostCallOutcome {
+    if !args.is_empty() {
+        return HostCallOutcome::Error("accel_ts_status expects 0 arguments".to_string());
+    }
+    let (loaded, abi_ver, grammar_cnt, langs) = lava_accel::ts_status_info();
+    let loaded_i64 = i64::from(loaded);
+    let langs_list = langs.into_iter().map(NativeValue::Str).collect();
+    HostCallOutcome::Return(NativeValue::List(vec![
+        NativeValue::I64(loaded_i64),
+        NativeValue::I64(abi_ver),
+        NativeValue::I64(grammar_cnt),
+        NativeValue::List(langs_list),
+    ]))
+}
+
 fn handle_pty_spawn(ptys: &PtyManager, args: &[NativeValue]) -> HostCallOutcome {
     if args.len() != 4 {
         return HostCallOutcome::Error("pty_spawn expects 4 arguments".to_string());
@@ -2717,6 +2896,7 @@ fn handle_lsp_poll_events(lsps: &LspManager, args: &[NativeValue]) -> HostCallOu
                             NativeValue::Str(c.insert_text),
                             NativeValue::Str(c.kind),
                             NativeValue::Str(c.detail),
+                            NativeValue::Str(c.documentation),
                         ])
                     })
                     .collect();
@@ -2724,6 +2904,23 @@ fn handle_lsp_poll_events(lsps: &LspManager, args: &[NativeValue]) -> HostCallOu
                     NativeValue::Str("completions".to_string()),
                     NativeValue::I64(req_id),
                     NativeValue::List(cmps),
+                ])
+            }
+            LspEvent::SignatureHelp {
+                req_id,
+                label,
+                documentation,
+                parameters,
+                active_param,
+            } => {
+                let params = parameters.into_iter().map(NativeValue::Str).collect();
+                NativeValue::List(vec![
+                    NativeValue::Str("signature_help".to_string()),
+                    NativeValue::I64(req_id),
+                    NativeValue::Str(label),
+                    NativeValue::Str(documentation),
+                    NativeValue::List(params),
+                    NativeValue::I64(active_param),
                 ])
             }
             LspEvent::WorkspaceEdit {

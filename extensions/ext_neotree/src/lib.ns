@@ -82,16 +82,33 @@ pub fn require_neotree_state(kernel: SystemKernel) -> !String NeotreeState {
 
 fn file_icon_prefix(name: String, is_symlink: bool) -> String {
     if is_symlink {
-        return "→"
+        return ""
     }
     let low = name.to_lower()
+    if low == ".gitignore" or low == ".gitmodules" or low == ".gitattributes" {
+        return ""
+    }
     when {
-        low.ends_with(".ns") => "λ",
-        low.ends_with(".rs") => "⚙",
-        low.ends_with(".toml") or low.ends_with(".json") or low.ends_with(".yaml") or low.ends_with(".yml") => "≡",
-        low.ends_with(".md") or low.ends_with(".org") or low.ends_with(".txt") => "¶",
-        low.starts_with(".") => "·",
-        else => "•",
+        low.ends_with(".ns") or low.ends_with(".zig") => "",
+        low.ends_with(".rs") => "",
+        low.ends_with(".lua") => "",
+        low.ends_with(".py") => "",
+        low.ends_with(".c") or low.ends_with(".h") => "",
+        low.ends_with(".cpp") or low.ends_with(".cc") or low.ends_with(".cxx") or low.ends_with(".hpp") => "",
+        low.ends_with(".js") or low.ends_with(".jsx") or low.ends_with(".mjs") => "",
+        low.ends_with(".ts") or low.ends_with(".tsx") => "",
+        low.ends_with(".go") => "",
+        low.ends_with(".json") or low.ends_with(".jsonc") => "",
+        low.ends_with(".toml") or low.ends_with(".yaml") or low.ends_with(".yml") or low.ends_with(".lock") or low.ends_with(".ini") or low.ends_with(".conf") => "",
+        low.ends_with(".md") or low.ends_with(".markdown") => "",
+        low.ends_with(".org") or low.ends_with(".txt") or low.ends_with(".rst") => "",
+        low.ends_with(".html") or low.ends_with(".htm") => "",
+        low.ends_with(".css") or low.ends_with(".scss") => "",
+        low.ends_with(".sh") or low.ends_with(".bash") or low.ends_with(".zsh") => "",
+        low.ends_with(".zip") or low.ends_with(".tar") or low.ends_with(".gz") or low.ends_with(".xz") or low.ends_with(".zst") => "",
+        low.ends_with(".png") or low.ends_with(".jpg") or low.ends_with(".jpeg") or low.ends_with(".gif") or low.ends_with(".svg") or low.ends_with(".webp") => "",
+        low.starts_with(".") => "",
+        else => "",
     }
 }
 
@@ -247,8 +264,14 @@ fn format_node_line(node: NeotreeNode) -> String {
     let indent = if node.depth > 0 { "  ".repeat(node.depth) } else { "" }
     let badge_suffix = if node.git_badge != "" { " " ++ node.git_badge } else { "" }
     if node.is_dir {
-        let chevron = if node.expanded { "▾ " } else { "▸ " }
-        indent ++ chevron ++ node.name ++ "/" ++ badge_suffix
+        let folder_icon = if node.expanded {
+            " "
+        } else if node.is_symlink {
+            " "
+        } else {
+            " "
+        }
+        indent ++ folder_icon ++ node.name ++ "/" ++ badge_suffix
     } else {
         let icon = file_icon_prefix(node.name, node.is_symlink)
         indent ++ "  " ++ icon ++ " " ++ node.name ++ badge_suffix

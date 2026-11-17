@@ -269,7 +269,9 @@ fn decorate_magit_buffer(buf: Buffer, state: MagitState) {
         }
         let meta_opt = state.meta_at(r)
         if meta_opt == null {
-            if ln.starts_with("Head:") or ln.starts_with("Help:") {
+            if ln.starts_with(" Head:") {
+                buf.add_inline_decor(OWNER_MAGIT, r, 0, 7, fg_rgba = hdr_fg)
+            } else if ln.starts_with("Head:") or ln.starts_with("Help:") {
                 buf.add_inline_decor(OWNER_MAGIT, r, 0, 5, fg_rgba = hdr_fg)
             }
             continue
@@ -336,7 +338,7 @@ pub fn render_magit_status(
 
     let lines = List()
     let subject = git_latest_subject(st.root)
-    lines.push("Head:     " ++ st.branch ++ " " ++ subject)
+    lines.push(" Head:     " ++ st.branch ++ " " ++ subject)
     lines.push("Help:     [s]tage [u]nstage [S]tage-all [U]nstage-all [Tab]diff [c]ommit [b]ranch [x]discard [l]og [g]refresh [q]uit")
     lines.push("")
 
@@ -346,7 +348,7 @@ pub fn render_magit_status(
     -- 1. Untracked files
     if not untracked_items.is_empty() {
         let hdr_row = lines.len()
-        lines.push("Untracked files (" ++ untracked_items.len().to_string() ++ ")")
+        lines.push(" Untracked files (" ++ untracked_items.len().to_string() ++ ")")
         state.row_meta.insert(hdr_row, MagitRowMeta {
             kind: "section",
             section: "untracked",
@@ -358,7 +360,7 @@ pub fn render_magit_status(
             let (code, rel) = untracked_items.get(i.as(usize)).as((String, String))
             let frow = lines.len()
             let exp_key = "untracked:" ++ rel
-            let chevron = if state.expanded_keys.contains(exp_key) { "▾ " } else { "▸ " }
+            let chevron = if state.expanded_keys.contains(exp_key) { " " } else { " " }
             lines.push("  " ++ chevron ++ status_code_label(code) ++ rel)
             state.row_meta.insert(frow, MagitRowMeta {
                 kind: "file",
@@ -394,7 +396,7 @@ pub fn render_magit_status(
     -- 2. Unstaged changes
     if not unstaged_items.is_empty() {
         let hdr_row = lines.len()
-        lines.push("Unstaged changes (" ++ unstaged_items.len().to_string() ++ ")")
+        lines.push(" Unstaged changes (" ++ unstaged_items.len().to_string() ++ ")")
         state.row_meta.insert(hdr_row, MagitRowMeta {
             kind: "section",
             section: "unstaged",
@@ -406,7 +408,7 @@ pub fn render_magit_status(
             let (code, rel) = unstaged_items.get(i.as(usize)).as((String, String))
             let frow = lines.len()
             let exp_key = "unstaged:" ++ rel
-            let chevron = if state.expanded_keys.contains(exp_key) { "▾ " } else { "▸ " }
+            let chevron = if state.expanded_keys.contains(exp_key) { " " } else { " " }
             lines.push("  " ++ chevron ++ status_code_label(code) ++ rel)
             state.row_meta.insert(frow, MagitRowMeta {
                 kind: "file",
@@ -450,7 +452,7 @@ pub fn render_magit_status(
     -- 3. Staged changes
     if not staged_items.is_empty() {
         let hdr_row = lines.len()
-        lines.push("Staged changes (" ++ staged_items.len().to_string() ++ ")")
+        lines.push(" Staged changes (" ++ staged_items.len().to_string() ++ ")")
         state.row_meta.insert(hdr_row, MagitRowMeta {
             kind: "section",
             section: "staged",
@@ -462,7 +464,7 @@ pub fn render_magit_status(
             let (code, rel) = staged_items.get(i.as(usize)).as((String, String))
             let frow = lines.len()
             let exp_key = "staged:" ++ rel
-            let chevron = if state.expanded_keys.contains(exp_key) { "▾ " } else { "▸ " }
+            let chevron = if state.expanded_keys.contains(exp_key) { " " } else { " " }
             lines.push("  " ++ chevron ++ status_code_label(code) ++ rel)
             state.row_meta.insert(frow, MagitRowMeta {
                 kind: "file",
@@ -511,7 +513,7 @@ pub fn render_magit_status(
     -- 4. Recent commits
     let commits = git_recent_commits(st.root, 10)
     let commits_hdr_row = lines.len()
-    lines.push("Recent commits")
+    lines.push(" Recent commits")
     state.row_meta.insert(commits_hdr_row, MagitRowMeta {
         kind: "section",
         section: "commits",

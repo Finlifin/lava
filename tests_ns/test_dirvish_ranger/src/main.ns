@@ -234,7 +234,7 @@ fn run_dirvish_ranger_suite(root: String) {
     -- Cursor in center pane is directly on `main.ns`
     check_eq_str(cursor_entry_name(state, world), "main.ns", "dirvish-jump places cursor on main.ns")
     check_true(
-        center_buf.line_at(0).contains("▸ ") and center_buf.line_at(0).contains("sort:"),
+        center_buf.line_at(0).contains(" ") and center_buf.line_at(0).contains("sort:"),
         "center header shows Yazi-style path & sort status",
     )
     check_true(center_buf.inline_decors.len() >= 6, "center buffer has column span decors")

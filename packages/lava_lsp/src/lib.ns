@@ -43,6 +43,7 @@ pub struct LspCompItem {
     pub insert_text: String,
     pub kind: String,
     pub detail: String,
+    pub documentation: String,
 }
 
 pub struct LspTextEdit {
@@ -80,6 +81,13 @@ pub enum LspWireEvent {
     pub Locations(req_id: i64, kind: String, items: List),
     pub Symbols(req_id: i64, items: List),
     pub Completions(req_id: i64, items: List),
+    pub SignatureHelp(
+        req_id: i64,
+        label: String,
+        documentation: String,
+        parameters: List,
+        active_param: i64,
+    ),
     pub WorkspaceEdit(req_id: i64, label: String, edits: List),
     pub CodeActions(req_id: i64, items: List),
     pub Log(level: String, message: String),
@@ -332,14 +340,28 @@ pub fn lsp_poll_events(session_id: i64) -> !String List {
                 let cmps = List()
                 for ci in 0..raw_cmps.len() {
                     let cm = raw_cmps.get(ci.as(usize)).as(List)
+                    let doc_str = if cm.len() >= 5 { cm.get(4).as(String) } else { "" }
                     cmps.push(LspCompItem {
                         label: cm.get(0).as(String),
                         insert_text: cm.get(1).as(String),
                         kind: cm.get(2).as(String),
                         detail: cm.get(3).as(String),
+                        documentation: doc_str,
                     })
                 }
                 out.push(LspWireEvent.Completions(req_id, cmps))
+            },
+            tag == "signature_help" => {
+                let req_id = rec.get(1).as(i64)
+                let lbl = rec.get(2).as(String)
+                let doc = rec.get(3).as(String)
+                let raw_params = rec.get(4).as(List)
+                let params = List()
+                for pi in 0..raw_params.len() {
+                    params.push(raw_params.get(pi.as(usize)).as(String))
+                }
+                let act_p = rec.get(5).as(i64)
+                out.push(LspWireEvent.SignatureHelp(req_id, lbl, doc, params, act_p))
             },
             tag == "workspace_edit" => {
                 let req_id = rec.get(1).as(i64)

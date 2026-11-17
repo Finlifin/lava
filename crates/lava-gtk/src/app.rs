@@ -1,20 +1,23 @@
 //! Dedicated GTK4 window, event controllers, system clipboard sync, and GLib main-context driver.
 
+use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, CString};
 use std::mem::transmute;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use lava_proto::{EventQueue, FrameSlot, MouseAction, PointerStyle, UiEvent};
 use libc::{c_double, c_int, c_uint, c_void};
 
+use crate::anim::{AnimController, ScrollDeltaAccumulator};
 use crate::ffi::{
     self, CairoT, G_PRIORITY_DEFAULT, G_PRIORITY_DEFAULT_IDLE, G_SOURCE_CONTINUE, G_SOURCE_REMOVE,
-    GClosure, GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES, GtkDrawingArea, GtkEventController,
-    GtkGesture, GtkGestureSingle, GtkWidget, GtkWindow,
+    GClosure, GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES, GdkFrameClock, GtkDrawingArea,
+    GtkEventController, GtkGesture, GtkGestureSingle, GtkWidget, GtkWindow,
 };
 use crate::keymap::{translate_gdk_key, translate_modifiers};
-use crate::render::render_frame_to_cairo;
 
 static GTK_DISPLAY_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CLIPBOARD_MIRROR: OnceLock<Mutex<String>> = OnceLock::new();
@@ -131,10 +134,52 @@ struct UiSharedState {
     event_queue: Arc<EventQueue>,
     alive: AtomicBool,
     wakeup_queued: AtomicBool,
+    epoch: Instant,
     window_addr: usize,
     drawing_area_addr: usize,
     applied_meta: Mutex<(String, PointerStyle)>,
     pointer_pos: Mutex<(f64, f64)>,
+    scroll_accum: Mutex<ScrollDeltaAccumulator>,
+}
+
+/// UI-thread-only animation state shared exclusively between `GtkDrawingArea`'s draw and VSync
+/// tick callbacks on the GTK main-context thread.
+struct GtkAnimSlot {
+    shared: Arc<UiSharedState>,
+    anim: RefCell<AnimController>,
+    tick_registered: Cell<bool>,
+}
+
+impl GtkAnimSlot {
+    /// Ensures a VSync tick callback is registered on `drawing_area` while animations run.
+    ///
+    /// # Safety
+    /// `slot_ptr` must be a live pointer originally produced by `Rc::into_raw` on the GTK main thread.
+    unsafe fn ensure_tick_callback(slot_ptr: *const Self) {
+        // SAFETY: `slot_ptr` is a live `GtkAnimSlot` on the single GTK main thread.
+        let slot = unsafe { &*slot_ptr };
+        if !slot.shared.alive.load(Ordering::Acquire) {
+            return;
+        }
+        let drawing_area = slot.shared.drawing_area_addr as *mut GtkWidget;
+        if drawing_area.is_null() {
+            return;
+        }
+        if !slot.tick_registered.replace(true) {
+            // SAFETY: `slot_ptr` was created via `Rc::into_raw` on this thread and remains live;
+            // incrementing its strong count gives `gtk_widget_add_tick_callback` an independent
+            // owned reference reclaimed once by `drop_anim_slot_source`.
+            unsafe {
+                Rc::increment_strong_count(slot_ptr);
+                ffi::gtk_widget_add_tick_callback(
+                    drawing_area,
+                    Some(on_drawing_area_tick),
+                    slot_ptr.cast_mut().cast::<c_void>(),
+                    Some(drop_anim_slot_source),
+                );
+            }
+        }
+    }
 }
 
 impl UiSharedState {
@@ -266,8 +311,65 @@ fn schedule_ui_wakeup(state: &Arc<UiSharedState>) {
     }
 }
 
+unsafe extern "C" fn drop_anim_slot_source(data: *mut c_void) {
+    if !data.is_null() {
+        // SAFETY: `data` is an owned `Rc<GtkAnimSlot>` pointer created via `Rc::into_raw` /
+        // `Rc::increment_strong_count` on the GTK main thread and finalized once by GTK.
+        unsafe {
+            drop(Rc::from_raw(data.cast::<GtkAnimSlot>()));
+        }
+    }
+}
+
+unsafe extern "C" fn on_drawing_area_tick(
+    widget: *mut GtkWidget,
+    frame_clock: *mut GdkFrameClock,
+    user_data: *mut c_void,
+) -> c_int {
+    if widget.is_null() || user_data.is_null() {
+        return G_SOURCE_REMOVE;
+    }
+    // SAFETY: `user_data` is a borrowed `&GtkAnimSlot` on the GTK main thread kept alive until
+    // `drop_anim_slot_source` runs.
+    let slot = unsafe { &*(user_data.cast::<GtkAnimSlot>()) };
+    if !slot.shared.alive.load(Ordering::Acquire) {
+        slot.tick_registered.set(false);
+        return G_SOURCE_REMOVE;
+    }
+
+    let now_sec = if !frame_clock.is_null() {
+        // SAFETY: `frame_clock` was supplied by GTK4's tick dispatcher on the UI thread.
+        let frame_us = unsafe { ffi::gdk_frame_clock_get_frame_time(frame_clock) };
+        if frame_us > 0 {
+            (frame_us as f64) * 1e-6
+        } else {
+            slot.shared.epoch.elapsed().as_secs_f64()
+        }
+    } else {
+        slot.shared.epoch.elapsed().as_secs_f64()
+    };
+
+    let (still_active, should_queue_draw) = slot.anim.borrow_mut().tick_at(now_sec);
+
+    if should_queue_draw {
+        // SAFETY: `widget` (`drawing_area`) is a live `GtkWidget` on the GTK main thread;
+        // `gtk_widget_queue_draw` is ONLY invoked while cursor or scroll animation is unsettled
+        // (plus the single final snap frame), keeping idle CPU at 0%.
+        unsafe {
+            ffi::gtk_widget_queue_draw(widget);
+        }
+    }
+
+    if still_active {
+        G_SOURCE_CONTINUE
+    } else {
+        slot.tick_registered.set(false);
+        G_SOURCE_REMOVE
+    }
+}
+
 unsafe extern "C" fn on_drawing_area_draw(
-    _area: *mut GtkDrawingArea,
+    area: *mut GtkDrawingArea,
     cr: *mut CairoT,
     width: c_int,
     height: c_int,
@@ -276,13 +378,31 @@ unsafe extern "C" fn on_drawing_area_draw(
     if cr.is_null() || user_data.is_null() {
         return;
     }
-    // SAFETY: `user_data` is a valid `UiSharedState` reference owned by the drawing area's draw
-    // callback slot, and GTK invokes `on_drawing_area_draw` with a valid thread-local `cr`.
-    let state = unsafe { &*(user_data.cast::<UiSharedState>()) };
-    let frame = state.frame_slot.latest();
-    // SAFETY: `cr` is valid and exclusively owned by GTK for this draw callback invocation.
-    unsafe {
-        render_frame_to_cairo(cr, f64::from(width), f64::from(height), &frame);
+    let widget_scale = if !area.is_null() {
+        // SAFETY: `area` is a valid `GtkDrawingArea` (subclass of `GtkWidget`).
+        f64::from(unsafe { ffi::gtk_widget_get_scale_factor(area.cast::<GtkWidget>()) }.max(1))
+    } else {
+        1.0
+    };
+    let slot_ptr = user_data.cast::<GtkAnimSlot>().cast_const();
+    // SAFETY: `slot_ptr` is a valid `GtkAnimSlot` owned by `drawing_area`'s draw callback on the
+    // GTK main thread, and `cr` is exclusively owned by GTK for this draw invocation.
+    let slot = unsafe { &*slot_ptr };
+    let frame = slot.shared.frame_slot.latest();
+    let hints = slot.shared.frame_slot.anim_hints();
+    let anim_active = {
+        let mut anim = slot.anim.borrow_mut();
+        // SAFETY: `cr` is valid and exclusively owned by GTK for this draw callback invocation.
+        unsafe {
+            anim.render_to_cairo_scaled(cr, width, height, widget_scale, &frame, &hints);
+        }
+        anim.is_active()
+    };
+    if anim_active {
+        // SAFETY: `slot_ptr` was registered via `Rc::into_raw` on this GTK main thread.
+        unsafe {
+            GtkAnimSlot::ensure_tick_callback(slot_ptr);
+        }
     }
 }
 
@@ -461,17 +581,27 @@ unsafe extern "C" fn on_pointer_scroll(
             ffi::gtk_event_controller_get_current_event_state(controller),
         )
     };
-    let (x, y) = *state
-        .pointer_pos
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
-    state.event_queue.push(UiEvent::MouseScroll {
-        dx,
-        dy,
-        x,
-        y,
-        modifiers: translate_modifiers(raw_mods),
-    });
+    let now_sec = state.epoch.elapsed().as_secs_f64();
+    let emitted = {
+        let mut accum = state
+            .scroll_accum
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        accum.accumulate(dx, dy, now_sec)
+    };
+    if let Some((step_dx, step_dy)) = emitted {
+        let (x, y) = *state
+            .pointer_pos
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        state.event_queue.push(UiEvent::MouseScroll {
+            dx: step_dx,
+            dy: step_dy,
+            x,
+            y,
+            modifiers: translate_modifiers(raw_mods),
+        });
+    }
     1
 }
 
@@ -531,6 +661,15 @@ pub fn run_gtk_app(
     config: GtkAppConfig,
     frame_slot: Arc<FrameSlot>,
     event_queue: Arc<EventQueue>,
+) -> Result<(), String> {
+    run_gtk_app_with_final_size(config, frame_slot, event_queue, None)
+}
+
+pub fn run_gtk_app_with_final_size(
+    config: GtkAppConfig,
+    frame_slot: Arc<FrameSlot>,
+    event_queue: Arc<EventQueue>,
+    final_window_size: Option<Arc<Mutex<Option<(i32, i32)>>>>,
 ) -> Result<(), String> {
     if !is_display_available() {
         return Err(
@@ -598,25 +737,32 @@ pub fn run_gtk_app(
         event_queue: Arc::clone(&event_queue),
         alive: AtomicBool::new(true),
         wakeup_queued: AtomicBool::new(false),
+        epoch: Instant::now(),
         window_addr: window as usize,
         drawing_area_addr: drawing_area as usize,
         applied_meta: Mutex::new((init_title, init_pointer)),
         pointer_pos: Mutex::new((0.0, 0.0)),
+        scroll_accum: Mutex::new(ScrollDeltaAccumulator::new()),
     });
 
-    // Attach Cairo draw callback on `GtkDrawingArea`.
+    // Attach Cairo draw callback and VSync animation tick callback on `GtkDrawingArea`.
     {
-        let draw_state = Arc::into_raw(Arc::clone(&state))
-            .cast_mut()
-            .cast::<c_void>();
-        // SAFETY: `drawing_area` is a valid `GtkDrawingArea`; `drop_state_source` releases `draw_state`.
+        let anim_slot = Rc::new(GtkAnimSlot {
+            shared: Arc::clone(&state),
+            anim: RefCell::new(AnimController::new()),
+            tick_registered: Cell::new(false),
+        });
+        let slot_ptr = Rc::into_raw(anim_slot);
+        // SAFETY: `drawing_area` is a valid `GtkDrawingArea` on the UI thread; `drop_anim_slot_source`
+        // releases `slot_ptr`, and `ensure_tick_callback` attaches the VSync tick callback.
         unsafe {
             ffi::gtk_drawing_area_set_draw_func(
                 drawing_area.cast::<GtkDrawingArea>(),
                 Some(on_drawing_area_draw),
-                draw_state,
-                Some(drop_state_source),
+                slot_ptr.cast_mut().cast::<c_void>(),
+                Some(drop_anim_slot_source),
             );
+            GtkAnimSlot::ensure_tick_callback(slot_ptr);
         }
     }
 
@@ -761,6 +907,22 @@ pub fn run_gtk_app(
     // Detach waker, mark window dead before destruction, destroy window, and drain pending cleanups.
     frame_slot.set_ui_waker(Box::new(|| {}));
     state.alive.store(false, Ordering::Release);
+
+    if let Some(out_size) = final_window_size {
+        // SAFETY: `window_widget` is still alive before `gtk_window_destroy(window)`.
+        let (win_w, win_h) = unsafe {
+            (
+                ffi::gtk_widget_get_width(window_widget),
+                ffi::gtk_widget_get_height(window_widget),
+            )
+        };
+        if win_w >= 64
+            && win_h >= 64
+            && let Ok(mut guard) = out_size.lock()
+        {
+            *guard = Some((win_w, win_h));
+        }
+    }
 
     // SAFETY: `window` was kept alive throughout the loop (close-request returned `GDK_EVENT_STOP`)
     // and `state.alive` is now `false` so no idle callback will touch `window` or `drawing_area`.

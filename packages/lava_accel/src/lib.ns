@@ -145,6 +145,13 @@ pub struct NativeConflictHit {
 }
 derive Eq, PartialEq, Display for NativeConflictHit
 
+pub struct TsSpan {
+    pub start_col: i64,
+    pub end_col: i64,
+    pub hl_group: i64,
+}
+derive Eq, PartialEq, Display for TsSpan
+
 -- ============================================================================
 -- 1. Fuzzy Batch Ranker
 -- ============================================================================
@@ -1074,10 +1081,166 @@ private fn extract_ident_prefix(s: String) -> String {
     trimmed.slice(0, j)
 }
 
+private fn fb_is_markdown_mode(m: String) -> bool {
+    m == "markdown" or m == "md" or m == "gfm" or m == "markdown-inline" or m == "markdown_inline"
+}
+
+private fn fb_md_frontmatter_end(lines: List) -> i64 {
+    if lines.is_empty() {
+        return -1
+    }
+    let first = lines.get(0).as(String).trim_end()
+    if first != "---" {
+        return -1
+    }
+    for r in 1..lines.len() {
+        let t = lines.get(r.as(usize)).as(String).trim_end()
+        if t == "---" or t == "..." {
+            return r
+        }
+    }
+    -1
+}
+
+private fn fb_strip_md_blockquote_and_indent(line: String) -> ?String {
+    var rest = if line.ends_with("\r") {
+        line.slice(0, line.char_len() - 1)
+    } else {
+        line
+    }
+    while true {
+        var sp: i64 = 0
+        let rlen = rest.char_len()
+        while sp < rlen and rest.slice(sp, sp + 1) == " " {
+            sp += 1
+        }
+        if sp <= 3 and sp < rlen and rest.slice(sp, sp + 1) == ">" {
+            rest = rest.drop(sp + 1)
+            if rest.starts_with(" ") or rest.starts_with("\t") {
+                rest = rest.drop(1)
+            }
+            continue
+        }
+        if sp > 3 or (sp < rlen and rest.slice(sp, sp + 1) == "\t") {
+            return null
+        }
+        return rest.drop(sp)
+    }
+    null
+}
+
+private fn fb_step_md_fence(line: String, open_ch: String, open_len: i64) -> (bool, String, i64) {
+    let after_opt = fb_strip_md_blockquote_and_indent(line)
+    if open_len > 0 {
+        if after_opt != null {
+            let after = after_opt.as(String)
+            let alen = after.char_len()
+            var clen: i64 = 0
+            while clen < alen and after.slice(clen, clen + 1) == open_ch {
+                clen += 1
+            }
+            if clen >= open_len and after.drop(clen).trim() == "" {
+                return (true, "", 0)
+            }
+        }
+        return (true, open_ch, open_len)
+    }
+    if after_opt != null {
+        let after = after_opt.as(String)
+        if after.starts_with("`") or after.starts_with("~") {
+            let fch = after.slice(0, 1)
+            let alen = after.char_len()
+            var flen: i64 = 0
+            while flen < alen and after.slice(flen, flen + 1) == fch {
+                flen += 1
+            }
+            if flen >= 3 {
+                let info = after.drop(flen)
+                if fch == "~" or (not info.contains("`")) {
+                    return (true, fch, flen)
+                }
+            }
+        }
+    }
+    (false, "", 0)
+}
+
+private fn fb_parse_md_atx_heading(line: String) -> ?(i64, i64, String) {
+    let clean = if line.ends_with("\r") {
+        line.slice(0, line.char_len() - 1)
+    } else {
+        line
+    }
+    let clen = clean.char_len()
+    var sp: i64 = 0
+    while sp < clen and clean.slice(sp, sp + 1) == " " {
+        sp += 1
+    }
+    if sp > 3 {
+        return null
+    }
+    let after = clean.drop(sp)
+    let alen = after.char_len()
+    var hashes: i64 = 0
+    while hashes < alen and after.slice(hashes, hashes + 1) == "#" {
+        hashes += 1
+    }
+    if hashes < 1 or hashes > 6 {
+        return null
+    }
+    var raw_rest = ""
+    if hashes < alen {
+        let sep = after.slice(hashes, hashes + 1)
+        if sep != " " and sep != "\t" {
+            return null
+        }
+        raw_rest = after.drop(hashes + 1)
+    }
+    var body = raw_rest.trim()
+    if body.ends_with("#") {
+        var idx = body.char_len()
+        while idx > 0 and body.slice(idx - 1, idx) == "#" {
+            idx -= 1
+        }
+        if idx == 0 {
+            body = ""
+        } else {
+            let prev = body.slice(idx - 1, idx)
+            if prev == " " or prev == "\t" {
+                body = body.slice(0, idx - 1).trim_end()
+            }
+        }
+    }
+    (sp, hashes, body)
+}
+
 pub fn accel_scan_symbols(lines: List, major_mode: String) -> List {
     let raw! = runtime.host_call("accel_scan_symbols", [lines, major_mode]) else {
         let m = major_mode.to_lower()
         let out = List()
+        if fb_is_markdown_mode(m) {
+            let fm_end = fb_md_frontmatter_end(lines)
+            var fence_ch = ""
+            var fence_len: i64 = 0
+            for r in 0..lines.len() {
+                if fm_end >= 0 and r <= fm_end {
+                    continue
+                }
+                let line = lines.get(r.as(usize)).as(String)
+                let (skip_fence, next_ch, next_len) = fb_step_md_fence(line, fence_ch, fence_len)
+                fence_ch = next_ch
+                fence_len = next_len
+                if skip_fence {
+                    continue
+                }
+                let h_opt = fb_parse_md_atx_heading(line)
+                if h_opt != null {
+                    let (indent, lvl, title) = h_opt.as((i64, i64, String))
+                    out.push(SymbolItem { name: title, kind: "Heading", row: r, col: indent, level: lvl })
+                }
+            }
+            return out
+        }
         for r in 0..lines.len() {
             let line = lines.get(r.as(usize)).as(String)
             let trimmed = line.trim_start()
@@ -1085,13 +1248,13 @@ pub fn accel_scan_symbols(lines: List, major_mode: String) -> List {
                 continue
             }
             let indent = line.char_len() - trimmed.char_len()
-            if m == "markdown" or m == "org" {
-                let mk = if m == "org" { "*" } else { "#" }
+            if m == "org" {
                 var lvl: i64 = 0
-                while lvl < trimmed.char_len() and trimmed.slice(lvl, lvl + 1) == mk {
+                while lvl < trimmed.char_len() and trimmed.slice(lvl, lvl + 1) == "*" {
                     lvl += 1
                 }
-                if lvl > 0 and lvl < trimmed.char_len() and trimmed.slice(lvl, lvl + 1) == " " {
+                if lvl > 0 and lvl < trimmed.char_len()
+                    and (trimmed.slice(lvl, lvl + 1) == " " or trimmed.slice(lvl, lvl + 1) == "\t") {
                     let title = trimmed.drop(lvl + 1).trim()
                     if title != "" {
                         out.push(SymbolItem { name: title, kind: "Heading", row: r, col: indent, level: lvl })
@@ -1390,49 +1553,59 @@ private fn fallback_parse_md_file(root: String, full_path: String, rel_path: Str
     }
     let manual = fallback_manual_name(root, rel_path)
     let headings = List()
-    var in_fence = false
+    let fm_end = fb_md_frontmatter_end(lines)
+    var fence_ch = ""
+    var fence_len: i64 = 0
     for r in 0..lines.len() {
+        if fm_end >= 0 and r <= fm_end {
+            continue
+        }
         let ln = lines.get(r.as(usize)).as(String)
-        let t = ln.trim_start()
-        if t.starts_with("```") or t.starts_with("~~~") {
-            in_fence = not in_fence
+        let (skip_fence, next_ch, next_len) = fb_step_md_fence(ln, fence_ch, fence_len)
+        fence_ch = next_ch
+        fence_len = next_len
+        if skip_fence {
             continue
         }
-        if in_fence {
-            continue
-        }
-        var hashes: i64 = 0
-        while hashes < t.char_len() and t.slice(hashes, hashes + 1) == "#" {
-            hashes += 1
-        }
-        if hashes >= 1 and hashes <= 3 and hashes < t.char_len() and t.slice(hashes, hashes + 1) == " " {
-            let raw_title = t.drop(hashes + 1).trim()
+        let h_opt = fb_parse_md_atx_heading(ln)
+        if h_opt != null {
+            let (_, hashes, raw_title) = h_opt.as((i64, i64, String))
             let htags = List()
             extract_star_tags_line(raw_title, htags)
             let clean = strip_trailing_tags(raw_title)
-            if clean != "" {
-                headings.push((r, hashes, clean, htags))
-            }
+            headings.push((r, hashes, clean, htags))
         }
     }
     if headings.is_empty() {
         let tags = List()
         var summary = ""
+        var fb_fch = ""
+        var fb_flen: i64 = 0
         for r in 0..lines.len() {
+            if fm_end >= 0 and r <= fm_end {
+                continue
+            }
             let ln = lines.get(r.as(usize)).as(String)
+            let (skip_f, nch, nlen) = fb_step_md_fence(ln, fb_fch, fb_flen)
+            fb_fch = nch
+            fb_flen = nlen
+            if skip_f {
+                continue
+            }
             extract_star_tags_line(ln, tags)
             let t = ln.trim()
             if summary == "" and t != "" {
                 summary = t.take(120)
             }
         }
+        let s_top = if fm_end >= 0 and fm_end + 1 < lines.len() { fm_end + 1 } else { 0 }
         out.push((DocNode {
             node_id: manual ++ "#top",
             manual: manual,
             title: manual,
             level: 1,
             file_path: full_path,
-            start_row: 0,
+            start_row: s_top,
             end_row: lines.len() - 1,
             tags: tags,
             summary: summary,
@@ -1460,24 +1633,25 @@ private fn fallback_parse_md_file(root: String, full_path: String, rel_path: Str
             tags.push(init_tags.get(ti.as(usize)))
         }
         var summary = ""
-        var in_code = false
+        var sec_fch = ""
+        var sec_flen: i64 = 0
         let sec_lines = List()
         for r in srow..(erow + 1) {
             let ln = lines.get(r.as(usize)).as(String)
             sec_lines.push(ln)
-            let t = ln.trim()
-            if t.starts_with("```") or t.starts_with("~~~") {
-                in_code = not in_code
+            let (skip_sec_f, nch, nlen) = fb_step_md_fence(ln, sec_fch, sec_flen)
+            sec_fch = nch
+            sec_flen = nlen
+            if skip_sec_f {
                 continue
             }
-            if not in_code {
-                extract_star_tags_line(ln, tags)
-                if r > srow and summary == "" and t != "" and (not t.starts_with("#"))
-                    and (not t.starts_with("---")) and (not t.starts_with("|")) {
-                    let cleaned = strip_trailing_tags(t)
-                    if cleaned != "" {
-                        summary = cleaned.take(120)
-                    }
+            let t = ln.trim()
+            extract_star_tags_line(ln, tags)
+            if r > srow and summary == "" and t != "" and (not t.starts_with("#"))
+                and (not t.starts_with("---")) and (not t.starts_with("|")) {
+                let cleaned = strip_trailing_tags(t)
+                if cleaned != "" {
+                    summary = cleaned.take(120)
                 }
             }
         }
@@ -3091,7 +3265,7 @@ pub fn accel_doc_scan_symbol_spans(doc_id: i64, major_mode: String, max_items: i
                     break
                 }
             }
-            if m == "markdown" or m == "org" {
+            if fb_is_markdown_mode(m) or m == "org" {
                 let end_r = if next_same >= 0 {
                     if next_same > sym.row { next_same - 1 } else { sym.row }
                 } else {
@@ -3626,4 +3800,590 @@ pub fn accel_lsp_did_save_doc(
         return false
     }
     raw.as(bool)
+}
+
+-- ============================================================================
+-- 8. Tree-Sitter Syntax Highlighting, Node Inspector & Status Bridge
+-- ============================================================================
+
+private fn fb_norm_ts_lang(raw: String) -> String {
+    let l = raw.trim().to_lower()
+    when {
+        l == "ns" or l == "nessa" => "nessa",
+        l == "rs" or l == "rust" => "rust",
+        l == "py" or l == "python" or l == "python3" or l == "pyi" => "python",
+        l == "js" or l == "jsx" or l == "mjs" or l == "cjs" or l == "javascript" => "javascript",
+        l == "ts" or l == "tsx" or l == "mts" or l == "cts" or l == "typescript" => "typescript",
+        l == "c++" or l == "cc" or l == "cxx" or l == "hpp" or l == "hxx" or l == "cpp" => "cpp",
+        l == "h" or l == "c" => "c",
+        l == "sh" or l == "zsh" or l == "shell" or l == "ksh" or l == "bash" => "bash",
+        l == "yml" or l == "yaml" => "yaml",
+        l == "md" or l == "gfm" or l == "markdown" => "markdown",
+        l == "htm" or l == "xhtml" or l == "html" => "html",
+        l == "cs" or l == "csharp" or l == "c#" or l == "c-sharp" or l == "c_sharp" => "c-sharp",
+        l == "golang" or l == "go" => "go",
+        l == "jsonc" or l == "jsonl" or l == "json" => "json",
+        l == "toml" => "toml",
+        l == "lua" => "lua",
+        l == "css" or l == "scss" => "css",
+        else => l,
+    }
+}
+
+private fn fb_is_supported_ts_lang(norm: String) -> bool {
+    norm == "nessa" or norm == "rust" or norm == "python" or norm == "javascript"
+        or norm == "typescript" or norm == "c" or norm == "cpp" or norm == "bash"
+        or norm == "yaml" or norm == "markdown" or norm == "html" or norm == "c-sharp"
+        or norm == "go" or norm == "json" or norm == "toml" or norm == "lua" or norm == "css"
+}
+
+private fn fb_push_ts_span(spans: List, start_col: i64, end_col: i64, hl_group: i64) {
+    if hl_group <= 0 or end_col <= start_col {
+        return
+    }
+    if not spans.is_empty() {
+        let last_idx = (spans.len() - 1).as(usize)
+        let prev = spans.get(last_idx).as(TsSpan)
+        if prev.hl_group == hl_group and prev.end_col == start_col {
+            spans.set(last_idx, TsSpan {
+                start_col: prev.start_col,
+                end_col: end_col,
+                hl_group: hl_group,
+            })
+            return
+        }
+    }
+    spans.push(TsSpan {
+        start_col: start_col,
+        end_col: end_col,
+        hl_group: hl_group,
+    })
+}
+
+private fn fb_is_control_kw(norm: String, w: String) -> bool {
+    w == "if" or w == "else" or w == "elif" or w == "for" or w == "while" or w == "loop"
+        or w == "match" or w == "matches" or w == "when" or w == "switch" or w == "case"
+        or w == "return" or w == "break" or w == "continue" or w == "defer" or w == "try"
+        or w == "catch" or w == "except" or w == "finally" or w == "throw" or w == "raise"
+        or w == "import" or w == "export" or w == "from" or w == "use" or w == "mod"
+        or w == "yield" or w == "await" or w == "in"
+        or (norm == "nessa" and (w == "error" or w == "handles" or w == "resume" or w == "reset" or w == "shift"))
+}
+
+private fn fb_is_other_kw(norm: String, w: String) -> bool {
+    if w == "fn" or w == "def" or w == "function" or w == "func" or w == "pub" or w == "private"
+        or w == "let" or w == "var" or w == "const" or w == "static" or w == "struct"
+        or w == "enum" or w == "union" or w == "class" or w == "trait" or w == "interface"
+        or w == "impl" or w == "type" or w == "where" or w == "async" or w == "as"
+        or w == "mut" or w == "ref" or w == "move" or w == "unsafe" or w == "dyn"
+        or w == "extern" or w == "crate" or w == "super" {
+        return true
+    }
+    if norm == "nessa" {
+        return w == "global" or w == "extend" or w == "effect" or w == "newtype" or w == "derive"
+            or w == "typealias" or w == "assoc" or w == "and" or w == "or" or w == "not"
+            or w == "is" or w == "do" or w == "lambda" or w == "test"
+    }
+    if norm == "python" {
+        return w == "with" or w == "pass" or w == "lambda" or w == "and" or w == "or"
+            or w == "not" or w == "is" or w == "global" or w == "nonlocal" or w == "assert"
+    }
+    if norm == "c" or norm == "cpp" or norm == "c-sharp" {
+        return w == "typedef" or w == "sizeof" or w == "volatile" or w == "inline"
+            or w == "namespace" or w == "template" or w == "typename" or w == "public"
+            or w == "protected" or w == "virtual" or w == "override"
+    }
+    if norm == "lua" {
+        return w == "local" or w == "then" or w == "end" or w == "do" or w == "repeat"
+            or w == "until" or w == "and" or w == "or" or w == "not"
+    }
+    false
+}
+
+private fn fb_is_builtin_const(w: String) -> bool {
+    w == "true" or w == "false" or w == "null" or w == "nil" or w == "None"
+        or w == "True" or w == "False" or w == "nullptr" or w == "NULL"
+        or w == "self" or w == "this" or w == "Some" or w == "Ok" or w == "Err"
+}
+
+private fn fb_is_builtin_type(w: String) -> bool {
+    w == "i64" or w == "i32" or w == "i16" or w == "i8" or w == "isize"
+        or w == "u64" or w == "u32" or w == "u16" or w == "u8" or w == "usize"
+        or w == "f64" or w == "f32" or w == "bool" or w == "char" or w == "str"
+        or w == "String" or w == "List" or w == "Unit" or w == "Any" or w == "Vec"
+        or w == "Option" or w == "Result" or w == "Self" or w == "Continuation" or w == "Future"
+        or w == "int" or w == "float" or w == "double" or w == "void" or w == "long"
+        or w == "short" or w == "size_t" or w == "uint32_t" or w == "uint64_t" or w == "int64_t"
+        or w == "string" or w == "number" or w == "boolean" or w == "dict" or w == "list" or w == "tuple"
+}
+
+private fn fb_is_screaming_const(w: String) -> bool {
+    let n = w.char_len()
+    if n < 2 {
+        return false
+    }
+    if not w.slice(0, 1).is_ascii_uppercase() {
+        return false
+    }
+    for i in 0..n {
+        let ch = w.slice(i, i + 1)
+        if (not ch.is_ascii_uppercase()) and (not ch.is_ascii_digit()) and ch != "_" {
+            return false
+        }
+    }
+    true
+}
+
+private fn fb_is_pascal_type(w: String) -> bool {
+    let n = w.char_len()
+    if n < 2 or (not w.slice(0, 1).is_ascii_uppercase()) {
+        return false
+    }
+    for i in 1..n {
+        if w.slice(i, i + 1).is_ascii_lowercase() {
+            return true
+        }
+    }
+    false
+}
+
+private fn fb_highlight_line_stateful(
+    line: String,
+    norm: String,
+    blk_depth: i64,
+) -> (List, i64) {
+    let spans = List()
+    let n = line.char_len()
+    if n == 0 {
+        return (spans, blk_depth)
+    }
+    if norm == "markdown" {
+        let h_opt = fb_parse_md_atx_heading(line)
+        if h_opt != null {
+            fb_push_ts_span(spans, 0, n, 17)
+            return (spans, 0)
+        }
+        let tr = line.trim_start()
+        if tr.starts_with("```") or tr.starts_with("~~~") {
+            fb_push_ts_span(spans, 0, n, 18)
+            return (spans, 0)
+        }
+        var mi: i64 = 0
+        while mi < n {
+            let mch = line.slice(mi, mi + 1)
+            if mch == "`" {
+                let s0 = mi
+                mi += 1
+                while mi < n and line.slice(mi, mi + 1) != "`" {
+                    mi += 1
+                }
+                if mi < n {
+                    mi += 1
+                }
+                fb_push_ts_span(spans, s0, mi, 18)
+                continue
+            }
+            mi += 1
+        }
+        return (spans, 0)
+    }
+
+    var cur_blk = blk_depth
+    var i: i64 = 0
+    var expect_fn = false
+    var after_dot = false
+    let blk_open = if norm == "nessa" {
+        "{{-"
+    } else if norm == "rust" or norm == "c" or norm == "cpp" or norm == "javascript"
+        or norm == "typescript" or norm == "go" or norm == "c-sharp" or norm == "css" {
+        "/*"
+    } else {
+        ""
+    }
+    let blk_close = if norm == "nessa" { "-}}" } else if blk_open == "/*" { "*/" } else { "" }
+
+    while i < n {
+        if cur_blk > 0 and blk_close != "" {
+            let bstart = i
+            while i < n {
+                if i + 2 <= n and line.slice(i, i + 2) == blk_close {
+                    cur_blk -= 1
+                    i += 2
+                    if cur_blk == 0 {
+                        break
+                    }
+                } else if norm == "nessa" and i + 2 <= n and line.slice(i, i + 2) == "{{-" {
+                    cur_blk += 1
+                    i += 2
+                } else {
+                    i += 1
+                }
+            }
+            fb_push_ts_span(spans, bstart, i, 15)
+            continue
+        }
+
+        let ch = line.slice(i, i + 1)
+        if ch == " " or ch == "\t" or ch == "\r" {
+            i += 1
+            continue
+        }
+
+        if blk_open != "" and i + 2 <= n and line.slice(i, i + 2) == blk_open {
+            cur_blk = 1
+            fb_push_ts_span(spans, i, i + 2, 15)
+            i += 2
+            continue
+        }
+
+        if (norm == "nessa" or norm == "lua") and i + 2 <= n and line.slice(i, i + 2) == "--" {
+            let is_doc = norm == "nessa" and i + 3 <= n and line.slice(i, i + 3) == "---"
+                and (i + 4 > n or line.slice(i + 3, i + 4) != "-")
+            fb_push_ts_span(spans, i, n, if is_doc { 16 } else { 15 })
+            break
+        }
+        if (norm == "rust" or norm == "c" or norm == "cpp" or norm == "javascript"
+            or norm == "typescript" or norm == "go" or norm == "c-sharp")
+            and i + 2 <= n and line.slice(i, i + 2) == "//" {
+            let is_doc = i + 3 <= n and (line.slice(i, i + 3) == "///" or line.slice(i, i + 3) == "//!")
+            fb_push_ts_span(spans, i, n, if is_doc { 16 } else { 15 })
+            break
+        }
+        if (norm == "python" or norm == "bash" or norm == "yaml" or norm == "toml") and ch == "#" {
+            fb_push_ts_span(spans, i, n, 15)
+            break
+        }
+
+        if ch == "\"" or (ch == "'" and (norm == "python" or norm == "javascript" or norm == "typescript" or norm == "bash" or norm == "yaml" or norm == "toml")) {
+            let q = ch
+            fb_push_ts_span(spans, i, i + 1, 7)
+            i += 1
+            var lit_s = i
+            while i < n {
+                let sc = line.slice(i, i + 1)
+                if sc == "\\" {
+                    fb_push_ts_span(spans, lit_s, i, 7)
+                    let es = i
+                    i = if i + 2 <= n { i + 2 } else { n }
+                    fb_push_ts_span(spans, es, i, 8)
+                    lit_s = i
+                    continue
+                }
+                if norm == "nessa" and q == "\"" and i + 2 <= n
+                    and (line.slice(i, i + 2) == "{{{{" or line.slice(i, i + 2) == "}}}}") {
+                    fb_push_ts_span(spans, lit_s, i, 7)
+                    fb_push_ts_span(spans, i, i + 2, 8)
+                    i += 2
+                    lit_s = i
+                    continue
+                }
+                if sc == q {
+                    fb_push_ts_span(spans, lit_s, i + 1, 7)
+                    i += 1
+                    lit_s = i
+                    break
+                }
+                i += 1
+            }
+            if lit_s < i {
+                fb_push_ts_span(spans, lit_s, i, 7)
+            }
+            after_dot = false
+            continue
+        }
+
+        if norm == "nessa" and ch == "@" {
+            let s0 = i
+            i += 1
+            while i < n and fb_is_ident_char(line.slice(i, i + 1)) {
+                i += 1
+            }
+            fb_push_ts_span(spans, s0, i, 13)
+            after_dot = false
+            continue
+        }
+
+        if (norm == "nessa" or norm == "rust" or norm == "c" or norm == "cpp") and ch == "#" {
+            let s0 = i
+            i += 1
+            while i < n and fb_is_ident_char(line.slice(i, i + 1)) {
+                i += 1
+            }
+            fb_push_ts_span(spans, s0, i, 4)
+            after_dot = false
+            continue
+        }
+
+        if ch.is_ascii_digit() {
+            let s0 = i
+            i += 1
+            while i < n {
+                let nc = line.slice(i, i + 1)
+                if nc.is_ascii_alphanumeric() or nc == "_" or nc == "." {
+                    i += 1
+                } else {
+                    break
+                }
+            }
+            fb_push_ts_span(spans, s0, i, 9)
+            after_dot = false
+            continue
+        }
+
+        if ch == "_" or ch.is_alphabetic() {
+            let s0 = i
+            i += 1
+            while i < n and fb_is_ident_char(line.slice(i, i + 1)) {
+                i += 1
+            }
+            let word = line.slice(s0, i)
+            var k = i
+            while k < n and (line.slice(k, k + 1) == " " or line.slice(k, k + 1) == "\t") {
+                k += 1
+            }
+            let next_c = if k < n { line.slice(k, k + 1) } else { "" }
+            let grp: i64 = if fb_is_control_kw(norm, word) {
+                2
+            } else if fb_is_other_kw(norm, word) {
+                if word == "fn" or word == "def" or word == "function" or word == "func" or word == "effect" {
+                    expect_fn = true
+                }
+                1
+            } else if fb_is_builtin_const(word) {
+                9
+            } else if fb_is_builtin_type(word) {
+                6
+            } else if expect_fn {
+                expect_fn = false
+                3
+            } else if fb_is_screaming_const(word) {
+                10
+            } else if fb_is_pascal_type(word) {
+                5
+            } else if next_c == "(" {
+                3
+            } else if next_c == "!" and norm == "rust" {
+                4
+            } else if after_dot {
+                11
+            } else {
+                0
+            }
+            after_dot = false
+            fb_push_ts_span(spans, s0, i, grp)
+            continue
+        }
+
+        if ch == "." {
+            if i + 2 <= n and line.slice(i, i + 2) == ".." {
+                fb_push_ts_span(spans, i, i + 2, 14)
+                i += 2
+                after_dot = false
+            } else {
+                after_dot = true
+                i += 1
+            }
+            continue
+        }
+
+        after_dot = false
+        if ch == "=" or ch == "+" or ch == "-" or ch == "*" or ch == "/" or ch == "%"
+            or ch == "<" or ch == ">" or ch == "!" or ch == "?" or ch == "&" or ch == "|"
+            or ch == "^" or ch == "~" or ch == ":" {
+            fb_push_ts_span(spans, i, i + 1, 14)
+        }
+        i += 1
+    }
+
+    (spans, cur_blk)
+}
+
+private fn decode_host_ts_rows(raw_rows: List) -> List {
+    let out = List()
+    for r in 0..raw_rows.len() {
+        let raw_row = raw_rows.get(r.as(usize)).as(List)
+        let row_spans = List()
+        for j in 0..raw_row.len() {
+            let item = raw_row.get(j.as(usize)).as(List)
+            row_spans.push(TsSpan {
+                start_col: item.get(0).as(i64),
+                end_col: item.get(1).as(i64),
+                hl_group: item.get(2).as(i64),
+            })
+        }
+        out.push(row_spans)
+    }
+    out
+}
+
+pub fn accel_ts_highlight_rows(
+    doc_id: i64,
+    lang: String,
+    start_row: i64,
+    end_row: i64,
+) -> List {
+    if end_row < start_row or start_row < 0 {
+        return List()
+    }
+    let raw! = runtime.host_call("accel_ts_highlight_rows", [doc_id, lang, start_row, end_row]) else {
+        let norm = fb_norm_ts_lang(lang)
+        if not fb_is_supported_ts_lang(norm) {
+            return List()
+        }
+        let total = accel_doc_line_count(doc_id)
+        if total <= 0 {
+            return List()
+        }
+        let need_end = if end_row + 1 < total { end_row + 1 } else { total }
+        let doc_lines = accel_doc_slice_lines(doc_id, 0, need_end)
+        let fetched = doc_lines.len()
+        let out = List()
+        var blk_depth: i64 = 0
+        for r in 0..start_row {
+            if r < fetched {
+                let (_, next_b) = fb_highlight_line_stateful(
+                    doc_lines.get(r.as(usize)).as(String),
+                    norm,
+                    blk_depth,
+                )
+                blk_depth = next_b
+            }
+        }
+        for r in start_row..(end_row + 1) {
+            if r < fetched {
+                let (row_spans, next_b) = fb_highlight_line_stateful(
+                    doc_lines.get(r.as(usize)).as(String),
+                    norm,
+                    blk_depth,
+                )
+                blk_depth = next_b
+                out.push(row_spans)
+            } else {
+                out.push(List())
+            }
+        }
+        return out
+    }
+    decode_host_ts_rows(raw.as(List))
+}
+
+pub fn accel_ts_highlight_snippet(text: String, lang: String) -> List {
+    if text == "" {
+        return List()
+    }
+    let raw! = runtime.host_call("accel_ts_highlight_snippet", [text, lang]) else {
+        let norm = fb_norm_ts_lang(lang)
+        if not fb_is_supported_ts_lang(norm) {
+            return List()
+        }
+        let lines = text.replace("\r\n", "\n").split("\n")
+        let out = List()
+        var blk_depth: i64 = 0
+        for i in 0..lines.len() {
+            let (row_spans, next_b) = fb_highlight_line_stateful(
+                lines.get(i.as(usize)).as(String),
+                norm,
+                blk_depth,
+            )
+            blk_depth = next_b
+            out.push(row_spans)
+        }
+        return out
+    }
+    decode_host_ts_rows(raw.as(List))
+}
+
+private fn fb_hl_group_label(grp: i64) -> String {
+    when {
+        grp == 1 => "Keyword",
+        grp == 2 => "Control/Import Keyword",
+        grp == 3 => "Function/Method/Constructor",
+        grp == 4 => "Macro/BuiltinFn/Attribute/Preproc",
+        grp == 5 => "Type",
+        grp == 6 => "BuiltinType",
+        grp == 7 => "String/Char",
+        grp == 8 => "Escape/Regexp",
+        grp == 9 => "Number/Float/Boolean/BuiltinConst",
+        grp == 10 => "Constant",
+        grp == 11 => "Property/Field/Member",
+        grp == 12 => "Parameter",
+        grp == 13 => "Namespace/Module/Label",
+        grp == 14 => "Operator",
+        grp == 15 => "Comment",
+        grp == 16 => "DocComment",
+        grp == 17 => "Tag/MarkupHeading",
+        grp == 18 => "MarkupRaw/Link/URL",
+        else => "Variable/Plain",
+    }
+}
+
+pub fn accel_ts_inspect_node(doc_id: i64, lang: String, row: i64, col: i64) -> String {
+    let raw! = runtime.host_call("accel_ts_inspect_node", [doc_id, lang, row, col]) else {
+        let norm = fb_norm_ts_lang(lang)
+        let total = accel_doc_line_count(doc_id)
+        if total <= 0 {
+            return ""
+        }
+        let safe_r = if row < 0 { 0 } else { row }
+        if safe_r >= total {
+            return "Language : " ++ norm ++ " (fallback)\nCursor out of bounds"
+        }
+        let line = accel_doc_line_at(doc_id, safe_r)
+        let llen = line.char_len()
+        let safe_c = if llen == 0 {
+            0
+        } else if col < 0 {
+            0
+        } else if col >= llen {
+            llen - 1
+        } else {
+            col
+        }
+        let rows = accel_ts_highlight_rows(doc_id, norm, safe_r, safe_r)
+        if not rows.is_empty() {
+            let r_spans = rows.get(0).as(List)
+            for i in 0..r_spans.len() {
+                let sp = r_spans.get(i.as(usize)).as(TsSpan)
+                if safe_c >= sp.start_col and safe_c < sp.end_col {
+                    let tok = line.slice(sp.start_col, sp.end_col)
+                    let lbl = fb_hl_group_label(sp.hl_group)
+                    return "Language : " ++ norm ++ " (pure-Nessa fallback)\n"
+                        ++ "Node     : " ++ lbl ++ " (" ++ tok ++ ")\n"
+                        ++ "Range    : [" ++ (safe_r + 1).to_string() ++ ":" ++ sp.start_col.to_string()
+                        ++ " .. " ++ (safe_r + 1).to_string() ++ ":" ++ sp.end_col.to_string() ++ "]\n"
+                        ++ "Highlight: " ++ lbl ++ " (hl_group=" ++ sp.hl_group.to_string() ++ ")"
+                }
+            }
+        }
+        return "Language : " ++ norm ++ " (pure-Nessa fallback)\n"
+            ++ "Node     : identifier / token\n"
+            ++ "Range    : [" ++ (safe_r + 1).to_string() ++ ":" ++ safe_c.to_string()
+            ++ " .. " ++ (safe_r + 1).to_string() ++ ":" ++ (safe_c + 1).to_string() ++ "]\n"
+            ++ "Highlight: Variable/Plain (hl_group=0)"
+    }
+    raw.as(String)
+}
+
+pub fn accel_ts_status() -> (bool, i64, i64, List) {
+    let raw! = runtime.host_call("accel_ts_status", []) else {
+        let fb_langs = [
+            "bash", "c", "c-sharp", "cpp", "css", "go", "html", "javascript",
+            "json", "lua", "markdown", "nessa", "python", "rust", "toml",
+            "typescript", "yaml",
+        ]
+        return (false, 0, fb_langs.len(), fb_langs)
+    }
+    let arr = raw.as(List)
+    let loaded_item = arr.get(0)
+    let loaded = if loaded_item matches _: bool {
+        loaded_item.as(bool)
+    } else {
+        loaded_item.as(i64) != 0
+    }
+    (
+        loaded,
+        arr.get(1).as(i64),
+        arr.get(2).as(i64),
+        arr.get(3).as(List),
+    )
 }

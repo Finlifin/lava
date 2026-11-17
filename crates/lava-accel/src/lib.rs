@@ -16,7 +16,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 pub mod doc_store;
+pub mod treesitter;
 pub use doc_store::{NativeConflictHit, NativeDiagHit, SymbolOutlineSpan};
+pub use treesitter::{
+    TsHighlightSpan, ts_highlight_doc_rows, ts_highlight_snippet, ts_inspect_doc_node,
+    ts_status_info,
+};
 
 // ---------------------------------------------------------------------------
 // 1. Batch Fuzzy Matcher & Ranker
@@ -1188,16 +1193,39 @@ fn extract_ident_after(s: &str) -> Option<String> {
 pub fn scan_symbols(lines: &[String], major_mode: &str) -> Vec<SymbolEntry> {
     let mode = major_mode.to_ascii_lowercase();
     let mut out = Vec::new();
+
+    if doc_store::is_markdown_mode_name(&mode) {
+        let fm_end = doc_store::markdown_frontmatter_end_row(lines.iter().map(String::as_str));
+        let mut fence = doc_store::MarkdownFenceState::new();
+        for (idx, line) in lines.iter().enumerate() {
+            if fm_end.is_some_and(|end| idx <= end) {
+                continue;
+            }
+            if fence.step_line(line) {
+                continue;
+            }
+            if let Some((indent_cols, level, title)) = doc_store::parse_markdown_atx_heading(line) {
+                out.push(SymbolEntry {
+                    name: title,
+                    kind: "Heading".to_string(),
+                    row: idx as i64,
+                    col: indent_cols,
+                    level,
+                });
+            }
+        }
+        return out;
+    }
+
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
         let indent_cols = (line.chars().count() - trimmed.chars().count()) as i64;
         if trimmed.is_empty() {
             continue;
         }
-        if mode == "markdown" || mode == "org" {
-            let marker = if mode == "org" { '*' } else { '#' };
-            let lvl = trimmed.chars().take_while(|c| *c == marker).count();
-            if lvl > 0 && trimmed.chars().nth(lvl) == Some(' ') {
+        if mode == "org" {
+            let lvl = trimmed.chars().take_while(|c| *c == '*').count();
+            if lvl > 0 && matches!(trimmed.chars().nth(lvl), Some(' ' | '\t')) {
                 let title = trimmed[lvl..].trim().to_string();
                 if !title.is_empty() {
                     out.push(SymbolEntry {
@@ -1496,32 +1524,31 @@ fn parse_markdown_sections(root: &Path, file_path: &Path) -> Vec<ParsedDocSectio
     let full_path_str = file_path.to_string_lossy().to_string();
 
     let mut headings: Vec<(usize, i64, String, Vec<String>)> = Vec::new();
-    let mut in_fence = false;
+    let fm_end = doc_store::markdown_frontmatter_end_row(all_lines.iter().map(String::as_str));
+    let mut fence = doc_store::MarkdownFenceState::new();
     for (idx, line) in all_lines.iter().enumerate() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
+        if fm_end.is_some_and(|end| idx <= end) {
             continue;
         }
-        if in_fence {
+        if fence.step_line(line) {
             continue;
         }
-        let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
-        if (1..=3).contains(&hashes) && trimmed.as_bytes().get(hashes) == Some(&b' ') {
-            let raw_title = trimmed[hashes + 1..].trim();
+        if let Some((_, level, raw_title)) = doc_store::parse_markdown_atx_heading(line) {
             let mut tags = Vec::new();
-            extract_star_tags_in_line(raw_title, &mut tags);
-            let clean_title = strip_trailing_star_tags(raw_title);
-            if !clean_title.is_empty() {
-                headings.push((idx, hashes as i64, clean_title, tags));
-            }
+            extract_star_tags_in_line(&raw_title, &mut tags);
+            let clean_title = strip_trailing_star_tags(&raw_title);
+            headings.push((idx, level, clean_title, tags));
         }
     }
 
     if headings.is_empty() {
         let mut tags = Vec::new();
         let mut summary = String::new();
-        for ln in &all_lines {
+        let mut fallback_fence = doc_store::MarkdownFenceState::new();
+        for (idx, ln) in all_lines.iter().enumerate() {
+            if fm_end.is_some_and(|end| idx <= end) || fallback_fence.step_line(ln) {
+                continue;
+            }
             extract_star_tags_in_line(ln, &mut tags);
             let t = ln.trim();
             if summary.is_empty() && !t.is_empty() {
@@ -1535,7 +1562,7 @@ fn parse_markdown_sections(root: &Path, file_path: &Path) -> Vec<ParsedDocSectio
                 manual,
                 level: 1,
                 file_path: full_path_str,
-                start_row: 0,
+                start_row: fm_end.map_or(0, |end| ((end + 1).min(all_lines.len() - 1)) as i64),
                 end_row: (all_lines.len() - 1) as i64,
                 tags,
                 summary,
@@ -1566,27 +1593,24 @@ fn parse_markdown_sections(root: &Path, file_path: &Path) -> Vec<ParsedDocSectio
 
         let mut tags = init_tags.clone();
         let mut summary = String::new();
-        let mut in_code = false;
+        let mut sec_fence = doc_store::MarkdownFenceState::new();
         let slice = &all_lines[start_row..=end_row];
         for (rel_i, ln) in slice.iter().enumerate() {
-            let t = ln.trim();
-            if t.starts_with("```") || t.starts_with("~~~") {
-                in_code = !in_code;
+            if sec_fence.step_line(ln) {
                 continue;
             }
-            if !in_code {
-                extract_star_tags_in_line(ln, &mut tags);
-                if rel_i > 0
-                    && summary.is_empty()
-                    && !t.is_empty()
-                    && !t.starts_with('#')
-                    && !t.starts_with("---")
-                    && !t.starts_with('|')
-                {
-                    let cleaned = strip_trailing_star_tags(t);
-                    if !cleaned.is_empty() {
-                        summary = cleaned.chars().take(120).collect();
-                    }
+            let t = ln.trim();
+            extract_star_tags_in_line(ln, &mut tags);
+            if rel_i > 0
+                && summary.is_empty()
+                && !t.is_empty()
+                && !t.starts_with('#')
+                && !t.starts_with("---")
+                && !t.starts_with('|')
+            {
+                let cleaned = strip_trailing_star_tags(t);
+                if !cleaned.is_empty() {
+                    summary = cleaned.chars().take(120).collect();
                 }
             }
         }
@@ -2158,6 +2182,78 @@ mod tests {
                 .any(|d| d.kind == "command" && d.symbol == "info")
         );
 
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn markdown_frontmatter_fences_and_atx_headings_work_across_all_scanners() {
+        let md_lines: Vec<String> = vec![
+            "---",
+            "title: Frontmatter Doc",
+            "# Not a heading inside YAML frontmatter",
+            "...",
+            "# Real H1",
+            "   ````markdown",
+            "   ```sh",
+            "   # Not a heading inside 4-backtick fence",
+            "   ```",
+            "   ~~~",
+            "   # Still inside 4-backtick fence",
+            "   ````",
+            "> ~~~python",
+            "> # Not a heading inside blockquote tilde fence",
+            "> ~~~",
+            "##\tTabbed H2",
+            "###",
+            "###### Max H6",
+            "####### Seven hashes ignored",
+            "#hashtag_ignored",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+        for mode in ["markdown", "md", "gfm"] {
+            let syms = scan_symbols(&md_lines, mode);
+            assert_eq!(syms.len(), 4, "mode={mode}: {syms:?}");
+            assert_eq!(
+                (syms[0].name.as_str(), syms[0].level, syms[0].row),
+                ("Real H1", 1, 4)
+            );
+            assert_eq!(
+                (syms[1].name.as_str(), syms[1].level, syms[1].row),
+                ("Tabbed H2", 2, 15)
+            );
+            assert_eq!(
+                (syms[2].name.as_str(), syms[2].level, syms[2].row),
+                ("", 3, 16)
+            );
+            assert_eq!(
+                (syms[3].name.as_str(), syms[3].level, syms[3].row),
+                ("Max H6", 6, 17)
+            );
+
+            let doc = doc_store::doc_new(md_lines.clone());
+            let spans = doc_store::doc_scan_symbol_spans(doc, mode, 50);
+            assert_eq!(spans.len(), 4, "doc spans mode={mode}: {spans:?}");
+            assert_eq!((spans[0].row, spans[0].end_row), (4, 19));
+            assert_eq!((spans[1].row, spans[1].end_row), (15, 19));
+            assert_eq!((spans[2].row, spans[2].end_row), (16, 19));
+            assert_eq!((spans[3].row, spans[3].end_row), (17, 19));
+            doc_store::doc_free(doc);
+        }
+
+        let tmp = std::env::temp_dir().join(format!("lava_md_fence_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("create tmp md dir");
+        let md_path = tmp.join("guide.md");
+        fs::write(&md_path, md_lines.join("\n")).expect("write guide.md");
+        let sections = index_docs(&[tmp.to_string_lossy().to_string()]);
+        assert_eq!(sections.len(), 4);
+        assert_eq!(sections[0].title, "Real H1");
+        assert_eq!(sections[1].title, "Tabbed H2");
+        assert_eq!(sections[3].title, "Max H6");
+        assert_eq!(sections[3].level, 6);
         let _ = fs::remove_dir_all(&tmp);
     }
 }

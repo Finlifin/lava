@@ -16,8 +16,8 @@ use @lava_accel.{
     accel_workspace_files, accel_workspace_grep
 }
 use @ext_document.{
-    Buffer, BufferId, EditorWorld, FloatingWindow, Pos, QuickfixEntry, ext_document_id,
-    require_editor_world
+    Buffer, BufferId, EditorWorld, FloatingWindow, Pos, QuickfixEntry, RegisterValue,
+    ext_document_id, require_editor_world
 }
 use @ext_vim.{
     KEYMAP_VIM_LEADER, ModalInterceptor, VimMode, VimState, ext_vim_id, require_vim_state,
@@ -53,13 +53,17 @@ pub struct TelescopeState {
     pub active: bool,
     pub mode: String,
     pub query: String,
+    pub cursor_pos: i64,
     pub base_items: List,
+    pub base_labels: List,
     pub filtered_items: List,
     pub selected_idx: i64,
     pub source_buf_id: BufferId,
     pub original_theme: String,
     pub has_history: bool,
     pub qf_header_rows: i64,
+    pub preview_cache_key: String,
+    pub preview_cache_lines: ?List,
 }
 
 impl TelescopeState {
@@ -68,13 +72,17 @@ impl TelescopeState {
             active: false,
             mode: "files",
             query: "",
+            cursor_pos: 0,
             base_items: List(),
+            base_labels: List(),
             filtered_items: List(),
             selected_idx: 0,
             source_buf_id: BufferId(1),
             original_theme: "catppuccin-mocha",
             has_history: false,
             qf_header_rows: 2,
+            preview_cache_key: "",
+            preview_cache_lines: null,
         }
     }
 }
@@ -243,6 +251,35 @@ fn apply_theme_preview(kernel: SystemKernel, world: EditorWorld, theme_name: Str
     }
 }
 
+fn telescope_file_icon(rel_path: String) -> String {
+    let fname_opt = path.file_name(rel_path)
+    let low = if fname_opt != null { fname_opt.as(String).to_lower() } else { rel_path.to_lower() }
+    if low == ".gitignore" or low == ".gitmodules" or low == ".gitattributes" {
+        return ""
+    }
+    when {
+        low.ends_with(".ns") or low.ends_with(".zig") => "",
+        low.ends_with(".rs") => "",
+        low.ends_with(".lua") => "",
+        low.ends_with(".py") => "",
+        low.ends_with(".c") or low.ends_with(".h") => "",
+        low.ends_with(".cpp") or low.ends_with(".cc") or low.ends_with(".cxx") or low.ends_with(".hpp") => "",
+        low.ends_with(".js") or low.ends_with(".jsx") or low.ends_with(".mjs") => "",
+        low.ends_with(".ts") or low.ends_with(".tsx") => "",
+        low.ends_with(".go") => "",
+        low.ends_with(".json") or low.ends_with(".jsonc") => "",
+        low.ends_with(".toml") or low.ends_with(".yaml") or low.ends_with(".yml") or low.ends_with(".lock") or low.ends_with(".ini") or low.ends_with(".conf") => "",
+        low.ends_with(".md") or low.ends_with(".markdown") => "",
+        low.ends_with(".org") or low.ends_with(".txt") or low.ends_with(".rst") => "",
+        low.ends_with(".html") or low.ends_with(".htm") => "",
+        low.ends_with(".css") or low.ends_with(".scss") => "",
+        low.ends_with(".sh") or low.ends_with(".bash") or low.ends_with(".zsh") => "",
+        low.ends_with(".zip") or low.ends_with(".tar") or low.ends_with(".gz") or low.ends_with(".xz") or low.ends_with(".zst") => "",
+        low.ends_with(".png") or low.ends_with(".jpg") or low.ends_with(".jpeg") or low.ends_with(".gif") or low.ends_with(".svg") or low.ends_with(".webp") => "",
+        else => "",
+    }
+}
+
 fn make_plain_item(
     label: String,
     display: String,
@@ -312,7 +349,7 @@ fn collect_base_items(kernel: SystemKernel, world: EditorWorld, state: Telescope
         let files = accel_workspace_files(world.cwd, max_files = 10000, include_hidden = false)
         for i in 0..files.len() {
             let rel = files.get(i.as(usize)).as(String)
-            items.push(make_plain_item(rel, rel, rel, 0, 0, BufferId(0), "", "", ""))
+            items.push(make_plain_item(rel, "", rel, 0, 0, BufferId(0), "", "", ""))
         }
         return items
     }
@@ -324,8 +361,9 @@ fn collect_base_items(kernel: SystemKernel, world: EditorWorld, state: Telescope
             let active_mark = if bid == state.source_buf_id { "%" } else { " " }
             let mod_mark = if b.modified { "+" } else if b.read_only { "-" } else { " " }
             let rel = relative_to_cwd(b.file_path, world.cwd)
+            let ficon = if b.file_path != "" { telescope_file_icon(b.name) } else { "" }
             let tail = if rel != "" { "  — " ++ rel } else { "  [" ++ b.major_mode ++ "]" }
-            let disp = active_mark ++ mod_mark ++ " #" ++ bid.raw().to_string() ++ " " ++ b.name ++ tail
+            let disp = active_mark ++ mod_mark ++ " #" ++ bid.raw().to_string() ++ " " ++ ficon ++ " " ++ b.name ++ tail
             items.push(make_plain_item(
                 b.name ++ " " ++ rel,
                 disp,
@@ -707,9 +745,10 @@ fn recompute_filtered_items(world: EditorWorld, state: TelescopeState) {
         let out = List()
         for i in 0..hits.len() {
             let h = hits.get(i.as(usize)).as(GrepHit)
-            let disp = h.file_path ++ ":" ++ (h.row + 1).to_string() ++ ":" ++ (h.col + 1).to_string() ++ ": " ++ h.line_text.trim()
+            let raw_loc = h.file_path ++ ":" ++ (h.row + 1).to_string() ++ ":" ++ (h.col + 1).to_string() ++ ": " ++ h.line_text.trim()
+            let disp = telescope_file_icon(h.file_path) ++ " " ++ raw_loc
             out.push(make_plain_item(
-                disp,
+                raw_loc,
                 disp,
                 h.file_path,
                 h.row,
@@ -767,11 +806,6 @@ fn recompute_filtered_items(world: EditorWorld, state: TelescopeState) {
         return
     }
 
-    let cands = List()
-    for i in 0..state.base_items.len() {
-        cands.push(state.base_items.get(i.as(usize)).as(PickerItem).label)
-    }
-
     let q_trim = state.query.trim()
     if q_trim == "" {
         let copy = List()
@@ -781,10 +815,17 @@ fn recompute_filtered_items(world: EditorWorld, state: TelescopeState) {
         }
         state.filtered_items = copy
     } else {
+        if state.base_labels.len() != state.base_items.len() {
+            let labels = List()
+            for i in 0..state.base_items.len() {
+                labels.push(state.base_items.get(i.as(usize)).as(PickerItem).label)
+            }
+            state.base_labels = labels
+        }
         let ranked = if has_orderless_syntax(q_trim) {
-            rank_candidates_orderless(q_trim, cands, 250)
+            rank_candidates_orderless(q_trim, state.base_labels, 250)
         } else {
-            accel_fuzzy_rank(state.query, cands, limit = 250)
+            accel_fuzzy_rank(state.query, state.base_labels, limit = 250)
         }
         let out = List()
         for i in 0..ranked.len() {
@@ -804,7 +845,7 @@ fn recompute_filtered_items(world: EditorWorld, state: TelescopeState) {
     }
 }
 
-fn load_preview_source_lines(world: EditorWorld, item: PickerItem) -> ?List {
+fn load_preview_source_lines(world: EditorWorld, state: TelescopeState, item: PickerItem) -> ?List {
     if item.buf_id.raw() > 0 {
         let b_opt = world.buffer(item.buf_id)
         if b_opt != null {
@@ -823,7 +864,12 @@ fn load_preview_source_lines(world: EditorWorld, item: PickerItem) -> ?List {
         let lim = if b.line_count() < 300 { b.line_count() } else { 300 }
         return b.slice_lines(0, lim)
     }
+    if state.preview_cache_key == full and state.preview_cache_lines != null {
+        return state.preview_cache_lines
+    }
     let raw! = fs.read_to_string(full) else {
+        state.preview_cache_key = ""
+        state.preview_cache_lines = null
         return null
     }
     let norm = raw.replace("\r\n", "\n").replace("\r", "\n")
@@ -831,6 +877,8 @@ fn load_preview_source_lines(world: EditorWorld, item: PickerItem) -> ?List {
     if parts.len() > 1 and norm.ends_with("\n") {
         let _ = parts.pop()
     }
+    state.preview_cache_key = full
+    state.preview_cache_lines = parts
     parts
 }
 
@@ -862,8 +910,8 @@ fn build_command_preview_window(kernel: SystemKernel, item: PickerItem) -> Float
         owner: "ext_telescope",
         title: "Preview — Command: " ++ item.command_name,
         anchor: "bottom",
-        width_cols: 78,
-        height_rows: 9,
+        width_cols: 108,
+        height_rows: 12,
         lines: lines,
         selected_row: 0,
         border_rgba: 0,
@@ -871,7 +919,7 @@ fn build_command_preview_window(kernel: SystemKernel, item: PickerItem) -> Float
 }
 
 fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: TelescopeState) -> FloatingWindow {
-    let preview_rows: i64 = 10
+    let preview_rows: i64 = 16
     if state.filtered_items.is_empty() {
         let empty_msg = if state.mode == "live_grep" and state.query.trim() == "" {
             "(Type a pattern above to search across workspace files)"
@@ -885,8 +933,8 @@ fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: Telesco
             owner: "ext_telescope",
             title: "Telescope Preview",
             anchor: "bottom",
-            width_cols: 78,
-            height_rows: 6,
+            width_cols: 108,
+            height_rows: 8,
             lines: [empty_msg],
             selected_row: -1,
             border_rgba: 0,
@@ -916,7 +964,7 @@ fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: Telesco
             owner: "ext_telescope",
             title: "Preview — Telescope: " ++ item.command_name,
             anchor: "bottom",
-            width_cols: 78,
+            width_cols: 108,
             height_rows: 8,
             lines: lines,
             selected_row: 0,
@@ -941,7 +989,7 @@ fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: Telesco
             owner: "ext_telescope",
             title: "Preview — Theme: " ++ p.name,
             anchor: "bottom",
-            width_cols: 78,
+            width_cols: 108,
             height_rows: preview_rows,
             lines: lines,
             selected_row: 0,
@@ -972,7 +1020,7 @@ fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: Telesco
             owner: "ext_telescope",
             title: "Preview — Keybinding: " ++ item.command_name,
             anchor: "bottom",
-            width_cols: 78,
+            width_cols: 108,
             height_rows: 8,
             lines: lines,
             selected_row: 0,
@@ -980,14 +1028,14 @@ fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: Telesco
         })
     }
 
-    let src_lines_opt = load_preview_source_lines(world, item)
+    let src_lines_opt = load_preview_source_lines(world, state, item)
     if src_lines_opt == null {
         return (FloatingWindow {
             id: FLOAT_PREVIEW_ID,
             owner: "ext_telescope",
             title: "Preview — " ++ item.display,
             anchor: "bottom",
-            width_cols: 78,
+            width_cols: 108,
             height_rows: 6,
             lines: ["(Binary or unreadable file: " ++ item.file_path ++ ")"],
             selected_row: -1,
@@ -1011,7 +1059,7 @@ fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: Telesco
         } else {
             total
         }
-        let max_sec_rows: i64 = 12
+        let max_sec_rows: i64 = 16
         let sec_end = if sec_start + max_sec_rows < raw_end {
             sec_start + max_sec_rows
         } else {
@@ -1029,7 +1077,7 @@ fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: Telesco
             owner: "ext_telescope",
             title: "Preview — " ++ hdr_label,
             anchor: "bottom",
-            width_cols: 78,
+            width_cols: 108,
             height_rows: max_sec_rows,
             lines: sec_out,
             selected_row: 0,
@@ -1081,7 +1129,7 @@ fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: Telesco
         owner: "ext_telescope",
         title: "Preview — " ++ title_target,
         anchor: "bottom",
-        width_cols: 78,
+        width_cols: 108,
         height_rows: preview_rows,
         lines: out_lines,
         selected_row: highlight_row,
@@ -1101,7 +1149,7 @@ pub fn sync_telescope_windows(kernel: SystemKernel, world: EditorWorld, state: T
         apply_theme_preview(kernel, world, sel_item.command_name)
     }
 
-    let max_cand_rows: i64 = 10
+    let max_cand_rows: i64 = 15
     let total_filtered = state.filtered_items.len()
     let denom = if state.mode == "live_grep" or state.mode == "docs" {
         total_filtered
@@ -1109,9 +1157,15 @@ pub fn sync_telescope_windows(kernel: SystemKernel, world: EditorWorld, state: T
         state.base_items.len()
     }
 
+    let qlen = state.query.char_len()
+    let cur = if state.cursor_pos < 0 { 0 } else if state.cursor_pos > qlen { qlen } else { state.cursor_pos }
+    state.cursor_pos = cur
+    let q_left = state.query.slice(0, cur)
+    let q_right = state.query.slice(cur, qlen)
+
     let picker_lines = List()
-    picker_lines.push("> " ++ state.query ++ "█")
-    picker_lines.push("────────────────────────────────────────────────────────────────────────")
+    picker_lines.push(" " ++ q_left ++ "█" ++ q_right)
+    picker_lines.push("────────────────────────────────────────────────────────────────────────────────────────────────────────")
 
     var win_sel_row: i64 = -1
     if total_filtered == 0 {
@@ -1136,11 +1190,16 @@ pub fn sync_telescope_windows(kernel: SystemKernel, world: EditorWorld, state: T
         }
         for idx in start_i..end_i {
             let it = state.filtered_items.get(idx.as(usize)).as(PickerItem)
-            let pfx = if idx == state.selected_idx { "❯ " } else { "  " }
+            let pfx = if idx == state.selected_idx { " " } else { "  " }
             if idx == state.selected_idx {
                 win_sel_row = picker_lines.len()
             }
-            picker_lines.push(pfx ++ it.display)
+            let disp = if it.display != "" {
+                it.display
+            } else {
+                telescope_file_icon(it.label) ++ " " ++ it.label
+            }
+            picker_lines.push(pfx ++ disp)
         }
     }
 
@@ -1153,8 +1212,8 @@ pub fn sync_telescope_windows(kernel: SystemKernel, world: EditorWorld, state: T
         owner: "ext_telescope",
         title: picker_title,
         anchor: "center",
-        width_cols: 76,
-        height_rows: 13,
+        width_cols: 108,
+        height_rows: 18,
         lines: picker_lines,
         selected_row: win_sel_row,
         border_rgba: 0,
@@ -1403,10 +1462,19 @@ fn telescope_intercept_key(
     }
 
     let is_cancel = stroke.key == "Escape"
-        or (stroke.ctrl and (stroke.key == "[" or stroke.key == "c" or stroke.key == "g"))
+        or (stroke.ctrl and (stroke.key == "[" or stroke.key == "g" or stroke.key == "d"))
     if is_cancel {
         close_telescope(kernel, world, vim, state, true)
         status_emit("Telescope cancelled")#
+        return true
+    }
+
+    if stroke.ctrl and (not stroke.alt) and stroke.key == "c" {
+        state.query = ""
+        state.cursor_pos = 0
+        state.selected_idx = 0
+        recompute_filtered_items(world, state)
+        sync_telescope_windows(kernel, world, state)
         return true
     }
 
@@ -1418,6 +1486,7 @@ fn telescope_intercept_key(
     let is_down = stroke.key == "Down"
         or (stroke.ctrl and stroke.key == "n")
         or (stroke.ctrl and stroke.key == "j")
+        or (stroke.alt and (not stroke.ctrl) and stroke.key == "n")
         or (stroke.key == "Tab" and (not stroke.shift_mod))
     if is_down {
         let count = state.filtered_items.len()
@@ -1431,6 +1500,7 @@ fn telescope_intercept_key(
     let is_up = stroke.key == "Up"
         or (stroke.ctrl and stroke.key == "p")
         or (stroke.ctrl and stroke.key == "k")
+        or (stroke.alt and (not stroke.ctrl) and stroke.key == "p")
         or (stroke.key == "Tab" and stroke.shift_mod)
     if is_up {
         let count = state.filtered_items.len()
@@ -1446,31 +1516,152 @@ fn telescope_intercept_key(
         return true
     }
 
-    if stroke.ctrl and stroke.key == "u" {
-        state.query = ""
-        state.selected_idx = 0
-        recompute_filtered_items(world, state)
+    let qlen = state.query.char_len()
+    let cur = if state.cursor_pos < 0 { 0 } else if state.cursor_pos > qlen { qlen } else { state.cursor_pos }
+
+    if (stroke.ctrl and (not stroke.alt) and stroke.key == "a") or stroke.key == "Home" {
+        state.cursor_pos = 0
         sync_telescope_windows(kernel, world, state)
         return true
     }
 
-    if stroke.ctrl and stroke.key == "w" {
-        var trimmed = state.query.trim_end()
-        var n = trimmed.char_len()
-        while n > 0 and trimmed.slice(n - 1, n) != " " and trimmed.slice(n - 1, n) != "/" {
+    if (stroke.ctrl and (not stroke.alt) and stroke.key == "e") or stroke.key == "End" {
+        state.cursor_pos = qlen
+        sync_telescope_windows(kernel, world, state)
+        return true
+    }
+
+    if (stroke.ctrl and (not stroke.alt) and stroke.key == "b") or stroke.key == "Left" {
+        if cur > 0 {
+            state.cursor_pos = cur - 1
+            sync_telescope_windows(kernel, world, state)
+        }
+        return true
+    }
+
+    if (stroke.ctrl and (not stroke.alt) and stroke.key == "f") or stroke.key == "Right" {
+        if cur < qlen {
+            state.cursor_pos = cur + 1
+            sync_telescope_windows(kernel, world, state)
+        }
+        return true
+    }
+
+    if stroke.ctrl and (not stroke.alt) and stroke.key == "k" {
+        if cur < qlen {
+            state.query = state.query.slice(0, cur)
+            state.selected_idx = 0
+            recompute_filtered_items(world, state)
+            sync_telescope_windows(kernel, world, state)
+        }
+        return true
+    }
+
+    if stroke.ctrl and stroke.key == "u" {
+        if cur > 0 {
+            state.query = state.query.slice(cur, qlen)
+            state.cursor_pos = 0
+            state.selected_idx = 0
+            recompute_filtered_items(world, state)
+            sync_telescope_windows(kernel, world, state)
+        }
+        return true
+    }
+
+    if stroke.ctrl and (not stroke.alt) and stroke.key == "y" {
+        let rv_opt = world.kill_ring.current()
+        if rv_opt != null {
+            let ytext = rv_opt.as(RegisterValue).text.replace("\n", " ")
+            state.query = state.query.slice(0, cur) ++ ytext ++ state.query.slice(cur, qlen)
+            state.cursor_pos = cur + ytext.char_len()
+            state.selected_idx = 0
+            recompute_filtered_items(world, state)
+            sync_telescope_windows(kernel, world, state)
+        }
+        return true
+    }
+
+    if stroke.alt and (not stroke.ctrl) and stroke.key == "b" {
+        var n = cur
+        while n > 0 and (state.query.slice(n - 1, n) == " " or state.query.slice(n - 1, n) == "/") {
             n -= 1
         }
-        state.query = trimmed.slice(0, n)
-        state.selected_idx = 0
-        recompute_filtered_items(world, state)
+        while n > 0 and state.query.slice(n - 1, n) != " " and state.query.slice(n - 1, n) != "/" {
+            n -= 1
+        }
+        state.cursor_pos = n
         sync_telescope_windows(kernel, world, state)
+        return true
+    }
+
+    if stroke.alt and (not stroke.ctrl) and stroke.key == "f" {
+        var n = cur
+        while n < qlen and (state.query.slice(n, n + 1) == " " or state.query.slice(n, n + 1) == "/") {
+            n += 1
+        }
+        while n < qlen and state.query.slice(n, n + 1) != " " and state.query.slice(n, n + 1) != "/" {
+            n += 1
+        }
+        state.cursor_pos = n
+        sync_telescope_windows(kernel, world, state)
+        return true
+    }
+
+    if stroke.alt and (not stroke.ctrl) and stroke.key == "d" {
+        if cur < qlen {
+            var n = cur
+            while n < qlen and (state.query.slice(n, n + 1) == " " or state.query.slice(n, n + 1) == "/") {
+                n += 1
+            }
+            while n < qlen and state.query.slice(n, n + 1) != " " and state.query.slice(n, n + 1) != "/" {
+                n += 1
+            }
+            let killed = state.query.slice(cur, n)
+            world.kill_ring.push(killed, linewise = false, append = false)
+            state.query = state.query.slice(0, cur) ++ state.query.slice(n, qlen)
+            state.selected_idx = 0
+            recompute_filtered_items(world, state)
+            sync_telescope_windows(kernel, world, state)
+        }
+        return true
+    }
+
+    if (stroke.ctrl and stroke.key == "w") or (stroke.alt and (not stroke.ctrl) and stroke.key == "BackSpace") {
+        if cur > 0 {
+            let before = state.query.slice(0, cur)
+            let after = state.query.slice(cur, qlen)
+            var n = cur
+            while n > 0 and (before.slice(n - 1, n) == " " or before.slice(n - 1, n) == "/") {
+                n -= 1
+            }
+            while n > 0 and before.slice(n - 1, n) != " " and before.slice(n - 1, n) != "/" {
+                n -= 1
+            }
+            let killed = before.slice(n, cur)
+            world.kill_ring.push(killed, linewise = false, append = false)
+            state.query = before.slice(0, n) ++ after
+            state.cursor_pos = n
+            state.selected_idx = 0
+            recompute_filtered_items(world, state)
+            sync_telescope_windows(kernel, world, state)
+        }
+        return true
+    }
+
+    if stroke.key == "Delete" {
+        if cur < qlen {
+            state.query = state.query.slice(0, cur) ++ state.query.slice(cur + 1, qlen)
+            state.selected_idx = 0
+            recompute_filtered_items(world, state)
+            sync_telescope_windows(kernel, world, state)
+        }
         return true
     }
 
     if stroke.key == "BackSpace" or (stroke.ctrl and stroke.key == "h") {
-        let qlen = state.query.char_len()
-        if qlen > 0 {
-            state.query = state.query.slice(0, qlen - 1)
+        if cur > 0 {
+            state.query = state.query.slice(0, cur - 1) ++ state.query.slice(cur, qlen)
+            state.cursor_pos = cur - 1
             state.selected_idx = 0
             recompute_filtered_items(world, state)
             sync_telescope_windows(kernel, world, state)
@@ -1480,7 +1671,8 @@ fn telescope_intercept_key(
 
     let ch = picker_printable_char(stroke)
     if ch != "" {
-        state.query = state.query ++ ch
+        state.query = state.query.slice(0, cur) ++ ch ++ state.query.slice(cur, qlen)
+        state.cursor_pos = cur + ch.char_len()
         state.selected_idx = 0
         recompute_filtered_items(world, state)
         sync_telescope_windows(kernel, world, state)
@@ -1508,7 +1700,10 @@ pub fn open_telescope_picker(
         state.original_theme = world.options.theme_name
         if state.mode != "live_grep" and state.mode != "docs" {
             state.base_items = collect_base_items(kernel, world, state)
+            state.base_labels = List()
         }
+        state.preview_cache_key = ""
+        state.preview_cache_lines = null
         recompute_filtered_items(world, state)
     } else {
         let resolved_opt = if mode == "" {
@@ -1524,11 +1719,15 @@ pub fn open_telescope_picker(
         state.active = true
         state.mode = norm_mode
         state.query = initial_query
+        state.cursor_pos = initial_query.char_len()
         state.selected_idx = 0
         state.source_buf_id = world.active_buffer_id
         state.original_theme = world.options.theme_name
         state.has_history = true
         state.base_items = collect_base_items(kernel, world, state)
+        state.base_labels = List()
+        state.preview_cache_key = ""
+        state.preview_cache_lines = null
         recompute_filtered_items(world, state)
     }
 

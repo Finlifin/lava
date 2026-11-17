@@ -1,0 +1,381 @@
+-- ext_treesitter: Native Tree-Sitter Syntax Highlighting, Cursor Node Inspector & Runtime Status
+-- Extension for Lava (`lava.org/ext_treesitter`).
+
+use @lava_sys.{rgb}
+use @lava_core.{
+    ExtId, HookListener, InteractiveEffects, KeyBindingEntry, KeyStroke, Keymap, SystemKernel,
+    clipboard_get, clipboard_set, log_event, status_emit
+}
+use @lava_accel.{
+    accel_ts_highlight_rows, accel_ts_inspect_node, accel_ts_status
+}
+use @ext_document.{
+    Buffer, BufferId, EditorWorld, FloatingWindow, Pos, ext_document_id, require_editor_world
+}
+use @ext_vim.{
+    KEYMAP_VIM_LEADER, ModalInterceptor, SERVICE_VIM, VimState, ext_vim_id
+}
+
+pub const SERVICE_TREESITTER: String = "lava.treesitter.highlighter"
+pub const OWNER_TREESITTER: String = "ext_treesitter"
+pub const FLOAT_TREESITTER_INSPECT: String = "treesitter_inspect"
+pub const BUF_TREESITTER_STATUS: String = "*TreeSitter*"
+pub const MODE_TREESITTER_STATUS: String = "treesitter-status"
+
+pub fn ext_treesitter_id() -> ExtId = ExtId("lava.org/ext_treesitter")
+
+pub struct TreesitterService {
+    pub enabled: bool,
+    pub inspect_count: i64,
+}
+
+impl TreesitterService {
+    pub fn new() -> TreesitterService {
+        TreesitterService {
+            enabled: true,
+            inspect_count: 0,
+        }
+    }
+}
+
+pub fn require_treesitter_service(kernel: SystemKernel) -> !String TreesitterService {
+    let raw = kernel.require_service(SERVICE_TREESITTER)!
+    raw.as(TreesitterService)
+}
+
+private global _prev_buf_before_ts_status: BufferId = BufferId(1)
+
+fn migrate_leader_u_prefix(leader_km: Keymap) {
+    let prev_opt = leader_km.bindings.get("<Space> u")
+    if prev_opt != null {
+        let prev = prev_opt.as(KeyBindingEntry)
+        if prev.command_name == "undo-tree-visualize" {
+            let _ = leader_km.unbind("<Space> u")
+            leader_km.bind("<Space> u u", prev.command_name, prev.owner, description = prev.description)
+        }
+    }
+}
+
+fn dismiss_inspect_float(kernel: SystemKernel) {
+    let w_opt = kernel.service("lava.document.world")
+    if w_opt != null {
+        let _ = w_opt.as(EditorWorld).remove_floating_window(FLOAT_TREESITTER_INSPECT)
+    }
+    let v_opt = kernel.service(SERVICE_VIM)
+    if v_opt != null {
+        let vs = v_opt.as(VimState)
+        if vs.modal_interceptor != null and vs.modal_interceptor.as(ModalInterceptor).owner == OWNER_TREESITTER {
+            vs.modal_interceptor = null
+        }
+    }
+}
+
+fn cleanup_treesitter_hooks_and_bindings(kernel: SystemKernel, ext_id: ExtId) {
+    for topic_any in kernel.hooks.keys() {
+        let topic = topic_any.as(String)
+        let list_opt = kernel.hooks.get(topic)
+        if list_opt != null {
+            let listeners = list_opt.as(List)
+            let kept = List()
+            for i in 0..listeners.len() {
+                let item = listeners.get(i.as(usize)).as(HookListener)
+                if item.owner != ext_id {
+                    kept.push(item)
+                }
+            }
+            kernel.hooks.insert(topic, kept)
+        }
+    }
+    for km_any in kernel.keymaps.keys() {
+        let km_name = km_any.as(String)
+        let km_opt = kernel.keymaps.get(km_name)
+        if km_opt != null {
+            let km = km_opt.as(Keymap)
+            for chord_any in km.bindings.keys() {
+                let chord = chord_any.as(String)
+                let entry_opt = km.bindings.get(chord)
+                if entry_opt != null and entry_opt.as(KeyBindingEntry).owner == ext_id {
+                    let _ = km.unbind(chord)
+                }
+            }
+        }
+    }
+    let leader_opt = kernel.keymaps.get(KEYMAP_VIM_LEADER)
+    if leader_opt != null {
+        let leader_km = leader_opt.as(Keymap)
+        var other_u_prefix = false
+        for chord_any in leader_km.bindings.keys() {
+            let chord = chord_any.as(String)
+            if chord.starts_with("<Space> u ") and chord != "<Space> u u" {
+                other_u_prefix = true
+                break
+            }
+        }
+        if (not other_u_prefix) and leader_km.bindings.contains_key("<Space> u u") {
+            let u_entry = leader_km.bindings.get("<Space> u u").as(KeyBindingEntry)
+            let _ = leader_km.unbind("<Space> u u")
+            leader_km.bind("<Space> u", u_entry.command_name, u_entry.owner, description = u_entry.description)
+        }
+    }
+}
+
+pub fn toggle_treesitter_highlighting(
+    kernel: SystemKernel,
+    args: List,
+) -> #InteractiveEffects !String bool {
+    let world = require_editor_world(kernel)!
+    let svc = require_treesitter_service(kernel)!
+
+    let next_state = if not args.is_empty() {
+        let arg0 = args.get(0).as(String).trim().to_lower()
+        if arg0 == "on" or arg0 == "enable" or arg0 == "true" or arg0 == "1" {
+            true
+        } else if arg0 == "off" or arg0 == "disable" or arg0 == "false" or arg0 == "0" {
+            false
+        } else {
+            not svc.enabled
+        }
+    } else {
+        not svc.enabled
+    }
+
+    svc.enabled = next_state
+    world.options.treesitter = next_state
+    if not next_state {
+        dismiss_inspect_float(kernel)
+    }
+
+    let msg = if next_state {
+        "Tree-sitter highlighting: enabled"
+    } else {
+        "Tree-sitter highlighting: disabled (lexical fallback)"
+    }
+    status_emit(msg)#
+    next_state
+}
+
+pub fn inspect_treesitter_node(kernel: SystemKernel) -> #InteractiveEffects !String String {
+    let world = require_editor_world(kernel)!
+    let svc = require_treesitter_service(kernel)!
+    let buf = world.active_buffer()
+    buf.sync_external_lines()
+
+    let raw_info = accel_ts_inspect_node(
+        buf.doc_id,
+        buf.major_mode,
+        buf.point.row,
+        buf.point.col,
+    )
+    svc.inspect_count += 1
+
+    let info_text = if raw_info.trim() == "" {
+        "Language : " ++ buf.major_mode ++ "\nNo Tree-sitter node information available at cursor."
+    } else {
+        raw_info
+    }
+
+    let raw_lines = info_text.replace("\r\n", "\n").split("\n")
+    let formatted = List()
+    var max_w: i64 = 38
+    for i in 0..raw_lines.len() {
+        let ln = raw_lines.get(i.as(usize)).as(String)
+        let clipped = if ln.char_len() > 88 { ln.slice(0, 88) ++ "…" } else { ln }
+        let padded = " " ++ clipped ++ " "
+        if padded.char_len() + 2 > max_w {
+            max_w = padded.char_len() + 2
+        }
+        formatted.push(padded)
+    }
+    if formatted.is_empty() {
+        formatted.push(" No syntax node under cursor. ")
+    }
+
+    let w_cols = if max_w > 94 { 94 } else { max_w }
+    let raw_h = formatted.len() + 2
+    let h_rows = if raw_h > 16 { 16 } else if raw_h < 4 { 4 } else { raw_h }
+    let title_mode = if buf.major_mode != "" { buf.major_mode } else { "text" }
+
+    world.set_floating_window(FloatingWindow {
+        id: FLOAT_TREESITTER_INSPECT,
+        owner: OWNER_TREESITTER,
+        title: " *TSInspect* · " ++ title_mode ++ " (" ++ (buf.point.row + 1).to_string() ++ ":" ++ (buf.point.col + 1).to_string() ++ ") ",
+        anchor: "cursor",
+        width_cols: w_cols,
+        height_rows: h_rows,
+        lines: formatted,
+        selected_row: 0,
+        border_rgba: rgb(137, 180, 250),
+    })
+
+    let vim_opt = kernel.service(SERVICE_VIM)
+    if vim_opt != null {
+        let vim = vim_opt.as(VimState)
+        if vim.modal_interceptor == null {
+            vim.modal_interceptor = ModalInterceptor {
+                owner: OWNER_TREESITTER,
+                handler: |kern: SystemKernel, stroke: KeyStroke| -> #[log_event, status_emit, clipboard_get, clipboard_set] !String bool {
+                    dismiss_inspect_float(kern)
+                    stroke.key == "Escape"
+                },
+            }
+        }
+    }
+
+    let first_line = raw_lines.get(0).as(String).trim()
+    status_emit("TSInspect: " ++ first_line)#
+    info_text
+}
+
+fn format_language_grid(langs: List, cols_per_row: i64) -> List {
+    let out = List()
+    if langs.is_empty() {
+        out.push("   (none)")
+        return out
+    }
+    var cur = "  "
+    var count_in_row: i64 = 0
+    for i in 0..langs.len() {
+        let name = langs.get(i.as(usize)).as(String)
+        let pad_len = if name.char_len() < 16 { 16 - name.char_len() } else { 1 }
+        cur = cur ++ " " ++ name ++ " ".repeat(pad_len)
+        count_in_row += 1
+        if count_in_row >= cols_per_row {
+            out.push(cur.trim_end())
+            cur = "  "
+            count_in_row = 0
+        }
+    }
+    if count_in_row > 0 {
+        out.push(cur.trim_end())
+    }
+    out
+}
+
+pub fn open_treesitter_status(kernel: SystemKernel) -> #InteractiveEffects !String Buffer {
+    let world = require_editor_world(kernel)!
+    let svc = require_treesitter_service(kernel)!
+    let active = world.active_buffer()
+    if active.name != BUF_TREESITTER_STATUS {
+        _prev_buf_before_ts_status = active.id
+    }
+
+    active.sync_external_lines()
+    let (loaded, abi_ver, grammar_cnt, langs) = accel_ts_status()
+    let probe_rows = accel_ts_highlight_rows(active.doc_id, active.major_mode, 0, 0)
+    let active_lang_supported = not probe_rows.is_empty()
+
+    let lines = List()
+    lines.push("========================================================================")
+    lines.push(" Lava Tree-Sitter Runtime Status (*TreeSitter*)      Press `q` to close ")
+    lines.push("========================================================================")
+    lines.push(" Highlighting  : " ++ (if svc.enabled and world.options.treesitter { "ENABLED" } else { "DISABLED" }))
+    lines.push(" Native Runtime: " ++ (if loaded { "libtree-sitter LOADED (dlopen)" } else { "Pure-Nessa Fallback Mode" }))
+    lines.push(" ABI Version   : " ++ abi_ver.to_string())
+    lines.push(" Grammars Found: " ++ grammar_cnt.to_string())
+    lines.push(" Inspect Count : " ++ svc.inspect_count.to_string())
+    lines.push("------------------------------------------------------------------------")
+    lines.push(" Origin Buffer : " ++ active.name ++ " (mode=" ++ active.major_mode ++ ", doc_id=" ++ active.doc_id.to_string() ++ ")")
+    lines.push(" Active Parser : " ++ (if active_lang_supported { "ACTIVE (" ++ active.major_mode ++ ")" } else { "Lexical Fallback (" ++ active.major_mode ++ ")" }))
+    lines.push("------------------------------------------------------------------------")
+    lines.push(" Available Languages (" ++ langs.len().to_string() ++ "):")
+
+    let grid = format_language_grid(langs, 4)
+    for i in 0..grid.len() {
+        lines.push(grid.get(i.as(usize)).as(String))
+    }
+
+    let ts_buf = world.ensure_special_buffer(
+        BUF_TREESITTER_STATUS,
+        MODE_TREESITTER_STATUS,
+        lines,
+        read_only = true,
+    )
+    ts_buf.point = Pos.zero()
+    let _ = world.switch_to_buffer(ts_buf.id)
+    kernel.emit_hook("buffer-switched", ts_buf.id)
+    status_emit(
+        "*TreeSitter*: runtime=" ++ (if loaded { "loaded" } else { "fallback" })
+        ++ ", ABI=" ++ abi_ver.to_string()
+        ++ ", grammars=" ++ grammar_cnt.to_string()
+    )#
+    ts_buf
+}
+
+pub fn register_treesitter_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_treesitter_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_treesitter",
+        "0.1.0",
+        "Native Tree-sitter syntax highlighting toggle (`<Space>uT`), cursor AST node inspector (`<Space>uI`), and `*TreeSitter*` runtime status (`:TSStatus`).",
+        [ext_document_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let svc = TreesitterService.new()
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                svc.enabled = w_opt.as(EditorWorld).options.treesitter
+            }
+            k.publish_service(SERVICE_TREESITTER, ext_id, svc)
+
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            migrate_leader_u_prefix(leader_km)
+            leader_km.bind("<Space> u T", "treesitter-toggle", ext_id, description = "Toggle Tree-sitter highlighting")
+            leader_km.bind("<Space> u I", "treesitter-inspect", ext_id, description = "Inspect Tree-sitter node at cursor")
+
+            let status_km = k.ensure_keymap("mode:" ++ MODE_TREESITTER_STATUS)
+            status_km.bind("q", "treesitter-status-close", ext_id, description = "Close *TreeSitter* buffer")
+            status_km.bind("<Escape>", "treesitter-status-close", ext_id, description = "Close *TreeSitter* buffer")
+
+            let on_dismiss = |kern: SystemKernel, _payload: Any| -> Unit {
+                dismiss_inspect_float(kern)
+            }
+            k.add_hook("cursor-moved", ext_id, on_dismiss, priority = 35)
+            k.add_hook("buffer-switched", ext_id, on_dismiss, priority = 35)
+            k.add_hook("buffer-changed", ext_id, on_dismiss, priority = 35)
+
+            let toggle_fn = |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                toggle_treesitter_highlighting(kern, args)#
+            }
+            let inspect_fn = |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                inspect_treesitter_node(kern)#
+            }
+            let status_fn = |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                open_treesitter_status(kern)#
+            }
+            let close_fn = |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                let w = require_editor_world(kern)!
+                if w.buffers.contains_key(_prev_buf_before_ts_status) {
+                    let _ = w.switch_to_buffer(_prev_buf_before_ts_status)
+                } else {
+                    let _ = w.cycle_buffer(-1)
+                }
+                kern.emit_hook("buffer-switched", w.active_buffer_id)
+                ()
+            }
+
+            k.register_command("treesitter-toggle", ext_id, "Toggle Tree-sitter syntax highlighting (`<Space> u T`, `:TSToggle`).", toggle_fn)
+            k.register_command("ex:TSToggle", ext_id, "Ex `:TSToggle`.", toggle_fn, interactive = false)
+            k.register_command("ex:TSHighlightToggle", ext_id, "Ex `:TSHighlightToggle`.", toggle_fn, interactive = false)
+
+            k.register_command("treesitter-inspect", ext_id, "Inspect Tree-sitter syntax node & highlight captures under cursor (`<Space> u I`, `:TSInspect`).", inspect_fn)
+            k.register_command("ex:TSInspect", ext_id, "Ex `:TSInspect`.", inspect_fn, interactive = false)
+            k.register_command("ex:TSNode", ext_id, "Ex `:TSNode`.", inspect_fn, interactive = false)
+
+            k.register_command("treesitter-status", ext_id, "Open `*TreeSitter*` read-only status buffer (`:TSStatus`).", status_fn)
+            k.register_command("ex:TSStatus", ext_id, "Ex `:TSStatus`.", status_fn, interactive = false)
+            k.register_command("treesitter-status-close", ext_id, "Close `*TreeSitter*` buffer and restore previous buffer.", close_fn, interactive = false)
+
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            dismiss_inspect_float(k)
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                w_opt.as(EditorWorld).clear_owner_ui(OWNER_TREESITTER)
+            }
+            cleanup_treesitter_hooks_and_bindings(k, ext_id)
+            ()
+        },
+    )
+}

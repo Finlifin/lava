@@ -8,11 +8,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::UNIX_EPOCH;
+use std::time::{Instant, UNIX_EPOCH};
 
 use driver::{
-    CompileResult, Driver, ManifestDocument, PackageSources, SourceFile, install_artifact,
-    load_package_sources, load_package_workspace,
+    CompileResult, Driver, ManifestDocument, OptLevel, PackageSources, SourceFile,
+    install_artifact, load_package_sources, load_package_workspace,
 };
 use gc::GcConfig;
 use initialization::{Engine, EngineConfig, JitConfig};
@@ -126,6 +126,7 @@ pub struct LavaWorkspace {
     workspace_root: PathBuf,
     extra_ext_dirs: Vec<PathBuf>,
     user_script: Option<PathBuf>,
+    cache_dir: Option<PathBuf>,
 }
 
 impl LavaWorkspace {
@@ -134,6 +135,7 @@ impl LavaWorkspace {
             workspace_root: workspace_root.into(),
             extra_ext_dirs: Vec::new(),
             user_script: None,
+            cache_dir: None,
         }
     }
 
@@ -144,6 +146,11 @@ impl LavaWorkspace {
 
     pub fn with_user_script(mut self, script: Option<PathBuf>) -> Self {
         self.user_script = script;
+        self
+    }
+
+    pub fn with_cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.cache_dir = Some(dir.into());
         self
     }
 
@@ -285,7 +292,7 @@ impl LavaWorkspace {
 
         let composed = self.compose_boot(options)?;
         let cache_path = nsbc_cache_path_for(
-            &self.workspace_root,
+            self.cache_dir.as_deref(),
             &composed.boot_package,
             &composed.catalog,
         );
@@ -298,6 +305,10 @@ impl LavaWorkspace {
             return Ok(cached);
         }
 
+        let opt_level = OptLevel::from_env();
+        let ext_count = composed.extensions.len();
+        eprintln!("[lava] compiling {ext_count} Nessa extension(s) ({opt_level:?})...");
+        let compile_start = Instant::now();
         let privileged = BTreeSet::new();
         let compiled = Driver::new().compile_package_sources_with_privileged(
             &composed.boot_package,
@@ -305,11 +316,15 @@ impl LavaWorkspace {
             &privileged,
         );
         let artifact = compile_result_to_artifact(compiled)?;
+        let elapsed = compile_start.elapsed().as_secs_f64();
         if let Some(path) = &cache_path {
             store_cached_artifact(path, &artifact);
             if let Some(ptr_path) = &stat_ptr_path {
                 store_stat_manifest_ptr(ptr_path, path);
             }
+            eprintln!("[lava] compiled in {elapsed:.2}s (cached: {})", path.display());
+        } else {
+            eprintln!("[lava] compiled in {elapsed:.2}s");
         }
         Ok(artifact)
     }
@@ -317,6 +332,10 @@ impl LavaWorkspace {
     /// Validate all discovered extensions (and optional `init.ns`) in a single Nessa compile pass.
     pub fn check_boot(&self, options: &BootOptions) -> Result<Vec<ExtensionPackageInfo>, String> {
         let composed = self.compose_boot(options)?;
+        let opt_level = OptLevel::from_env();
+        let ext_count = composed.extensions.len();
+        eprintln!("[lava] checking {ext_count} Nessa extension(s) ({opt_level:?})...");
+        let compile_start = Instant::now();
         let privileged = BTreeSet::new();
         let compiled = Driver::new().compile_package_sources_with_privileged(
             &composed.boot_package,
@@ -324,8 +343,12 @@ impl LavaWorkspace {
             &privileged,
         );
         let artifact = compile_result_to_artifact(compiled)?;
+        eprintln!(
+            "[lava] checked in {:.2}s",
+            compile_start.elapsed().as_secs_f64()
+        );
         if let Some(path) = nsbc_cache_path_for(
-            &self.workspace_root,
+            self.cache_dir.as_deref(),
             &composed.boot_package,
             &composed.catalog,
         ) {
@@ -450,18 +473,29 @@ pub fn run_entry_package(
         }
     }
 
-    let cache_path = nsbc_cache_path_for(workspace_root, &root_pkg, &catalog);
+    let cache_path = nsbc_cache_path_for(None, &root_pkg, &catalog);
     let artifact = if let Some(path) = &cache_path
         && let Some(cached) = try_load_cached_artifact(path)
     {
         cached
     } else {
+        let opt_level = OptLevel::from_env();
+        let pkg_name = root_pkg.manifest.manifest().name.clone();
+        eprintln!("[lava] compiling package '{pkg_name}' ({opt_level:?})...");
+        let compile_start = Instant::now();
         let privileged = BTreeSet::new();
         let compiled =
             Driver::new().compile_package_sources_with_privileged(&root_pkg, &catalog, &privileged);
         let built = compile_result_to_artifact(compiled)?;
+        let elapsed = compile_start.elapsed().as_secs_f64();
         if let Some(path) = &cache_path {
             store_cached_artifact(path, &built);
+            eprintln!(
+                "[lava] compiled '{pkg_name}' in {elapsed:.2}s (cached: {})",
+                path.display()
+            );
+        } else {
+            eprintln!("[lava] compiled '{pkg_name}' in {elapsed:.2}s");
         }
         built
     };
@@ -623,32 +657,53 @@ fn hash_package_sources(hasher: &mut ContentHasher128, pkg: &PackageSources) {
     hash_module_tree(hasher, &pkg.modules);
 }
 
-fn resolve_nsbc_cache_dir(workspace_root: &Path) -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("LAVA_NSBC_CACHE_DIR") {
+fn resolve_nsbc_cache_dir_from_vars(
+    override_dir: Option<&Path>,
+    env_cache_dir: Option<&str>,
+    xdg_cache_home: Option<&str>,
+    home_dir: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(dir) = override_dir {
+        return Some(dir.to_path_buf());
+    }
+    if let Some(explicit) = env_cache_dir.map(str::trim).filter(|s| !s.is_empty()) {
         if explicit == "0" || explicit.eq_ignore_ascii_case("off") {
             return None;
         }
-        if !explicit.is_empty() {
-            return Some(PathBuf::from(explicit));
-        }
+        return Some(PathBuf::from(explicit));
     }
-    let ws_target = workspace_root.join("target");
-    if ws_target.is_dir() {
-        return Some(ws_target.join("lava-nsbc-cache"));
+    if let Some(xdg) = xdg_cache_home.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(xdg).join("lava").join("nsbc"));
+    }
+    if let Some(home) = home_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(home).join(".cache").join("lava").join("nsbc"));
     }
     Some(std::env::temp_dir().join("lava-nsbc-cache"))
 }
 
+fn resolve_nsbc_cache_dir(override_dir: Option<&Path>) -> Option<PathBuf> {
+    let env_cache_dir = std::env::var("LAVA_NSBC_CACHE_DIR").ok();
+    let xdg_cache_home = std::env::var("XDG_CACHE_HOME").ok();
+    let home_dir = std::env::var("HOME").ok();
+    resolve_nsbc_cache_dir_from_vars(
+        override_dir,
+        env_cache_dir.as_deref(),
+        xdg_cache_home.as_deref(),
+        home_dir.as_deref(),
+    )
+}
+
 fn nsbc_cache_path_for(
-    workspace_root: &Path,
+    override_cache_dir: Option<&Path>,
     boot_pkg: &PackageSources,
     catalog: &[PackageSources],
 ) -> Option<PathBuf> {
-    let dir = resolve_nsbc_cache_dir(workspace_root)?;
+    let dir = resolve_nsbc_cache_dir(override_cache_dir)?;
     let mut hasher = ContentHasher128::new();
-    hasher.write_str("lava-nsbc-cache-v1");
+    hasher.write_str("lava-nsbc-cache-v2");
     hasher.write_str(env!("CARGO_PKG_VERSION"));
     hasher.write_u64(u64::from(nsbc::VERSION));
+    hasher.write_u64(u64::from(driver::OptLevel::from_env().as_u8()));
     hash_package_sources(&mut hasher, boot_pkg);
 
     let mut sorted_catalog: Vec<&PackageSources> = catalog.iter().collect();
@@ -801,7 +856,7 @@ fn collect_parent_pkg_children_stats(
 
 impl LavaWorkspace {
     fn compute_stat_manifest_ptr_path(&self, options: &BootOptions) -> Option<PathBuf> {
-        let cache_dir = resolve_nsbc_cache_dir(&self.workspace_root)?;
+        let cache_dir = resolve_nsbc_cache_dir(self.cache_dir.as_deref())?;
         let packages_dir = self.workspace_root.join("packages");
         if !packages_dir.is_dir() {
             return None;
@@ -839,9 +894,10 @@ impl LavaWorkspace {
         stats.sort();
 
         let mut hasher = ContentHasher128::new();
-        hasher.write_str("lava-stat-v1");
+        hasher.write_str("lava-stat-v2");
         hasher.write_str(env!("CARGO_PKG_VERSION"));
         hasher.write_u64(u64::from(nsbc::VERSION));
+        hasher.write_u64(u64::from(driver::OptLevel::from_env().as_u8()));
         hasher.write_str(&options.entry_pkg);
         hasher.write_u64(u64::from(self.user_script.is_some()));
         hasher.write_u64(stats.len() as u64);
@@ -1102,6 +1158,7 @@ fn synthesize_user_init_package(
             source,
         },
         modules: Vec::new(),
+        wasm_assets: Vec::new(),
     })
 }
 
@@ -1213,6 +1270,7 @@ fn synthesize_boot_package(
             source: main_source,
         },
         modules: Vec::new(),
+        wasm_assets: Vec::new(),
     };
     attach_host_abi_anchor_module(&mut boot_pkg);
     Ok(boot_pkg)
@@ -2326,6 +2384,7 @@ fn main() {{
                 source: main_source,
             },
             modules: Vec::new(),
+            wasm_assets: Vec::new(),
         };
         attach_host_abi_anchor_module(&mut root_pkg);
 
@@ -2383,7 +2442,7 @@ fn main() {{
         let lib_ns = pkg_dir.join("lib.ns");
         fs::write(&lib_ns, "pub fn launch() -> i64 {\n    return 0\n}\n").expect("write lib.ns");
 
-        let ws = LavaWorkspace::new(&tmp_ws);
+        let ws = LavaWorkspace::new(&tmp_ws).with_cache_dir(&cache_dir);
         let opts = BootOptions::default().with_entry_pkg("lava.org/mini_app");
 
         let ptr1 = ws
@@ -2423,5 +2482,34 @@ fn main() {{
         assert_eq!(rc3, 0);
 
         let _ = fs::remove_dir_all(&tmp_ws);
+    }
+
+    #[test]
+    fn xdg_cache_dir_resolution_respects_precedence_and_disable() {
+        let explicit = PathBuf::from("/tmp/explicit-ws-cache");
+        assert_eq!(
+            resolve_nsbc_cache_dir_from_vars(Some(&explicit), Some("/tmp/env"), Some("/tmp/xdg"), Some("/tmp/home")),
+            Some(explicit)
+        );
+        assert_eq!(
+            resolve_nsbc_cache_dir_from_vars(None, Some("off"), Some("/tmp/xdg"), Some("/tmp/home")),
+            None
+        );
+        assert_eq!(
+            resolve_nsbc_cache_dir_from_vars(None, Some("0"), Some("/tmp/xdg"), Some("/tmp/home")),
+            None
+        );
+        assert_eq!(
+            resolve_nsbc_cache_dir_from_vars(None, Some("/tmp/custom-lava"), Some("/tmp/xdg"), Some("/tmp/home")),
+            Some(PathBuf::from("/tmp/custom-lava"))
+        );
+        assert_eq!(
+            resolve_nsbc_cache_dir_from_vars(None, None, Some("/tmp/xdg"), Some("/tmp/home")),
+            Some(PathBuf::from("/tmp/xdg/lava/nsbc"))
+        );
+        assert_eq!(
+            resolve_nsbc_cache_dir_from_vars(None, None, None, Some("/tmp/home")),
+            Some(PathBuf::from("/tmp/home/.cache/lava/nsbc"))
+        );
     }
 }

@@ -212,6 +212,82 @@ fn try_parse_rgb_call(line: String, col: i64, llen: i64) -> ?(i64, i64, i64, i64
     (after_b + 1, r, g, b)
 }
 
+fn is_prose_markup_mode(mode_low: String) -> bool {
+    mode_low == "markdown"
+        or mode_low == "md"
+        or mode_low == "gfm"
+        or mode_low == "org"
+        or mode_low == "text"
+        or mode_low == "plaintext"
+}
+
+fn is_all_ascii_digits(s: String) -> bool {
+    let n = s.len()
+    if n == 0 {
+        return false
+    }
+    var i: i64 = 0
+    while i < n {
+        let b = s.byte_at(i)
+        if b < 48 or b > 57 {
+            return false
+        }
+        i += 1
+    }
+    true
+}
+
+fn md_fence_open_spec(line: String) -> ?(i64, i64, String) {
+    let blen = line.len()
+    var sp: i64 = 0
+    while sp < blen and sp < 12 and (line.byte_at(sp) == 32 or line.byte_at(sp) == 9 or line.byte_at(sp) == 62) {
+        sp += 1
+    }
+    if sp + 3 > blen {
+        return null
+    }
+    let fc = line.byte_at(sp)
+    if fc != 96 and fc != 126 {
+        return null
+    }
+    var flen: i64 = 0
+    while sp + flen < blen and line.byte_at(sp + flen) == fc {
+        flen += 1
+    }
+    if flen < 3 {
+        return null
+    }
+    let rest = line.drop(sp + flen).trim()
+    if fc == 96 and rest.contains("`") {
+        return null
+    }
+    (fc, flen, rest.to_lower())
+}
+
+fn md_fence_is_close(line: String, fc: i64, min_len: i64) -> bool {
+    let blen = line.len()
+    var sp: i64 = 0
+    while sp < blen and sp < 12 and (line.byte_at(sp) == 32 or line.byte_at(sp) == 9 or line.byte_at(sp) == 62) {
+        sp += 1
+    }
+    var flen: i64 = 0
+    while sp + flen < blen and line.byte_at(sp + flen) == fc {
+        flen += 1
+    }
+    if flen < min_len {
+        return false
+    }
+    var k = sp + flen
+    while k < blen {
+        let b = line.byte_at(k)
+        if b != 32 and b != 9 {
+            return false
+        }
+        k += 1
+    }
+    true
+}
+
 -- Try to parse `#RGB`, `#RRGGBB`, or `#RRGGBBAA` at `col`, returning `?(end_col, r, g, b)`.
 fn try_parse_hash_hex(line: String, col: i64, llen: i64) -> ?(i64, i64, i64, i64) {
     if col + 4 > llen or line.slice(col, col + 1) != "#" {
@@ -270,7 +346,7 @@ fn try_parse_zero_x_hex(line: String, col: i64, llen: i64) -> ?(i64, i64, i64, i
     (end_col, r, g, b)
 }
 
-fn decorate_line_color_swatches(buf: Buffer, row: i64, line: String) {
+fn decorate_line_color_swatches(buf: Buffer, row: i64, line: String, prose_mode: bool) {
     let llen = line.char_len()
     var c: i64 = 0
     while c < llen {
@@ -279,17 +355,24 @@ fn decorate_line_color_swatches(buf: Buffer, row: i64, line: String) {
             let hit_opt = try_parse_hash_hex(line, c, llen)
             if hit_opt != null {
                 let (ec, r, g, b) = hit_opt.as((i64, i64, i64, i64))
-                buf.add_inline_decor(
-                    OWNER_COLORIZER,
-                    row,
-                    c,
-                    ec,
-                    bg_rgba = rgb(r, g, b),
-                    fg_rgba = swatch_contrast_fg(r, g, b),
-                    underline = false,
-                )
-                c = ec
-                continue
+                let tok = line.slice(c + 1, ec)
+                -- In Markdown/Org prose, avoid turning GitHub issue numbers (`#123`) or `#anchor` links into `#RGB` swatches!
+                let skip_prose_short = prose_mode
+                    and tok.char_len() == 3
+                    and (is_all_ascii_digits(tok) or (c > 0 and line.slice(c - 1, c) == "("))
+                if not skip_prose_short {
+                    buf.add_inline_decor(
+                        OWNER_COLORIZER,
+                        row,
+                        c,
+                        ec,
+                        bg_rgba = rgb(r, g, b),
+                        fg_rgba = swatch_contrast_fg(r, g, b),
+                        underline = false,
+                    )
+                    c = ec
+                    continue
+                }
             }
             c += 1
             continue
@@ -401,14 +484,54 @@ fn is_double_dash_comment_mode(mode_low: String) -> bool {
 
 fn decorate_buffer_rainbow(buf: Buffer, win_start: i64, win_end: i64) {
     let mode_low = buf.major_mode.to_lower()
+    if mode_low == "org" or mode_low == "text" or mode_low == "plaintext" or mode_low == "info" or mode_low == "help" {
+        return
+    }
+    let is_md = mode_low == "markdown" or mode_low == "md" or mode_low == "gfm"
     let stack = List()
     var block_cmt_end = ""
     let err_col = rainbow_unmatched_error_color()
-    let dash_cmt = is_double_dash_comment_mode(mode_low)
-    let scan_from = if win_start > 80 { win_start - 80 } else { 0 }
+    var in_md_fence = false
+    var md_fc: i64 = 0
+    var md_flen: i64 = 0
+    var fence_mode = mode_low
+    let scan_from = if is_md {
+        0
+    } else if win_start > 80 {
+        win_start - 80
+    } else {
+        0
+    }
 
     for r in scan_from..win_end {
         let line = buf.line_at(r)
+        if is_md {
+            if not in_md_fence {
+                let f_opt = md_fence_open_spec(line)
+                if f_opt != null {
+                    let (fc, fl, flang) = f_opt.as((i64, i64, String))
+                    in_md_fence = true
+                    md_fc = fc
+                    md_flen = fl
+                    fence_mode = flang
+                    while not stack.is_empty() {
+                        let _ = stack.pop()
+                    }
+                    block_cmt_end = ""
+                }
+                continue
+            } else if md_fence_is_close(line, md_fc, md_flen) {
+                in_md_fence = false
+                fence_mode = mode_low
+                while not stack.is_empty() {
+                    let _ = stack.pop()
+                }
+                block_cmt_end = ""
+                continue
+            }
+        }
+        let eff_mode = if is_md { fence_mode } else { mode_low }
+        let dash_cmt = is_double_dash_comment_mode(eff_mode)
         if block_cmt_end == ""
             and (not line.contains("("))
             and (not line.contains(")"))
@@ -457,7 +580,7 @@ fn decorate_buffer_rainbow(buf: Buffer, win_start: i64, win_end: i64) {
             }
 
             let ch = line.slice(c, c + 1)
-            if ch == "#" and is_hash_comment_start(line, c, llen, mode_low) {
+            if ch == "#" and is_hash_comment_start(line, c, llen, eff_mode) {
                 break
             }
 
@@ -481,7 +604,7 @@ fn decorate_buffer_rainbow(buf: Buffer, win_start: i64, win_end: i64) {
 
             -- Single-quoted char/string literal `'...'` (careful with Rust `&'a` lifetimes & contractions)
             if ch == "'" {
-                if mode_low == "rust" {
+                if eff_mode == "rust" or eff_mode == "rs" {
                     if c + 2 < llen and line.slice(c + 1, c + 2) != "\\" and line.slice(c + 2, c + 3) == "'" {
                         c += 3
                         continue
@@ -631,10 +754,11 @@ pub fn refresh_buffer_colorizer(
     buf.clear_owner_decors(OWNER_RAINBOW)
 
     if service.colors_enabled {
+        let prose_mode = is_prose_markup_mode(buf.major_mode.to_lower())
         for r in win_start..win_end {
             let line = buf.line_at(r)
-            if line.contains("#") or line.contains("rgb") or line.contains("RGB") or line.contains("hsl") or line.contains("HSL") {
-                decorate_line_color_swatches(buf, r, line)
+            if line.contains("#") or line.contains("0x") or line.contains("0X") or line.contains("rgb") or line.contains("RGB") or line.contains("hsl") or line.contains("HSL") {
+                decorate_line_color_swatches(buf, r, line, prose_mode)
             }
         }
     }

@@ -112,7 +112,7 @@ fn format_git_segment(entry: LualineGitCacheEntry) -> String {
         return ""
     }
     let br = if entry.branch != "" { entry.branch } else { "HEAD" }
-    var out = "git:" ++ br
+    var out = " git:" ++ br
     if entry.staged_count > 0 {
         out = out ++ " +" ++ entry.staged_count.to_string()
     }

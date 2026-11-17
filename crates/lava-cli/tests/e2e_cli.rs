@@ -139,6 +139,7 @@ fn cli_list_extensions_and_check_user_init_succeed() {
         "lava.org/lava_remote",
         "lava.org/ext_diff",
         "lava.org/ext_remote",
+        "lava.org/ext_treesitter",
     ] {
         assert!(
             stdout.contains(expected),
@@ -161,7 +162,7 @@ fn cli_list_extensions_and_check_user_init_succeed() {
     );
     let chk_stdout = String::from_utf8_lossy(&check_out.stdout);
     assert!(
-        chk_stdout.contains("ok: verified 45 extension(s)"),
+        chk_stdout.contains("ok: verified 46 extension(s)"),
         "stdout was: {chk_stdout}"
     );
 }

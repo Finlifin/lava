@@ -4,10 +4,13 @@
 -- and `--ext-dir`) inside a single shared Nessa VM, installs effect capability handlers,
 -- routes platform UI events into Extension computations, and commits 2D `RenderFrame` scenes.
 
+use std.env
 use std.fs
+use std.path
 use @lava_sys.{
-    RawUiEvent, host_clipboard_get, host_clipboard_set, host_commit_frame, host_measure_font,
-    host_poll_events, host_request_quit, host_wait_events, mock_quit_requested
+    RawUiEvent, ScrollViewportSpec, host_clipboard_get, host_clipboard_set, host_commit_frame,
+    host_measure_font, host_poll_events, host_request_quit, host_set_anim_hints, host_wait_events,
+    mock_quit_requested
 }
 use @lava_core.{
     ExtId, InteractiveEffects, KeyStroke, PromptRequest, ServiceEffects, SystemKernel,
@@ -18,8 +21,10 @@ use @ext_document.{
     VisualKind, VisualSelection, ext_document_id, register_document_extension, require_editor_world
 }
 use @ext_window.{
-    WinId, WindowManager, WindowPane, char_display_width, ext_window_id, register_window_extension,
-    require_window_manager
+    WinId, WindowManager, WindowPane, char_col_to_visual_col, char_display_width,
+    compute_gutter_width, ext_window_id, mode_line_height, register_window_extension,
+    require_window_manager, safe_tabstop, step_visible_row_backward, step_visible_row_forward,
+    visible_buffer_rows
 }
 use @ext_render.{compose_frame, ext_render_id, register_render_extension}
 use @ext_minibuffer.{
@@ -171,6 +176,8 @@ fn should_try_special_tools_first(
     vs.mode == VimMode.Normal
         and vs.pending_prefix == ""
         and vs.leader_strokes.is_empty()
+        and vs.plugin_strokes.is_empty()
+        and vs.modal_interceptor == null
         and (not kernel.macros.is_recording())
 }
 
@@ -309,6 +316,29 @@ fn display_col_to_char_col(line: String, target_disp_col: i64) -> i64 {
     n
 }
 
+fn cursor_anchor_pixel_pos(world: EditorWorld, wm: WindowManager) -> (f64, f64, f64) {
+    let cell_w = if wm.metrics.cell_width > 1.0 { wm.metrics.cell_width } else { 9.0 }
+    let cell_h = if wm.metrics.cell_height > 1.0 { wm.metrics.cell_height } else { 19.0 }
+    let pane = wm.active_pane()
+    let buf = world.active_buffer()
+    let r = pane.rect
+    let gw = compute_gutter_width(buf, world.options, wm.metrics)
+    let ts = safe_tabstop(world.options)
+    let cur_line = buf.line_at(pane.cursor.row)
+    let cur_vcol = char_col_to_visual_col(cur_line, pane.cursor.col, ts) - pane.left_col
+    let cx = r.x + gw + (if cur_vcol > 0 { cur_vcol } else { 0 }).as(f64) * cell_w
+    let vis = visible_buffer_rows(buf, pane.top_row, wm.pane_rows(pane))
+    var s_idx: i64 = 0
+    for i in 0..vis.len() {
+        if vis.get(i.as(usize)).as(i64) == pane.cursor.row {
+            s_idx = i
+            break
+        }
+    }
+    let cy = r.y + s_idx.as(f64) * cell_h
+    (cx, cy, cell_h)
+}
+
 fn floating_window_box(world: EditorWorld, wm: WindowManager, fw: FloatingWindow) -> (f64, f64, f64, f64) {
     let cell_w = if wm.metrics.cell_width > 1.0 { wm.metrics.cell_width } else { 9.0 }
     let cell_h = if wm.metrics.cell_height > 1.0 { wm.metrics.cell_height } else { 19.0 }
@@ -320,6 +350,26 @@ fn floating_window_box(world: EditorWorld, wm: WindowManager, fw: FloatingWindow
     let box_w = if raw_w > win_w - 24.0 { win_w - 24.0 } else if raw_w < 160.0 { 160.0 } else { raw_w }
     let max_avail_h = echo_y - 26.0 - 16.0
     let box_h = if raw_h > max_avail_h { max_avail_h } else if raw_h < cell_h * 3.0 { cell_h * 3.0 } else { raw_h }
+    if fw.anchor == "cursor" {
+        let (cx, cy, ch) = cursor_anchor_pixel_pos(world, wm)
+        var bx = cx.floor()
+        if bx + box_w > win_w - 12.0 {
+            bx = (win_w - box_w - 12.0).floor()
+        }
+        if bx < 12.0 {
+            bx = 12.0
+        }
+        let below_y = (cy + ch + 4.0).floor()
+        let above_y = (cy - box_h - 4.0).floor()
+        let by = if below_y + box_h <= echo_y - 6.0 {
+            below_y
+        } else if above_y >= 8.0 {
+            above_y
+        } else {
+            below_y
+        }
+        return (bx, by, box_w, box_h)
+    }
     let box_x = if fw.anchor == "bottom" {
         16.0
     } else {
@@ -330,7 +380,6 @@ fn floating_window_box(world: EditorWorld, wm: WindowManager, fw: FloatingWindow
     } else {
         ((win_h - box_h) * 0.45).floor()
     }
-    let _ = world
     (box_x, box_y, box_w, box_h)
 }
 
@@ -469,7 +518,7 @@ fn handle_mouse_click(
             let tidx = (px / tab_w).floor().as(i64)
             if tidx >= 0 and tidx < wm.tabs.len() and tidx != wm.active_tab_idx {
                 wm.active_tab_idx = tidx
-                wm.relayout(world)
+                wm.layout_all()
                 wm.sync_to_world(world)
                 kernel.emit_hook("buffer-switched", world.active_buffer_id)
                 return
@@ -643,36 +692,44 @@ fn handle_mouse_scroll(kernel: SystemKernel, world: EditorWorld, wm: WindowManag
         return
     }
     wm.sync_from_world(world)
-    let pane = wm.active_pane()
-    let buf = world.active_buffer()
-    let step: i64 = if dy > 0.0 {
-        3
-    } else if dy < 0.0 {
-        -3
+    let hit_pane_opt = wm.pane_at_pixel(px, py)
+    let pane = if hit_pane_opt != null {
+        hit_pane_opt.as(WindowPane)
     } else {
-        0
+        wm.active_pane()
     }
-    if step == 0 {
+    let buf_opt = world.buffer(pane.buffer_id)
+    let buf = if buf_opt != null { buf_opt.as(Buffer) } else { world.active_buffer() }
+    let abs_dy = if dy < 0.0 { -dy } else { dy }
+    let mag_raw = (abs_dy * 3.0).round().as(i64)
+    let mag = if mag_raw < 1 { 1 } else if mag_raw > 12 { 12 } else { mag_raw }
+    if dy == 0.0 {
         return
     }
-    let lo = buf.min_row()
-    let hi = buf.max_row()
-    var next_top = pane.top_row + step
-    if next_top < lo {
-        next_top = lo
-    } else if next_top > hi {
-        next_top = hi
+    let next_top = if dy > 0.0 {
+        step_visible_row_forward(buf, pane.top_row, mag)
+    } else {
+        step_visible_row_backward(buf, pane.top_row, mag)
     }
     pane.top_row = next_top
+    pane.explicit_scroll = true
     let rows = wm.pane_rows(pane)
-    if buf.point.row < next_top {
-        buf.point = buf.clamp_pos(Pos.new(next_top, buf.point.col), insert_mode = false)
-    } else if buf.point.row >= next_top + rows {
-        let bottom_r = if next_top + rows - 1 <= hi { next_top + rows - 1 } else { hi }
-        buf.point = buf.clamp_pos(Pos.new(bottom_r, buf.point.col), insert_mode = false)
+    let vis = visible_buffer_rows(buf, next_top, rows)
+    if not vis.is_empty() {
+        let first_vis = vis.get(0).as(i64)
+        let last_vis = vis.get((vis.len() - 1).as(usize)).as(i64)
+        if pane.cursor.row < first_vis {
+            pane.cursor = buf.clamp_pos(Pos.new(first_vis, pane.cursor.col), insert_mode = false)
+            pane.prev_cursor = pane.cursor
+        } else if pane.cursor.row > last_vis {
+            pane.cursor = buf.clamp_pos(Pos.new(last_vis, pane.cursor.col), insert_mode = false)
+            pane.prev_cursor = pane.cursor
+        }
     }
-    pane.cursor = buf.point
-    world.viewport_top_row = pane.top_row
+    if pane.id == wm.active_pane().id {
+        buf.point = pane.cursor
+        world.viewport_top_row = pane.top_row
+    }
 }
 
 pub fn app_step_event(
@@ -777,10 +834,63 @@ pub fn app_step_event(
     }
 }
 
+private global _last_measured_font_key: String = ""
+
+fn sync_font_metrics_if_changed(world: EditorWorld, wm: WindowManager) {
+    let key = world.options.font_family ++ "|" ++ world.options.font_size_pt.to_string()
+    if _last_measured_font_key != "" and _last_measured_font_key != key {
+        wm.metrics = host_measure_font(world.options.font_family, world.options.font_size_pt)
+        wm.sync_from_world(world)
+    }
+    _last_measured_font_key = key
+}
+
+fn push_anim_viewport_hints(world: EditorWorld, wm: WindowManager) {
+    let cell_w = if wm.metrics.cell_width > 1.0 { wm.metrics.cell_width } else { 8.4 }
+    let cell_h = if wm.metrics.cell_height > 1.0 { wm.metrics.cell_height } else { 19.0 }
+    let ml_h = mode_line_height(wm.metrics)
+    let vis = wm.visible_panes()
+    let vps = List()
+    for i in 0..vis.len() {
+        let p = vis.get(i.as(usize)).as(WindowPane)
+        let r = p.rect
+        let content_h = if r.h > ml_h { r.h - ml_h } else { r.h }
+        let b_opt = world.buffer(p.buffer_id)
+        let doc_num: i64 = if b_opt != null {
+            let b = b_opt.as(Buffer)
+            let m = b.major_mode.to_lower()
+            if m == "dirvish" or m == "dirvish-parent" or m == "dirvish-preview" or m == "terminal" {
+                -1
+            } else {
+                b.id.raw()
+            }
+        } else {
+            -1
+        }
+        if doc_num >= 0 and r.w > 4.0 and content_h > 4.0 {
+            vps.push(ScrollViewportSpec {
+                pane_id: p.id.raw(),
+                doc_id: doc_num,
+                x: r.x,
+                y: r.y,
+                w: r.w,
+                h: content_h,
+                top_row: p.top_row,
+                left_col: p.left_col,
+                cell_w: cell_w,
+                cell_h: cell_h,
+            })
+        }
+    }
+    host_set_anim_hints(world.options.smooth_scroll, world.options.cursor_anim, vps)
+}
+
 pub fn app_commit_frame(kernel: SystemKernel) -> !String i64 {
     let world = require_editor_world(kernel)!
     let wm = require_window_manager(kernel)!
+    sync_font_metrics_if_changed(world, wm)
     let (win_spec, cmds) = compose_frame(kernel, world, wm)
+    push_anim_viewport_hints(world, wm)
     host_commit_frame(win_spec, cmds)
 }
 
@@ -793,6 +903,41 @@ fn session_should_exit(world: EditorWorld) -> bool {
         return true
     }
     mock_quit_requested() != null
+}
+
+fn resolve_window_state_path() -> String {
+    let explicit = env.get_or("LAVA_WINDOW_STATE_FILE", "").trim()
+    if explicit != "" {
+        return explicit
+    }
+    let xdg = env.get_or("XDG_CONFIG_HOME", "").trim()
+    if xdg != "" {
+        return path.join(path.join(xdg, "lava"), "window_state.txt")
+    }
+    let home = env.get_or("HOME", "").trim()
+    if home != "" {
+        return path.join(path.join(path.join(home, ".config"), "lava"), "window_state.txt")
+    }
+    ""
+}
+
+fn save_last_window_state(world: EditorWorld, wm: WindowManager) {
+    let target = resolve_window_state_path()
+    if target == "" {
+        return
+    }
+    let parent_opt = path.parent(target)
+    if parent_opt != null {
+        let pdir = parent_opt.as(String)
+        if pdir != "" and (not fs.exists(pdir)) {
+            let _ = fs.create_dir_all(pdir) ! { _ => () }
+        }
+    }
+    let rem = if world.options.remember_window_size { "true" } else { "false" }
+    let w_val = if wm.pixel_width >= 64 { wm.pixel_width } else { 1280 }
+    let h_val = if wm.pixel_height >= 64 { wm.pixel_height } else { 800 }
+    let content = "width=" ++ w_val.to_string() ++ "\nheight=" ++ h_val.to_string() ++ "\nremember=" ++ rem ++ "\n"
+    let _ = fs.write_string(target, content) ! { _ => () }
 }
 
 fn run_session_with_caps(
@@ -947,6 +1092,7 @@ fn run_session_with_caps(
         }
     }
 
+    save_last_window_state(world, wm)
     host_request_quit(world.exit_code)
     world.exit_code
 }

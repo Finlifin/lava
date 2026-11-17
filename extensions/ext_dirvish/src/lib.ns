@@ -647,11 +647,16 @@ fn render_parent_buffer(world: EditorWorld, state: DirvishState) -> Buffer {
     var active_row: i64 = 0
     for i in 0..p_entries.len() {
         let pe = p_entries.get(i.as(usize)).as(DirvishEntry)
-        let icon = if pe.is_dir { "▸ " } else { "◫ " }
+        let is_cur_dir = pe.name == cur_base
+        let icon = if pe.is_dir {
+            if is_cur_dir { " " } else if pe.is_symlink { " " } else { " " }
+        } else {
+            entry_icon(pe) ++ " "
+        }
         let suffix = if pe.is_dir { "/" } else { "" }
         let ln = " " ++ icon ++ pe.name ++ suffix
         lines.push(ln)
-        if pe.name == cur_base {
+        if is_cur_dir {
             active_row = i + 1
         }
     }
@@ -706,25 +711,43 @@ fn render_parent_buffer(world: EditorWorld, state: DirvishState) -> Buffer {
 
 fn entry_icon(ent: DirvishEntry) -> String {
     if ent.is_dir {
-        return "▸"
+        if ent.is_symlink {
+            return ""
+        }
+        return ""
     }
     if ent.is_symlink {
-        return "◈"
+        return ""
     }
     if ent.is_exec {
-        return "▶"
+        return ""
+    }
+    let low_name = ent.name.to_lower()
+    if low_name == ".gitignore" or low_name == ".gitmodules" or low_name == ".gitattributes" {
+        return ""
     }
     let ext = entry_extension_lower(ent.name)
-    if ext == "toml" or ext == "json" or ext == "yaml" or ext == "yml" or ext == "lock" or ext == "ini" or ext == "conf" {
-        return "⚙"
+    when {
+        ext == "rs" => "",
+        ext == "ns" or ext == "zig" => "",
+        ext == "lua" => "",
+        ext == "py" => "",
+        ext == "c" or ext == "h" => "",
+        ext == "cpp" or ext == "cc" or ext == "cxx" or ext == "hpp" or ext == "hxx" => "",
+        ext == "js" or ext == "jsx" or ext == "mjs" or ext == "cjs" => "",
+        ext == "ts" or ext == "tsx" => "",
+        ext == "go" => "",
+        ext == "md" or ext == "markdown" => "",
+        ext == "txt" or ext == "org" or ext == "rst" => "",
+        ext == "json" or ext == "jsonc" => "",
+        ext == "toml" or ext == "yaml" or ext == "yml" or ext == "lock" or ext == "ini" or ext == "conf" => "",
+        ext == "html" or ext == "htm" => "",
+        ext == "css" or ext == "scss" => "",
+        ext == "sh" or ext == "bash" or ext == "zsh" or ext == "fish" => "",
+        ext == "zip" or ext == "tar" or ext == "gz" or ext == "xz" or ext == "zst" or ext == "bz2" or ext == "7z" => "",
+        ext == "png" or ext == "jpg" or ext == "jpeg" or ext == "gif" or ext == "svg" or ext == "webp" or ext == "ico" => "",
+        else => "",
     }
-    if ext == "md" or ext == "txt" or ext == "org" or ext == "rst" {
-        return "▤"
-    }
-    if ext == "ns" or ext == "rs" or ext == "py" or ext == "ts" or ext == "tsx" or ext == "js" or ext == "jsx" or ext == "go" or ext == "c" or ext == "cpp" or ext == "h" or ext == "sh" or ext == "lua" or ext == "zig" {
-        return "≡"
-    }
-    "◫"
 }
 
 fn format_center_header(state: DirvishState) -> String {
@@ -742,7 +765,7 @@ fn format_center_header(state: DirvishState) -> String {
     } else {
         ""
     }
-    "  ▸ " ++ abbreviate_path(state.current_dir) ++ "  " ++ count_tag ++ "  " ++ sort_tag ++ hidden_tag ++ filter_tag ++ ring_tag
+    "   " ++ abbreviate_path(state.current_dir) ++ "  " ++ count_tag ++ "  " ++ sort_tag ++ hidden_tag ++ filter_tag ++ ring_tag
 }
 
 fn render_center_buffer(
@@ -1031,7 +1054,7 @@ fn render_preview_buffer(world: EditorWorld, state: DirvishState, center_buf: Bu
             return preview_buf
         }
         let total = children.len()
-        let hdr = "  ▸ " ++ ent.name ++ "/  (" ++ total.to_string() ++ " items)"
+        let hdr = "   " ++ ent.name ++ "/  (" ++ total.to_string() ++ " items)"
         let lines = List()
         lines.push(hdr)
         let limit = if total > 80 { 80 } else { total }
@@ -1041,7 +1064,8 @@ fn render_preview_buffer(world: EditorWorld, state: DirvishState, center_buf: Bu
             for i in 0..limit {
                 let ch = children.get(i.as(usize)).as(DirvishEntry)
                 if ch.is_dir {
-                    lines.push("  ▸ " ++ ch.name ++ "/")
+                    let ch_icon = if ch.is_symlink { " " } else { " " }
+                    lines.push("  " ++ ch_icon ++ ch.name ++ "/")
                 } else {
                     let disp_name = if ch.name.char_len() > 26 {
                         ch.name.take(23) ++ "..."
@@ -1421,8 +1445,7 @@ fn refresh_preview_for_cursor(world: EditorWorld, wm: WindowManager, state: Dirv
     if state.miller_mode {
         let pvid_opt = find_win_id_for_buffer_in_tab(wm, preview_buf.id)
         if pvid_opt != null {
-            let pvid? = pvid_opt else { return }
-            let pvp = wm.panes.get(pvid).as(WindowPane)
+            let pvp = wm.panes.get(pvid_opt.as(WinId)).as(WindowPane)
             pvp.cursor = Pos.zero()
             pvp.top_row = 0
             pvp.left_col = 0
@@ -1450,7 +1473,13 @@ fn open_dirvish_at(
         state.origin_buf_id = cur_buf.id
     }
 
-    let target_dir = clean_dir_path(raw_dir, world.cwd)
+    let effective_raw = if raw_dir.trim() == "" and world.cwd == "/" {
+        let h = home_directory()
+        if h != "" and fs.is_dir(h) { h } else { world.cwd }
+    } else {
+        raw_dir
+    }
+    let target_dir = clean_dir_path(effective_raw, world.cwd)
     if not fs.is_dir(target_dir) {
         return error ("Dirvish target is not a directory: " ++ target_dir)
     }
@@ -1631,8 +1660,14 @@ fn target_paths_for_action(state: DirvishState, center_buf: Buffer) -> List {
 
 fn cmd_dirvish(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
     let world = require_editor_world(kernel)!
+    let state = require_dirvish_state(kernel)!
     let cur_buf = world.active_buffer()
-    var target_dir = world.cwd
+    var target_dir = if world.cwd != "/" and world.cwd != "" {
+        world.cwd
+    } else {
+        let h = home_directory()
+        if h != "" and fs.is_dir(h) { h } else { world.cwd }
+    }
     if not args.is_empty() {
         let raw_arg = args.get(0).as(String).trim()
         if raw_arg != "" {
@@ -1649,6 +1684,8 @@ fn cmd_dirvish(kernel: SystemKernel, args: List) -> #InteractiveEffects !String 
                 target_dir = p_opt.as(String)
             }
         }
+    } else if state.current_dir != "" and state.current_dir != "/" and fs.is_dir(state.current_dir) {
+        target_dir = state.current_dir
     }
     open_dirvish_at(kernel, target_dir, "", true)#!
 }
@@ -1786,6 +1823,7 @@ fn cmd_dirvish_enter(kernel: SystemKernel, _args: List) -> #InteractiveEffects !
     ap.cursor = opened.point
     wm.sync_from_world(world)
     ensure_vim_normal(kernel, world)
+    kernel.emit_hook("buffer-switched", opened.id)
     ()
 }
 

@@ -150,6 +150,37 @@ impl FontMetrics {
     }
 }
 
+pub struct ScrollViewportSpec {
+    pub pane_id: i64,
+    pub doc_id: i64,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    pub top_row: i64,
+    pub left_col: i64,
+    pub cell_w: f64,
+    pub cell_h: f64,
+}
+derive PartialEq for ScrollViewportSpec
+
+impl ScrollViewportSpec {
+    pub fn to_wire(self) -> List {
+        [
+            self.pane_id,
+            self.doc_id,
+            self.x,
+            self.y,
+            self.w,
+            self.h,
+            self.top_row,
+            self.left_col,
+            self.cell_w,
+            self.cell_h,
+        ]
+    }
+}
+
 pub enum RawUiEvent {
     pub Key(key: String, modifiers: i64, text: String),
     pub MouseButton(is_press: bool, button: i64, x: f64, y: f64, modifiers: i64, press_count: i64),
@@ -348,6 +379,23 @@ pub fn host_commit_frame(spec: WindowSpec, cmds: List) -> i64 {
         return _mock_frame_gen
     }
     gen.as(i64)
+}
+
+pub fn host_set_anim_hints(smooth_scroll: bool, cursor_anim: bool, viewports: List) {
+    if _mock_enabled {
+        return
+    }
+    let wire = List()
+    for vp in viewports {
+        if vp matches _: ScrollViewportSpec {
+            wire.push(vp.as(ScrollViewportSpec).to_wire())
+        } else if vp matches _: List {
+            wire.push(vp)
+        }
+    }
+    let _ = runtime.host_call("ui_set_anim_hints", [smooth_scroll, cursor_anim, wire]) ! {
+        _ => (),
+    }
 }
 
 pub fn host_measure_font(family: String, size_pt: f64) -> FontMetrics {
