@@ -3783,9 +3783,7 @@ fn render_window_pane(
         }
         let is_folded = buf.folded_rows.contains(buf_row)
             or (
-                md_fence_kind == 0
-                and heading_fold_level(raw_line, buf.major_mode) > 0
-                and buf_row + 1 <= buf.max_row()
+                buf_row + 1 <= buf.max_row()
                 and buf.folded_rows.contains(buf_row + 1)
             )
         let dim_row = world.options.twilight_mode

@@ -1,0 +1,936 @@
+-- ext_fold: VS Code-style Code Folding Engine (`lava.org/ext_fold`).
+-- Supports `#region`/`#endregion`, `{{{`/`}}}`, brace `{ ... }` blocks, indentation blocks,
+-- Markdown/Org headings, multi-line comment blocks, and import groups, with Vim `za`/`zc`/`zo`/
+-- `zM`/`zR`/`zj`/`zk`/`z1`..`z5` keybindings, `:Fold*` Ex commands, and gutter `▾`/`▸` markers.
+
+use @lava_sys.{rgb}
+use @lava_core.{
+    ExtId, InteractiveEffects, Keymap, SystemKernel, status_emit
+}
+use @ext_document.{
+    Buffer, BufferId, BufferKind, EditorWorld, Pos, ext_document_id, require_editor_world
+}
+use @ext_window.{
+    SERVICE_WINDOW_MANAGER, WindowManager, ext_window_id, heading_fold_level
+}
+use @ext_vim.{
+    KEYMAP_VIM_NORMAL, VimState, ext_vim_id, sync_world_from_vim
+}
+
+pub const SERVICE_FOLD: String = "lava.fold.manager"
+pub const OWNER_FOLD: String = "ext_fold"
+
+pub fn ext_fold_id() -> ExtId = ExtId("lava.org/ext_fold")
+
+pub struct FoldRange {
+    pub start_row: i64,
+    pub end_row: i64,
+    pub level: i64,
+    pub kind: String,
+}
+
+pub struct FoldService {
+    pub folded_by_buf: HashMap,
+    pub ranges_cache: HashMap,
+}
+
+impl FoldService {
+    pub fn new() -> FoldService {
+        FoldService {
+            folded_by_buf: HashMap.new(),
+            ranges_cache: HashMap.new(),
+        }
+    }
+
+    pub fn ranges_for_buffer(self, buf: Buffer) -> List {
+        let cached_opt = self.ranges_cache.get(buf.id)
+        if cached_opt != null {
+            let (ver, ranges) = cached_opt.as((i64, List))
+            if ver == buf.edit_version {
+                return ranges
+            }
+        }
+        let ranges = compute_fold_ranges(buf)
+        if self.ranges_cache.len() > 64 {
+            self.ranges_cache.clear()
+        }
+        self.ranges_cache.insert(buf.id, (buf.edit_version, ranges))
+        ranges
+    }
+
+    pub fn active_folds(self, buf_id: BufferId) -> List {
+        let opt = self.folded_by_buf.get(buf_id)
+        if opt != null {
+            opt.as(List)
+        } else {
+            List()
+        }
+    }
+
+    pub fn sync_buffer_folds(self, buf: Buffer) {
+        if buf.kind == BufferKind.Special {
+            return
+        }
+        buf.clear_owner_decors(OWNER_FOLD)
+        let active = self.active_folds(buf.id)
+        let lo = buf.min_row()
+        let hi = buf.max_row()
+        let next_rows = Set.new()
+        let valid_active = List()
+
+        for i in 0..active.len() {
+            let (sr, er) = active.get(i.as(usize)).as((i64, i64))
+            if sr >= lo and er > sr and er <= hi {
+                valid_active.push((sr, er))
+                var r = sr + 1
+                while r <= er {
+                    next_rows.insert(r)
+                    r += 1
+                }
+            }
+        }
+        self.folded_by_buf.insert(buf.id, valid_active)
+        buf.folded_rows = next_rows
+
+        let ranges = self.ranges_for_buffer(buf)
+        let sign_col = rgb(108, 112, 134)
+        for i in 0..ranges.len() {
+            let fr = ranges.get(i.as(usize)).as(FoldRange)
+            if fr.start_row >= lo and fr.start_row <= hi and (not next_rows.contains(fr.start_row)) {
+                buf.add_sign(OWNER_FOLD, fr.start_row, "▾", sign_col, priority = 10)
+            }
+        }
+    }
+
+    pub fn fold_range(self, world: EditorWorld, buf: Buffer, target: FoldRange) -> bool {
+        let active = self.active_folds(buf.id)
+        for i in 0..active.len() {
+            let (sr, er) = active.get(i.as(usize)).as((i64, i64))
+            if sr == target.start_row and er == target.end_row {
+                return false
+            }
+        }
+        let next = List()
+        for i in 0..active.len() {
+            let (sr, er) = active.get(i.as(usize)).as((i64, i64))
+            if sr != target.start_row {
+                next.push((sr, er))
+            }
+        }
+        next.push((target.start_row, target.end_row))
+        self.folded_by_buf.insert(buf.id, next)
+        self.sync_buffer_folds(buf)
+        if buf.point.row > target.start_row and buf.point.row <= target.end_row {
+            buf.point = buf.clamp_pos(Pos.new(target.start_row, buf.point.col), insert_mode = false)
+            buf.preferred_col = buf.point.col
+        }
+        let _ = world
+        true
+    }
+
+    pub fn unfold_at_row(self, buf: Buffer, row: i64) -> bool {
+        let active = self.active_folds(buf.id)
+        if active.is_empty() {
+            return false
+        }
+        var best_idx: i64 = -1
+        var best_span: i64 = 1000000000
+        for i in 0..active.len() {
+            let (sr, er) = active.get(i.as(usize)).as((i64, i64))
+            if row >= sr and row <= er {
+                let sp = er - sr
+                if sp < best_span {
+                    best_span = sp
+                    best_idx = i
+                }
+            }
+        }
+        if best_idx < 0 {
+            return false
+        }
+        let next = List()
+        for i in 0..active.len() {
+            if i != best_idx {
+                next.push(active.get(i.as(usize)))
+            }
+        }
+        self.folded_by_buf.insert(buf.id, next)
+        self.sync_buffer_folds(buf)
+        true
+    }
+
+    pub fn toggle_at_cursor(self, world: EditorWorld, buf: Buffer) -> String {
+        let row = buf.point.row
+        let active = self.active_folds(buf.id)
+        for i in 0..active.len() {
+            let (sr, er) = active.get(i.as(usize)).as((i64, i64))
+            if sr == row {
+                let _ = self.unfold_at_row(buf, row)
+                return "Unfolded lines " ++ (sr + 1).to_string() ++ ".." ++ (er + 1).to_string()
+            }
+        }
+        let ranges = self.ranges_for_buffer(buf)
+        let target_opt = find_innermost_fold_range(ranges, row)
+        if target_opt == null {
+            return "No foldable range at line " ++ (row + 1).to_string()
+        }
+        let target = target_opt.as(FoldRange)
+        if self.fold_range(world, buf, target) {
+            return "Folded lines " ++ (target.start_row + 1).to_string() ++ ".." ++ (target.end_row + 1).to_string()
+        }
+        if self.unfold_at_row(buf, row) {
+            return "Unfolded lines " ++ (target.start_row + 1).to_string() ++ ".." ++ (target.end_row + 1).to_string()
+        }
+        "No fold change"
+    }
+
+    pub fn close_at_cursor(self, world: EditorWorld, buf: Buffer) -> String {
+        let row = buf.point.row
+        let ranges = self.ranges_for_buffer(buf)
+        let target_opt = find_innermost_fold_range(ranges, row)
+        if target_opt == null {
+            return "No foldable range at line " ++ (row + 1).to_string()
+        }
+        let target = target_opt.as(FoldRange)
+        if self.fold_range(world, buf, target) {
+            return "Folded lines " ++ (target.start_row + 1).to_string() ++ ".." ++ (target.end_row + 1).to_string()
+        }
+        "Already folded"
+    }
+
+    pub fn open_at_cursor(self, buf: Buffer) -> String {
+        if self.unfold_at_row(buf, buf.point.row) {
+            return "Unfolded fold at line " ++ (buf.point.row + 1).to_string()
+        }
+        "No closed fold at line " ++ (buf.point.row + 1).to_string()
+    }
+
+    pub fn fold_all(self, world: EditorWorld, buf: Buffer) -> i64 {
+        let ranges = self.ranges_for_buffer(buf)
+        let next = List()
+        for i in 0..ranges.len() {
+            let fr = ranges.get(i.as(usize)).as(FoldRange)
+            if fr.level == 1 {
+                next.push((fr.start_row, fr.end_row))
+            }
+        }
+        if next.is_empty() {
+            for i in 0..ranges.len() {
+                let fr = ranges.get(i.as(usize)).as(FoldRange)
+                next.push((fr.start_row, fr.end_row))
+            }
+        }
+        self.folded_by_buf.insert(buf.id, next)
+        self.sync_buffer_folds(buf)
+        clamp_cursor_out_of_folds(buf, next)
+        let _ = world
+        next.len()
+    }
+
+    pub fn unfold_all(self, buf: Buffer) -> i64 {
+        let prev_cnt = self.active_folds(buf.id).len()
+        self.folded_by_buf.insert(buf.id, List())
+        self.sync_buffer_folds(buf)
+        prev_cnt
+    }
+
+    pub fn fold_level(self, world: EditorWorld, buf: Buffer, target_level: i64) -> i64 {
+        let ranges = self.ranges_for_buffer(buf)
+        let next = List()
+        for i in 0..ranges.len() {
+            let fr = ranges.get(i.as(usize)).as(FoldRange)
+            if fr.level == target_level {
+                next.push((fr.start_row, fr.end_row))
+            }
+        }
+        self.folded_by_buf.insert(buf.id, next)
+        self.sync_buffer_folds(buf)
+        clamp_cursor_out_of_folds(buf, next)
+        let _ = world
+        next.len()
+    }
+
+    pub fn fold_by_kind(self, world: EditorWorld, buf: Buffer, target_kind: String) -> i64 {
+        let ranges = self.ranges_for_buffer(buf)
+        let active = self.active_folds(buf.id)
+        let next = List()
+        let seen_starts = Set.new()
+        for i in 0..active.len() {
+            let (sr, er) = active.get(i.as(usize)).as((i64, i64))
+            next.push((sr, er))
+            seen_starts.insert(sr)
+        }
+        var added: i64 = 0
+        for i in 0..ranges.len() {
+            let fr = ranges.get(i.as(usize)).as(FoldRange)
+            if fr.kind == target_kind and (not seen_starts.contains(fr.start_row)) {
+                next.push((fr.start_row, fr.end_row))
+                seen_starts.insert(fr.start_row)
+                added += 1
+            }
+        }
+        self.folded_by_buf.insert(buf.id, next)
+        self.sync_buffer_folds(buf)
+        clamp_cursor_out_of_folds(buf, next)
+        let _ = world
+        added
+    }
+}
+
+fn clamp_cursor_out_of_folds(buf: Buffer, folds: List) {
+    let r = buf.point.row
+    for i in 0..folds.len() {
+        let (sr, er) = folds.get(i.as(usize)).as((i64, i64))
+        if r > sr and r <= er {
+            buf.point = buf.clamp_pos(Pos.new(sr, buf.point.col), insert_mode = false)
+            buf.preferred_col = buf.point.col
+            return
+        }
+    }
+}
+
+fn find_innermost_fold_range(ranges: List, row: i64) -> ?FoldRange {
+    var best: ?FoldRange = null
+    var best_span: i64 = 1000000000
+    for i in 0..ranges.len() {
+        let fr = ranges.get(i.as(usize)).as(FoldRange)
+        if fr.start_row == row {
+            return fr
+        }
+        if row > fr.start_row and row <= fr.end_row {
+            let sp = fr.end_row - fr.start_row
+            if sp < best_span {
+                best_span = sp
+                best = fr
+            }
+        }
+    }
+    best
+}
+
+fn line_indent_cols(line: String) -> i64 {
+    let n = line.char_len()
+    var i: i64 = 0
+    var cols: i64 = 0
+    while i < n {
+        let ch = line.slice(i, i + 1)
+        if ch == " " {
+            cols += 1
+        } else if ch == "\t" {
+            cols += 4
+        } else {
+            break
+        }
+        i += 1
+    }
+    cols
+}
+
+fn is_region_start(trimmed: String) -> bool {
+    let low = trimmed.to_lower()
+    low.starts_with("#region")
+        or low.starts_with("//#region")
+        or low.starts_with("// #region")
+        or low.starts_with("// region")
+        or low.starts_with("-- #region")
+        or low.starts_with("-- region")
+        or low.starts_with("/* #region")
+        or low.starts_with("/* region")
+        or trimmed.ends_with("{{{{{{")
+}
+
+fn is_region_end(trimmed: String) -> bool {
+    let low = trimmed.to_lower()
+    low.starts_with("#endregion")
+        or low.starts_with("//#endregion")
+        or low.starts_with("// #endregion")
+        or low.starts_with("// endregion")
+        or low.starts_with("-- #endregion")
+        or low.starts_with("-- endregion")
+        or low.starts_with("/* #endregion")
+        or low.starts_with("/* endregion")
+        or trimmed.ends_with("}}}}}}")
+}
+
+fn is_single_line_comment(trimmed: String, mode: String) -> bool {
+    if trimmed.starts_with("//") or trimmed.starts_with("--") {
+        return true
+    }
+    let m = mode.to_lower()
+    if m != "markdown" and m != "md" and m != "gfm" and trimmed.starts_with("#") {
+        return not trimmed.starts_with("#include")
+            and not trimmed.starts_with("#define")
+            and not trimmed.starts_with("#if")
+            and not trimmed.starts_with("#endif")
+            and not trimmed.starts_with("#pragma")
+            and not trimmed.starts_with("#region")
+            and not trimmed.starts_with("#endregion")
+    }
+    false
+}
+
+fn is_import_line(trimmed: String) -> bool {
+    trimmed.starts_with("import ")
+        or trimmed.starts_with("from ")
+        or trimmed.starts_with("use ")
+        or trimmed.starts_with("#include ")
+        or trimmed.starts_with("#include<")
+}
+
+fn is_indent_language(mode: String) -> bool {
+    let m = mode.to_lower()
+    m == "python" or m == "py" or m == "yaml" or m == "yml" or m == "toml" or m == "nim"
+}
+
+fn push_range_if_new(out: List, seen_starts: Set, sr: i64, er: i64, kind: String) {
+    if er > sr and (not seen_starts.contains(sr)) {
+        seen_starts.insert(sr)
+        out.push(FoldRange {
+            start_row: sr,
+            end_row: er,
+            level: 1,
+            kind: kind,
+        })
+    }
+}
+
+pub fn compute_fold_ranges(buf: Buffer) -> List {
+    let total = buf.line_count()
+    let raw = List()
+    let seen_starts = Set.new()
+    if total < 2 {
+        return raw
+    }
+    let mode = buf.major_mode.to_lower()
+
+    -- 1. `#region`/`#endregion`, `{{{`/`}}}`, `/* ... */` block comments, and brace `{ ... }` ranges
+    let region_stack = List()
+    let brace_stack = List()
+    var in_block_comment = false
+    var block_comment_start: i64 = -1
+
+    for r in 0..total {
+        let line = buf.line_at(r)
+        let trimmed = line.trim()
+        if trimmed == "" {
+            continue
+        }
+
+        if is_region_start(trimmed) {
+            region_stack.push(r)
+            continue
+        }
+        if is_region_end(trimmed) {
+            if not region_stack.is_empty() {
+                let sr = region_stack.pop().as(i64)
+                push_range_if_new(raw, seen_starts, sr, r, "region")
+            }
+            continue
+        }
+
+        if in_block_comment {
+            if trimmed.contains("*/") {
+                if block_comment_start >= 0 and r > block_comment_start {
+                    push_range_if_new(raw, seen_starts, block_comment_start, r, "comment")
+                }
+                in_block_comment = false
+                block_comment_start = -1
+            }
+            continue
+        }
+        if trimmed.starts_with("/*") and (not trimmed.contains("*/")) {
+            in_block_comment = true
+            block_comment_start = r
+            continue
+        }
+
+        -- Scan line for `{` and `}` outside strings & line comments
+        let n = line.char_len()
+        var i: i64 = 0
+        var in_sq = false
+        var in_dq = false
+        var escaped = false
+        while i < n {
+            let ch = line.slice(i, i + 1)
+            if escaped {
+                escaped = false
+                i += 1
+                continue
+            }
+            if (in_sq or in_dq) and ch == "\\" {
+                escaped = true
+                i += 1
+                continue
+            }
+            if (not in_sq) and ch == "\"" {
+                in_dq = not in_dq
+                i += 1
+                continue
+            }
+            if (not in_dq) and ch == "'" and mode != "rust" {
+                in_sq = not in_sq
+                i += 1
+                continue
+            }
+            if (not in_sq) and (not in_dq) {
+                if i + 1 < n {
+                    let two = line.slice(i, i + 2)
+                    if two == "//" or two == "--" {
+                        break
+                    }
+                }
+                if ch == "{{" {
+                    brace_stack.push(r)
+                } else if ch == "}}" {
+                    if not brace_stack.is_empty() {
+                        let sr = brace_stack.pop().as(i64)
+                        push_range_if_new(raw, seen_starts, sr, r, "block")
+                    }
+                }
+            }
+            i += 1
+        }
+    }
+
+    -- 2. Consecutive single-line comment blocks (>= 3 lines) and import groups (>= 3 lines)
+    var c_start: i64 = -1
+    var c_end: i64 = -1
+    var imp_start: i64 = -1
+    var imp_end: i64 = -1
+    for r in 0..total {
+        let trimmed = buf.line_at(r).trim()
+        if is_single_line_comment(trimmed, mode) and (not is_region_start(trimmed)) and (not is_region_end(trimmed)) {
+            if c_start < 0 {
+                c_start = r
+            }
+            c_end = r
+        } else {
+            if c_start >= 0 and c_end - c_start >= 2 {
+                push_range_if_new(raw, seen_starts, c_start, c_end, "comment")
+            }
+            c_start = -1
+            c_end = -1
+        }
+        if is_import_line(trimmed) {
+            if imp_start < 0 {
+                imp_start = r
+            }
+            imp_end = r
+        } else {
+            if imp_start >= 0 and imp_end - imp_start >= 2 {
+                push_range_if_new(raw, seen_starts, imp_start, imp_end, "imports")
+            }
+            imp_start = -1
+            imp_end = -1
+        }
+    }
+    if c_start >= 0 and c_end - c_start >= 2 {
+        push_range_if_new(raw, seen_starts, c_start, c_end, "comment")
+    }
+    if imp_start >= 0 and imp_end - imp_start >= 2 {
+        push_range_if_new(raw, seen_starts, imp_start, imp_end, "imports")
+    }
+
+    -- 3. Markdown / Org headings
+    if mode == "markdown" or mode == "md" or mode == "gfm" or mode == "org" {
+        let h_stack = List()
+        for r in 0..total {
+            let lvl = heading_fold_level(buf.line_at(r), mode)
+            if lvl > 0 {
+                while not h_stack.is_empty() {
+                    let top_idx = h_stack.len() - 1
+                    let (prev_r, prev_lvl) = h_stack.get(top_idx.as(usize)).as((i64, i64))
+                    if prev_lvl >= lvl {
+                        let _ = h_stack.pop()
+                        push_range_if_new(raw, seen_starts, prev_r, r - 1, "heading")
+                    } else {
+                        break
+                    }
+                }
+                h_stack.push((r, lvl))
+            }
+        }
+        while not h_stack.is_empty() {
+            let (prev_r, _lvl) = h_stack.pop().as((i64, i64))
+            push_range_if_new(raw, seen_starts, prev_r, total - 1, "heading")
+        }
+    }
+
+    -- 4. Indentation-based blocks (Python/YAML/TOML, or any buffer with no brace blocks)
+    if is_indent_language(mode) or raw.is_empty() {
+        let ind_stack = List()
+        var last_nonempty: i64 = -1
+        for r in 0..total {
+            let line = buf.line_at(r)
+            if line.trim() == "" {
+                continue
+            }
+            let ind = line_indent_cols(line)
+            while not ind_stack.is_empty() {
+                let top_idx = ind_stack.len() - 1
+                let (prev_r, prev_ind) = ind_stack.get(top_idx.as(usize)).as((i64, i64))
+                if ind <= prev_ind {
+                    let _ = ind_stack.pop()
+                    if last_nonempty > prev_r {
+                        push_range_if_new(raw, seen_starts, prev_r, last_nonempty, "indent")
+                    }
+                } else {
+                    break
+                }
+            }
+            ind_stack.push((r, ind))
+            last_nonempty = r
+        }
+        while not ind_stack.is_empty() {
+            let (prev_r, _pi) = ind_stack.pop().as((i64, i64))
+            if last_nonempty > prev_r {
+                push_range_if_new(raw, seen_starts, prev_r, last_nonempty, "indent")
+            }
+        }
+    }
+
+    -- Sort by `start_row` ascending and compute nesting levels (`1`-based)
+    raw.sort_by(|a: Any, b: Any| {
+        let fa = a.as(FoldRange)
+        let fb = b.as(FoldRange)
+        if fa.start_row != fb.start_row {
+            fa.start_row.cmp(fb.start_row)
+        } else {
+            fb.end_row.cmp(fa.end_row)
+        }
+    })
+
+    let end_stack = List()
+    let leveled = List()
+    for i in 0..raw.len() {
+        let fr = raw.get(i.as(usize)).as(FoldRange)
+        while not end_stack.is_empty() {
+            let top_idx = end_stack.len() - 1
+            let top_end = end_stack.get(top_idx.as(usize)).as(i64)
+            if fr.start_row > top_end {
+                let _ = end_stack.pop()
+            } else {
+                break
+            }
+        }
+        let lvl = end_stack.len() + 1
+        end_stack.push(fr.end_row)
+        leveled.push(FoldRange {
+            start_row: fr.start_row,
+            end_row: fr.end_row,
+            level: lvl,
+            kind: fr.kind,
+        })
+    }
+    leveled
+}
+
+pub fn require_fold_service(kernel: SystemKernel) -> !String FoldService {
+    let raw = kernel.require_service(SERVICE_FOLD)!
+    raw.as(FoldService)
+}
+
+fn sync_wm_after_fold(kernel: SystemKernel, world: EditorWorld) {
+    let wm_opt = kernel.service(SERVICE_WINDOW_MANAGER)
+    if wm_opt != null {
+        wm_opt.as(WindowManager).sync_from_world(world)
+    }
+}
+
+fn register_fold_cmd(
+    k: SystemKernel,
+    ext_id: ExtId,
+    kebab_name: String,
+    ex_name: String,
+    summary: String,
+    action: fn(SystemKernel, List) -> #InteractiveEffects !String Any,
+) {
+    k.register_command(kebab_name, ext_id, summary, action)
+    if ex_name != "" {
+        k.register_command("ex:" ++ ex_name, ext_id, "Ex command `:" ++ ex_name ++ "`.", action, interactive = false)
+    }
+}
+
+pub fn register_fold_extension(kernel: SystemKernel) -> !String Unit {
+    let ext_id = ext_fold_id()
+    kernel.register_extension(
+        ext_id,
+        "lava.org",
+        "ext_fold",
+        "0.1.0",
+        "VS Code-style code folding (`#region`, braces, indentation, comments, imports) with Vim `za`/`zc`/`zo`/`zM`/`zR`.",
+        [ext_document_id(), ext_window_id(), ext_vim_id()],
+        |k: SystemKernel| -> !String Unit {
+            let svc = FoldService.new()
+            k.publish_service(SERVICE_FOLD, ext_id, svc)
+
+            register_fold_cmd(
+                k, ext_id, "fold-toggle", "FoldToggle",
+                "Toggle fold at cursor (`za`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let f = require_fold_service(kern)!
+                    let msg = f.toggle_at_cursor(w, w.active_buffer())
+                    sync_wm_after_fold(kern, w)
+                    status_emit(msg)#
+                    ()
+                },
+            )
+            register_fold_cmd(
+                k, ext_id, "fold-close", "Fold",
+                "Close fold at cursor (`zc`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let f = require_fold_service(kern)!
+                    let msg = f.close_at_cursor(w, w.active_buffer())
+                    sync_wm_after_fold(kern, w)
+                    status_emit(msg)#
+                    ()
+                },
+            )
+            register_fold_cmd(
+                k, ext_id, "fold-open", "Unfold",
+                "Open fold at cursor (`zo`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let f = require_fold_service(kern)!
+                    let msg = f.open_at_cursor(w.active_buffer())
+                    sync_wm_after_fold(kern, w)
+                    status_emit(msg)#
+                    ()
+                },
+            )
+            register_fold_cmd(
+                k, ext_id, "fold-all", "FoldAll",
+                "Fold all top-level regions (`zM`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let f = require_fold_service(kern)!
+                    let cnt = f.fold_all(w, w.active_buffer())
+                    sync_wm_after_fold(kern, w)
+                    status_emit("Folded " ++ cnt.to_string() ++ " region(s)")#
+                    cnt
+                },
+            )
+            register_fold_cmd(
+                k, ext_id, "fold-open-all", "UnfoldAll",
+                "Unfold all folded regions (`zR`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let f = require_fold_service(kern)!
+                    let cnt = f.unfold_all(w.active_buffer())
+                    sync_wm_after_fold(kern, w)
+                    status_emit("Unfolded " ++ cnt.to_string() ++ " region(s)")#
+                    cnt
+                },
+            )
+            register_fold_cmd(
+                k, ext_id, "fold-comments", "FoldComments",
+                "Fold all multi-line comment blocks (VS Code Fold All Block Comments).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let f = require_fold_service(kern)!
+                    let cnt = f.fold_by_kind(w, w.active_buffer(), "comment")
+                    sync_wm_after_fold(kern, w)
+                    status_emit("Folded " ++ cnt.to_string() ++ " comment block(s)")#
+                    cnt
+                },
+            )
+            register_fold_cmd(
+                k, ext_id, "fold-imports", "FoldImports",
+                "Fold import/use/include blocks.",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let f = require_fold_service(kern)!
+                    let cnt = f.fold_by_kind(w, w.active_buffer(), "imports")
+                    sync_wm_after_fold(kern, w)
+                    status_emit("Folded " ++ cnt.to_string() ++ " import block(s)")#
+                    cnt
+                },
+            )
+            register_fold_cmd(
+                k, ext_id, "fold-regions", "FoldRegions",
+                "Fold all `#region` blocks (VS Code Fold All Regions).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let f = require_fold_service(kern)!
+                    let cnt = f.fold_by_kind(w, w.active_buffer(), "region")
+                    sync_wm_after_fold(kern, w)
+                    status_emit("Folded " ++ cnt.to_string() ++ " #region(s)")#
+                    cnt
+                },
+            )
+            register_fold_cmd(
+                k, ext_id, "fold-level", "FoldLevel",
+                "Fold blocks at nesting level N (`:FoldLevel 2`, `z1`..`z5`).",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let f = require_fold_service(kern)!
+                    var lvl: i64 = 1
+                    if not args.is_empty() {
+                        let parsed? = args.get(0).as(String).trim().parse_i64() else {
+                            status_emit("Usage: :FoldLevel <1..9>")#
+                            return 0
+                        }
+                        if parsed >= 1 {
+                            lvl = parsed
+                        }
+                    }
+                    let cnt = f.fold_level(w, w.active_buffer(), lvl)
+                    sync_wm_after_fold(kern, w)
+                    status_emit("Folded " ++ cnt.to_string() ++ " level-" ++ lvl.to_string() ++ " block(s)")#
+                    cnt
+                },
+            )
+            k.register_command(
+                "fold-next",
+                ext_id,
+                "Jump to next foldable header (`zj`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let f = require_fold_service(kern)!
+                    let buf = w.active_buffer()
+                    let ranges = f.ranges_for_buffer(buf)
+                    for i in 0..ranges.len() {
+                        let fr = ranges.get(i.as(usize)).as(FoldRange)
+                        if fr.start_row > buf.point.row {
+                            buf.point = buf.clamp_pos(Pos.new(fr.start_row, 0), insert_mode = false)
+                            buf.preferred_col = 0
+                            sync_wm_after_fold(kern, w)
+                            return fr.start_row
+                        }
+                    }
+                    status_emit("No next fold")#
+                    -1
+                },
+            )
+            k.register_command(
+                "fold-prev",
+                ext_id,
+                "Jump to previous foldable header (`zk`).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    let f = require_fold_service(kern)!
+                    let buf = w.active_buffer()
+                    let ranges = f.ranges_for_buffer(buf)
+                    var i = ranges.len() - 1
+                    while i >= 0 {
+                        let fr = ranges.get(i.as(usize)).as(FoldRange)
+                        if fr.start_row < buf.point.row {
+                            buf.point = buf.clamp_pos(Pos.new(fr.start_row, 0), insert_mode = false)
+                            buf.preferred_col = 0
+                            sync_wm_after_fold(kern, w)
+                            return fr.start_row
+                        }
+                        i -= 1
+                    }
+                    status_emit("No previous fold")#
+                    -1
+                },
+            )
+
+            -- Bind Vim fold chords in Normal mode
+            let norm_km = k.ensure_keymap(KEYMAP_VIM_NORMAL)
+            norm_km.bind("z a", "fold-toggle", ext_id, description = "Toggle fold at cursor")
+            norm_km.bind("z c", "fold-close", ext_id, description = "Close fold at cursor")
+            norm_km.bind("z o", "fold-open", ext_id, description = "Open fold at cursor")
+            norm_km.bind("z M", "fold-all", ext_id, description = "Fold all regions")
+            norm_km.bind("z R", "fold-open-all", ext_id, description = "Unfold all regions")
+            norm_km.bind("z j", "fold-next", ext_id, description = "Next fold")
+            norm_km.bind("z k", "fold-prev", ext_id, description = "Previous fold")
+
+            for lvl_i in 1..6 {
+                let lvl_str = lvl_i.to_string()
+                let cmd_name = "fold-level-" ++ lvl_str
+                let lvl_val = lvl_i
+                k.register_command(
+                    cmd_name,
+                    ext_id,
+                    "Fold all level-" ++ lvl_str ++ " blocks (`z" ++ lvl_str ++ "`).",
+                    |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                        let w = require_editor_world(kern)!
+                        let f = require_fold_service(kern)!
+                        let cnt = f.fold_level(w, w.active_buffer(), lvl_val)
+                        sync_wm_after_fold(kern, w)
+                        status_emit("Folded " ++ cnt.to_string() ++ " level-" ++ lvl_val.to_string() ++ " block(s)")#
+                        cnt
+                    },
+                )
+                norm_km.bind("z " ++ lvl_str, cmd_name, ext_id, description = "Fold level " ++ lvl_str)
+            }
+
+            k.add_hook(
+                "buffer-switched",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| -> Unit {
+                    let w_opt = kern.service("lava.document.world")
+                    let f_opt = kern.service(SERVICE_FOLD)
+                    if w_opt != null and f_opt != null {
+                        f_opt.as(FoldService).sync_buffer_folds(w_opt.as(EditorWorld).active_buffer())
+                    }
+                },
+                priority = 60,
+            )
+            k.add_hook(
+                "buffer-modified",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| -> Unit {
+                    let w_opt = kern.service("lava.document.world")
+                    let f_opt = kern.service(SERVICE_FOLD)
+                    if w_opt != null and f_opt != null {
+                        let w = w_opt.as(EditorWorld)
+                        let buf = w.active_buffer()
+                        let f = f_opt.as(FoldService)
+                        let in_insert = w.mode_name.to_upper().contains("INSERT")
+                        if (not in_insert) or (not f.active_folds(buf.id).is_empty()) {
+                            f.sync_buffer_folds(buf)
+                        }
+                    }
+                },
+                priority = 60,
+            )
+            k.add_hook(
+                "mode-changed",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| -> Unit {
+                    let w_opt = kern.service("lava.document.world")
+                    let f_opt = kern.service(SERVICE_FOLD)
+                    if w_opt != null and f_opt != null {
+                        let w = w_opt.as(EditorWorld)
+                        if not w.mode_name.to_upper().contains("INSERT") {
+                            f_opt.as(FoldService).sync_buffer_folds(w.active_buffer())
+                        }
+                    }
+                },
+                priority = 60,
+            )
+            k.add_hook(
+                "buffer-closed",
+                ext_id,
+                |kern: SystemKernel, payload: Any| -> Unit {
+                    let f_opt = kern.service(SERVICE_FOLD)
+                    if f_opt != null and (payload matches _: BufferId) {
+                        let bid = payload.as(BufferId)
+                        let f = f_opt.as(FoldService)
+                        let _ = f.folded_by_buf.remove(bid)
+                        let _ = f.ranges_cache.remove(bid)
+                    }
+                },
+                priority = 60,
+            )
+            ()
+        },
+        |k: SystemKernel| -> !String Unit {
+            let w_opt = k.service("lava.document.world")
+            if w_opt != null {
+                let w = w_opt.as(EditorWorld)
+                for bk in w.buffers.keys() {
+                    let b = w.buffers.get(bk.as(BufferId)).as(Buffer)
+                    b.clear_owner_decors(OWNER_FOLD)
+                    b.folded_rows = Set.new()
+                }
+            }
+            ()
+        },
+    )
+}
