@@ -732,6 +732,30 @@ fn try_load_cached_artifact(path: &Path) -> Option<CompiledArtifact> {
     }
 }
 
+fn prune_old_cache_files(dir: &Path, ext: &str, keep_latest: usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) == Some(ext) {
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(UNIX_EPOCH);
+            files.push((mtime, p));
+        }
+    }
+    if files.len() <= keep_latest {
+        return;
+    }
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, old_path) in files.into_iter().skip(keep_latest) {
+        let _ = fs::remove_file(old_path);
+    }
+}
+
 fn store_cached_artifact(path: &Path, artifact: &CompiledArtifact) {
     let Some(parent) = path.parent() else {
         return;
@@ -752,8 +776,13 @@ fn store_cached_artifact(path: &Path, artifact: &CompiledArtifact) {
         seq
     );
     let tmp_path = parent.join(tmp_name);
-    if fs::write(&tmp_path, &bytes).is_ok() && fs::rename(&tmp_path, path).is_err() {
-        let _ = fs::remove_file(&tmp_path);
+    if fs::write(&tmp_path, &bytes).is_ok() {
+        if fs::rename(&tmp_path, path).is_ok() {
+            prune_old_cache_files(parent, "nsbc", 12);
+            prune_old_cache_files(parent, "ptr", 12);
+        } else {
+            let _ = fs::remove_file(&tmp_path);
+        }
     }
 }
 

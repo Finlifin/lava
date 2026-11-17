@@ -911,6 +911,90 @@ fn dispatch_optional_cmd(
     true
 }
 
+fn which_key_group_label(head: String) -> String {
+    when {
+        head == "a" => "+aerial / ai",
+        head == "b" => "+buffer",
+        head == "c" => "+code / lsp",
+        head == "d" => "+diff / debug",
+        head == "f" => "+file",
+        head == "g" => "+git",
+        head == "h" => "+help",
+        head == "l" => "+lazy / lsp",
+        head == "m" => "+marks / macro",
+        head == "n" => "+notes / nav",
+        head == "o" => "+org / open",
+        head == "p" => "+project",
+        head == "q" => "+quit / session",
+        head == "r" => "+refactor / remote",
+        head == "s" => "+search",
+        head == "t" => "+toggle / tab",
+        head == "u" => "+ui",
+        head == "w" => "+window",
+        head == "x" => "+diagnostics",
+        else => "+" ++ head,
+    }
+}
+
+fn group_which_key_hints(hints: List, pfx_str: String) -> List {
+    let direct = List()
+    let group_counts = HashMap.new()
+    let strip_pfx = if pfx_str != "" { pfx_str ++ " " } else { "" }
+    let strip_len = strip_pfx.char_len()
+    let eid = ext_vim_id()
+
+    for i in 0..hints.len() {
+        let kb = hints.get(i.as(usize)).as(KeyBindingEntry)
+        let rel = if strip_pfx != "" and kb.chord.starts_with(strip_pfx) {
+            kb.chord.drop(strip_len)
+        } else {
+            kb.chord
+        }
+        let parts = rel.split(" ")
+        if parts.len() <= 1 {
+            direct.push(KeyBindingEntry {
+                chord: rel,
+                command_name: kb.command_name,
+                owner: kb.owner,
+                description: kb.description,
+            })
+        } else {
+            let head = parts.get(0).as(String)
+            let prev_opt = group_counts.get(head)
+            let prev_cnt = if prev_opt != null { prev_opt.as(i64) } else { 0 }
+            group_counts.insert(head, prev_cnt + 1)
+        }
+    }
+
+    let groups = List()
+    for gk in group_counts.keys() {
+        let head = gk.as(String)
+        let cnt = group_counts.get(head).as(i64)
+        let lbl = which_key_group_label(head) ++ " (" ++ cnt.to_string() ++ ")"
+        groups.push(KeyBindingEntry {
+            chord: head,
+            command_name: lbl,
+            owner: eid,
+            description: lbl,
+        })
+    }
+    groups.sort_by(|a: Any, b: Any| {
+        a.as(KeyBindingEntry).chord.cmp(b.as(KeyBindingEntry).chord)
+    })
+    direct.sort_by(|a: Any, b: Any| {
+        a.as(KeyBindingEntry).chord.cmp(b.as(KeyBindingEntry).chord)
+    })
+
+    let out = List()
+    for i in 0..groups.len() {
+        out.push(groups.get(i.as(usize)))
+    }
+    for i in 0..direct.len() {
+        out.push(direct.get(i.as(usize)))
+    }
+    out
+}
+
 fn sort_key_hints(hints: List) -> List {
     let copy = List()
     for i in 0..hints.len() {
@@ -3219,8 +3303,9 @@ fn handle_leader_sequence(
             return true
         },
         KeyLookup.Prefix(hints) => {
-            world.which_key_items = sort_key_hints(hints)
-            world.pending_keys_display = format_chord(vim.leader_strokes)
+            let pfx_str = format_chord(vim.leader_strokes)
+            world.which_key_items = group_which_key_hints(hints, pfx_str)
+            world.pending_keys_display = pfx_str
             return true
         },
         KeyLookup.Unbound => {

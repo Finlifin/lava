@@ -178,14 +178,33 @@ pub fn render_lazy_buffer(kernel: SystemKernel, _world: EditorWorld) -> List {
     out.push("==========================================================================================")
     out.push("")
 
+    let cmd_counts = HashMap.new()
+    for ck in kernel.commands.keys() {
+        let cname = ck.as(String)
+        let spec = kernel.commands.get(cname).as(CommandSpec)
+        let prev_opt = cmd_counts.get(spec.owner)
+        let prev = if prev_opt != null { prev_opt.as(i64) } else { 0 }
+        cmd_counts.insert(spec.owner, prev + 1)
+    }
+    let svc_counts = HashMap.new()
+    for sk in kernel.services.keys() {
+        let sname = sk.as(String)
+        let entry = kernel.services.get(sname).as(ServiceEntry)
+        let prev_opt = svc_counts.get(entry.owner)
+        let prev = if prev_opt != null { prev_opt.as(i64) } else { 0 }
+        svc_counts.insert(entry.owner, prev + 1)
+    }
+
     out.push("● Active Extensions (" ++ active_a.to_string() ++ ")")
     if active_a == 0 {
         out.push("  (none)")
     } else {
         for i in 0..active_a {
             let rec = active_list.get(i.as(usize)).as(ExtensionRecord)
-            let cmd_cnt = commands_owned_by(kernel, rec.id).len()
-            let svc_cnt = services_owned_by(kernel, rec.id).len()
+            let c_opt = cmd_counts.get(rec.id)
+            let cmd_cnt = if c_opt != null { c_opt.as(i64) } else { 0 }
+            let s_opt = svc_counts.get(rec.id)
+            let svc_cnt = if s_opt != null { s_opt.as(i64) } else { 0 }
             let row_idx = out.len()
             row_map.insert(row_idx, rec.id)
             out.push(

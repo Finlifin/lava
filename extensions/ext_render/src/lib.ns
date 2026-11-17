@@ -4297,13 +4297,14 @@ fn render_which_key_overlay(
         cmds.push(DrawCmd.TextRun(arrow_x, iy, "->", font_fam, font_sz, theme.fg_muted, false, false, false))
         let cmd_x = arrow_x + 3.0 * cell_w
         let avail_chars = max_cell_chars - chord_w - 4
+        let cmd_fg = if cmd_name.starts_with("+") { theme.accent } else { theme.fg }
         cmds.push(DrawCmd.TextRun(
             cmd_x,
             iy,
             clip_str(cmd_name, if avail_chars > 4 { avail_chars } else { 8 }),
             font_fam,
             font_sz,
-            theme.fg,
+            cmd_fg,
             false,
             false,
             false,

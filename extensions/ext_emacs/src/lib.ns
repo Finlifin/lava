@@ -198,6 +198,41 @@ private fn backward_word_once(buf: Buffer, pos: Pos) -> Pos {
     Pos.new(cur.row, c)
 }
 
+private fn is_horiz_ws(ch: String) -> bool {
+    ch == " " or ch == "\t"
+}
+
+private fn backward_kill_word_pos(buf: Buffer, pos: Pos) -> Pos {
+    let cur = buf.clamp_pos(pos, insert_mode = true)
+    if cur.col == 0 {
+        if cur.row > buf.min_row() {
+            let prev_row = cur.row - 1
+            return Pos.new(prev_row, buf.line_char_len(prev_row))
+        }
+        return cur
+    }
+    let line = buf.line_at(cur.row)
+    var c = cur.col
+    while c > 0 and is_horiz_ws(line.slice(c - 1, c)) {
+        c -= 1
+    }
+    if c == 0 {
+        return Pos.new(cur.row, 0)
+    }
+    if is_word_char(line.slice(c - 1, c)) {
+        while c > 0 and is_word_char(line.slice(c - 1, c)) {
+            c -= 1
+        }
+    } else {
+        while c > 0
+            and (not is_word_char(line.slice(c - 1, c)))
+            and (not is_horiz_ws(line.slice(c - 1, c))) {
+            c -= 1
+        }
+    }
+    Pos.new(cur.row, c)
+}
+
 private fn find_next_from_inclusive(
     buf: Buffer,
     needle: String,
@@ -1519,7 +1554,7 @@ private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
             var start_p = end_p
             let count = if n < 1 { 1 } else { n }
             for _ in 0..count {
-                start_p = backward_word_once(buf, start_p)
+                start_p = backward_kill_word_pos(buf, start_p)
             }
             buf.checkpoint(end_p, "backward-kill-word-pre")
             let (_, removed) = buf.delete_span(Span.normalized(start_p, end_p))!
