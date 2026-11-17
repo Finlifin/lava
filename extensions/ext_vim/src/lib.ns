@@ -4812,6 +4812,7 @@ pub fn vim_handle_key(
     let prev_buf_id = prev_buf.id
     let prev_point = prev_buf.point
     let prev_mod = prev_buf.modified
+    let prev_edit_ver = prev_buf.edit_version
     let prev_yank_len = world.registers.yank_history.len()
 
     let handled = vim_dispatch_stroke_core(kernel, world, vim, stroke)#!
@@ -4844,7 +4845,7 @@ pub fn vim_handle_key(
     if cur_buf.id != prev_buf_id or cur_buf.point != prev_point {
         kernel.emit_hook("cursor-moved", cur_buf.id)
     }
-    if cur_buf.id == prev_buf_id and cur_buf.modified != prev_mod {
+    if cur_buf.id == prev_buf_id and (cur_buf.modified != prev_mod or cur_buf.edit_version != prev_edit_ver) {
         kernel.emit_hook("buffer-modified", cur_buf.id)
     }
 

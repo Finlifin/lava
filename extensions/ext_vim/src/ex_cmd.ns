@@ -8,8 +8,8 @@ use std.process
 use @lava_sys.{host_request_quit, host_write_file_lines}
 use @lava_remote.{is_ssh_uri, remote_stat, remote_write_lines}
 use @lava_core.{
-    CommandSpec, ExtensionRecord, InteractiveEffects, ServiceEntry, SystemKernel, clipboard_get,
-    clipboard_set, log_event, status_emit
+    CommandSpec, ExtensionRecord, InteractiveEffects, PromptTurn, ServiceEntry, SystemKernel,
+    clipboard_get, clipboard_set, log_event, status_emit
 }
 use @ext_document.{
     Buffer, BufferId, EditorWorld, JumpEntry, NarrowRegion, Pos, RegisterValue,
@@ -682,6 +682,13 @@ fn apply_set_options(world: EditorWorld, arg_str: String) -> !String String {
     "set " ++ applied.join(" ")
 }
 
+fn prompt_turn_bool(turn: PromptTurn) -> bool {
+    turn match {
+        PromptTurn.Completed(v) => (v matches _: bool) and v.as(bool),
+        _ => false,
+    }
+}
+
 pub fn execute_ex_command(kernel: SystemKernel, raw_cmd: String) -> #InteractiveEffects !String Unit {
     let world = require_editor_world(kernel)!
     let buf = world.active_buffer()
@@ -1024,7 +1031,35 @@ pub fn execute_ex_command(kernel: SystemKernel, raw_cmd: String) -> #Interactive
         return ()
     }
 
-    if verb == "q" or verb == "quit" or verb == "qa" or verb == "qall" {
+    if verb == "q" or verb == "quit" {
+        if kernel.get_command("delete-window") != null {
+            if prompt_turn_bool(kernel.dispatch_command("delete-window", List())#!) {
+                return ()
+            }
+        }
+        if kernel.get_command("tab-close") != null {
+            if prompt_turn_bool(kernel.dispatch_command("tab-close", List())#!) {
+                return ()
+            }
+        }
+        if not bang {
+            let unsaved = world.unsaved_file_buffers()
+            if not unsaved.is_empty() {
+                let first_b = unsaved.get(0).as(Buffer)
+                let msg = "E37: No write since last change for buffer \"" ++ first_b.name ++ "\" (add ! to override)"
+                world.append_message(msg)
+                status_emit(msg)#
+                return ()
+            }
+        }
+        world.quit_requested = true
+        world.exit_code = 0
+        host_request_quit(0)
+        status_emit("Quit")#
+        return ()
+    }
+
+    if verb == "qa" or verb == "qall" {
         if not bang {
             let unsaved = world.unsaved_file_buffers()
             if not unsaved.is_empty() {
@@ -1050,6 +1085,16 @@ pub fn execute_ex_command(kernel: SystemKernel, raw_cmd: String) -> #Interactive
                 kernel.emit_hook("buffer-will-save", buf.id)
                 world.save_buffer(buf.id, override_path = arg)#!
                 kernel.emit_hook("buffer-saved", buf.id)
+            }
+        }
+        if kernel.get_command("delete-window") != null {
+            if prompt_turn_bool(kernel.dispatch_command("delete-window", List())#!) {
+                return ()
+            }
+        }
+        if kernel.get_command("tab-close") != null {
+            if prompt_turn_bool(kernel.dispatch_command("tab-close", List())#!) {
+                return ()
             }
         }
         if not bang {

@@ -4106,12 +4106,20 @@ fn render_window_pane(
         }
 
         -- 5c. End-of-line `VirtualTextDecor` (git blame, inline diagnostics, hints) + Closing-Scope Shadow Labels
+        let in_insert_mode = is_focused and (
+            world.mode_name.to_upper().contains("INSERT")
+            or world.mode_name.to_upper().contains("REPLACE")
+        )
         let row_vts_opt = row_vts_map.get(buf_row)
+        var rendered_row_vt = false
         if row_vts_opt != null {
             let row_vts = row_vts_opt.as(List)
             var vt_vcol = (if cur_vcol < pane.left_col { 0 } else { cur_vcol - pane.left_col }) + 2
             for vi in 0..row_vts.len() {
                 let vt = row_vts.get(vi.as(usize)).as(VirtualTextDecor)
+                if in_insert_mode and vt.owner == "ext_lsp" {
+                    continue
+                }
                 let vx = text_x0 + vt_vcol.as(f64) * cell_w
                 if vx < pane_right_x - cell_w * 2.0 {
                     let max_vt = (((pane_right_x - vx) / cell_w).floor().as(i64))
@@ -4122,9 +4130,11 @@ fn render_window_pane(
                         false, vt.italic, false,
                     ))
                     vt_vcol += str_display_width(vtxt) + 2
+                    rendered_row_vt = true
                 }
             }
-        } else if (not has_row_ghost) and world.options.shadow_text {
+        }
+        if (not rendered_row_vt) and (not has_row_ghost) and world.options.shadow_text {
             let scope_lbl_opt = scope_hints_map.get(buf_row)
             if scope_lbl_opt != null {
                 let scope_lbl = scope_lbl_opt.as(String)
@@ -4819,7 +4829,7 @@ fn render_buffer_completion_popup(
     let gutter_w = compute_gutter_width(buf, world.options, wm.metrics)
 
     let total = cp.items.len()
-    let vis_count = if total > 10 { 10 } else { total }
+    let vis_count = if total > 14 { 14 } else { total }
     let sel = if cp.selected_idx < 0 {
         0
     } else if cp.selected_idx >= total {

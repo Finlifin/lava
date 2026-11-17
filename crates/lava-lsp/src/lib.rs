@@ -955,6 +955,7 @@ struct SessionShared {
     server_version: Mutex<String>,
     capabilities: Mutex<String>,
     pending_methods: Mutex<HashMap<i64, (String, String)>>,
+    pre_init_queue: Mutex<Vec<Vec<u8>>>,
     events: Mutex<VecDeque<LspEvent>>,
 }
 
@@ -1073,6 +1074,7 @@ impl LspManager {
             server_version: Mutex::new(String::new()),
             capabilities: Mutex::new(String::new()),
             pending_methods: Mutex::new(HashMap::new()),
+            pre_init_queue: Mutex::new(Vec::new()),
             events: Mutex::new(VecDeque::new()),
         });
 
@@ -1258,6 +1260,7 @@ impl LspManager {
             server_version: Mutex::new(String::new()),
             capabilities: Mutex::new(String::new()),
             pending_methods: Mutex::new(HashMap::new()),
+            pre_init_queue: Mutex::new(Vec::new()),
             events: Mutex::new(VecDeque::new()),
         });
 
@@ -1357,6 +1360,29 @@ impl LspManager {
             .ok_or_else(|| format!("unknown LSP session id {id}"))
     }
 
+    fn send_or_queue(sess: &LspSession, framed: Vec<u8>) -> Result<(), String> {
+        if sess.shared.initialized.load(Ordering::Acquire) {
+            return sess
+                .tx
+                .send(framed)
+                .map_err(|_| "LSP stdin pipe closed".to_string());
+        }
+        let mut q = sess
+            .shared
+            .pre_init_queue
+            .lock()
+            .map_err(|_| "LSP pre-init queue lock poisoned".to_string())?;
+        if sess.shared.initialized.load(Ordering::Acquire) {
+            drop(q);
+            return sess
+                .tx
+                .send(framed)
+                .map_err(|_| "LSP stdin pipe closed".to_string());
+        }
+        q.push(framed);
+        Ok(())
+    }
+
     pub fn notify_did_open(
         &self,
         id: u64,
@@ -1383,9 +1409,7 @@ impl LspManager {
                 )]),
             ),
         ]);
-        sess.tx
-            .send(frame_json_rpc(&msg))
-            .map_err(|_| "LSP stdin pipe closed".to_string())
+        Self::send_or_queue(&sess, frame_json_rpc(&msg))
     }
 
     pub fn notify_did_change(
@@ -1423,9 +1447,7 @@ impl LspManager {
                 ]),
             ),
         ]);
-        sess.tx
-            .send(frame_json_rpc(&msg))
-            .map_err(|_| "LSP stdin pipe closed".to_string())
+        Self::send_or_queue(&sess, frame_json_rpc(&msg))
     }
 
     pub fn notify_did_save(&self, id: u64, file_path: &str, text: &str) -> Result<(), String> {
@@ -1445,9 +1467,7 @@ impl LspManager {
                 ]),
             ),
         ]);
-        sess.tx
-            .send(frame_json_rpc(&msg))
-            .map_err(|_| "LSP stdin pipe closed".to_string())
+        Self::send_or_queue(&sess, frame_json_rpc(&msg))
     }
 
     pub fn notify_did_close(&self, id: u64, file_path: &str) -> Result<(), String> {
@@ -1467,9 +1487,7 @@ impl LspManager {
                 )]),
             ),
         ]);
-        sess.tx
-            .send(frame_json_rpc(&msg))
-            .map_err(|_| "LSP stdin pipe closed".to_string())
+        Self::send_or_queue(&sess, frame_json_rpc(&msg))
     }
 
     /// Send a standard LSP request (`hover`, `definition`, `implementation`, `typeDefinition`,
@@ -1582,9 +1600,7 @@ impl LspManager {
             ("method", JsonValue::Str(method.to_string())),
             ("params", params),
         ]);
-        sess.tx
-            .send(frame_json_rpc(&req_obj))
-            .map_err(|_| "LSP stdin pipe closed".to_string())?;
+        Self::send_or_queue(&sess, frame_json_rpc(&req_obj))?;
         Ok(req_id)
     }
 
@@ -1777,15 +1793,22 @@ fn handle_incoming_rpc(msg: &JsonValue, shared: &Arc<SessionShared>, tx: &mpsc::
         if let Ok(mut g) = shared.capabilities.lock() {
             *g = caps_str.clone();
         }
-        shared.initialized.store(true, Ordering::Release);
-
-        // Immediately send `initialized` notification!
+        // Immediately send `initialized` notification, then flush any pre-init messages in FIFO order!
         let initialized_notif = JsonValue::obj([
             ("jsonrpc", JsonValue::Str("2.0".to_string())),
             ("method", JsonValue::Str("initialized".to_string())),
             ("params", JsonValue::Object(BTreeMap::new())),
         ]);
-        let _ = tx.send(frame_json_rpc(&initialized_notif));
+        if let Ok(mut pre_q) = shared.pre_init_queue.lock() {
+            let _ = tx.send(frame_json_rpc(&initialized_notif));
+            shared.initialized.store(true, Ordering::Release);
+            for framed in pre_q.drain(..) {
+                let _ = tx.send(framed);
+            }
+        } else {
+            let _ = tx.send(frame_json_rpc(&initialized_notif));
+            shared.initialized.store(true, Ordering::Release);
+        }
 
         if let Ok(mut q) = shared.events.lock() {
             q.push_back(LspEvent::Initialized {

@@ -1546,10 +1546,10 @@ pub fn register_window_extension(kernel: SystemKernel) -> !String Unit {
                     let mgr = require_window_manager(kern)!
                     if not mgr.close_active(w) {
                         status_emit("Cannot delete sole window")#
-                        return ()
+                        return false
                     }
                     status_emit("Closed window (" ++ mgr.visible_panes().len().to_string() ++ " remaining)")#
-                    ()
+                    true
                 },
             )
 
@@ -1762,10 +1762,10 @@ pub fn register_window_extension(kernel: SystemKernel) -> !String Unit {
                     let mgr = require_window_manager(kern)!
                     if not mgr.tab_close(w) {
                         status_emit("Cannot close last tab")#
-                        return ()
+                        return false
                     }
                     status_emit("Closed tab (" ++ mgr.tabs.len().to_string() ++ " remaining)")#
-                    ()
+                    true
                 },
             )
 

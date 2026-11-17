@@ -2611,9 +2611,9 @@ private fn try_register_cmp_source(kernel: SystemKernel, svc: LspService) {
             lsvc.request_signature_help_for_buffer(world, buf, row, col)
             let live_sig_opt = lsvc.signature_cache.get(buf.id)
             if live_sig_opt != null {
-                let (srow, _sver, slbl, sdoc, sparams, sact) =
+                let (srow, sver, slbl, sdoc, sparams, sact) =
                     live_sig_opt.as((i64, i64, String, String, List, i64))
-                if (srow == row or (row >= srow and row - srow <= 4)) and slbl.contains(callee) {
+                if sver == buf.edit_version and (srow == row or (row >= srow and row - srow <= 4)) {
                     let eff_p = if sact >= 0 { sact } else { active_param }
                     let doc_first = if sdoc != "" {
                         sdoc.replace("\r\n", "\n").split("\n").get(0).as(String).trim()
@@ -3170,7 +3170,7 @@ pub fn register_lsp_extension(kernel: SystemKernel) -> !String Unit {
                 let w_opt = kern.service("lava.document.world")
                 if w_opt != null {
                     let w = w_opt.as(EditorWorld)
-                    svc.notify_buffer_changed(w, w.active_buffer())
+                    svc.sync_buffer_did_change(w.active_buffer())
                 }
             }
             let on_insert_stroke = |kern: SystemKernel, _payload: Any| -> Unit {
@@ -3178,9 +3178,7 @@ pub fn register_lsp_extension(kernel: SystemKernel) -> !String Unit {
                 if w_opt != null {
                     let w = w_opt.as(EditorWorld)
                     let b = w.active_buffer()
-                    if b.line_count() <= 2000 {
-                        svc.notify_buffer_changed(w, b)
-                    }
+                    svc.sync_buffer_did_change(b)
                 }
             }
             k.add_hook("buffer-changed", ext_id, on_buf_edit, priority = 40)

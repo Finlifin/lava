@@ -176,6 +176,30 @@ fn extract_prefix_context(world: EditorWorld, buf: Buffer, row: i64, col: i64) -
         }
     }
 
+    -- 1b. C/C++/ObjC `#include <...>` / `#include "..."` header name prefix (preserve `-` and `.` across header names!)
+    let trimmed_before = line.slice(0, safe_col).trim_start()
+    if trimmed_before.starts_with("#include") or trimmed_before.starts_with("#import") {
+        var h_start = safe_col
+        while h_start > 0 {
+            let prev = line.slice(h_start - 1, h_start)
+            if prev == "<" or prev == "\"" or prev == "/" or prev == " " or prev == "\t" {
+                break
+            }
+            h_start -= 1
+        }
+        if h_start > 0 {
+            let delim = line.slice(h_start - 1, h_start)
+            if delim == "<" or delim == "\"" or delim == "/" {
+                return (PrefixContext {
+                    kind: "ident",
+                    replace_start_col: h_start,
+                    prefix: line.slice(h_start, safe_col),
+                    dir_part: "",
+                })
+            }
+        }
+    }
+
     -- 2. Identifier / Snippet / Keyword prefix
     var id_start = safe_col
     while id_start > 0 {
@@ -1239,7 +1263,7 @@ pub fn collect_candidates(
     buf: Buffer,
     prefix: String,
     .replace_start_col: i64 = -1,
-    .limit: i64 = 15,
+    .limit: i64 = 19,
 ) -> List {
     let raw_items = List()
     let labels = List()
@@ -1375,7 +1399,7 @@ pub fn collect_candidates(
     if raw_items.is_empty() {
         return raw_items
     }
-    let lim = if limit > 0 { limit } else { 15 }
+    let lim = if limit > 0 { limit } else { 19 }
     let hits = accel_fuzzy_rank(prefix, labels, limit = lim)
     let ranked = List()
     for i in 0..hits.len() {
@@ -1405,7 +1429,7 @@ impl CmpService {
         CmpService {
             enabled: true,
             min_chars: 2,
-            max_items: 15,
+            max_items: 19,
             custom_sources: List(),
             doc_providers: List(),
             sig_providers: List(),
@@ -1980,7 +2004,10 @@ impl CmpService {
         world.completion_popup = CompletionPopup.inactive()
         world.inline_ghost = InlineGhostText.inactive()
 
-        if item.kind == "Snippet" or item.insert_text.contains("$1") or item.insert_text.contains("${{") {
+        if item.kind == "Snippet"
+            or item.insert_text.contains("$1")
+            or item.insert_text.contains("$0")
+            or item.insert_text.contains("${{") {
             let snip_opt = kernel.service(SERVICE_SNIPPETS)
             if snip_opt != null {
                 let snip_svc = snip_opt.as(SnippetService)
@@ -2018,7 +2045,9 @@ impl CmpService {
         } else {
             item.insert_text
         }
-        let place_inside_parens = if auto_parens {
+        let inserted_empty_parens = auto_parens
+            or (is_callable_kind(item.kind) and item.insert_text.ends_with("()") and (not after_cursor.starts_with("(")))
+        let place_inside_parens = if inserted_empty_parens {
             not is_zero_arity_callable_item(world, buf, item, is_meth)
         } else {
             false
