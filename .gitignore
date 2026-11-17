@@ -3,3 +3,4 @@
 *.nsbc
 *.lisp
 *.bc
+.cargo/config.toml

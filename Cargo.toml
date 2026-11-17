@@ -19,14 +19,14 @@ edition = "2024"
 [workspace.dependencies]
 libc = "0.2"
 pkg-config = "0.3"
-driver = { path = "/home/fin/nessa/nessa2/engine/driver" }
-gc = { path = "/home/fin/nessa/nessa2/engine/gc" }
-initialization = { path = "/home/fin/nessa/nessa2/engine/initialization" }
-interpreter = { path = "/home/fin/nessa/nessa2/engine/interpreter" }
-nsbc = { path = "/home/fin/nessa/nessa2/engine/nsbc" }
-nsbc_io = { path = "/home/fin/nessa/nessa2/engine/nsbc_io" }
-pkg_manager = { path = "/home/fin/nessa/nessa2/engine/pkg_manager" }
-runtime = { path = "/home/fin/nessa/nessa2/engine/runtime" }
+driver = { git = "https://github.com/Finlifin/nessa.git", branch = "main" }
+gc = { git = "https://github.com/Finlifin/nessa.git", branch = "main" }
+initialization = { git = "https://github.com/Finlifin/nessa.git", branch = "main" }
+interpreter = { git = "https://github.com/Finlifin/nessa.git", branch = "main" }
+nsbc = { git = "https://github.com/Finlifin/nessa.git", branch = "main" }
+nsbc_io = { git = "https://github.com/Finlifin/nessa.git", branch = "main" }
+pkg_manager = { git = "https://github.com/Finlifin/nessa.git", branch = "main" }
+runtime = { git = "https://github.com/Finlifin/nessa.git", branch = "main" }
 lava-accel = { path = "crates/lava-accel" }
 lava-lsp = { path = "crates/lava-lsp" }
 lava-remote = { path = "crates/lava-remote" }
