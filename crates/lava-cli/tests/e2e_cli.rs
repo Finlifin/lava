@@ -162,7 +162,7 @@ fn cli_list_extensions_and_check_user_init_succeed() {
     );
     let chk_stdout = String::from_utf8_lossy(&check_out.stdout);
     assert!(
-        chk_stdout.contains("ok: verified 46 extension(s)"),
+        chk_stdout.contains("ok: verified 47 extension(s)"),
         "stdout was: {chk_stdout}"
     );
 }

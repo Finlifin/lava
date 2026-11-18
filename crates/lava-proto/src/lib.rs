@@ -430,6 +430,15 @@ impl EventQueue {
                         *py = *y;
                         *pm = *modifiers;
                     }
+                    (
+                        UiEvent::Tick { timer_id, now_ms },
+                        Some(UiEvent::Tick {
+                            timer_id: ptid,
+                            now_ms: pnow,
+                        }),
+                    ) if *timer_id == *ptid => {
+                        *pnow = *now_ms;
+                    }
                     _ => guard.queue.push_back(event),
                 }
                 self.cvar.notify_all();

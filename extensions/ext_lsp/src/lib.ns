@@ -2020,19 +2020,29 @@ impl LspService {
                                 let meta_opt = self.completion_req_meta.remove(req_id)
                                 if meta_opt != null {
                                     let meta = meta_opt.as(LspCompletionReqMeta)
-                                    let entry = LspCompletionCacheEntry {
-                                        client_id: meta.client_id,
-                                        req_id: req_id,
-                                        buf_id: meta.buf_id,
-                                        row: meta.row,
-                                        col: meta.col,
-                                        edit_version: meta.edit_version,
-                                        items: items,
+                                    let last_opt = self.completion_last_req.get(meta.buf_id)
+                                    var is_stale = false
+                                    if last_opt != null {
+                                        let (_lr, _lc, _lver, latest_rid) = last_opt.as((i64, i64, i64, i64))
+                                        if latest_rid > 0 and req_id < latest_rid {
+                                            is_stale = true
+                                        }
                                     }
-                                    self.completion_cache.insert(meta.buf_id, entry)
-                                    let cur_buf = world.active_buffer()
-                                    if cur_buf.id == meta.buf_id and cur_buf.point.row == meta.row {
-                                        self.pending_cmp_refresh_buf_id = meta.buf_id.as(i64)
+                                    if not is_stale {
+                                        let entry = LspCompletionCacheEntry {
+                                            client_id: meta.client_id,
+                                            req_id: req_id,
+                                            buf_id: meta.buf_id,
+                                            row: meta.row,
+                                            col: meta.col,
+                                            edit_version: meta.edit_version,
+                                            items: items,
+                                        }
+                                        self.completion_cache.insert(meta.buf_id, entry)
+                                        let cur_buf = world.active_buffer()
+                                        if cur_buf.id == meta.buf_id and cur_buf.point.row == meta.row {
+                                            self.pending_cmp_refresh_buf_id = meta.buf_id.as(i64)
+                                        }
                                     }
                                 } else {
                                     let cur_buf = world.active_buffer()
@@ -2184,6 +2194,21 @@ impl LspService {
             let cached = cached_opt.as(LspCompletionCacheEntry)
             if cached.edit_version == ver and cached.row == row and cached.col == col {
                 return
+            }
+            if wait_ms <= 0 and cached.row == row and col >= cached.col and (not cached.items.is_empty()) {
+                let line = buf.line_at(row)
+                let end_c = if col > line.char_len() { line.char_len() } else { col }
+                let start_c = if cached.col < 0 { 0 } else if cached.col > end_c { end_c } else { cached.col }
+                let typed_since = line.slice(start_c, end_c)
+                if (not typed_since.contains("."))
+                    and (not typed_since.contains(":"))
+                    and (not typed_since.contains(">"))
+                    and (not typed_since.contains("<"))
+                    and (not typed_since.contains("/"))
+                    and (not typed_since.contains("("))
+                    and (not typed_since.contains(" ")) {
+                    return
+                }
             }
         }
 

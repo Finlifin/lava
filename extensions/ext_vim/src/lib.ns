@@ -974,6 +974,7 @@ fn which_key_group_label(head: String) -> String {
         head == "u" => "+ui",
         head == "w" => "+window",
         head == "x" => "+diagnostics",
+        head == "z" => "+fold / zen",
         else => "+" ++ head,
     }
 }
