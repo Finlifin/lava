@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use interpreter::{HostCallOutcome, HostHandler, NativeValue, Vm, VmResult};
 use lava_lsp::{LSP_WAKE_TIMER_ID, LspEvent, LspManager, LspTextEditItem};
-use lava_proto::{AnimHints, EventQueue, FontMetrics, FrameSlot, ScrollViewport, UiEvent};
+use lava_proto::{
+    AnimHints, EventQueue, FontMetrics, FrameSlot, ScrollViewport, TransferOverlay, UiEvent,
+};
 use lava_remote::{
     RemoteConnInfo, RemoteManager, discover_ssh_config_hosts, read_rpc_frame, write_rpc_frame,
 };
@@ -355,6 +357,21 @@ impl LavaHostHandler {
                 now_ms,
             });
         }));
+
+        let fs_for_remote = Arc::clone(&config.frame_slot);
+        config
+            .remotes
+            .set_progress_callback(Some(Arc::new(move |snap_opt| {
+                let overlay = snap_opt.map(|s| TransferOverlay {
+                    active: s.active,
+                    title: s.title,
+                    transport: s.transport,
+                    bytes_done: s.bytes_done,
+                    bytes_total: s.bytes_total,
+                    lines_loaded: s.lines_loaded,
+                });
+                fs_for_remote.set_transfer_overlay(overlay);
+            })));
 
         let controller = HostWaitController {
             event_queue: Arc::clone(&config.event_queue),
@@ -853,9 +870,9 @@ impl HostHandler for LavaHostHandler {
             "accel_ts_highlight_snippet" => handle_accel_ts_highlight_snippet(args),
             "accel_ts_inspect_node" => handle_accel_ts_inspect_node(args),
             "accel_ts_status" => handle_accel_ts_status(args),
-            "pty_available" => {
-                HostCallOutcome::Return(NativeValue::Bool(!self.mock_mode.load(Ordering::SeqCst)))
-            }
+            "pty_available" => HostCallOutcome::Return(NativeValue::Bool(
+                cfg!(unix) && !self.mock_mode.load(Ordering::SeqCst),
+            )),
             "pty_spawn" => handle_pty_spawn(&self.ptys, args),
             "pty_write" => handle_pty_write(&self.ptys, args),
             "pty_send_key" => handle_pty_send_key(&self.ptys, args),
@@ -912,6 +929,13 @@ impl HostHandler for LavaHostHandler {
             "remote_port_forward_start" => handle_remote_port_forward_start(&self.remotes, args),
             "remote_port_forward_stop" => handle_remote_port_forward_stop(&self.remotes, args),
             "remote_port_forward_list" => handle_remote_port_forward_list(&self.remotes, args),
+            "remote_open_doc" => handle_remote_open_doc(&self.remotes, args),
+            "remote_save_doc" => handle_remote_save_doc(&self.remotes, args),
+            "remote_read_preview" => handle_remote_read_preview(&self.remotes, args),
+            "remote_transfer_progress" => handle_remote_transfer_progress(&self.remotes, args),
+            "remote_git_status" => handle_remote_git_status(&self.remotes, args),
+            "remote_git_head_lines" => handle_remote_git_head_lines(&self.remotes, args),
+            "remote_git_blame_line" => handle_remote_git_blame_line(&self.remotes, args),
             other => HostCallOutcome::Error(format!("unknown lava_sys host operation: {other}")),
         }
     }
@@ -2415,6 +2439,7 @@ fn handle_accel_doc_search_preview(args: &[NativeValue]) -> HostCallOutcome {
     ]))
 }
 
+#[cfg(not(windows))]
 fn encode_ts_highlight_rows(rows: Vec<Vec<lava_accel::TsHighlightSpan>>) -> NativeValue {
     NativeValue::List(
         rows.into_iter()
@@ -2439,28 +2464,35 @@ fn handle_accel_ts_highlight_rows(args: &[NativeValue]) -> HostCallOutcome {
     if args.len() != 4 {
         return HostCallOutcome::Error("accel_ts_highlight_rows expects 4 arguments".to_string());
     }
-    let doc_id = match expect_i64(&args[0], "accel_ts_highlight_rows.doc_id") {
-        Ok(v) => v,
-        Err(e) => return HostCallOutcome::Error(e),
-    };
-    let lang = match expect_str(&args[1], "accel_ts_highlight_rows.lang") {
-        Ok(s) => s,
-        Err(e) => return HostCallOutcome::Error(e),
-    };
-    let start_row = match expect_i64(&args[2], "accel_ts_highlight_rows.start_row") {
-        Ok(v) => v,
-        Err(e) => return HostCallOutcome::Error(e),
-    };
-    let end_row = match expect_i64(&args[3], "accel_ts_highlight_rows.end_row") {
-        Ok(v) => v,
-        Err(e) => return HostCallOutcome::Error(e),
-    };
-    let s = start_row.max(0);
-    if end_row < s {
-        return HostCallOutcome::Return(NativeValue::List(Vec::new()));
+    #[cfg(windows)]
+    {
+        HostCallOutcome::Return(NativeValue::List(Vec::new()))
     }
-    let rows = lava_accel::ts_highlight_doc_rows(doc_id, &lang, s as usize, end_row as usize);
-    HostCallOutcome::Return(encode_ts_highlight_rows(rows))
+    #[cfg(not(windows))]
+    {
+        let doc_id = match expect_i64(&args[0], "accel_ts_highlight_rows.doc_id") {
+            Ok(v) => v,
+            Err(e) => return HostCallOutcome::Error(e),
+        };
+        let lang = match expect_str(&args[1], "accel_ts_highlight_rows.lang") {
+            Ok(s) => s,
+            Err(e) => return HostCallOutcome::Error(e),
+        };
+        let start_row = match expect_i64(&args[2], "accel_ts_highlight_rows.start_row") {
+            Ok(v) => v,
+            Err(e) => return HostCallOutcome::Error(e),
+        };
+        let end_row = match expect_i64(&args[3], "accel_ts_highlight_rows.end_row") {
+            Ok(v) => v,
+            Err(e) => return HostCallOutcome::Error(e),
+        };
+        let s = start_row.max(0);
+        if end_row < s {
+            return HostCallOutcome::Return(NativeValue::List(Vec::new()));
+        }
+        let rows = lava_accel::ts_highlight_doc_rows(doc_id, &lang, s as usize, end_row as usize);
+        HostCallOutcome::Return(encode_ts_highlight_rows(rows))
+    }
 }
 
 fn handle_accel_ts_highlight_snippet(args: &[NativeValue]) -> HostCallOutcome {
@@ -2469,16 +2501,23 @@ fn handle_accel_ts_highlight_snippet(args: &[NativeValue]) -> HostCallOutcome {
             "accel_ts_highlight_snippet expects 2 arguments".to_string(),
         );
     }
-    let text = match expect_str(&args[0], "accel_ts_highlight_snippet.text") {
-        Ok(s) => s,
-        Err(e) => return HostCallOutcome::Error(e),
-    };
-    let lang = match expect_str(&args[1], "accel_ts_highlight_snippet.lang") {
-        Ok(s) => s,
-        Err(e) => return HostCallOutcome::Error(e),
-    };
-    let rows = lava_accel::ts_highlight_snippet(&text, &lang);
-    HostCallOutcome::Return(encode_ts_highlight_rows(rows))
+    #[cfg(windows)]
+    {
+        HostCallOutcome::Return(NativeValue::List(Vec::new()))
+    }
+    #[cfg(not(windows))]
+    {
+        let text = match expect_str(&args[0], "accel_ts_highlight_snippet.text") {
+            Ok(s) => s,
+            Err(e) => return HostCallOutcome::Error(e),
+        };
+        let lang = match expect_str(&args[1], "accel_ts_highlight_snippet.lang") {
+            Ok(s) => s,
+            Err(e) => return HostCallOutcome::Error(e),
+        };
+        let rows = lava_accel::ts_highlight_snippet(&text, &lang);
+        HostCallOutcome::Return(encode_ts_highlight_rows(rows))
+    }
 }
 
 fn handle_accel_ts_inspect_node(args: &[NativeValue]) -> HostCallOutcome {
@@ -3837,6 +3876,210 @@ fn handle_remote_port_forward_list(
         })
         .collect();
     HostCallOutcome::Return(NativeValue::List(list))
+}
+
+fn handle_remote_open_doc(remotes: &RemoteManager, args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 1 {
+        return HostCallOutcome::Error("remote_open_doc expects 1 argument".to_string());
+    }
+    let uri = match expect_str(&args[0], "remote_open_doc.uri") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    match remotes.read_file_bytes(&uri) {
+        Ok((exists, is_dir, readonly, bytes, transport)) => {
+            if !exists || is_dir {
+                return HostCallOutcome::Return(NativeValue::List(vec![
+                    NativeValue::Bool(exists),
+                    NativeValue::Bool(is_dir),
+                    NativeValue::Bool(readonly),
+                    NativeValue::I64(0),
+                    NativeValue::I64(0),
+                    NativeValue::Bool(false),
+                    NativeValue::I64(0),
+                    NativeValue::Str(transport),
+                ]));
+            }
+            let byte_len = bytes.len() as i64;
+            let (doc_id, line_count, crlf) = lava_accel::doc_store::doc_open_from_bytes(bytes);
+            HostCallOutcome::Return(NativeValue::List(vec![
+                NativeValue::Bool(true),
+                NativeValue::Bool(false),
+                NativeValue::Bool(readonly),
+                NativeValue::I64(doc_id),
+                NativeValue::I64(line_count),
+                NativeValue::Bool(crlf),
+                NativeValue::I64(byte_len),
+                NativeValue::Str(transport),
+            ]))
+        }
+        Err(err) => HostCallOutcome::Error(err),
+    }
+}
+
+fn handle_remote_save_doc(remotes: &RemoteManager, args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 3 {
+        return HostCallOutcome::Error("remote_save_doc expects 3 arguments".to_string());
+    }
+    let uri = match expect_str(&args[0], "remote_save_doc.uri") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let doc_id = match expect_i64(&args[1], "remote_save_doc.doc_id") {
+        Ok(v) => v,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let crlf = match expect_bool(&args[2], "remote_save_doc.crlf") {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let bytes = match lava_accel::doc_store::doc_encode_to_bytes(doc_id, crlf) {
+        Ok(b) => b,
+        Err(err) => return HostCallOutcome::Error(err),
+    };
+    match remotes.write_file_bytes(&uri, &bytes, crlf) {
+        Ok((written, transport)) => HostCallOutcome::Return(NativeValue::List(vec![
+            NativeValue::I64(written as i64),
+            NativeValue::Str(transport),
+        ])),
+        Err(err) => HostCallOutcome::Error(err),
+    }
+}
+
+fn handle_remote_read_preview(remotes: &RemoteManager, args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 3 {
+        return HostCallOutcome::Error("remote_read_preview expects 3 arguments".to_string());
+    }
+    let uri = match expect_str(&args[0], "remote_read_preview.uri") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let max_bytes = match expect_i64(&args[1], "remote_read_preview.max_bytes") {
+        Ok(v) => v,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let max_lines = match expect_i64(&args[2], "remote_read_preview.max_lines") {
+        Ok(v) => v,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    match remotes.read_preview(&uri, max_bytes, max_lines) {
+        Ok(prev) => HostCallOutcome::Return(NativeValue::List(vec![
+            NativeValue::List(prev.lines.into_iter().map(NativeValue::Str).collect()),
+            NativeValue::Bool(prev.is_binary),
+            NativeValue::Bool(prev.truncated),
+            NativeValue::I64(prev.total_size),
+        ])),
+        Err(err) => HostCallOutcome::Error(err),
+    }
+}
+
+fn handle_remote_transfer_progress(
+    remotes: &RemoteManager,
+    args: &[NativeValue],
+) -> HostCallOutcome {
+    if !args.is_empty() {
+        return HostCallOutcome::Error("remote_transfer_progress expects 0 arguments".to_string());
+    }
+    let snap = remotes.last_transfer_progress();
+    HostCallOutcome::Return(NativeValue::List(vec![
+        NativeValue::Bool(snap.active),
+        NativeValue::Str(snap.title),
+        NativeValue::Str(snap.detail),
+        NativeValue::Str(snap.transport),
+        NativeValue::I64(snap.bytes_done as i64),
+        NativeValue::I64(snap.bytes_total as i64),
+        NativeValue::I64(snap.lines_loaded as i64),
+    ]))
+}
+
+fn handle_remote_git_status(remotes: &RemoteManager, args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 1 {
+        return HostCallOutcome::Error("remote_git_status expects 1 argument".to_string());
+    }
+    let uri = match expect_str(&args[0], "remote_git_status.uri") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    match remotes.git_status(&uri) {
+        Ok(st) => {
+            let entries = st
+                .entries
+                .into_iter()
+                .map(|e| {
+                    NativeValue::List(vec![
+                        NativeValue::Str(e.index_status),
+                        NativeValue::Str(e.worktree_status),
+                        NativeValue::Str(e.rel_path),
+                    ])
+                })
+                .collect();
+            HostCallOutcome::Return(NativeValue::List(vec![
+                NativeValue::Bool(st.is_repo),
+                NativeValue::Str(st.root),
+                NativeValue::Str(st.branch),
+                NativeValue::I64(st.staged_count),
+                NativeValue::I64(st.modified_count),
+                NativeValue::I64(st.untracked_count),
+                NativeValue::List(entries),
+            ]))
+        }
+        Err(err) => HostCallOutcome::Error(err),
+    }
+}
+
+fn handle_remote_git_head_lines(remotes: &RemoteManager, args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 3 {
+        return HostCallOutcome::Error("remote_git_head_lines expects 3 arguments".to_string());
+    }
+    let uri = match expect_str(&args[0], "remote_git_head_lines.uri") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let file_path = match expect_str(&args[1], "remote_git_head_lines.file_path") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let rev = match expect_str(&args[2], "remote_git_head_lines.rev") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    match remotes.git_head_lines(&uri, &file_path, &rev) {
+        Ok(Some(lines)) => HostCallOutcome::Return(NativeValue::List(vec![
+            NativeValue::Bool(true),
+            NativeValue::List(lines.into_iter().map(NativeValue::Str).collect()),
+        ])),
+        Ok(None) => HostCallOutcome::Return(NativeValue::List(vec![NativeValue::Bool(false)])),
+        Err(err) => HostCallOutcome::Error(err),
+    }
+}
+
+fn handle_remote_git_blame_line(remotes: &RemoteManager, args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 3 {
+        return HostCallOutcome::Error("remote_git_blame_line expects 3 arguments".to_string());
+    }
+    let uri = match expect_str(&args[0], "remote_git_blame_line.uri") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let file_path = match expect_str(&args[1], "remote_git_blame_line.file_path") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let row = match expect_i64(&args[2], "remote_git_blame_line.row") {
+        Ok(v) => v,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    match remotes.git_blame_line(&uri, &file_path, row) {
+        Ok(Some(b)) => HostCallOutcome::Return(NativeValue::List(vec![
+            NativeValue::Bool(true),
+            NativeValue::Str(b.commit_short),
+            NativeValue::Str(b.author),
+            NativeValue::Str(b.date_ymd),
+            NativeValue::Str(b.summary),
+        ])),
+        Ok(None) => HostCallOutcome::Return(NativeValue::List(vec![NativeValue::Bool(false)])),
+        Err(err) => HostCallOutcome::Error(err),
+    }
 }
 
 /// Drive `vm` inside a single continuous Nessa `Scheduler` + `libuv` session, waking

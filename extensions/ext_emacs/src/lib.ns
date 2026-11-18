@@ -138,7 +138,10 @@ private fn step_forward_char(buf: Buffer, pos: Pos) -> Pos {
         return Pos.new(p.row, p.col + 1)
     }
     if p.row < buf.max_row() {
-        return Pos.new(p.row + 1, 0)
+        let nr = buf.step_visible_row_down(p.row, 1)
+        if nr != p.row {
+            return Pos.new(nr, 0)
+        }
     }
     p
 }
@@ -149,15 +152,17 @@ private fn step_backward_char(buf: Buffer, pos: Pos) -> Pos {
         return Pos.new(p.row, p.col - 1)
     }
     if p.row > buf.min_row() {
-        let prev_row = p.row - 1
-        return Pos.new(prev_row, buf.line_char_len(prev_row))
+        let prev_row = buf.step_visible_row_up(p.row, 1)
+        if prev_row != p.row {
+            return Pos.new(prev_row, buf.line_char_len(prev_row))
+        }
     }
     p
 }
 
 private fn forward_word_once(buf: Buffer, pos: Pos) -> Pos {
     var cur = buf.clamp_pos(pos, insert_mode = true)
-    -- 1. Skip non-word characters (including line breaks)
+    -- 1. Skip non-word characters (including line breaks across visible rows)
     while true {
         let llen = buf.line_char_len(cur.row)
         if cur.col < llen {
@@ -167,7 +172,11 @@ private fn forward_word_once(buf: Buffer, pos: Pos) -> Pos {
             }
             cur = Pos.new(cur.row, cur.col + 1)
         } else if cur.row < buf.max_row() {
-            cur = Pos.new(cur.row + 1, 0)
+            let nr = buf.step_visible_row_down(cur.row, 1)
+            if nr == cur.row {
+                return cur
+            }
+            cur = Pos.new(nr, 0)
         } else {
             return cur
         }
@@ -184,7 +193,7 @@ private fn forward_word_once(buf: Buffer, pos: Pos) -> Pos {
 
 private fn backward_word_once(buf: Buffer, pos: Pos) -> Pos {
     var cur = buf.clamp_pos(pos, insert_mode = true)
-    -- 1. Step back across non-word characters (including line breaks)
+    -- 1. Step back across non-word characters (including line breaks across visible rows)
     while true {
         if cur.col > 0 {
             let ch = buf.line_at(cur.row).slice(cur.col - 1, cur.col)
@@ -193,7 +202,10 @@ private fn backward_word_once(buf: Buffer, pos: Pos) -> Pos {
             }
             cur = Pos.new(cur.row, cur.col - 1)
         } else if cur.row > buf.min_row() {
-            let prev_row = cur.row - 1
+            let prev_row = buf.step_visible_row_up(cur.row, 1)
+            if prev_row == cur.row {
+                return cur
+            }
             cur = Pos.new(prev_row, buf.line_char_len(prev_row))
         } else {
             return cur
@@ -1298,11 +1310,10 @@ private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
             let st = require_emacs_state(kern)!
             let n = st.consume_count(args)
             let buf = w.active_buffer()
-            var r = buf.point.row + n
-            if r < buf.min_row() {
-                r = buf.min_row()
-            } else if r > buf.max_row() {
-                r = buf.max_row()
+            let r = if n >= 0 {
+                buf.step_visible_row_down(buf.point.row, n)
+            } else {
+                buf.step_visible_row_up(buf.point.row, -n)
             }
             buf.point = buf.clamp_pos(Pos.new(r, buf.preferred_col), insert_mode = true)
             ensure_cursor_visible(w, buf.point.row)
@@ -1319,11 +1330,10 @@ private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
             let st = require_emacs_state(kern)!
             let n = st.consume_count(args)
             let buf = w.active_buffer()
-            var r = buf.point.row - n
-            if r < buf.min_row() {
-                r = buf.min_row()
-            } else if r > buf.max_row() {
-                r = buf.max_row()
+            let r = if n >= 0 {
+                buf.step_visible_row_up(buf.point.row, n)
+            } else {
+                buf.step_visible_row_down(buf.point.row, -n)
             }
             buf.point = buf.clamp_pos(Pos.new(r, buf.preferred_col), insert_mode = true)
             ensure_cursor_visible(w, buf.point.row)
@@ -1427,7 +1437,7 @@ private fn register_all_emacs_commands(kernel: SystemKernel, ext_id: ExtId) {
             let w = require_editor_world(kern)!
             let buf = w.active_buffer()
             buf.set_mark(buf.point, activate = false)
-            let hi = buf.max_row()
+            let hi = buf.snap_to_visible_row(buf.max_row())
             let end_c = buf.line_char_len(hi)
             buf.point = Pos.new(hi, end_c)
             buf.preferred_col = end_c

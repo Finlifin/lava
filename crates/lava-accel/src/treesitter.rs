@@ -7,8 +7,12 @@
 //! `(doc_id, version, lang)` (LRU 32), and converts UTF-8 byte offsets to exact 0-based Unicode
 //! `char` columns on every row.
 
+#![cfg_attr(not(unix), allow(dead_code))]
+
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, c_char, c_void};
+#[cfg(unix)]
+use std::ffi::{CString, c_int};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -172,6 +176,9 @@ const RTLD_LOCAL: c_int = 0;
 unsafe extern "C" {
     fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+}
+
+unsafe extern "C" {
     fn free(ptr: *mut c_void);
 }
 
@@ -405,6 +412,7 @@ pub fn normalize_ts_lang(raw: &str) -> String {
 fn home_dir_path() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()))
         .map(PathBuf::from)
 }
 

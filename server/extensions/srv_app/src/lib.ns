@@ -79,3 +79,10 @@ pub fn boot_and_run_stdio() -> !String Unit {
     let kernel = create_server_kernel()!
     run_stdio_loop(kernel)
 }
+
+pub fn boot_and_run_stdio_with_http(http_port: i64, http_token: String) -> !String Unit {
+    let kernel = create_server_kernel()!
+    kernel.http_port = http_port
+    kernel.http_token = http_token
+    run_stdio_loop(kernel)
+}

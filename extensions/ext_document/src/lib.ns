@@ -18,7 +18,8 @@ use @lava_accel.{
     accel_doc_to_text_capped
 }
 use @lava_remote.{
-    is_ssh_uri, join_ssh_uri, normalize_ssh_uri, remote_read_lines, remote_stat,
+    RemoteOpenDocResult, RemoteTransferProgress, is_ssh_uri, join_ssh_uri, normalize_ssh_uri,
+    remote_open_doc, remote_read_lines, remote_save_doc, remote_stat, remote_transfer_progress,
     remote_write_lines, ssh_uri_basename
 }
 use @lava_core.{
@@ -724,12 +725,34 @@ pub struct QuickfixEntry {
     pub text: String,
 }
 
--- Parse `path:line:col:text` or `path:line:text` diagnostic/grep output lines.
+-- Parse `path:line:col:text` or `path:line:text` diagnostic/grep output lines
+-- (preserving Windows drive prefixes like `C:\foo\bar.rs:10:2:` and `ssh://...` URIs).
 pub fn parse_quickfix_line(line: String) -> ?QuickfixEntry {
     let first_split? = line.split_once(":") else {
         return null
     }
-    let (fpath, rest1) = first_split
+    let (p0, r0) = first_split
+    let (fpath, rest1) = if p0.trim().char_len() == 1 and (r0.starts_with("\\") or r0.starts_with("/")) {
+        let win_split? = r0.split_once(":") else {
+            return null
+        }
+        let (win_rel, after_drive) = win_split
+        (p0 ++ ":" ++ win_rel, after_drive)
+    } else if line.starts_with("ssh://") {
+        let after_scheme = line.drop(6)
+        let slash_opt = after_scheme.split_once("/")
+        if slash_opt == null {
+            return null
+        }
+        let (auth, path_and_rest) = slash_opt.as((String, String))
+        let p_split? = path_and_rest.split_once(":") else {
+            return null
+        }
+        let (rpath, rem) = p_split
+        ("ssh://" ++ auth ++ "/" ++ rpath, rem)
+    } else {
+        (p0, r0)
+    }
     if fpath.trim() == "" {
         return null
     }
@@ -875,6 +898,46 @@ pub struct Buffer {
     pub tracked_sign_len: i64,
     pub tracked_inline_len: i64,
     pub tracked_vt_len: i64,
+    pub decor_gen: i64,
+}
+
+private fn doc_heading_fold_level(line: String, major_mode: String) -> i64 {
+    if major_mode == "org" {
+        let n = line.char_len()
+        var stars: i64 = 0
+        while stars < n and line.slice(stars, stars + 1) == "*" {
+            stars += 1
+        }
+        if stars > 0 and stars < n and line.slice(stars, stars + 1) == " " {
+            return stars
+        }
+        return 0
+    }
+    if major_mode == "markdown" or major_mode == "md" {
+        let blen = line.len()
+        var sp: i64 = 0
+        while sp < blen and sp < 4 and line.byte_at(sp) == 32 {
+            sp += 1
+        }
+        if sp >= 4 or sp >= blen {
+            return 0
+        }
+        var hashes: i64 = 0
+        while sp + hashes < blen and line.byte_at(sp + hashes) == 35 {
+            hashes += 1
+        }
+        if hashes >= 1 and hashes <= 6 {
+            if sp + hashes == blen {
+                return hashes
+            }
+            let next_b = line.byte_at(sp + hashes)
+            if next_b == 32 or next_b == 9 {
+                return hashes
+            }
+        }
+        return 0
+    }
+    0
 }
 
 impl Buffer {
@@ -944,6 +1007,7 @@ impl Buffer {
             tracked_sign_len: 0,
             tracked_inline_len: 0,
             tracked_vt_len: 0,
+            decor_gen: 1,
         }
     }
 
@@ -1004,6 +1068,7 @@ impl Buffer {
             tracked_sign_len: 0,
             tracked_inline_len: 0,
             tracked_vt_len: 0,
+            decor_gen: 1,
         }
     }
 
@@ -1099,6 +1164,104 @@ impl Buffer {
 
     pub fn widen(self) {
         self.narrow = null
+    }
+
+    pub fn is_row_hidden_by_fold(self, row: i64) -> bool {
+        if self.folded_rows.is_empty() {
+            return false
+        }
+        if not self.folded_rows.contains(row) {
+            return false
+        }
+        let lvl = doc_heading_fold_level(self.line_at(row), self.major_mode)
+        if lvl > 0 {
+            let hi = self.max_row()
+            let body_marked = row + 1 <= hi and self.folded_rows.contains(row + 1)
+            if not body_marked {
+                return false
+            }
+        }
+        true
+    }
+
+    pub fn snap_to_visible_row(self, row: i64) -> i64 {
+        let lo = self.min_row()
+        let hi = self.max_row()
+        var cur = if row < lo { lo } else if row > hi { hi } else { row }
+        if self.folded_rows.is_empty() {
+            return cur
+        }
+        while cur > lo and self.is_row_hidden_by_fold(cur) {
+            cur -= 1
+        }
+        cur
+    }
+
+    pub fn step_visible_row_down(self, from_row: i64, steps: i64) -> i64 {
+        let lo = self.min_row()
+        let hi = self.max_row()
+        var cur = if from_row < lo { lo } else if from_row > hi { hi } else { from_row }
+        if self.folded_rows.is_empty() {
+            let raw = cur + steps
+            return if raw < lo { lo } else if raw > hi { hi } else { raw }
+        }
+        cur = self.snap_to_visible_row(cur)
+        if steps <= 0 {
+            return cur
+        }
+        var rem = steps
+        while rem > 0 and cur < hi {
+            var nx = cur + 1
+            if self.folded_rows.contains(cur) {
+                let lvl = doc_heading_fold_level(self.line_at(cur), self.major_mode)
+                let body_marked = cur + 1 <= hi and self.folded_rows.contains(cur + 1)
+                if lvl > 0 and (not body_marked) {
+                    while nx <= hi {
+                        let nlvl = doc_heading_fold_level(self.line_at(nx), self.major_mode)
+                        if nlvl > 0 and nlvl <= lvl {
+                            break
+                        }
+                        nx += 1
+                    }
+                }
+            }
+            while nx <= hi and self.is_row_hidden_by_fold(nx) {
+                nx += 1
+            }
+            if nx > hi {
+                break
+            }
+            cur = nx
+            rem -= 1
+        }
+        cur
+    }
+
+    pub fn step_visible_row_up(self, from_row: i64, steps: i64) -> i64 {
+        let lo = self.min_row()
+        let hi = self.max_row()
+        var cur = if from_row < lo { lo } else if from_row > hi { hi } else { from_row }
+        if self.folded_rows.is_empty() {
+            let raw = cur - steps
+            return if raw < lo { lo } else if raw > hi { hi } else { raw }
+        }
+        cur = self.snap_to_visible_row(cur)
+        if steps <= 0 {
+            return cur
+        }
+        var rem = steps
+        while rem > 0 and cur > lo {
+            var prev = cur - 1
+            while prev > lo and self.is_row_hidden_by_fold(prev) {
+                prev -= 1
+            }
+            if self.is_row_hidden_by_fold(prev) {
+                break
+            }
+            cur = prev
+            rem -= 1
+        }
+        cur
     }
 
     pub fn line_at(self, row: i64) -> String {
@@ -1842,6 +2005,7 @@ impl Buffer {
                 }
                 if next_signs.len() != old_len {
                     self.signs = next_signs
+                    self.decor_gen += 1
                 }
                 self.tracked_sign_len = self.signs.len()
                 self.cleared_sign_owners.set(owner, true)
@@ -1864,6 +2028,7 @@ impl Buffer {
                 }
                 if next_inline.len() != old_len {
                     self.inline_decors = next_inline
+                    self.decor_gen += 1
                 }
                 self.tracked_inline_len = self.inline_decors.len()
                 self.cleared_inline_owners.set(owner, true)
@@ -1886,6 +2051,7 @@ impl Buffer {
                 }
                 if next_vt.len() != old_len {
                     self.virt_texts = next_vt
+                    self.decor_gen += 1
                 }
                 self.tracked_vt_len = self.virt_texts.len()
                 self.cleared_vt_owners.set(owner, true)
@@ -1903,6 +2069,7 @@ impl Buffer {
         self.tracked_sign_len = 0
         self.tracked_inline_len = 0
         self.tracked_vt_len = 0
+        self.decor_gen += 1
     }
 
     pub fn add_sign(
@@ -1925,6 +2092,7 @@ impl Buffer {
             priority: priority,
         })
         self.tracked_sign_len = self.signs.len()
+        self.decor_gen += 1
     }
 
     pub fn add_inline_decor(
@@ -1953,6 +2121,7 @@ impl Buffer {
             replace_label: replace_label,
         })
         self.tracked_inline_len = self.inline_decors.len()
+        self.decor_gen += 1
     }
 
     pub fn add_virt_text(
@@ -1975,6 +2144,7 @@ impl Buffer {
             italic: italic,
         })
         self.tracked_vt_len = self.virt_texts.len()
+        self.decor_gen += 1
     }
 
     pub fn compute_smart_indent(self, row: i64, shiftwidth: i64, expandtab: bool) -> String {
@@ -2069,6 +2239,7 @@ pub struct EditorOptions {
     pub smooth_scroll: bool,
     pub cursor_anim: bool,
     pub treesitter: bool,
+    pub window_decorations: bool,
 }
 
 impl EditorOptions {
@@ -2108,7 +2279,8 @@ impl EditorOptions {
             shadow_text: true,
             smooth_scroll: true,
             cursor_anim: true,
-            treesitter: true,
+            treesitter: env.os() != "windows",
+            window_decorations: false,
         }
     }
 }
@@ -2316,6 +2488,30 @@ impl MinibufferView {
     }
 }
 
+pub struct TransferProgressState {
+    pub active: bool,
+    pub title: String,
+    pub detail: String,
+    pub transport: String,
+    pub bytes_done: i64,
+    pub bytes_total: i64,
+    pub lines_loaded: i64,
+}
+
+impl TransferProgressState {
+    pub fn idle() -> TransferProgressState {
+        TransferProgressState {
+            active: false,
+            title: "",
+            detail: "",
+            transport: "",
+            bytes_done: 0,
+            bytes_total: 0,
+            lines_loaded: 0,
+        }
+    }
+}
+
 pub struct EditorWorld {
     pub buffers: HashMap,
     pub buffer_order: List,
@@ -2364,6 +2560,8 @@ pub struct EditorWorld {
     pub minibuffer_rich_items: List,
     pub minibuffer_mode_badge: String,
     pub minibuffer_hint_bar: String,
+    pub minibuffer_history_ghost: String,
+    pub transfer_progress: TransferProgressState,
     pub floating_window_spans: HashMap,
     pub floating_window_cursor: HashMap,
     pub in_key_burst: bool,
@@ -2453,6 +2651,8 @@ impl EditorWorld {
             minibuffer_rich_items: List(),
             minibuffer_mode_badge: "",
             minibuffer_hint_bar: "",
+            minibuffer_history_ghost: "",
+            transfer_progress: TransferProgressState.idle(),
             floating_window_spans: HashMap.new(),
             floating_window_cursor: HashMap.new(),
             in_key_burst: false,
@@ -2659,25 +2859,52 @@ impl EditorWorld {
         if is_ssh_uri(full_path) {
             let rbase = ssh_uri_basename(full_path)
             let rmode = detect_major_mode(full_path)
-            let st = remote_stat(full_path)!
-            if st.exists {
-                if st.is_dir {
-                    return error ("path is a remote directory (use :RemoteBrowse): " ++ full_path)
+            self.transfer_progress = TransferProgressState {
+                active: true,
+                title: "Fetching " ++ rbase,
+                detail: full_path,
+                transport: "SSH",
+                bytes_done: 0,
+                bytes_total: 0,
+                lines_loaded: 0,
+            }
+            let opened_res = remote_open_doc(full_path)
+            let opened = opened_res match {
+                v! => v,
+                error err_msg => {
+                    self.transfer_progress = TransferProgressState.idle()
+                    return error err_msg
+                },
+            }
+            let tp = remote_transfer_progress()
+            self.transfer_progress = TransferProgressState {
+                active: false,
+                title: tp.title,
+                detail: tp.detail,
+                transport: opened.transport,
+                bytes_done: opened.byte_len,
+                bytes_total: opened.byte_len,
+                lines_loaded: opened.line_count,
+            }
+            if opened.exists {
+                if opened.is_dir {
+                    return error ("path is a remote directory (use :Dirvish or :RemoteBrowse): " ++ full_path)
                 }
-                let (file_lines, crlf) = remote_read_lines(full_path)!
-                let buf = self.create_buffer(
+                let buf = self.create_buffer_from_doc(
                     rbase,
                     BufferKind.file,
+                    opened.doc_id,
+                    opened.line_count,
+                    opened.crlf,
                     file_path = full_path,
                     major_mode = rmode,
-                    initial_lines = file_lines,
                 )
-                buf.crlf = crlf
-                buf.read_only = st.readonly
+                buf.read_only = opened.readonly
                 buf.modified = false
                 self.active_buffer_id = buf.id
-                log_event("info", "ext_document", "Opened remote file " ++ full_path)#
-                let msg = "[SSH] \"" ++ rbase ++ "\" " ++ buf.line_count().to_string() ++ "L (" ++ full_path ++ ")"
+                log_event("info", "ext_document", "Opened remote file " ++ full_path ++ " via " ++ opened.transport)#
+                let proto_tag = if opened.transport == "HTTP" { "[HTTP]" } else { "[SSH]" }
+                let msg = proto_tag ++ " \"" ++ rbase ++ "\" " ++ buf.line_count().to_string() ++ "L (" ++ full_path ++ ")"
                 self.status_message = msg
                 status_emit(msg)#
                 return buf
@@ -2752,20 +2979,24 @@ impl EditorWorld {
         buf.sync_external_lines()
         if is_ssh_uri(target) {
             let total_l = buf.line_count()
-            let ssh_lines = if not buf.native_large {
-                buf.lines
-            } else {
-                let cap = if total_l < 60000 { total_l } else { 60000 }
-                buf.slice_lines(0, cap)
+            let (written, transport) = remote_save_doc(target, buf.doc_id, buf.crlf)!
+            self.transfer_progress = TransferProgressState {
+                active: false,
+                title: "Uploaded " ++ ssh_uri_basename(target),
+                detail: target,
+                transport: transport,
+                bytes_done: written,
+                bytes_total: written,
+                lines_loaded: total_l,
             }
-            let written = remote_write_lines(target, ssh_lines, buf.crlf)!
             buf.file_path = target
             buf.kind = BufferKind.file
             buf.name = ssh_uri_basename(target)
             buf.major_mode = detect_major_mode(target)
             buf.modified = false
-            log_event("info", "ext_document", "Wrote remote " ++ target)#
-            let msg = "[SSH] \"" ++ buf.name ++ "\" " ++ total_l.to_string() ++ "L, " ++ written.to_string() ++ "B written"
+            log_event("info", "ext_document", "Wrote remote " ++ target ++ " via " ++ transport)#
+            let proto_tag = if transport == "HTTP" { "[HTTP]" } else { "[SSH]" }
+            let msg = proto_tag ++ " \"" ++ buf.name ++ "\" " ++ total_l.to_string() ++ "L, " ++ written.to_string() ++ "B written"
             self.status_message = msg
             status_emit(msg)#
             return ()

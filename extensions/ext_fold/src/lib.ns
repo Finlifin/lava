@@ -32,6 +32,7 @@ pub struct FoldRange {
 pub struct FoldService {
     pub folded_by_buf: HashMap,
     pub ranges_cache: HashMap,
+    pub synced_ver_by_buf: HashMap,
 }
 
 impl FoldService {
@@ -39,6 +40,7 @@ impl FoldService {
         FoldService {
             folded_by_buf: HashMap.new(),
             ranges_cache: HashMap.new(),
+            synced_ver_by_buf: HashMap.new(),
         }
     }
 
@@ -67,12 +69,19 @@ impl FoldService {
         }
     }
 
-    pub fn sync_buffer_folds(self, buf: Buffer) {
+    pub fn sync_buffer_folds(self, buf: Buffer, .force: bool = false) {
         if buf.kind == BufferKind.special {
             return
         }
-        buf.clear_owner_decors(OWNER_FOLD)
         let active = self.active_folds(buf.id)
+        if not force {
+            let prev_v_opt = self.synced_ver_by_buf.get(buf.id)
+            if prev_v_opt != null and prev_v_opt.as(i64) == buf.edit_version {
+                return
+            }
+        }
+        self.synced_ver_by_buf.insert(buf.id, buf.edit_version)
+        buf.clear_owner_decors(OWNER_FOLD)
         let lo = buf.min_row()
         let hi = buf.max_row()
         let next_rows = Set.new()
@@ -92,11 +101,20 @@ impl FoldService {
         self.folded_by_buf.insert(buf.id, valid_active)
         buf.folded_rows = next_rows
 
-        let ranges = self.ranges_for_buffer(buf)
+        -- Compute viewport-bounded fold indicator signs (`▾`) so opening or exiting Insert mode
+        -- on 2k–100k+ line buffers stays O(viewport) instead of scanning the entire file!
+        let center_r = buf.point.row
+        let win_lo = if center_r - 80 > lo { center_r - 80 } else { lo }
+        let win_hi = if center_r + 80 < hi + 1 { center_r + 80 } else { hi + 1 }
+        let ranges = if buf.line_count() <= 300 {
+            self.ranges_for_buffer(buf)
+        } else {
+            compute_fold_ranges_in_window(buf, win_lo, win_hi)
+        }
         let sign_col = rgb(108, 112, 134)
         for i in 0..ranges.len() {
             let fr = ranges.get(i.as(usize)).as(FoldRange)
-            if fr.start_row >= lo and fr.start_row <= hi and (not next_rows.contains(fr.start_row)) {
+            if fr.start_row >= win_lo and fr.start_row < win_hi and (not next_rows.contains(fr.start_row)) {
                 buf.add_sign(OWNER_FOLD, fr.start_row, "▾", sign_col, priority = 10)
             }
         }
@@ -119,7 +137,7 @@ impl FoldService {
         }
         next.push((target.start_row, target.end_row))
         self.folded_by_buf.insert(buf.id, next)
-        self.sync_buffer_folds(buf)
+        self.sync_buffer_folds(buf, force = true)
         if buf.point.row > target.start_row and buf.point.row <= target.end_row {
             buf.point = buf.clamp_pos(Pos.new(target.start_row, buf.point.col), insert_mode = false)
             buf.preferred_col = buf.point.col
@@ -155,8 +173,30 @@ impl FoldService {
             }
         }
         self.folded_by_buf.insert(buf.id, next)
-        self.sync_buffer_folds(buf)
+        self.sync_buffer_folds(buf, force = true)
         true
+    }
+
+    pub fn unfold_enclosing_at_row(self, buf: Buffer, row: i64) -> bool {
+        let active = self.active_folds(buf.id)
+        if active.is_empty() {
+            return false
+        }
+        var changed = false
+        let next = List()
+        for i in 0..active.len() {
+            let (sr, er) = active.get(i.as(usize)).as((i64, i64))
+            if row > sr and row <= er {
+                changed = true
+            } else {
+                next.push((sr, er))
+            }
+        }
+        if changed {
+            self.folded_by_buf.insert(buf.id, next)
+            self.sync_buffer_folds(buf, force = true)
+        }
+        changed
     }
 
     pub fn toggle_at_cursor(self, world: EditorWorld, buf: Buffer) -> String {
@@ -221,7 +261,7 @@ impl FoldService {
             }
         }
         self.folded_by_buf.insert(buf.id, next)
-        self.sync_buffer_folds(buf)
+        self.sync_buffer_folds(buf, force = true)
         clamp_cursor_out_of_folds(buf, next)
         let _ = world
         next.len()
@@ -244,7 +284,7 @@ impl FoldService {
             }
         }
         self.folded_by_buf.insert(buf.id, next)
-        self.sync_buffer_folds(buf)
+        self.sync_buffer_folds(buf, force = true)
         clamp_cursor_out_of_folds(buf, next)
         let _ = world
         next.len()
@@ -270,7 +310,7 @@ impl FoldService {
             }
         }
         self.folded_by_buf.insert(buf.id, next)
-        self.sync_buffer_folds(buf)
+        self.sync_buffer_folds(buf, force = true)
         clamp_cursor_out_of_folds(buf, next)
         let _ = world
         added
@@ -396,22 +436,74 @@ fn push_range_if_new(out: List, seen_starts: Set, sr: i64, er: i64, kind: String
 
 pub fn compute_fold_ranges(buf: Buffer) -> List {
     let total = buf.line_count()
+    if total < 2 {
+        return List()
+    }
+    let scan_lo: i64 = if total > 3000 {
+        let lo_cand = buf.point.row - 1200
+        if lo_cand > 0 { lo_cand } else { 0 }
+    } else {
+        0
+    }
+    let scan_hi: i64 = if total > 3000 {
+        let hi_cand = buf.point.row + 1200
+        if hi_cand < total { hi_cand } else { total }
+    } else {
+        total
+    }
+    compute_fold_ranges_in_window(buf, scan_lo, scan_hi)
+}
+
+fn compute_fold_ranges_in_window(buf: Buffer, scan_lo: i64, scan_hi: i64) -> List {
     let raw = List()
     let seen_starts = Set.new()
-    if total < 2 {
+    if scan_hi - scan_lo < 2 {
         return raw
     }
     let mode = buf.major_mode.to_lower()
+    let lines = buf.slice_lines(scan_lo, scan_hi)
 
     -- 1. `#region`/`#endregion`, `{{{`/`}}}`, `/* ... */` block comments, and brace `{ ... }` ranges
     let region_stack = List()
     let brace_stack = List()
     var in_block_comment = false
     var block_comment_start: i64 = -1
+    var saw_any_brace = false
+    var c_start: i64 = -1
+    var c_end: i64 = -1
+    var imp_start: i64 = -1
+    var imp_end: i64 = -1
 
-    for r in 0..total {
-        let line = buf.line_at(r)
+    for r in scan_lo..scan_hi {
+        let line = lines.get((r - scan_lo).as(usize)).as(String)
         let trimmed = line.trim()
+
+        -- Single-pass comment & import group tracking (eliminates separate Pass 2!)
+        if trimmed != "" and is_single_line_comment(trimmed, mode) and (not is_region_start(trimmed)) and (not is_region_end(trimmed)) {
+            if c_start < 0 {
+                c_start = r
+            }
+            c_end = r
+        } else {
+            if c_start >= 0 and c_end - c_start >= 2 {
+                push_range_if_new(raw, seen_starts, c_start, c_end, "comment")
+            }
+            c_start = -1
+            c_end = -1
+        }
+        if trimmed != "" and is_import_line(trimmed) {
+            if imp_start < 0 {
+                imp_start = r
+            }
+            imp_end = r
+        } else {
+            if imp_start >= 0 and imp_end - imp_start >= 2 {
+                push_range_if_new(raw, seen_starts, imp_start, imp_end, "imports")
+            }
+            imp_start = -1
+            imp_end = -1
+        }
+
         if trimmed == "" {
             continue
         }
@@ -441,6 +533,34 @@ pub fn compute_fold_ranges(buf: Buffer) -> List {
         if trimmed.starts_with("/*") and (not trimmed.contains("*/")) {
             in_block_comment = true
             block_comment_start = r
+            continue
+        }
+
+        let has_open_b = line.contains("{{")
+        let has_close_b = line.contains("}}")
+        if (not has_open_b) and (not has_close_b) {
+            continue
+        }
+        saw_any_brace = true
+
+        -- Fast ASCII byte path when line has no quotes or line-comment markers
+        if line.is_ascii()
+            and (not line.contains("\""))
+            and (not line.contains("'"))
+            and (not line.contains("//"))
+            and (not line.contains("--")) {
+            let bs = line.bytes()
+            for bi in 0..bs.len() {
+                let b = bs.get(bi.as(usize)).as(i64)
+                if b == 123 {
+                    brace_stack.push(r)
+                } else if b == 125 {
+                    if not brace_stack.is_empty() {
+                        let sr = brace_stack.pop().as(i64)
+                        push_range_if_new(raw, seen_starts, sr, r, "block")
+                    }
+                }
+            }
             continue
         }
 
@@ -491,39 +611,6 @@ pub fn compute_fold_ranges(buf: Buffer) -> List {
             i += 1
         }
     }
-
-    -- 2. Consecutive single-line comment blocks (>= 3 lines) and import groups (>= 3 lines)
-    var c_start: i64 = -1
-    var c_end: i64 = -1
-    var imp_start: i64 = -1
-    var imp_end: i64 = -1
-    for r in 0..total {
-        let trimmed = buf.line_at(r).trim()
-        if is_single_line_comment(trimmed, mode) and (not is_region_start(trimmed)) and (not is_region_end(trimmed)) {
-            if c_start < 0 {
-                c_start = r
-            }
-            c_end = r
-        } else {
-            if c_start >= 0 and c_end - c_start >= 2 {
-                push_range_if_new(raw, seen_starts, c_start, c_end, "comment")
-            }
-            c_start = -1
-            c_end = -1
-        }
-        if is_import_line(trimmed) {
-            if imp_start < 0 {
-                imp_start = r
-            }
-            imp_end = r
-        } else {
-            if imp_start >= 0 and imp_end - imp_start >= 2 {
-                push_range_if_new(raw, seen_starts, imp_start, imp_end, "imports")
-            }
-            imp_start = -1
-            imp_end = -1
-        }
-    }
     if c_start >= 0 and c_end - c_start >= 2 {
         push_range_if_new(raw, seen_starts, c_start, c_end, "comment")
     }
@@ -534,8 +621,8 @@ pub fn compute_fold_ranges(buf: Buffer) -> List {
     -- 3. Markdown / Org headings
     if mode == "markdown" or mode == "md" or mode == "gfm" or mode == "org" {
         let h_stack = List()
-        for r in 0..total {
-            let lvl = heading_fold_level(buf.line_at(r), mode)
+        for r in scan_lo..scan_hi {
+            let lvl = heading_fold_level(lines.get((r - scan_lo).as(usize)).as(String), mode)
             if lvl > 0 {
                 while not h_stack.is_empty() {
                     let top_idx = h_stack.len() - 1
@@ -552,16 +639,16 @@ pub fn compute_fold_ranges(buf: Buffer) -> List {
         }
         while not h_stack.is_empty() {
             let (prev_r, _lvl) = h_stack.pop().as((i64, i64))
-            push_range_if_new(raw, seen_starts, prev_r, total - 1, "heading")
+            push_range_if_new(raw, seen_starts, prev_r, scan_hi - 1, "heading")
         }
     }
 
-    -- 4. Indentation-based blocks (Python/YAML/TOML, or any buffer with no brace blocks)
-    if is_indent_language(mode) or raw.is_empty() {
+    -- 4. Indentation-based blocks (Python/YAML/TOML, or any buffer with no braces)
+    if is_indent_language(mode) or (raw.is_empty() and (not saw_any_brace)) {
         let ind_stack = List()
         var last_nonempty: i64 = -1
-        for r in 0..total {
-            let line = buf.line_at(r)
+        for r in scan_lo..scan_hi {
+            let line = lines.get((r - scan_lo).as(usize)).as(String)
             if line.trim() == "" {
                 continue
             }
@@ -860,6 +947,25 @@ pub fn register_fold_extension(kernel: SystemKernel) -> !String Unit {
             }
 
             k.add_hook(
+                "cursor-moved",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| -> Unit {
+                    let w_opt = kern.service("lava.document.world")
+                    let f_opt = kern.service(SERVICE_FOLD)
+                    if w_opt != null and f_opt != null {
+                        let w = w_opt.as(EditorWorld)
+                        let buf = w.active_buffer()
+                        if not buf.folded_rows.is_empty() and buf.folded_rows.contains(buf.point.row) {
+                            let f = f_opt.as(FoldService)
+                            if f.unfold_enclosing_at_row(buf, buf.point.row) {
+                                sync_wm_after_fold(kern, w)
+                            }
+                        }
+                    }
+                },
+                priority = 55,
+            )
+            k.add_hook(
                 "buffer-switched",
                 ext_id,
                 |kern: SystemKernel, _payload: Any| -> Unit {
@@ -914,6 +1020,7 @@ pub fn register_fold_extension(kernel: SystemKernel) -> !String Unit {
                         let f = f_opt.as(FoldService)
                         let _ = f.folded_by_buf.remove(bid)
                         let _ = f.ranges_cache.remove(bid)
+                        let _ = f.synced_ver_by_buf.remove(bid)
                     }
                 },
                 priority = 60,

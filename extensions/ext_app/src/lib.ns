@@ -926,7 +926,11 @@ fn resolve_window_state_path() -> String {
     if xdg != "" {
         return path.join(path.join(xdg, "lava"), "window_state.txt")
     }
-    let home = env.get_or("HOME", "").trim()
+    let appdata = env.get_or("APPDATA", "").trim()
+    if appdata != "" {
+        return path.join(path.join(appdata, "lava"), "window_state.txt")
+    }
+    let home = env.get_or("HOME", env.get_or("USERPROFILE", "")).trim()
     if home != "" {
         return path.join(path.join(path.join(home, ".config"), "lava"), "window_state.txt")
     }

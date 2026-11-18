@@ -26,6 +26,10 @@ use @lava_term.{
     PTY_WAKE_TIMER_ID, TermSnapshot, TermSpan, pty_available, pty_kill, pty_resize, pty_send_key,
     pty_snapshot, pty_spawn, pty_write
 }
+use @lava_remote.{
+    is_ssh_uri, join_ssh_uri, normalize_ssh_uri, parse_ssh_uri, remote_exec, remote_host_available,
+    remote_stat
+}
 use @ext_document.{
     Buffer, BufferId, EditorWorld, FloatingWindow, InlineSpanDecor, Pos, Span, ext_document_id,
     require_editor_world
@@ -116,8 +120,24 @@ pub struct TerminalSession {
 
 impl TerminalSession {
     pub fn new(id: i64, initial_cwd: String) -> TerminalSession {
-        let clean_cwd = if initial_cwd.trim() != "" { path.normalize(initial_cwd) } else { "." }
+        let trimmed_cwd = initial_cwd.trim()
+        let clean_cwd = if trimmed_cwd == "" {
+            "."
+        } else if is_ssh_uri(trimmed_cwd) {
+            normalize_ssh_uri(trimmed_cwd)
+        } else {
+            path.normalize(trimmed_cwd)
+        }
         let sh = resolve_default_shell()
+        let init_title = if is_ssh_uri(clean_cwd) {
+            let pt_res = parse_ssh_uri(clean_cwd)
+            pt_res match {
+                pt! => "ssh:" ++ pt.authority,
+                error _ => short_shell_name(sh),
+            }
+        } else {
+            short_shell_name(sh)
+        }
         TerminalSession {
             id: id,
             name: "*terminal-" ++ id.to_string() ++ "*",
@@ -127,7 +147,7 @@ impl TerminalSession {
             last_exit_code: 0,
             pty_id: 0,
             shell: sh,
-            title: short_shell_name(sh),
+            title: init_title,
             alive: true,
             alt_screen: false,
             cursor_row: 0,
@@ -313,6 +333,9 @@ pub fn ensure_session_pty(session: TerminalSession, rows: i64, cols: i64) -> boo
     if not pty_available() {
         return false
     }
+    if is_ssh_uri(session.cwd) and (not remote_host_available()) {
+        return false
+    }
     let r = clamp_pty_rows(rows)
     let c = clamp_pty_cols(cols)
     if session.pty_id > 0 {
@@ -328,13 +351,30 @@ pub fn ensure_session_pty(session: TerminalSession, rows: i64, cols: i64) -> boo
     }
     let sh = if session.shell != "" { session.shell } else { resolve_default_shell() }
     session.shell = sh
-    let spawned_res = pty_spawn(sh, session.cwd, r, c)
+    let local_spawn_cwd = if is_ssh_uri(session.cwd) { "." } else { session.cwd }
+    let spawned_res = pty_spawn(sh, local_spawn_cwd, r, c)
     spawned_res match {
         pid! => {
             session.pty_id = pid
             session.pty_rows = r
             session.pty_cols = c
             session.alive = true
+            if is_ssh_uri(session.cwd) {
+                let pt_res = parse_ssh_uri(session.cwd)
+                pt_res match {
+                    pt! => {
+                        var port_flag = ""
+                        if pt.port > 0 and pt.port != 22 {
+                            port_flag = "-p " ++ pt.port.to_string() ++ " "
+                        }
+                        let safe_dir = pt.remote_path.replace("'", "'\\''")
+                        let ssh_boot = "exec ssh -t " ++ port_flag ++ pt.ssh_destination()
+                            ++ " \"cd '" ++ safe_dir ++ "' && exec ${{SHELL:-/bin/sh}} -l\"\n"
+                        let _ = pty_write(pid, ssh_boot) ! { _ => () }
+                    },
+                    error _ => (),
+                }
+            }
             let _ = sync_session_from_pty(session, true)
             true
         },
@@ -357,7 +397,7 @@ pub fn sync_session_from_pty(session: TerminalSession, include_scrollback: bool)
             session.alt_screen = snap.alt_screen
             session.alive = snap.alive
             session.last_exit_code = snap.exit_code
-            if snap.cwd.trim() != "" {
+            if snap.cwd.trim() != "" and (not is_ssh_uri(session.cwd)) {
                 session.cwd = snap.cwd.trim()
             }
             if snap.title.trim() != "" {
@@ -469,6 +509,36 @@ pub fn run_in_session(session: TerminalSession, raw_cmd: String) -> i64 {
     -- 3. Built-in standalone `cd` / `cd <dir>`
     if is_pure_cd_command(cmd_line) {
         let arg = if cmd_line == "cd" { "" } else { cmd_line.drop(3).trim() }
+        if is_ssh_uri(session.cwd) {
+            let stripped = strip_quotes(arg)
+            let next_u = if stripped == "" or stripped == "~" {
+                let pt_res = parse_ssh_uri(session.cwd)
+                pt_res match {
+                    pt! => pt.prefix ++ "/",
+                    error _ => session.cwd,
+                }
+            } else if is_ssh_uri(stripped) {
+                normalize_ssh_uri(stripped)
+            } else if stripped.starts_with("/") {
+                let pt_res = parse_ssh_uri(session.cwd)
+                pt_res match {
+                    pt! => normalize_ssh_uri(pt.prefix ++ stripped),
+                    error _ => join_ssh_uri(session.cwd, stripped),
+                }
+            } else {
+                join_ssh_uri(session.cwd, stripped)
+            }
+            let st_opt = remote_stat(next_u) ! { _ => null }
+            if st_opt != null and st_opt.exists and st_opt.is_dir {
+                session.cwd = next_u
+                session.last_exit_code = 0
+                return 0
+            }
+            session.append_line("cd: no such remote directory: " ++ (if arg != "" { arg } else { next_u }))
+            session.append_line("[exit 1]")
+            session.last_exit_code = 1
+            return 1
+        }
         let target = resolve_cd_target(session.cwd, arg)
         if fs.exists(target) and fs.is_dir(target) {
             let canon = fs.canonicalize(target) ! { _ => target }
@@ -480,6 +550,33 @@ pub fn run_in_session(session: TerminalSession, raw_cmd: String) -> i64 {
         session.append_line("[exit 1]")
         session.last_exit_code = 1
         return 1
+    }
+
+    if is_ssh_uri(session.cwd) {
+        let pt_res = parse_ssh_uri(session.cwd)
+        let rem_cwd = pt_res match {
+            pt! => pt.remote_path,
+            error _ => "/",
+        }
+        let rres = remote_exec(session.cwd, cmd_line, cwd = rem_cwd)
+        rres match {
+            tup! => {
+                let (code, out_s, err_s) = tup
+                push_output_text_lines(session, out_s)
+                push_output_text_lines(session, err_s)
+                if code != 0 {
+                    session.append_line("[exit " ++ code.to_string() ++ "]")
+                }
+                session.last_exit_code = code
+                return code
+            },
+            error rerr => {
+                session.append_line("remote shell error: " ++ rerr)
+                session.append_line("[exit 127]")
+                session.last_exit_code = 127
+                return 127
+            },
+        }
     }
 
     -- 4. External shell command (preserving compound `cd <dir> && <cmd>` directory transitions!)

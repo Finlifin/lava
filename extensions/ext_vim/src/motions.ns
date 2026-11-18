@@ -180,7 +180,11 @@ pub fn motion_word_forward(
             if for_operator and step_idx == steps - 1 {
                 return MotionTarget.ok(Pos.new(r, 0), MotionShape.exclusive)
             }
-            r += 1
+            let nr0 = if for_operator { r + 1 } else { buf.step_visible_row_down(r, 1) }
+            if nr0 == r {
+                return MotionTarget.ok(Pos.new(r, 0), MotionShape.exclusive)
+            }
+            r = nr0
             c = buf.first_non_blank_col(r)
             continue
         }
@@ -190,7 +194,12 @@ pub fn motion_word_forward(
                 let end_c = if for_operator { llen } else { llen - 1 }
                 return MotionTarget.ok(Pos.new(r, end_c), MotionShape.exclusive)
             }
-            r += 1
+            let nr1 = if for_operator { r + 1 } else { buf.step_visible_row_down(r, 1) }
+            if nr1 == r {
+                let end_c = if for_operator { llen } else { llen - 1 }
+                return MotionTarget.ok(Pos.new(r, end_c), MotionShape.exclusive)
+            }
+            r = nr1
             c = buf.first_non_blank_col(r)
             continue
         }
@@ -222,10 +231,19 @@ pub fn motion_word_forward(
             return MotionTarget.ok(Pos.new(r, end_c), MotionShape.exclusive)
         }
 
-        -- Advance to next line; empty line itself is a word stop in Vim!
-        r += 1
+        -- Advance to next visible line; empty line itself is a word stop in Vim!
+        let nr2 = if for_operator { r + 1 } else { buf.step_visible_row_down(r, 1) }
+        if nr2 == r {
+            let end_c = if for_operator { llen } else if llen > 0 { llen - 1 } else { 0 }
+            return MotionTarget.ok(Pos.new(r, end_c), MotionShape.exclusive)
+        }
+        r = nr2
         while r < max_r and buf.line_char_len(r) > 0 and is_blank_line(buf, r) {
-            r += 1
+            let nx = if for_operator { r + 1 } else { buf.step_visible_row_down(r, 1) }
+            if nx == r {
+                break
+            }
+            r = nx
         }
         if buf.line_char_len(r) == 0 {
             c = 0
@@ -249,7 +267,11 @@ pub fn motion_word_backward(buf: Buffer, from: Pos, count: i64, big_word: bool) 
         if c > 0 {
             c -= 1
         } else if r > min_r {
-            r -= 1
+            let prev_r = buf.step_visible_row_up(r, 1)
+            if prev_r == r {
+                return MotionTarget.ok(Pos.new(r, 0), MotionShape.exclusive)
+            }
+            r = prev_r
             let prev_len = buf.line_char_len(r)
             if prev_len == 0 {
                 c = 0
@@ -284,7 +306,13 @@ pub fn motion_word_backward(buf: Buffer, from: Pos, count: i64, big_word: bool) 
                 stopped_empty = true
                 break
             }
-            r -= 1
+            let prev_r2 = buf.step_visible_row_up(r, 1)
+            if prev_r2 == r {
+                c = 0
+                stopped_empty = true
+                break
+            }
+            r = prev_r2
             let plen = buf.line_char_len(r)
             if plen == 0 {
                 c = 0
@@ -320,7 +348,12 @@ pub fn motion_word_end(buf: Buffer, from: Pos, count: i64, big_word: bool) -> Mo
         if c + 1 < cur_len {
             c += 1
         } else if r < max_r {
-            r += 1
+            let nr = buf.step_visible_row_down(r, 1)
+            if nr == r {
+                let end_c = if cur_len > 0 { cur_len - 1 } else { 0 }
+                return MotionTarget.ok(Pos.new(r, end_c), MotionShape.inclusive)
+            }
+            r = nr
             c = 0
         } else {
             let end_c = if cur_len > 0 { cur_len - 1 } else { 0 }
@@ -343,7 +376,13 @@ pub fn motion_word_end(buf: Buffer, from: Pos, count: i64, big_word: bool) -> Mo
                 at_end = true
                 break
             }
-            r += 1
+            let nr2 = buf.step_visible_row_down(r, 1)
+            if nr2 == r {
+                c = if llen > 0 { llen - 1 } else { 0 }
+                at_end = true
+                break
+            }
+            r = nr2
             c = 0
         }
 
@@ -386,7 +425,11 @@ pub fn motion_word_end_backward(buf: Buffer, from: Pos, count: i64, big_word: bo
         if c > 0 {
             c -= 1
         } else if r > min_r {
-            r -= 1
+            let prev_r = buf.step_visible_row_up(r, 1)
+            if prev_r == r {
+                return MotionTarget.ok(Pos.new(r, 0), MotionShape.inclusive)
+            }
+            r = prev_r
             let plen = buf.line_char_len(r)
             c = if plen > 0 { plen - 1 } else { 0 }
         } else {
@@ -411,7 +454,11 @@ pub fn motion_word_end_backward(buf: Buffer, from: Pos, count: i64, big_word: bo
             if r <= min_r {
                 return MotionTarget.ok(Pos.new(min_r, 0), MotionShape.inclusive)
             }
-            r -= 1
+            let prev_r2 = buf.step_visible_row_up(r, 1)
+            if prev_r2 == r {
+                return MotionTarget.ok(Pos.new(r, 0), MotionShape.inclusive)
+            }
+            r = prev_r2
             let plen = buf.line_char_len(r)
             c = if plen > 0 { plen - 1 } else { 0 }
         }
@@ -507,13 +554,21 @@ pub fn motion_paragraph_prev(buf: Buffer, from: Pos, count: i64) -> MotionTarget
     var r = from.row
     for _ in 0..steps {
         if r > min_r {
-            r -= 1
+            r = buf.step_visible_row_up(r, 1)
         }
         while r > min_r and is_blank_line(buf, r) {
-            r -= 1
+            let pr = buf.step_visible_row_up(r, 1)
+            if pr == r {
+                break
+            }
+            r = pr
         }
         while r > min_r and not is_blank_line(buf, r) {
-            r -= 1
+            let pr = buf.step_visible_row_up(r, 1)
+            if pr == r {
+                break
+            }
+            r = pr
         }
     }
     MotionTarget.ok(Pos.new(r, 0), MotionShape.exclusive, is_jump = true)
@@ -525,13 +580,21 @@ pub fn motion_paragraph_next(buf: Buffer, from: Pos, count: i64) -> MotionTarget
     var r = from.row
     for _ in 0..steps {
         if r < max_r {
-            r += 1
+            r = buf.step_visible_row_down(r, 1)
         }
         while r < max_r and is_blank_line(buf, r) {
-            r += 1
+            let nr = buf.step_visible_row_down(r, 1)
+            if nr == r {
+                break
+            }
+            r = nr
         }
         while r < max_r and not is_blank_line(buf, r) {
-            r += 1
+            let nr = buf.step_visible_row_down(r, 1)
+            if nr == r {
+                break
+            }
+            r = nr
         }
     }
     MotionTarget.ok(Pos.new(r, 0), MotionShape.exclusive, is_jump = true)
@@ -641,24 +704,32 @@ pub fn motion_viewport_line(world: EditorWorld, buf: Buffer, which: String, coun
     if top > max_r {
         top = max_r
     }
+    top = buf.snap_to_visible_row(top)
     let vrows = if world.viewport_rows > 1 { world.viewport_rows } else { 1 }
-    var bot = top + vrows - 1
-    if bot > max_r {
-        bot = max_r
-    }
+    let bot = buf.step_visible_row_down(top, vrows - 1)
 
     var target_r = top
     if which == "H" {
         let off = if has_count and count > 1 { count - 1 } else { 0 }
-        target_r = top + off
+        target_r = buf.step_visible_row_down(top, off)
         if target_r > bot {
             target_r = bot
         }
     } else if which == "M" {
-        target_r = (top + bot) / 2
+        var vis_cnt: i64 = 1
+        var probe = top
+        while probe < bot {
+            let nx = buf.step_visible_row_down(probe, 1)
+            if nx == probe {
+                break
+            }
+            probe = nx
+            vis_cnt += 1
+        }
+        target_r = buf.step_visible_row_down(top, (vis_cnt - 1) / 2)
     } else {
         let off = if has_count and count > 1 { count - 1 } else { 0 }
-        target_r = bot - off
+        target_r = buf.step_visible_row_up(bot, off)
         if target_r < top {
             target_r = top
         }

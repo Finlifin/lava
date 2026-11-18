@@ -137,7 +137,7 @@ struct UiSharedState {
     epoch: Instant,
     window_addr: usize,
     drawing_area_addr: usize,
-    applied_meta: Mutex<(String, PointerStyle)>,
+    applied_meta: Mutex<(String, PointerStyle, bool)>,
     pointer_pos: Mutex<(f64, f64)>,
     scroll_accum: Mutex<ScrollDeltaAccumulator>,
 }
@@ -201,6 +201,7 @@ impl UiSharedState {
         let frame = self.frame_slot.latest();
         let mut title_to_apply: Option<CString> = None;
         let mut cursor_to_apply: Option<PointerStyle> = None;
+        let mut decorated_to_apply: Option<bool> = None;
 
         {
             let mut meta = self
@@ -220,6 +221,10 @@ impl UiSharedState {
                 meta.1 = frame.window.pointer;
                 cursor_to_apply = Some(frame.window.pointer);
             }
+            if meta.2 != frame.window.decorated {
+                meta.2 = frame.window.decorated;
+                decorated_to_apply = Some(frame.window.decorated);
+            }
         }
 
         if let Some(title_cstr) = title_to_apply {
@@ -227,6 +232,13 @@ impl UiSharedState {
             // so `window` is a live `GtkWindow` and `title_cstr` is a valid NUL-terminated string.
             unsafe {
                 ffi::gtk_window_set_title(window, title_cstr.as_ptr());
+            }
+        }
+
+        if let Some(decorated) = decorated_to_apply {
+            // SAFETY: `window` is a live `GtkWindow` accessed on the GTK main thread.
+            unsafe {
+                ffi::gtk_window_set_decorated(window, c_int::from(decorated));
             }
         }
 
@@ -398,11 +410,19 @@ unsafe extern "C" fn on_drawing_area_draw(
     let slot = unsafe { &*slot_ptr };
     let frame = slot.shared.frame_slot.latest();
     let hints = slot.shared.frame_slot.anim_hints();
+    let transfer_overlay = slot.shared.frame_slot.transfer_overlay();
     let anim_active = {
         let mut anim = slot.anim.borrow_mut();
         // SAFETY: `cr` is valid and exclusively owned by GTK for this draw callback invocation.
         unsafe {
-            anim.render_to_cairo_scaled(cr, width, height, widget_scale, &frame, &hints);
+            anim.render_to_cairo_scaled_with_overlay(
+                cr,
+                (width, height),
+                widget_scale,
+                &frame,
+                &hints,
+                transfer_overlay.as_ref(),
+            );
         }
         anim.is_active()
     };
@@ -690,21 +710,24 @@ pub fn run_gtk_app_with_final_size(
     }
 
     let latest_initial = frame_slot.latest();
-    let (init_title, init_width, init_height, init_pointer) = if latest_initial.generation > 0 {
-        (
-            latest_initial.window.title.clone(),
-            latest_initial.window.width.max(1),
-            latest_initial.window.height.max(1),
-            latest_initial.window.pointer,
-        )
-    } else {
-        (
-            config.initial_title,
-            config.initial_width.max(1),
-            config.initial_height.max(1),
-            PointerStyle::Default,
-        )
-    };
+    let (init_title, init_width, init_height, init_pointer, init_decorated) =
+        if latest_initial.generation > 0 {
+            (
+                latest_initial.window.title.clone(),
+                latest_initial.window.width.max(1),
+                latest_initial.window.height.max(1),
+                latest_initial.window.pointer,
+                latest_initial.window.decorated,
+            )
+        } else {
+            (
+                config.initial_title,
+                config.initial_width.max(1),
+                config.initial_height.max(1),
+                PointerStyle::Default,
+                false,
+            )
+        };
 
     // SAFETY: GTK4 has been initialized on this thread via `is_display_available()`.
     let (window_widget, drawing_area) =
@@ -732,6 +755,7 @@ pub fn run_gtk_app_with_final_size(
     // `title_cstr` / cursor name are valid NUL-terminated strings.
     unsafe {
         ffi::gtk_window_set_title(window, title_cstr.as_ptr());
+        ffi::gtk_window_set_decorated(window, c_int::from(init_decorated));
         ffi::gtk_window_set_default_size(window, init_width, init_height);
         ffi::gtk_widget_set_hexpand(drawing_area, 1);
         ffi::gtk_widget_set_vexpand(drawing_area, 1);
@@ -751,7 +775,7 @@ pub fn run_gtk_app_with_final_size(
         epoch: Instant::now(),
         window_addr: window as usize,
         drawing_area_addr: drawing_area as usize,
-        applied_meta: Mutex::new((init_title, init_pointer)),
+        applied_meta: Mutex::new((init_title, init_pointer, init_decorated)),
         pointer_pos: Mutex::new((0.0, 0.0)),
         scroll_accum: Mutex::new(ScrollDeltaAccumulator::new()),
     });

@@ -6,11 +6,17 @@
 -- Single-VM expression & kernel introspection evaluator.
 
 use std.collections.{HashMap, Set}
+use std.env
 use std.fs
 use std.path
 use std.process
 
 use @lava_sys.{host_cancel_job, host_spawn_job}
+use @lava_remote.{
+    RemoteDirItem, RemoteGrepMatch, is_ssh_uri, join_ssh_uri, normalize_ssh_uri, parent_ssh_uri,
+    parse_ssh_uri, remote_exec, remote_host_available, remote_read_lines, remote_readdir,
+    remote_search_grep, remote_stat
+}
 use @lava_core.{
     CommandSpec, ExtId, ExtState, ExtensionRecord, InteractiveEffects, KeyStroke, PromptKind,
     PromptRequest, PromptTurn, ServiceEffects, SystemKernel, ask_prompt, clipboard_get,
@@ -42,7 +48,19 @@ pub fn scan_shard_sync(files: List, pattern: String, ignore_case: bool) -> List 
     let n_files = files.len()
     for i in 0..n_files {
         let full_path = files.get(i.as(usize)).as(String)
-        let raw! = fs.read_to_string(full_path) else {
+        let raw_opt: ?String = if is_ssh_uri(full_path) {
+            let rl_res = remote_read_lines(full_path)
+            rl_res match {
+                pair! => {
+                    let (flines, _) = pair
+                    flines.join("\n")
+                },
+                error _ => null,
+            }
+        } else {
+            fs.read_to_string(full_path) ! { _ => null }
+        }
+        let raw? = raw_opt else {
             continue
         }
         if raw.contains("\x00") {
@@ -126,9 +144,46 @@ private fn walk_dir_recursive(cur_dir: String, out: List, depth: i64) {
     }
 }
 
+private fn walk_remote_dir_recursive(cur_uri: String, out: List, depth: i64) {
+    if depth > 16 or out.len() >= 5000 {
+        return
+    }
+    let ritems! = remote_readdir(cur_uri, show_hidden = false) else {
+        return
+    }
+    for i in 0..ritems.len() {
+        let ri = ritems.get(i.as(usize)).as(RemoteDirItem)
+        if ri.name == "" or ri.name == "." or ri.name == ".." {
+            continue
+        }
+        if ri.is_dir {
+            if not should_skip_walk_dir(ri.name) {
+                walk_remote_dir_recursive(ri.full_uri, out, depth + 1)
+            }
+        } else {
+            out.push(ri.full_uri)
+        }
+    }
+}
+
 pub fn collect_workspace_files(root_dir: String) -> List {
     let files = List()
-    if root_dir == "" or (not fs.exists(root_dir)) {
+    if root_dir == "" {
+        return files
+    }
+    if is_ssh_uri(root_dir) {
+        let st_opt = remote_stat(root_dir) ! { _ => null }
+        if st_opt == null or (not st_opt.exists) {
+            return files
+        }
+        if st_opt.is_file {
+            files.push(normalize_ssh_uri(root_dir))
+            return files
+        }
+        walk_remote_dir_recursive(normalize_ssh_uri(root_dir), files, 0)
+        return files
+    }
+    if not fs.exists(root_dir) {
         return files
     }
     if fs.is_file(root_dir) {
@@ -310,38 +365,68 @@ private fn render_dired_entry_line(entry: DiredEntry) -> String {
 }
 
 private fn build_dired_listing(dir_path: String, preserved_marks: HashMap) -> !String (List, List) {
-    let dir_iter! = fs.iter_dir(dir_path) else {
-        return error ("cannot read directory: " ++ dir_path)
-    }
-    let parent_opt = path.parent(dir_path)
-    let parent_dir = if parent_opt != null { parent_opt.as(String) } else { dir_path }
-
     let subdirs = List()
     let reg_files = List()
-    for de in dir_iter {
-        let nm = de.name
-        if nm == "" or nm == "." or nm == ".." {
-            continue
+    var parent_dir = dir_path
+    if is_ssh_uri(dir_path) {
+        let norm_u = normalize_ssh_uri(dir_path)
+        parent_dir = parent_ssh_uri(norm_u)
+        let ritems = remote_readdir(norm_u, show_hidden = true)!
+        for i in 0..ritems.len() {
+            let ri = ritems.get(i.as(usize)).as(RemoteDirItem)
+            if ri.name == "" or ri.name == "." or ri.name == ".." {
+                continue
+            }
+            let full = normalize_ssh_uri(ri.full_uri)
+            let prev_mark_opt = preserved_marks.get(full)
+            let mflag = if prev_mark_opt != null { prev_mark_opt.as(String) } else { " " }
+            let item = DiredEntry {
+                name: ri.name,
+                full_path: full,
+                is_dir: ri.is_dir,
+                is_symlink: false,
+                size: ri.size,
+                mark_flag: mflag,
+                line_row: 0,
+            }
+            if ri.is_dir {
+                subdirs.push(item)
+            } else {
+                reg_files.push(item)
+            }
         }
-        let full = path.join(dir_path, nm)
-        let is_sym = de.is_symlink()
-        let is_d = de.is_dir() or (is_sym and fs.is_dir(full))
-        let sz = de.size
-        let prev_mark_opt = preserved_marks.get(full)
-        let mflag = if prev_mark_opt != null { prev_mark_opt.as(String) } else { " " }
-        let item = DiredEntry {
-            name: nm,
-            full_path: full,
-            is_dir: is_d,
-            is_symlink: is_sym,
-            size: sz,
-            mark_flag: mflag,
-            line_row: 0,
+    } else {
+        let dir_iter! = fs.iter_dir(dir_path) else {
+            return error ("cannot read directory: " ++ dir_path)
         }
-        if is_d {
-            subdirs.push(item)
-        } else {
-            reg_files.push(item)
+        let parent_opt = path.parent(dir_path)
+        parent_dir = if parent_opt != null { parent_opt.as(String) } else { dir_path }
+
+        for de in dir_iter {
+            let nm = de.name
+            if nm == "" or nm == "." or nm == ".." {
+                continue
+            }
+            let full = path.join(dir_path, nm)
+            let is_sym = de.is_symlink()
+            let is_d = de.is_dir() or (is_sym and fs.is_dir(full))
+            let sz = de.size
+            let prev_mark_opt = preserved_marks.get(full)
+            let mflag = if prev_mark_opt != null { prev_mark_opt.as(String) } else { " " }
+            let item = DiredEntry {
+                name: nm,
+                full_path: full,
+                is_dir: is_d,
+                is_symlink: is_sym,
+                size: sz,
+                mark_flag: mflag,
+                line_row: 0,
+            }
+            if is_d {
+                subdirs.push(item)
+            } else {
+                reg_files.push(item)
+            }
         }
     }
     subdirs.sort_by(|a: Any, b: Any| {
@@ -639,9 +724,16 @@ private fn shell_quote(arg: String) -> String {
     "'" ++ arg.replace("'", "'\"'\"'") ++ "'"
 }
 
+private fn cmd_quote_win(arg: String) -> String {
+    "\"" ++ arg.replace("\"", "\\\"") ++ "\""
+}
+
 private fn wrap_cmd_in_cwd(cmd: String, cwd: String) -> String {
     if cwd.trim() == "" {
         return cmd
+    }
+    if env.os() == "windows" {
+        return "cd /d " ++ cmd_quote_win(cwd) ++ " && (" ++ cmd ++ ")"
     }
     "cd " ++ shell_quote(cwd) ++ " && (" ++ cmd ++ ")"
 }
@@ -773,6 +865,38 @@ pub fn run_project_search(
     let ignore_case = world.effective_ignore_case(pattern)
     world.last_search = pattern
 
+    if is_ssh_uri(search_root) and remote_host_available() {
+        let rhits = remote_search_grep(search_root, pattern, limit = 400)!
+        let rqf = List()
+        for i in 0..rhits.len() {
+            let rh = rhits.get(i.as(usize)).as(RemoteGrepMatch)
+            rqf.push(QuickfixEntry {
+                file_path: rh.full_uri,
+                row: rh.row,
+                col: rh.col,
+                text: rh.line_text,
+            })
+        }
+        let rheaders = [
+            "-*- mode: grep; default-directory: \"" ++ search_root ++ "\" -*-",
+            "Remote project search for \"" ++ pattern ++ "\": " ++ rqf.len().to_string() ++ " match(es)",
+            "------------------------------------------------------------",
+        ]
+        let rgrep_buf = populate_quickfix_buffer(
+            world,
+            mgr,
+            "*Grep*",
+            "grep",
+            rheaders,
+            rqf,
+            "Project Search: " ++ pattern,
+            search_root,
+        )
+        let _ = world.switch_to_buffer(rgrep_buf.id)
+        kernel.emit_hook("buffer-switched", rgrep_buf.id)
+        status_emit("Remote project search: " ++ rqf.len().to_string() ++ " match(es)")#
+        return rqf.len()
+    }
     let all_files = collect_workspace_files(search_root)
     let shards = partition_into_four_shards(all_files)
     let qf_entries = parallel_project_scan(shards, pattern, ignore_case) # {
@@ -849,6 +973,16 @@ private fn remove_active_job_from_world(world: EditorWorld, job_id: i64) -> ?Act
     found
 }
 
+private fn build_ssh_job_command(raw_cmd: String, ssh_cwd: String) -> !String String {
+    let pt = parse_ssh_uri(ssh_cwd)!
+    var port_flag = ""
+    if pt.port > 0 and pt.port != 22 {
+        port_flag = "-p " ++ pt.port.to_string() ++ " "
+    }
+    let remote_wrapped = wrap_cmd_in_cwd(raw_cmd, pt.remote_path)
+    "ssh " ++ port_flag ++ pt.ssh_destination() ++ " " ++ shell_quote(remote_wrapped)
+}
+
 pub fn spawn_grep_job(
     kernel: SystemKernel,
     pattern: String,
@@ -858,13 +992,24 @@ pub fn spawn_grep_job(
     if pattern == "" {
         return error "grep pattern cannot be empty"
     }
+    if is_ssh_uri(world.cwd) and (not remote_host_available()) {
+        return run_project_search(kernel, pattern, root_dir = world.cwd)#!
+    }
     world.last_search = pattern
     let qpat = shell_quote(pattern)
     let ic_flag = if world.effective_ignore_case(pattern) { "-i " } else { "" }
-    let raw_cmd =
+    let raw_cmd = if (not is_ssh_uri(world.cwd)) and env.os() == "windows" {
+        "rg -n --column --no-heading --color=never " ++ ic_flag ++ "-- " ++ cmd_quote_win(pattern) ++ " ."
+    } else {
         "if command -v rg >/dev/null 2>&1; then rg -n --column --no-heading --color=never "
         ++ ic_flag ++ "-- " ++ qpat ++ " .; else grep -rn " ++ ic_flag ++ "-- " ++ qpat ++ " .; fi"
-    let full_cmd = wrap_cmd_in_cwd(raw_cmd, world.cwd)
+    }
+    let full_cmd = if is_ssh_uri(world.cwd) {
+        build_ssh_job_command(raw_cmd, world.cwd)!
+    } else {
+        wrap_cmd_in_cwd(raw_cmd, world.cwd)
+    }
+    let local_spawn_cwd = if is_ssh_uri(world.cwd) { "." } else { world.cwd }
 
     let init_lines = [
         "-*- mode: grep; default-directory: \"" ++ world.cwd ++ "\" -*-",
@@ -873,7 +1018,7 @@ pub fn spawn_grep_job(
     let gbuf = world.ensure_special_buffer("*Grep*", "grep", init_lines, read_only = true)
     mgr.clear_qf_rows_for_buffer(gbuf.id)
 
-    let job_id = host_spawn_job(full_cmd, world.cwd, "")
+    let job_id = host_spawn_job(full_cmd, local_spawn_cwd, "")
     register_bg_job(
         world,
         mgr,
@@ -902,20 +1047,36 @@ pub fn run_shell_command_sync(
         return error "shell command cannot be empty"
     }
     mgr.last_shell_cmd = trimmed_cmd
-    let full_cmd = wrap_cmd_in_cwd(trimmed_cmd, world.cwd)
-    let out! = process.shell(full_cmd) else {
-        return error ("failed to execute shell command: " ++ trimmed_cmd)
-    }
-    var combined = out.stdout
-    if out.stderr != "" {
-        if combined != "" and (not combined.ends_with("\n")) {
-            combined = combined ++ "\n"
+    var exit_code: i64 = 0
+    var combined = ""
+    if is_ssh_uri(world.cwd) {
+        let pt = parse_ssh_uri(world.cwd)!
+        let (rc, out_s, err_s) = remote_exec(world.cwd, trimmed_cmd, cwd = pt.remote_path)!
+        exit_code = rc
+        combined = out_s
+        if err_s != "" {
+            if combined != "" and (not combined.ends_with("\n")) {
+                combined = combined ++ "\n"
+            }
+            combined = combined ++ err_s
         }
-        combined = combined ++ out.stderr
+    } else {
+        let full_cmd = wrap_cmd_in_cwd(trimmed_cmd, world.cwd)
+        let out! = process.shell(full_cmd) else {
+            return error ("failed to execute shell command: " ++ trimmed_cmd)
+        }
+        exit_code = out.status
+        combined = out.stdout
+        if out.stderr != "" {
+            if combined != "" and (not combined.ends_with("\n")) {
+                combined = combined ++ "\n"
+            }
+            combined = combined ++ out.stderr
+        }
     }
     let clean = combined.replace("\r\n", "\n").trim_end_matches("\n")
     let out_lines = if clean == "" {
-        ["(Shell command finished with exit code " ++ out.status.to_string() ++ ")"]
+        ["(Shell command finished with exit code " ++ exit_code.to_string() ++ ")"]
     } else {
         clean.split("\n")
     }
@@ -929,7 +1090,7 @@ pub fn run_shell_command_sync(
         kernel.emit_hook("buffer-switched", sbuf.id)
         status_emit(
             "Shell command output (" ++ out_lines.len().to_string()
-            ++ " lines, exit " ++ out.status.to_string() ++ ")"
+            ++ " lines, exit " ++ exit_code.to_string() ++ ")"
         )#
     }
     clean
@@ -954,7 +1115,32 @@ pub fn spawn_async_shell_job(
     let abuf = world.ensure_special_buffer("*Async Shell Command*", "compilation", init_lines, read_only = true)
     mgr.clear_qf_rows_for_buffer(abuf.id)
 
-    let job_id = host_spawn_job(wrap_cmd_in_cwd(trimmed_cmd, world.cwd), world.cwd, "")
+    if is_ssh_uri(world.cwd) and (not remote_host_available()) {
+        let pt = parse_ssh_uri(world.cwd)!
+        let (rc, out_s, err_s) = remote_exec(world.cwd, trimmed_cmd, cwd = pt.remote_path)!
+        register_bg_job(
+            world,
+            mgr,
+            990001,
+            "async-shell",
+            trimmed_cmd,
+            world.cwd,
+            "Async Shell: " ++ trimmed_cmd,
+            "*Async Shell Command*",
+        )
+        let _ = tools_on_async_job_done(kernel, 990001, rc == 0, rc, out_s, err_s)#!
+        let _ = world.switch_to_buffer(abuf.id)
+        kernel.emit_hook("buffer-switched", abuf.id)
+        return 990001
+    }
+
+    let spawn_cmd = if is_ssh_uri(world.cwd) {
+        build_ssh_job_command(trimmed_cmd, world.cwd)!
+    } else {
+        wrap_cmd_in_cwd(trimmed_cmd, world.cwd)
+    }
+    let local_spawn_cwd = if is_ssh_uri(world.cwd) { "." } else { world.cwd }
+    let job_id = host_spawn_job(spawn_cmd, local_spawn_cwd, "")
     register_bg_job(
         world,
         mgr,
@@ -990,7 +1176,32 @@ pub fn spawn_compile_job(
     let cbuf = world.ensure_special_buffer("*Compilation*", "compilation", init_lines, read_only = true)
     mgr.clear_qf_rows_for_buffer(cbuf.id)
 
-    let job_id = host_spawn_job(wrap_cmd_in_cwd(trimmed_cmd, world.cwd), world.cwd, "")
+    if is_ssh_uri(world.cwd) and (not remote_host_available()) {
+        let pt = parse_ssh_uri(world.cwd)!
+        let (rc, out_s, err_s) = remote_exec(world.cwd, trimmed_cmd, cwd = pt.remote_path)!
+        register_bg_job(
+            world,
+            mgr,
+            990002,
+            "compile",
+            trimmed_cmd,
+            world.cwd,
+            "Compile: " ++ trimmed_cmd,
+            "*Compilation*",
+        )
+        let _ = tools_on_async_job_done(kernel, 990002, rc == 0, rc, out_s, err_s)#!
+        let _ = world.switch_to_buffer(cbuf.id)
+        kernel.emit_hook("buffer-switched", cbuf.id)
+        return 990002
+    }
+
+    let spawn_cmd = if is_ssh_uri(world.cwd) {
+        build_ssh_job_command(trimmed_cmd, world.cwd)!
+    } else {
+        wrap_cmd_in_cwd(trimmed_cmd, world.cwd)
+    }
+    let local_spawn_cwd = if is_ssh_uri(world.cwd) { "." } else { world.cwd }
+    let job_id = host_spawn_job(spawn_cmd, local_spawn_cwd, "")
     register_bg_job(
         world,
         mgr,
@@ -1066,7 +1277,19 @@ private fn parse_job_diagnostic_line(line: String, job_cwd: String) -> ?Quickfix
     if fpath == "" or fpath.contains(" ") {
         return null
     }
-    let resolved_path = if path.is_absolute(fpath) {
+    let resolved_path = if is_ssh_uri(fpath) {
+        normalize_ssh_uri(fpath)
+    } else if is_ssh_uri(job_cwd) {
+        if fpath.starts_with("/") {
+            let pt_res = parse_ssh_uri(job_cwd)
+            pt_res match {
+                pt! => normalize_ssh_uri(pt.prefix ++ fpath),
+                error _ => join_ssh_uri(job_cwd, fpath),
+            }
+        } else {
+            join_ssh_uri(job_cwd, fpath)
+        }
+    } else if path.is_absolute(fpath) {
         path.normalize(fpath)
     } else if job_cwd != "" {
         path.normalize(path.join(job_cwd, fpath))

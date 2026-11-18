@@ -89,6 +89,7 @@ pub struct WindowConfig {
     pub height: i32,
     pub background: ColorRgba,
     pub pointer: PointerStyle,
+    pub decorated: bool,
 }
 
 impl Default for WindowConfig {
@@ -99,6 +100,7 @@ impl Default for WindowConfig {
             height: 800,
             background: ColorRgba::from_rgba(30, 30, 46, 255),
             pointer: PointerStyle::Default,
+            decorated: false,
         }
     }
 }
@@ -277,10 +279,22 @@ pub enum UiEvent {
     },
 }
 
+/// Live file-transfer progress overlay rendered directly by the UI compositor during streaming downloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferOverlay {
+    pub active: bool,
+    pub title: String,
+    pub transport: String,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub lines_loaded: u64,
+}
+
 /// Thread-safe slot holding the most recently committed [`RenderFrame`].
 pub struct FrameSlot {
     inner: Mutex<Arc<RenderFrame>>,
     anim_hints: Mutex<AnimHints>,
+    transfer_overlay: Mutex<Option<TransferOverlay>>,
     wakeup: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
@@ -295,8 +309,32 @@ impl FrameSlot {
         Self {
             inner: Mutex::new(Arc::new(RenderFrame::default())),
             anim_hints: Mutex::new(AnimHints::default()),
+            transfer_overlay: Mutex::new(None),
             wakeup: Mutex::new(None),
         }
+    }
+
+    pub fn set_transfer_overlay(&self, overlay: Option<TransferOverlay>) {
+        {
+            let mut guard = self
+                .transfer_overlay
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *guard = overlay;
+        }
+        if let Ok(guard) = self.wakeup.lock()
+            && let Some(waker) = guard.as_ref()
+        {
+            waker();
+        }
+    }
+
+    pub fn transfer_overlay(&self) -> Option<TransferOverlay> {
+        let guard = self
+            .transfer_overlay
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.clone()
     }
 
     pub fn set_ui_waker(&self, waker: Box<dyn Fn() + Send + Sync>) {

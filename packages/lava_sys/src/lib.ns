@@ -103,6 +103,7 @@ pub struct WindowSpec {
     pub height: i64,
     pub bg_rgba: i64,
     pub pointer: PointerHint,
+    pub decorated: bool = false,
 }
 
 impl WindowSpec {
@@ -113,6 +114,7 @@ impl WindowSpec {
             height: 800,
             bg_rgba: rgb(30, 30, 46),
             pointer: PointerHint.default,
+            decorated: false,
         }
     }
 }
@@ -314,6 +316,7 @@ private global _mock_clipboard: String = ""
 private global _mock_frame_gen: i64 = 0
 private global _mock_last_cmds: List = List()
 private global _mock_last_title: String = "Lava"
+private global _mock_last_decorated: bool = false
 private global _mock_quit_code: ?i64 = null
 private global _mock_next_id: i64 = 1
 private global _frame_flat_buf: List = List()
@@ -330,6 +333,7 @@ pub fn mock_enable(enabled: bool) {
         _mock_frame_gen = 0
         _mock_last_cmds = List()
         _mock_last_title = "Lava"
+        _mock_last_decorated = false
         _mock_quit_code = null
         _mock_next_id = 1
     }
@@ -344,6 +348,8 @@ pub fn mock_last_frame_cmds() -> List = _mock_last_cmds
 pub fn mock_frame_generation() -> i64 = _mock_frame_gen
 
 pub fn mock_last_title() -> String = _mock_last_title
+
+pub fn mock_last_decorated() -> bool = _mock_last_decorated
 
 pub fn mock_quit_requested() -> ?i64 = _mock_quit_code
 
@@ -392,6 +398,7 @@ pub fn host_commit_frame(spec: WindowSpec, cmds: List) -> i64 {
         _mock_frame_gen += 1
         _mock_last_cmds = cmds
         _mock_last_title = spec.title
+        _mock_last_decorated = spec.decorated
         return _mock_frame_gen
     }
     let flat = _frame_flat_buf
@@ -476,7 +483,7 @@ pub fn host_commit_frame(spec: WindowSpec, cmds: List) -> i64 {
     }
     let flat_res = runtime.host_call(
         "ui_commit_frame_flat",
-        [spec.title, spec.width, spec.height, spec.bg_rgba, spec.pointer.code(), flat],
+        [spec.title, spec.width, spec.height, spec.bg_rgba, spec.pointer.code(), flat, spec.decorated],
     )
     flat_res match {
         gen! => return gen.as(i64),
@@ -567,7 +574,7 @@ pub fn host_commit_frame(spec: WindowSpec, cmds: List) -> i64 {
     }
     let fast_res = runtime.host_call(
         "ui_commit_frame_bytes",
-        [spec.title, spec.width, spec.height, spec.bg_rgba, spec.pointer.code(), buf],
+        [spec.title, spec.width, spec.height, spec.bg_rgba, spec.pointer.code(), buf, spec.decorated],
     )
     fast_res match {
         gen! => return gen.as(i64),
@@ -579,11 +586,12 @@ pub fn host_commit_frame(spec: WindowSpec, cmds: List) -> i64 {
     }
     let gen! = runtime.host_call(
         "ui_commit_frame",
-        [spec.title, spec.width, spec.height, spec.bg_rgba, spec.pointer.code(), wire]
+        [spec.title, spec.width, spec.height, spec.bg_rgba, spec.pointer.code(), wire, spec.decorated]
     ) else {
         _mock_frame_gen += 1
         _mock_last_cmds = cmds
         _mock_last_title = spec.title
+        _mock_last_decorated = spec.decorated
         return _mock_frame_gen
     }
     gen.as(i64)

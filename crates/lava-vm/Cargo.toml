@@ -13,9 +13,11 @@ lava-lsp.workspace = true
 lava-proto.workspace = true
 lava-remote.workspace = true
 lava-term.workspace = true
-libc.workspace = true
 nsbc.workspace = true
 nsbc_io.workspace = true
 pkg_manager.workspace = true
 runtime.workspace = true
 scheduler.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

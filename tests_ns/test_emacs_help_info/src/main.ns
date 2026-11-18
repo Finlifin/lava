@@ -215,8 +215,8 @@ fn run_help_info_apropos_suite(
     state.override_code_roots = [code_dir]
     world.cwd = root
 
-    -- Verify all 34 EditorOptions are cataloged
-    check_eq_i64(all_option_metas().len(), 34, "all 34 EditorOptions documented in OptionMeta catalog")
+    -- Verify all 35 EditorOptions are cataloged
+    check_eq_i64(all_option_metas().len(), 35, "all 35 EditorOptions documented in OptionMeta catalog")
 
     handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let _cap = AppHostCap.new(world)
 

@@ -12,6 +12,7 @@ use @lava_core.{
     status_emit
 }
 use @lava_accel.{GitStatusSummary, accel_git_status}
+use @lava_remote.{is_ssh_uri, parent_ssh_uri, parse_ssh_uri, remote_git_status}
 use @ext_document.{
     Buffer, EditorWorld, GutterSign, Pos, Span, VisualKind, ext_document_id, require_editor_world
 }
@@ -61,6 +62,30 @@ impl LualineService {
                 return cached_opt.as(LualineGitCacheEntry)
             }
         }
+        if is_ssh_uri(key) {
+            let rsum_opt = remote_git_status(key) ! { _ => null }
+            let rentry = if rsum_opt != null {
+                let rsum = rsum_opt
+                LualineGitCacheEntry {
+                    is_repo: rsum.is_repo,
+                    branch: rsum.branch,
+                    staged_count: rsum.staged_count,
+                    modified_count: rsum.modified_count,
+                    untracked_count: rsum.untracked_count,
+                }
+            } else {
+                LualineGitCacheEntry {
+                    is_repo: false,
+                    branch: "",
+                    staged_count: 0,
+                    modified_count: 0,
+                    untracked_count: 0,
+                }
+            }
+            self.git_cache.insert(key, rentry)
+            self.git_refresh_count += 1
+            return rentry
+        }
         let summary: GitStatusSummary = accel_git_status(key)
         let entry = LualineGitCacheEntry {
             is_repo: summary.is_repo,
@@ -92,6 +117,11 @@ fn git_dir_for_buffer(svc: LualineService, world: EditorWorld, buf: Buffer) -> S
             return cached_opt.as(String)
         }
         let full = world.resolve_path(buf.file_path)
+        if is_ssh_uri(full) {
+            let rdir = parent_ssh_uri(full)
+            svc.dir_cache.insert(cache_key, rdir)
+            return rdir
+        }
         let parent_opt = path.parent(full)
         if parent_opt != null {
             let pdir = parent_opt.as(String)
@@ -284,6 +314,20 @@ pub fn sync_lualine_segments(kernel: SystemKernel, force_git_refresh: bool) {
     }
 
     let left_parts = List()
+    let remote_probe = if is_ssh_uri(buf.file_path) {
+        buf.file_path
+    } else if is_ssh_uri(world.cwd) {
+        world.cwd
+    } else {
+        ""
+    }
+    if remote_probe != "" {
+        let pt_res = parse_ssh_uri(remote_probe)
+        pt_res match {
+            pt! => left_parts.push("[SSH: " ++ pt.authority ++ "]"),
+            error _ => (),
+        }
+    }
     let git_seg = format_git_segment(git_entry)
     if git_seg != "" {
         left_parts.push(git_seg)

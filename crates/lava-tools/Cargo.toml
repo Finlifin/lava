@@ -1,0 +1,20 @@
+[package]
+name = "lava-tools"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "lava_tools"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rg"
+path = "src/bin/rg.rs"
+
+[[bin]]
+name = "fd"
+path = "src/bin/fd.rs"
+
+[dependencies]
+memchr.workspace = true
+regex.workspace = true

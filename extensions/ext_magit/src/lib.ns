@@ -13,6 +13,10 @@ use @lava_core.{
     clipboard_get, clipboard_set, log_event, status_emit
 }
 use @lava_accel.{GitFileEntry, GitStatusSummary, accel_git_status}
+use @lava_remote.{
+    RemoteGitFileEntry, is_ssh_uri, join_ssh_uri, normalize_ssh_uri, parent_ssh_uri,
+    parse_ssh_uri, remote_exec, remote_git_status, remote_read_lines, remote_remove, remote_stat
+}
 use @ext_document.{
     Buffer, BufferId, BufferKind, EditorWorld, Pos, ext_document_id, require_editor_world
 }
@@ -98,26 +102,112 @@ fn status_code_label(code: String) -> String {
     }
 }
 
+fn shell_quote_arg(s: String) -> String {
+    "'" ++ s.replace("'", "'\\''") ++ "'"
+}
+
+fn magit_run_git(root: String, args: List) -> (bool, String, String) {
+    if is_ssh_uri(root) {
+        let pt! = parse_ssh_uri(root) else {
+            return (false, "", "invalid ssh root: " ++ root)
+        }
+        let quoted = List()
+        quoted.push("git")
+        for i in 0..args.len() {
+            quoted.push(shell_quote_arg(args.get(i.as(usize)).as(String)))
+        }
+        let cmd = quoted.join(" ")
+        let res = remote_exec(root, cmd, cwd = pt.remote_path)
+        res match {
+            tup! => {
+                let (code, out_s, err_s) = tup
+                return (code == 0, out_s, err_s)
+            },
+            error e => {
+                return (false, "", e)
+            },
+        }
+    }
+    let res = process.run("git", args = args, cwd = root)
+    res match {
+        out! => (out.is_success(), out.stdout, out.stderr),
+        error e => (false, "", e.to_string()),
+    }
+}
+
+fn magit_git_status_any(dir_or_uri: String) -> GitStatusSummary {
+    if is_ssh_uri(dir_or_uri) {
+        let rsum_opt = remote_git_status(dir_or_uri) ! { _ => null }
+        if rsum_opt == null {
+            let empty_st = GitStatusSummary {
+                is_repo: false,
+                root: "",
+                branch: "",
+                staged_count: 0,
+                modified_count: 0,
+                untracked_count: 0,
+                entries: List(),
+            }
+            return empty_st
+        }
+        let rsum = rsum_opt
+        let ents = List()
+        for i in 0..rsum.entries.len() {
+            let re = rsum.entries.get(i.as(usize)).as(RemoteGitFileEntry)
+            ents.push(GitFileEntry {
+                index_status: re.index_status,
+                worktree_status: re.worktree_status,
+                rel_path: re.rel_path,
+            })
+        }
+        let full_st = GitStatusSummary {
+            is_repo: rsum.is_repo,
+            root: rsum.root,
+            branch: rsum.branch,
+            staged_count: rsum.staged_count,
+            modified_count: rsum.modified_count,
+            untracked_count: rsum.untracked_count,
+            entries: ents,
+        }
+        return full_st
+    }
+    accel_git_status(dir_or_uri)
+}
+
+fn magit_join_path(root: String, rel: String) -> String {
+    if is_ssh_uri(root) {
+        return join_ssh_uri(root, rel)
+    }
+    path.join(root, rel)
+}
+
 fn resolve_git_status(world: EditorWorld, state: MagitState) -> GitStatusSummary {
     let buf = world.active_buffer()
     if buf.file_path != "" {
-        let p_opt = path.parent(buf.file_path)
-        if p_opt != null {
-            let pdir = p_opt.as(String)
-            if pdir != "" and fs.is_dir(pdir) {
-                let st_buf = accel_git_status(pdir)
-                if st_buf.is_repo {
-                    return st_buf
+        if is_ssh_uri(buf.file_path) {
+            let st_rem = magit_git_status_any(parent_ssh_uri(buf.file_path))
+            if st_rem.is_repo {
+                return st_rem
+            }
+        } else {
+            let p_opt = path.parent(buf.file_path)
+            if p_opt != null {
+                let pdir = p_opt.as(String)
+                if pdir != "" and fs.is_dir(pdir) {
+                    let st_buf = accel_git_status(pdir)
+                    if st_buf.is_repo {
+                        return st_buf
+                    }
                 }
             }
         }
     }
-    let st_cwd = accel_git_status(world.cwd)
+    let st_cwd = magit_git_status_any(world.cwd)
     if st_cwd.is_repo {
         return st_cwd
     }
-    if state.repo_root != "" and fs.is_dir(state.repo_root) {
-        let st_prev = accel_git_status(state.repo_root)
+    if state.repo_root != "" and (is_ssh_uri(state.repo_root) or fs.is_dir(state.repo_root)) {
+        let st_prev = magit_git_status_any(state.repo_root)
         if st_prev.is_repo {
             return st_prev
         }
@@ -126,50 +216,29 @@ fn resolve_git_status(world: EditorWorld, state: MagitState) -> GitStatusSummary
 }
 
 fn git_head_exists(root: String) -> bool {
-    let res = process.run("git", args = ["rev-parse", "--verify", "HEAD"], cwd = root)
-    res match {
-        out! => out.is_success(),
-        error _ => false,
-    }
+    let (ok, _, _) = magit_run_git(root, ["rev-parse", "--verify", "HEAD"])
+    ok
 }
 
 fn git_latest_subject(root: String) -> String {
-    let res = process.run(
-        "git",
-        args = ["log", "-1", "--pretty=format:%h %s"],
-        cwd = root,
-    )
-    res match {
-        out! => {
-            if out.is_success() and out.stdout.trim() != "" {
-                return out.stdout.trim()
-            }
-            "(no commits yet)"
-        },
-        error _ => "(no commits yet)",
+    let (ok, stdout, _) = magit_run_git(root, ["log", "-1", "--pretty=format:%h %s"])
+    if ok and stdout.trim() != "" {
+        return stdout.trim()
     }
+    "(no commits yet)"
 }
 
 fn git_recent_commits(root: String, limit: i64) -> List {
     let out_list = List()
-    let res = process.run(
-        "git",
-        args = ["log", "--oneline", "-n", limit.to_string()],
-        cwd = root,
-    )
-    res match {
-        out! => {
-            if out.is_success() and out.stdout.trim() != "" {
-                let raw_lines = out.stdout.replace("\r\n", "\n").split("\n")
-                for i in 0..raw_lines.len() {
-                    let ln = raw_lines.get(i.as(usize)).as(String).trim_end()
-                    if ln.trim() != "" {
-                        out_list.push(ln)
-                    }
-                }
+    let (ok, stdout, _) = magit_run_git(root, ["log", "--oneline", "-n", limit.to_string()])
+    if ok and stdout.trim() != "" {
+        let raw_lines = stdout.replace("\r\n", "\n").split("\n")
+        for i in 0..raw_lines.len() {
+            let ln = raw_lines.get(i.as(usize)).as(String).trim_end()
+            if ln.trim() != "" {
+                out_list.push(ln)
             }
-        },
-        error _ => (),
+        }
     }
     out_list
 }
@@ -177,7 +246,25 @@ fn git_recent_commits(root: String, limit: i64) -> List {
 fn git_inline_diff_lines(root: String, section: String, rel_path: String) -> List {
     let out_list = List()
     if section == "untracked" {
-        let full = path.join(root, rel_path)
+        let full = magit_join_path(root, rel_path)
+        if is_ssh_uri(full) {
+            let rl_res = remote_read_lines(full)
+            rl_res match {
+                pair! => {
+                    let (parts, _) = pair
+                    out_list.push("    @@ -0,0 +1," ++ parts.len().to_string() ++ " @@")
+                    let cap = if parts.len() > 80 { 80 } else { parts.len() }
+                    for i in 0..cap {
+                        out_list.push("    +" ++ parts.get(i.as(usize)).as(String))
+                    }
+                    return out_list
+                },
+                error _ => {
+                    out_list.push("    (binary or unreadable remote file)")
+                    return out_list
+                },
+            }
+        }
         let content! = fs.read_to_string(full) else {
             out_list.push("    (binary or unreadable file)")
             return out_list
@@ -200,27 +287,22 @@ fn git_inline_diff_lines(root: String, section: String, rel_path: String) -> Lis
     } else {
         ["diff", "--no-color", "-U2", "--", rel_path]
     }
-    let res = process.run("git", args = args, cwd = root)
-    res match {
-        out! => {
-            if out.is_success() and out.stdout.trim() != "" {
-                let raw_lines = out.stdout.replace("\r\n", "\n").split("\n")
-                for i in 0..raw_lines.len() {
-                    let ln = raw_lines.get(i.as(usize)).as(String)
-                    if ln.starts_with("diff --git ")
-                        or ln.starts_with("index ")
-                        or ln.starts_with("--- ")
-                        or ln.starts_with("+++ ") {
-                        continue
-                    }
-                    if ln == "" and i == raw_lines.len() - 1 {
-                        continue
-                    }
-                    out_list.push("    " ++ ln)
-                }
+    let (ok, stdout, _) = magit_run_git(root, args)
+    if ok and stdout.trim() != "" {
+        let raw_lines = stdout.replace("\r\n", "\n").split("\n")
+        for i in 0..raw_lines.len() {
+            let ln = raw_lines.get(i.as(usize)).as(String)
+            if ln.starts_with("diff --git ")
+                or ln.starts_with("index ")
+                or ln.starts_with("--- ")
+                or ln.starts_with("+++ ") {
+                continue
             }
-        },
-        error _ => (),
+            if ln == "" and i == raw_lines.len() - 1 {
+                continue
+            }
+            out_list.push("    " ++ ln)
+        }
     }
     if out_list.is_empty() {
         out_list.push("    (no textual diff)")
@@ -650,25 +732,8 @@ fn cmd_magit_toggle_diff(kernel: SystemKernel) -> #InteractiveEffects !String An
 }
 
 fn run_git_checked(root: String, args: List) -> !String String {
-    let raw_res = process.run("git", args = args, cwd = root)
-    var ok_out = ""
-    var ok_err = ""
-    var exited_zero = false
-    var io_err_msg = ""
-    raw_res match {
-        out! => {
-            exited_zero = out.is_success()
-            ok_out = out.stdout
-            ok_err = out.stderr
-        },
-        error e => {
-            io_err_msg = "git execution error: " ++ e.to_string()
-        },
-    }
-    if io_err_msg != "" {
-        return error io_err_msg
-    }
-    if not exited_zero {
+    let (ok, ok_out, ok_err) = magit_run_git(root, args)
+    if not ok {
         let msg = if ok_err.trim() != "" { ok_err.trim() } else { ok_out.trim() }
         return error ("git failed: " ++ msg)
     }
@@ -792,6 +857,25 @@ fn cmd_magit_unstage_all(kernel: SystemKernel) -> #InteractiveEffects !String An
 }
 
 fn reload_open_buffer_from_disk(kernel: SystemKernel, world: EditorWorld, full_path: String) {
+    if is_ssh_uri(full_path) {
+        let norm_u = normalize_ssh_uri(full_path)
+        let open_opt = world.find_buffer_by_path(norm_u)
+        if open_opt == null {
+            return
+        }
+        let b = open_opt.as(Buffer)
+        let rl_res = remote_read_lines(norm_u)
+        rl_res match {
+            pair! => {
+                let (flines, _) = pair
+                b.set_lines(flines, record_undo = true)
+                b.modified = false
+                kernel.emit_hook("buffer-saved", b.id)
+            },
+            error _ => (),
+        }
+        return
+    }
     let norm = path.normalize(full_path)
     let open_opt = world.find_buffer_by_path(norm)
     if open_opt == null {
@@ -840,24 +924,31 @@ fn cmd_magit_discard(kernel: SystemKernel) -> #InteractiveEffects !String Any {
         status_emit("Discard cancelled")#
         return ()
     }
-    let full = path.join(state.repo_root, rel)
+    let full = magit_join_path(state.repo_root, rel)
     if meta.section == "untracked" {
-        var rm_err = ""
-        if fs.is_dir(full) {
-            let rm_res = fs.remove_dir(full, recursive = true)
-            rm_res match {
-                _! => (),
-                error e => { rm_err = e.to_string() },
+        if is_ssh_uri(full) {
+            let st_opt = remote_stat(full) ! { _ => null }
+            if st_opt != null and st_opt.exists {
+                remote_remove(full, recursive = st_opt.is_dir)!
             }
-        } else if fs.exists(full) {
-            let rm_res = fs.remove_file(full)
-            rm_res match {
-                _! => (),
-                error e => { rm_err = e.to_string() },
+        } else {
+            var rm_err = ""
+            if fs.is_dir(full) {
+                let rm_res = fs.remove_dir(full, recursive = true)
+                rm_res match {
+                    _! => (),
+                    error e => { rm_err = e.to_string() },
+                }
+            } else if fs.exists(full) {
+                let rm_res = fs.remove_file(full)
+                rm_res match {
+                    _! => (),
+                    error e => { rm_err = e.to_string() },
+                }
             }
-        }
-        if rm_err != "" {
-            return error rm_err
+            if rm_err != "" {
+                return error rm_err
+            }
         }
     } else {
         let _ = run_git_checked(state.repo_root, ["checkout", "--", rel])!
@@ -910,24 +1001,15 @@ fn cmd_magit_commit(kernel: SystemKernel) -> #InteractiveEffects !String Any {
 
 fn list_git_branches(root: String) -> List {
     let out_list = List()
-    let res = process.run(
-        "git",
-        args = ["branch", "--format=%(refname:short)"],
-        cwd = root,
-    )
-    res match {
-        out! => {
-            if out.is_success() {
-                let raw_lines = out.stdout.replace("\r\n", "\n").split("\n")
-                for i in 0..raw_lines.len() {
-                    let b = raw_lines.get(i.as(usize)).as(String).trim()
-                    if b != "" {
-                        out_list.push(b)
-                    }
-                }
+    let (ok, stdout, _) = magit_run_git(root, ["branch", "--format=%(refname:short)"])
+    if ok {
+        let raw_lines = stdout.replace("\r\n", "\n").split("\n")
+        for i in 0..raw_lines.len() {
+            let b = raw_lines.get(i.as(usize)).as(String).trim()
+            if b != "" {
+                out_list.push(b)
             }
-        },
-        error _ => (),
+        }
     }
     out_list
 }
@@ -983,25 +1065,17 @@ fn cmd_magit_log(kernel: SystemKernel) -> #InteractiveEffects !String Any {
     let lines = List()
     lines.push("Commits in " ++ state.repo_root ++ "  ([g] refresh, [q] back)")
     lines.push("========================================================================")
-    let res = process.run(
-        "git",
-        args = ["log", "--graph", "--decorate", "--date=short", "--pretty=format:%h  %ad  %an  %s", "-n", "50"],
-        cwd = state.repo_root,
+    let (log_ok, log_stdout, _) = magit_run_git(
+        state.repo_root,
+        ["log", "--graph", "--decorate", "--date=short", "--pretty=format:%h  %ad  %an  %s", "-n", "50"],
     )
-    res match {
-        out! => {
-            if out.is_success() and out.stdout.trim() != "" {
-                let raw_lines = out.stdout.replace("\r\n", "\n").split("\n")
-                for i in 0..raw_lines.len() {
-                    lines.push(raw_lines.get(i.as(usize)).as(String))
-                }
-            } else {
-                lines.push("(no commits yet)")
-            }
-        },
-        error _ => {
-            lines.push("(failed to read git log)")
-        },
+    if log_ok and log_stdout.trim() != "" {
+        let raw_lines = log_stdout.replace("\r\n", "\n").split("\n")
+        for i in 0..raw_lines.len() {
+            lines.push(raw_lines.get(i.as(usize)).as(String))
+        }
+    } else {
+        lines.push("(no commits yet)")
     }
     let lbuf = world.ensure_special_buffer(MAGIT_LOG_BUF_NAME, "magit-log", lines, read_only = true)
     let _ = world.switch_to_buffer(lbuf.id)
@@ -1021,8 +1095,14 @@ fn cmd_magit_visit(kernel: SystemKernel) -> #InteractiveEffects !String Any {
         return ()
     }
     if (meta.kind == "file" or meta.kind == "diff") and meta.rel_path != "" {
-        let full = path.join(state.repo_root, meta.rel_path)
-        if not fs.exists(full) {
+        let full = magit_join_path(state.repo_root, meta.rel_path)
+        let exists_flag = if is_ssh_uri(full) {
+            let st_opt = remote_stat(full) ! { _ => null }
+            st_opt != null and st_opt.exists
+        } else {
+            fs.exists(full)
+        }
+        if not exists_flag {
             status_emit("File does not exist on disk: " ++ meta.rel_path)#
             return ()
         }
@@ -1039,22 +1119,16 @@ fn cmd_magit_visit(kernel: SystemKernel) -> #InteractiveEffects !String Any {
         return ()
     }
     if meta.kind == "commit" and meta.commit_hash != "" {
-        let res = process.run(
-            "git",
-            args = ["show", "--stat", "--no-color", meta.commit_hash],
-            cwd = state.repo_root,
+        let (show_ok, show_out, _) = magit_run_git(
+            state.repo_root,
+            ["show", "--stat", "--no-color", meta.commit_hash],
         )
-        res match {
-            out! => {
-                if out.is_success() {
-                    let show_lines = out.stdout.replace("\r\n", "\n").split("\n")
-                    let cbuf = world.ensure_special_buffer(MAGIT_LOG_BUF_NAME, "magit-log", show_lines, read_only = true)
-                    let _ = world.switch_to_buffer(cbuf.id)
-                    kernel.emit_hook("buffer-switched", cbuf.id)
-                    status_emit("Commit " ++ meta.commit_hash)#
-                }
-            },
-            error _ => (),
+        if show_ok {
+            let show_lines = show_out.replace("\r\n", "\n").split("\n")
+            let cbuf = world.ensure_special_buffer(MAGIT_LOG_BUF_NAME, "magit-log", show_lines, read_only = true)
+            let _ = world.switch_to_buffer(cbuf.id)
+            kernel.emit_hook("buffer-switched", cbuf.id)
+            status_emit("Commit " ++ meta.commit_hash)#
         }
     }
     ()

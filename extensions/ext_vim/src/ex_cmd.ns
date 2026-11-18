@@ -7,7 +7,7 @@ use std.fs
 use std.process
 
 use @lava_sys.{host_request_quit, host_write_file_lines}
-use @lava_remote.{is_ssh_uri, remote_stat, remote_write_lines}
+use @lava_remote.{is_ssh_uri, parent_ssh_uri, remote_exec, remote_stat, remote_write_lines}
 use @lava_core.{
     CommandSpec, ExtensionRecord, InteractiveEffects, PromptTurn, ServiceEntry, SystemKernel,
     clipboard_get, clipboard_set, log_event, status_emit
@@ -465,6 +465,7 @@ fn apply_set_options(world: EditorWorld, arg_str: String) -> !String String {
             ++ " smooth_scroll=" ++ world.options.smooth_scroll.to_string()
             ++ " cursor_anim=" ++ world.options.cursor_anim.to_string()
             ++ " treesitter=" ++ world.options.treesitter.to_string()
+            ++ " decorations=" ++ world.options.window_decorations.to_string()
         )
     }
     let tokens = trimmed.split_whitespace()
@@ -676,6 +677,15 @@ fn apply_set_options(world: EditorWorld, arg_str: String) -> !String String {
         } else if tok == "treesitter!" {
             world.options.treesitter = not world.options.treesitter
             applied.push(if world.options.treesitter { "treesitter" } else { "notreesitter" })
+        } else if tok == "decorations" or tok == "window_decorations" or tok == "windowdecorations" {
+            world.options.window_decorations = true
+            applied.push("decorations")
+        } else if tok == "nodecorations" or tok == "nowindow_decorations" or tok == "nowindowdecorations" {
+            world.options.window_decorations = false
+            applied.push("nodecorations")
+        } else if tok == "decorations!" or tok == "window_decorations!" or tok == "windowdecorations!" {
+            world.options.window_decorations = not world.options.window_decorations
+            applied.push(if world.options.window_decorations { "decorations" } else { "nodecorations" })
         } else {
             return error ("E518: Unknown option: " ++ tok)
         }
@@ -728,6 +738,31 @@ pub fn execute_ex_command(kernel: SystemKernel, raw_cmd: String) -> #Interactive
         }
         let handled_shell = dispatch_if_available(kernel, "shell-command", [shell_cmd])#!
         if handled_shell {
+            return ()
+        }
+        let rem_ctx = if is_ssh_uri(buf.file_path) {
+            parent_ssh_uri(buf.file_path)
+        } else if is_ssh_uri(world.cwd) {
+            world.cwd
+        } else {
+            ""
+        }
+        if rem_ctx != "" {
+            let (rcode, r_out, r_err) = remote_exec(rem_ctx, shell_cmd, cwd = rem_ctx)!
+            let r_comb = if r_err != "" {
+                r_out ++ (if r_out != "" and not r_out.ends_with("\n") { "\n" } else { "" }) ++ r_err
+            } else {
+                r_out
+            }
+            let r_lines = if r_comb.trim() == "" {
+                ["(Remote command exited with status " ++ rcode.to_string() ++ ")"]
+            } else {
+                r_comb.split("\n")
+            }
+            let sb = world.ensure_special_buffer("*Shell Command Output*", "text", r_lines, read_only = true)
+            let _ = world.switch_to_buffer(sb.id)
+            kernel.emit_hook("buffer-switched", sb.id)
+            status_emit("[SSH] :!" ++ shell_cmd ++ " (exit " ++ rcode.to_string() ++ ")")#
             return ()
         }
         let out! = process.shell(shell_cmd) else {
@@ -1303,6 +1338,19 @@ pub fn execute_ex_command(kernel: SystemKernel, raw_cmd: String) -> #Interactive
             world.cwd
         } else {
             world.resolve_path(arg)
+        }
+        if is_ssh_uri(target_dir) {
+            let rst! = remote_stat(target_dir) else {
+                status_emit("E344: Can't find remote directory \"" ++ target_dir ++ "\"")#
+                return ()
+            }
+            if (not rst.exists) or (not rst.is_dir) {
+                status_emit("E344: Can't find remote directory \"" ++ target_dir ++ "\"")#
+                return ()
+            }
+            world.cwd = target_dir
+            status_emit(world.cwd)#
+            return ()
         }
         if not (fs.exists(target_dir) and fs.is_dir(target_dir)) {
             status_emit("E344: Can't find directory \"" ++ target_dir ++ "\"")#

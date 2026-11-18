@@ -10,8 +10,12 @@ use @lava_core.{
     ExtId, InteractiveEffects, SystemKernel, clipboard_get, clipboard_set, log_event, status_emit
 }
 use @lava_accel.{
-    DiffHunk, GitBlame, accel_doc_diff_head, accel_git_blame_line, accel_git_head_lines,
-    accel_git_status
+    DiffHunk, GitBlame, accel_diff_lines, accel_doc_diff_head, accel_git_blame_line,
+    accel_git_head_lines, accel_git_status
+}
+use @lava_remote.{
+    RemoteGitBlame, is_ssh_uri, normalize_ssh_uri, parent_ssh_uri, parse_ssh_uri, remote_exec,
+    remote_git_blame_line, remote_git_head_lines, remote_git_status
 }
 use @ext_document.{
     Buffer, BufferId, BufferKind, EditorWorld, FloatingWindow, Pos, ext_document_id,
@@ -103,10 +107,21 @@ impl GitsignsState {
 
     pub fn invalidate_file(self, file_path: String) {
         if file_path != "" {
-            let norm = path.normalize(file_path)
+            let norm = if is_ssh_uri(file_path) {
+                normalize_ssh_uri(file_path)
+            } else {
+                path.normalize(file_path)
+            }
             let _ = self.head_cache.remove(norm)
             let _ = self.untracked_cache.remove(norm)
-            if self.blame_file_path == file_path or path.normalize(self.blame_file_path) == norm {
+            let norm_blame = if self.blame_file_path == "" {
+                ""
+            } else if is_ssh_uri(self.blame_file_path) {
+                normalize_ssh_uri(self.blame_file_path)
+            } else {
+                path.normalize(self.blame_file_path)
+            }
+            if self.blame_file_path == file_path or norm_blame == norm {
                 self.blame_file_path = ""
                 self.blame_row = -1
                 self.blame_text = ""
@@ -139,6 +154,9 @@ pub fn require_gitsigns_state(kernel: SystemKernel) -> !String GitsignsState {
 
 fn effective_git_cwd(world: EditorWorld, file_path: String) -> String {
     if file_path != "" {
+        if is_ssh_uri(file_path) {
+            return parent_ssh_uri(file_path)
+        }
         let p_opt = path.parent(file_path)
         if p_opt != null {
             let pdir = p_opt.as(String)
@@ -154,7 +172,11 @@ fn fetch_base_lines(world: EditorWorld, state: GitsignsState, file_path: String,
     if file_path == "" {
         return null
     }
-    let norm = path.normalize(file_path)
+    let norm = if is_ssh_uri(file_path) {
+        normalize_ssh_uri(file_path)
+    } else {
+        path.normalize(file_path)
+    }
     if not force_reload {
         if state.head_cache.contains_key(norm) {
             return state.head_cache.get(norm).as(List)
@@ -168,7 +190,11 @@ fn fetch_base_lines(world: EditorWorld, state: GitsignsState, file_path: String,
     }
 
     let cwd = effective_git_cwd(world, norm)
-    let head_opt = accel_git_head_lines(cwd, norm)
+    let head_opt: ?List = if is_ssh_uri(norm) {
+        remote_git_head_lines(cwd, norm) ! { _ => null }
+    } else {
+        accel_git_head_lines(cwd, norm)
+    }
     let raw_lines? = head_opt else {
         state.untracked_cache.insert(norm)
         return null
@@ -271,15 +297,35 @@ fn apply_gitsigns_decorations(world: EditorWorld, state: GitsignsState, buf: Buf
             state.blame_text
         } else {
             let cwd = effective_git_cwd(world, buf.file_path)
-            let blame_opt = accel_git_blame_line(cwd, buf.file_path, cur_row)
-            let blame = if blame_opt != null {
-                blame_opt.as(GitBlame)
+            let blame = if is_ssh_uri(buf.file_path) {
+                let rbl_opt: ?RemoteGitBlame = remote_git_blame_line(cwd, buf.file_path, cur_row) ! { _ => null }
+                if rbl_opt != null {
+                    let rb = rbl_opt.as(RemoteGitBlame)
+                    GitBlame {
+                        commit_short: rb.commit_short,
+                        author: rb.author,
+                        date_ymd: rb.date_ymd,
+                        summary: rb.summary,
+                    }
+                } else {
+                    GitBlame {
+                        commit_short: "0000000",
+                        author: "Uncommitted",
+                        date_ymd: "recent",
+                        summary: "Not committed yet",
+                    }
+                }
             } else {
-                GitBlame {
-                    commit_short: "0000000",
-                    author: "Uncommitted",
-                    date_ymd: "recent",
-                    summary: "Not committed yet",
+                let blame_opt = accel_git_blame_line(cwd, buf.file_path, cur_row)
+                if blame_opt != null {
+                    blame_opt.as(GitBlame)
+                } else {
+                    GitBlame {
+                        commit_short: "0000000",
+                        author: "Uncommitted",
+                        date_ymd: "recent",
+                        summary: "Not committed yet",
+                    }
                 }
             }
             let built = "   " ++ blame.author ++ ", " ++ blame.date_ymd ++ " • " ++ blame.summary
@@ -321,7 +367,32 @@ pub fn refresh_buffer_gitsigns(
         return
     }
 
-    let diff_opt = accel_doc_diff_head(buf.doc_id, buf.file_path, force_reload_head)
+    let diff_opt: ?(List, i64, i64, i64) = if is_ssh_uri(buf.file_path) {
+        let base_opt = fetch_base_lines(world, state, buf.file_path, force_reload_head)
+        if base_opt != null {
+            let cap = min_i64(buf.line_count(), 50000)
+            let cur_lines = buf.slice_lines(0, cap)
+            let rhunks = accel_diff_lines(base_opt.as(List), cur_lines)
+            var r_add: i64 = 0
+            var r_chg: i64 = 0
+            var r_del: i64 = 0
+            for ri in 0..rhunks.len() {
+                let rh = rhunks.get(ri.as(usize)).as(DiffHunk)
+                if rh.kind == "add" {
+                    r_add += rh.new_count
+                } else if rh.kind == "change" {
+                    r_chg += max_i64(rh.new_count, rh.old_count)
+                } else if rh.kind == "delete" {
+                    r_del += rh.old_count
+                }
+            }
+            (rhunks, r_add, r_chg, r_del)
+        } else {
+            null
+        }
+    } else {
+        accel_doc_diff_head(buf.doc_id, buf.file_path, force_reload_head)
+    }
     let diff_res? = diff_opt else {
         buf.clear_owner_decors(OWNER_GITSIGNS)
         state.hunks_by_buf.insert(buf.id, List())
@@ -674,38 +745,78 @@ fn cmd_stage_hunk(kernel: SystemKernel) -> #InteractiveEffects !String Any {
     }
     let base_lines = head_opt.as(List)
     let cwd = effective_git_cwd(world, buf.file_path)
-    let st = accel_git_status(cwd)
-    if not st.is_repo {
-        status_emit("Not inside a git repository")#
-        return ()
-    }
-    let full = path.normalize(buf.file_path)
-    let prefix = st.root ++ "/"
-    if not full.starts_with(prefix) {
-        status_emit("File is outside git repository root")#
-        return ()
-    }
-    let rel = full.drop(prefix.char_len())
-    let body_lines = format_hunk_unified_lines(base_lines, buf, hunk)
-    let patch = "diff --git a/" ++ rel ++ " b/" ++ rel ++ "\n"
-        ++ "--- a/" ++ rel ++ "\n"
-        ++ "+++ b/" ++ rel ++ "\n"
-        ++ body_lines.join("\n") ++ "\n"
-
-    let apply_res = process.run(
-        "git",
-        args = ["apply", "--cached", "--unidiff-zero", "-"],
-        stdin = patch,
-        cwd = st.root,
-    )
+    var rel = ""
+    var full = ""
     var staged_ok = false
-    apply_res match {
-        out! => {
-            if out.is_success() {
-                staged_ok = true
+    if is_ssh_uri(buf.file_path) {
+        let rst = remote_git_status(cwd) ! {
+            e => {
+                status_emit("Remote git status failed: " ++ e)#
+                return ()
             }
-        },
-        error _ => (),
+        }
+        if not rst.is_repo {
+            status_emit("Not inside a remote git repository")#
+            return ()
+        }
+        full = normalize_ssh_uri(buf.file_path)
+        let root_u = normalize_ssh_uri(rst.root)
+        let pfx = if root_u.ends_with("/") { root_u } else { root_u ++ "/" }
+        if not full.starts_with(pfx) {
+            status_emit("File is outside remote git repository root")#
+            return ()
+        }
+        rel = full.drop(pfx.char_len())
+        let body_lines = format_hunk_unified_lines(base_lines, buf, hunk)
+        let patch = "diff --git a/" ++ rel ++ " b/" ++ rel ++ "\n"
+            ++ "--- a/" ++ rel ++ "\n"
+            ++ "+++ b/" ++ rel ++ "\n"
+            ++ body_lines.join("\n") ++ "\n"
+        let pt = parse_ssh_uri(root_u)!
+        let sh_cmd = "git apply --cached --unidiff-zero - <<'__LAVA_HUNK_EOF__'\n"
+            ++ patch
+            ++ "__LAVA_HUNK_EOF__"
+        let ex_res = remote_exec(root_u, sh_cmd, cwd = pt.remote_path)
+        ex_res match {
+            tup! => {
+                let (code, _, _) = tup
+                staged_ok = code == 0
+            },
+            error _ => (),
+        }
+    } else {
+        let st = accel_git_status(cwd)
+        if not st.is_repo {
+            status_emit("Not inside a git repository")#
+            return ()
+        }
+        full = path.normalize(buf.file_path)
+        let prefix = st.root ++ "/"
+        if not full.starts_with(prefix) {
+            status_emit("File is outside git repository root")#
+            return ()
+        }
+        rel = full.drop(prefix.char_len())
+        let body_lines = format_hunk_unified_lines(base_lines, buf, hunk)
+        let patch = "diff --git a/" ++ rel ++ " b/" ++ rel ++ "\n"
+            ++ "--- a/" ++ rel ++ "\n"
+            ++ "+++ b/" ++ rel ++ "\n"
+            ++ body_lines.join("\n") ++ "\n"
+
+        let apply_res = process.run(
+            "git",
+            args = ["apply", "--cached", "--unidiff-zero", "-"],
+            stdin = patch,
+            cwd = st.root,
+        )
+        apply_res match {
+            out! => {
+                if out.is_success() {
+                    staged_ok = true
+                }
+            },
+            error _ => (),
+        }
     }
 
     if not staged_ok {

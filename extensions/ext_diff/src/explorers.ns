@@ -6,6 +6,10 @@ use std.fs
 use std.path
 use std.process
 use @lava_accel.{DiffHunk, GitFileEntry, accel_diff_lines, accel_git_head_lines, accel_git_status}
+use @lava_remote.{
+    RemoteGitFileEntry, is_ssh_uri, join_ssh_uri, normalize_ssh_uri, parent_ssh_uri,
+    parse_ssh_uri, remote_exec, remote_git_head_lines, remote_git_status, remote_read_lines
+}
 use @ext_document.{Buffer, EditorWorld}
 use align.{DIFF_HEADER_ROWS, OWNER_DIFF, max_i64, rgba_hex}
 use pipeline.split_stdio_output_lines
@@ -31,7 +35,10 @@ pub struct DiffDirEntry {
 }
 
 pub fn effective_git_cwd(world: EditorWorld, file_path: String) -> String {
-    if file_path != "" and (not file_path.starts_with("ssh://")) {
+    if file_path != "" {
+        if is_ssh_uri(file_path) {
+            return parent_ssh_uri(file_path)
+        }
         let p_opt = path.parent(file_path)
         if p_opt != null {
             let pdir = p_opt.as(String)
@@ -56,6 +63,20 @@ pub fn split_file_text_lines(raw: String) -> List {
 }
 
 fn verify_git_rev(repo_root: String, rev: String) -> bool {
+    if is_ssh_uri(repo_root) {
+        let pt! = parse_ssh_uri(repo_root) else { return false }
+        let safe_rev = "'" ++ rev.replace("'", "'\\''") ++ "'"
+        let res = remote_exec(repo_root, "git rev-parse --verify " ++ safe_rev, cwd = pt.remote_path)
+        res match {
+            tup! => {
+                let (code, _, _) = tup
+                return code == 0
+            },
+            error _ => {
+                return false
+            },
+        }
+    }
     let out! = process.run("git", args = ["rev-parse", "--verify", rev], cwd = repo_root) else {
         return false
     }
@@ -69,6 +90,32 @@ pub fn fetch_git_revision_lines(
 ) -> !String (String, String, List) {
     if file_path == "" {
         return error "Buffer has no file path to compare against Git"
+    }
+    if is_ssh_uri(file_path) or is_ssh_uri(cwd) {
+        let full_u = if is_ssh_uri(file_path) {
+            normalize_ssh_uri(file_path)
+        } else {
+            join_ssh_uri(cwd, file_path)
+        }
+        let rst = remote_git_status(if is_ssh_uri(cwd) { cwd } else { parent_ssh_uri(full_u) })!
+        if not rst.is_repo {
+            return error ("Not inside a remote Git repository: " ++ full_u)
+        }
+        let root_u = normalize_ssh_uri(rst.root)
+        let root_pfx = if root_u.ends_with("/") { root_u } else { root_u ++ "/" }
+        if not full_u.starts_with(root_pfx) {
+            return error ("File is outside remote Git repository root (" ++ root_u ++ "): " ++ full_u)
+        }
+        let rel = full_u.drop(root_pfx.char_len())
+        let target_rev = if rev.trim() == "" { "HEAD" } else { rev.trim() }
+        let head_opt = remote_git_head_lines(root_u, full_u, rev = target_rev)!
+        if head_opt != null {
+            return (root_u, rel, head_opt.as(List))
+        }
+        if not verify_git_rev(root_u, target_rev) {
+            return error ("Unknown remote Git revision: " ++ target_rev)
+        }
+        return (root_u, rel, List())
     }
     let st = accel_git_status(cwd)
     if not st.is_repo {
@@ -124,6 +171,18 @@ fn count_lines_added_deleted(old_lines: List, new_lines: List) -> (i64, i64) {
 }
 
 fn read_disk_lines_or_empty(full_path: String) -> List {
+    if is_ssh_uri(full_path) {
+        let rl_res = remote_read_lines(full_path)
+        rl_res match {
+            pair! => {
+                let (flines, _) = pair
+                return flines
+            },
+            error _ => {
+                return List()
+            },
+        }
+    }
     if not fs.is_file(full_path) {
         return List()
     }
@@ -138,6 +197,76 @@ pub fn scan_git_diffview_entries(
     cwd: String,
     rev: String,
 ) -> !String (String, String, List) {
+    if is_ssh_uri(cwd) {
+        let rst = remote_git_status(cwd)!
+        if not rst.is_repo {
+            return error ("Not inside a remote Git repository: " ++ cwd)
+        }
+        let target_rev = if rev.trim() == "" { "HEAD" } else { rev.trim() }
+        let has_rev = verify_git_rev(rst.root, target_rev)
+        if rev.trim() != "" and rev.trim() != "HEAD" and (not has_rev) {
+            return error ("Unknown Git revision: " ++ target_rev)
+        }
+        let status_by_rel = HashMap.new()
+        let rel_list = List()
+        let seen = Set.new()
+        for i in 0..rst.entries.len() {
+            let ge = rst.entries.get(i.as(usize)).as(RemoteGitFileEntry)
+            let rel = ge.rel_path
+            if rel != "" and (not seen.contains(rel)) {
+                seen.insert(rel)
+                rel_list.push(rel)
+                let badge = if ge.index_status == "?" {
+                    "?"
+                } else if ge.index_status == "A" {
+                    "A"
+                } else if ge.index_status == "D" or ge.worktree_status == "D" {
+                    "D"
+                } else {
+                    "M"
+                }
+                status_by_rel.insert(rel, badge)
+            }
+        }
+        rel_list.sort()
+        let entries = List()
+        for i in 0..rel_list.len() {
+            let rel = rel_list.get(i.as(usize)).as(String)
+            let badge = status_by_rel.get(rel).as(String)
+            let full = join_ssh_uri(rst.root, rel)
+            let open_opt = world.find_buffer_by_path(full)
+            let cur_lines = if open_opt != null {
+                let ob = open_opt.as(Buffer)
+                let cap = if ob.line_count() < 50000 { ob.line_count() } else { 50000 }
+                ob.slice_lines(0, cap)
+            } else {
+                read_disk_lines_or_empty(full)
+            }
+            let base_lines = if has_rev and badge != "?" {
+                let rev_tup = fetch_git_revision_lines(rst.root, full, target_rev) ! {
+                    _ => ("", "", List()),
+                }
+                let (_, _, bl) = rev_tup
+                bl
+            } else {
+                List()
+            }
+            let (add_n, del_n) = count_lines_added_deleted(base_lines, cur_lines)
+            entries.push(DiffViewEntry {
+                status: badge,
+                rel_path: rel,
+                full_path: full,
+                added: add_n,
+                deleted: del_n,
+            })
+        }
+        let label_rev = if rst.branch != "" and target_rev == "HEAD" {
+            rst.branch ++ " (HEAD)"
+        } else {
+            target_rev
+        }
+        return (rst.root, label_rev, entries)
+    }
     let st = accel_git_status(cwd)
     if not st.is_repo {
         return error ("Not inside a Git repository: " ++ cwd)

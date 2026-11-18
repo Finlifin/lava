@@ -10,6 +10,11 @@ use std.path
 use @lava_core.{
     ExtId, InteractiveEffects, SystemKernel, log_event, status_emit
 }
+use @lava_remote.{
+    RemoteDirItem, is_ssh_uri, join_ssh_uri, normalize_ssh_uri, parent_ssh_uri, parse_ssh_uri,
+    remote_copy, remote_mkdir, remote_readdir, remote_remove, remote_rename, remote_stat,
+    remote_write_lines, ssh_uri_basename
+}
 use @ext_document.{
     Buffer, BufferId, BufferKind, EditorWorld, Pos, ext_document_id, require_editor_world
 }
@@ -141,7 +146,66 @@ fn parse_oil_id_prefix(trimmed_line: String) -> ?(i64, String) {
     (num_opt.as(i64), rest)
 }
 
+fn oil_norm_path(raw: String) -> String {
+    if is_ssh_uri(raw) {
+        let pt_res = parse_ssh_uri(raw)
+        pt_res match {
+            pt! => {
+                if pt.remote_path == "/" {
+                    return pt.prefix ++ "/"
+                }
+                return pt.prefix ++ pt.remote_path
+            },
+            error _ => {
+                return normalize_ssh_uri(raw)
+            },
+        }
+    }
+    path.normalize(raw)
+}
+
+fn oil_exists(p: String) -> bool {
+    if is_ssh_uri(p) {
+        let st = remote_stat(p) ! { _ => return false }
+        return st.exists
+    }
+    fs.exists(p)
+}
+
+fn oil_is_dir(p: String) -> bool {
+    if is_ssh_uri(p) {
+        let st = remote_stat(p) ! { _ => return false }
+        return st.exists and st.is_dir
+    }
+    fs.is_dir(p)
+}
+
+fn oil_parent(p: String) -> ?String {
+    if is_ssh_uri(p) {
+        let pt = parse_ssh_uri(p) ! { _ => return null }
+        if pt.remote_path == "/" {
+            return null
+        }
+        return oil_norm_path(parent_ssh_uri(p))
+    }
+    path.parent(p)
+}
+
+fn oil_basename(p: String) -> String {
+    if is_ssh_uri(p) {
+        return ssh_uri_basename(p)
+    }
+    let fn_opt = path.file_name(p)
+    if fn_opt != null { fn_opt.as(String) } else { "" }
+}
+
 fn resolve_oil_child_path(dir_path: String, rel_or_abs: String) -> String {
+    if is_ssh_uri(rel_or_abs) {
+        return oil_norm_path(rel_or_abs)
+    }
+    if is_ssh_uri(dir_path) {
+        return oil_norm_path(join_ssh_uri(dir_path, rel_or_abs))
+    }
     if path.is_absolute(rel_or_abs) {
         path.normalize(rel_or_abs)
     } else {
@@ -155,49 +219,13 @@ fn populate_oil_buffer(
     dir_path: String,
     .focus_name: String = "",
 ) -> !String Buffer {
-    let norm_dir = path.normalize(dir_path)
-    if not fs.exists(norm_dir) {
+    let norm_dir = oil_norm_path(dir_path)
+    if not oil_exists(norm_dir) {
         return error ("Oil: directory does not exist: " ++ norm_dir)
     }
-    if not fs.is_dir(norm_dir) {
+    if not oil_is_dir(norm_dir) {
         return error ("Oil: not a directory: " ++ norm_dir)
     }
-
-    let raw_entries! = fs.read_dir_entries(norm_dir) else {
-        return error ("Oil: failed reading directory: " ++ norm_dir)
-    }
-
-    let dirs = List()
-    let files = List()
-    for i in 0..raw_entries.len() {
-        let e = raw_entries.get(i.as(usize)).as(DirEntry)
-        if e.name == "" or e.name == "." or e.name == ".." {
-            continue
-        }
-        if (not state.show_hidden) and e.name.starts_with(".") {
-            continue
-        }
-        if e.is_dir() {
-            dirs.push(e)
-        } else {
-            files.push(e)
-        }
-    }
-
-    dirs.sort_by(|a: Any, b: Any| {
-        let na = a.as(DirEntry).name
-        let nb = b.as(DirEntry).name
-        let la = na.to_lower()
-        let lb = nb.to_lower()
-        if la != lb { la.cmp(lb) } else { na.cmp(nb) }
-    })
-    files.sort_by(|a: Any, b: Any| {
-        let na = a.as(DirEntry).name
-        let nb = b.as(DirEntry).name
-        let la = na.to_lower()
-        let lb = nb.to_lower()
-        if la != lb { la.cmp(lb) } else { na.cmp(nb) }
-    })
 
     let lines = List()
     lines.push("-- oil://" ++ norm_dir ++ "  (<Return>: open, -: parent, :w: apply)")
@@ -207,42 +235,106 @@ fn populate_oil_buffer(
     var next_id: i64 = 1
     var focus_row: i64 = -1
 
-    for i in 0..dirs.len() {
-        let d = dirs.get(i.as(usize)).as(DirEntry)
-        let id = next_id
-        next_id += 1
-        let oe = OilEntry {
-            id: id,
-            name: d.name,
-            full_path: path.normalize(d.path),
-            is_dir: true,
-            is_symlink: d.is_symlink(),
+    if is_ssh_uri(norm_dir) {
+        let ritems = remote_readdir(norm_dir, show_hidden = state.show_hidden)!
+        for i in 0..ritems.len() {
+            let ri = ritems.get(i.as(usize)).as(RemoteDirItem)
+            if ri.name == "" or ri.name == "." or ri.name == ".." {
+                continue
+            }
+            if (not state.show_hidden) and ri.name.starts_with(".") {
+                continue
+            }
+            let id = next_id
+            next_id += 1
+            let oe = OilEntry {
+                id: id,
+                name: ri.name,
+                full_path: oil_norm_path(ri.full_uri),
+                is_dir: ri.is_dir,
+                is_symlink: false,
+            }
+            entries_by_id.insert(id, oe)
+            entry_order.push(id)
+            if focus_name != "" and (ri.name == focus_name or (ri.name ++ "/") == focus_name) {
+                focus_row = lines.len()
+            }
+            lines.push(format_oil_entry_line(oe))
         }
-        entries_by_id.insert(id, oe)
-        entry_order.push(id)
-        if focus_name != "" and (d.name == focus_name or (d.name ++ "/") == focus_name) {
-            focus_row = lines.len()
+    } else {
+        let raw_entries! = fs.read_dir_entries(norm_dir) else {
+            return error ("Oil: failed reading directory: " ++ norm_dir)
         }
-        lines.push(format_oil_entry_line(oe))
-    }
 
-    for i in 0..files.len() {
-        let f = files.get(i.as(usize)).as(DirEntry)
-        let id = next_id
-        next_id += 1
-        let oe = OilEntry {
-            id: id,
-            name: f.name,
-            full_path: path.normalize(f.path),
-            is_dir: false,
-            is_symlink: f.is_symlink(),
+        let dirs = List()
+        let files = List()
+        for i in 0..raw_entries.len() {
+            let e = raw_entries.get(i.as(usize)).as(DirEntry)
+            if e.name == "" or e.name == "." or e.name == ".." {
+                continue
+            }
+            if (not state.show_hidden) and e.name.starts_with(".") {
+                continue
+            }
+            if e.is_dir() {
+                dirs.push(e)
+            } else {
+                files.push(e)
+            }
         }
-        entries_by_id.insert(id, oe)
-        entry_order.push(id)
-        if focus_name != "" and f.name == focus_name {
-            focus_row = lines.len()
+
+        dirs.sort_by(|a: Any, b: Any| {
+            let na = a.as(DirEntry).name
+            let nb = b.as(DirEntry).name
+            let la = na.to_lower()
+            let lb = nb.to_lower()
+            if la != lb { la.cmp(lb) } else { na.cmp(nb) }
+        })
+        files.sort_by(|a: Any, b: Any| {
+            let na = a.as(DirEntry).name
+            let nb = b.as(DirEntry).name
+            let la = na.to_lower()
+            let lb = nb.to_lower()
+            if la != lb { la.cmp(lb) } else { na.cmp(nb) }
+        })
+
+        for i in 0..dirs.len() {
+            let d = dirs.get(i.as(usize)).as(DirEntry)
+            let id = next_id
+            next_id += 1
+            let oe = OilEntry {
+                id: id,
+                name: d.name,
+                full_path: path.normalize(d.path),
+                is_dir: true,
+                is_symlink: d.is_symlink(),
+            }
+            entries_by_id.insert(id, oe)
+            entry_order.push(id)
+            if focus_name != "" and (d.name == focus_name or (d.name ++ "/") == focus_name) {
+                focus_row = lines.len()
+            }
+            lines.push(format_oil_entry_line(oe))
         }
-        lines.push(format_oil_entry_line(oe))
+
+        for i in 0..files.len() {
+            let f = files.get(i.as(usize)).as(DirEntry)
+            let id = next_id
+            next_id += 1
+            let oe = OilEntry {
+                id: id,
+                name: f.name,
+                full_path: path.normalize(f.path),
+                is_dir: false,
+                is_symlink: f.is_symlink(),
+            }
+            entries_by_id.insert(id, oe)
+            entry_order.push(id)
+            if focus_name != "" and f.name == focus_name {
+                focus_row = lines.len()
+            }
+            lines.push(format_oil_entry_line(oe))
+        }
     }
 
     let has_entries = not entry_order.is_empty()
@@ -321,6 +413,16 @@ pub fn open_oil_directory(
 }
 
 fn ensure_parent_dirs(full_path: String) -> !String Unit {
+    if is_ssh_uri(full_path) {
+        let p_opt = oil_parent(full_path)
+        if p_opt != null {
+            let pdir = p_opt.as(String)
+            if pdir != "" and (not oil_exists(pdir)) {
+                remote_mkdir(pdir)!
+            }
+        }
+        return ()
+    }
     let p_opt = path.parent(full_path)
     if p_opt != null {
         let pdir = p_opt.as(String)
@@ -413,20 +515,28 @@ fn apply_oil_buffer_changes(kernel: SystemKernel, buf: Buffer) -> #[log_event, s
         let (orig, dest_rel) = copies.get(i.as(usize)).as((OilEntry, String))
         let dest_full = resolve_oil_child_path(snap.dir_path, dest_rel)
         ensure_parent_dirs(dest_full)!
-        let cp_res = fs.copy(orig.full_path, dest_full)
-        cp_res match {
-            _! => { created_count += 1 },
-            error err => return error ("Oil copy failed (" ++ orig.name ++ " -> " ++ dest_rel ++ "): " ++ err.to_string()),
+        if is_ssh_uri(dest_full) {
+            remote_copy(orig.full_path, dest_full)!
+            created_count += 1
+        } else {
+            let cp_res = fs.copy(orig.full_path, dest_full)
+            cp_res match {
+                _! => { created_count += 1 },
+                error err => return error ("Oil copy failed (" ++ orig.name ++ " -> " ++ dest_rel ++ "): " ++ err.to_string()),
+            }
         }
     }
 
     -- 2. Execute deletions for entries whose `/NNN` line was deleted
     for i in 0..deletions.len() {
         let ent = deletions.get(i.as(usize)).as(OilEntry)
-        if not fs.exists(ent.full_path) {
+        if not oil_exists(ent.full_path) {
             continue
         }
-        if ent.is_dir {
+        if is_ssh_uri(ent.full_path) {
+            remote_remove(ent.full_path, recursive = ent.is_dir)!
+            deleted_count += 1
+        } else if ent.is_dir {
             let rm_res = fs.remove_dir(ent.full_path, recursive = true)
             rm_res match {
                 _! => { deleted_count += 1 },
@@ -455,15 +565,19 @@ fn apply_oil_buffer_changes(kernel: SystemKernel, buf: Buffer) -> #[log_event, s
         if dest_full == orig.full_path {
             continue
         }
-        if rename_sources.contains(dest_full) and fs.exists(dest_full) {
-            let tmp_path = path.join(
+        if rename_sources.contains(dest_full) and oil_exists(dest_full) {
+            let tmp_path = resolve_oil_child_path(
                 snap.dir_path,
                 ".oil_stage_" ++ i.to_string() ++ "_" ++ orig.id.to_string(),
             )
-            let st_res = fs.rename(orig.full_path, tmp_path)
-            st_res match {
-                _! => (),
-                error err => return error ("Oil stage rename failed: " ++ err.to_string()),
+            if is_ssh_uri(orig.full_path) {
+                remote_rename(orig.full_path, tmp_path)!
+            } else {
+                let st_res = fs.rename(orig.full_path, tmp_path)
+                st_res match {
+                    _! => (),
+                    error err => return error ("Oil stage rename failed: " ++ err.to_string()),
+                }
             }
             staged_renames.push((orig, tmp_path, dest_full))
         } else {
@@ -474,21 +588,35 @@ fn apply_oil_buffer_changes(kernel: SystemKernel, buf: Buffer) -> #[log_event, s
     for i in 0..staged_renames.len() {
         let (orig, cur_src, dest_full) = staged_renames.get(i.as(usize)).as((OilEntry, String, String))
         ensure_parent_dirs(dest_full)!
-        let rn_res = fs.rename(cur_src, dest_full)
-        rn_res match {
-            _! => {
-                renamed_count += 1
-                let open_opt = world.find_buffer_by_path(orig.full_path)
-                if open_opt != null {
-                    let ob = open_opt.as(Buffer)
-                    ob.file_path = dest_full
-                    let bn_opt = path.file_name(dest_full)
-                    if bn_opt != null {
-                        ob.name = bn_opt.as(String)
-                    }
+        if is_ssh_uri(dest_full) {
+            remote_rename(cur_src, dest_full)!
+            renamed_count += 1
+            let open_opt = world.find_buffer_by_path(orig.full_path)
+            if open_opt != null {
+                let ob = open_opt.as(Buffer)
+                ob.file_path = dest_full
+                let bname = oil_basename(dest_full)
+                if bname != "" {
+                    ob.name = bname
                 }
-            },
-            error err => return error ("Oil rename failed (" ++ orig.name ++ " -> " ++ dest_full ++ "): " ++ err.to_string()),
+            }
+        } else {
+            let rn_res = fs.rename(cur_src, dest_full)
+            rn_res match {
+                _! => {
+                    renamed_count += 1
+                    let open_opt = world.find_buffer_by_path(orig.full_path)
+                    if open_opt != null {
+                        let ob = open_opt.as(Buffer)
+                        ob.file_path = dest_full
+                        let bn_opt = path.file_name(dest_full)
+                        if bn_opt != null {
+                            ob.name = bn_opt.as(String)
+                        }
+                    }
+                },
+                error err => return error ("Oil rename failed (" ++ orig.name ++ " -> " ++ dest_full ++ "): " ++ err.to_string()),
+            }
         }
     }
 
@@ -502,18 +630,28 @@ fn apply_oil_buffer_changes(kernel: SystemKernel, buf: Buffer) -> #[log_event, s
         }
         let target_full = resolve_oil_child_path(snap.dir_path, clean_spec)
         if is_dir_spec {
-            let mk_res = fs.create_dir(target_full, parents = true)
-            mk_res match {
-                _! => { created_count += 1 },
-                error err => return error ("Oil create_dir failed (" ++ target_full ++ "): " ++ err.to_string()),
+            if is_ssh_uri(target_full) {
+                remote_mkdir(target_full)!
+                created_count += 1
+            } else {
+                let mk_res = fs.create_dir(target_full, parents = true)
+                mk_res match {
+                    _! => { created_count += 1 },
+                    error err => return error ("Oil create_dir failed (" ++ target_full ++ "): " ++ err.to_string()),
+                }
             }
         } else {
             ensure_parent_dirs(target_full)!
-            if not fs.exists(target_full) {
-                let wr_res = fs.write_string(target_full, "")
-                wr_res match {
-                    _! => { created_count += 1 },
-                    error err => return error ("Oil write_string failed (" ++ target_full ++ "): " ++ err.to_string()),
+            if not oil_exists(target_full) {
+                if is_ssh_uri(target_full) {
+                    let _ = remote_write_lines(target_full, [""], false)!
+                    created_count += 1
+                } else {
+                    let wr_res = fs.write_string(target_full, "")
+                    wr_res match {
+                        _! => { created_count += 1 },
+                        error err => return error ("Oil write_string failed (" ++ target_full ++ "): " ++ err.to_string()),
+                    }
                 }
             }
         }
@@ -543,22 +681,20 @@ fn cmd_oil_open_parent(kern: SystemKernel, _args: List) -> #InteractiveEffects !
             status_emit("Oil: buffer has unsaved filesystem edits (:w to apply or u to undo)")#
             return ()
         }
-        let parent_opt = path.parent(snap.dir_path)
+        let parent_opt = oil_parent(snap.dir_path)
         if parent_opt == null or parent_opt.as(String) == snap.dir_path {
             status_emit("Oil: already at filesystem root")#
             return ()
         }
-        let base_opt = path.file_name(snap.dir_path)
-        let focus = if base_opt != null { base_opt.as(String) } else { "" }
+        let focus = oil_basename(snap.dir_path)
         let _ = open_oil_directory(kern, parent_opt.as(String), focus_name = focus)#!
         return ()
     }
 
     if buf.file_path != "" {
-        let parent_opt = path.parent(buf.file_path)
+        let parent_opt = oil_parent(buf.file_path)
         let target_dir = if parent_opt != null { parent_opt.as(String) } else { world.cwd }
-        let base_opt = path.file_name(buf.file_path)
-        let focus = if base_opt != null { base_opt.as(String) } else { "" }
+        let focus = oil_basename(buf.file_path)
         let _ = open_oil_directory(kern, target_dir, focus_name = focus)#!
         return ()
     }
@@ -603,7 +739,7 @@ fn cmd_oil_select_entry(kern: SystemKernel, _args: List) -> #InteractiveEffects 
             return ()
         }
         target_path = resolve_oil_child_path(snap.dir_path, spec)
-        target_is_dir = fs.is_dir(target_path)
+        target_is_dir = oil_is_dir(target_path)
     }
 
     if target_is_dir {
@@ -643,12 +779,11 @@ fn cmd_oil_entry(kern: SystemKernel, args: List) -> #InteractiveEffects !String 
     if raw == "" {
         return cmd_oil_open_parent(kern, List())#
     }
-    let resolved = world.resolve_path(raw)
-    if fs.exists(resolved) and (not fs.is_dir(resolved)) {
-        let p_opt = path.parent(resolved)
+    let resolved = oil_norm_path(world.resolve_path(raw))
+    if oil_exists(resolved) and (not oil_is_dir(resolved)) {
+        let p_opt = oil_parent(resolved)
         let dir_p = if p_opt != null { p_opt.as(String) } else { world.cwd }
-        let fn_opt = path.file_name(resolved)
-        let focus = if fn_opt != null { fn_opt.as(String) } else { "" }
+        let focus = oil_basename(resolved)
         let b = open_oil_directory(kern, dir_p, focus_name = focus)#!
         return b.id
     }

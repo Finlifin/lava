@@ -89,6 +89,73 @@ pub struct RemoteTunnelInfo {
     pub alive: bool,
 }
 
+pub const HTTP_TRANSFER_THRESHOLD_BYTES: i64 = 524288
+
+pub struct RemoteTransferProgress {
+    pub active: bool,
+    pub title: String,
+    pub detail: String,
+    pub transport: String,
+    pub bytes_done: i64,
+    pub bytes_total: i64,
+    pub lines_loaded: i64,
+}
+
+impl RemoteTransferProgress {
+    pub fn idle() -> RemoteTransferProgress {
+        RemoteTransferProgress {
+            active: false,
+            title: "",
+            detail: "",
+            transport: "",
+            bytes_done: 0,
+            bytes_total: 0,
+            lines_loaded: 0,
+        }
+    }
+}
+
+pub struct RemoteOpenDocResult {
+    pub exists: bool,
+    pub is_dir: bool,
+    pub readonly: bool,
+    pub doc_id: i64,
+    pub line_count: i64,
+    pub crlf: bool,
+    pub byte_len: i64,
+    pub transport: String,
+}
+
+pub struct RemotePreviewData {
+    pub lines: List,
+    pub is_binary: bool,
+    pub truncated: bool,
+    pub total_size: i64,
+}
+
+pub struct RemoteGitFileEntry {
+    pub index_status: String,
+    pub worktree_status: String,
+    pub rel_path: String,
+}
+
+pub struct RemoteGitStatus {
+    pub is_repo: bool,
+    pub root: String,
+    pub branch: String,
+    pub staged_count: i64,
+    pub modified_count: i64,
+    pub untracked_count: i64,
+    pub entries: List,
+}
+
+pub struct RemoteGitBlame {
+    pub commit_short: String,
+    pub author: String,
+    pub date_ymd: String,
+    pub summary: String,
+}
+
 -- ============================================================================
 -- 1. Pure-Nessa `ssh://` & Emacs TRAMP `/ssh:` URI Parser & Normalizer
 -- ============================================================================
@@ -282,6 +349,12 @@ var g_mock_mounts: ?HashMap = null
 var g_mock_connected: ?HashMap = null
 var g_mock_tunnels: ?List = null
 var g_next_mock_tunnel: i64 = 1
+var g_mock_progress: ?RemoteTransferProgress = null
+var g_ssh_config_override: String = ""
+
+pub fn remote_set_ssh_config_path(cfg_path: String) {
+    g_ssh_config_override = cfg_path.trim()
+}
 
 fn ensure_mock_maps() -> (HashMap, HashMap) {
     if g_mock_mounts == null {
@@ -362,7 +435,131 @@ fn decode_conn_info(f: List) -> RemoteConnectionInfo {
     }
 }
 
+private fn parse_ssh_config_text_into(
+    cfg_path: String,
+    ssh_dir: String,
+    depth: i64,
+    out: List,
+) {
+    if depth > 4 or (not fs.exists(cfg_path)) or fs.is_dir(cfg_path) {
+        return
+    }
+    let content = fs.read_to_string(cfg_path) ! { _ => "" }
+    let lines = content.split("\n")
+    var aliases = List()
+    var hostname = ""
+    var user = ""
+    var port: i64 = 0
+    var identity_file = ""
+    var proxy_jump = ""
+
+    let flush_block = |als: List, hn: String, u: String, p: i64, idf: String, pj: String| {
+        for ai in 0..als.len() {
+            let a = als.get(ai.as(usize)).as(String).trim()
+            if a == "" or a.contains("*") or a.contains("?") or a.starts_with("!") {
+                continue
+            }
+            var dup = false
+            for oi in 0..out.len() {
+                if out.get(oi.as(usize)).as(SshHostConfigEntry).alias_name == a {
+                    dup = true
+                    break
+                }
+            }
+            if not dup {
+                out.push(SshHostConfigEntry {
+                    alias_name: a,
+                    hostname: if hn == "" { a } else { hn },
+                    user: u,
+                    port: p,
+                    identity_file: idf,
+                    proxy_jump: pj,
+                })
+            }
+        }
+    }
+
+    for i in 0..lines.len() {
+        let raw_ln = lines.get(i.as(usize)).as(String)
+        let hash_idx = raw_ln.find_indices("#")
+        let clean_ln = if hash_idx.is_empty() {
+            raw_ln.trim()
+        } else {
+            raw_ln.slice(0, hash_idx.get(0).as(i64)).trim()
+        }
+        if clean_ln == "" {
+            continue
+        }
+        let norm_ws = clean_ln.replace("\t", " ").replace("=", " ")
+        let sp_opt = norm_ws.split_once(" ")
+        if sp_opt == null {
+            continue
+        }
+        let (k_raw, v_raw) = sp_opt.as((String, String))
+        let k = k_raw.trim().to_lower()
+        let v = v_raw.trim().trim_matches("\"")
+        if k == "include" {
+            flush_block(aliases, hostname, user, port, identity_file, proxy_jump)
+            aliases = List()
+            hostname = ""
+            user = ""
+            port = 0
+            identity_file = ""
+            proxy_jump = ""
+            let inc_p = if path.is_absolute(v) { v } else { path.join(ssh_dir, v) }
+            if inc_p.contains("*") {
+                let par_opt = path.parent(inc_p)
+                if par_opt != null and fs.exists(par_opt.as(String)) and fs.is_dir(par_opt.as(String)) {
+                    let sub_names = fs.read_dir(par_opt.as(String)) ! { _ => List() }
+                    sub_names.sort()
+                    for si in 0..sub_names.len() {
+                        let sn = sub_names.get(si.as(usize)).as(String)
+                        if not sn.starts_with(".") {
+                            parse_ssh_config_text_into(path.join(par_opt.as(String), sn), ssh_dir, depth + 1, out)
+                        }
+                    }
+                }
+            } else {
+                parse_ssh_config_text_into(inc_p, ssh_dir, depth + 1, out)
+            }
+        } else if k == "host" {
+            flush_block(aliases, hostname, user, port, identity_file, proxy_jump)
+            aliases = v.split(" ")
+            hostname = ""
+            user = ""
+            port = 0
+            identity_file = ""
+            proxy_jump = ""
+        } else if k == "match" {
+            flush_block(aliases, hostname, user, port, identity_file, proxy_jump)
+            aliases = List()
+        } else if k == "hostname" {
+            hostname = v
+        } else if k == "user" {
+            user = v
+        } else if k == "port" {
+            let pp? = v.try_parse(i64) else { continue }
+            port = pp
+        } else if k == "identityfile" {
+            identity_file = v
+        } else if k == "proxyjump" {
+            proxy_jump = v
+        }
+    }
+    flush_block(aliases, hostname, user, port, identity_file, proxy_jump)
+}
+
 pub fn remote_discover_ssh_hosts() -> List {
+    if g_ssh_config_override != "" {
+        if not fs.exists(g_ssh_config_override) {
+            return List()
+        }
+        let ssh_dir_opt = path.parent(g_ssh_config_override)
+        let ssh_dir = if ssh_dir_opt != null { ssh_dir_opt.as(String) } else { "." }
+        let out = List()
+        parse_ssh_config_text_into(g_ssh_config_override, ssh_dir, 0, out)
+        return out
+    }
     if remote_host_available() {
         let raw_res = runtime.host_call("remote_ssh_hosts", List())
         raw_res match {
@@ -385,33 +582,31 @@ pub fn remote_discover_ssh_hosts() -> List {
             error _ => (),
         }
     }
-    let home = env.get_or("HOME", "")
-    if home == "" {
-        return List()
+    let custom_cfg = env.get_or("LAVA_SSH_CONFIG", "").trim()
+    let cfg_path = if custom_cfg != "" {
+        custom_cfg
+    } else {
+        let home = env.get_or("HOME", env.get_or("USERPROFILE", ""))
+        if home == "" {
+            return List()
+        }
+        path.join(path.join(home, ".ssh"), "config")
     }
-    let cfg_path = path.join(path.join(home, ".ssh"), "config")
     if not fs.exists(cfg_path) {
         return List()
     }
-    let content = fs.read_to_string(cfg_path) ! { _ => "" }
-    let lines = content.split("\n")
+    let ssh_dir_opt = path.parent(cfg_path)
+    let ssh_dir = if ssh_dir_opt != null { ssh_dir_opt.as(String) } else { "." }
     let out = List()
-    for i in 0..lines.len() {
-        let ln = lines.get(i.as(usize)).as(String).trim()
-        if ln.starts_with("Host ") or ln.starts_with("host ") {
-            let rest = ln.drop(5).trim()
-            if rest != "" and (not rest.contains("*")) and (not rest.contains("?")) {
-                let alias_tok = rest.split(" ").get(0).as(String).trim()
-                if alias_tok != "" {
-                    out.push(SshHostConfigEntry {
-                        alias_name: alias_tok,
-                        hostname: alias_tok,
-                        user: "",
-                        port: 0,
-                        identity_file: "",
-                        proxy_jump: "",
-                    })
-                }
+    parse_ssh_config_text_into(cfg_path, ssh_dir, 0, out)
+    let conf_d = path.join(ssh_dir, "config.d")
+    if fs.exists(conf_d) and fs.is_dir(conf_d) {
+        let sub_names = fs.read_dir(conf_d) ! { _ => List() }
+        sub_names.sort()
+        for si in 0..sub_names.len() {
+            let sn = sub_names.get(si.as(usize)).as(String)
+            if not sn.starts_with(".") {
+                parse_ssh_config_text_into(path.join(conf_d, sn), ssh_dir, 1, out)
             }
         }
     }
@@ -886,8 +1081,386 @@ pub fn remote_probe_tcp(host: String, port: i64, .timeout_ms: i64 = 1500) -> !St
 }
 
 pub fn remote_deploy_server(target: String, local_server_bin: String) -> !String RemoteConnectionInfo {
+    let parsed = parse_ssh_uri(target)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let mount_root = local_opt.as(String)
+        let install_dir = path.join(mount_root, ".lava-server")
+        let _ = fs.create_dir(path.join(install_dir, "server"), parents = true) ! { _ => () }
+        let marker_bin = path.join(install_dir, "lava-server")
+        let _ = fs.write_string(marker_bin, "#!/bin/sh\nexec lava-server \"$@\"\n") ! { _ => () }
+        let _ = process.shell("chmod +x " ++ marker_bin) ! { _ => () }
+        let (_, connected) = ensure_mock_maps()
+        let info = RemoteConnectionInfo {
+            authority: parsed.authority,
+            prefix: parsed.prefix,
+            mode: "lava-server",
+            alive: true,
+            hostname: parsed.host,
+            os: "linux",
+            arch: "x86_64",
+            remote_home: "/",
+            remote_cwd: "/",
+            server_version: "0.1.0-lava-server",
+            latency_us: 25,
+        }
+        connected.insert(parsed.authority, info)
+        g_mock_progress = RemoteTransferProgress {
+            active: false,
+            title: "Installed lava-server -> " ++ parsed.authority,
+            detail: "~/.lava-server/lava-server",
+            transport: "SSH-DEPLOY",
+            bytes_done: 1024,
+            bytes_total: 1024,
+            lines_loaded: 16,
+        }
+        return info
+    }
     let raw = runtime.host_call("remote_deploy_server", [target, local_server_bin])!
     decode_conn_info(raw.as(List))
+}
+
+pub fn remote_open_doc(uri: String) -> !String RemoteOpenDocResult {
+    let parsed = parse_ssh_uri(uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let _ = remote_connect(uri)!
+        let lp = local_opt.as(String)
+        if not fs.exists(lp) {
+            let r = RemoteOpenDocResult {
+                exists: false,
+                is_dir: false,
+                readonly: false,
+                doc_id: 0,
+                line_count: 0,
+                crlf: false,
+                byte_len: 0,
+                transport: "SSH",
+            }
+            return r
+        }
+        if fs.is_dir(lp) {
+            let r = RemoteOpenDocResult {
+                exists: true,
+                is_dir: true,
+                readonly: false,
+                doc_id: 0,
+                line_count: 0,
+                crlf: false,
+                byte_len: 0,
+                transport: "SSH",
+            }
+            return r
+        }
+        let st_meta: ?fs.FileMetadata = fs.metadata(lp) ! { _ => null }
+        let sz: i64 = if st_meta != null {
+            st_meta.as(fs.FileMetadata).size
+        } else {
+            let txt = fs.read_to_string(lp) ! { _ => "" }
+            txt.len()
+        }
+        let transport = if sz > HTTP_TRANSFER_THRESHOLD_BYTES { "HTTP" } else { "SSH" }
+        let open_raw = runtime.host_call("accel_doc_open_file", [lp])!
+        let open_arr = open_raw.as(List)
+        if not open_arr.get(0).as(bool) {
+            return error open_arr.get(1).as(String)
+        }
+        let doc_id = open_arr.get(1).as(i64)
+        let lcount = open_arr.get(2).as(i64)
+        let crlf = open_arr.get(3).as(bool)
+        g_mock_progress = RemoteTransferProgress {
+            active: false,
+            title: "Fetched " ++ ssh_uri_basename(parsed.canonical_uri()),
+            detail: parsed.canonical_uri(),
+            transport: transport,
+            bytes_done: sz,
+            bytes_total: sz,
+            lines_loaded: lcount,
+        }
+        let r = RemoteOpenDocResult {
+            exists: true,
+            is_dir: false,
+            readonly: false,
+            doc_id: doc_id,
+            line_count: lcount,
+            crlf: crlf,
+            byte_len: sz,
+            transport: transport,
+        }
+        return r
+    }
+    let raw = runtime.host_call("remote_open_doc", [uri])!
+    let f = raw.as(List)
+    RemoteOpenDocResult {
+        exists: f.get(0).as(bool),
+        is_dir: f.get(1).as(bool),
+        readonly: f.get(2).as(bool),
+        doc_id: f.get(3).as(i64),
+        line_count: f.get(4).as(i64),
+        crlf: f.get(5).as(bool),
+        byte_len: f.get(6).as(i64),
+        transport: f.get(7).as(String),
+    }
+}
+
+pub fn remote_save_doc(uri: String, doc_id: i64, crlf: bool) -> !String (i64, String) {
+    let parsed = parse_ssh_uri(uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let _ = remote_connect(uri)!
+        let lp = local_opt.as(String)
+        let p_opt = path.parent(lp)
+        if p_opt != null {
+            let pd = p_opt.as(String)
+            if pd != "" and (not fs.exists(pd)) {
+                let _ = fs.create_dir(pd, parents = true) ! { _ => () }
+            }
+        }
+        let save_raw = runtime.host_call("accel_doc_save_file", [doc_id, lp, crlf])!
+        let save_arr = save_raw.as(List)
+        if not save_arr.get(0).as(bool) {
+            return error save_arr.get(1).as(String)
+        }
+        let written = save_arr.get(1).as(i64)
+        let transport = if written > HTTP_TRANSFER_THRESHOLD_BYTES { "HTTP" } else { "SSH" }
+        g_mock_progress = RemoteTransferProgress {
+            active: false,
+            title: "Uploaded " ++ ssh_uri_basename(parsed.canonical_uri()),
+            detail: parsed.canonical_uri(),
+            transport: transport,
+            bytes_done: written,
+            bytes_total: written,
+            lines_loaded: 1,
+        }
+        return (written, transport)
+    }
+    let raw = runtime.host_call("remote_save_doc", [uri, doc_id, crlf])!
+    let f = raw.as(List)
+    (f.get(0).as(i64), f.get(1).as(String))
+}
+
+pub fn remote_read_preview(
+    uri: String,
+    .max_bytes: i64 = 8192,
+    .max_lines: i64 = 120,
+) -> !String RemotePreviewData {
+    let parsed = parse_ssh_uri(uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let lp = local_opt.as(String)
+        if (not fs.exists(lp)) or fs.is_dir(lp) {
+            return error ("cannot preview remote path: " ++ parsed.canonical_uri())
+        }
+        let bytes = fs.read_bytes(lp) ! {
+            _ => return error ("cannot read remote preview: " ++ parsed.canonical_uri()),
+        }
+        let total_sz = bytes.len()
+        let take_n = if total_sz > max_bytes { max_bytes } else { total_sz }
+        for bi in 0..take_n {
+            if bytes.get(bi.as(usize)).as(i64) == 0 {
+                let bpv = RemotePreviewData {
+                    lines: List(),
+                    is_binary: true,
+                    truncated: true,
+                    total_size: total_sz,
+                }
+                return bpv
+            }
+        }
+        let open_raw = runtime.host_call("accel_doc_open_file", [lp])!
+        let open_arr = open_raw.as(List)
+        if not open_arr.get(0).as(bool) {
+            return error open_arr.get(1).as(String)
+        }
+        let doc_id = open_arr.get(1).as(i64)
+        let lcount = open_arr.get(2).as(i64)
+        let cap_l = if lcount < max_lines { lcount } else { max_lines }
+        let sliced = runtime.host_call("accel_doc_slice_lines", [doc_id, 0, cap_l]) ! { _ => List() }
+        let _ = runtime.host_call("accel_doc_free", [doc_id]) ! { _ => null }
+        let tpv = RemotePreviewData {
+            lines: sliced.as(List),
+            is_binary: false,
+            truncated: lcount > max_lines or total_sz > max_bytes,
+            total_size: total_sz,
+        }
+        return tpv
+    }
+    let raw = runtime.host_call("remote_read_preview", [uri, max_bytes, max_lines])!
+    let f = raw.as(List)
+    RemotePreviewData {
+        lines: f.get(0).as(List),
+        is_binary: f.get(1).as(bool),
+        truncated: f.get(2).as(bool),
+        total_size: f.get(3).as(i64),
+    }
+}
+
+pub fn remote_transfer_progress() -> RemoteTransferProgress {
+    if remote_host_available() {
+        let raw_res = runtime.host_call("remote_transfer_progress", List())
+        raw_res match {
+            v! => {
+                let f = v.as(List)
+                let tp = RemoteTransferProgress {
+                    active: f.get(0).as(bool),
+                    title: f.get(1).as(String),
+                    detail: f.get(2).as(String),
+                    transport: f.get(3).as(String),
+                    bytes_done: f.get(4).as(i64),
+                    bytes_total: f.get(5).as(i64),
+                    lines_loaded: f.get(6).as(i64),
+                }
+                return tp
+            },
+            error _ => (),
+        }
+    }
+    if g_mock_progress != null {
+        return g_mock_progress.as(RemoteTransferProgress)
+    }
+    RemoteTransferProgress.idle()
+}
+
+pub fn remote_git_status(uri: String) -> !String RemoteGitStatus {
+    let parsed = parse_ssh_uri(uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let (mounts, _) = ensure_mock_maps()
+        let mount_root = mounts.get(parsed.authority).as(String)
+        let raw = runtime.host_call("accel_git_status", [local_opt.as(String)])!
+        let f = raw.as(List)
+        let is_repo = f.get(0).as(bool)
+        let local_git_root = f.get(1).as(String)
+        let remote_root = if is_repo and local_git_root.starts_with(mount_root) {
+            parsed.prefix ++ normalize_posix_remote_path(local_git_root.drop(mount_root.char_len()))
+        } else if is_repo {
+            parsed.prefix ++ "/"
+        } else {
+            ""
+        }
+        let raw_entries = f.get(6).as(List)
+        let entries = List()
+        for i in 0..raw_entries.len() {
+            let e = raw_entries.get(i.as(usize)).as(List)
+            entries.push(RemoteGitFileEntry {
+                index_status: e.get(0).as(String),
+                worktree_status: e.get(1).as(String),
+                rel_path: e.get(2).as(String),
+            })
+        }
+        let rgs = RemoteGitStatus {
+            is_repo: is_repo,
+            root: remote_root,
+            branch: f.get(2).as(String),
+            staged_count: f.get(3).as(i64),
+            modified_count: f.get(4).as(i64),
+            untracked_count: f.get(5).as(i64),
+            entries: entries,
+        }
+        return rgs
+    }
+    let raw = runtime.host_call("remote_git_status", [uri])!
+    let f = raw.as(List)
+    let raw_entries = f.get(6).as(List)
+    let entries = List()
+    for i in 0..raw_entries.len() {
+        let e = raw_entries.get(i.as(usize)).as(List)
+        entries.push(RemoteGitFileEntry {
+            index_status: e.get(0).as(String),
+            worktree_status: e.get(1).as(String),
+            rel_path: e.get(2).as(String),
+        })
+    }
+    RemoteGitStatus {
+        is_repo: f.get(0).as(bool),
+        root: f.get(1).as(String),
+        branch: f.get(2).as(String),
+        staged_count: f.get(3).as(i64),
+        modified_count: f.get(4).as(i64),
+        untracked_count: f.get(5).as(i64),
+        entries: entries,
+    }
+}
+
+pub fn remote_git_head_lines(
+    uri: String,
+    file_path: String,
+    .rev: String = "HEAD",
+) -> !String ?List {
+    let parsed = parse_ssh_uri(uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let fp_parsed! = parse_ssh_uri(file_path) else {
+            return null
+        }
+        let fp_local? = resolve_mock_local_path(fp_parsed) else {
+            return null
+        }
+        let dir_path = if fs.is_dir(local_opt.as(String)) {
+            local_opt.as(String)
+        } else {
+            let p_opt = path.parent(local_opt.as(String))
+            if p_opt != null { p_opt.as(String) } else { local_opt.as(String) }
+        }
+        let raw = runtime.host_call("accel_git_head_lines", [dir_path, fp_local])!
+        let f = raw.as(List)
+        if not f.get(0).as(bool) {
+            return null
+        }
+        return f.get(1).as(List)
+    }
+    let raw = runtime.host_call("remote_git_head_lines", [uri, file_path, rev])!
+    let f = raw.as(List)
+    if not f.get(0).as(bool) {
+        return null
+    }
+    f.get(1).as(List)
+}
+
+pub fn remote_git_blame_line(
+    uri: String,
+    file_path: String,
+    row: i64,
+) -> !String ?RemoteGitBlame {
+    let parsed = parse_ssh_uri(uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let fp_parsed! = parse_ssh_uri(file_path) else {
+            return null
+        }
+        let fp_local? = resolve_mock_local_path(fp_parsed) else {
+            return null
+        }
+        let dir_path = if fs.is_dir(local_opt.as(String)) {
+            local_opt.as(String)
+        } else {
+            let p_opt = path.parent(local_opt.as(String))
+            if p_opt != null { p_opt.as(String) } else { local_opt.as(String) }
+        }
+        let raw = runtime.host_call("accel_git_blame_line", [dir_path, fp_local, row])!
+        let f = raw.as(List)
+        if not f.get(0).as(bool) {
+            return null
+        }
+        let rgb = RemoteGitBlame {
+            commit_short: f.get(1).as(String),
+            author: f.get(2).as(String),
+            date_ymd: f.get(3).as(String),
+            summary: f.get(4).as(String),
+        }
+        return rgb
+    }
+    let raw = runtime.host_call("remote_git_blame_line", [uri, file_path, row])!
+    let f = raw.as(List)
+    if not f.get(0).as(bool) {
+        return null
+    }
+    RemoteGitBlame {
+        commit_short: f.get(1).as(String),
+        author: f.get(2).as(String),
+        date_ymd: f.get(3).as(String),
+        summary: f.get(4).as(String),
+    }
 }
 
 -- Returns `(transport_bin, transport_args, remote_prefix, clean_remote_root)` ready for `lsp_spawn_remote`!

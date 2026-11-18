@@ -143,6 +143,8 @@ where
 struct ActiveJobHandle {
     cancelled: AtomicBool,
     pid: Mutex<Option<u32>>,
+    #[cfg(windows)]
+    win_job: Mutex<usize>,
 }
 
 impl ActiveJobHandle {
@@ -150,17 +152,42 @@ impl ActiveJobHandle {
         Self {
             cancelled: AtomicBool::new(false),
             pid: Mutex::new(None),
+            #[cfg(windows)]
+            win_job: Mutex::new(0),
         }
     }
 
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        #[cfg(windows)]
+        {
+            let jh = *self
+                .win_job
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if jh != 0 {
+                win_job_ctrl::terminate_job(jh);
+            }
+        }
         let pid_opt = *self
             .pid
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(pid) = pid_opt {
             kill_process_group(pid);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ActiveJobHandle {
+    fn drop(&mut self) {
+        let jh = *self
+            .win_job
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if jh != 0 {
+            win_job_ctrl::close_job(jh);
         }
     }
 }
@@ -179,7 +206,195 @@ fn kill_process_group(pid: u32) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+mod win_job_ctrl {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct IoCounters {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct JobObjectBasicLimitInformation {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct JobObjectExtendedLimitInformation {
+        basic_limit_information: JobObjectBasicLimitInformation,
+        io_info: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    #[repr(C)]
+    struct ProcessEntry32W {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; 260],
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateJobObjectW(security_attrs: *mut c_void, name: *const u16) -> *mut c_void;
+        fn SetInformationJobObject(
+            job: *mut c_void,
+            info_class: i32,
+            info: *const c_void,
+            info_len: u32,
+        ) -> i32;
+        fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+        fn TerminateJobObject(job: *mut c_void, exit_code: u32) -> i32;
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
+        fn CreateToolhelp32Snapshot(flags: u32, th32_process_id: u32) -> *mut c_void;
+        fn Process32FirstW(snapshot: *mut c_void, lppe: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(snapshot: *mut c_void, lppe: *mut ProcessEntry32W) -> i32;
+        fn CloseHandle(object: *mut c_void) -> i32;
+    }
+
+    pub(super) fn create_and_assign(proc_handle: *mut c_void) -> usize {
+        // SAFETY: `CreateJobObjectW`, `SetInformationJobObject`, and `AssignProcessToJobObject`
+        // are Win2000+ `kernel32.dll` primitives valid on Windows 10 1709+ and Wine.
+        unsafe {
+            let job = CreateJobObjectW(ptr::null_mut(), ptr::null());
+            if job.is_null() {
+                return 0;
+            }
+            let mut info = JobObjectExtendedLimitInformation::default();
+            info.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let _ = SetInformationJobObject(
+                job,
+                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+                (&raw const info).cast::<c_void>(),
+                std::mem::size_of::<JobObjectExtendedLimitInformation>() as u32,
+            );
+            if AssignProcessToJobObject(job, proc_handle) == 0 {
+                let _ = CloseHandle(job);
+                return 0;
+            }
+            job as usize
+        }
+    }
+
+    pub(super) fn terminate_job(job_addr: usize) {
+        if job_addr != 0 {
+            // SAFETY: `job_addr` is a live Job Object handle owned by `ActiveJobHandle`.
+            unsafe {
+                let _ = TerminateJobObject(job_addr as *mut c_void, 1);
+            }
+        }
+    }
+
+    pub(super) fn close_job(job_addr: usize) {
+        if job_addr != 0 {
+            // SAFETY: `CloseHandle` is called once in `ActiveJobHandle::drop`.
+            unsafe {
+                let _ = CloseHandle(job_addr as *mut c_void);
+            }
+        }
+    }
+
+    pub(super) fn kill_process_tree(root_pid: u32) {
+        if root_pid == 0 {
+            return;
+        }
+        // SAFETY: Snapshot process table via `CreateToolhelp32Snapshot` (Win2000+) and terminate
+        // direct/transitive children plus `root_pid`.
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if !snap.is_null() && (snap as isize) != INVALID_HANDLE_VALUE {
+                let mut pairs: Vec<(u32, u32)> = Vec::new();
+                let mut entry = ProcessEntry32W {
+                    dw_size: std::mem::size_of::<ProcessEntry32W>() as u32,
+                    cnt_usage: 0,
+                    th32_process_id: 0,
+                    th32_default_heap_id: 0,
+                    th32_module_id: 0,
+                    cnt_threads: 0,
+                    th32_parent_process_id: 0,
+                    pc_pri_class_base: 0,
+                    dw_flags: 0,
+                    sz_exe_file: [0; 260],
+                };
+                if Process32FirstW(snap, &raw mut entry) != 0 {
+                    loop {
+                        pairs.push((entry.th32_process_id, entry.th32_parent_process_id));
+                        if Process32NextW(snap, &raw mut entry) == 0 {
+                            break;
+                        }
+                    }
+                }
+                let _ = CloseHandle(snap);
+
+                let mut to_kill = vec![root_pid];
+                let mut idx = 0usize;
+                while idx < to_kill.len() {
+                    let parent = to_kill[idx];
+                    for &(child, ppid) in &pairs {
+                        if ppid == parent && child != 0 && !to_kill.contains(&child) {
+                            to_kill.push(child);
+                        }
+                    }
+                    idx += 1;
+                }
+                for &pid in to_kill.iter().rev() {
+                    let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+                    if !h.is_null() {
+                        let _ = TerminateProcess(h, 1);
+                        let _ = CloseHandle(h);
+                    }
+                }
+                return;
+            }
+            let h = OpenProcess(PROCESS_TERMINATE, 0, root_pid);
+            if !h.is_null() {
+                let _ = TerminateProcess(h, 1);
+                let _ = CloseHandle(h);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn kill_process_group(pid: u32) {
+    win_job_ctrl::kill_process_tree(pid);
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn kill_process_group(_pid: u32) {}
 
 /// Manages asynchronous background shell subprocesses and timers for the Lava host bridge.
@@ -335,12 +550,23 @@ fn run_child_process(
         };
     }
 
-    let mut command = Command::new("sh");
-    command
-        .arg("-c")
-        .arg(cmd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    let mut command = {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(cmd);
+        c
+    };
+    #[cfg(windows)]
+    let mut command = {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+        let mut c = Command::new(comspec);
+        c.raw_arg(format!("/d /s /c \"{cmd}\""));
+        c.creation_flags(CREATE_NO_WINDOW);
+        c
+    };
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     if stdin_data.is_empty() {
         command.stdin(Stdio::null());
@@ -378,6 +604,18 @@ fn run_child_process(
     };
 
     let pid = child.id();
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        let jh = win_job_ctrl::create_and_assign(child.as_raw_handle().cast());
+        if jh != 0 {
+            let mut slot = handle
+                .win_job
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot = jh;
+        }
+    }
     {
         let mut pid_slot = handle
             .pid
@@ -386,6 +624,16 @@ fn run_child_process(
         *pid_slot = Some(pid);
     }
     if handle.cancelled.load(Ordering::Acquire) || event_queue.quit_code().is_some() {
+        #[cfg(windows)]
+        {
+            let jh = *handle
+                .win_job
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if jh != 0 {
+                win_job_ctrl::terminate_job(jh);
+            }
+        }
         kill_process_group(pid);
         let _ = child.kill();
     }

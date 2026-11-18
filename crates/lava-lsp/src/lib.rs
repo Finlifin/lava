@@ -290,21 +290,42 @@ fn remap_event_for_remote(ev: LspEvent, remote_prefix: &str) -> LspEvent {
     }
 }
 
+fn strip_win_verbatim(raw: &str) -> &str {
+    raw.strip_prefix(r"\\?\").unwrap_or(raw)
+}
+
+fn is_windows_drive_path(raw: &str) -> bool {
+    let b = raw.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+}
+
 /// Convert a filesystem path into a standard `file://` URI.
 pub fn path_to_uri(path: &str) -> String {
     if path.starts_with("file://") {
         return path.to_string();
     }
-    let abs = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
+    let clean_input = strip_win_verbatim(path);
+    let abs_str = if is_windows_drive_path(clean_input)
+        || clean_input.starts_with('/')
+        || Path::new(clean_input).is_absolute()
+    {
+        clean_input.to_string()
     } else {
-        env::current_dir()
+        let joined = env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
+            .join(clean_input);
+        strip_win_verbatim(&joined.to_string_lossy()).to_string()
     };
-    let raw = abs.to_string_lossy();
+
+    let slash_norm = abs_str.replace('\\', "/");
+    let with_leading_slash = if slash_norm.starts_with('/') {
+        slash_norm
+    } else {
+        format!("/{slash_norm}")
+    };
+
     let mut encoded = String::from("file://");
-    for b in raw.bytes() {
+    for b in with_leading_slash.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' | b':' => {
                 encoded.push(b as char)
@@ -334,7 +355,45 @@ pub fn uri_to_path(uri: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    let decoded = String::from_utf8_lossy(&out).into_owned();
+    let b = decoded.as_bytes();
+    if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+        #[cfg(windows)]
+        {
+            return decoded[1..].replace('/', "\\");
+        }
+        #[cfg(not(windows))]
+        {
+            return decoded[1..].to_string();
+        }
+    }
+    decoded
+}
+
+fn check_executable_with_win_exts(base: &Path) -> Option<String> {
+    if is_executable_file(base) {
+        return Some(base.to_string_lossy().into_owned());
+    }
+    #[cfg(windows)]
+    {
+        if base.extension().is_none() {
+            let pathext = env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".to_string());
+            for raw_ext in pathext.split(';') {
+                let ext = raw_ext.trim().trim_start_matches('.');
+                if ext.is_empty() {
+                    continue;
+                }
+                let mut cand_os = base.as_os_str().to_os_string();
+                cand_os.push(".");
+                cand_os.push(ext.to_ascii_lowercase());
+                let cand = PathBuf::from(cand_os);
+                if is_executable_file(&cand) {
+                    return Some(cand.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Resolve an executable binary name on `$PATH` (or verify an explicit path).
@@ -345,19 +404,32 @@ pub fn which_binary(bin: &str) -> String {
         return String::new();
     }
     let candidate_path = Path::new(trimmed);
-    if trimmed.contains('/') || candidate_path.is_absolute() {
-        if is_executable_file(candidate_path) {
-            return candidate_path.to_string_lossy().into_owned();
-        }
-        return String::new();
+    if trimmed.contains('/') || trimmed.contains('\\') || candidate_path.is_absolute() {
+        return check_executable_with_win_exts(candidate_path).unwrap_or_default();
     }
-    let Some(path_os) = env::var_os("PATH") else {
-        return String::new();
-    };
-    for dir in env::split_paths(&path_os) {
-        let full = dir.join(trimmed);
-        if is_executable_file(&full) {
-            return full.to_string_lossy().into_owned();
+    if let Some(path_os) = env::var_os("PATH") {
+        for dir in env::split_paths(&path_os) {
+            let full = dir.join(trimmed);
+            if let Some(found) = check_executable_with_win_exts(&full) {
+                return found;
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let sys_root = env::var("SystemRoot")
+            .or_else(|_| env::var("WINDIR"))
+            .unwrap_or_else(|_| r"C:\Windows".to_string());
+        let root_pb = PathBuf::from(sys_root);
+        for sys_dir in [
+            root_pb.join("System32"),
+            root_pb.join("System32").join("OpenSSH"),
+            root_pb,
+        ] {
+            let full = sys_dir.join(trimmed);
+            if let Some(found) = check_executable_with_win_exts(&full) {
+                return found;
+            }
         }
     }
     String::new()
@@ -367,17 +439,14 @@ fn is_executable_file(path: &Path) -> bool {
     let Ok(meta) = fs::metadata(path) else {
         return false;
     };
-    if !meta.is_file() {
-        return false;
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
     }
     #[cfg(not(unix))]
     {
-        true
+        meta.is_file()
     }
 }
 
@@ -398,12 +467,13 @@ pub fn find_project_root(start_path: &str, markers: &[String]) -> String {
             .unwrap_or_else(|| PathBuf::from("."))
     };
     let canon_start = fs::canonicalize(&start_dir).unwrap_or(start_dir);
+    let clean_start = PathBuf::from(strip_win_verbatim(&canon_start.to_string_lossy()));
 
     for marker in markers {
         if marker.is_empty() {
             continue;
         }
-        let mut cur: Option<&Path> = Some(canon_start.as_path());
+        let mut cur: Option<&Path> = Some(clean_start.as_path());
         while let Some(dir) = cur {
             if dir.join(marker).exists() {
                 return dir.to_string_lossy().into_owned();
@@ -412,7 +482,7 @@ pub fn find_project_root(start_path: &str, markers: &[String]) -> String {
         }
     }
 
-    canon_start.to_string_lossy().into_owned()
+    clean_start.to_string_lossy().into_owned()
 }
 
 fn frame_json_rpc(payload: &JsonValue) -> Vec<u8> {
@@ -1006,7 +1076,10 @@ impl LspManager {
         root_dir: &str,
         init_options_json: &str,
     ) -> Result<u64, String> {
-        let resolved = if cmd_bin.contains('/') || Path::new(cmd_bin).is_absolute() {
+        let resolved = if cmd_bin.contains('/')
+            || cmd_bin.contains('\\')
+            || Path::new(cmd_bin).is_absolute()
+        {
             cmd_bin.to_string()
         } else {
             let w = which_binary(cmd_bin);
@@ -1017,6 +1090,12 @@ impl LspManager {
         };
 
         let mut cmd = Command::new(&resolved);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1212,6 +1291,12 @@ impl LspManager {
         };
 
         let mut cmd = Command::new(&resolved);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
         cmd.args(transport_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2079,7 +2164,19 @@ mod tests {
         let uri = path_to_uri("/tmp/my project/main.rs");
         assert_eq!(uri, "file:///tmp/my%20project/main.rs");
         assert_eq!(uri_to_path(&uri), "/tmp/my project/main.rs");
-        assert!(!which_binary("sh").is_empty());
+
+        let win_uri = path_to_uri(r"C:\Users\alice\my project\main.rs");
+        assert_eq!(win_uri, "file:///C:/Users/alice/my%20project/main.rs");
+        #[cfg(windows)]
+        {
+            assert_eq!(uri_to_path(&win_uri), r"C:\Users\alice\my project\main.rs");
+            assert!(!which_binary("cmd").is_empty());
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(uri_to_path(&win_uri), "C:/Users/alice/my project/main.rs");
+            assert!(!which_binary("sh").is_empty());
+        }
     }
 
     #[test]

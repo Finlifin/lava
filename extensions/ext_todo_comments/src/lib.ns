@@ -9,6 +9,10 @@ use @lava_core.{
     ExtId, InteractiveEffects, KeyBindingEntry, Keymap, SystemKernel, status_emit
 }
 use @lava_accel.{TodoItem, accel_doc_scan_todos, accel_scan_workspace_todos}
+use @lava_remote.{
+    RemoteDirItem, RemoteGrepMatch, is_ssh_uri, normalize_ssh_uri, parent_ssh_uri,
+    remote_find_root, remote_host_available, remote_read_lines, remote_readdir, remote_search_grep
+}
 use @ext_document.{
     Buffer, BufferId, BufferKind, EditorWorld, Pos, QuickfixEntry, ext_document_id,
     require_editor_world
@@ -398,8 +402,134 @@ fn jump_todo_in_buffer(kernel: SystemKernel, forward: bool) -> #InteractiveEffec
     ()
 }
 
+fn extract_todo_from_line(file_path: String, row: i64, line: String) -> ?TodoItem {
+    let tags = ["FIXME", "TODO", "HACK", "WARN", "PERF", "NOTE", "BUG"]
+    for i in 0..tags.len() {
+        let tag = tags.get(i.as(usize)).as(String)
+        let hits = line.find_indices(tag)
+        for hi in 0..hits.len() {
+            let col = hits.get(hi.as(usize)).as(i64)
+            let after_col = col + tag.char_len()
+            if after_col < line.char_len() {
+                let nxt = line.slice(after_col, after_col + 1)
+                if nxt == ":" or nxt == "(" {
+                    let msg = line.slice(after_col, line.char_len()).trim_start_matches(":").trim()
+                    let ti = TodoItem {
+                        file_path: file_path,
+                        row: row,
+                        col: col,
+                        tag: tag,
+                        text: if msg != "" { msg } else { line.trim() },
+                    }
+                    return ti
+                }
+            }
+        }
+    }
+    null
+}
+
+fn walk_remote_todo_files(dir_uri: String, limit: i64, depth: i64, out: List) {
+    if depth > 12 or out.len() >= limit {
+        return
+    }
+    let items = remote_readdir(dir_uri, show_hidden = false) ! { _ => List() }
+    for i in 0..items.len() {
+        if out.len() >= limit {
+            return
+        }
+        let it = items.get(i.as(usize)).as(RemoteDirItem)
+        if it.is_dir {
+            if it.name != ".git" and it.name != "target" and it.name != "node_modules" {
+                walk_remote_todo_files(it.full_uri, limit, depth + 1, out)
+            }
+        } else {
+            out.push(it.full_uri)
+        }
+    }
+}
+
+fn scan_remote_workspace_todos(root_uri: String) -> List {
+    let out = List()
+    let seen = Set.new()
+    if remote_host_available() {
+        let tags = ["TODO", "FIXME", "NOTE", "HACK", "WARN", "PERF", "BUG"]
+        for ti in 0..tags.len() {
+            let tg = tags.get(ti.as(usize)).as(String)
+            let rhits = remote_search_grep(root_uri, tg, limit = 100) ! { _ => List() }
+            for i in 0..rhits.len() {
+                let rh = rhits.get(i.as(usize)).as(RemoteGrepMatch)
+                let key = rh.full_uri ++ ":" ++ rh.row.to_string()
+                if not seen.contains(key) {
+                    let parsed_opt = extract_todo_from_line(rh.full_uri, rh.row, rh.line_text)
+                    if parsed_opt != null {
+                        seen.insert(key)
+                        out.push(parsed_opt.as(TodoItem))
+                    }
+                }
+            }
+        }
+        return out
+    }
+    let files = List()
+    walk_remote_todo_files(root_uri, 400, 0, files)
+    for fi in 0..files.len() {
+        let furi = files.get(fi.as(usize)).as(String)
+        let rl_res = remote_read_lines(furi)
+        rl_res match {
+            pair! => {
+                let (flines, _) = pair
+                for r in 0..flines.len() {
+                    let ln = flines.get(r.as(usize)).as(String)
+                    if line_may_have_todo_tag(ln) {
+                        let parsed_opt = extract_todo_from_line(furi, r, ln)
+                        if parsed_opt != null {
+                            out.push(parsed_opt.as(TodoItem))
+                        }
+                    }
+                }
+            },
+            error _ => (),
+        }
+    }
+    out
+}
+
+fn effective_todo_workspace_root(world: EditorWorld, service: TodoCommentsService) -> String {
+    if is_ssh_uri(world.cwd) {
+        return normalize_ssh_uri(world.cwd)
+    }
+    let src_opt = world.buffer(service.source_buf_id)
+    let fp = if src_opt != null {
+        src_opt.as(Buffer).file_path
+    } else {
+        world.active_buffer().file_path
+    }
+    if is_ssh_uri(fp) {
+        let base_u = parent_ssh_uri(fp)
+        let r_res = remote_find_root(
+            base_u,
+            [".git", "Cargo.toml", "package.toml", "compile_commands.json", "pyproject.toml", "package.json", "go.mod"],
+        )
+        r_res match {
+            found! => {
+                return found
+            },
+            error _ => {
+                return base_u
+            },
+        }
+    }
+    world.cwd
+}
+
 fn scan_and_populate_workspace_todos(world: EditorWorld, service: TodoCommentsService) -> List {
-    let scanned = accel_scan_workspace_todos(world.cwd)
+    let eff_root = effective_todo_workspace_root(world, service)
+    let scanned = if is_ssh_uri(eff_root) {
+        scan_remote_workspace_todos(eff_root)
+    } else {
+        accel_scan_workspace_todos(world.cwd)
+    }
     service.workspace_items = scanned
 
     let qf_list = List()

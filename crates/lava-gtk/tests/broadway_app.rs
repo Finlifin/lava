@@ -1,5 +1,7 @@
 //! Live headless GTK4 integration test against `gtk4-broadwayd`.
 
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -121,6 +123,7 @@ fn live_broadway_window_renders_frame_and_exits_cleanly() {
                 height: 400,
                 background: ColorRgba::from_rgba(30, 30, 46, 255),
                 pointer: PointerStyle::Text,
+                decorated: false,
             },
             commands: vec![
                 DrawCmd::FillRect {

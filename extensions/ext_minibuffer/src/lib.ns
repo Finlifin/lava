@@ -16,8 +16,8 @@ use @lava_core.{
 }
 use @lava_accel.{OrderlessHit, accel_doc_search_preview, accel_orderless_rank}
 use @lava_remote.{
-    RemoteConnectionInfo, RemoteDirItem, SshHostConfigEntry, parse_ssh_uri,
-    remote_discover_ssh_hosts, remote_list_connections, remote_readdir
+    RemoteConnectionInfo, RemoteDirItem, SshHostConfigEntry, is_ssh_uri, join_ssh_uri,
+    parse_ssh_uri, remote_discover_ssh_hosts, remote_list_connections, remote_readdir
 }
 use @ext_document.{
     Buffer, BufferId, EditorWorld, MinibufferRichItem, MinibufferView, Pos, RegisterValue,
@@ -25,7 +25,7 @@ use @ext_document.{
 }
 
 pub const SERVICE_MINIBUFFER: String = "lava.minibuffer.controller"
-const DEFAULT_HINT_BAR: String = "Tab:complete  M-n/M-p:move  M-Up/Dn:hist  M-BS:up-dir  Enter:confirm  Esc:cancel"
+const DEFAULT_HINT_BAR: String = "Tab:complete  M-n/M-p:move  Up/Dn:hist  Right:ghost  M-BS:up-dir  Enter:confirm"
 const MINIBUFFER_BATCH_CAP: i64 = 256
 const MINIBUFFER_QUERY_CAP: i64 = 48
 
@@ -332,8 +332,8 @@ private fn mode_badge_for_kind(kind: PromptKind) -> String {
 private fn hint_bar_for_kind(kind: PromptKind) -> String {
     kind match {
         PromptKind.confirm => "y/n/!/q:confirm  Esc/C-g:cancel",
-        PromptKind.search_forward => "C-s/C-r:next/prev  M-n/M-p:move  M-Up/Dn:hist  Enter:accept  Esc:cancel",
-        PromptKind.search_backward => "C-s/C-r:next/prev  M-n/M-p:move  M-Up/Dn:hist  Enter:accept  Esc:cancel",
+        PromptKind.search_forward => "C-s/C-r:next/prev  M-n/M-p:move  Up/Dn:hist  Right:ghost  Enter:accept  Esc:cancel",
+        PromptKind.search_backward => "C-s/C-r:next/prev  M-n/M-p:move  Up/Dn:hist  Right:ghost  Enter:accept  Esc:cancel",
         _ => DEFAULT_HINT_BAR,
     }
 }
@@ -343,6 +343,7 @@ private fn clear_world_minibuffer(world: EditorWorld) {
     world.minibuffer_rich_items = List()
     world.minibuffer_mode_badge = ""
     world.minibuffer_hint_bar = ""
+    world.minibuffer_history_ghost = ""
 }
 
 -- ============================================================================
@@ -376,6 +377,7 @@ pub struct MinibufferController {
     pub histories: HashMap,
     pub history_idx: i64,
     pub saved_draft: String,
+    pub history_ghost: String,
     pub preview_buf_id: ?BufferId,
     pub preview_orig_point: Pos,
     pub preview_orig_last_search: String,
@@ -418,6 +420,7 @@ impl MinibufferController {
             histories: HashMap.new(),
             history_idx: -1,
             saved_draft: "",
+            history_ghost: "",
             preview_buf_id: null,
             preview_orig_point: Pos.zero(),
             preview_orig_last_search: "",
@@ -501,11 +504,46 @@ impl MinibufferController {
         }
     }
 
+    pub fn compute_history_ghost(self) -> String {
+        if (not self.active) or self.request.kind == PromptKind.confirm {
+            return ""
+        }
+        let in_txt = self.input_text
+        let in_len = in_txt.char_len()
+        if in_len == 0 or self.cursor_col != in_len {
+            return ""
+        }
+        let hist = self.history_list(self.request.kind)
+        if hist.is_empty() {
+            return ""
+        }
+        var i = hist.len() - 1
+        while i >= 0 {
+            let entry = hist.get(i.as(usize)).as(String)
+            if entry.char_len() > in_len and entry.starts_with(in_txt) {
+                return entry.drop(in_len)
+            }
+            i -= 1
+        }
+        let in_low = in_txt.to_lower()
+        var j = hist.len() - 1
+        while j >= 0 {
+            let entry = hist.get(j.as(usize)).as(String)
+            if entry.char_len() > in_len and entry.to_lower().starts_with(in_low) {
+                return entry.drop(in_len)
+            }
+            j -= 1
+        }
+        ""
+    }
+
     pub fn sync_to_world(self, world: EditorWorld) {
         if not self.active {
+            self.history_ghost = ""
             clear_world_minibuffer(world)
             return
         }
+        self.history_ghost = self.compute_history_ghost()
         world.minibuffer_view = MinibufferView {
             active: true,
             prompt_label: self.request.label,
@@ -518,6 +556,7 @@ impl MinibufferController {
         world.minibuffer_rich_items = self.rich_items
         world.minibuffer_mode_badge = mode_badge_for_kind(self.request.kind)
         world.minibuffer_hint_bar = hint_bar_for_kind(self.request.kind)
+        world.minibuffer_history_ghost = self.history_ghost
     }
 }
 
@@ -721,7 +760,8 @@ pub fn collect_kernel_commands(kernel: SystemKernel, interactive_only: bool) -> 
 }
 
 private fn home_directory(fallback_cwd: String) -> String {
-    env.get_or("HOME", fallback_cwd)
+    let h = env.get_or("HOME", env.get_or("USERPROFILE", "")).trim()
+    if h != "" { h } else { fallback_cwd }
 }
 
 private fn expand_tilde_path(raw: String, fallback_cwd: String) -> String {
@@ -729,7 +769,7 @@ private fn expand_tilde_path(raw: String, fallback_cwd: String) -> String {
     if raw == "~" {
         return path.normalize(home)
     }
-    if raw.starts_with("~/") {
+    if raw.starts_with("~/") or raw.starts_with("~\\") {
         return path.normalize(path.join(home, raw.drop(2)))
     }
     raw
@@ -755,11 +795,18 @@ private fn split_file_input(raw_input: String, cwd: String) -> (String, String, 
     let base_prefix = raw_input.slice(last_slash + 1, n)
     let dir_part = if last_slash == 0 {
         "/"
+    } else if last_slash == 2 and raw_input.slice(1, 2) == ":" {
+        raw_input.slice(0, 3)
     } else {
         raw_input.slice(0, last_slash)
     }
     let expanded_dir = expand_tilde_path(dir_part, cwd)
-    let resolved_dir = if path.is_absolute(expanded_dir) {
+    let resolved_dir = if is_ssh_uri(expanded_dir) {
+        if expanded_dir.ends_with("/") { expanded_dir } else { expanded_dir ++ "/" }
+    } else if is_ssh_uri(cwd) {
+        let joined = join_ssh_uri(cwd, expanded_dir)
+        if joined.ends_with("/") { joined } else { joined ++ "/" }
+    } else if path.is_absolute(expanded_dir) {
         path.normalize(expanded_dir)
     } else {
         path.normalize(path.join(cwd, expanded_dir))
@@ -891,15 +938,8 @@ private fn build_ssh_host_candidates(
         if h.alias_name == "" {
             continue
         }
-        var auth = ""
-        if h.user != "" {
-            auth = h.user ++ "@"
-        }
-        auth = auth ++ h.alias_name
-        if h.port > 0 and h.port != 22 {
-            auth = auth ++ ":" ++ h.port.to_string()
-        }
-        if (not seen.contains(auth)) and (not seen.contains(h.alias_name)) {
+        let auth = h.alias_name
+        if not seen.contains(auth) {
             seen.insert(auth)
             let user_part = if h.user != "" { h.user ++ "@" } else { "" }
             let host_part = if h.hostname != "" { h.hostname } else { h.alias_name }
@@ -940,7 +980,13 @@ private fn build_ssh_host_candidates(
     let scored = List()
     for i in 0..rows.len() {
         let (auth, badge, marg, bias) = rows.get(i.as(usize)).as((String, String, String, i64))
-        let (sc, mpos) = score_candidate_with_positions(auth_q, auth)
+        let (sc_alias, mpos_alias) = score_candidate_with_positions(auth_q, auth)
+        let (sc, mpos) = if sc_alias >= 0 {
+            (sc_alias, mpos_alias)
+        } else {
+            let (sc_marg, _) = score_candidate_with_positions(auth_q, marg)
+            (sc_marg, List())
+        }
         if sc >= 0 {
             let full_cand = ssh_pfx ++ auth ++ "/"
             let pair_det = if legacy_pair_detail { "dir" } else { marg }
@@ -956,6 +1002,126 @@ private fn build_ssh_host_candidates(
                     key_hint: "",
                     marginalia: marg,
                     match_indices: shift_indices(mpos, ssh_pfx_len),
+                },
+            })
+        }
+    }
+    sort_rich_scored(scored)
+    unpack_rich_scored(scored)
+}
+
+private fn build_ssh_profile_ex_candidates(
+    arg_input: String,
+    verb_prefix: String,
+    include_conns: bool,
+    as_ssh_uri: bool,
+) -> (List, List, i64) {
+    let raw_q = arg_input.trim()
+    var q = if raw_q.starts_with("ssh://") {
+        raw_q.drop(6)
+    } else if raw_q.starts_with("/ssh:") {
+        raw_q.drop(5)
+    } else {
+        raw_q
+    }
+    while q.ends_with("/") or q.ends_with(":") {
+        q = q.slice(0, q.char_len() - 1)
+    }
+    let use_uri = as_ssh_uri or raw_q.starts_with("ssh://")
+    let hosts = remote_discover_ssh_hosts()
+    let seen = Set.new()
+    let rows = List()
+
+    if include_conns {
+        let conns = remote_list_connections()
+        for i in 0..conns.len() {
+            let c = conns.get(i.as(usize)).as(RemoteConnectionInfo)
+            if c.authority != "" and (not seen.contains(c.authority)) {
+                seen.insert(c.authority)
+                let sys_tag = if c.os != "" {
+                    "[" ++ c.mode ++ "]  " ++ c.hostname ++ " (" ++ c.os ++ "/" ++ c.arch ++ ")"
+                } else {
+                    "[" ++ c.mode ++ "]  " ++ c.hostname
+                }
+                let val = if use_uri { "ssh://" ++ c.authority ++ "/" } else { c.authority }
+                rows.push((val, c.authority, "[CONN]", sys_tag, 220 - i))
+            }
+        }
+    }
+
+    for i in 0..hosts.len() {
+        let h = hosts.get(i.as(usize)).as(SshHostConfigEntry)
+        let alias = h.alias_name.trim()
+        if alias == "" or seen.contains(alias) {
+            continue
+        }
+        seen.insert(alias)
+        let user_part = if h.user != "" { h.user ++ "@" } else { "" }
+        let host_part = if h.hostname != "" { h.hostname } else { alias }
+        let port_part = if h.port > 0 { ":" ++ h.port.to_string() } else { ":22" }
+        let jump_part = if h.proxy_jump != "" { "  via " ++ h.proxy_jump } else { "" }
+        let key_part = if h.identity_file != "" {
+            let kb_opt = path.file_name(h.identity_file)
+            let kb = if kb_opt != null { kb_opt.as(String) } else { h.identity_file }
+            "  [key:" ++ kb ++ "]"
+        } else {
+            ""
+        }
+        let marg = user_part ++ host_part ++ port_part ++ jump_part ++ key_part
+        let val = if use_uri { "ssh://" ++ alias ++ "/" } else { alias }
+        rows.push((val, alias, "[SSH]", marg, 100 - i))
+    }
+
+    if rows.is_empty() {
+        return (List(), List(), 0)
+    }
+
+    let pfx_len = verb_prefix.char_len()
+    let val_offset = if use_uri { pfx_len + 6 } else { pfx_len }
+
+    if q == "" {
+        let pairs = List()
+        let rich_list = List()
+        for i in 0..rows.len() {
+            let (val, _, badge, marg, _) = rows.get(i.as(usize)).as((String, String, String, String, i64))
+            let full_cand = verb_prefix ++ val
+            pairs.push((full_cand, marg))
+            rich_list.push(MinibufferRichItem {
+                kind_badge: badge,
+                badge_rgba: 0,
+                label: full_cand,
+                key_hint: "",
+                marginalia: marg,
+                match_indices: List(),
+            })
+        }
+        return (pairs, rich_list, rows.len())
+    }
+
+    let scored = List()
+    for i in 0..rows.len() {
+        let (val, alias, badge, marg, bias) = rows.get(i.as(usize)).as((String, String, String, String, i64))
+        let (sc_alias, mpos_alias) = score_candidate_with_positions(q, alias)
+        let (sc, mpos) = if sc_alias >= 0 {
+            (sc_alias, mpos_alias)
+        } else {
+            let (sc_marg, _) = score_candidate_with_positions(q, alias ++ " " ++ marg)
+            (sc_marg, List())
+        }
+        if sc >= 0 {
+            let full_cand = verb_prefix ++ val
+            scored.push(RichScoredCandidate {
+                score: sc + bias,
+                is_dir: use_uri,
+                cand: full_cand,
+                detail: marg,
+                rich: MinibufferRichItem {
+                    kind_badge: badge,
+                    badge_rgba: 0,
+                    label: full_cand,
+                    key_hint: "",
+                    marginalia: marg,
+                    match_indices: shift_indices(mpos, val_offset),
                 },
             })
         }
@@ -1103,24 +1269,26 @@ private fn build_path_candidates(
     } else {
         split_file_input(path_input, cwd)
     }
+    let is_remote_dir = remote_split_opt != null or is_ssh_uri(dir_to_read)
     let show_hidden = base_prefix.starts_with(".")
     let label_prefix = insert_prefix ++ raw_dir_prefix
     let prefix_offset = label_prefix.char_len()
 
-    let vis_cache_key = (if remote_split_opt != null { "rvis:" } else { "lvis:" })
+    let vis_cache_key = (if is_remote_dir { "rvis:" } else { "lvis:" })
         ++ dir_to_read
         ++ (if show_hidden { "#1" } else { "#0" })
     let cached_vis_opt = ctrl.cached_dir_map.get(vis_cache_key)
     let (vis_entries, vis_names) = if cached_vis_opt != null {
-        ctrl.cached_path_dir = if remote_split_opt != null and show_hidden {
+        ctrl.cached_path_dir = if is_remote_dir and show_hidden {
             dir_to_read ++ "#hidden"
         } else {
             dir_to_read
         }
         cached_vis_opt.as((List, List))
     } else {
-        let dir_entries = if remote_split_opt != null {
-            ensure_cached_remote_dir_entries(ctrl, dir_to_read, show_hidden)
+        let dir_entries = if is_remote_dir {
+            let rdir_norm = if dir_to_read.ends_with("/") { dir_to_read } else { dir_to_read ++ "/" }
+            ensure_cached_remote_dir_entries(ctrl, rdir_norm, show_hidden)
         } else {
             ensure_cached_dir_entries(ctrl, dir_to_read)
         }
@@ -1349,7 +1517,26 @@ private fn is_ex_file_verb(v: String) -> bool {
         or v == "vsp" or v == "vsplit" or v == "tabnew" or v == "cd"
         or v == "Dirvish" or v == "Ranger" or v == "Ex" or v == "Explore"
         or v == "Oil" or v == "saveas" or v == "r" or v == "read"
-        or v == "DiffFiles" or v == "RemoteBrowse" or v == "RemoteConnect" or v == "RemoteFiles"
+        or v == "DiffFiles"
+}
+
+private fn is_ex_ssh_profile_verb(v: String) -> bool {
+    v == "RemoteConnectProfile" or v == "SshConnect"
+        or v == "remote-connect-profile" or v == "ssh-connect-profile"
+}
+
+private fn is_ex_ssh_disconnect_verb(v: String) -> bool {
+    v == "RemoteDisconnect" or v == "remote-disconnect"
+}
+
+private fn is_ex_ssh_target_verb(v: String) -> bool {
+    v == "RemoteConnect" or v == "remote-connect"
+        or v == "RemoteBrowse" or v == "remote-browse"
+        or v == "RemoteFiles" or v == "remote-files"
+        or v == "RemoteInstallServer" or v == "RemoteUpdateServer" or v == "RemoteDeploy"
+        or v == "remote-install-server" or v == "remote-deploy"
+        or v == "RemoteShell" or v == "RemoteTerm" or v == "remote-shell"
+        or v == "RemoteProbe" or v == "remote-probe"
 }
 
 private fn is_ex_buffer_verb(v: String) -> bool {
@@ -1394,6 +1581,7 @@ private fn ex_verb_expects_arg(raw_verb: String) -> bool {
     is_ex_file_verb(v) or is_ex_buffer_verb(v) or is_ex_theme_verb(v)
         or is_ex_set_verb(v) or is_ex_telescope_verb(v)
         or is_ex_help_verb(v) or is_ex_info_verb(v) or is_ex_apropos_verb(v)
+        or is_ex_ssh_profile_verb(v) or is_ex_ssh_disconnect_verb(v) or is_ex_ssh_target_verb(v)
         or v == "term" or v == "terminal" or v == "vterm"
 }
 
@@ -1492,7 +1680,14 @@ private fn builtin_ex_verbs() -> List {
         ("Overseer", "Open Overseer task runner  :Overseer"),
         ("ZenMode", "Toggle distraction-free Zen mode  :ZenMode"),
         ("ConformFormat", "Format active buffer  :ConformFormat"),
-        ("TodoQuickFix", "Populate quickfix with TODO/FIXME items  :TodoQuickFix"),
+        ("TodoQuickfix", "Populate quickfix with TODO/FIXME items  :TodoQuickfix"),
+        ("RemoteConnectProfile", "Connect OpenSSH ~/.ssh/config profile  :RemoteConnectProfile <profile>"),
+        ("SshConnect", "Connect OpenSSH ~/.ssh/config profile  :SshConnect <profile>"),
+        ("RemoteConnect", "Connect SSH host or profile  :RemoteConnect <profile|ssh://host>"),
+        ("RemoteBrowse", "Browse remote SSH directory  :RemoteBrowse [profile|ssh://host/dir]"),
+        ("RemoteInstallServer", "Install/update ~/.lava-server over SSH  :RemoteInstallServer [profile]"),
+        ("RemoteDisconnect", "Disconnect active SSH session  :RemoteDisconnect [profile]"),
+        ("RemoteStatus", "Open *Remote* SSH & port-forward dashboard  :RemoteStatus"),
         ("s/%s", "Substitute pattern across line or buffer  :[%]s/pat/rep/g"),
         ("%s/", "Substitute pattern across entire buffer  :%s/pat/rep/g"),
     ]
@@ -1781,6 +1976,8 @@ private fn build_set_option_candidates(
         ("nocursor_anim", "cursor_anim=" ++ opts.cursor_anim.to_string(), "Disable cursor trail animation"),
         ("treesitter", "treesitter=" ++ opts.treesitter.to_string(), "Enable Tree-sitter AST syntax highlighting"),
         ("notreesitter", "treesitter=" ++ opts.treesitter.to_string(), "Disable Tree-sitter AST syntax highlighting"),
+        ("decorations", "decorations=" ++ opts.window_decorations.to_string(), "Show OS window decorations / titlebar"),
+        ("nodecorations", "decorations=" ++ opts.window_decorations.to_string(), "Hide OS window decorations (borderless)"),
         ("theme=" ++ opts.theme_name, "theme=" ++ opts.theme_name, "Active editor color theme"),
     ]
 
@@ -2254,6 +2451,7 @@ private fn all_help_option_names() -> List {
         "smooth_scroll",
         "cursor_anim",
         "treesitter",
+        "window_decorations",
     ]
 }
 
@@ -2558,6 +2756,26 @@ private fn build_ex_candidates(
     let v = normalize_ex_verb_base(raw_verb)
     let verb_prefix = range_pfx ++ raw_verb ++ " "
 
+    if is_ex_ssh_profile_verb(v) {
+        return build_ssh_profile_ex_candidates(arg_part, verb_prefix, false, false)
+    }
+    if is_ex_ssh_disconnect_verb(v) {
+        return build_ssh_profile_ex_candidates(arg_part, verb_prefix, true, false)
+    }
+    if is_ex_ssh_target_verb(v) {
+        let trimmed_arg = arg_part.trim_start()
+        let is_browse_like = v == "RemoteConnect" or v == "remote-connect"
+            or v == "RemoteBrowse" or v == "remote-browse"
+            or v == "RemoteFiles" or v == "remote-files"
+        if is_browse_like and (
+            (trimmed_arg.starts_with("ssh://") and trimmed_arg.drop(6).contains("/"))
+            or (trimmed_arg.starts_with("/ssh:") and trimmed_arg.drop(5).contains(":"))
+        ) {
+            return build_path_candidates(ctrl, arg_part, world.cwd, verb_prefix, false)
+        }
+        let as_uri = v == "RemoteBrowse" or v == "remote-browse" or v == "RemoteFiles" or v == "remote-files"
+        return build_ssh_profile_ex_candidates(arg_part, verb_prefix, true, as_uri)
+    }
     if is_ex_file_verb(v) {
         if v == "DiffFiles" and arg_part.contains(" ") {
             let sp_hits = arg_part.find_indices(" ")
@@ -2600,6 +2818,7 @@ private fn build_ex_candidates(
             ("diagnostics", "Jump to buffer/workspace diagnostics"),
             ("git_status", "Inspect modified Git files"),
             ("colorscheme", "Switch color theme with live preview"),
+            ("ssh", "Connect OpenSSH ~/.ssh/config remote profile"),
             ("resume", "Resume previous Telescope picker session"),
         ]
         return build_static_subcmd_candidates(pickers, "[tel]", arg_part, verb_prefix)
@@ -3376,6 +3595,85 @@ private fn backward_word_col_in_text(s: String, col: i64) -> i64 {
     i
 }
 
+private fn forward_word_len_in_text(s: String) -> i64 {
+    let n = s.char_len()
+    if n <= 0 {
+        return 0
+    }
+    var i: i64 = 0
+    while i < n {
+        let ch = s.slice(i, i + 1)
+        if ch == " " or ch == "\t" or ch == "/" or ch == "-" or ch == "_" or ch == "." {
+            i += 1
+        } else {
+            break
+        }
+    }
+    while i < n {
+        let ch = s.slice(i, i + 1)
+        if ch == " " or ch == "\t" or ch == "/" or ch == "-" or ch == "_" or ch == "." {
+            if ch == "/" {
+                i += 1
+            }
+            break
+        }
+        i += 1
+    }
+    if i > 0 { i } else { n }
+}
+
+private fn history_matches_draft(entry: String, draft: String, req_initial: String) -> bool {
+    if draft == "" or draft == req_initial {
+        return true
+    }
+    entry.to_lower().starts_with(draft.to_lower())
+}
+
+private fn find_prev_history_index(
+    hist: List,
+    from_idx: i64,
+    draft: String,
+    req_initial: String,
+    cur_text: String,
+) -> i64 {
+    let n = hist.len()
+    if n == 0 or from_idx < 0 {
+        return -1
+    }
+    var idx = if from_idx >= n { n - 1 } else { from_idx }
+    while idx >= 0 {
+        let cand = hist.get(idx.as(usize)).as(String)
+        if cand != cur_text and history_matches_draft(cand, draft, req_initial) {
+            return idx
+        }
+        idx -= 1
+    }
+    -- Fallback if draft had no prefix matches and we were not yet in history
+    if draft != "" and draft != req_initial and from_idx == n - 1 {
+        return n - 1
+    }
+    -1
+}
+
+private fn find_next_history_index(
+    hist: List,
+    from_idx: i64,
+    draft: String,
+    req_initial: String,
+    cur_text: String,
+) -> i64 {
+    let n = hist.len()
+    var idx = from_idx
+    while idx < n {
+        let cand = hist.get(idx.as(usize)).as(String)
+        if cand != cur_text and history_matches_draft(cand, draft, req_initial) {
+            return idx
+        }
+        idx += 1
+    }
+    -1
+}
+
 private fn ensure_controller_instance(kernel: SystemKernel) -> MinibufferController {
     let existing_opt = kernel.service(SERVICE_MINIBUFFER)
     if existing_opt != null {
@@ -3493,7 +3791,88 @@ private fn submit_and_transition(
     ()
 }
 
-private fn resolve_submitted_value(ctrl: MinibufferController, cwd: String) -> String {
+private fn ex_camel_to_kebab(s: String) -> String {
+    let n = s.char_len()
+    var out = ""
+    for i in 0..n {
+        let ch = s.slice(i, i + 1)
+        let low = ch.to_lower()
+        if ch != low and ch.is_alphabetic() {
+            if i > 0 {
+                let prev = s.slice(i - 1, i)
+                if prev != "-" and prev != "_" and prev != ":" {
+                    out = out ++ "-"
+                }
+            }
+            out = out ++ low
+        } else if ch == "_" {
+            out = out ++ "-"
+        } else {
+            out = out ++ ch
+        }
+    }
+    out
+}
+
+private fn is_literal_standalone_ex_verb(kernel: SystemKernel, raw_rest: String) -> bool {
+    let t = raw_rest.trim()
+    if t == "" {
+        return true
+    }
+    if t.starts_with("!") or t.starts_with("s/") or t.starts_with("%s")
+        or t.contains("/") or t.contains("=") {
+        return true
+    }
+    if t.try_parse(i64) != null {
+        return true
+    }
+    let v = normalize_ex_verb_base(t)
+    if v == "w" or v == "write" or v == "q" or v == "quit" or v == "wq" or v == "x"
+        or v == "qa" or v == "qall" or v == "wqa" or v == "e" or v == "edit"
+        or v == "b" or v == "buffer" or v == "bn" or v == "bnext" or v == "bp" or v == "bprev"
+        or v == "bd" or v == "bdelete" or v == "ls" or v == "buffers"
+        or v == "sp" or v == "split" or v == "vsp" or v == "vsplit"
+        or v == "only" or v == "close" or v == "tabnew" or v == "tabn" or v == "tabnext"
+        or v == "tabp" or v == "tabprev" or v == "tabc" or v == "tabclose"
+        or v == "set" or v == "se" or v == "noh" or v == "nohlsearch"
+        or v == "pwd" or v == "cd" or v == "h" or v == "help"
+        or v == "marks" or v == "reg" or v == "registers" or v == "jumps"
+        or v == "changes" or v == "undolist" or v == "undotree"
+        or v == "grep" or v == "vimgrep" or v == "make" or v == "copen" or v == "cclose"
+        or v == "cn" or v == "cnext" or v == "cp" or v == "cprev"
+        or v == "colo" or v == "colorscheme" or v == "theme"
+        or v == "r" or v == "read" or v == "saveas" {
+        return true
+    }
+    let kebab = ex_camel_to_kebab(v)
+    let low = v.to_lower()
+    kernel.commands.contains_key("ex:" ++ t)
+        or kernel.commands.contains_key("ex:" ++ v)
+        or kernel.commands.contains_key("ex:" ++ low)
+        or kernel.commands.contains_key(t)
+        or kernel.commands.contains_key(v)
+        or kernel.commands.contains_key(v.replace("_", "-"))
+        or kernel.commands.contains_key(low)
+        or kernel.commands.contains_key(low.replace("_", "-"))
+        or kernel.commands.contains_key(kebab)
+}
+
+private fn ex_stage2_auto_accepts_top_candidate(v: String, arg_part: String) -> bool {
+    let trimmed = arg_part.trim()
+    if trimmed == "" {
+        return false
+    }
+    if is_ex_buffer_verb(v) or is_ex_theme_verb(v) or is_ex_telescope_verb(v)
+        or is_ex_ssh_profile_verb(v) or is_ex_ssh_disconnect_verb(v) {
+        return true
+    }
+    if is_ex_set_verb(v) and (not trimmed.contains("=")) and (not trimmed.contains(" ")) {
+        return true
+    }
+    false
+}
+
+private fn resolve_submitted_value(kernel: SystemKernel, ctrl: MinibufferController, cwd: String) -> String {
     let kind = ctrl.request.kind
     if kind == PromptKind.command_name or kind == PromptKind.buffer_name {
         if (not ctrl.items.is_empty()) and ctrl.selected_idx >= 0 and ctrl.selected_idx < ctrl.items.len() {
@@ -3527,11 +3906,31 @@ private fn resolve_submitted_value(ctrl: MinibufferController, cwd: String) -> S
         return raw_path
     }
     if kind == PromptKind.ex_command {
-        -- CRITICAL Ex Submission Rule: when `selection_touched == false`, submit `ctrl.input_text` literally!
-        let chosen = if ctrl.selection_touched and (not ctrl.items.is_empty()) and
-            ctrl.selected_idx >= 0 and ctrl.selected_idx < ctrl.items.len() {
+        let has_sel_item = (not ctrl.items.is_empty()) and
+            ctrl.selected_idx >= 0 and ctrl.selected_idx < ctrl.items.len()
+        let chosen = if ctrl.selection_touched and has_sel_item {
             let (cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
             cand
+        } else if has_sel_item {
+            let (_, in_rest) = split_ex_range_prefix(ctrl.input_text)
+            let in_sp = in_rest.split_once(" ")
+            if in_sp == null {
+                if is_literal_standalone_ex_verb(kernel, in_rest) {
+                    ctrl.input_text
+                } else {
+                    let (cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
+                    cand
+                }
+            } else {
+                let (in_verb, in_arg) = in_sp.as((String, String))
+                let in_v = normalize_ex_verb_base(in_verb)
+                if ex_stage2_auto_accepts_top_candidate(in_v, in_arg) {
+                    let (cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
+                    cand
+                } else {
+                    ctrl.input_text
+                }
+            }
         } else {
             ctrl.input_text
         }
@@ -3586,7 +3985,7 @@ private fn try_vertico_directory_up(
         if sp_opt != null {
             let (raw_verb, arg_part) = sp_opt.as((String, String))
             let v = normalize_ex_verb_base(raw_verb)
-            if is_ex_file_verb(v) {
+            if is_ex_file_verb(v) or (is_ex_ssh_target_verb(v) and arg_part.contains("/")) {
                 if v == "DiffFiles" and arg_part.contains(" ") {
                     let sp_hits = arg_part.find_indices(" ")
                     let last_sp = sp_hits.get((sp_hits.len() - 1).as(usize)).as(i64)
@@ -3701,7 +4100,7 @@ pub fn minibuffer_handle_key(
     -- 3. Submit (`<Return>`, `<C-j>`, `<C-m>`)
     if ((not stroke.ctrl) and (not stroke.alt) and stroke.key == "Return") or
         (stroke.ctrl and (not stroke.alt) and (stroke.key == "j" or stroke.key == "m")) {
-        let chosen = resolve_submitted_value(ctrl, world.cwd)
+        let chosen = resolve_submitted_value(kernel, ctrl, world.cwd)
         submit_and_transition(kernel, world, ctrl, chosen)#!
         return true
     }
@@ -3734,13 +4133,13 @@ pub fn minibuffer_handle_key(
         }
     }
 
-    -- 5. Candidate Navigation (`<M-n>`, `<C-n>`, `<Down>`, `<M-p>`, `<C-p>`, `<Up>`, `<Tab>`, `<S-Tab>`)
+    -- 5. Candidate Navigation (`<M-n>`, `<C-n>`, `<M-p>`, `<C-p>`, `<Tab>`, `<S-Tab>`)
+    --    Plain `<Up>` and `<Down>` navigate input history (Section 6)!
     let alt_only = stroke.alt and (not stroke.ctrl) and (not stroke.super_mod)
     let ctrl_only = stroke.ctrl and (not stroke.alt) and (not stroke.super_mod)
     let plain_nav = (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod)
 
-    if ctrl_only and stroke.key == "n"
-        or (plain_nav and stroke.key == "Down")
+    if (ctrl_only and stroke.key == "n")
         or (alt_only and stroke.key == "n" and (not ctrl.items.is_empty())) {
         if not ctrl.items.is_empty() {
             ctrl.selected_idx = (ctrl.selected_idx + 1) % ctrl.items.len()
@@ -3751,8 +4150,7 @@ pub fn minibuffer_handle_key(
         return true
     }
 
-    if ctrl_only and stroke.key == "p"
-        or (plain_nav and stroke.key == "Up")
+    if (ctrl_only and stroke.key == "p")
         or (alt_only and stroke.key == "p" and (not ctrl.items.is_empty())) {
         if not ctrl.items.is_empty() {
             let n = ctrl.items.len()
@@ -3779,6 +4177,14 @@ pub fn minibuffer_handle_key(
 
     if stroke.key == "Tab" and (not stroke.shift_mod) and (not stroke.ctrl) and (not stroke.alt) {
         if ctrl.items.is_empty() {
+            if ctrl.history_ghost != "" {
+                ctrl.input_text = ctrl.input_text ++ ctrl.history_ghost
+                ctrl.cursor_col = ctrl.input_text.char_len()
+                ctrl.history_idx = -1
+                ctrl.selection_touched = false
+                ctrl.selected_idx = 0
+                refresh_controller(kernel, world, ctrl)
+            }
             return true
         }
 
@@ -3811,8 +4217,8 @@ pub fn minibuffer_handle_key(
                 }
                 ctrl.input_text = cand
                 ctrl.cursor_col = cand.char_len()
-                ctrl.selection_touched = false
-                refresh_controller(kernel, world, ctrl)
+                ctrl.selection_touched = true
+                ctrl.sync_to_world(world)
                 return true
             }
 
@@ -3837,65 +4243,86 @@ pub fn minibuffer_handle_key(
             }
             ctrl.input_text = cand
             ctrl.cursor_col = cand.char_len()
-            ctrl.selection_touched = false
-            refresh_controller(kernel, world, ctrl)
+            ctrl.selection_touched = true
+            apply_consult_preview(world, ctrl)
+            ctrl.sync_to_world(world)
             return true
         }
 
         if ctrl.request.kind == PromptKind.file_path {
             if ctrl.selection_touched or ctrl.items.len() == 1 {
                 let (cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
+                if ctrl.input_text == cand and ctrl.items.len() > 1 and (not cand.ends_with("/")) {
+                    ctrl.selected_idx = (ctrl.selected_idx + 1) % ctrl.items.len()
+                    let (next_cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
+                    ctrl.input_text = next_cand
+                    ctrl.cursor_col = next_cand.char_len()
+                    ctrl.selection_touched = true
+                    ctrl.sync_to_world(world)
+                    return true
+                }
                 ctrl.input_text = cand
                 ctrl.cursor_col = cand.char_len()
-                ctrl.selection_touched = false
-                ctrl.selected_idx = 0
-                refresh_controller(kernel, world, ctrl)
+                if cand.ends_with("/") {
+                    ctrl.selection_touched = false
+                    ctrl.selected_idx = 0
+                    refresh_controller(kernel, world, ctrl)
+                } else {
+                    ctrl.selection_touched = true
+                    ctrl.sync_to_world(world)
+                }
                 return true
             }
             let lcp = common_candidate_prefix(ctrl.items)
             if lcp.char_len() > ctrl.input_text.char_len() {
                 ctrl.input_text = lcp
                 ctrl.cursor_col = lcp.char_len()
-                ctrl.selection_touched = false
                 ctrl.selected_idx = 0
                 refresh_controller(kernel, world, ctrl)
+                ctrl.selection_touched = not lcp.ends_with("/")
+                ctrl.sync_to_world(world)
                 return true
             }
             let (cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
-            if ctrl.input_text == cand and ctrl.items.len() > 1 {
-                ctrl.selected_idx = (ctrl.selected_idx + 1) % ctrl.items.len()
-                let (next_cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
-                ctrl.input_text = next_cand
-                ctrl.cursor_col = next_cand.char_len()
+            ctrl.input_text = cand
+            ctrl.cursor_col = cand.char_len()
+            if cand.ends_with("/") {
+                ctrl.selection_touched = false
+                ctrl.selected_idx = 0
+                refresh_controller(kernel, world, ctrl)
             } else {
-                ctrl.input_text = cand
-                ctrl.cursor_col = cand.char_len()
+                ctrl.selection_touched = true
+                ctrl.sync_to_world(world)
             }
-            ctrl.selection_touched = false
-            refresh_controller(kernel, world, ctrl)
             return true
         }
 
-        -- CommandName / BufferName / Choice / others: fill single match or extend common prefix or cycle
+        -- CommandName / BufferName / Choice / FreeText: fill top match, extend prefix, or cycle
+        let (cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
         if ctrl.items.len() == 1 {
-            let (cand, _) = ctrl.items.get(0).as((String, String))
             ctrl.input_text = cand
             ctrl.cursor_col = cand.char_len()
             ctrl.selection_touched = true
-            refresh_controller(kernel, world, ctrl)
+            apply_consult_preview(world, ctrl)
+            ctrl.sync_to_world(world)
             return true
         }
         let lcp = common_candidate_prefix(ctrl.items)
-        if ctrl.input_text != "" and
+        if (not ctrl.selection_touched) and ctrl.input_text != "" and
             lcp.char_len() > ctrl.input_text.char_len() and
             lcp.to_lower().starts_with(ctrl.input_text.to_lower()) {
             ctrl.input_text = lcp
             ctrl.cursor_col = lcp.char_len()
-            ctrl.selection_touched = false
+            ctrl.selection_touched = true
             refresh_controller(kernel, world, ctrl)
             return true
         }
-        ctrl.selected_idx = (ctrl.selected_idx + 1) % ctrl.items.len()
+        if ctrl.input_text == cand and ctrl.items.len() > 1 {
+            ctrl.selected_idx = (ctrl.selected_idx + 1) % ctrl.items.len()
+        }
+        let (next_cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
+        ctrl.input_text = next_cand
+        ctrl.cursor_col = next_cand.char_len()
         ctrl.selection_touched = true
         apply_consult_preview(world, ctrl)
         ctrl.sync_to_world(world)
@@ -3928,35 +4355,54 @@ pub fn minibuffer_handle_key(
         return true
     }
 
-    -- 6. History Navigation (`<M-Up>`/`<C-Up>`, `<M-Down>`/`<C-Down>`, plus `<M-p>`/`<M-n>` when no candidate list is active)
-    if (alt_only and stroke.key == "Up")
+    -- 6. Input History Navigation (`<Up>`, `<Down>`, `<M-Up>`/`<C-Up>`, `<M-Down>`/`<C-Down>`, plus `<M-p>`/`<M-n>` when no candidate list is active)
+    if (plain_nav and stroke.key == "Up")
+        or (alt_only and stroke.key == "Up")
         or (ctrl_only and stroke.key == "Up")
         or (alt_only and stroke.key == "p" and ctrl.items.is_empty()) {
         let hist = ctrl.history_list(ctrl.request.kind)
         if not hist.is_empty() {
-            if ctrl.history_idx < 0 {
+            let search_from = if ctrl.history_idx < 0 {
                 ctrl.saved_draft = ctrl.input_text
-                ctrl.history_idx = hist.len() - 1
-            } else if ctrl.history_idx > 0 {
-                ctrl.history_idx -= 1
+                hist.len() - 1
+            } else {
+                ctrl.history_idx - 1
             }
-            ctrl.input_text = hist.get(ctrl.history_idx.as(usize)).as(String)
-            ctrl.cursor_col = ctrl.input_text.char_len()
-            ctrl.selection_touched = false
-            ctrl.selected_idx = 0
-            refresh_controller(kernel, world, ctrl)
+            let prev_idx = find_prev_history_index(
+                hist,
+                search_from,
+                ctrl.saved_draft,
+                ctrl.request.initial,
+                ctrl.input_text,
+            )
+            if prev_idx >= 0 {
+                ctrl.history_idx = prev_idx
+                ctrl.input_text = hist.get(prev_idx.as(usize)).as(String)
+                ctrl.cursor_col = ctrl.input_text.char_len()
+                ctrl.selection_touched = false
+                ctrl.selected_idx = 0
+                refresh_controller(kernel, world, ctrl)
+            }
         }
         return true
     }
 
-    if (alt_only and stroke.key == "Down")
+    if (plain_nav and stroke.key == "Down")
+        or (alt_only and stroke.key == "Down")
         or (ctrl_only and stroke.key == "Down")
         or (alt_only and stroke.key == "n" and ctrl.items.is_empty()) {
         let hist = ctrl.history_list(ctrl.request.kind)
         if ctrl.history_idx >= 0 {
-            if ctrl.history_idx + 1 < hist.len() {
-                ctrl.history_idx += 1
-                ctrl.input_text = hist.get(ctrl.history_idx.as(usize)).as(String)
+            let next_idx = find_next_history_index(
+                hist,
+                ctrl.history_idx + 1,
+                ctrl.saved_draft,
+                ctrl.request.initial,
+                ctrl.input_text,
+            )
+            if next_idx >= 0 {
+                ctrl.history_idx = next_idx
+                ctrl.input_text = hist.get(next_idx.as(usize)).as(String)
             } else {
                 ctrl.history_idx = -1
                 ctrl.input_text = ctrl.saved_draft
@@ -3969,7 +4415,7 @@ pub fn minibuffer_handle_key(
         return true
     }
 
-    -- 7. Cursor Movement & Line Editing
+    -- 7. Cursor Movement, Fish-Style History Ghost Acceptance & Line Editing
     if (stroke.ctrl and (not stroke.alt) and stroke.key == "a") or
         ((not stroke.ctrl) and (not stroke.alt) and stroke.key == "Home") {
         ctrl.cursor_col = 0
@@ -3979,8 +4425,17 @@ pub fn minibuffer_handle_key(
 
     if (stroke.ctrl and (not stroke.alt) and stroke.key == "e") or
         ((not stroke.ctrl) and (not stroke.alt) and stroke.key == "End") {
-        ctrl.cursor_col = ctrl.input_text.char_len()
-        ctrl.sync_to_world(world)
+        if ctrl.cursor_col >= ctrl.input_text.char_len() and ctrl.history_ghost != "" {
+            ctrl.input_text = ctrl.input_text ++ ctrl.history_ghost
+            ctrl.cursor_col = ctrl.input_text.char_len()
+            ctrl.history_idx = -1
+            ctrl.selection_touched = false
+            ctrl.selected_idx = 0
+            refresh_controller(kernel, world, ctrl)
+        } else {
+            ctrl.cursor_col = ctrl.input_text.char_len()
+            ctrl.sync_to_world(world)
+        }
         return true
     }
 
@@ -3998,6 +4453,39 @@ pub fn minibuffer_handle_key(
         if ctrl.cursor_col < ctrl.input_text.char_len() {
             ctrl.cursor_col += 1
             ctrl.sync_to_world(world)
+        } else if ctrl.history_ghost != "" {
+            ctrl.input_text = ctrl.input_text ++ ctrl.history_ghost
+            ctrl.cursor_col = ctrl.input_text.char_len()
+            ctrl.history_idx = -1
+            ctrl.selection_touched = false
+            ctrl.selected_idx = 0
+            refresh_controller(kernel, world, ctrl)
+        }
+        return true
+    }
+
+    if alt_only and (stroke.key == "f" or stroke.key == "Right") {
+        let in_len = ctrl.input_text.char_len()
+        if ctrl.cursor_col < in_len {
+            let rem = ctrl.input_text.drop(ctrl.cursor_col)
+            ctrl.cursor_col += forward_word_len_in_text(rem)
+            ctrl.sync_to_world(world)
+        } else if ctrl.history_ghost != "" {
+            let take_n = forward_word_len_in_text(ctrl.history_ghost)
+            ctrl.input_text = ctrl.input_text ++ ctrl.history_ghost.take(take_n)
+            ctrl.cursor_col = ctrl.input_text.char_len()
+            ctrl.history_idx = -1
+            ctrl.selection_touched = false
+            ctrl.selected_idx = 0
+            refresh_controller(kernel, world, ctrl)
+        }
+        return true
+    }
+
+    if alt_only and (stroke.key == "b" or stroke.key == "Left") {
+        if ctrl.cursor_col > 0 {
+            ctrl.cursor_col = backward_word_col_in_text(ctrl.input_text, ctrl.cursor_col)
+            ctrl.sync_to_world(world)
         }
         return true
     }
@@ -4008,6 +4496,7 @@ pub fn minibuffer_handle_key(
             let s = ctrl.input_text
             ctrl.input_text = s.slice(0, ctrl.cursor_col - 1) ++ s.slice(ctrl.cursor_col, s.char_len())
             ctrl.cursor_col -= 1
+            ctrl.history_idx = -1
             ctrl.selection_touched = false
             ctrl.selected_idx = 0
             refresh_controller(kernel, world, ctrl)
@@ -4019,6 +4508,7 @@ pub fn minibuffer_handle_key(
         let s = ctrl.input_text
         if ctrl.cursor_col < s.char_len() {
             ctrl.input_text = s.slice(0, ctrl.cursor_col) ++ s.slice(ctrl.cursor_col + 1, s.char_len())
+            ctrl.history_idx = -1
             ctrl.selection_touched = false
             ctrl.selected_idx = 0
             refresh_controller(kernel, world, ctrl)
@@ -4031,6 +4521,7 @@ pub fn minibuffer_handle_key(
         let s = ctrl.input_text
         if ctrl.cursor_col < s.char_len() {
             ctrl.input_text = s.slice(0, ctrl.cursor_col) ++ s.slice(ctrl.cursor_col + 1, s.char_len())
+            ctrl.history_idx = -1
             ctrl.selection_touched = false
             ctrl.selected_idx = 0
             refresh_controller(kernel, world, ctrl)
@@ -4045,6 +4536,7 @@ pub fn minibuffer_handle_key(
             let killed = s.slice(ctrl.cursor_col, s.char_len())
             world.kill_ring.push(killed, linewise = false, append = false)
             ctrl.input_text = s.slice(0, ctrl.cursor_col)
+            ctrl.history_idx = -1
             ctrl.selection_touched = false
             ctrl.selected_idx = 0
             refresh_controller(kernel, world, ctrl)
@@ -4061,6 +4553,7 @@ pub fn minibuffer_handle_key(
             ctrl.input_text = ""
             ctrl.cursor_col = 0
         }
+        ctrl.history_idx = -1
         ctrl.selection_touched = false
         ctrl.selected_idx = 0
         refresh_controller(kernel, world, ctrl)
@@ -4075,6 +4568,7 @@ pub fn minibuffer_handle_key(
             world.kill_ring.push(killed, linewise = false, append = false)
             ctrl.input_text = s.slice(0, target_col) ++ s.slice(ctrl.cursor_col, s.char_len())
             ctrl.cursor_col = target_col
+            ctrl.history_idx = -1
             ctrl.selection_touched = false
             ctrl.selected_idx = 0
             refresh_controller(kernel, world, ctrl)
@@ -4089,6 +4583,7 @@ pub fn minibuffer_handle_key(
             let s = ctrl.input_text
             ctrl.input_text = s.slice(0, ctrl.cursor_col) ++ ytext ++ s.slice(ctrl.cursor_col, s.char_len())
             ctrl.cursor_col += ytext.char_len()
+            ctrl.history_idx = -1
             ctrl.selection_touched = false
             ctrl.selected_idx = 0
             refresh_controller(kernel, world, ctrl)
@@ -4100,9 +4595,24 @@ pub fn minibuffer_handle_key(
     let ch_opt = stroke_printable_text(stroke)
     if ch_opt != null {
         let ch = ch_opt.as(String)
+        if ch == " " and ctrl.request.kind == PromptKind.ex_command and ctrl.selection_touched and
+            (not ctrl.items.is_empty()) and ctrl.selected_idx >= 0 and ctrl.selected_idx < ctrl.items.len() {
+            let (_, rest_cur) = split_ex_range_prefix(ctrl.input_text)
+            if not rest_cur.contains(" ") {
+                let (cand, _) = ctrl.items.get(ctrl.selected_idx.as(usize)).as((String, String))
+                ctrl.input_text = cand ++ " "
+                ctrl.cursor_col = ctrl.input_text.char_len()
+                ctrl.history_idx = -1
+                ctrl.selection_touched = false
+                ctrl.selected_idx = 0
+                refresh_controller(kernel, world, ctrl)
+                return true
+            }
+        }
         let s = ctrl.input_text
         ctrl.input_text = s.slice(0, ctrl.cursor_col) ++ ch ++ s.slice(ctrl.cursor_col, s.char_len())
         ctrl.cursor_col += ch.char_len()
+        ctrl.history_idx = -1
         ctrl.selection_touched = false
         ctrl.selected_idx = 0
         refresh_controller(kernel, world, ctrl)

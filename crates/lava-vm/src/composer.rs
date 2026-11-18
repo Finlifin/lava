@@ -691,8 +691,22 @@ fn resolve_nsbc_cache_dir_from_vars(
 
 fn resolve_nsbc_cache_dir(override_dir: Option<&Path>) -> Option<PathBuf> {
     let env_cache_dir = std::env::var("LAVA_NSBC_CACHE_DIR").ok();
-    let xdg_cache_home = std::env::var("XDG_CACHE_HOME").ok();
-    let home_dir = std::env::var("HOME").ok();
+    let xdg_cache_home = std::env::var("XDG_CACHE_HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("LOCALAPPDATA")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        });
+    let home_dir = std::env::var("HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("USERPROFILE")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        });
     resolve_nsbc_cache_dir_from_vars(
         override_dir,
         env_cache_dir.as_deref(),
@@ -716,7 +730,8 @@ fn nsbc_cache_path_for(
 ) -> Option<PathBuf> {
     let dir = resolve_nsbc_cache_dir(override_cache_dir)?;
     let mut hasher = ContentHasher128::new();
-    hasher.write_str("lava-nsbc-cache-v2");
+    hasher.write_str("lava-nsbc-cache-v3");
+    hasher.write_str(std::env::consts::OS);
     hasher.write_str(env!("CARGO_PKG_VERSION"));
     hasher.write_u64(u64::from(nsbc::VERSION));
     hasher.write_u64(u64::from(resolve_lava_opt_level().as_u8()));
@@ -939,7 +954,8 @@ impl LavaWorkspace {
         stats.sort();
 
         let mut hasher = ContentHasher128::new();
-        hasher.write_str("lava-stat-v2");
+        hasher.write_str("lava-stat-v3");
+        hasher.write_str(std::env::consts::OS);
         hasher.write_str(env!("CARGO_PKG_VERSION"));
         hasher.write_u64(u64::from(nsbc::VERSION));
         hasher.write_u64(u64::from(resolve_lava_opt_level().as_u8()));
@@ -1005,6 +1021,15 @@ fn store_stat_manifest_ptr(ptr_path: &Path, nsbc_path: &Path) {
     }
 }
 
+fn is_platform_disabled_extension(qualified_name: &str) -> bool {
+    // Windows 10 1709 predates ConPTY (`ext_toggleterm`) and disables Tree-sitter (`ext_treesitter`).
+    cfg!(windows)
+        && matches!(
+            qualified_name,
+            "lava.org/ext_toggleterm" | "lava.org/ext_treesitter"
+        )
+}
+
 fn scan_package_children(
     parent_dir: &Path,
     origin: PackageOrigin,
@@ -1029,7 +1054,10 @@ fn scan_package_children(
 
     let mut packages = Vec::with_capacity(subdirs.len());
     for subdir in subdirs {
-        packages.push(load_single_package(&subdir, origin)?);
+        let pkg = load_single_package(&subdir, origin)?;
+        if !is_platform_disabled_extension(&pkg.info.qualified_name) {
+            packages.push(pkg);
+        }
     }
     Ok(packages)
 }

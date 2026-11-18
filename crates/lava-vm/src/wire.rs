@@ -397,12 +397,12 @@ pub fn parse_draw_cmd(val: &NativeValue) -> Result<DrawCmd, String> {
     }
 }
 
-/// Parse `"ui_commit_frame"` arguments `[title, width, height, bg_rgba, pointer_code, wire_cmds]`
+/// Parse `"ui_commit_frame"` arguments `[title, width, height, bg_rgba, pointer_code, wire_cmds (, decorated)]`
 /// into a [`RenderFrame`].
 pub fn parse_commit_frame_args(args: &[NativeValue]) -> Result<RenderFrame, String> {
-    if args.len() != 6 {
+    if args.len() != 6 && args.len() != 7 {
         return Err(format!(
-            "ui_commit_frame expects 6 arguments, got {}",
+            "ui_commit_frame expects 6 or 7 arguments, got {}",
             args.len()
         ));
     }
@@ -412,6 +412,11 @@ pub fn parse_commit_frame_args(args: &[NativeValue]) -> Result<RenderFrame, Stri
     let bg_rgba = unpack_rgba(expect_i64(&args[3], "ui_commit_frame.bg_rgba")?);
     let pointer_code = expect_i64(&args[4], "ui_commit_frame.pointer_code")?;
     let raw_cmds = expect_list(&args[5], "ui_commit_frame.wire_cmds")?;
+    let decorated = if args.len() >= 7 {
+        expect_bool(&args[6], "ui_commit_frame.decorated")?
+    } else {
+        false
+    };
 
     let width = raw_width.clamp(1, i64::from(i32::MAX)) as i32;
     let height = raw_height.clamp(1, i64::from(i32::MAX)) as i32;
@@ -429,6 +434,7 @@ pub fn parse_commit_frame_args(args: &[NativeValue]) -> Result<RenderFrame, Stri
             height,
             background: bg_rgba,
             pointer: PointerStyle::from_code(pointer_code),
+            decorated,
         },
         commands,
     })
@@ -446,12 +452,12 @@ fn next_flat_val<'a>(
     Ok(v)
 }
 
-/// Parse `"ui_commit_frame_flat"` arguments `[title, width, height, bg_rgba, pointer_code, flat_list]`
+/// Parse `"ui_commit_frame_flat"` arguments `[title, width, height, bg_rgba, pointer_code, flat_list (, decorated)]`
 /// into a [`RenderFrame`] with a single reused Nessa `List` (zero per-command child `List`s or byte loops).
 pub fn parse_commit_frame_flat_args(args: &[NativeValue]) -> Result<RenderFrame, String> {
-    if args.len() != 6 {
+    if args.len() != 6 && args.len() != 7 {
         return Err(format!(
-            "ui_commit_frame_flat expects 6 arguments, got {}",
+            "ui_commit_frame_flat expects 6 or 7 arguments, got {}",
             args.len()
         ));
     }
@@ -461,6 +467,11 @@ pub fn parse_commit_frame_flat_args(args: &[NativeValue]) -> Result<RenderFrame,
     let bg_rgba = unpack_rgba(expect_i64(&args[3], "ui_commit_frame_flat.bg_rgba")?);
     let pointer_code = expect_i64(&args[4], "ui_commit_frame_flat.pointer_code")?;
     let items = expect_list(&args[5], "ui_commit_frame_flat.flat_list")?;
+    let decorated = if args.len() >= 7 {
+        expect_bool(&args[6], "ui_commit_frame_flat.decorated")?
+    } else {
+        false
+    };
 
     let width = raw_width.clamp(1, i64::from(i32::MAX)) as i32;
     let height = raw_height.clamp(1, i64::from(i32::MAX)) as i32;
@@ -683,6 +694,7 @@ pub fn parse_commit_frame_flat_args(args: &[NativeValue]) -> Result<RenderFrame,
             height,
             background: bg_rgba,
             pointer: PointerStyle::from_code(pointer_code),
+            decorated,
         },
         commands,
     })
@@ -739,12 +751,12 @@ fn read_utf8_str(buf: &[u8], cur: &mut usize, ctx: &str) -> Result<String, Strin
         .map_err(|e| format!("invalid UTF-8 in {ctx}: {e}"))
 }
 
-/// Parse `"ui_commit_frame_bytes"` arguments `[title, width, height, bg_rgba, pointer_code, bytes]`
+/// Parse `"ui_commit_frame_bytes"` arguments `[title, width, height, bg_rgba, pointer_code, bytes (, decorated)]`
 /// into a [`RenderFrame`] without per-command GC `List` or `Vec<NativeValue>` allocations.
 pub fn parse_commit_frame_bytes_args(args: &[NativeValue]) -> Result<RenderFrame, String> {
-    if args.len() != 6 {
+    if args.len() != 6 && args.len() != 7 {
         return Err(format!(
-            "ui_commit_frame_bytes expects 6 arguments, got {}",
+            "ui_commit_frame_bytes expects 6 or 7 arguments, got {}",
             args.len()
         ));
     }
@@ -760,6 +772,11 @@ pub fn parse_commit_frame_bytes_args(args: &[NativeValue]) -> Result<RenderFrame
                 "expected Bytes for ui_commit_frame_bytes.wire_bytes, got {other:?}"
             ));
         }
+    };
+    let decorated = if args.len() >= 7 {
+        expect_bool(&args[6], "ui_commit_frame_bytes.decorated")?
+    } else {
+        false
     };
 
     let width = raw_width.clamp(1, i64::from(i32::MAX)) as i32;
@@ -903,6 +920,7 @@ pub fn parse_commit_frame_bytes_args(args: &[NativeValue]) -> Result<RenderFrame
             height,
             background: bg_rgba,
             pointer: PointerStyle::from_code(pointer_code),
+            decorated,
         },
         commands,
     })

@@ -12,10 +12,18 @@ const PACKAGES: &[&str] = &[
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_LIBDIR");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_SYSROOT_DIR");
+
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        for lib in ["user32", "gdi32", "imm32", "dwmapi"] {
+            println!("cargo:rustc-link-lib={lib}");
+        }
+        return;
+    }
 
     let pkg_config = std::env::var("PKG_CONFIG").unwrap_or_else(|_| "pkg-config".to_string());
     let output = match Command::new(&pkg_config)

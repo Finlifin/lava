@@ -4,6 +4,8 @@
 //!    disk file roundtrip, and PangoCairo `--dump-frame-png` output verification.
 //! 3. Live decoupled GTK4 UI thread + `"lava-nessa-vm"` thread against `gtk4-broadwayd`.
 
+#![cfg(unix)]
+
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};

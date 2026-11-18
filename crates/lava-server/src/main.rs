@@ -6,9 +6,14 @@
 //! `rust-analyzer`, `pyright`, `gopls`, etc.).
 
 use std::env;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lava_lsp::which_binary;
 use lava_proto::{EventQueue, FrameSlot};
@@ -296,14 +301,289 @@ fn run_lsp_proxy(cwd: &str, cmd_name: &str, args: &[String]) -> Result<i32, Stri
     }
 }
 
-fn build_server_boot_options(entry_pkg: &str) -> BootOptions {
+fn generate_http_auth_token() -> String {
+    let mut bytes = [0u8; 32];
+    let mut filled = false;
+    if let Ok(mut urandom) = File::open("/dev/urandom")
+        && urandom.read_exact(&mut bytes).is_ok()
+    {
+        filled = true;
+    }
+    if !filled {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = u128::from(std::process::id());
+        let seed_a = nanos ^ (pid << 64) ^ 0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C834_u128;
+        let seed_b =
+            nanos.rotate_left(37) ^ (pid << 17) ^ 0xBF58_476D_1CE4_E5B9_94D0_49BB_1331_11EB_u128;
+        bytes[..16].copy_from_slice(&seed_a.to_le_bytes());
+        bytes[16..].copy_from_slice(&seed_b.to_le_bytes());
+    }
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn percent_decode(input: &str) -> String {
+    let raw = input.as_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0usize;
+    while i < raw.len() {
+        if raw[i] == b'%'
+            && i + 2 < raw.len()
+            && let (Some(hi), Some(lo)) = (
+                (raw[i + 1] as char).to_digit(16),
+                (raw[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+            continue;
+        }
+        out.push(raw[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn expand_remote_server_path(raw: &str) -> PathBuf {
+    let trimmed = raw.trim();
+    if (trimmed == "~" || trimmed.starts_with("~/"))
+        && let Ok(home) = env::var("HOME")
+        && !home.is_empty()
+    {
+        if trimmed == "~" {
+            return PathBuf::from(home);
+        }
+        return Path::new(&home).join(&trimmed[2..]);
+    }
+    PathBuf::from(trimmed)
+}
+
+fn write_http_status(stream: &mut TcpStream, code: u16, reason: &str, msg: &str) {
+    let body = msg.as_bytes();
+    let hdr = format!(
+        "HTTP/1.1 {code} {reason}\r\nContent-Length: {}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(hdr.as_bytes());
+    let _ = stream.write_all(body);
+    let _ = stream.flush();
+}
+
+fn handle_http_file_client(mut stream: TcpStream, expected_token: &str) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
+    let Ok(read_clone) = stream.try_clone() else {
+        return;
+    };
+    let mut reader = BufReader::new(read_clone);
+
+    let mut req_line = String::new();
+    if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+        return;
+    }
+    let mut parts = req_line.split_whitespace();
+    let Some(method) = parts.next() else {
+        return;
+    };
+    let Some(target) = parts.next() else {
+        return;
+    };
+
+    let mut auth_ok = false;
+    let mut content_len: usize = 0;
+    loop {
+        let mut hdr = String::new();
+        if reader.read_line(&mut hdr).unwrap_or(0) == 0 {
+            break;
+        }
+        let trimmed = hdr.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = trimmed.split_once(':') {
+            let key = k.trim();
+            let val = v.trim();
+            if key.eq_ignore_ascii_case("Authorization")
+                && let Some(tok) = val.strip_prefix("Bearer ")
+                && constant_time_eq(tok.trim().as_bytes(), expected_token.as_bytes())
+            {
+                auth_ok = true;
+            } else if key.eq_ignore_ascii_case("Content-Length") {
+                content_len = val.parse::<usize>().unwrap_or(0);
+            }
+        }
+    }
+
+    if !auth_ok {
+        write_http_status(&mut stream, 403, "Forbidden", "invalid bearer token");
+        return;
+    }
+
+    let Some(query) = target.strip_prefix("/lava-file?") else {
+        write_http_status(&mut stream, 404, "Not Found", "unknown endpoint");
+        return;
+    };
+    let mut raw_path = None;
+    for kv in query.split('&') {
+        if let Some(enc) = kv.strip_prefix("path=") {
+            raw_path = Some(percent_decode(enc));
+            break;
+        }
+    }
+    let Some(path_str) = raw_path.filter(|s| !s.is_empty()) else {
+        write_http_status(&mut stream, 400, "Bad Request", "missing path query param");
+        return;
+    };
+    let target_path = expand_remote_server_path(&path_str);
+
+    if method == "GET" {
+        let mut file = match File::open(&target_path) {
+            Ok(f) => f,
+            Err(err) => {
+                write_http_status(&mut stream, 404, "Not Found", &err.to_string());
+                return;
+            }
+        };
+        let meta = match file.metadata() {
+            Ok(m) if m.is_file() => m,
+            Ok(_) => {
+                write_http_status(
+                    &mut stream,
+                    400,
+                    "Bad Request",
+                    "path is not a regular file",
+                );
+                return;
+            }
+            Err(err) => {
+                write_http_status(&mut stream, 500, "Internal Server Error", &err.to_string());
+                return;
+            }
+        };
+        let len = meta.len();
+        let hdr = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n"
+        );
+        if stream.write_all(hdr.as_bytes()).is_err() {
+            return;
+        }
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if stream.write_all(&buf[..n]).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = stream.flush();
+    } else if method == "PUT" {
+        if let Some(parent) = target_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let tmp_path = target_path.with_extension(format!("lava-http-tmp-{}", std::process::id()));
+        let mut out_file = match File::create(&tmp_path) {
+            Ok(f) => f,
+            Err(err) => {
+                write_http_status(&mut stream, 500, "Internal Server Error", &err.to_string());
+                return;
+            }
+        };
+        let mut remaining = content_len;
+        let mut buf = vec![0u8; 64 * 1024];
+        while remaining > 0 {
+            let to_read = remaining.min(buf.len());
+            match reader.read(&mut buf[..to_read]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if out_file.write_all(&buf[..n]).is_err() {
+                        let _ = fs::remove_file(&tmp_path);
+                        write_http_status(&mut stream, 500, "Internal Server Error", "write error");
+                        return;
+                    }
+                    remaining -= n;
+                }
+                Err(err) => {
+                    let _ = fs::remove_file(&tmp_path);
+                    write_http_status(&mut stream, 500, "Internal Server Error", &err.to_string());
+                    return;
+                }
+            }
+        }
+        let _ = out_file.flush();
+        drop(out_file);
+        if let Err(err) = fs::rename(&tmp_path, &target_path) {
+            let _ = fs::remove_file(&tmp_path);
+            write_http_status(&mut stream, 500, "Internal Server Error", &err.to_string());
+            return;
+        }
+        write_http_status(&mut stream, 200, "OK", &content_len.to_string());
+    } else {
+        write_http_status(
+            &mut stream,
+            405,
+            "Method Not Allowed",
+            "expected GET or PUT",
+        );
+    }
+}
+
+/// Starts a background authenticated HTTP/1.1 streaming file server for >512 KiB transfers so
+/// multi-hundred-thousand-line files never occupy or block the interactive SSH stdio JSON-RPC pipe.
+fn start_http_file_server() -> Option<(u16, String)> {
+    let bind_addr = env::var("LAVA_HTTP_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:0".to_string());
+    let listener = TcpListener::bind(&bind_addr)
+        .or_else(|_| TcpListener::bind("127.0.0.1:0"))
+        .ok()?;
+    let port = listener.local_addr().ok()?.port();
+    let token = generate_http_auth_token();
+    let token_bg = token.clone();
+    thread::spawn(move || {
+        for incoming in listener.incoming().flatten() {
+            let tok = token_bg.clone();
+            thread::spawn(move || {
+                handle_http_file_client(incoming, &tok);
+            });
+        }
+    });
+    Some((port, token))
+}
+
+fn build_server_boot_options(entry_pkg: &str, http_port: u16, http_token: &str) -> BootOptions {
     let short_mod = entry_pkg
         .split_once('/')
         .map(|(_, short)| short)
         .unwrap_or(entry_pkg);
-    let main_src = format!(
-        "use @{short_mod}\n\nfn main() -> Unit {{\n    let _ = {short_mod}.boot_and_run_stdio() ! {{ e => {{\n        println(\"lava-server fatal: \" ++ e.to_string())\n        ()\n    }} }}\n    ()\n}}\n"
-    );
+    let main_src = if http_port > 0 && !http_token.is_empty() && short_mod == "srv_app" {
+        format!(
+            "use @{short_mod}\n\nfn main() -> Unit {{\n    let _ = {short_mod}.boot_and_run_stdio_with_http({http_port}, \"{http_token}\") ! {{ e => {{\n        println(\"lava-server fatal: \" ++ e.to_string())\n        ()\n    }} }}\n    ()\n}}\n"
+        )
+    } else {
+        format!(
+            "use @{short_mod}\n\nfn main() -> Unit {{\n    let _ = {short_mod}.boot_and_run_stdio() ! {{ e => {{\n        println(\"lava-server fatal: \" ++ e.to_string())\n        ()\n    }} }}\n    ()\n}}\n"
+        )
+    };
     BootOptions::new()
         .with_entry_pkg(entry_pkg)
         .with_headless(true)
@@ -357,7 +637,7 @@ fn run_server(opts: ServerCliOptions) -> Result<i32, String> {
             Ok(0)
         }
         ServerMode::Check => {
-            let boot_opts = build_server_boot_options(&opts.entry_pkg);
+            let boot_opts = build_server_boot_options(&opts.entry_pkg, 0, "");
             let exts = check_workspace(
                 &server_root,
                 &opts.extra_ext_dirs,
@@ -372,7 +652,8 @@ fn run_server(opts: ServerCliOptions) -> Result<i32, String> {
             Ok(0)
         }
         ServerMode::Stdio => {
-            let boot_opts = build_server_boot_options(&opts.entry_pkg);
+            let (http_port, http_token) = start_http_file_server().unwrap_or((0, String::new()));
+            let boot_opts = build_server_boot_options(&opts.entry_pkg, http_port, &http_token);
             let frame_slot = Arc::new(FrameSlot::new());
             let event_queue = Arc::new(EventQueue::new());
             let host_config = HostConfig::new(frame_slot, event_queue);

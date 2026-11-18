@@ -3,5 +3,5 @@ name = "lava-term"
 version.workspace = true
 edition.workspace = true
 
-[dependencies]
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true

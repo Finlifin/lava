@@ -698,8 +698,22 @@ pub(crate) unsafe fn render_frame_to_cairo_with_opts(
     // SAFETY: `cr` is non-null and verified by caller invariant; fills the background rectangle.
     unsafe {
         ffi::cairo_fill(cr);
+        render_commands_to_cairo(cr, &frame.commands, skip_caret_idx);
     }
+}
 
+/// Renders a slice of [`DrawCmd`]s directly onto `cr` without clearing the background surface.
+///
+/// # Safety
+/// `cr` must be a valid, non-null `*mut CairoT` exclusively accessed on the current thread.
+pub(crate) unsafe fn render_commands_to_cairo(
+    cr: *mut CairoT,
+    commands: &[DrawCmd],
+    skip_caret_idx: Option<usize>,
+) {
+    if cr.is_null() {
+        return;
+    }
     let mut pango_scope = PangoFrameScope::new(cr);
     let mut clip_depth: usize = 0;
     // SAFETY: `cr` is valid per caller invariant.
@@ -708,7 +722,7 @@ pub(crate) unsafe fn render_frame_to_cairo_with_opts(
     let mut row_buf = String::with_capacity(256);
     let mut row_spans: Vec<(u32, u32, ColorRgba, bool)> = Vec::with_capacity(64);
 
-    for (cmd_idx, cmd) in frame.commands.iter().enumerate() {
+    for (cmd_idx, cmd) in commands.iter().enumerate() {
         if cmd_idx < skip_until_idx {
             continue;
         }
@@ -820,7 +834,7 @@ pub(crate) unsafe fn render_frame_to_cairo_with_opts(
                     let can_try_batch = !*underline && (color.0 & 0xff) == 0xff;
                     let has_mergeable_next = can_try_batch
                         && matches!(
-                            frame.commands.get(cmd_idx + 1),
+                            commands.get(cmd_idx + 1),
                             Some(DrawCmd::TextRun {
                                 x: nx,
                                 y: ny,
@@ -875,7 +889,7 @@ pub(crate) unsafe fn render_frame_to_cairo_with_opts(
                             bold: nbold,
                             italic: nitalic,
                             underline: nul,
-                        }) = frame.commands.get(lookahead)
+                        }) = commands.get(lookahead)
                         {
                             if *nul
                                 || (ncol.0 & 0xff) != 0xff

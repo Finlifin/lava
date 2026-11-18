@@ -287,6 +287,7 @@ unsafe extern "C" {
     pub(crate) fn gtk_init_check() -> c_int;
     pub(crate) fn gtk_window_new() -> *mut GtkWidget;
     pub(crate) fn gtk_window_set_title(window: *mut GtkWindow, title: *const c_char);
+    pub(crate) fn gtk_window_set_decorated(window: *mut GtkWindow, setting: c_int);
     pub(crate) fn gtk_window_set_default_size(window: *mut GtkWindow, width: c_int, height: c_int);
     pub(crate) fn gtk_window_set_child(window: *mut GtkWindow, child: *mut GtkWidget);
     pub(crate) fn gtk_window_present(window: *mut GtkWindow);

@@ -977,8 +977,23 @@ pub struct GitRepoStatus {
     pub entries: Vec<(String, String, String)>,
 }
 
+fn strip_win_verbatim_buf(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        p
+    }
+}
+
 fn run_git(cwd: &str, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new("git");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1000,7 +1015,7 @@ static NON_REPO_STATUS_CACHE: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceL
 fn resolve_git_cwd_dir(cwd_or_path: &str) -> (String, PathBuf) {
     if cwd_or_path.is_empty() {
         let cur = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let canon = fs::canonicalize(&cur).unwrap_or(cur);
+        let canon = strip_win_verbatim_buf(fs::canonicalize(&cur).unwrap_or(cur));
         return (String::new(), canon);
     }
     let p = Path::new(cwd_or_path);
@@ -1009,7 +1024,7 @@ fn resolve_git_cwd_dir(cwd_or_path: &str) -> (String, PathBuf) {
     } else {
         p
     };
-    let canon = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let canon = strip_win_verbatim_buf(fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
     let dir_str = dir.to_string_lossy().into_owned();
     (dir_str, canon)
 }

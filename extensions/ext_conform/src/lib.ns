@@ -13,6 +13,9 @@ use std.time
 use @lava_core.{
     ExtId, InteractiveEffects, KeyBindingEntry, Keymap, SystemKernel, log_event, status_emit
 }
+use @lava_remote.{
+    is_ssh_uri, parent_ssh_uri, parse_ssh_uri, remote_exec, remote_remove, remote_write_lines
+}
 use @ext_document.{
     Buffer, BufferId, BufferKind, EditorWorld, NarrowRegion, Pos, ext_document_id,
     require_editor_world
@@ -1038,7 +1041,37 @@ pub fn format_prose_or_indent_lines(
 -- 5. Unified Buffer & Range Formatting Engine (Single Undo Checkpoint)
 -- ============================================================================
 
+fn conform_shell_quote(s: String) -> String {
+    "'" ++ s.replace("'", "'\\''") ++ "'"
+}
+
 fn run_external_formatter(spec: ExternalFormatterSpec, lines: List, cwd: String) -> !String List {
+    if is_ssh_uri(cwd) {
+        let pt = parse_ssh_uri(cwd)!
+        let rtmp = "/tmp/lava_conform_" ++ time.unix_millis().to_string() ++ ".tmp"
+        let rtmp_uri = pt.prefix ++ rtmp
+        let _ = remote_write_lines(rtmp_uri, lines, false)!
+        let cmd_parts = List()
+        cmd_parts.push(conform_shell_quote(spec.command))
+        for i in 0..spec.args.len() {
+            let a = spec.args.get(i.as(usize)).as(String)
+            if a == "$FILENAME" or a == "{{file}}" {
+                cmd_parts.push(conform_shell_quote(rtmp))
+            } else {
+                cmd_parts.push(conform_shell_quote(a))
+            }
+        }
+        let (rc, out_s, err_s) = remote_exec(cwd, cmd_parts.join(" "), cwd = pt.remote_path)!
+        let _ = remote_remove(rtmp_uri, recursive = false) ! { _ => () }
+        if rc != 0 {
+            return error (spec.name ++ " exited with status " ++ rc.to_string() ++ ": " ++ err_s.trim())
+        }
+        let rparts = out_s.lines()
+        if rparts.is_empty() {
+            rparts.push("")
+        }
+        return rparts
+    }
     let tmp_path = "/tmp/lava_conform_" ++ time.unix_millis().to_string() ++ ".tmp"
     let text = lines.join("\n") ++ "\n"
     let _ = fs.write_string(tmp_path, text) ! {
@@ -1106,7 +1139,8 @@ pub fn compute_formatted_lines(
         formatted_part = f(slice_in, sw, et)!
     } else if service.external_formatters.contains_key(mode) {
         let ext_spec = service.external_formatters.get(mode).as(ExternalFormatterSpec)
-        formatted_part = run_external_formatter(ext_spec, slice_in, world.cwd)!
+        let fmt_cwd = if is_ssh_uri(buf.file_path) { parent_ssh_uri(buf.file_path) } else { world.cwd }
+        formatted_part = run_external_formatter(ext_spec, slice_in, fmt_cwd)!
     } else if mode == "json" or mode == "jsonc" {
         formatted_part = format_json_lines(slice_in, sw, et)!
     } else if is_brace_structured_mode(mode) {

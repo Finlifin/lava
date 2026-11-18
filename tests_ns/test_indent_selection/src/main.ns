@@ -7,6 +7,7 @@
 --   3. Indentation text objects (`vii`, `vai`, `viI`, `vaI`, `dii`, `cii`, `yii`, `=ii`) & `[i` / `]i` motions
 --   4. Incremental expand/shrink (`<Space> v` / `<Space> V`, `<M-Up>` / `<M-Down>`, `:IndentExpand` / `:IndentShrink`)
 
+use std.path
 use @lava_sys.mock_enable
 use @lava_core.{
     HostClipboardCap, LogCollectorCap, PromptKind, StatusCollectorCap, SystemKernel,
@@ -274,12 +275,13 @@ fn test_normal_and_shared_commands() -> #[log_event, status_emit, clipboard_get,
     assert_str_eq(gib.line_at(0), "prefixMID_MORE_end", "gi resumed Insert at exact '^' mark")
 
     -- 2d. `gf` opens file under cursor (with `:line` jump!)
+    let gf_target = path.join(world.cwd, "packages/lava_core/package.toml")
     let gfb = setup_buffer(world, [
-        "see /home/fin/apps/lava/packages/lava_core/package.toml:3 for details"
+        "see " ++ gf_target ++ ":3 for details"
     ])
     vim_feed_keys(kernel, "0wgf")#!
     let opened = world.active_buffer()
-    assert_str_eq(opened.file_path, "/home/fin/apps/lava/packages/lava_core/package.toml", "gf opened file under cursor")
+    assert_str_eq(opened.file_path, gf_target, "gf opened file under cursor")
     assert_i64_eq(opened.point.row, 2, "gf jumped to 1-based :3 -> row 2")
 
     -- 2e. `gJ` joins lines WITHOUT inserting whitespace (in Normal and Visual)

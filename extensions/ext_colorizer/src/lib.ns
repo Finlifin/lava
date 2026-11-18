@@ -34,6 +34,7 @@ struct BufferDecorCache {
     rainbow_rows: Map,
     row_entry_stacks: Map,
     row_exit_stacks: Map,
+    checkpoints: Map,
     colors_enabled: bool,
     rainbow_enabled: bool,
     major_mode: String,
@@ -465,7 +466,23 @@ fn find_closing_single_quote(line: String, open_col: i64, llen: i64) -> i64 {
 }
 
 fn is_hash_comment_start(line: String, col: i64, llen: i64, mode_low: String) -> bool {
-    if mode_low == "rust" or mode_low == "c" or mode_low == "cpp" or mode_low == "css" or mode_low == "scss" {
+    if mode_low == "rust"
+        or mode_low == "rs"
+        or mode_low == "c"
+        or mode_low == "cpp"
+        or mode_low == "go"
+        or mode_low == "java"
+        or mode_low == "javascript"
+        or mode_low == "js"
+        or mode_low == "typescript"
+        or mode_low == "ts"
+        or mode_low == "tsx"
+        or mode_low == "jsx"
+        or mode_low == "lua"
+        or mode_low == "css"
+        or mode_low == "scss"
+        or mode_low == "json"
+        or mode_low == "jsonc" {
         return false
     }
     -- Never treat valid `#RGB`, `#RRGGBB`, or `#RRGGBBAA` color literals as comments!
@@ -473,33 +490,133 @@ fn is_hash_comment_start(line: String, col: i64, llen: i64, mode_low: String) ->
         return false
     }
     if mode_low == "python"
+        or mode_low == "py"
         or mode_low == "shell"
         or mode_low == "sh"
+        or mode_low == "bash"
+        or mode_low == "zsh"
+        or mode_low == "fish"
         or mode_low == "toml"
         or mode_low == "yaml"
+        or mode_low == "yml"
         or mode_low == "makefile"
+        or mode_low == "cmake"
+        or mode_low == "dockerfile"
+        or mode_low == "ruby"
+        or mode_low == "perl"
+        or mode_low == "nix"
         or mode_low == "conf" {
         return true
     }
-    -- In Nessa / generic text buffers, `# ...` (or `#` at start/after whitespace) starts a comment
+    -- In Nessa (`#[eff]`, `#Eff`, `call()#`), `#` is the algebraic effect operator!
+    -- Only treat `# ` / `#\t` (with whitespace before & after) or col-0 `#!` shebang as a comment.
+    let at_boundary = col == 0 or line.slice(col - 1, col) == " " or line.slice(col - 1, col) == "\t"
+    if not at_boundary {
+        return false
+    }
     if col + 1 >= llen {
-        return true
+        return col == 0
     }
     let next_ch = line.slice(col + 1, col + 2)
-    if next_ch == " " or next_ch == "\t" {
-        return true
-    }
-    col == 0 or line.slice(col - 1, col) == " " or line.slice(col - 1, col) == "\t"
+    next_ch == " " or next_ch == "\t" or (col == 0 and next_ch == "!")
 }
 
 fn is_double_dash_comment_mode(mode_low: String) -> bool {
     mode_low != "c"
         and mode_low != "cpp"
         and mode_low != "rust"
+        and mode_low != "rs"
         and mode_low != "go"
         and mode_low != "javascript"
+        and mode_low != "js"
         and mode_low != "typescript"
+        and mode_low != "ts"
+        and mode_low != "tsx"
+        and mode_low != "jsx"
         and mode_low != "java"
+        and mode_low != "python"
+        and mode_low != "py"
+        and mode_low != "sh"
+        and mode_low != "shell"
+        and mode_low != "bash"
+}
+
+fn is_backtick_string_mode(mode_low: String) -> bool {
+    mode_low == "go"
+        or mode_low == "javascript"
+        or mode_low == "js"
+        or mode_low == "typescript"
+        or mode_low == "ts"
+        or mode_low == "tsx"
+        or mode_low == "jsx"
+        or mode_low == "sh"
+        or mode_low == "shell"
+        or mode_low == "bash"
+        or mode_low == "sql"
+        or mode_low == "markdown"
+        or mode_low == "md"
+        or mode_low == "gfm"
+}
+
+-- Recognize Rust raw string opening at `col` (`r"..."`, `r#"..."#`, `br#"..."#`, `cr#"..."#`),
+-- returning `?(after_open_col, closing_delim)`.
+fn try_match_rust_raw_str(line: String, col: i64, llen: i64) -> ?(i64, String) {
+    if col > 0 and is_ident_char(line.slice(col - 1, col)) {
+        return null
+    }
+    let ch0 = line.slice(col, col + 1)
+    var p_len: i64 = 0
+    if ch0 == "r" {
+        p_len = 1
+    } else if (ch0 == "b" or ch0 == "c") and col + 1 < llen and line.slice(col + 1, col + 2) == "r" {
+        p_len = 2
+    } else {
+        return null
+    }
+    var idx = col + p_len
+    var hashes = ""
+    while idx < llen and line.slice(idx, idx + 1) == "#" {
+        hashes = hashes ++ "#"
+        idx += 1
+    }
+    if idx < llen and line.slice(idx, idx + 1) == "\"" {
+        return (idx + 1, "\"" ++ hashes)
+    }
+    null
+}
+
+-- Recognize Rust char / byte-char literal `'x'`, `'\n'`, `'\''`, `'\x7f'`, `'\u{10FFFF}'` at `'`,
+-- returning end_col (exclusive) or -1 if it is a lifetime (`'a`, `'static`).
+fn match_rust_char_end(line: String, quote_col: i64, llen: i64) -> i64 {
+    if quote_col + 2 >= llen {
+        return -1
+    }
+    let c1 = line.slice(quote_col + 1, quote_col + 2)
+    if c1 == "'" {
+        return -1
+    }
+    if c1 != "\\" {
+        if line.slice(quote_col + 2, quote_col + 3) == "'" {
+            return quote_col + 3
+        }
+        return -1
+    }
+    var i = quote_col + 2
+    var limit = quote_col + 14
+    if limit > llen {
+        limit = llen
+    }
+    while i < limit {
+        let ch = line.slice(i, i + 1)
+        if ch == "'" {
+            return i + 1
+        }
+        if ch == " " or ch == "\t" {
+            return -1
+        }
+        i += 1
+    }
+    -1
 }
 
 fn clone_rainbow_stack(src: List) -> List {
@@ -531,15 +648,18 @@ fn scan_single_line_rainbow(
     dash_cmt: bool,
     err_col: i64,
     stack: List,
-    block_cmt_in: String,
+    ml_end_in: String,
+    ml_esc_in: bool,
+    stack_anchored: bool,
     emit_decors: bool,
     out_decors: List,
-) -> (String, bool) {
-    var block_cmt_end = block_cmt_in
-    if block_cmt_end == "" {
+) -> (String, bool, bool) {
+    var ml_end = ml_end_in
+    var ml_esc = ml_esc_in
+    if ml_end == "" {
         let lead = line.trim_start()
         if lead.starts_with("//") or (dash_cmt and lead.starts_with("--") and (not lead.starts_with("--[["))) {
-            return ("", false)
+            return ("", false, false)
         }
         if (not line.contains("("))
             and (not line.contains(")"))
@@ -548,14 +668,18 @@ fn scan_single_line_rainbow(
             and (not line.contains("{{"))
             and (not line.contains("}}"))
             and (not line.contains("/*"))
-            and (not line.contains("--[[")) {
-            return ("", false)
+            and (not line.contains("--[["))
+            and (not line.contains("\""))
+            and (not line.contains("'"))
+            and (not line.contains("`")) {
+            return ("", false, false)
         }
     }
-    if block_cmt_end == ""
+    if ml_end == ""
         and line.is_ascii()
         and (not line.contains("\""))
         and (not line.contains("'"))
+        and (not line.contains("`"))
         and (not line.contains("//"))
         and (not line.contains("/*"))
         and (not line.contains("#"))
@@ -578,7 +702,11 @@ fn scan_single_line_rainbow(
                 let want = if b == 41 { "(" } else if b == 93 { "[" } else { "{{" }
                 if stack.is_empty() {
                     if emit_decors {
-                        out_decors.push((r, idx, idx + 1, err_col, true))
+                        if stack_anchored {
+                            out_decors.push((r, idx, idx + 1, err_col, true))
+                        } else {
+                            out_decors.push((r, idx, idx + 1, rainbow_palette_color(0), false))
+                        }
                     }
                 } else {
                     let top_idx = (stack.len() - 1).as(usize)
@@ -588,23 +716,44 @@ fn scan_single_line_rainbow(
                         if emit_decors {
                             out_decors.push((r, idx, idx + 1, rainbow_palette_color(open_depth), false))
                         }
-                    } else if emit_decors {
-                        out_decors.push((r, idx, idx + 1, err_col, true))
+                    } else {
+                        if emit_decors {
+                            out_decors.push((r, idx, idx + 1, err_col, true))
+                        }
+                        if stack.len() >= 2 {
+                            let (below_ch, _) = stack.get((stack.len() - 2).as(usize)).as((String, i64))
+                            if below_ch == want {
+                                let _ = stack.pop()
+                                let _ = stack.pop()
+                            } else if open_ch != "{{" and want != "{{" {
+                                let _ = stack.pop()
+                            }
+                        } else if open_ch != "{{" and want != "{{" {
+                            let _ = stack.pop()
+                        }
                     }
                 }
             }
         }
-        return ("", touched_ascii)
+        return ("", false, touched_ascii)
     }
+
     let llen = line.char_len()
+    let is_rust = eff_mode == "rust" or eff_mode == "rs"
+    let backtick_ok = is_backtick_string_mode(eff_mode)
     var touched = false
     var c: i64 = 0
     while c < llen {
-        if block_cmt_end != "" {
+        if ml_end != "" {
             touched = true
-            let elen = block_cmt_end.char_len()
-            if c + elen <= llen and line.slice(c, c + elen) == block_cmt_end {
-                block_cmt_end = ""
+            if ml_esc and line.slice(c, c + 1) == "\\" {
+                c += 2
+                continue
+            }
+            let elen = ml_end.char_len()
+            if c + elen <= llen and line.slice(c, c + elen) == ml_end {
+                ml_end = ""
+                ml_esc = false
                 c += elen
             } else {
                 c += 1
@@ -614,13 +763,15 @@ fn scan_single_line_rainbow(
 
         if dash_cmt and c + 4 <= llen and line.slice(c, c + 4) == "--[[" {
             touched = true
-            block_cmt_end = "]]"
+            ml_end = "]]"
+            ml_esc = false
             c += 4
             continue
         }
         if c + 2 <= llen and line.slice(c, c + 2) == "/*" {
             touched = true
-            block_cmt_end = "*/"
+            ml_end = "*/"
+            ml_esc = false
             c += 2
             continue
         }
@@ -637,31 +788,124 @@ fn scan_single_line_rainbow(
             break
         }
 
+        if is_rust {
+            if (ch == "r" or ch == "b" or ch == "c") {
+                let raw_opt = try_match_rust_raw_str(line, c, llen)
+                if raw_opt != null {
+                    let (after_c, close_d) = raw_opt.as((i64, String))
+                    touched = true
+                    ml_end = close_d
+                    ml_esc = false
+                    c = after_c
+                    continue
+                }
+                if ch == "b" and c + 1 < llen and line.slice(c + 1, c + 2) == "'" and (c == 0 or (not is_ident_char(line.slice(c - 1, c)))) {
+                    let bch_end = match_rust_char_end(line, c + 1, llen)
+                    if bch_end > c {
+                        c = bch_end
+                        continue
+                    }
+                }
+            }
+        }
+
+        if c + 3 <= llen {
+            let tri = line.slice(c, c + 3)
+            if tri == "\"\"\"" or (tri == "'''" and (not is_rust)) {
+                touched = true
+                ml_end = tri
+                ml_esc = true
+                c += 3
+                continue
+            }
+        }
+
+        if backtick_ok and ch == "`" {
+            touched = true
+            ml_end = "`"
+            ml_esc = eff_mode != "go" and eff_mode != "sql"
+            c += 1
+            continue
+        }
+
         if ch == "\"" {
             c += 1
+            let lb = "{{"
+            let rb = "}}"
+            let nessa_interp = eff_mode == "nessa" or eff_mode == ""
+            var interp_depth: i64 = 0
+            var closed_q = false
+            var ended_with_bs = false
             while c < llen {
                 let sch = line.slice(c, c + 1)
                 if sch == "\\" {
+                    if c + 1 >= llen {
+                        ended_with_bs = true
+                        c += 1
+                        break
+                    }
                     c += 2
                     continue
                 }
-                if sch == "\"" {
+                if nessa_interp {
+                    if interp_depth == 0 {
+                        if c + 2 <= llen and (line.slice(c, c + 2) == lb ++ lb or line.slice(c, c + 2) == rb ++ rb) {
+                            c += 2
+                            continue
+                        }
+                        if sch == lb {
+                            interp_depth = 1
+                            c += 1
+                            continue
+                        }
+                    } else {
+                        if sch == "\"" {
+                            c += 1
+                            while c < llen {
+                                let nch = line.slice(c, c + 1)
+                                if nch == "\\" {
+                                    c += 2
+                                    continue
+                                }
+                                c += 1
+                                if nch == "\"" {
+                                    break
+                                }
+                            }
+                            continue
+                        }
+                        if sch == lb {
+                            interp_depth += 1
+                            c += 1
+                            continue
+                        }
+                        if sch == rb {
+                            interp_depth -= 1
+                            c += 1
+                            continue
+                        }
+                    }
+                }
+                if interp_depth == 0 and sch == "\"" {
+                    closed_q = true
                     c += 1
                     break
                 }
                 c += 1
             }
+            if (not closed_q) and (ended_with_bs or is_rust) {
+                touched = true
+                ml_end = "\""
+                ml_esc = true
+            }
             continue
         }
 
         if ch == "'" {
-            if eff_mode == "rust" or eff_mode == "rs" {
-                if c + 2 < llen and line.slice(c + 1, c + 2) != "\\" and line.slice(c + 2, c + 3) == "'" {
-                    c += 3
-                    continue
-                }
-                if c + 3 < llen and line.slice(c + 1, c + 2) == "\\" and line.slice(c + 3, c + 4) == "'" {
-                    c += 4
+            if is_rust {
+                let ch_end = match_rust_char_end(line, c, llen)
+                if ch_end > c {
+                    c = ch_end
                     continue
                 }
             } else if c == 0 or (not line.slice(c - 1, c).is_alphanumeric()) {
@@ -685,7 +929,11 @@ fn scan_single_line_rainbow(
             let want = matching_open_for_close(ch)
             if stack.is_empty() {
                 if emit_decors {
-                    out_decors.push((r, c, c + 1, err_col, true))
+                    if stack_anchored {
+                        out_decors.push((r, c, c + 1, err_col, true))
+                    } else {
+                        out_decors.push((r, c, c + 1, rainbow_palette_color(0), false))
+                    }
                 }
             } else {
                 let top_idx = (stack.len() - 1).as(usize)
@@ -699,41 +947,81 @@ fn scan_single_line_rainbow(
                     if emit_decors {
                         out_decors.push((r, c, c + 1, err_col, true))
                     }
+                    if stack.len() >= 2 {
+                        let (below_ch, _) = stack.get((stack.len() - 2).as(usize)).as((String, i64))
+                        if below_ch == want {
+                            let _ = stack.pop()
+                            let _ = stack.pop()
+                        }
+                    }
                 }
             }
         }
         c += 1
     }
-    (block_cmt_end, touched)
+    (ml_end, ml_esc, touched)
 }
 
-fn decorate_buffer_rainbow(buf: Buffer, win_start: i64, win_end: i64) -> (Map, Map, Map) {
+const RAINBOW_CHECKPOINT_STRIDE: i64 = 128
+const RAINBOW_MAX_FULL_ANCHOR_ROW: i64 = 16384
+
+fn decorate_buffer_rainbow(
+    buf: Buffer,
+    win_start: i64,
+    win_end: i64,
+    seed_checkpoints: Map,
+) -> (Map, Map, Map, Map) {
     let touched_rows = Map.new()
     let entry_stacks = Map.new()
     let exit_stacks = Map.new()
+    let out_checkpoints = Map.new()
+    for cp_k in seed_checkpoints.keys() {
+        out_checkpoints.set(cp_k, seed_checkpoints.get(cp_k))
+    }
+
     let mode_low = buf.major_mode.to_lower()
     if mode_low == "org" or mode_low == "text" or mode_low == "plaintext" or mode_low == "info" or mode_low == "help" {
-        return (touched_rows, entry_stacks, exit_stacks)
+        return (touched_rows, entry_stacks, exit_stacks, out_checkpoints)
     }
     let is_md = mode_low == "markdown" or mode_low == "md" or mode_low == "gfm"
-    let stack = List()
-    var block_cmt_end = ""
+    var stack = List()
+    var ml_end = ""
+    var ml_esc = false
+    var stack_anchored = true
     let err_col = rainbow_unmatched_error_color()
     var in_md_fence = false
     var md_fc: i64 = 0
     var md_flen: i64 = 0
     var fence_mode = mode_low
-    let scan_from = if is_md {
-        0
-    } else if win_start > 80 {
-        win_start - 80
-    } else {
-        0
+
+    var scan_from: i64 = 0
+    if not is_md {
+        var cand_cp = (win_start / RAINBOW_CHECKPOINT_STRIDE) * RAINBOW_CHECKPOINT_STRIDE
+        while cand_cp > 0 {
+            let cp_key = cand_cp.to_string()
+            if out_checkpoints.contains(cp_key) {
+                let (cp_stack, cp_ml_end, cp_ml_esc) = out_checkpoints.get(cp_key).as((List, String, bool))
+                stack = clone_rainbow_stack(cp_stack)
+                ml_end = cp_ml_end
+                ml_esc = cp_ml_esc
+                scan_from = cand_cp
+                stack_anchored = true
+                break
+            }
+            cand_cp -= RAINBOW_CHECKPOINT_STRIDE
+        }
+        if scan_from == 0 and win_start > RAINBOW_MAX_FULL_ANCHOR_ROW {
+            scan_from = win_start - RAINBOW_CHECKPOINT_STRIDE
+            stack_anchored = false
+        }
     }
 
     let pending_decors = List()
     let lines = if win_end > scan_from { buf.slice_lines(scan_from, win_end) } else { List() }
     for r in scan_from..win_end {
+        if (not is_md) and stack_anchored and r > 0 and (r % RAINBOW_CHECKPOINT_STRIDE == 0) {
+            out_checkpoints.set(r.to_string(), (clone_rainbow_stack(stack), ml_end, ml_esc))
+        }
         let line = lines.get((r - scan_from).as(usize)).as(String)
         let r_key = r.to_string()
         if is_md {
@@ -748,7 +1036,8 @@ fn decorate_buffer_rainbow(buf: Buffer, win_start: i64, win_end: i64) -> (Map, M
                     while not stack.is_empty() {
                         let _ = stack.pop()
                     }
-                    block_cmt_end = ""
+                    ml_end = ""
+                    ml_esc = false
                     touched_rows.set(r_key, true)
                 }
                 continue
@@ -758,7 +1047,8 @@ fn decorate_buffer_rainbow(buf: Buffer, win_start: i64, win_end: i64) -> (Map, M
                 while not stack.is_empty() {
                     let _ = stack.pop()
                 }
-                block_cmt_end = ""
+                ml_end = ""
+                ml_esc = false
                 touched_rows.set(r_key, true)
                 continue
             }
@@ -766,29 +1056,32 @@ fn decorate_buffer_rainbow(buf: Buffer, win_start: i64, win_end: i64) -> (Map, M
         let eff_mode = if is_md { fence_mode } else { mode_low }
         let dash_cmt = is_double_dash_comment_mode(eff_mode)
         let emit_row = r >= win_start
-        if emit_row and (not is_md) and block_cmt_end == "" {
+        if emit_row and (not is_md) and ml_end == "" and stack_anchored {
             entry_stacks.set(r_key, clone_rainbow_stack(stack))
         }
-        let (next_block_cmt, row_touched) = scan_single_line_rainbow(
+        let (next_ml_end, next_ml_esc, row_touched) = scan_single_line_rainbow(
             line,
             r,
             eff_mode,
             dash_cmt,
             err_col,
             stack,
-            block_cmt_end,
+            ml_end,
+            ml_esc,
+            stack_anchored,
             emit_row,
             pending_decors,
         )
         if row_touched {
             touched_rows.set(r_key, true)
         }
-        if emit_row and (not is_md) and block_cmt_end == "" and next_block_cmt == "" {
+        if emit_row and (not is_md) and ml_end == "" and next_ml_end == "" and stack_anchored {
             exit_stacks.set(r_key, clone_rainbow_stack(stack))
         } else if emit_row and (not is_md) {
             let _ = entry_stacks.remove(r_key)
         }
-        block_cmt_end = next_block_cmt
+        ml_end = next_ml_end
+        ml_esc = next_ml_esc
     }
 
     for i in 0..pending_decors.len() {
@@ -803,7 +1096,7 @@ fn decorate_buffer_rainbow(buf: Buffer, win_start: i64, win_end: i64) -> (Map, M
             underline = ul,
         )
     }
-    (touched_rows, entry_stacks, exit_stacks)
+    (touched_rows, entry_stacks, exit_stacks, out_checkpoints)
 }
 
 -- ============================================================================
@@ -836,6 +1129,23 @@ fn line_has_rainbow_syntax(line: String) -> bool {
         or line.contains("--[[")
         or line.contains("```")
         or line.contains("~~~")
+        or line.contains("\"\"\"")
+        or line.contains("'''")
+        or line.contains("`")
+        or line.contains("r#\"")
+        or line.contains("br#\"")
+}
+
+fn filter_checkpoints_up_to(src: Map, max_row_inclusive: i64) -> Map {
+    let out = Map.new()
+    for k in src.keys() {
+        let k_str = k.as(String)
+        let r_opt = k_str.try_parse(i64)
+        if r_opt != null and r_opt.as(i64) <= max_row_inclusive {
+            out.set(k_str, src.get(k_str))
+        }
+    }
+    out
 }
 
 fn compute_scan_window(world: EditorWorld, buf: Buffer) -> (i64, i64) {
@@ -884,6 +1194,7 @@ pub fn refresh_buffer_colorizer(
     var prev_rainbow_rows = Map.new()
     var prev_entry_stacks = Map.new()
     var prev_exit_stacks = Map.new()
+    var seed_checkpoints = Map.new()
 
     if not force {
         let cached_opt = service.cache_by_buf.get(buf.id)
@@ -893,6 +1204,13 @@ pub fn refresh_buffer_colorizer(
             let same_cfg = cached.colors_enabled == service.colors_enabled
                 and cached.rainbow_enabled == service.rainbow_enabled
                 and cached.major_mode == buf.major_mode
+            if same_cfg {
+                if cached.edit_version == buf.edit_version {
+                    seed_checkpoints = cached.checkpoints
+                } else {
+                    seed_checkpoints = filter_checkpoints_up_to(cached.checkpoints, buf.point.row)
+                }
+            }
             if same_cfg and covered {
                 if cached.edit_version == buf.edit_version
                     or (service.last_scan_buf_id == buf.id and service.last_scan_ver == buf.edit_version) {
@@ -932,7 +1250,7 @@ pub fn refresh_buffer_colorizer(
                     if not is_md {
                         let work_stack = clone_rainbow_stack(cached.row_entry_stacks.get(cur_row_key).as(List))
                         let row_decors = List()
-                        let (blk_after, row_touched) = scan_single_line_rainbow(
+                        let (ml_after, _, row_touched) = scan_single_line_rainbow(
                             cur_line,
                             cur_row,
                             mode_low,
@@ -940,32 +1258,42 @@ pub fn refresh_buffer_colorizer(
                             rainbow_unmatched_error_color(),
                             work_stack,
                             "",
+                            false,
+                            true,
                             true,
                             row_decors,
                         )
                         let prev_exit = cached.row_exit_stacks.get(cur_row_key).as(List)
-                        if blk_after == "" and rainbow_stacks_equal(work_stack, prev_exit) {
-                            let kept = List()
-                            for di in 0..buf.inline_decors.len() {
-                                let d = buf.inline_decors.get(di.as(usize)).as(InlineSpanDecor)
-                                if not (d.owner == OWNER_RAINBOW and d.row == cur_row) {
-                                    kept.push(d)
+                        if ml_after == "" and rainbow_stacks_equal(work_stack, prev_exit) {
+                            let had_prev_row = cached.rainbow_rows.contains(cur_row_key)
+                            if had_prev_row or (not row_decors.is_empty()) {
+                                if had_prev_row {
+                                    let kept = List()
+                                    for di in 0..buf.inline_decors.len() {
+                                        let d = buf.inline_decors.get(di.as(usize)).as(InlineSpanDecor)
+                                        if not (d.owner == OWNER_RAINBOW and d.row == cur_row) {
+                                            kept.push(d)
+                                        }
+                                    }
+                                    buf.inline_decors = kept
+                                    buf.tracked_inline_len = kept.len()
+                                    buf.decor_gen += 1
                                 }
-                            }
-                            buf.inline_decors = kept
-                            for ri in 0..row_decors.len() {
-                                let (dr, sc, ec, fg, ul) = row_decors.get(ri.as(usize)).as((i64, i64, i64, i64, bool))
-                                buf.add_inline_decor(OWNER_RAINBOW, dr, sc, ec, bg_rgba = 0, fg_rgba = fg, underline = ul)
+                                for ri in 0..row_decors.len() {
+                                    let (dr, sc, ec, fg, ul) = row_decors.get(ri.as(usize)).as((i64, i64, i64, i64, bool))
+                                    buf.add_inline_decor(OWNER_RAINBOW, dr, sc, ec, bg_rgba = 0, fg_rgba = fg, underline = ul)
+                                }
                             }
                             if row_touched {
                                 cached.rainbow_rows.set(cur_row_key, true)
-                            } else {
+                            } else if had_prev_row {
                                 let _ = cached.rainbow_rows.remove(cur_row_key)
                             }
                             skip_rainbow_scan = true
                             prev_rainbow_rows = cached.rainbow_rows
                             prev_entry_stacks = cached.row_entry_stacks
                             prev_exit_stacks = cached.row_exit_stacks
+                            seed_checkpoints = cached.checkpoints
                         }
                     }
                 }
@@ -979,6 +1307,7 @@ pub fn refresh_buffer_colorizer(
                         rainbow_rows: prev_rainbow_rows,
                         row_entry_stacks: prev_entry_stacks,
                         row_exit_stacks: prev_exit_stacks,
+                        checkpoints: seed_checkpoints,
                         colors_enabled: service.colors_enabled,
                         rainbow_enabled: service.rainbow_enabled,
                         major_mode: buf.major_mode,
@@ -1011,17 +1340,20 @@ pub fn refresh_buffer_colorizer(
     var rainbow_rows = prev_rainbow_rows
     var entry_stacks = prev_entry_stacks
     var exit_stacks = prev_exit_stacks
+    var next_checkpoints = seed_checkpoints
     if not skip_rainbow_scan {
         buf.clear_owner_decors(OWNER_RAINBOW)
         if service.rainbow_enabled {
-            let (tr, ents, exts) = decorate_buffer_rainbow(buf, win_start, win_end)
+            let (tr, ents, exts, cps) = decorate_buffer_rainbow(buf, win_start, win_end, seed_checkpoints)
             rainbow_rows = tr
             entry_stacks = ents
             exit_stacks = exts
+            next_checkpoints = cps
         } else {
             rainbow_rows = Map.new()
             entry_stacks = Map.new()
             exit_stacks = Map.new()
+            next_checkpoints = Map.new()
         }
     }
 
@@ -1033,6 +1365,7 @@ pub fn refresh_buffer_colorizer(
         rainbow_rows: rainbow_rows,
         row_entry_stacks: entry_stacks,
         row_exit_stacks: exit_stacks,
+        checkpoints: next_checkpoints,
         colors_enabled: service.colors_enabled,
         rainbow_enabled: service.rainbow_enabled,
         major_mode: buf.major_mode,

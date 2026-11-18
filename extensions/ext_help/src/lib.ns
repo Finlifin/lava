@@ -1091,6 +1091,14 @@ pub fn all_option_metas() -> List {
             summary_zh: "启用原生 Tree-sitter 增量语法树高亮。",
         },
         OptionMeta {
+            name: "window_decorations",
+            short_alias: "decorations",
+            val_type: "bool",
+            set_example: ":set decorations  |  :set nodecorations",
+            summary_en: "Show OS window titlebar and frame decorations (default false).",
+            summary_zh: "显示系统窗口标题栏与边框装饰（默认 false 关闭）。",
+        },
+        OptionMeta {
             name: "zen_width",
             short_alias: "",
             val_type: "i64",
@@ -1212,6 +1220,7 @@ pub fn get_option_value_str(opts: EditorOptions, name: String) -> String {
         name == "smooth_scroll" => opts.smooth_scroll.to_string(),
         name == "cursor_anim" => opts.cursor_anim.to_string(),
         name == "treesitter" => opts.treesitter.to_string(),
+        name == "window_decorations" => opts.window_decorations.to_string(),
         else => "",
     }
 }
@@ -1263,6 +1272,7 @@ private fn toggle_bool_option(kernel: SystemKernel, world: EditorWorld, name: St
         name == "smooth_scroll" => { opts.smooth_scroll = not opts.smooth_scroll; next_val = opts.smooth_scroll },
         name == "cursor_anim" => { opts.cursor_anim = not opts.cursor_anim; next_val = opts.cursor_anim },
         name == "treesitter" => { opts.treesitter = not opts.treesitter; next_val = opts.treesitter },
+        name == "window_decorations" => { opts.window_decorations = not opts.window_decorations; next_val = opts.window_decorations },
         name == "evil_mode" => {
             opts.evil_mode = not opts.evil_mode
             let vim_opt = kernel.service(SERVICE_VIM)

@@ -524,10 +524,15 @@ mod tests {
         );
 
         let start = Instant::now();
+        let long_cmd = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >nul"
+        } else {
+            "exec sleep 30"
+        };
         let HostCallOutcome::Return(NativeValue::I64(job_id)) = handler.call(
             "sys_spawn_job",
             &[
-                NativeValue::Str("exec sleep 30".to_string()),
+                NativeValue::Str(long_cmd.to_string()),
                 NativeValue::Str(String::new()),
                 NativeValue::Str(String::new()),
             ],
@@ -660,8 +665,8 @@ fn await_key_and_bg_job(
         return error ("unexpected async sum: " ++ async_sum.to_string())
     }
 
-    -- Spawn a real non-blocking background OS process (`printf 'hello_bg\n'`) and receive AsyncJobDone.
-    let job_id = host_spawn_job("printf 'hello_bg\n'", "", "")
+    -- Spawn a real non-blocking background OS process (`echo hello_bg`) and receive AsyncJobDone.
+    let job_id = host_spawn_job("echo hello_bg", "", "")
     var job_out = ""
     while job_out == "" {
         let batch = host_wait_events(2000)
@@ -904,6 +909,7 @@ fn main() {
         height: 200,
         bg_rgba: rgba(10, 10, 15, 255),
         pointer: PointerHint.pointer,
+        decorated: true,
     }
     let _ = host_commit_frame(spec, cmds)
     host_request_quit(7)
@@ -924,6 +930,7 @@ fn main() {
         assert_eq!(frame.generation, 1);
         assert_eq!(frame.window.title, "MiniExe");
         assert_eq!(frame.window.pointer, PointerStyle::Pointer);
+        assert!(frame.window.decorated);
         assert_eq!(frame.commands.len(), 1);
     }
 

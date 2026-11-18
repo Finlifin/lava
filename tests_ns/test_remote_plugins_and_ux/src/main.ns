@@ -1,0 +1,657 @@
+-- End-to-End Integration Test Suite for:
+--   1. Window decorations option (`window_decorations` default `false`, `:set decorations`/`nodecorations`, `<Space>uD`)
+--      and visual remote transfer progress bar (`TransferProgressState` -> `DrawCmd` rendering)
+--   2. Minibuffer `<Up>` / `<Down>` prefix-aware input history navigation (without moving candidate `selected_idx`)
+--      and fish-shell style inline gray history autosuggestion (`minibuffer_history_ghost`, `<Right>`, `<M-f>`)
+--   3. OpenSSH profile connection (`:RemoteConnectProfile` / `:SshConnect`) & `~/.lava-server` auto-install (`:RemoteInstallServer`)
+--   4. `dirvish-fd` (`:DirvishFd`, `F`, `gf` in `mode:dirvish`, `gd` parent-dir jump, live preview, local & `ssh://`)
+--   5. Full remote (`ssh://`) adaptation across plugins (`ext_dirvish`, `ext_lualine`, `ext_gitsigns`, `ext_magit`,
+--      `ext_telescope`, `ext_neotree`, `ext_oil`, `ext_spectre`, `ext_todo_comments`, `ext_overseer`, `ext_cmp`, `ext_persistence`)
+--   6. Bracket highlighting regression suite (`ext_colorizer` + `ext_trouble` on Nessa `#` effects, string interpolation,
+--      >300-line scrolled checkpoints, non-cascading inline `(1 + 2]` inside `{ ... }`, and Rust raw/multiline strings & lifetimes)
+
+use std.fs
+use std.path
+use std.process
+use std.time
+use @lava_sys.{DrawCmd, RawUiEvent, mock_enable, mock_last_decorated}
+use @lava_core.{SystemKernel, clipboard_get, clipboard_set, log_event, status_emit}
+use @lava_remote.{
+    remote_connect, remote_discover_ssh_hosts, remote_register_mock_mount,
+    remote_set_ssh_config_path, remote_stat
+}
+use @ext_document.{
+    Buffer, BufferId, EditorWorld, FloatingWindow, GutterSign, InlineSpanDecor,
+    TransferProgressState, require_editor_world
+}
+use @ext_window.require_window_manager
+use @ext_render.compose_frame
+use @ext_app.{AppHostCap, app_commit_frame, app_feed_keys, app_step_event, boot_kernel}
+use @ext_remote.register_remote_extension
+use @ext_dirvish.{DIRVISH_BUF_NAME, DIRVISH_PREVIEW_BUF_NAME, register_dirvish_extension}
+use @ext_telescope.{FLOAT_PICKER_ID, FLOAT_PREVIEW_ID, register_telescope_extension}
+use @ext_neotree.register_neotree_extension
+use @ext_oil.register_oil_extension
+use @ext_magit.{register_magit_extension, require_magit_state}
+use @ext_gitsigns.{OWNER_GITSIGNS, register_gitsigns_extension}
+use @ext_lualine.register_lualine_extension
+use @ext_diff.register_diff_extension
+use @ext_spectre.register_spectre_extension
+use @ext_todo_comments.register_todo_comments_extension
+use @ext_overseer.register_overseer_extension
+use @ext_conform.register_conform_extension
+use @ext_snippets.register_snippets_extension
+use @ext_cmp.register_cmp_extension
+use @ext_persistence.register_persistence_extension
+use @ext_colorizer.{OWNER_RAINBOW, register_colorizer_extension}
+use @ext_trouble.{OWNER_TROUBLE, register_trouble_extension}
+use @ext_fold.register_fold_extension
+
+fn check_true(cond: bool, label: String) {
+    if not cond {
+        panic("FAILED: " ++ label)
+    }
+}
+
+fn check_eq_str(actual: String, expected: String, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual='" ++ actual ++ "' expected='" ++ expected ++ "'")
+    }
+}
+
+fn check_eq_i64(actual: i64, expected: i64, label: String) {
+    if actual != expected {
+        panic(label ++ ": actual=" ++ actual.to_string() ++ " expected=" ++ expected.to_string())
+    }
+}
+
+fn buf_has_substr(buf: Buffer, needle: String) -> bool {
+    for i in 0..buf.line_count() {
+        if buf.line_at(i).contains(needle) {
+            return true
+        }
+    }
+    false
+}
+
+fn find_buffer_by_name(world: EditorWorld, name: String) -> ?Buffer {
+    for i in 0..world.buffer_order.len() {
+        let bid = world.buffer_order.get(i.as(usize)).as(BufferId)
+        let b_opt = world.buffers.get(bid)
+        if b_opt != null {
+            let b = b_opt.as(Buffer)
+            if b.name == name {
+                return b
+            }
+        }
+    }
+    null
+}
+
+fn frame_has_text_substr(cmds: List, needle: String) -> bool {
+    for i in 0..cmds.len() {
+        let cmd = cmds.get(i.as(usize)).as(DrawCmd)
+        cmd match {
+            DrawCmd.text_run(_, _, text, _, _, _, _, _, _) => {
+                if text.contains(needle) {
+                    return true
+                }
+            },
+            _ => (),
+        }
+    }
+    false
+}
+
+fn count_underlined_rainbow_or_trouble_on_row(buf: Buffer, row: i64) -> i64 {
+    var cnt: i64 = 0
+    for i in 0..buf.inline_decors.len() {
+        let d = buf.inline_decors.get(i.as(usize)).as(InlineSpanDecor)
+        if d.row == row and d.underline and (d.owner == OWNER_RAINBOW or d.owner == OWNER_TROUBLE) {
+            cnt += 1
+        }
+    }
+    cnt
+}
+
+fn count_owner_signs(buf: Buffer, owner: String) -> i64 {
+    var cnt: i64 = 0
+    for i in 0..buf.signs.len() {
+        let s = buf.signs.get(i.as(usize)).as(GutterSign)
+        if s.owner == owner {
+            cnt += 1
+        }
+    }
+    cnt
+}
+
+fn boot_full_test_kernel() -> SystemKernel {
+    let kernel: SystemKernel = (boot_kernel() ! { e => panic(e) }).as(SystemKernel)
+    let _ = register_remote_extension(kernel) ! { e => panic(e) }
+    let _ = register_dirvish_extension(kernel) ! { e => panic(e) }
+    let _ = register_telescope_extension(kernel) ! { e => panic(e) }
+    let _ = register_neotree_extension(kernel) ! { e => panic(e) }
+    let _ = register_oil_extension(kernel) ! { e => panic(e) }
+    let _ = register_magit_extension(kernel) ! { e => panic(e) }
+    let _ = register_gitsigns_extension(kernel) ! { e => panic(e) }
+    let _ = register_lualine_extension(kernel) ! { e => panic(e) }
+    let _ = register_diff_extension(kernel) ! { e => panic(e) }
+    let _ = register_spectre_extension(kernel) ! { e => panic(e) }
+    let _ = register_todo_comments_extension(kernel) ! { e => panic(e) }
+    let _ = register_overseer_extension(kernel) ! { e => panic(e) }
+    let _ = register_conform_extension(kernel) ! { e => panic(e) }
+    let _ = register_snippets_extension(kernel) ! { e => panic(e) }
+    let _ = register_cmp_extension(kernel) ! { e => panic(e) }
+    let _ = register_persistence_extension(kernel) ! { e => panic(e) }
+    let _ = register_colorizer_extension(kernel) ! { e => panic(e) }
+    let _ = register_trouble_extension(kernel) ! { e => panic(e) }
+    let _ = register_fold_extension(kernel) ! { e => panic(e) }
+    let _ = kernel.activate_all() ! { e => panic(e) }
+    kernel
+}
+
+fn run_suite() {
+    println("=== test_remote_plugins_and_ux ===")
+    mock_enable(true)
+
+    let tmp_base = "/tmp/lava_remote_ux_" ++ time.unix_millis().to_string()
+    let local_proj = path.join(tmp_base, "local_proj")
+    let remote_root = path.join(tmp_base, "remote_devbox")
+    let remote_proj = path.join(remote_root, "project")
+    let _ = fs.create_dir(path.join(local_proj, "src/core"), parents = true) ! { e => panic(e.to_string()) }
+    let _ = fs.create_dir(path.join(local_proj, "docs"), parents = true) ! { e => panic(e.to_string()) }
+    let _ = fs.create_dir(path.join(remote_proj, "src/nested"), parents = true) ! { e => panic(e.to_string()) }
+
+    let lb = "{{"
+    let rb = "}}"
+    let _ = fs.write_string(
+        path.join(local_proj, "src/core/engine.ns"),
+        "pub fn boot_engine() -> i64 " ++ lb ++ "\n    42\n" ++ rb ++ "\n",
+    ) ! { e => panic(e.to_string()) }
+    let _ = fs.write_string(
+        path.join(local_proj, "docs/guide.md"),
+        "# Engine Guide\nFast local and remote editing.\n",
+    ) ! { e => panic(e.to_string()) }
+
+    -- Seed remote project files and initialize a real Git repository inside `remote_proj`
+    let _ = fs.write_string(
+        path.join(remote_proj, "src/lib.ns"),
+        "-- TODO: optimize remote loop\npub fn compute_remote(x: i64) -> i64 " ++ lb ++ "\n    x + 10\n" ++ rb ++ "\n",
+    ) ! { e => panic(e.to_string()) }
+    let _ = fs.write_string(
+        path.join(remote_proj, "src/nested/worker.ns"),
+        "pub fn run_worker() -> String " ++ lb ++ "\n    \"remote_worker_ok\"\n" ++ rb ++ "\n",
+    ) ! { e => panic(e.to_string()) }
+    let _ = fs.write_string(
+        path.join(remote_proj, "Makefile"),
+        "build:\n\t@echo remote_build_ok\n",
+    ) ! { e => panic(e.to_string()) }
+
+    let _ = process.run("git", args = ["init"], cwd = remote_proj)
+    let _ = process.run("git", args = ["config", "user.email", "dev@lava.org"], cwd = remote_proj)
+    let _ = process.run("git", args = ["config", "user.name", "Lava Dev"], cwd = remote_proj)
+    let _ = process.run("git", args = ["add", "."], cwd = remote_proj)
+    let _ = process.run("git", args = ["commit", "-m", "initial remote repo"], cwd = remote_proj)
+
+    remote_register_mock_mount("devbox", remote_root)
+
+    let kernel = boot_full_test_kernel()
+    let world: EditorWorld = (require_editor_world(kernel) ! { e => panic(e) }).as(EditorWorld)
+    let wm = (require_window_manager(kernel) ! { e => panic(e) })
+    world.cwd = local_proj
+
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let cap = AppHostCap.new(world)
+    let _ = app_step_event(kernel, RawUiEvent.resize(1400, 900, 1))# ! { e => panic(e) }
+
+    -- ========================================================================
+    -- PART 1: Window Decorations Option (Default OFF) & Transfer Progress Bar
+    -- ========================================================================
+    app_commit_frame(kernel)#
+    check_true(not world.options.window_decorations, "window_decorations defaults to false")
+    check_true(not mock_last_decorated(), "WindowSpec.decorated committed as false by default")
+
+    app_feed_keys(kernel, ":set<Space>decorations<Return>")# ! { e => panic(e) }
+    app_commit_frame(kernel)#
+    check_true(world.options.window_decorations, ":set decorations enabled window_decorations")
+    check_true(mock_last_decorated(), "WindowSpec.decorated committed as true")
+
+    app_feed_keys(kernel, ":set<Space>nodecorations<Return>")# ! { e => panic(e) }
+    app_commit_frame(kernel)#
+    check_true(not world.options.window_decorations, ":set nodecorations disabled window_decorations")
+    check_true(not mock_last_decorated(), "WindowSpec.decorated committed back to false")
+
+    app_feed_keys(kernel, "<Space>uD")# ! { e => panic(e) }
+    app_commit_frame(kernel)#
+    check_true(mock_last_decorated(), "<Space>uD toggled window decorations ON")
+    app_feed_keys(kernel, "<Space>uD")# ! { e => panic(e) }
+    app_commit_frame(kernel)#
+    check_true(not mock_last_decorated(), "<Space>uD toggled window decorations OFF")
+
+    -- Verify visual transfer progress bar renders `[HTTP]`, percentage, and loaded line count
+    world.transfer_progress = TransferProgressState {
+        active: true,
+        title: "Fetching huge_dataset.log",
+        detail: "ssh://devbox/var/log/huge_dataset.log",
+        transport: "HTTP",
+        bytes_done: 1048576,
+        bytes_total: 2097152,
+        lines_loaded: 125000,
+    }
+    let (_, prog_cmds) = compose_frame(kernel, world, wm)
+    check_true(frame_has_text_substr(prog_cmds, "[HTTP]"), "progress card displays [HTTP] transport badge")
+    check_true(frame_has_text_substr(prog_cmds, "50%"), "progress card displays 50% completion")
+    check_true(frame_has_text_substr(prog_cmds, "125000"), "progress card displays 125000 lines count")
+    world.transfer_progress = TransferProgressState.idle()
+    println("  [PASS] Part 1: Window decorations (default off + runtime toggle) & HTTP progress card")
+
+    -- ========================================================================
+    -- PART 2: Minibuffer <Up>/<Down> History + Fish Gray Ghost Autosuggestion
+    -- ========================================================================
+    app_feed_keys(kernel, ":set<Space>number<Return>")# ! { e => panic(e) }
+    app_feed_keys(kernel, ":set<Space>relativenumber<Return>")# ! { e => panic(e) }
+
+    app_feed_keys(kernel, ":")# ! { e => panic(e) }
+    check_true(world.minibuffer_view.active, "minibuffer opened for ':'")
+    check_eq_i64(world.minibuffer_view.selected_idx, 0, "initial selected_idx is 0")
+
+    -- `<M-n>` and `<M-p>` move candidates
+    app_feed_keys(kernel, "<M-n>")# ! { e => panic(e) }
+    check_eq_i64(world.minibuffer_view.selected_idx, 1, "<M-n> moved candidate selection to 1")
+    app_feed_keys(kernel, "<M-p>")# ! { e => panic(e) }
+    check_eq_i64(world.minibuffer_view.selected_idx, 0, "<M-p> moved candidate selection back to 0")
+
+    -- `<Up>` and `<Down>` switch history inputs instead of moving candidates!
+    app_feed_keys(kernel, "<Up>")# ! { e => panic(e) }
+    check_eq_str(world.minibuffer_view.input_text, "set relativenumber", "<Up> recalled most recent history entry")
+    app_feed_keys(kernel, "<Up>")# ! { e => panic(e) }
+    check_eq_str(world.minibuffer_view.input_text, "set number", "second <Up> recalled older history entry")
+    app_feed_keys(kernel, "<Down>")# ! { e => panic(e) }
+    check_eq_str(world.minibuffer_view.input_text, "set relativenumber", "<Down> stepped forward in history")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    -- Fish-style inline gray history ghost autosuggestion + `<Right>` full accept & `<M-f>` word accept
+    app_feed_keys(kernel, ":set<Space>rel")# ! { e => panic(e) }
+    check_eq_str(world.minibuffer_history_ghost, "ativenumber", "fish history ghost suggests suffix 'ativenumber'")
+    let (_, ghost_cmds) = compose_frame(kernel, world, wm)
+    check_true(frame_has_text_substr(ghost_cmds, "ativenumber"), "compose_frame renders gray history ghost suffix")
+    app_feed_keys(kernel, "<Right>")# ! { e => panic(e) }
+    check_eq_str(world.minibuffer_view.input_text, "set relativenumber", "<Right> at EOL accepted full fish history ghost")
+    check_eq_str(world.minibuffer_history_ghost, "", "ghost cleared once accepted")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    app_feed_keys(kernel, ":set<Space>")# ! { e => panic(e) }
+    check_eq_str(world.minibuffer_history_ghost, "relativenumber", "ghost suggests 'relativenumber' after 'set '")
+    app_feed_keys(kernel, "<M-f>")# ! { e => panic(e) }
+    check_eq_str(world.minibuffer_view.input_text, "set relativenumber", "<M-f> accepted next ghost word")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+    println("  [PASS] Part 2: Minibuffer <Up>/<Down> history & fish gray ghost autosuggestion")
+
+    -- ========================================================================
+    -- PART 3: OpenSSH Profile Connect & `~/.lava-server` Auto-Install Command
+    -- ========================================================================
+    let _ = remote_discover_ssh_hosts()
+    app_feed_keys(kernel, ":RemoteConnectProfile<Space>devbox<Return>")# ! { e => panic(e) }
+    check_true(world.cwd.starts_with("ssh://devbox"), ":RemoteConnectProfile connected and switched cwd to ssh://devbox")
+    check_eq_str(world.active_buffer().name, DIRVISH_BUF_NAME, ":RemoteConnectProfile opened Dirvish on remote host")
+
+    app_feed_keys(kernel, ":RemoteInstallServer<Space>ssh://devbox<Return>")# ! { e => panic(e) }
+    let srv_stat! = remote_stat("ssh://devbox/.lava-server/lava-server") else {
+        panic("remote_stat ~/.lava-server/lava-server failed")
+    }
+    check_true(srv_stat.exists, ":RemoteInstallServer installed binary into remote ~/.lava-server/lava-server")
+    let conn_after! = remote_connect("ssh://devbox") else {
+        panic("remote_connect devbox after install failed")
+    }
+    check_eq_str(conn_after.mode, "lava-server", "connection runs in lava-server mode after ~/.lava-server install")
+    println("  [PASS] Part 3: :RemoteConnectProfile & :RemoteInstallServer (~/.lava-server)")
+
+    -- ========================================================================
+    -- PART 4: `dirvish-fd` (Local & Remote `ssh://devbox/project`)
+    -- ========================================================================
+    world.cwd = local_proj
+    app_feed_keys(kernel, ":Dirvish<Space>" ++ local_proj ++ "<Return>")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, DIRVISH_BUF_NAME, "opened local *dirvish*")
+
+    -- Press `F<Return>` to trigger `dirvish-fd` recursively across all nested entries
+    app_feed_keys(kernel, "F<Return>")# ! { e => panic(e) }
+    let dv_local = world.active_buffer()
+    check_true(buf_has_substr(dv_local, "fd:*"), "*dirvish* header shows fd:* recursive finder badge")
+    check_true(buf_has_substr(dv_local, "src/core/engine.ns"), "local dirvish-fd found nested src/core/engine.ns")
+    check_true(buf_has_substr(dv_local, "docs/guide.md"), "local dirvish-fd found nested docs/guide.md")
+
+    -- Narrow via `/` to `engine.ns` and jump to its parent directory via `gd` (`dirvish-fd-jump`)
+    app_feed_keys(kernel, "/engine<Return>")# ! { e => panic(e) }
+    let pv_opt = find_buffer_by_name(world, DIRVISH_PREVIEW_BUF_NAME)
+    check_true(pv_opt != null, "*dirvish-preview* buffer exists during dirvish-fd")
+    check_true(buf_has_substr(pv_opt.as(Buffer), "boot_engine"), "dirvish-fd live preview loaded engine.ns contents")
+
+    app_feed_keys(kernel, "gd")# ! { e => panic(e) }
+    check_true(buf_has_substr(world.active_buffer(), "engine.ns"), "gd jumped Dirvish into src/core parent directory")
+
+    -- Remote `dirvish-fd` on `ssh://devbox/project` triggered via `gf<Return>` in `mode:dirvish`!
+    app_feed_keys(kernel, ":Dirvish<Space>ssh://devbox/project<Return>")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, DIRVISH_BUF_NAME, "opened remote *dirvish* on ssh://devbox/project")
+    app_feed_keys(kernel, "gf<Return>")# ! { e => panic(e) }
+    let dv_rem = world.active_buffer()
+    check_true(buf_has_substr(dv_rem, "fd:*"), "gf in mode:dirvish activated remote dirvish-fd")
+    check_true(buf_has_substr(dv_rem, "src/nested/worker.ns"), "remote dirvish-fd found src/nested/worker.ns")
+    app_feed_keys(kernel, "/worker<Return>")# ! { e => panic(e) }
+    let rem_pv = find_buffer_by_name(world, DIRVISH_PREVIEW_BUF_NAME).as(Buffer)
+    check_true(buf_has_substr(rem_pv, "remote_worker_ok"), "remote dirvish-fd preview loaded via remote_read_preview")
+    app_feed_keys(kernel, "<Return>")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().file_path, "ssh://devbox/project/src/nested/worker.ns", "<Return> in remote dirvish-fd opened ssh:// file")
+    println("  [PASS] Part 4: dirvish-fd (F, gf, /, live preview, gd jump, <Return>) local & remote")
+
+    -- ========================================================================
+    -- PART 5: Full Remote (`ssh://devbox/project`) Plugin Adaptation
+    -- ========================================================================
+    world.cwd = "ssh://devbox/project"
+    app_feed_keys(kernel, ":e<Space>ssh://devbox/project/src/lib.ns<Return>")# ! { e => panic(e) }
+    let rem_lib = world.active_buffer()
+    check_eq_str(rem_lib.file_path, "ssh://devbox/project/src/lib.ns", "opened remote src/lib.ns")
+
+    -- Modify and save remote file so git worktree has a real modification
+    app_feed_keys(kernel, "Go//<Space>added_remote_line<Escape>:w<Return>")# ! { e => panic(e) }
+    app_commit_frame(kernel)#
+
+    -- 5a. `ext_lualine` preserves `[SSH: devbox]` alongside remote git branch!
+    check_true(world.statusline_left_extra.contains("[SSH: devbox]"), "lualine preserved [SSH: devbox] indicator")
+    check_true(world.statusline_left_extra.contains("git:"), "lualine displays remote git branch alongside [SSH: devbox]")
+
+    -- 5b. `ext_gitsigns` populates live diff signs on `ssh://devbox/project/src/lib.ns`!
+    check_true(count_owner_signs(rem_lib, OWNER_GITSIGNS) >= 1, "ext_gitsigns populated gutter hunk sign on remote ssh:// buffer")
+
+    -- 5c. `ext_magit` opens remote status, resolves `ssh://devbox/project`, and lists `src/lib.ns`!
+    app_feed_keys(kernel, ":Magit<Return>")# ! { e => panic(e) }
+    let magit_buf = world.active_buffer()
+    let magit_st = require_magit_state(kernel) ! { e => panic(e) }
+    check_eq_str(magit_buf.name, "*magit*", ":Magit opened *magit* on remote repo")
+    check_eq_str(magit_st.repo_root, "ssh://devbox/project", "*magit* resolved repo_root to ssh://devbox/project")
+    check_true(buf_has_substr(magit_buf, "initial remote repo"), "*magit* header shows remote HEAD commit subject")
+    check_true(buf_has_substr(magit_buf, "src/lib.ns"), "*magit* lists modified remote src/lib.ns")
+
+    -- 5d. `ext_telescope` finds & previews remote files on `ssh://devbox/project`
+    app_feed_keys(kernel, ":Telescope<Space>files<Return>")# ! { e => panic(e) }
+    var has_picker_float = false
+    var has_preview_float = false
+    var picker_has_worker = false
+    for fi in 0..world.floating_windows.len() {
+        let fw = world.floating_windows.get(fi.as(usize)).as(FloatingWindow)
+        if fw.id == FLOAT_PICKER_ID {
+            has_picker_float = true
+            for fl in 0..fw.lines.len() {
+                if fw.lines.get(fl.as(usize)).as(String).contains("worker.ns") {
+                    picker_has_worker = true
+                }
+            }
+        }
+        if fw.id == FLOAT_PREVIEW_ID {
+            has_preview_float = true
+        }
+    }
+    check_true(has_picker_float and has_preview_float, ":Telescope files opened picker + preview floats on remote cwd")
+    check_true(picker_has_worker, "Telescope discovered remote src/nested/worker.ns")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    -- 5e. `ext_neotree` renders remote `ssh://devbox/project` sidebar
+    app_feed_keys(kernel, ":Neotree<Space>show<Return>")# ! { e => panic(e) }
+    check_true(world.left_sidebar.visible, ":Neotree show opened left sidebar for remote cwd")
+    let sb_lines = world.left_sidebar.lines
+    var found_src_tree = false
+    for si in 0..sb_lines.len() {
+        if sb_lines.get(si.as(usize)).as(String).contains("src") {
+            found_src_tree = true
+        }
+    }
+    check_true(found_src_tree, "Neo-tree rendered remote 'src' directory in sidebar")
+    app_feed_keys(kernel, ":Neotree<Space>close<Return>")# ! { e => panic(e) }
+
+    -- 5f. `ext_oil` edits `ssh://devbox/project/src` as buffer and creates remote file on `:w`!
+    app_feed_keys(kernel, ":Oil<Space>ssh://devbox/project/src<Return>")# ! { e => panic(e) }
+    let oil_buf = world.active_buffer()
+    check_eq_str(oil_buf.major_mode, "oil", ":Oil opened remote directory in oil mode")
+    check_true(buf_has_substr(oil_buf, "lib.ns"), "oil buffer lists remote lib.ns")
+    app_feed_keys(kernel, "Gohelper_created.ns<Escape>:w<Return>")# ! { e => panic(e) }
+    let created_st! = remote_stat("ssh://devbox/project/src/helper_created.ns") else {
+        panic("remote_stat oil created file failed")
+    }
+    check_true(created_st.exists, "Oil :w created ssh://devbox/project/src/helper_created.ns on remote")
+
+    -- 5g. `ext_todo_comments` & `ext_spectre` & `ext_overseer` & `ext_persistence` on remote `ssh://`
+    app_feed_keys(kernel, ":TodoQuickfix<Return>")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, "*Todos*", ":TodoQuickfix opened *Todos* on remote workspace")
+    check_true(buf_has_substr(world.active_buffer(), "optimize remote loop"), "*Todos* found TODO in remote src/lib.ns")
+
+    app_feed_keys(kernel, ":Spectre<Space>compute_remote<Return>")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, "*Spectre*", ":Spectre opened on remote workspace")
+    check_true(buf_has_substr(world.active_buffer(), "compute_remote"), "*Spectre* matched compute_remote in remote src/lib.ns")
+
+    app_feed_keys(kernel, ":OverseerRun<Space>make:<Space>build<Return>")# ! { e => panic(e) }
+    app_feed_keys(kernel, ":Overseer<Return>")# ! { e => panic(e) }
+    let ov_opt = find_buffer_by_name(world, "*Overseer*")
+    check_true(ov_opt != null and buf_has_substr(ov_opt.as(Buffer), "remote_build_ok"), "Overseer discovered remote Makefile task & executed remotely via remote_exec")
+
+    app_feed_keys(kernel, ":SessionSave<Return>")# ! { e => panic(e) }
+    let sess_st! = remote_stat("ssh://devbox/project/.lava_session.txt") else {
+        panic("remote_stat .lava_session.txt failed")
+    }
+    check_true(sess_st.exists, ":SessionSave persisted .lava_session.txt onto remote workspace")
+    println("  [PASS] Part 5: Remote plugins (lualine, gitsigns, magit, telescope, neotree, oil, todo, spectre, overseer, persistence)")
+
+    -- ========================================================================
+    -- PART 6: Bracket Highlighting Regression Suite (`ext_colorizer` + `ext_trouble`)
+    -- ========================================================================
+    let nessa_tricky_path = path.join(local_proj, "tricky_brackets.ns")
+    let tricky_lines = List()
+    tricky_lines.push("pub fn effectful(line: String) -> #[log_event, status_emit] !String i64 " ++ lb)
+    tricky_lines.push("    let msg = \"interp " ++ lb ++ "line.contains(\")\")" ++ rb ++ " literal " ++ lb ++ lb ++ " ok\"")
+    for idx in 0..320 {
+        tricky_lines.push("    let v_" ++ idx.to_string() ++ " = (idx_val_" ++ idx.to_string() ++ " + [1, 2].len())")
+    }
+    tricky_lines.push("    0")
+    tricky_lines.push(rb)
+    tricky_lines.push("pub fn isolated_inline_mismatch() -> i64 " ++ lb)
+    tricky_lines.push("    let bad = (1 + 2]")
+    tricky_lines.push("    bad")
+    tricky_lines.push(rb)
+    let _ = fs.write_string(nessa_tricky_path, tricky_lines.join("\n") ++ "\n") ! { e => panic(e.to_string()) }
+
+    app_feed_keys(kernel, ":e<Space>" ++ nessa_tricky_path ++ "<Return>")# ! { e => panic(e) }
+    let tb = world.active_buffer()
+    -- Scroll down past row 250 so rainbow checkpoints (>300 lines) are exercised!
+    world.viewport_top_row = 260
+    tb.point.row = 323
+    app_commit_frame(kernel)#
+
+    check_eq_i64(
+        count_underlined_rainbow_or_trouble_on_row(tb, 0),
+        0,
+        "Nessa #[eff] signature row 0 has 0 false red+underlined brackets",
+    )
+    check_eq_i64(
+        count_underlined_rainbow_or_trouble_on_row(tb, 1),
+        0,
+        "Nessa interpolated string containing '\")\"' has 0 false red+underlined brackets",
+    )
+    check_eq_i64(
+        count_underlined_rainbow_or_trouble_on_row(tb, 323),
+        0,
+        "Closing '}}' after 320 lines + #[eff] has 0 false red+underlined brackets",
+    )
+    check_true(
+        count_underlined_rainbow_or_trouble_on_row(tb, 325) >= 1,
+        "True mismatched ']' in '(1 + 2]' on row 325 IS highlighted red+underlined",
+    )
+    check_eq_i64(
+        count_underlined_rainbow_or_trouble_on_row(tb, 327),
+        0,
+        "Enclosing function '}}' on row 327 after '(1 + 2]' is NOT falsely marked red+underlined",
+    )
+
+    -- Rust raw strings, Unicode char escapes, lifetimes, and multiline strings
+    let rust_tricky_path = path.join(local_proj, "tricky_brackets.rs")
+    let rust_src = [
+        "pub fn lex_demo<'a>(input: &'a str) -> (&'a str, char) " ++ lb,
+        "    let raw = r#\"unbalanced ( [ \" inside raw string\"#;",
+        "    let emoji = '\\u" ++ lb ++ "1F600" ++ rb ++ "';",
+        "    let multi = \"line one (",
+        "line two\";",
+        "    (input, emoji)",
+        rb,
+    ].join("\n") ++ "\n"
+    let _ = fs.write_string(rust_tricky_path, rust_src) ! { e => panic(e.to_string()) }
+
+    world.viewport_top_row = 0
+    app_feed_keys(kernel, ":e<Space>" ++ rust_tricky_path ++ "<Return>")# ! { e => panic(e) }
+    let rb_buf = world.active_buffer()
+    app_commit_frame(kernel)#
+    for r_i in 0..rb_buf.line_count() {
+        check_eq_i64(
+            count_underlined_rainbow_or_trouble_on_row(rb_buf, r_i),
+            0,
+            "Rust raw string / lifetime / unicode char / multiline string row " ++ r_i.to_string() ++ " has 0 false underlined brackets",
+        )
+    }
+    println("  [PASS] Part 6: Bracket highlighting regression suite (Nessa #[eff], interp, >300 lines, Rust raw/lifetimes)")
+
+    -- ========================================================================
+    -- PART 7: Fold-Skipping Cursor Motions, SSH Profile Completion & Minibuffer <Return> Submission
+    -- ========================================================================
+    let fold_path = path.join(local_proj, "fold_motion.ns")
+    let fold_src = [
+        "pub fn alpha_block() -> i64 " ++ lb,
+        "    let hidden_a1 = 10",
+        "    let hidden_a2 = 20",
+        "    let inside_fold_target = 30",
+        "    hidden_a1 + hidden_a2 + inside_fold_target",
+        rb,
+        "let visible_mid = 99",
+        "pub fn beta_block() -> i64 " ++ lb,
+        "    let hidden_b1 = 1",
+        "    let hidden_b2 = 2",
+        "    hidden_b1 + hidden_b2",
+        rb,
+    ].join("\n") ++ "\n"
+    let _ = fs.write_string(fold_path, fold_src) ! { e => panic(e.to_string()) }
+
+    world.cwd = local_proj
+    app_feed_keys(kernel, ":e<Space>" ++ fold_path ++ "<Return>")# ! { e => panic(e) }
+    let fbuf = world.active_buffer()
+    app_feed_keys(kernel, "gg")# ! { e => panic(e) }
+    check_eq_i64(fbuf.point.row, 0, "cursor starts at row 0")
+
+    -- Fold `alpha_block` (rows 0..=5 -> body rows 1..=5 hidden) via `za`
+    app_feed_keys(kernel, "za")# ! { e => panic(e) }
+    check_true(fbuf.folded_rows.contains(1) and fbuf.folded_rows.contains(5), "rows 1..=5 folded")
+
+    -- Normal mode `j`/`k` and `<Down>`/`<Up>` skip hidden folded rows 1..=5!
+    app_feed_keys(kernel, "j")# ! { e => panic(e) }
+    check_eq_i64(fbuf.point.row, 6, "`j` skipped folded body rows 1..=5 directly to row 6")
+    app_feed_keys(kernel, "k")# ! { e => panic(e) }
+    check_eq_i64(fbuf.point.row, 0, "`k` skipped folded body rows 5..=1 directly back to row 0")
+
+    app_feed_keys(kernel, "<Down>")# ! { e => panic(e) }
+    check_eq_i64(fbuf.point.row, 6, "`<Down>` skipped folded body rows 1..=5")
+    app_feed_keys(kernel, "<Up>")# ! { e => panic(e) }
+    check_eq_i64(fbuf.point.row, 0, "`<Up>` skipped folded body rows 5..=1")
+
+    -- Word motion `w` from end of row 0 (`$`) skips hidden rows 1..=5 to row 6, and `b` returns to row 0!
+    app_feed_keys(kernel, "$w")# ! { e => panic(e) }
+    check_eq_i64(fbuf.point.row, 6, "`w` from EOL of folded header skipped hidden rows 1..=5 to row 6")
+    app_feed_keys(kernel, "0b")# ! { e => panic(e) }
+    check_eq_i64(fbuf.point.row, 0, "`b` from BOL of row 6 skipped hidden rows 5..=1 back to row 0")
+
+    -- Insert mode `<Down>` and `<Up>` skip hidden rows 1..=5!
+    app_feed_keys(kernel, "i<Down>")# ! { e => panic(e) }
+    check_eq_i64(fbuf.point.row, 6, "Insert `<Down>` skipped hidden rows 1..=5")
+    app_feed_keys(kernel, "<Up><Escape>")# ! { e => panic(e) }
+    check_eq_i64(fbuf.point.row, 0, "Insert `<Up>` skipped hidden rows 5..=1")
+
+    -- Emacs `next-line` and `previous-line` commands skip hidden rows 1..=5!
+    let _ = kernel.dispatch_command("next-line", List())# ! { e => panic(e) }
+    check_eq_i64(fbuf.point.row, 6, "Emacs `next-line` skipped hidden rows 1..=5")
+    let _ = kernel.dispatch_command("previous-line", List())# ! { e => panic(e) }
+    check_eq_i64(fbuf.point.row, 0, "Emacs `previous-line` skipped hidden rows 5..=1")
+
+    -- Fold all (`zM` -> both `0..=5` and `7..=11` folded!) and verify `G` lands on visible row 7 (NOT hidden row 11)!
+    app_feed_keys(kernel, "zM")# ! { e => panic(e) }
+    check_true(fbuf.folded_rows.contains(11), "zM folded trailing beta_block up to EOF row 11")
+    app_feed_keys(kernel, "G")# ! { e => panic(e) }
+    check_eq_i64(fbuf.point.row, 7, "`G` snapped to last visible fold header row 7 instead of hidden row 11")
+
+    -- Explicit search jump `/inside_fold_target<Return>` lands on row 3 AND auto-unfolds `alpha_block`!
+    app_feed_keys(kernel, "gg/inside_fold_target<Return>")# ! { e => panic(e) }
+    check_eq_i64(fbuf.point.row, 3, "search `/inside_fold_target` jumped to row 3")
+    check_true(not fbuf.folded_rows.contains(3), "explicit search jump into closed fold auto-unfolded enclosing block")
+
+    -- 7b & 7c. OpenSSH `~/.ssh/config` Profile Completion + Minibuffer Completion `<Return>` Submission
+    let ssh_cfg_file = path.join(tmp_base, "mock_ssh_config")
+    let ssh_cfg_text = [
+        "Host prod-gpu",
+        "  HostName 10.88.1.5",
+        "  User mlops",
+        "  Port 2222",
+        "  ProxyJump bastion",
+        "",
+        "Host edge-web",
+        "  HostName 192.168.50.9",
+        "  User ubuntu",
+    ].join("\n") ++ "\n"
+    let _ = fs.write_string(ssh_cfg_file, ssh_cfg_text) ! { e => panic(e.to_string()) }
+    remote_set_ssh_config_path(ssh_cfg_file)
+    let prod_root = path.join(tmp_base, "remote_prod_gpu")
+    let _ = fs.create_dir(prod_root, parents = true) ! { e => panic(e.to_string()) }
+    let _ = remote_register_mock_mount("prod-gpu", prod_root)
+
+    -- `:RemoteConnectProfile ` lists SSH profiles from `~/.ssh/config`, and typing partial `prod` + `<Return>`
+    -- submits the completed `"RemoteConnectProfile prod-gpu"` instead of raw `"RemoteConnectProfile prod"`!
+    app_feed_keys(kernel, ":RemoteConnectProfile<Space>")# ! { e => panic(e) }
+    check_true(world.minibuffer_view.active, "`:RemoteConnectProfile ` opened Stage 2 completion")
+    check_true(world.minibuffer_view.items.len() >= 2, "Stage 2 lists prod-gpu and edge-web SSH profiles")
+    app_feed_keys(kernel, "prod<Return>")# ! { e => panic(e) }
+    check_true(not world.minibuffer_view.active, "minibuffer closed on <Return>")
+    check_true(world.cwd.starts_with("ssh://prod-gpu"), "partial `:RemoteConnectProfile prod<Return>` submitted completed `prod-gpu`")
+
+    -- Also verify `:RemoteConnect ` Stage 2 completion with `<Tab>` + `<Return>`!
+    world.cwd = local_proj
+    app_feed_keys(kernel, ":RemoteConnect<Space>prod<Tab><Return>")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().name, "*Remote*", "`:RemoteConnect prod<Tab><Return>` completed and connected prod-gpu")
+
+    -- Verify `:Telescope ssh` fuzzy picker lists OpenSSH profiles from `~/.ssh/config`!
+    app_feed_keys(kernel, ":Telescope<Space>ssh<Return>")# ! { e => panic(e) }
+    var saw_tel_ssh_picker = false
+    var tel_ssh_text = ""
+    for fi in 0..world.floating_windows.len() {
+        let fw = world.floating_windows.get(fi.as(usize)).as(FloatingWindow)
+        if fw.id == FLOAT_PICKER_ID {
+            saw_tel_ssh_picker = true
+            tel_ssh_text = fw.lines.join("\n")
+        }
+    }
+    check_true(saw_tel_ssh_picker, ":Telescope ssh opened picker floating window")
+    check_true(tel_ssh_text.contains("prod-gpu") and tel_ssh_text.contains("edge-web"), ":Telescope ssh displays prod-gpu & edge-web")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    -- Verify `:color<Tab>gruv<Return>` submits completed `"colorscheme gruvbox-dark"` (not `"colorscheme gruv"`)!
+    app_feed_keys(kernel, ":color<Tab>gruv<Return>")# ! { e => panic(e) }
+    check_eq_str(world.options.theme_name, "gruvbox-dark", "`:color<Tab>gruv<Return>` submitted completed gruvbox-dark theme")
+    app_feed_keys(kernel, ":color<Tab>catppuccin-m<Return>")# ! { e => panic(e) }
+    check_eq_str(world.options.theme_name, "catppuccin-mocha", "restored catppuccin-mocha via partial completion + <Return>")
+
+    -- Verify `M-x` + `<Tab>` + `<Return>` AND `FilePath` (`find-file`) + partial prefix + `<Tab>` + `<Return>`!
+    world.cwd = local_proj
+    app_feed_keys(kernel, "<M-x>find-f<Tab><Return>")# ! { e => panic(e) }
+    check_true(world.minibuffer_view.active, "M-x find-f<Tab><Return> launched find-file FilePath minibuffer")
+    app_feed_keys(kernel, "fold_m<Tab><Return>")# ! { e => panic(e) }
+    check_eq_str(world.active_buffer().file_path, fold_path, "`find-file` + `fold_m<Tab><Return>` opened completed fold_motion.ns")
+
+    remote_set_ssh_config_path("")
+    println("  [PASS] Part 7: Fold-skipping motions, SSH profile completion & minibuffer completion <Return> submission")
+
+    let _ = fs.remove_dir(tmp_base, recursive = true)
+    println("ALL REMOTE PLUGINS + DIRVISH-FD + MINIBUFFER + DECORATIONS + BRACKET TESTS PASSED!")
+}
+
+fn main() {
+    run_suite()
+}

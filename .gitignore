@@ -1,4 +1,5 @@
 /target
+/dist
 *.lava-cargo.lock
 *.nsbc
 *.lisp

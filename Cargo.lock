@@ -887,7 +887,6 @@ version = "0.1.0"
 dependencies = [
  "lava-proto",
  "libc",
- "pkg-config",
 ]
 
 [[package]]
@@ -919,6 +918,14 @@ name = "lava-term"
 version = "0.1.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "lava-tools"
+version = "0.1.0"
+dependencies = [
+ "memchr",
+ "regex",
 ]
 
 [[package]]

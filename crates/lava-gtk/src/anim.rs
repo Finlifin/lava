@@ -4,24 +4,27 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use lava_proto::{AnimHints, CaretShape, ColorRgba, DrawCmd, RenderFrame, ScrollViewport};
+use lava_proto::{
+    AnimHints, CaretShape, ColorRgba, DrawCmd, RenderFrame, ScrollViewport, TransferOverlay,
+};
 use libc::c_int;
 
 use crate::ffi::{self, CairoSurfaceT, CairoT};
 use crate::render::{
-    OffscreenSurface, draw_caret, query_cairo_device_scale, render_frame_to_cairo_with_opts,
+    OffscreenSurface, draw_caret, query_cairo_device_scale, render_commands_to_cairo,
+    render_frame_to_cairo_with_opts,
 };
 
-/// Leading-corner exponential decay time constant in seconds (~24 ms).
-pub(crate) const TAU_CURSOR_LEAD: f64 = 0.024;
-/// Trailing-corner exponential decay time constant for jumps > 2 cells (~62 ms).
-pub(crate) const TAU_CURSOR_TRAIL: f64 = 0.062;
-/// Trailing-corner exponential decay time constant for <= 2-cell horizontal typing (~38 ms).
-pub(crate) const TAU_CURSOR_TRAIL_TYPING: f64 = 0.038;
+/// Leading-corner exponential decay time constant in seconds (~14 ms).
+pub(crate) const TAU_CURSOR_LEAD: f64 = 0.014;
+/// Trailing-corner exponential decay time constant for jumps > 2 cells (~44 ms).
+pub(crate) const TAU_CURSOR_TRAIL: f64 = 0.044;
+/// Crisp unified glide time constant for <= 2-cell adjacent typing/motion (~12 ms, zero smear tail).
+pub(crate) const TAU_CURSOR_SHORT: f64 = 0.012;
 /// Smooth viewport vertical scroll decay time constant in seconds (~42 ms).
 pub(crate) const TAU_SCROLL_DECAY: f64 = 0.042;
 /// Sub-pixel convergence threshold below which animations snap to target and stop VSync wakeups.
-pub(crate) const SNAP_EPSILON_PX: f64 = 0.2;
+pub(crate) const SNAP_EPSILON_PX: f64 = 0.55;
 
 /// Clockwise corner unit signs `[TL, TR, BR, BL]` around a cursor center.
 const CORNER_SIGNS: [(f64, f64); 4] = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
@@ -215,13 +218,18 @@ impl CursorPhysics {
             1.0 / 60.0
         };
         let target_corners = caret.target_corners();
-        let tau_trail = if self.short_typing_hop {
-            TAU_CURSOR_TRAIL_TYPING
+        let lead_decay = if self.short_typing_hop {
+            (-dt / TAU_CURSOR_SHORT).exp()
         } else {
-            TAU_CURSOR_TRAIL
+            (-dt / TAU_CURSOR_LEAD).exp()
         };
-        let lead_decay = (-dt / TAU_CURSOR_LEAD).exp();
-        let trail_decay = (-dt / tau_trail).exp();
+        let trail_decay = if self.short_typing_hop {
+            // Short 1-2 cell typing/motion moves all 4 corners uniformly without stretching a
+            // translucent tail across neighboring characters, eliminating typing double-vision.
+            lead_decay
+        } else {
+            (-dt / TAU_CURSOR_TRAIL).exp()
+        };
 
         let mut max_err = 0.0_f64;
         for i in 0..4 {
@@ -255,7 +263,9 @@ impl CursorPhysics {
         }
     }
 
-    /// Renders the 4-corner smear polygon + crisp cursor head onto `cr`.
+    /// Renders a single unified cursor shape onto `cr` (never double-drawing a smear polygon and
+    /// a second overlapping caret rectangle on top of each other, which previously caused alpha
+    /// compounding / ghosting artifacts).
     ///
     /// # Safety
     /// `cr` must be a valid non-null `*mut CairoT` owned on the current thread.
@@ -263,24 +273,34 @@ impl CursorPhysics {
         let Some(caret) = self.target else {
             return;
         };
-        if self.settled {
-            draw_caret(
-                cr,
-                caret.x,
-                caret.y,
-                caret.w,
-                caret.h,
-                caret.shape,
-                caret.color,
-            );
+        if self.settled || caret.shape == CaretShape::HollowBlock {
+            let gx = (caret.x + self.head_offset.0).round();
+            let gy = (caret.y + self.head_offset.1).round();
+            draw_caret(cr, gx, gy, caret.w, caret.h, caret.shape, caret.color);
             return;
         }
 
+        let (_, _, target_w, target_h) = caret.visual_rect();
+        let poly_w = (self.corners[1].0 - self.corners[0].0)
+            .abs()
+            .max((self.corners[2].0 - self.corners[3].0).abs());
+        let poly_h = (self.corners[3].1 - self.corners[0].1)
+            .abs()
+            .max((self.corners[2].1 - self.corners[1].1).abs());
+        let stretched = (poly_w - target_w).abs() > 0.85 || (poly_h - target_h).abs() > 0.85;
+
+        if self.short_typing_hop || !stretched {
+            let gx = (caret.x + self.head_offset.0).round();
+            let gy = (caret.y + self.head_offset.1).round();
+            draw_caret(cr, gx, gy, caret.w, caret.h, caret.shape, caret.color);
+            return;
+        }
+
+        // Single unified 4-corner quad at exact `caret.color` — zero overlapping second layer!
         let (r, g, b, a) = caret.color.components_f64();
-        let smear_alpha = (a * 0.72).clamp(0.18, 0.88);
-        // SAFETY: `cr` is valid per caller invariant; builds and fills the closed 4-corner polygon.
+        // SAFETY: `cr` is valid per caller invariant; builds and fills one closed 4-corner polygon.
         unsafe {
-            ffi::cairo_set_source_rgba(cr, r, g, b, smear_alpha);
+            ffi::cairo_set_source_rgba(cr, r, g, b, a);
             ffi::cairo_new_path(cr);
             ffi::cairo_move_to(cr, self.corners[0].0, self.corners[0].1);
             ffi::cairo_line_to(cr, self.corners[1].0, self.corners[1].1);
@@ -289,16 +309,6 @@ impl CursorPhysics {
             ffi::cairo_close_path(cr);
             ffi::cairo_fill(cr);
         }
-
-        draw_caret(
-            cr,
-            caret.x + self.head_offset.0,
-            caret.y + self.head_offset.1,
-            caret.w,
-            caret.h,
-            caret.shape,
-            caret.color,
-        );
     }
 }
 
@@ -749,6 +759,7 @@ impl AnimController {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) unsafe fn render_to_cairo_scaled(
         &mut self,
         cr: *mut CairoT,
@@ -757,6 +768,28 @@ impl AnimController {
         min_scale: f64,
         frame: &RenderFrame,
         hints: &AnimHints,
+    ) {
+        // SAFETY: Forwards caller's `cr` invariant with no transfer overlay.
+        unsafe {
+            self.render_to_cairo_scaled_with_overlay(
+                cr,
+                (width, height),
+                min_scale,
+                frame,
+                hints,
+                None,
+            );
+        }
+    }
+
+    pub(crate) unsafe fn render_to_cairo_scaled_with_overlay(
+        &mut self,
+        cr: *mut CairoT,
+        (width, height): (c_int, c_int),
+        min_scale: f64,
+        frame: &RenderFrame,
+        hints: &AnimHints,
+        transfer_overlay: Option<&TransferOverlay>,
     ) {
         if cr.is_null() {
             return;
@@ -864,6 +897,142 @@ impl AnimController {
                 );
             }
         }
+
+        if let Some(ov) = transfer_overlay
+            && ov.active
+        {
+            // SAFETY: `cr` is valid per caller invariant.
+            unsafe {
+                draw_transfer_progress_overlay(cr, f64::from(safe_w), f64::from(safe_h), ov);
+            }
+        }
+    }
+}
+
+fn format_transfer_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KiB", (bytes as f64) / 1024.0)
+    } else {
+        format!("{:.2} MiB", (bytes as f64) / (1024.0 * 1024.0))
+    }
+}
+
+unsafe fn draw_transfer_progress_overlay(
+    cr: *mut CairoT,
+    win_w: f64,
+    win_h: f64,
+    ov: &TransferOverlay,
+) {
+    let card_w = (win_w - 32.0).clamp(240.0, 440.0);
+    let card_h = 68.0;
+    let card_x = (win_w - card_w - 16.0).max(12.0).floor();
+    let card_y = (win_h - card_h - 34.0).max(12.0).floor();
+    let frac = if ov.bytes_total > 0 {
+        (ov.bytes_done as f64 / ov.bytes_total as f64).clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let pct = (frac * 100.0).round() as u64;
+    let badge = if ov.transport.eq_ignore_ascii_case("http") {
+        "[HTTP]"
+    } else {
+        "[SSH]"
+    };
+    let title = format!("{badge} Fetching {}", ov.title);
+    let detail = if ov.bytes_total > 0 {
+        if ov.lines_loaded > 0 {
+            format!(
+                "{} / {}  ({pct}%)  •  {} lines",
+                format_transfer_bytes(ov.bytes_done),
+                format_transfer_bytes(ov.bytes_total),
+                ov.lines_loaded
+            )
+        } else {
+            format!(
+                "{} / {}  ({pct}%)",
+                format_transfer_bytes(ov.bytes_done),
+                format_transfer_bytes(ov.bytes_total)
+            )
+        }
+    } else {
+        format!("{} received...", format_transfer_bytes(ov.bytes_done))
+    };
+
+    let bar_x = card_x + 12.0;
+    let bar_y = card_y + 48.0;
+    let bar_w = card_w - 24.0;
+    let bar_h = 8.0;
+    let fill_w = (bar_w * frac).max(if ov.bytes_done > 0 { 4.0 } else { 0.0 });
+
+    let cmds = [
+        DrawCmd::ClipPush {
+            x: card_x,
+            y: card_y,
+            w: card_w,
+            h: card_h,
+        },
+        DrawCmd::FillRect {
+            x: card_x,
+            y: card_y,
+            w: card_w,
+            h: card_h,
+            color: ColorRgba::from_rgba(36, 39, 58, 245),
+            radius: 6.0,
+        },
+        DrawCmd::StrokeRect {
+            x: card_x,
+            y: card_y,
+            w: card_w,
+            h: card_h,
+            color: ColorRgba::from_rgba(137, 180, 250, 255),
+            line_width: 1.4,
+            radius: 6.0,
+        },
+        DrawCmd::TextRun {
+            x: card_x + 12.0,
+            y: card_y + 6.0,
+            text: title,
+            font_family: "Monospace".to_string(),
+            font_size_pt: 11.5,
+            color: ColorRgba::from_rgba(137, 180, 250, 255),
+            bold: false,
+            italic: false,
+            underline: false,
+        },
+        DrawCmd::TextRun {
+            x: card_x + 12.0,
+            y: card_y + 26.0,
+            text: detail,
+            font_family: "Monospace".to_string(),
+            font_size_pt: 10.5,
+            color: ColorRgba::from_rgba(205, 214, 244, 255),
+            bold: false,
+            italic: false,
+            underline: false,
+        },
+        DrawCmd::FillRect {
+            x: bar_x,
+            y: bar_y,
+            w: bar_w,
+            h: bar_h,
+            color: ColorRgba::from_rgba(24, 24, 37, 255),
+            radius: 4.0,
+        },
+        DrawCmd::FillRect {
+            x: bar_x,
+            y: bar_y,
+            w: fill_w,
+            h: bar_h,
+            color: ColorRgba::from_rgba(166, 227, 161, 255),
+            radius: 4.0,
+        },
+        DrawCmd::ClipPop,
+    ];
+    // SAFETY: `cr` is valid per caller invariant.
+    unsafe {
+        render_commands_to_cairo(cr, &cmds, None);
     }
 }
 

@@ -9,6 +9,7 @@ members = [
     "crates/lava-vm",
     "crates/lava-cli",
     "crates/lava-server",
+    "crates/lava-tools",
 ]
 resolver = "2"
 
@@ -18,7 +19,8 @@ edition = "2024"
 
 [workspace.dependencies]
 libc = "0.2"
-pkg-config = "0.3"
+memchr = "2.8.0"
+regex = "1.12.3"
 driver = { git = "https://github.com/Finlifin/nessa.git", branch = "main" }
 gc = { git = "https://github.com/Finlifin/nessa.git", branch = "main" }
 initialization = { git = "https://github.com/Finlifin/nessa.git", branch = "main" }
@@ -46,6 +48,9 @@ opt-level = 2
 [profile.dev.package.lava-accel]
 opt-level = 2
 
+[profile.dev.package.lava-vm]
+opt-level = 2
+
 [profile.test]
 debug = 0
 incremental = false
@@ -54,6 +59,9 @@ incremental = false
 opt-level = 2
 
 [profile.test.package.lava-accel]
+opt-level = 2
+
+[profile.test.package.lava-vm]
 opt-level = 2
 
 [profile.release]

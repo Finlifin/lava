@@ -11,6 +11,7 @@ use std.fs
 use std.path
 
 use @lava_sys.CaretShape
+use @lava_remote.{is_ssh_uri, join_ssh_uri, parent_ssh_uri, remote_stat}
 use @lava_core.{
     ExtId, InteractiveEffects, KeyBindingEntry, KeyLookup, KeyStroke, Keymap, PromptKind,
     PromptRequest, ServiceEffects, SystemKernel, ask_prompt, clipboard_get, clipboard_set,
@@ -1972,6 +1973,23 @@ fn parent_dir_of_path(p: String) -> String {
 }
 
 fn resolve_gf_path(world: EditorWorld, buf: Buffer, raw_path: String) -> String {
+    if is_ssh_uri(raw_path) {
+        return world.resolve_path(raw_path)
+    }
+    if is_ssh_uri(buf.file_path) {
+        let rdir = parent_ssh_uri(buf.file_path)
+        let rel_remote = join_ssh_uri(rdir, raw_path)
+        let rst_res = remote_stat(rel_remote)
+        rst_res match {
+            st! => {
+                if st.exists {
+                    return rel_remote
+                }
+            },
+            error _ => (),
+        }
+        return world.resolve_path(raw_path)
+    }
     if raw_path.starts_with("/") {
         return raw_path
     }
@@ -2468,12 +2486,14 @@ fn handle_insert_mode_key(
     }
     if stroke.key == "Up" {
         vim.block_insert_active = false
-        buf.point = buf.clamp_pos(Pos.new(buf.point.row - 1, buf.point.col), insert_mode = true)
+        let new_r = buf.step_visible_row_up(buf.point.row, 1)
+        buf.point = buf.clamp_pos(Pos.new(new_r, buf.point.col), insert_mode = true)
         return true
     }
     if stroke.key == "Down" {
         vim.block_insert_active = false
-        buf.point = buf.clamp_pos(Pos.new(buf.point.row + 1, buf.point.col), insert_mode = true)
+        let new_r = buf.step_visible_row_down(buf.point.row, 1)
+        buf.point = buf.clamp_pos(Pos.new(new_r, buf.point.col), insert_mode = true)
         return true
     }
 
@@ -2912,6 +2932,31 @@ fn handle_pending_prefix(
     if pfx == "g" {
         vim.pending_prefix = ""
         let k = stroke.key
+        -- Mode-specific `g<key>` bindings (e.g. `mode:dirvish` `gf` -> `dirvish-fd`, `gd` -> `dirvish-fd-jump`)
+        -- take priority over generic Normal-mode `gf` in special buffers while preserving `gg` everywhere.
+        if vim.mode == VimMode.normal and k != "g" {
+            let mode_km_opt = kernel.keymaps.get("mode:" ++ buf.major_mode)
+            if mode_km_opt != null {
+                let mode_seq = [KeyStroke.plain("g"), stroke]
+                mode_km_opt.as(Keymap).lookup(mode_seq) match {
+                    KeyLookup.exact(cmd_name, _) => {
+                        vim.clear_transient()
+                        world.which_key_items = List()
+                        world.pending_keys_display = ""
+                        vim.vim_owns_which_key = false
+                        abort_change(vim)
+                        let _ = dispatch_optional_cmd(kernel, cmd_name, List())#!
+                        return true
+                    },
+                    KeyLookup.prefix(hints) => {
+                        vim.plugin_strokes = mode_seq
+                        world.which_key_items = sort_key_hints(hints)
+                        return true
+                    },
+                    KeyLookup.unbound => (),
+                }
+            }
+        }
         if (not stroke.ctrl) and (not stroke.alt) {
             if k == "g" {
                 let target_r = if vim.has_explicit_count() {
@@ -2934,9 +2979,20 @@ fn handle_pending_prefix(
                 apply_resolved_motion(world, buf, vim, tgt)#!
                 return true
             }
+            if k == "j" or k == "k" {
+                let cnt = vim.effective_count()
+                let new_r = if k == "j" {
+                    buf.step_visible_row_down(buf.point.row, cnt)
+                } else {
+                    buf.step_visible_row_up(buf.point.row, cnt)
+                }
+                let tgt = MotionTarget.ok(Pos.new(new_r, buf.preferred_col), MotionShape.linewise, preserve_pref_col = true)
+                apply_resolved_motion(world, buf, vim, tgt)#!
+                return true
+            }
             if k == "_" {
                 let extra = if vim.effective_count() > 1 { vim.effective_count() - 1 } else { 0 }
-                let tr = if buf.point.row + extra <= buf.max_row() { buf.point.row + extra } else { buf.max_row() }
+                let tr = buf.step_visible_row_down(buf.point.row, extra)
                 let tgt = MotionTarget.ok(
                     Pos.new(tr, last_non_blank_col(buf, tr)),
                     MotionShape.inclusive,
@@ -3034,7 +3090,16 @@ fn handle_pending_prefix(
                 }
                 let (raw_p, tgt_line, tgt_col) = target_opt.as((String, i64, i64))
                 let resolved = resolve_gf_path(world, buf, raw_p)
-                if (not fs.exists(resolved)) or fs.is_dir(resolved) {
+                if is_ssh_uri(resolved) {
+                    let rst! = remote_stat(resolved) else {
+                        status_emit("E447: Can't find remote file \"" ++ raw_p ++ "\" in path")#
+                        return true
+                    }
+                    if (not rst.exists) or rst.is_dir {
+                        status_emit("E447: Can't find remote file \"" ++ raw_p ++ "\" in path")#
+                        return true
+                    }
+                } else if (not fs.exists(resolved)) or fs.is_dir(resolved) {
                     status_emit("E447: Can't find file \"" ++ raw_p ++ "\" in path")#
                     return true
                 }
@@ -4096,7 +4161,7 @@ fn vim_dispatch_stroke_core(
     }
 
     if plain and (k == "j" or k == "Down") {
-        let new_r = if buf.point.row + eff <= buf.max_row() { buf.point.row + eff } else { buf.max_row() }
+        let new_r = buf.step_visible_row_down(buf.point.row, eff)
         let pref = buf.preferred_col
         let tgt = MotionTarget.ok(Pos.new(new_r, pref), MotionShape.linewise, preserve_pref_col = true)
         apply_resolved_motion(world, buf, vim, tgt)#!
@@ -4105,7 +4170,7 @@ fn vim_dispatch_stroke_core(
     }
 
     if plain and (k == "k" or k == "Up") {
-        let new_r = if buf.point.row - eff >= buf.min_row() { buf.point.row - eff } else { buf.min_row() }
+        let new_r = buf.step_visible_row_up(buf.point.row, eff)
         let pref = buf.preferred_col
         let tgt = MotionTarget.ok(Pos.new(new_r, pref), MotionShape.linewise, preserve_pref_col = true)
         apply_resolved_motion(world, buf, vim, tgt)#!
@@ -4127,7 +4192,7 @@ fn vim_dispatch_stroke_core(
     }
 
     if plain and k == "$" {
-        let tr = if buf.point.row + eff - 1 <= buf.max_row() { buf.point.row + eff - 1 } else { buf.max_row() }
+        let tr = if eff > 1 { buf.step_visible_row_down(buf.point.row, eff - 1) } else { buf.point.row }
         let llen = buf.line_char_len(tr)
         let ec = if llen > 0 { llen - 1 } else { 0 }
         let tgt = MotionTarget.ok(Pos.new(tr, ec), MotionShape.inclusive, end_of_line_pref = true)
@@ -4203,7 +4268,7 @@ fn vim_dispatch_stroke_core(
             let r = eff - 1
             if r < buf.min_row() { buf.min_row() } else if r > buf.max_row() { buf.max_row() } else { r }
         } else {
-            buf.max_row()
+            buf.snap_to_visible_row(buf.max_row())
         }
         let tgt = MotionTarget.ok(
             Pos.new(dest_r, buf.first_non_blank_col(dest_r)),
@@ -4254,20 +4319,16 @@ fn vim_dispatch_stroke_core(
         } else {
             if vrows - 2 > 1 { vrows - 2 } else { 1 }
         }
-        let delta = if is_down { step_base * eff } else { -(step_base * eff) }
-        var nr = buf.point.row + delta
-        if nr < buf.min_row() {
-            nr = buf.min_row()
+        let steps = step_base * eff
+        let nr = if is_down {
+            buf.step_visible_row_down(buf.point.row, steps)
+        } else {
+            buf.step_visible_row_up(buf.point.row, steps)
         }
-        if nr > buf.max_row() {
-            nr = buf.max_row()
-        }
-        var ntop = world.viewport_top_row + delta
-        if ntop < buf.min_row() {
-            ntop = buf.min_row()
-        }
-        if ntop > buf.max_row() {
-            ntop = buf.max_row()
+        let ntop = if is_down {
+            buf.step_visible_row_down(world.viewport_top_row, steps)
+        } else {
+            buf.step_visible_row_up(world.viewport_top_row, steps)
         }
         world.viewport_top_row = ntop
         let tgt = MotionTarget.ok(Pos.new(nr, buf.first_non_blank_col(nr)), MotionShape.linewise)
@@ -4279,19 +4340,16 @@ fn vim_dispatch_stroke_core(
     -- Viewport-only scroll (`<C-e>` down, `<C-y>` up) in Normal and Visual modes
     if (not is_op_pending) and ctrl_only and (k == "e" or k == "y") {
         let vrows = if world.viewport_rows > 1 { world.viewport_rows } else { 20 }
-        let delta = if k == "e" { eff } else { -eff }
-        var ntop = world.viewport_top_row + delta
-        if ntop < buf.min_row() {
-            ntop = buf.min_row()
-        }
-        if ntop > buf.max_row() {
-            ntop = buf.max_row()
+        let ntop = if k == "e" {
+            buf.step_visible_row_down(world.viewport_top_row, eff)
+        } else {
+            buf.step_visible_row_up(world.viewport_top_row, eff)
         }
         world.viewport_top_row = ntop
+        let bot_r = buf.step_visible_row_down(ntop, vrows - 1)
         if buf.point.row < ntop {
             buf.point = buf.clamp_pos(Pos.new(ntop, buf.preferred_col), insert_mode = false)
-        } else if buf.point.row >= ntop + vrows {
-            let bot_r = if ntop + vrows - 1 <= buf.max_row() { ntop + vrows - 1 } else { buf.max_row() }
+        } else if buf.point.row > bot_r {
             buf.point = buf.clamp_pos(Pos.new(bot_r, buf.preferred_col), insert_mode = false)
         }
         vim.count1 = 0
@@ -5026,6 +5084,7 @@ fn run_interactive_vim_search(
             count = parsed.as(i64)
         }
     }
+    let orig_point = world.active_buffer().point
     let req = PromptRequest {
         label: if forward { "/" } else { "?" },
         initial: "",
@@ -5048,8 +5107,9 @@ fn run_interactive_vim_search(
     world.search_highlight_active = world.options.hlsearch
 
     let buf = world.active_buffer()
+    buf.point = buf.clamp_pos(orig_point, insert_mode = false)
     let ic = world.effective_ignore_case(pat)
-    var cur_p = buf.point
+    var cur_p = orig_point
     var matched: ?Pos = null
     for _ in 0..count {
         matched = if forward {
@@ -5072,6 +5132,7 @@ fn run_interactive_vim_search(
         }
     } else {
         apply_resolved_motion(world, buf, vim, MotionTarget.ok(matched.as(Pos), MotionShape.exclusive, is_jump = true))#!
+        kernel.emit_hook("cursor-moved", buf.id)
     }
     sync_world_from_vim(world, vim)
     ()
@@ -5276,6 +5337,23 @@ pub fn register_vim_extension(kernel: SystemKernel) -> !String Unit {
                     ()
                 },
             )
+
+            k.register_command(
+                "toggle-window-decorations",
+                ext_id,
+                "Toggle OS window titlebar/frame decorations (`:set decorations` / `:set nodecorations`, default off).",
+                |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+                    let w = require_editor_world(kern)!
+                    w.options.window_decorations = not w.options.window_decorations
+                    let state_s = if w.options.window_decorations { "ON" } else { "OFF" }
+                    let msg = "Window decorations: " ++ state_s
+                    w.status_message = msg
+                    status_emit(msg)#
+                    ()
+                },
+            )
+            let leader_km = k.ensure_keymap(KEYMAP_VIM_LEADER)
+            leader_km.bind("<Space> u D", "toggle-window-decorations", ext_id, description = "Toggle window decorations")
 
             k.add_hook(
                 "buffer-switched",

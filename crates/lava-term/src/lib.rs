@@ -4,16 +4,30 @@
 //! keeping full interactive shell state, alternate screen switching, SGR 16/256/TrueColor spans,
 //! scrollback history, window resize (`TIOCSWINSZ`), and live `/proc/<pid>/cwd` inspection.
 
+#[cfg(unix)]
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::ffi::CStr;
+#[cfg(unix)]
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::Write;
+#[cfg(unix)]
+use std::io::{self, Read};
+#[cfg(unix)]
 use std::os::fd::FromRawFd;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
 use std::thread;
 
 /// Packed `0xRRGGBBAA` helper matching `lava_proto::ColorRgba` and `@lava_sys.rgba`.
@@ -1466,6 +1480,7 @@ pub fn encode_key_input(
     out
 }
 
+#[cfg(unix)]
 struct PtyInstance {
     writer: File,
     master_fd: libc::c_int,
@@ -1480,6 +1495,7 @@ struct PtyInstance {
     cached_exit_code: Option<i32>,
 }
 
+#[cfg(unix)]
 impl PtyInstance {
     fn current_cwd(&mut self, screen_osc: &str) -> String {
         if !screen_osc.is_empty() {
@@ -1524,6 +1540,7 @@ impl PtyInstance {
     }
 }
 
+#[cfg(unix)]
 impl Drop for PtyInstance {
     fn drop(&mut self) {
         if self.cached_exit_code.is_none() {
@@ -1537,11 +1554,18 @@ impl Drop for PtyInstance {
 pub type PtyWakeFn = Arc<dyn Fn() + Send + Sync>;
 
 /// Thread-safe manager owning all live POSIX PTY sessions for a Lava VM instance.
+#[cfg(unix)]
 pub struct PtyManager {
     next_id: AtomicU64,
     sessions: Mutex<BTreeMap<u64, PtyInstance>>,
     dirty: Arc<AtomicBool>,
     waker: Mutex<Option<PtyWakeFn>>,
+}
+
+/// Stub PTY manager on Windows (Windows 10 1709 baseline predates ConPTY; terminal extension is disabled).
+#[cfg(not(unix))]
+pub struct PtyManager {
+    dirty: AtomicBool,
 }
 
 impl Default for PtyManager {
@@ -1550,6 +1574,67 @@ impl Default for PtyManager {
     }
 }
 
+#[cfg(not(unix))]
+impl PtyManager {
+    pub fn new() -> Self {
+        Self {
+            dirty: AtomicBool::new(false),
+        }
+    }
+
+    pub fn set_waker(&self, _waker: PtyWakeFn) {}
+
+    pub fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    pub fn has_active_sessions(&self) -> bool {
+        false
+    }
+
+    pub fn spawn(
+        &self,
+        _shell: &str,
+        _cwd: &str,
+        _rows: usize,
+        _cols: usize,
+    ) -> Result<u64, String> {
+        Err("PTY terminal is disabled on Windows (Windows 10 1709 lacks ConPTY)".to_string())
+    }
+
+    pub fn write_bytes(&self, id: u64, _data: &[u8]) -> Result<(), String> {
+        Err(format!("unknown PTY session id {id}"))
+    }
+
+    pub fn send_key(
+        &self,
+        id: u64,
+        _key: &str,
+        _text: &str,
+        _ctrl: bool,
+        _alt: bool,
+        _shift: bool,
+    ) -> Result<(), String> {
+        let _ = encode_key_input("", "", false, false, false, false);
+        Err(format!("unknown PTY session id {id}"))
+    }
+
+    pub fn resize(&self, id: u64, _rows: usize, _cols: usize) -> Result<(), String> {
+        Err(format!("unknown PTY session id {id}"))
+    }
+
+    pub fn snapshot(&self, id: u64, _include_scrollback: bool) -> Result<TermSnapshot, String> {
+        Err(format!("unknown PTY session id {id}"))
+    }
+
+    pub fn kill(&self, _id: u64) -> bool {
+        false
+    }
+
+    pub fn kill_all(&self) {}
+}
+
+#[cfg(unix)]
 impl PtyManager {
     pub fn new() -> Self {
         Self {
@@ -1827,6 +1912,7 @@ impl PtyManager {
     }
 }
 
+#[cfg(unix)]
 fn resolve_shell_program(explicit: &str) -> String {
     let trimmed = explicit.trim();
     if !trimmed.is_empty() && Path::new(trimmed).exists() {
@@ -1846,6 +1932,7 @@ fn resolve_shell_program(explicit: &str) -> String {
     "/bin/sh".to_string()
 }
 
+#[cfg(unix)]
 fn set_pty_winsize(fd: libc::c_int, rows: usize, cols: usize) {
     let ws = libc::winsize {
         ws_row: rows.min(u16::MAX as usize) as u16,
@@ -1860,6 +1947,7 @@ fn set_pty_winsize(fd: libc::c_int, rows: usize, cols: usize) {
     }
 }
 
+#[cfg(unix)]
 fn open_posix_pty(rows: usize, cols: usize) -> Result<(File, File, File, libc::c_int), String> {
     // SAFETY: `posix_openpt`, `grantpt`, `unlockpt`, `ptsname_r`, and `open` are standard
     // POSIX/Linux PTY setup calls; all returned descriptors are checked `< 0` before wrapping
@@ -1916,6 +2004,7 @@ fn open_posix_pty(rows: usize, cols: usize) -> Result<(File, File, File, libc::c
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -1949,6 +2038,7 @@ mod tests {
         assert_eq!(restored.lines[1], "progress 100%");
     }
 
+    #[cfg(unix)]
     #[test]
     fn live_posix_pty_spawns_shell_streams_ansi_tracks_cwd_and_exits() {
         let mgr = PtyManager::new();
@@ -2056,6 +2146,7 @@ mod tests {
         assert_eq!(after_kitty_pop.cursor_col, 6);
     }
 
+    #[cfg(unix)]
     #[test]
     fn fish_or_sh_pty_starts_instantly_without_da1_warning_and_exits_on_ctrl_d() {
         let shell = if std::path::Path::new("/usr/bin/fish").exists() {

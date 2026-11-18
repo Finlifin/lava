@@ -4,6 +4,7 @@
 -- visual-block/Emacs-mark selections, search matches, mode-lines, which-key, and minibuffer.
 
 use std.collections.{HashMap, Set}
+use std.env
 use @lava_sys.{CaretShape, DrawCmd, FontMetrics, PointerHint, WindowSpec, rgb, rgba}
 use @lava_core.{
     CommandSpec, ExtId, InteractiveEffects, KeyBindingEntry, PromptKind, PromptRequest,
@@ -2441,7 +2442,7 @@ private fn get_md_fenced_block_ts_spans(
         body_lines.push(buf.line_at(r))
         r += 1
     }
-    if body_lines.is_empty() {
+    if body_lines.is_empty() or env.os() == "windows" {
         return List()
     }
     let res = accel_ts_highlight_snippet(body_lines.join("\n"), fence_mode)
@@ -2526,7 +2527,7 @@ fn drop_visual_cols(expanded: String, skip_vcols: i64) -> (String, i64) {
 fn abs_i64(n: i64) -> i64 = if n < 0 { -n } else { n }
 
 fn pad_left(text: String, width: i64) -> String {
-    let len = str_display_width(text)
+    let len = if text.is_ascii() { text.len() } else { str_display_width(text) }
     if len >= width {
         return text
     }
@@ -3591,6 +3592,124 @@ fn emit_ts_row_spans_with_fg_decs(
     cur_vcol
 }
 
+private global _ts_row_seg_cfg_key: String = ""
+private global _ts_row_seg_cache: ?Map = null
+private global _pane_decor_cache_key: String = ""
+private global _pane_decor_cache_maps: ?(Map, Map, Map) = null
+
+fn ts_spans_exact_eq(a: List, b: List) -> bool {
+    let n = a.len()
+    if n != b.len() {
+        return false
+    }
+    if n == 0 {
+        return true
+    }
+    let a0 = a.get(0).as(TsSpan)
+    let b0 = b.get(0).as(TsSpan)
+    if a0.start_col != b0.start_col or a0.end_col != b0.end_col or a0.hl_group != b0.hl_group {
+        return false
+    }
+    if n > 1 {
+        let last_u = (n - 1).as(usize)
+        let al = a.get(last_u).as(TsSpan)
+        let bl = b.get(last_u).as(TsSpan)
+        if al.start_col != bl.start_col or al.end_col != bl.end_col or al.hl_group != bl.hl_group {
+            return false
+        }
+    }
+    if n > 2 {
+        let mid_u = (n / 2).as(usize)
+        let am = a.get(mid_u).as(TsSpan)
+        let bm = b.get(mid_u).as(TsSpan)
+        if am.start_col != bm.start_col or am.end_col != bm.end_col or am.hl_group != bm.hl_group {
+            return false
+        }
+    }
+    true
+}
+
+fn fg_decs_exact_eq(a: List, b: List) -> bool {
+    let n = a.len()
+    if n != b.len() {
+        return false
+    }
+    for i in 0..n {
+        let da = a.get(i.as(usize)).as(InlineSpanDecor)
+        let db = b.get(i.as(usize)).as(InlineSpanDecor)
+        if da.start_col != db.start_col or da.end_col != db.end_col or da.fg_rgba != db.fg_rgba or da.underline != db.underline {
+            return false
+        }
+    }
+    true
+}
+
+fn emit_cached_ts_row(
+    cmds: List,
+    cache_opt: ?Map,
+    raw_line: String,
+    row_ts: List,
+    fg_decs: List,
+    dim_row: bool,
+    tabstop: i64,
+    left_col: i64,
+    text_x0: f64,
+    pane_right_x: f64,
+    row_y: f64,
+    cell_w: f64,
+    font_fam: String,
+    font_sz: f64,
+    theme: ThemePalette,
+) -> i64 {
+    let can_cache = cache_opt != null and raw_line.len() <= 256
+    if can_cache {
+        let cmap = cache_opt.as(Map)
+        if cmap.contains(raw_line) {
+            let (c_ts, c_decs, c_dim, c_vcol, c_runs) =
+                cmap.get(raw_line).as((List, List, bool, i64, List))
+            if c_dim == dim_row and fg_decs_exact_eq(c_decs, fg_decs) and ts_spans_exact_eq(c_ts, row_ts) {
+                for ri in 0..c_runs.len() {
+                    let (rx, rtxt, rcol, rit, rul) =
+                        c_runs.get(ri.as(usize)).as((f64, String, i64, bool, bool))
+                    cmds.push(DrawCmd.text_run(rx, row_y, rtxt, font_fam, font_sz, rcol, false, rit, rul))
+                }
+                return c_vcol
+            }
+        }
+    }
+    let start_idx = cmds.len()
+    let out_vcol = if fg_decs.is_empty() {
+        emit_ts_row_spans(
+            cmds, raw_line, row_ts, dim_row, tabstop, left_col,
+            text_x0, pane_right_x, row_y, cell_w, font_fam, font_sz, theme,
+        )
+    } else {
+        emit_ts_row_spans_with_fg_decs(
+            cmds, raw_line, row_ts, fg_decs, dim_row, tabstop, left_col,
+            text_x0, pane_right_x, row_y, cell_w, font_fam, font_sz, theme,
+        )
+    }
+    if can_cache {
+        let cmap = cache_opt.as(Map)
+        if cmap.len() > 256 {
+            _ts_row_seg_cache = Map.new()
+        } else {
+            let captured = List()
+            for ci in start_idx..cmds.len() {
+                let dcmd = cmds.get(ci.as(usize)).as(DrawCmd)
+                dcmd match {
+                    DrawCmd.text_run(rx, _, rtxt, _, _, rcol, _, rit, rul) => {
+                        captured.push((rx, rtxt, rcol, rit, rul))
+                    },
+                    _ => (),
+                }
+            }
+            cmap.set(raw_line, (row_ts, fg_decs, dim_row, out_vcol, captured))
+        }
+    }
+    out_vcol
+}
+
 fn emit_segmented_row_runs(
     cmds: List,
     raw_line: String,
@@ -4186,20 +4305,35 @@ fn render_window_pane(
     } else {
         -1
     }
-    let row_decors_map = if buf.inline_decors.is_empty() or first_vis_row < 0 {
-        Map.new()
+    let decor_ckey = buf.id.raw().to_string()
+        ++ "|" ++ buf.decor_gen.to_string()
+        ++ "|" ++ buf.inline_decors.len().to_string()
+        ++ "|" ++ buf.signs.len().to_string()
+        ++ "|" ++ buf.virt_texts.len().to_string()
+        ++ "|" ++ first_vis_row.to_string()
+        ++ "|" ++ last_vis_row.to_string()
+    let (row_decors_map, row_signs_map, row_vts_map) = if _pane_decor_cache_key == decor_ckey and _pane_decor_cache_maps != null {
+        _pane_decor_cache_maps.as((Map, Map, Map))
     } else {
-        index_inline_decors_in_row_range(buf.inline_decors, first_vis_row, last_vis_row)
-    }
-    let row_signs_map = if buf.signs.is_empty() or first_vis_row < 0 {
-        Map.new()
-    } else {
-        index_best_signs_in_row_range(buf.signs, first_vis_row, last_vis_row)
-    }
-    let row_vts_map = if buf.virt_texts.is_empty() or first_vis_row < 0 {
-        Map.new()
-    } else {
-        index_virt_texts_in_row_range(buf.virt_texts, first_vis_row, last_vis_row)
+        let dm = if buf.inline_decors.is_empty() or first_vis_row < 0 {
+            Map.new()
+        } else {
+            index_inline_decors_in_row_range(buf.inline_decors, first_vis_row, last_vis_row)
+        }
+        let sm = if buf.signs.is_empty() or first_vis_row < 0 {
+            Map.new()
+        } else {
+            index_best_signs_in_row_range(buf.signs, first_vis_row, last_vis_row)
+        }
+        let vm = if buf.virt_texts.is_empty() or first_vis_row < 0 {
+            Map.new()
+        } else {
+            index_virt_texts_in_row_range(buf.virt_texts, first_vis_row, last_vis_row)
+        }
+        let triple = (dm, sm, vm)
+        _pane_decor_cache_key = decor_ckey
+        _pane_decor_cache_maps = triple
+        triple
     }
 
     let md_fence_states = if is_markdown_buf and last_vis_row >= 0 {
@@ -4273,6 +4407,23 @@ fn render_window_pane(
         buf.slice_lines(first_vis_row, last_vis_row + 1)
     } else {
         List()
+    }
+
+    if not ts_viewport_rows.is_empty() {
+        let seg_cfg = buf.doc_id.to_string()
+            ++ "|" ++ ts_lang
+            ++ "|" ++ tabstop.to_string()
+            ++ "|" ++ pane.left_col.to_string()
+            ++ "|" ++ text_x0.to_string()
+            ++ "|" ++ pane_right_x.to_string()
+            ++ "|" ++ cell_w.to_string()
+            ++ "|" ++ font_fam
+            ++ "|" ++ font_sz.to_string()
+            ++ "|" ++ theme.bg.to_string()
+        if _ts_row_seg_cfg_key != seg_cfg or _ts_row_seg_cache == null {
+            _ts_row_seg_cfg_key = seg_cfg
+            _ts_row_seg_cache = Map.new()
+        }
     }
 
     for s_idx in 0..row_count {
@@ -4387,10 +4538,12 @@ fn render_window_pane(
         }
 
         -- 3. Selection background rectangles BEFORE text
-        render_pane_selection_for_row(
-            cmds, world, buf, pane, is_focused, buf_row, raw_line,
-            tabstop, text_x0, row_y, pane_right_x, cell_w, cell_h, theme,
-        )
+        if is_focused and (world.visual.kind != VisualKind.none or buf.mark_active) {
+            render_pane_selection_for_row(
+                cmds, world, buf, pane, is_focused, buf_row, raw_line,
+                tabstop, text_x0, row_y, pane_right_x, cell_w, cell_h, theme,
+            )
+        }
 
         -- 4. Search match highlights + Bracket match + Plugin `InlineSpanDecor` backgrounds BEFORE text
         if search_active {
@@ -4455,40 +4608,23 @@ fn render_window_pane(
 
         if has_ts_row {
             let row_ts = ts_viewport_rows.get((buf_row - first_vis_row).as(usize)).as(List)
-            if fg_decs.is_empty() {
-                cur_vcol = emit_ts_row_spans(
-                    cmds,
-                    raw_line,
-                    row_ts,
-                    dim_row,
-                    tabstop,
-                    pane.left_col,
-                    text_x0,
-                    pane_right_x,
-                    row_y,
-                    cell_w,
-                    font_fam,
-                    font_sz,
-                    theme,
-                )
-            } else {
-                cur_vcol = emit_ts_row_spans_with_fg_decs(
-                    cmds,
-                    raw_line,
-                    row_ts,
-                    fg_decs,
-                    dim_row,
-                    tabstop,
-                    pane.left_col,
-                    text_x0,
-                    pane_right_x,
-                    row_y,
-                    cell_w,
-                    font_fam,
-                    font_sz,
-                    theme,
-                )
-            }
+            cur_vcol = emit_cached_ts_row(
+                cmds,
+                _ts_row_seg_cache,
+                raw_line,
+                row_ts,
+                fg_decs,
+                dim_row,
+                tabstop,
+                pane.left_col,
+                text_x0,
+                pane_right_x,
+                row_y,
+                cell_w,
+                font_fam,
+                font_sz,
+                theme,
+            )
         } else {
             let full_runs = if is_markdown_buf and md_fence_kind == 1 {
                 tokenize_markdown_fence_delim(raw_line, theme)
@@ -5026,6 +5162,13 @@ fn render_echo_or_minibuffer(
             mb.input_text.char_len()
         } else {
             mb.cursor_col
+        }
+        if world.minibuffer_history_ghost != "" and clamped_col == mb.input_text.char_len() {
+            let ghost_x = input_x + str_display_width(mb.input_text).as(f64) * cell_w
+            cmds.push(DrawCmd.text_run(
+                ghost_x, text_y, world.minibuffer_history_ghost, font_fam, font_sz,
+                theme.fg_muted, false, false, false,
+            ))
         }
         let prefix_cols = if clamped_col > 0 {
             str_display_width(mb.input_text.slice(0, clamped_col))
@@ -6139,6 +6282,84 @@ fn render_toast_notifications(
     }
 }
 
+fn format_transfer_bytes(bytes: i64) -> String {
+    if bytes <= 0 {
+        return "0 B"
+    }
+    if bytes < 1024 {
+        return bytes.to_string() ++ " B"
+    }
+    if bytes < 1048576 {
+        let kb = bytes / 1024
+        return kb.to_string() ++ " KiB"
+    }
+    let tenths = (bytes * 10) / 1048576
+    (tenths / 10).to_string() ++ "." ++ (tenths % 10).to_string() ++ " MiB"
+}
+
+fn render_transfer_progress_bar(
+    cmds: List,
+    world: EditorWorld,
+    wm: WindowManager,
+    theme: ThemePalette,
+    win_w: f64,
+    echo_y: f64,
+) {
+    let tp = world.transfer_progress
+    if not tp.active {
+        return
+    }
+    let cell_w = wm.metrics.cell_width
+    let cell_h = wm.metrics.cell_height
+    let font_fam = world.options.font_family
+    let font_sz = world.options.font_size_pt
+    let card_w = if win_w * 0.44 < 440.0 { 440.0 } else { win_w * 0.44 }
+    let clamped_w = if card_w > win_w - 24.0 { win_w - 24.0 } else { card_w }
+    if clamped_w < 120.0 {
+        return
+    }
+    let card_h = cell_h * 2.0 + 18.0
+    let x = ((win_w - clamped_w) * 0.5).floor()
+    let y = (echo_y - card_h - 12.0).floor()
+    if y < 8.0 {
+        return
+    }
+    let transport_lbl = if tp.transport != "" { "[" ++ tp.transport ++ "] " } else { "[SSH] " }
+    let pct = if tp.bytes_total > 0 {
+        let raw_pct = (tp.bytes_done * 100) / tp.bytes_total
+        if raw_pct < 0 { 0 } else if raw_pct > 100 { 100 } else { raw_pct }
+    } else {
+        100
+    }
+    let lines_lbl = if tp.lines_loaded > 0 {
+        " · " ++ tp.lines_loaded.to_string() ++ " lines"
+    } else {
+        ""
+    }
+    let stats_txt = pct.to_string() ++ "% ("
+        ++ format_transfer_bytes(tp.bytes_done) ++ " / "
+        ++ format_transfer_bytes(tp.bytes_total) ++ ")" ++ lines_lbl
+    let max_chars = (((clamped_w - 24.0) / cell_w).floor().as(i64))
+    let header_txt = clip_str(transport_lbl ++ tp.title ++ "  " ++ stats_txt, max_chars)
+
+    cmds.push(DrawCmd.clip_push(x, y, clamped_w, card_h))
+    cmds.push(DrawCmd.fill_rect(x, y, clamped_w, card_h, theme.bg_popup, 6.0))
+    cmds.push(DrawCmd.stroke_rect(x, y, clamped_w, card_h, theme.accent, 1.2, 6.0))
+    cmds.push(DrawCmd.text_run(x + 12.0, y + 4.0, header_txt, font_fam, font_sz, theme.fg, false, false, false))
+
+    let bar_x = x + 12.0
+    let bar_y = y + cell_h + 10.0
+    let bar_w = clamped_w - 24.0
+    let bar_h = 6.0
+    cmds.push(DrawCmd.fill_rect(bar_x, bar_y, bar_w, bar_h, theme.bg_alt, 3.0))
+    let fill_ratio = (pct.as(f64)) / 100.0
+    let fill_w = (bar_w * fill_ratio).floor()
+    if fill_w > 1.0 {
+        cmds.push(DrawCmd.fill_rect(bar_x, bar_y, fill_w, bar_h, theme.accent, 3.0))
+    }
+    cmds.push(DrawCmd.clip_pop)
+}
+
 pub fn compose_frame(
     kernel: SystemKernel,
     world: EditorWorld,
@@ -6161,6 +6382,7 @@ pub fn compose_frame(
         height: wm.pixel_height,
         bg_rgba: theme.bg,
         pointer: PointerHint.default,
+        decorated: world.options.window_decorations,
     }
 
     let cmds = List()
@@ -6200,8 +6422,9 @@ pub fn compose_frame(
     -- 4. Bottom Echo Bar / Interactive Minibuffer + Completion Popup
     render_echo_or_minibuffer(cmds, world, wm, theme, win_w, echo_y)
 
-    -- 5. Top-Right Toast Notifications (`ext_noice`)
+    -- 5. Top-Right Toast Notifications (`ext_noice`) + Remote Transfer Progress Bar
     render_toast_notifications(cmds, world, wm, theme, win_w)
+    render_transfer_progress_bar(cmds, world, wm, theme, win_w, echo_y)
 
     (spec, cmds)
 }

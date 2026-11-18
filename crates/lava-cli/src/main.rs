@@ -317,7 +317,15 @@ fn resolve_user_init_script(opts: &CliOptions) -> Result<Option<PathBuf>, String
             return Ok(Some(candidate));
         }
     }
-    if let Ok(home) = env::var("HOME")
+    if let Ok(appdata) = env::var("APPDATA")
+        && !appdata.is_empty()
+    {
+        let candidate = PathBuf::from(appdata).join("lava").join("init.ns");
+        if candidate.is_file() {
+            return Ok(Some(candidate));
+        }
+    }
+    if let Ok(home) = env::var("HOME").or_else(|_| env::var("USERPROFILE"))
         && !home.is_empty()
     {
         let candidate = PathBuf::from(home)
@@ -342,7 +350,12 @@ fn resolve_window_state_path() -> Option<PathBuf> {
     {
         return Some(PathBuf::from(xdg).join("lava").join("window_state.txt"));
     }
-    if let Ok(home) = env::var("HOME")
+    if let Ok(appdata) = env::var("APPDATA")
+        && !appdata.is_empty()
+    {
+        return Some(PathBuf::from(appdata).join("lava").join("window_state.txt"));
+    }
+    if let Ok(home) = env::var("HOME").or_else(|_| env::var("USERPROFILE"))
         && !home.is_empty()
     {
         return Some(
@@ -594,7 +607,59 @@ fn run_cli(opts: CliOptions) -> Result<i32, String> {
     }
 }
 
+fn bootstrap_bundled_environment() {
+    #[cfg(windows)]
+    {
+        if env::var_os("HOME").is_none()
+            && let Some(user_profile) = env::var_os("USERPROFILE")
+            && !user_profile.is_empty()
+        {
+            // SAFETY: Invoked once at the very start of `main()` before any worker threads spawn.
+            unsafe {
+                env::set_var("HOME", user_profile);
+            }
+        }
+    }
+
+    if let Ok(exe) = env::current_exe()
+        && let Some(exe_dir) = exe.parent()
+    {
+        if env::var_os("LAVA_FONTS_DIR").is_none() {
+            let bundled_fonts = exe_dir.join("fonts");
+            if bundled_fonts.is_dir() {
+                // SAFETY: Invoked once at the very start of `main()` before any worker threads spawn.
+                unsafe {
+                    env::set_var("LAVA_FONTS_DIR", &bundled_fonts);
+                }
+            }
+        }
+
+        let mut prepend_dirs: Vec<PathBuf> = Vec::new();
+        let bundled_bin = exe_dir.join("bin");
+        if bundled_bin.is_dir() {
+            prepend_dirs.push(bundled_bin);
+        }
+        prepend_dirs.push(exe_dir.to_path_buf());
+
+        let existing: Vec<PathBuf> = env::var_os("PATH")
+            .map(|p| env::split_paths(&p).collect())
+            .unwrap_or_default();
+        for dir in existing {
+            if !prepend_dirs.iter().any(|d| d == &dir) {
+                prepend_dirs.push(dir);
+            }
+        }
+        if let Ok(joined) = env::join_paths(prepend_dirs) {
+            // SAFETY: Invoked once at the very start of `main()` before any worker threads spawn.
+            unsafe {
+                env::set_var("PATH", joined);
+            }
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    bootstrap_bundled_environment();
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_cli_args(args).and_then(run_cli) {
         Ok(code) => ExitCode::from((code.clamp(0, 255)) as u8),

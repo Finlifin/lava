@@ -11,6 +11,7 @@ pub mod explorers
 use std.fs
 use std.path
 use @lava_sys.host_read_file_lines
+use @lava_remote.{is_ssh_uri, normalize_ssh_uri, remote_read_lines}
 use @lava_core.{
     ExtId, InteractiveEffects, PromptKind, PromptRequest, ServiceEffects, SystemKernel, ask_prompt,
     clipboard_get, clipboard_set, log_event, status_emit
@@ -450,26 +451,27 @@ fn open_or_load_file_buffer(
     }
     let saved_active = world.active_buffer_id
 
-    if trimmed.starts_with("ssh://") {
-        let existing_ssh = world.find_buffer_by_path(trimmed)
+    if is_ssh_uri(trimmed) {
+        let norm_u = normalize_ssh_uri(trimmed)
+        let existing_ssh = world.find_buffer_by_path(norm_u)
         if existing_ssh != null {
             return existing_ssh.as(Buffer)
         }
-        -- Support dedicated `ext_ssh` opener command if present, otherwise `world.open_file`
-        if kernel.get_command("ssh-open-uri") != null {
-            let _ = kernel.dispatch_command("ssh-open-uri", [trimmed])#!
-            let after_ssh = world.find_buffer_by_path(trimmed)
-            if after_ssh != null {
-                world.active_buffer_id = saved_active
-                return after_ssh.as(Buffer)
-            }
-        }
-        let opened_ssh = world.open_file(trimmed)#!
+        let opened_ssh = world.open_file(norm_u)#!
         world.active_buffer_id = saved_active
         return opened_ssh
     }
 
     let full = world.resolve_path(trimmed)
+    if is_ssh_uri(full) {
+        let existing_r = world.find_buffer_by_path(full)
+        if existing_r != null {
+            return existing_r.as(Buffer)
+        }
+        let opened_r = world.open_file(full)#!
+        world.active_buffer_id = saved_active
+        return opened_r
+    }
     let existing = world.find_buffer_by_path(full)
     if existing != null {
         return existing.as(Buffer)
@@ -507,8 +509,18 @@ fn load_source_raw_lines(world: EditorWorld, src: DiffSource) -> !String List {
     }
     if src.kind == "saved" {
         if src.file_path != "" {
-            if src.file_path.starts_with("ssh://") {
-                return clone_str_list(src.snapshot_lines)
+            if is_ssh_uri(src.file_path) {
+                let rl_res = remote_read_lines(src.file_path)
+                rl_res match {
+                    pair! => {
+                        let (flines, _) = pair
+                        src.snapshot_lines = clone_str_list(flines)
+                        return flines
+                    },
+                    error _ => {
+                        return clone_str_list(src.snapshot_lines)
+                    },
+                }
             }
             if fs.is_file(src.file_path) {
                 let (flines, _) = host_read_file_lines(src.file_path)!

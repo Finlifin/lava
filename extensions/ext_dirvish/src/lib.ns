@@ -23,7 +23,13 @@ use @lava_core.{
     ExtId, InteractiveEffects, PromptKind, PromptRequest, SystemKernel, ask_prompt, clipboard_set,
     log_event, status_emit
 }
-use @lava_accel.{GitFileEntry, accel_git_status}
+use @lava_accel.{GitFileEntry, OrderlessHit, accel_git_status, accel_orderless_rank, accel_workspace_files}
+use @lava_remote.{
+    RemoteDirItem, RemoteGitFileEntry, is_ssh_uri, join_ssh_uri, normalize_ssh_uri, parent_ssh_uri,
+    parse_ssh_uri, remote_copy, remote_git_status, remote_host_available, remote_mkdir,
+    remote_read_lines, remote_read_preview, remote_readdir, remote_remove, remote_rename,
+    remote_search_files, remote_stat, remote_write_lines, ssh_uri_basename
+}
 use @ext_document.{
     Buffer, BufferId, BufferKind, EditorWorld, Pos, RegisterValue, detect_major_mode,
     ext_document_id, require_editor_world
@@ -88,6 +94,10 @@ pub struct DirvishState {
     pub cursor_by_dir: HashMap,
     pub preview_cache: HashMap,
     pub preview_cache_order: List,
+    pub fd_mode: bool,
+    pub fd_root: String,
+    pub fd_pattern: String,
+    pub fd_all_entries: List,
 }
 
 impl DirvishState {
@@ -110,6 +120,10 @@ impl DirvishState {
             cursor_by_dir: HashMap.new(),
             preview_cache: HashMap.new(),
             preview_cache_order: List(),
+            fd_mode: false,
+            fd_root: "",
+            fd_pattern: "",
+            fd_all_entries: List(),
         }
     }
 
@@ -149,6 +163,23 @@ fn clean_dir_path(raw_dir: String, fallback_cwd: String) -> String {
     } else {
         raw_dir.trim()
     }
+    if is_ssh_uri(base) {
+        let pt_res = parse_ssh_uri(base)
+        pt_res match {
+            pt! => {
+                if pt.remote_path == "/" {
+                    return pt.prefix ++ "/"
+                }
+                return pt.prefix ++ pt.remote_path
+            },
+            error _ => {
+                return normalize_ssh_uri(base)
+            },
+        }
+    }
+    if is_ssh_uri(fallback_cwd.trim()) and not path.is_absolute(base) {
+        return clean_dir_path(join_ssh_uri(fallback_cwd.trim(), base), "/")
+    }
     let abs_p = if path.is_absolute(base) {
         path.normalize(base)
     } else {
@@ -156,32 +187,118 @@ fn clean_dir_path(raw_dir: String, fallback_cwd: String) -> String {
         path.normalize(path.join(cwd_clean, base))
     }
     if abs_p == "" {
-        return "/"
+        return path.separator()
     }
-    if abs_p.char_len() > 1 and abs_p.ends_with("/") {
+    if abs_p.char_len() == 3 and abs_p.slice(1, 2) == ":" and (abs_p.ends_with("/") or abs_p.ends_with("\\")) {
+        return abs_p
+    }
+    if abs_p.char_len() > 1 and (abs_p.ends_with("/") or abs_p.ends_with("\\")) {
         return abs_p.slice(0, abs_p.char_len() - 1)
     }
     abs_p
 }
 
-fn home_directory() -> String {
-    let h_opt = env.get("HOME")
-    if h_opt != null {
-        let h = h_opt.as(String).trim()
-        if h != "" {
-            return clean_dir_path(h, "/")
+fn is_dir_root_path(dir_path: String) -> bool {
+    if dir_path == "/" or dir_path == "\\" or dir_path == "" {
+        return true
+    }
+    if dir_path.char_len() == 2 and dir_path.slice(1, 2) == ":" {
+        return true
+    }
+    if dir_path.char_len() == 3 and dir_path.slice(1, 2) == ":" and (dir_path.ends_with("/") or dir_path.ends_with("\\")) {
+        return true
+    }
+    if is_ssh_uri(dir_path) {
+        let pt_res = parse_ssh_uri(dir_path)
+        pt_res match {
+            pt! => {
+                return pt.remote_path == "/"
+            },
+            error _ => {
+                return false
+            },
         }
+    }
+    false
+}
+
+fn any_parent_dir(target_path: String) -> String {
+    if is_ssh_uri(target_path) {
+        return clean_dir_path(parent_ssh_uri(target_path), "/")
+    }
+    let p_opt = path.parent(target_path)
+    if p_opt != null and p_opt.as(String) != "" {
+        return clean_dir_path(p_opt.as(String), "/")
     }
     "/"
 }
 
+fn any_basename(target_path: String) -> String {
+    if is_ssh_uri(target_path) {
+        return ssh_uri_basename(target_path)
+    }
+    let fn_opt = path.file_name(target_path)
+    if fn_opt != null {
+        return fn_opt.as(String)
+    }
+    ""
+}
+
+fn any_join_path(dir_path: String, child: String) -> String {
+    if is_ssh_uri(dir_path) {
+        return clean_dir_path(join_ssh_uri(dir_path, child), "/")
+    }
+    path.normalize(path.join(dir_path, child))
+}
+
+fn any_exists(target_path: String) -> bool {
+    if is_ssh_uri(target_path) {
+        let st_res = remote_stat(target_path)
+        st_res match {
+            st! => {
+                return st.exists
+            },
+            error _ => {
+                return false
+            },
+        }
+    }
+    fs.exists(target_path)
+}
+
+fn any_is_dir(target_path: String) -> bool {
+    if is_ssh_uri(target_path) {
+        let st_res = remote_stat(target_path)
+        st_res match {
+            st! => {
+                return st.exists and st.is_dir
+            },
+            error _ => {
+                return false
+            },
+        }
+    }
+    fs.is_dir(target_path)
+}
+
+fn home_directory() -> String {
+    let h = env.get_or("HOME", env.get_or("USERPROFILE", "")).trim()
+    if h != "" {
+        return clean_dir_path(h, path.separator())
+    }
+    path.separator()
+}
+
 fn abbreviate_path(dir_path: String) -> String {
+    if is_ssh_uri(dir_path) {
+        return dir_path
+    }
     let home = home_directory()
-    if home != "/" and home != "" {
+    if home != "/" and home != "\\" and home != "" {
         if dir_path == home {
             return "~"
         }
-        if dir_path.starts_with(home ++ "/") {
+        if dir_path.starts_with(home ++ "/") or dir_path.starts_with(home ++ "\\") {
             return "~" ++ dir_path.slice(home.char_len(), dir_path.char_len())
         }
     }
@@ -360,6 +477,54 @@ fn normalize_git_badge(idx_st: String, wt_st: String) -> String {
 
 fn collect_dir_git_badges(dir_path: String) -> HashMap {
     let badges = HashMap.new()
+    if is_ssh_uri(dir_path) {
+        let rsum = remote_git_status(dir_path) ! { _ => return badges }
+        if not rsum.is_repo {
+            return badges
+        }
+        let repo_root = clean_dir_path(rsum.root, "/")
+        let dir_clean = clean_dir_path(dir_path, "/")
+        var rel_prefix = ""
+        if dir_clean == repo_root {
+            rel_prefix = ""
+        } else if repo_root.ends_with("/") and dir_clean.starts_with(repo_root) {
+            rel_prefix = dir_clean.slice(repo_root.char_len(), dir_clean.char_len()) ++ "/"
+        } else if dir_clean.starts_with(repo_root ++ "/") {
+            rel_prefix = dir_clean.slice(repo_root.char_len() + 1, dir_clean.char_len()) ++ "/"
+        } else {
+            return badges
+        }
+        for i in 0..rsum.entries.len() {
+            let rge = rsum.entries.get(i.as(usize)).as(RemoteGitFileEntry)
+            let rp = rge.rel_path
+            if rel_prefix == "" or rp.starts_with(rel_prefix) {
+                let sub = if rel_prefix == "" {
+                    rp
+                } else {
+                    rp.slice(rel_prefix.char_len(), rp.char_len())
+                }
+                if sub != "" {
+                    let sp_opt = sub.split_once("/")
+                    let child_name = if sp_opt != null {
+                        let (head, _) = sp_opt.as((String, String))
+                        head
+                    } else {
+                        sub
+                    }
+                    if child_name != "" {
+                        let badge = normalize_git_badge(rge.index_status, rge.worktree_status)
+                        if badge != " " {
+                            let existing_opt = badges.get(child_name)
+                            if existing_opt == null or existing_opt.as(String) == "?" {
+                                badges.insert(child_name, badge)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return badges
+    }
     let repo_opt = find_git_repo_root(dir_path)
     if repo_opt == null {
         return badges
@@ -481,6 +646,59 @@ fn scan_directory_entries(
     sort_reverse: bool,
     include_git: bool,
 ) -> !String List {
+    if is_ssh_uri(dir_path) {
+        let ritems = remote_readdir(dir_path, show_hidden = show_hidden)!
+        let git_badges = if include_git {
+            collect_dir_git_badges(dir_path)
+        } else {
+            HashMap.new()
+        }
+        let q_low = filter_query.trim().to_lower()
+        let out = List()
+        for i in 0..ritems.len() {
+            let ri = ritems.get(i.as(usize)).as(RemoteDirItem)
+            if ri.name == "." or ri.name == ".." {
+                continue
+            }
+            if (not show_hidden) and ri.name.starts_with(".") {
+                continue
+            }
+            if q_low != "" and (not ri.name.to_lower().contains(q_low)) {
+                continue
+            }
+            let low = ri.name.to_lower()
+            let is_exec = (not ri.is_dir) and (
+                low.ends_with(".sh")
+                or low.ends_with(".bash")
+                or low.ends_with(".zsh")
+                or low.ends_with(".bin")
+                or low.ends_with(".out")
+            )
+            let perms = if ri.is_dir {
+                "drwxr-xr-x"
+            } else if is_exec {
+                "-rwxr-xr-x"
+            } else {
+                "-rw-r--r--"
+            }
+            let badge_opt = git_badges.get(ri.name)
+            let git_badge = if badge_opt != null { badge_opt.as(String) } else { " " }
+            out.push(DirvishEntry {
+                name: ri.name,
+                full_path: clean_dir_path(ri.full_uri, dir_path),
+                is_dir: ri.is_dir,
+                is_symlink: false,
+                is_exec: is_exec,
+                size: ri.size,
+                modified_unix_secs: 0,
+                symlink_target: "",
+                git_badge: git_badge,
+                perms: perms,
+            })
+        }
+        sort_dirvish_entries(out, sort_by, sort_reverse)
+        return out
+    }
     let raw = (fs.read_dir_entries(dir_path) ! {
         err => error ("Cannot read directory '" ++ dir_path ++ "': " ++ err.to_string())
     })!
@@ -610,10 +828,10 @@ fn render_parent_buffer(world: EditorWorld, state: DirvishState) -> Buffer {
     parent_buf.read_only = false
     parent_buf.clear_owner_decors(DIRVISH_DECOR_OWNER)
 
-    if state.current_dir == "/" {
+    if is_dir_root_path(state.current_dir) {
         state.parent_entries = List()
         parent_buf.file_path = ""
-        let root_line = "  [root /]"
+        let root_line = "  [root " ++ state.current_dir ++ "]"
         parent_buf.set_lines([root_line], record_undo = false)
         parent_buf.add_inline_decor(
             DIRVISH_DECOR_OWNER,
@@ -629,16 +847,10 @@ fn render_parent_buffer(world: EditorWorld, state: DirvishState) -> Buffer {
         return parent_buf
     }
 
-    let p_opt = path.parent(state.current_dir)
-    let parent_dir = if p_opt != null and p_opt.as(String) != "" {
-        clean_dir_path(p_opt.as(String), "/")
-    } else {
-        "/"
-    }
+    let parent_dir = any_parent_dir(state.current_dir)
     parent_buf.file_path = ""
 
-    let cur_base_opt = path.file_name(state.current_dir)
-    let cur_base = if cur_base_opt != null { cur_base_opt.as(String) } else { "" }
+    let cur_base = any_basename(state.current_dir)
 
     -- Always include `cur_base` even if it starts with `.` and `show_hidden` is false
     let show_dots = state.show_hidden or cur_base.starts_with(".")
@@ -763,17 +975,21 @@ fn entry_icon(ent: DirvishEntry) -> String {
 }
 
 fn format_center_header(state: DirvishState) -> String {
-    let sort_arrow = if state.sort_reverse { "↓" } else { "↑" }
     let count_tag = "[" ++ state.entries.len().to_string() ++ "]"
-    let sort_tag = "sort:" ++ state.sort_by ++ " " ++ sort_arrow
     let hidden_tag = if state.show_hidden { "  ·hidden" } else { "" }
-    let filter_tag = if state.filter_query != "" {
-        "  filter:" ++ state.filter_query
+    let ring_tag = if not state.yank_ring.is_empty() {
+        "  " ++ state.yank_mode ++ ":" ++ state.yank_ring.len().to_string()
     } else {
         ""
     }
-    let ring_tag = if not state.yank_ring.is_empty() {
-        "  " ++ state.yank_mode ++ ":" ++ state.yank_ring.len().to_string()
+    if state.fd_mode {
+        let pat_lbl = if state.fd_pattern != "" { state.fd_pattern } else { "*" }
+        return "   fd " ++ abbreviate_path(state.fd_root) ++ "  " ++ count_tag ++ "  fd:" ++ pat_lbl ++ hidden_tag ++ ring_tag
+    }
+    let sort_arrow = if state.sort_reverse { "↓" } else { "↑" }
+    let sort_tag = "sort:" ++ state.sort_by ++ " " ++ sort_arrow
+    let filter_tag = if state.filter_query != "" {
+        "  filter:" ++ state.filter_query
     } else {
         ""
     }
@@ -1198,17 +1414,49 @@ fn render_preview_buffer(world: EditorWorld, state: DirvishState, center_buf: Bu
         "100644"
     }
 
-    let meta_opt: ?fs.FileMetadata = fs.metadata(ent.full_path) ! { _ => null }
-    let (eff_mtime, eff_size) = if meta_opt != null {
-        let m = meta_opt.as(fs.FileMetadata)
-        (m.modified_unix_secs, m.size)
-    } else {
+    let (eff_mtime, eff_size) = if is_ssh_uri(ent.full_path) {
         (ent.modified_unix_secs, ent.size)
+    } else {
+        let meta_opt: ?fs.FileMetadata = fs.metadata(ent.full_path) ! { _ => null }
+        if meta_opt != null {
+            let m = meta_opt.as(fs.FileMetadata)
+            (m.modified_unix_secs, m.size)
+        } else {
+            (ent.modified_unix_secs, ent.size)
+        }
     }
     let cache_key = ent.full_path ++ "\n" ++ eff_mtime.to_string() ++ ":" ++ eff_size.to_string()
     let cached_opt = state.preview_cache.get(cache_key)
     let resolved_preview = if cached_opt != null {
         cached_opt.as(DirvishPreviewCacheEntry)
+    } else if is_ssh_uri(ent.full_path) {
+        let built = remote_read_preview(ent.full_path, max_bytes = 8192, max_lines = 120) match {
+            pv! => {
+                if pv.is_binary {
+                    let sz_val = if pv.total_size > 0 { pv.total_size } else { eff_size }
+                    let bin_msg = "[Binary file — " ++ format_human_size(sz_val).trim() ++ ", mode " ++ mode_oct ++ "]"
+                    DirvishPreviewCacheEntry {
+                        kind: "binary",
+                        major_mode: "text",
+                        lines: [bin_msg],
+                    }
+                } else {
+                    let plines = if pv.lines.is_empty() { [""] } else { pv.lines }
+                    DirvishPreviewCacheEntry {
+                        kind: "text",
+                        major_mode: detect_major_mode(ent.full_path),
+                        lines: plines,
+                    }
+                }
+            },
+            error _ => DirvishPreviewCacheEntry {
+                kind: "unreadable",
+                major_mode: "text",
+                lines: ["[Unable to read remote file]"],
+            },
+        }
+        cache_dirvish_preview(state, cache_key, built)
+        built
     } else {
         let built = inspect_preview_file_single_open(ent.full_path) match {
             res! => {
@@ -1443,6 +1691,223 @@ fn ensure_vim_normal(kernel: SystemKernel, world: EditorWorld) {
     sync_world_from_vim(world, vim_res)
 }
 
+fn walk_remote_fd_entries(
+    root_uri: String,
+    dir_uri: String,
+    rel_prefix: String,
+    show_hidden: bool,
+    limit: i64,
+    depth: i64,
+    out: List,
+) {
+    if depth > 12 or out.len() >= limit {
+        return
+    }
+    let items = remote_readdir(dir_uri, show_hidden = show_hidden) ! { _ => List() }
+    for i in 0..items.len() {
+        if out.len() >= limit {
+            return
+        }
+        let it = items.get(i.as(usize)).as(RemoteDirItem)
+        if it.name == "." or it.name == ".." {
+            continue
+        }
+        if (not show_hidden) and it.name.starts_with(".") {
+            continue
+        }
+        if it.is_dir and (it.name == ".git" or it.name == "target" or it.name == "node_modules") {
+            continue
+        }
+        let rel_name = if rel_prefix == "" { it.name } else { rel_prefix ++ "/" ++ it.name }
+        let clean_full = clean_dir_path(it.full_uri, root_uri)
+        out.push(DirvishEntry {
+            name: rel_name,
+            full_path: clean_full,
+            is_dir: it.is_dir,
+            is_symlink: false,
+            is_exec: false,
+            size: it.size,
+            modified_unix_secs: 0,
+            symlink_target: "",
+            git_badge: " ",
+            perms: if it.is_dir { "drwxr-xr-x" } else { "-rw-r--r--" },
+        })
+        if it.is_dir {
+            walk_remote_fd_entries(root_uri, clean_full, rel_name, show_hidden, limit, depth + 1, out)
+        }
+    }
+}
+
+fn scan_fd_all_entries(root_dir: String, show_hidden: bool) -> !String List {
+    let clean_root = clean_dir_path(root_dir, "/")
+    if is_ssh_uri(clean_root) {
+        if remote_host_available() {
+            let uris = remote_search_files(clean_root, "", limit = 2500)!
+            let seen_dirs = Set.new()
+            let out = List()
+            let root_prefix = if clean_root.ends_with("/") { clean_root } else { clean_root ++ "/" }
+            for i in 0..uris.len() {
+                let raw_u = uris.get(i.as(usize)).as(String)
+                let u = clean_dir_path(raw_u, clean_root)
+                let rel = if u.starts_with(root_prefix) {
+                    u.slice(root_prefix.char_len(), u.char_len())
+                } else {
+                    any_basename(u)
+                }
+                if rel == "" {
+                    continue
+                }
+                -- Synthesize ancestor relative directories so `dirvish-fd` finds dirs too
+                let segs = rel.split("/")
+                if segs.len() > 1 {
+                    var acc = ""
+                    for si in 0..(segs.len() - 1) {
+                        let seg = segs.get(si.as(usize)).as(String)
+                        acc = if acc == "" { seg } else { acc ++ "/" ++ seg }
+                        if not seen_dirs.contains(acc) {
+                            seen_dirs.insert(acc)
+                            out.push(DirvishEntry {
+                                name: acc,
+                                full_path: any_join_path(clean_root, acc),
+                                is_dir: true,
+                                is_symlink: false,
+                                is_exec: false,
+                                size: 0,
+                                modified_unix_secs: 0,
+                                symlink_target: "",
+                                git_badge: " ",
+                                perms: "drwxr-xr-x",
+                            })
+                        }
+                    }
+                }
+                out.push(DirvishEntry {
+                    name: rel,
+                    full_path: u,
+                    is_dir: false,
+                    is_symlink: false,
+                    is_exec: false,
+                    size: 0,
+                    modified_unix_secs: 0,
+                    symlink_target: "",
+                    git_badge: " ",
+                    perms: "-rw-r--r--",
+                })
+            }
+            return out
+        }
+        let mock_out = List()
+        walk_remote_fd_entries(clean_root, clean_root, "", show_hidden, 2500, 0, mock_out)
+        return mock_out
+    }
+
+    let rel_files = accel_workspace_files(clean_root, max_files = 4000, include_hidden = show_hidden)
+    let seen_dirs = Set.new()
+    let out = List()
+    -- Also capture top-level / empty subdirectories via a shallow walk when small
+    let top_entries = fs.read_dir_entries(clean_root) ! { _ => List() }
+    for ti in 0..top_entries.len() {
+        let tde = top_entries.get(ti.as(usize)).as(DirEntry)
+        if tde.name == "." or tde.name == ".." or tde.name == ".git" or tde.name == "target" or tde.name == "node_modules" {
+            continue
+        }
+        if (not show_hidden) and tde.name.starts_with(".") {
+            continue
+        }
+        if tde.is_dir() and not seen_dirs.contains(tde.name) {
+            seen_dirs.insert(tde.name)
+            out.push(DirvishEntry {
+                name: tde.name,
+                full_path: path.join(clean_root, tde.name),
+                is_dir: true,
+                is_symlink: tde.is_symlink(),
+                is_exec: false,
+                size: 0,
+                modified_unix_secs: tde.modified_unix_secs,
+                symlink_target: "",
+                git_badge: " ",
+                perms: "drwxr-xr-x",
+            })
+        }
+    }
+    for i in 0..rel_files.len() {
+        let rel = rel_files.get(i.as(usize)).as(String)
+        if rel == "" {
+            continue
+        }
+        let segs = rel.split("/")
+        if segs.len() > 1 {
+            var acc = ""
+            for si in 0..(segs.len() - 1) {
+                let seg = segs.get(si.as(usize)).as(String)
+                acc = if acc == "" { seg } else { acc ++ "/" ++ seg }
+                if not seen_dirs.contains(acc) {
+                    seen_dirs.insert(acc)
+                    out.push(DirvishEntry {
+                        name: acc,
+                        full_path: path.join(clean_root, acc),
+                        is_dir: true,
+                        is_symlink: false,
+                        is_exec: false,
+                        size: 0,
+                        modified_unix_secs: 0,
+                        symlink_target: "",
+                        git_badge: " ",
+                        perms: "drwxr-xr-x",
+                    })
+                }
+            }
+        }
+        let full_p = path.join(clean_root, rel)
+        let meta_opt: ?fs.FileMetadata = fs.metadata(full_p) ! { _ => null }
+        let (sz, mt) = if meta_opt != null {
+            let m = meta_opt.as(fs.FileMetadata)
+            (m.size, m.modified_unix_secs)
+        } else {
+            (0, 0)
+        }
+        out.push(DirvishEntry {
+            name: rel,
+            full_path: full_p,
+            is_dir: false,
+            is_symlink: false,
+            is_exec: false,
+            size: sz,
+            modified_unix_secs: mt,
+            symlink_target: "",
+            git_badge: " ",
+            perms: "-rw-r--r--",
+        })
+    }
+    out
+}
+
+fn filter_fd_entries(all_entries: List, pattern: String, sort_by: String, sort_reverse: bool) -> List {
+    let q = pattern.trim()
+    if q == "" {
+        let copied = List()
+        for i in 0..all_entries.len() {
+            copied.push(all_entries.get(i.as(usize)))
+        }
+        sort_dirvish_entries(copied, sort_by, sort_reverse)
+        return copied
+    }
+    let names = List()
+    for i in 0..all_entries.len() {
+        let ent = all_entries.get(i.as(usize)).as(DirvishEntry)
+        names.push(if ent.is_dir { ent.name ++ "/" } else { ent.name })
+    }
+    let (_, ranked) = accel_orderless_rank(q, names, limit = 500)
+    let out = List()
+    for i in 0..ranked.len() {
+        let hit = ranked.get(i.as(usize)).as(OrderlessHit)
+        if hit.index >= 0 and hit.index < all_entries.len() {
+            out.push(all_entries.get(hit.index.as(usize)))
+        }
+    }
+    out
+}
+
 fn refresh_dirvish_all(
     kernel: SystemKernel,
     world: EditorWorld,
@@ -1451,15 +1916,24 @@ fn refresh_dirvish_all(
     .focus_name: String = "",
     .preferred_row: i64 = 0,
 ) -> #[log_event, status_emit] !String Unit {
-    let entries = scan_directory_entries(
-        state.current_dir,
-        state.show_hidden,
-        state.filter_query,
-        state.sort_by,
-        state.sort_reverse,
-        true,
-    )!
-    state.entries = entries
+    if state.fd_mode {
+        state.entries = filter_fd_entries(
+            state.fd_all_entries,
+            state.fd_pattern,
+            state.sort_by,
+            state.sort_reverse,
+        )
+    } else {
+        let entries = scan_directory_entries(
+            state.current_dir,
+            state.show_hidden,
+            state.filter_query,
+            state.sort_by,
+            state.sort_reverse,
+            true,
+        )!
+        state.entries = entries
+    }
 
     let parent_buf = render_parent_buffer(world, state)
     let center_buf = render_center_buffer(world, state, focus_name, preferred_row)
@@ -1513,10 +1987,11 @@ fn open_dirvish_at(
         raw_dir
     }
     let target_dir = clean_dir_path(effective_raw, world.cwd)
-    if not fs.is_dir(target_dir) {
+    if not any_is_dir(target_dir) {
         return error ("Dirvish target is not a directory: " ++ target_dir)
     }
 
+    state.fd_mode = false
     state.current_dir = target_dir
     if record_hist {
         state.record_history(target_dir)
@@ -1532,19 +2007,19 @@ fn open_dirvish_at(
 -- ============================================================================
 
 fn disambiguate_dest_path(dest_dir: String, orig_name: String) -> String {
-    let direct = path.join(dest_dir, orig_name)
-    if not fs.exists(direct) {
+    let direct = any_join_path(dest_dir, orig_name)
+    if not any_exists(direct) {
         return direct
     }
     let (stem, ext) = split_stem_and_ext(orig_name)
-    let first_copy = path.join(dest_dir, stem ++ "_copy" ++ ext)
-    if not fs.exists(first_copy) {
+    let first_copy = any_join_path(dest_dir, stem ++ "_copy" ++ ext)
+    if not any_exists(first_copy) {
         return first_copy
     }
     var n: i64 = 2
     while true {
-        let candidate = path.join(dest_dir, stem ++ "_copy" ++ n.to_string() ++ ext)
-        if not fs.exists(candidate) {
+        let candidate = any_join_path(dest_dir, stem ++ "_copy" ++ n.to_string() ++ ext)
+        if not any_exists(candidate) {
             return candidate
         }
         n += 1
@@ -1553,6 +2028,13 @@ fn disambiguate_dest_path(dest_dir: String, orig_name: String) -> String {
 }
 
 fn remove_path_any(target: String) -> !String Unit {
+    if is_ssh_uri(target) {
+        if not any_exists(target) {
+            return ()
+        }
+        remote_remove(target, recursive = any_is_dir(target))!
+        return ()
+    }
     if not fs.exists(target) {
         return ()
     }
@@ -1576,6 +2058,30 @@ fn remove_path_any(target: String) -> !String Unit {
 }
 
 fn copy_recursive(src: String, dst: String) -> !String Unit {
+    if is_ssh_uri(src) and is_ssh_uri(dst) {
+        remote_copy(src, dst)!
+        return ()
+    }
+    if is_ssh_uri(src) and (not is_ssh_uri(dst)) {
+        let (lines, eol) = remote_read_lines(src)!
+        let sep = if eol == "CRLF" { "\r\n" } else { "\n" }
+        let p_opt = path.parent(dst)
+        if p_opt != null and p_opt.as(String) != "" {
+            let _ = fs.create_dir(p_opt.as(String), parents = true) ! { _ => () }
+        }
+        let _ = (fs.write_string(dst, lines.join(sep)) ! {
+            err => error ("Cannot copy remote '" ++ src ++ "' -> '" ++ dst ++ "': " ++ err.to_string())
+        })!
+        return ()
+    }
+    if (not is_ssh_uri(src)) and is_ssh_uri(dst) {
+        let text = (fs.read_to_string(src) ! {
+            err => error ("Cannot read '" ++ src ++ "': " ++ err.to_string())
+        })!
+        let lines = text.replace("\r\n", "\n").split("\n")
+        let _ = remote_write_lines(dst, lines, false)!
+        return ()
+    }
     if fs.is_dir(src) {
         let clean_src = clean_dir_path(src, "/")
         let clean_dst = clean_dir_path(dst, "/")
@@ -1613,12 +2119,18 @@ fn move_entry(src: String, dst: String) -> !String Unit {
     if clean_dir_path(src, "/") == clean_dir_path(dst, "/") {
         return ()
     }
-    let renamed_ok = fs.rename(src, dst) match {
-        _! => true,
-        error _ => false,
-    }
-    if renamed_ok {
+    if is_ssh_uri(src) and is_ssh_uri(dst) {
+        remote_rename(src, dst)!
         return ()
+    }
+    if (not is_ssh_uri(src)) and (not is_ssh_uri(dst)) {
+        let renamed_ok = fs.rename(src, dst) match {
+            _! => true,
+            error _ => false,
+        }
+        if renamed_ok {
+            return ()
+        }
     }
     copy_recursive(src, dst)!
     remove_path_any(src)!
@@ -1637,9 +2149,9 @@ fn sync_renamed_buffers(world: EditorWorld, old_path: String, new_path: String) 
         }
         if b.file_path == old_clean {
             b.file_path = new_clean
-            let fn_opt = path.file_name(new_clean)
-            if fn_opt != null {
-                b.name = fn_opt.as(String)
+            let bname = any_basename(new_clean)
+            if bname != "" {
+                b.name = bname
             }
             b.major_mode = detect_major_mode(new_clean)
         } else if b.file_path.starts_with(old_clean ++ "/") {
@@ -1709,15 +2221,12 @@ fn cmd_dirvish(kernel: SystemKernel, args: List) -> #InteractiveEffects !String 
     } else if cur_buf.name == DIRVISH_BUF_NAME and cur_buf.file_path != "" {
         target_dir = cur_buf.file_path
     } else if cur_buf.file_path != "" {
-        if fs.is_dir(cur_buf.file_path) {
+        if any_is_dir(cur_buf.file_path) {
             target_dir = cur_buf.file_path
         } else {
-            let p_opt = path.parent(cur_buf.file_path)
-            if p_opt != null and p_opt.as(String) != "" {
-                target_dir = p_opt.as(String)
-            }
+            target_dir = any_parent_dir(cur_buf.file_path)
         }
-    } else if state.current_dir != "" and state.current_dir != "/" and fs.is_dir(state.current_dir) {
+    } else if state.current_dir != "" and (not is_dir_root_path(state.current_dir)) and any_is_dir(state.current_dir) {
         target_dir = state.current_dir
     }
     open_dirvish_at(kernel, target_dir, "", true)#!
@@ -1735,35 +2244,124 @@ fn cmd_dirvish_jump(kernel: SystemKernel, _args: List) -> #InteractiveEffects !S
     var target_dir = world.cwd
     var focus_name = ""
     if cur_buf.file_path != "" {
-        if fs.is_dir(cur_buf.file_path) {
+        if any_is_dir(cur_buf.file_path) {
             let clean_cur = clean_dir_path(cur_buf.file_path, world.cwd)
-            if clean_cur != "/" {
-                let p_opt = path.parent(clean_cur)
-                if p_opt != null and p_opt.as(String) != "" {
-                    target_dir = p_opt.as(String)
-                }
-                let b_opt = path.file_name(clean_cur)
-                if b_opt != null {
-                    focus_name = b_opt.as(String)
-                }
+            if not is_dir_root_path(clean_cur) {
+                target_dir = any_parent_dir(clean_cur)
+                focus_name = any_basename(clean_cur)
             } else {
-                target_dir = "/"
+                target_dir = clean_cur
             }
         } else {
-            let p_opt = path.parent(cur_buf.file_path)
-            if p_opt != null and p_opt.as(String) != "" {
-                target_dir = p_opt.as(String)
-            }
-            let b_opt = path.file_name(cur_buf.file_path)
-            if b_opt != null {
-                focus_name = b_opt.as(String)
-            }
+            target_dir = any_parent_dir(cur_buf.file_path)
+            focus_name = any_basename(cur_buf.file_path)
         }
     }
     if focus_name.starts_with(".") {
         state.show_hidden = true
     }
     open_dirvish_at(kernel, target_dir, focus_name, true)#!
+}
+
+fn cmd_dirvish_fd(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let cur_buf = world.active_buffer()
+
+    if (
+        cur_buf.name != DIRVISH_BUF_NAME
+        and cur_buf.name != DIRVISH_PARENT_BUF_NAME
+        and cur_buf.name != DIRVISH_PREVIEW_BUF_NAME
+    ) {
+        state.origin_buf_id = cur_buf.id
+    }
+
+    var base_dir = if cur_buf.name == DIRVISH_BUF_NAME and state.current_dir != "" {
+        if state.fd_mode and state.fd_root != "" { state.fd_root } else { state.current_dir }
+    } else if cur_buf.file_path != "" {
+        if any_is_dir(cur_buf.file_path) {
+            cur_buf.file_path
+        } else {
+            any_parent_dir(cur_buf.file_path)
+        }
+    } else if world.cwd != "" {
+        world.cwd
+    } else {
+        home_directory()
+    }
+    base_dir = clean_dir_path(base_dir, world.cwd)
+
+    var pattern = ""
+    var should_prompt = true
+    if args.len() >= 2 {
+        let raw_d = args.get(0).as(String).trim()
+        if raw_d != "" {
+            base_dir = clean_dir_path(world.resolve_path(raw_d), world.cwd)
+        }
+        let rest = List()
+        for ai in 1..args.len() {
+            rest.push(args.get(ai.as(usize)).as(String))
+        }
+        pattern = rest.join(" ").trim()
+        should_prompt = false
+    } else if args.len() == 1 {
+        let a0 = args.get(0).as(String).trim()
+        if a0 != "" {
+            let resolved_a0 = clean_dir_path(world.resolve_path(a0), world.cwd)
+            if (is_ssh_uri(a0) or a0.starts_with("/") or a0.starts_with("./") or a0.starts_with("../") or a0 == "~")
+                and any_is_dir(resolved_a0) {
+                base_dir = resolved_a0
+                should_prompt = true
+            } else {
+                pattern = a0
+                should_prompt = false
+            }
+        }
+    }
+
+    if not any_is_dir(base_dir) {
+        return error ("dirvish-fd root is not a directory: " ++ base_dir)
+    }
+
+    if should_prompt {
+        let default_pat = if state.fd_mode and state.fd_root == base_dir { state.fd_pattern } else { "" }
+        let ans_opt = ask_prompt(PromptRequest.text(
+            "Dirvish fd (" ++ abbreviate_path(base_dir) ++ "): ",
+            default_pat,
+        ))#
+        let ans? = ans_opt else {
+            return ()
+        }
+        pattern = ans.trim()
+    }
+
+    let all_entries = scan_fd_all_entries(base_dir, state.show_hidden)!
+    state.fd_mode = true
+    state.fd_root = base_dir
+    state.fd_pattern = pattern
+    state.fd_all_entries = all_entries
+    state.current_dir = base_dir
+
+    refresh_dirvish_all(kernel, world, wm, state)#!
+    let pat_lbl = if pattern != "" { "'" ++ pattern ++ "'" } else { "*" }
+    status_emit(
+        "Dirvish fd: " ++ abbreviate_path(base_dir) ++ " [" ++ pat_lbl ++ "] ("
+        ++ state.entries.len().to_string() ++ " match(es))",
+    )#
+    ()
+}
+
+fn cmd_dirvish_fd_jump(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
+    let world = require_editor_world(kernel)!
+    let state = require_dirvish_state(kernel)!
+    let ent? = entry_at_cursor(state, world.active_buffer()) else {
+        status_emit("No entry under cursor")#
+        return ()
+    }
+    let par_dir = any_parent_dir(ent.full_path)
+    let leaf_name = any_basename(ent.full_path)
+    open_dirvish_at(kernel, par_dir, leaf_name, true)#!
 }
 
 fn move_dirvish_cursor(kernel: SystemKernel, delta: i64, absolute_row: i64) -> #InteractiveEffects !String Any {
@@ -1815,18 +2413,18 @@ fn cmd_dirvish_goto_bottom(kernel: SystemKernel, _args: List) -> #InteractiveEff
 
 fn cmd_dirvish_up_dir(kernel: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
     let state = require_dirvish_state(kernel)!
-    if state.current_dir == "" or state.current_dir == "/" {
-        status_emit("Already at filesystem root '/'")#
+    if state.fd_mode and state.fd_root != "" {
+        let root_back = state.fd_root
+        state.fd_mode = false
+        open_dirvish_at(kernel, root_back, "", false)#!
         return ()
     }
-    let child_opt = path.file_name(state.current_dir)
-    let child_name = if child_opt != null { child_opt.as(String) } else { "" }
-    let p_opt = path.parent(state.current_dir)
-    let parent_dir = if p_opt != null and p_opt.as(String) != "" {
-        clean_dir_path(p_opt.as(String), "/")
-    } else {
-        "/"
+    if is_dir_root_path(state.current_dir) {
+        status_emit("Already at filesystem root '" ++ state.current_dir ++ "'")#
+        return ()
     }
+    let child_name = any_basename(state.current_dir)
+    let parent_dir = any_parent_dir(state.current_dir)
     if child_name.starts_with(".") {
         state.show_hidden = true
     }
@@ -2044,12 +2642,14 @@ fn execute_paste(kernel: SystemKernel, overwrite: bool) -> #[log_event, status_e
 
     for i in 0..state.yank_ring.len() {
         let src = state.yank_ring.get(i.as(usize)).as(String)
-        if not fs.exists(src) {
+        if not any_exists(src) {
             continue
         }
-        let base_opt = path.file_name(src)
-        let orig_name = if base_opt != null { base_opt.as(String) } else { continue }
-        let direct_dst = path.join(state.current_dir, orig_name)
+        let orig_name = any_basename(src)
+        if orig_name == "" {
+            continue
+        }
+        let direct_dst = any_join_path(state.current_dir, orig_name)
 
         if is_cut and clean_dir_path(src, "/") == clean_dir_path(direct_dst, "/") {
             last_created_name = orig_name
@@ -2059,10 +2659,10 @@ fn execute_paste(kernel: SystemKernel, overwrite: bool) -> #[log_event, status_e
 
         var dst = direct_dst
         if overwrite {
-            if fs.exists(dst) and clean_dir_path(src, "/") != clean_dir_path(dst, "/") {
+            if any_exists(dst) and clean_dir_path(src, "/") != clean_dir_path(dst, "/") {
                 remove_path_any(dst)!
             }
-        } else if fs.exists(dst) {
+        } else if any_exists(dst) {
             dst = disambiguate_dest_path(state.current_dir, orig_name)
         }
 
@@ -2073,9 +2673,9 @@ fn execute_paste(kernel: SystemKernel, overwrite: bool) -> #[log_event, status_e
             copy_recursive(src, dst)!
         }
 
-        let dst_name_opt = path.file_name(dst)
-        if dst_name_opt != null {
-            last_created_name = dst_name_opt.as(String)
+        let dst_name = any_basename(dst)
+        if dst_name != "" {
+            last_created_name = dst_name
         }
         processed += 1
     }
@@ -2158,17 +2758,24 @@ fn apply_entry_rename(
     let wm = require_window_manager(kernel)!
     let state = require_dirvish_state(kernel)!
 
-    let dst = if path.is_absolute(trimmed) {
+    let base_for_rename = if state.fd_mode { any_parent_dir(ent.full_path) } else { state.current_dir }
+    let dst = if is_ssh_uri(trimmed) {
+        clean_dir_path(trimmed, base_for_rename)
+    } else if is_ssh_uri(base_for_rename) {
+        any_join_path(base_for_rename, trimmed)
+    } else if path.is_absolute(trimmed) {
         path.normalize(trimmed)
     } else {
-        path.normalize(path.join(state.current_dir, trimmed))
+        path.normalize(path.join(base_for_rename, trimmed))
     }
-    if fs.exists(dst) and clean_dir_path(dst, "/") != clean_dir_path(ent.full_path, "/") {
+    if any_exists(dst) and clean_dir_path(dst, "/") != clean_dir_path(ent.full_path, "/") {
         return error ("Rename target already exists: " ++ dst)
     }
-    let p_opt = path.parent(dst)
-    if p_opt != null and p_opt.as(String) != "" {
-        let _ = fs.create_dir(p_opt.as(String), parents = true) ! { _ => () }
+    if not is_ssh_uri(dst) {
+        let p_opt = path.parent(dst)
+        if p_opt != null and p_opt.as(String) != "" {
+            let _ = fs.create_dir(p_opt.as(String), parents = true) ! { _ => () }
+        }
     }
     move_entry(ent.full_path, dst)!
     sync_renamed_buffers(world, ent.full_path, dst)
@@ -2177,8 +2784,10 @@ fn apply_entry_rename(
         let _ = state.marked_paths.insert(dst)
     }
 
-    let focus_opt = path.file_name(dst)
-    let focus = if focus_opt != null { focus_opt.as(String) } else { "" }
+    let focus = any_basename(dst)
+    if state.fd_mode {
+        state.fd_all_entries = scan_fd_all_entries(state.fd_root, state.show_hidden)!
+    }
     refresh_dirvish_all(kernel, world, wm, state, focus_name = focus)#!
     status_emit("Renamed '" ++ ent.name ++ "' -> '" ++ focus ++ "'")#
     ()
@@ -2266,21 +2875,35 @@ fn cmd_dirvish_create_file(kernel: SystemKernel, _args: List) -> #InteractiveEff
     if rel == "" {
         return ()
     }
-    let target = if path.is_absolute(rel) {
+    let target = if is_ssh_uri(rel) {
+        clean_dir_path(rel, state.current_dir)
+    } else if is_ssh_uri(state.current_dir) {
+        any_join_path(state.current_dir, rel)
+    } else if path.is_absolute(rel) {
         path.normalize(rel)
     } else {
         path.normalize(path.join(state.current_dir, rel))
     }
-    let p_opt = path.parent(target)
-    if p_opt != null and p_opt.as(String) != "" {
-        (fs.create_dir(p_opt.as(String), parents = true) ! {
-            err => error ("Failed creating parent directories: " ++ err.to_string())
-        })!
-    }
-    if not fs.exists(target) {
-        (fs.write_string(target, "") ! {
-            err => error ("Failed creating file '" ++ target ++ "': " ++ err.to_string())
-        })!
+    if is_ssh_uri(target) {
+        let par_u = any_parent_dir(target)
+        if par_u != "" and not any_exists(par_u) {
+            remote_mkdir(par_u)!
+        }
+        if not any_exists(target) {
+            let _ = remote_write_lines(target, [""], false)!
+        }
+    } else {
+        let p_opt = path.parent(target)
+        if p_opt != null and p_opt.as(String) != "" {
+            (fs.create_dir(p_opt.as(String), parents = true) ! {
+                err => error ("Failed creating parent directories: " ++ err.to_string())
+            })!
+        }
+        if not fs.exists(target) {
+            (fs.write_string(target, "") ! {
+                err => error ("Failed creating file '" ++ target ++ "': " ++ err.to_string())
+            })!
+        }
     }
 
     -- Focus newly created file (or its top-level parent child inside `current_dir`)
@@ -2291,6 +2914,9 @@ fn cmd_dirvish_create_file(kernel: SystemKernel, _args: List) -> #InteractiveEff
     }
     if focus_item.starts_with(".") {
         state.show_hidden = true
+    }
+    if state.fd_mode {
+        state.fd_all_entries = scan_fd_all_entries(state.fd_root, state.show_hidden)!
     }
     refresh_dirvish_all(kernel, world, wm, state, focus_name = focus_item)#!
     status_emit("Created file: " ++ rel)#
@@ -2314,14 +2940,22 @@ fn cmd_dirvish_mkdir(kernel: SystemKernel, _args: List) -> #InteractiveEffects !
     } else {
         rel
     }
-    let target = if path.is_absolute(clean_rel) {
+    let target = if is_ssh_uri(clean_rel) {
+        clean_dir_path(clean_rel, state.current_dir)
+    } else if is_ssh_uri(state.current_dir) {
+        any_join_path(state.current_dir, clean_rel)
+    } else if path.is_absolute(clean_rel) {
         path.normalize(clean_rel)
     } else {
         path.normalize(path.join(state.current_dir, clean_rel))
     }
-    (fs.create_dir(target, parents = true) ! {
-        err => error ("Failed creating directory '" ++ target ++ "': " ++ err.to_string())
-    })!
+    if is_ssh_uri(target) {
+        remote_mkdir(target)!
+    } else {
+        (fs.create_dir(target, parents = true) ! {
+            err => error ("Failed creating directory '" ++ target ++ "': " ++ err.to_string())
+        })!
+    }
 
     var focus_item = clean_rel
     if clean_rel.contains("/") {
@@ -2330,6 +2964,9 @@ fn cmd_dirvish_mkdir(kernel: SystemKernel, _args: List) -> #InteractiveEffects !
     }
     if focus_item.starts_with(".") {
         state.show_hidden = true
+    }
+    if state.fd_mode {
+        state.fd_all_entries = scan_fd_all_entries(state.fd_root, state.show_hidden)!
     }
     refresh_dirvish_all(kernel, world, wm, state, focus_name = focus_item)#!
     status_emit("Created directory: " ++ clean_rel)#
@@ -2347,6 +2984,9 @@ fn cmd_dirvish_toggle_hidden(kernel: SystemKernel, _args: List) -> #InteractiveE
     let cur_opt = entry_at_cursor(state, world.active_buffer())
     let keep_name = if cur_opt != null { cur_opt.as(DirvishEntry).name } else { "" }
     state.show_hidden = not state.show_hidden
+    if state.fd_mode and state.fd_root != "" {
+        state.fd_all_entries = scan_fd_all_entries(state.fd_root, state.show_hidden)!
+    }
     refresh_dirvish_all(kernel, world, wm, state, focus_name = keep_name)#!
     status_emit("Dirvish hidden files: " ++ (if state.show_hidden { "ON" } else { "OFF" }))#
     ()
@@ -2369,6 +3009,22 @@ fn cmd_dirvish_filter(kernel: SystemKernel, _args: List) -> #InteractiveEffects 
     let world = require_editor_world(kernel)!
     let wm = require_window_manager(kernel)!
     let state = require_dirvish_state(kernel)!
+    if state.fd_mode {
+        let ans_opt = ask_prompt(PromptRequest.text(
+            "Narrow fd (" ++ abbreviate_path(state.fd_root) ++ "): ",
+            state.fd_pattern,
+        ))#
+        let ans? = ans_opt else {
+            return ()
+        }
+        state.fd_pattern = ans.trim()
+        refresh_dirvish_all(kernel, world, wm, state)#!
+        status_emit(
+            "Dirvish fd filter: '" ++ state.fd_pattern ++ "' ("
+            ++ state.entries.len().to_string() ++ " matches)",
+        )#
+        return ()
+    }
     let ans_opt = ask_prompt(PromptRequest.text("Filter entries: ", state.filter_query))#
     let ans? = ans_opt else {
         return ()
@@ -2387,7 +3043,11 @@ fn cmd_dirvish_clear_filter(kernel: SystemKernel, _args: List) -> #InteractiveEf
     let world = require_editor_world(kernel)!
     let wm = require_window_manager(kernel)!
     let state = require_dirvish_state(kernel)!
-    state.filter_query = ""
+    if state.fd_mode {
+        state.fd_pattern = ""
+    } else {
+        state.filter_query = ""
+    }
     refresh_dirvish_all(kernel, world, wm, state)#!
     status_emit("Dirvish filter cleared")#
     ()
@@ -2488,6 +3148,11 @@ fn cmd_dirvish_open_shell(kernel: SystemKernel, _args: List) -> #InteractiveEffe
     if state.current_dir != "" {
         world.cwd = state.current_dir
     }
+    if is_ssh_uri(state.current_dir) and has_registered_cmd(kernel, "remote-shell") {
+        collapse_dirvish_splits(world, wm)
+        let _ = kernel.dispatch_command("remote-shell", [state.current_dir])#!
+        return ()
+    }
     if has_registered_cmd(kernel, "terminal-here") {
         collapse_dirvish_splits(world, wm)
         let _ = kernel.dispatch_command("terminal-here", [state.current_dir])#!
@@ -2509,6 +3174,9 @@ fn cmd_dirvish_refresh(kernel: SystemKernel, _args: List) -> #InteractiveEffects
     state.preview_cache_order = List()
     let cur_opt = entry_at_cursor(state, world.active_buffer())
     let keep_name = if cur_opt != null { cur_opt.as(DirvishEntry).name } else { "" }
+    if state.fd_mode and state.fd_root != "" {
+        state.fd_all_entries = scan_fd_all_entries(state.fd_root, state.show_hidden)!
+    }
     refresh_dirvish_all(kernel, world, wm, state, focus_name = keep_name)#!
     status_emit("Dirvish refreshed: " ++ abbreviate_path(state.current_dir))#
     ()
@@ -2588,8 +3256,11 @@ pub fn register_dirvish_extension(kernel: SystemKernel) -> !String Unit {
             -- Entry & Ex commands
             k.register_command("dirvish", ext_id, "Open Emacs Dirvish 3-pane Miller file manager.", cmd_dirvish)
             k.register_command("dirvish-jump", ext_id, "Open Dirvish in active file's parent directory (`-`).", cmd_dirvish_jump)
+            k.register_command("dirvish-fd", ext_id, "Recursive fast file & directory search inside Dirvish (`:DirvishFd [dir] [pattern]`).", cmd_dirvish_fd)
+            k.register_command("dirvish-fd-jump", ext_id, "Open parent directory of highlighted dirvish-fd match (`gd`).", cmd_dirvish_fd_jump)
             k.register_command("ranger", ext_id, "Open Dirvish with Ranger keybindings.", cmd_dirvish)
             k.register_command("ex:Dirvish", ext_id, "Open Dirvish (`:Dirvish [dir]`).", cmd_dirvish, interactive = false)
+            k.register_command("ex:DirvishFd", ext_id, "Recursive Dirvish fd search (`:DirvishFd [dir] [pattern]`).", cmd_dirvish_fd, interactive = false)
             k.register_command("ex:Ranger", ext_id, "Open Dirvish (`:Ranger [dir]`).", cmd_dirvish, interactive = false)
 
             -- Navigation commands
@@ -2649,19 +3320,25 @@ pub fn register_dirvish_extension(kernel: SystemKernel) -> !String Unit {
             let norm_km = k.ensure_keymap(KEYMAP_VIM_NORMAL)
             norm_km.bind("-", "dirvish-jump", ext_id, description = "Jump to Dirvish in parent directory")
             norm_km.bind("<Space>fd", "dirvish", ext_id, description = "Open Dirvish file manager")
+            norm_km.bind("<Space>fF", "dirvish-fd", ext_id, description = "Dirvish fd recursive find")
             norm_km.bind("<Space>R", "dirvish", ext_id, description = "Open Ranger / Dirvish")
 
             let leader_km = k.ensure_keymap("vim-leader")
             leader_km.bind("<Space> f d", "dirvish", ext_id, description = "Dirvish file manager")
+            leader_km.bind("<Space> f F", "dirvish-fd", ext_id, description = "Dirvish fd recursive find")
             leader_km.bind("<Space> R", "dirvish", ext_id, description = "Ranger / Dirvish")
 
             k.ensure_keymap("emacs-global").bind("<C-x> d", "dirvish", ext_id, description = "Open Dirvish")
+            k.ensure_keymap("emacs-global").bind("<C-x> F", "dirvish-fd", ext_id, description = "Open Dirvish fd")
             k.ensure_keymap("global").bind("<C-x> d", "dirvish", ext_id, description = "Open Dirvish")
 
             -- Authentic Ranger keymap in `mode:dirvish`
             let km = k.ensure_keymap("mode:dirvish")
 
-            -- 1. Navigation
+            -- 1. Navigation & Recursive fd
+            km.bind("F", "dirvish-fd", ext_id, description = "Dirvish fd recursive find")
+            km.bind("g f", "dirvish-fd", ext_id, description = "Dirvish fd recursive find")
+            km.bind("g d", "dirvish-fd-jump", ext_id, description = "Open parent directory of entry")
             km.bind("j", "dirvish-next-line", ext_id, description = "Next entry")
             km.bind("<Down>", "dirvish-next-line", ext_id, description = "Next entry")
             km.bind("k", "dirvish-prev-line", ext_id, description = "Previous entry")

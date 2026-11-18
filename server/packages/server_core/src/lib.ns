@@ -94,6 +94,8 @@ pub struct ServerKernel {
     pub rpc_methods: HashMap,
     pub hooks: HashMap,
     pub shutdown_requested: bool,
+    pub http_port: i64,
+    pub http_token: String,
 }
 
 pub fn server_core_id() -> SrvExtId = SrvExtId("lava.server/server_core")
@@ -107,6 +109,8 @@ impl ServerKernel {
             rpc_methods: HashMap.new(),
             hooks: HashMap.new(),
             shutdown_requested: false,
+            http_port: 0,
+            http_token: "",
         }
         kernel.install_builtin_rpcs()
         kernel
@@ -132,6 +136,8 @@ impl ServerKernel {
                 out.set("server", SERVER_NAME)
                 out.set("version", SERVER_VERSION)
                 out.set("extensions", active_ids)
+                out.set("http_port", k.http_port)
+                out.set("http_token", k.http_token)
                 out
             },
         )

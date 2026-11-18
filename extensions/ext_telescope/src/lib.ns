@@ -16,6 +16,11 @@ use @lava_accel.{
     accel_doc_scan_symbol_spans, accel_fuzzy_rank, accel_index_docs, accel_search_docs,
     accel_workspace_files, accel_workspace_grep
 }
+use @lava_remote.{
+    RemoteDirItem, RemoteGrepMatch, SshHostConfigEntry, is_ssh_uri, normalize_ssh_uri,
+    parent_ssh_uri, remote_discover_ssh_hosts, remote_find_root, remote_host_available,
+    remote_read_lines, remote_read_preview, remote_readdir, remote_search_files, remote_search_grep
+}
 use @ext_document.{
     Buffer, BufferId, EditorWorld, FloatingWindow, Pos, QuickfixEntry, RegisterValue,
     ext_document_id, require_editor_world
@@ -31,7 +36,7 @@ use @ext_render.{
 pub const SERVICE_TELESCOPE: String = "lava.telescope.state"
 pub const FLOAT_PICKER_ID: String = "telescope-picker"
 pub const FLOAT_PREVIEW_ID: String = "telescope-preview"
-const TELESCOPE_AVAILABLE_MODES_SUMMARY: String = "files, live_grep, buffers, symbols, help_tags, docs, commands, keymaps, colorscheme, resume"
+const TELESCOPE_AVAILABLE_MODES_SUMMARY: String = "files, live_grep, buffers, symbols, help_tags, docs, commands, keymaps, colorscheme, ssh, resume"
 
 pub fn ext_telescope_id() -> ExtId = ExtId("lava.org/ext_telescope")
 
@@ -95,12 +100,20 @@ pub fn require_telescope_state(kernel: SystemKernel) -> !String TelescopeState {
 
 pub fn collect_help_doc_roots(world: EditorWorld) -> List {
     let roots = List()
-    let cwd_docs = path.join(world.cwd, "docs")
+    let local_cwd = if is_ssh_uri(world.cwd) { "." } else { world.cwd }
+    let cwd_docs = path.join(local_cwd, "docs")
     if fs.exists(cwd_docs) and fs.is_dir(cwd_docs) {
         roots.push(path.normalize(cwd_docs))
     }
-    let isolated_marker = path.join(world.cwd, ".lava_isolated_doc_test")
+    let isolated_marker = path.join(local_cwd, ".lava_isolated_doc_test")
     if not fs.exists(isolated_marker) {
+        let lava_docs_a = "/home/fin/app/lava/docs"
+        if fs.exists(lava_docs_a) and fs.is_dir(lava_docs_a) {
+            let norm_a = path.normalize(lava_docs_a)
+            if not roots.contains(norm_a) {
+                roots.push(norm_a)
+            }
+        }
         let lava_docs = "/home/fin/apps/lava/docs"
         if fs.exists(lava_docs) and fs.is_dir(lava_docs) {
             let norm_lava = path.normalize(lava_docs)
@@ -117,6 +130,115 @@ pub fn collect_help_doc_roots(world: EditorWorld) -> List {
         }
     }
     roots
+}
+
+fn effective_workspace_root(world: EditorWorld, state: TelescopeState) -> String {
+    if is_ssh_uri(world.cwd) {
+        return normalize_ssh_uri(world.cwd)
+    }
+    let src_opt = world.buffer(state.source_buf_id)
+    let src_fp = if src_opt != null {
+        src_opt.as(Buffer).file_path
+    } else {
+        world.active_buffer().file_path
+    }
+    if is_ssh_uri(src_fp) {
+        let base_u = parent_ssh_uri(src_fp)
+        let r_res = remote_find_root(
+            base_u,
+            [".git", "Cargo.toml", "package.toml", "compile_commands.json", "pyproject.toml", "package.json", "go.mod"],
+        )
+        r_res match {
+            found! => {
+                return found
+            },
+            error _ => {
+                return base_u
+            },
+        }
+    }
+    world.cwd
+}
+
+fn walk_remote_telescope_files(dir_uri: String, limit: i64, depth: i64, out: List) {
+    if depth > 12 or out.len() >= limit {
+        return
+    }
+    let items = remote_readdir(dir_uri, show_hidden = false) ! { _ => List() }
+    for i in 0..items.len() {
+        if out.len() >= limit {
+            return
+        }
+        let it = items.get(i.as(usize)).as(RemoteDirItem)
+        if it.is_dir {
+            if it.name != ".git" and it.name != "target" and it.name != "node_modules" {
+                walk_remote_telescope_files(it.full_uri, limit, depth + 1, out)
+            }
+        } else {
+            out.push(it.full_uri)
+        }
+    }
+}
+
+fn collect_remote_workspace_files(root_uri: String, limit: i64) -> List {
+    if remote_host_available() {
+        let res = remote_search_files(root_uri, "", limit = limit)
+        res match {
+            uris! => {
+                return uris
+            },
+            error _ => {
+                return List()
+            },
+        }
+    }
+    let out = List()
+    walk_remote_telescope_files(root_uri, limit, 0, out)
+    out
+}
+
+fn collect_remote_workspace_grep(root_uri: String, query: String, case_sens: bool, limit: i64) -> List {
+    if remote_host_available() {
+        let res = remote_search_grep(root_uri, query, limit = limit)
+        res match {
+            hits! => {
+                return hits
+            },
+            error _ => {
+                return List()
+            },
+        }
+    }
+    let files = collect_remote_workspace_files(root_uri, 500)
+    let q_cmp = if case_sens { query } else { query.to_lower() }
+    let out = List()
+    for fi in 0..files.len() {
+        let furi = files.get(fi.as(usize)).as(String)
+        let rl_res = remote_read_lines(furi)
+        rl_res match {
+            pair! => {
+                let (flines, _) = pair
+                for r in 0..flines.len() {
+                    let ln = flines.get(r.as(usize)).as(String)
+                    let hay = if case_sens { ln } else { ln.to_lower() }
+                    let idxs = hay.find_indices(q_cmp)
+                    if not idxs.is_empty() {
+                        out.push(RemoteGrepMatch {
+                            full_uri: furi,
+                            row: r,
+                            col: idxs.get(0).as(i64),
+                            line_text: ln,
+                        })
+                        if out.len() >= limit {
+                            return out
+                        }
+                    }
+                }
+            },
+            error _ => (),
+        }
+    }
+    out
 }
 
 fn picker_printable_char(stroke: KeyStroke) -> String {
@@ -146,6 +268,7 @@ fn mode_display_title(mode: String) -> String {
         mode == "commands" => "Commands",
         mode == "keymaps" => "Keymaps",
         mode == "colorscheme" => "Colorscheme",
+        mode == "ssh" => "OpenSSH Profiles",
         mode == "builtin" => "Pickers",
         else => "Picker",
     }
@@ -163,6 +286,7 @@ fn normalize_picker_mode_opt(mode: String) -> ?String {
         m == "commands" or m == "command" => "commands",
         m == "keymaps" or m == "keymap" => "keymaps",
         m == "colorscheme" or m == "themes" or m == "theme" => "colorscheme",
+        m == "ssh" or m == "ssh_profiles" or m == "ssh_hosts" or m == "remote" => "ssh",
         m == "builtin" or m == "pickers" => "builtin",
         else => null,
     }
@@ -171,6 +295,15 @@ fn normalize_picker_mode_opt(mode: String) -> ?String {
 fn relative_to_cwd(full_path: String, cwd: String) -> String {
     if full_path == "" {
         return ""
+    }
+    if is_ssh_uri(cwd) or is_ssh_uri(full_path) {
+        let nc = if is_ssh_uri(cwd) { normalize_ssh_uri(cwd) } else { cwd }
+        let nf = if is_ssh_uri(full_path) { normalize_ssh_uri(full_path) } else { full_path }
+        let pfx = if nc.ends_with("/") { nc } else { nc ++ "/" }
+        if nf.starts_with(pfx) {
+            return nf.drop(pfx.char_len())
+        }
+        return nf
     }
     let norm_cwd = path.normalize(cwd)
     let prefix = if norm_cwd.ends_with("/") { norm_cwd } else { norm_cwd ++ "/" }
@@ -323,6 +456,7 @@ fn collect_base_items(kernel: SystemKernel, world: EditorWorld, state: Telescope
             ("commands", "commands", "<Space> f C", "Fuzzy/Orderless picker over registered commands"),
             ("keymaps", "keymaps", "<Space> s k", "Inspect active keybindings across keymaps"),
             ("colorscheme", "colorscheme", "<Space> s c", "Preview and apply editor color themes"),
+            ("ssh", "ssh", "<Space> r p", "Fuzzy pick and connect ~/.ssh/config profile"),
             ("resume", "resume", "<Space> s r", "Resume previous Telescope picker session"),
         ]
         for i in 0..modes.len() {
@@ -347,6 +481,16 @@ fn collect_base_items(kernel: SystemKernel, world: EditorWorld, state: Telescope
     }
 
     if mode == "files" {
+        let eff_root = effective_workspace_root(world, state)
+        if is_ssh_uri(eff_root) {
+            let rfiles = collect_remote_workspace_files(eff_root, 3000)
+            for i in 0..rfiles.len() {
+                let furi = rfiles.get(i.as(usize)).as(String)
+                let rel = relative_to_cwd(furi, eff_root)
+                items.push(make_plain_item(rel, "", furi, 0, 0, BufferId(0), "", "", ""))
+            }
+            return items
+        }
         let files = accel_workspace_files(world.cwd, max_files = 10000, include_hidden = false)
         for i in 0..files.len() {
             let rel = files.get(i.as(usize)).as(String)
@@ -570,6 +714,37 @@ fn collect_base_items(kernel: SystemKernel, world: EditorWorld, state: Telescope
         return items
     }
 
+    if mode == "ssh" {
+        let hosts = remote_discover_ssh_hosts()
+        let seen = Set.new()
+        for i in 0..hosts.len() {
+            let h = hosts.get(i.as(usize)).as(SshHostConfigEntry)
+            let alias = h.alias_name.trim()
+            if alias != "" and (not seen.contains(alias)) {
+                seen.insert(alias)
+                let up = if h.user != "" { h.user ++ "@" } else { "" }
+                let hp = if h.hostname != "" { h.hostname } else { alias }
+                let pp = if h.port > 0 { ":" ++ h.port.to_string() } else { ":22" }
+                let jp = if h.proxy_jump != "" { "  via " ++ h.proxy_jump } else { "" }
+                let kp = if h.identity_file != "" { "  [key:" ++ h.identity_file ++ "]" } else { "" }
+                let summary = up ++ hp ++ pp ++ jp
+                let disp = "[SSH] " ++ alias.pad_end(22, " ") ++ " — " ++ summary
+                items.push(make_plain_item(
+                    alias ++ " " ++ summary ++ kp,
+                    disp,
+                    "",
+                    0,
+                    0,
+                    BufferId(0),
+                    summary,
+                    alias,
+                    hp ++ "|" ++ (if h.user != "" { h.user } else { "(default)" }) ++ "|" ++ (if h.port > 0 { h.port.to_string() } else { "22" }) ++ "|" ++ (if h.proxy_jump != "" { h.proxy_jump } else { "(none)" }) ++ "|" ++ (if h.identity_file != "" { h.identity_file } else { "(default)" }),
+                ))
+            }
+        }
+        return items
+    }
+
     items
 }
 
@@ -737,28 +912,50 @@ fn recompute_filtered_items(world: EditorWorld, state: TelescopeState) {
             return
         }
         let case_sens = not world.effective_ignore_case(q)
-        let hits = accel_workspace_grep(
-            world.cwd,
-            q,
-            case_sensitive = case_sens,
-            max_results = 250,
-        )
+        let eff_root = effective_workspace_root(world, state)
         let out = List()
-        for i in 0..hits.len() {
-            let h = hits.get(i.as(usize)).as(GrepHit)
-            let raw_loc = h.file_path ++ ":" ++ (h.row + 1).to_string() ++ ":" ++ (h.col + 1).to_string() ++ ": " ++ h.line_text.trim()
-            let disp = telescope_file_icon(h.file_path) ++ " " ++ raw_loc
-            out.push(make_plain_item(
-                raw_loc,
-                disp,
-                h.file_path,
-                h.row,
-                h.col,
-                BufferId(0),
-                h.line_text,
-                "",
-                "",
-            ))
+        if is_ssh_uri(eff_root) {
+            let rhits = collect_remote_workspace_grep(eff_root, q, case_sens, 250)
+            for i in 0..rhits.len() {
+                let rh = rhits.get(i.as(usize)).as(RemoteGrepMatch)
+                let rel_p = relative_to_cwd(rh.full_uri, eff_root)
+                let raw_loc = rel_p ++ ":" ++ (rh.row + 1).to_string() ++ ":" ++ (rh.col + 1).to_string() ++ ": " ++ rh.line_text.trim()
+                let disp = telescope_file_icon(rel_p) ++ " " ++ raw_loc
+                out.push(make_plain_item(
+                    raw_loc,
+                    disp,
+                    rh.full_uri,
+                    rh.row,
+                    rh.col,
+                    BufferId(0),
+                    rh.line_text,
+                    "",
+                    "",
+                ))
+            }
+        } else {
+            let hits = accel_workspace_grep(
+                world.cwd,
+                q,
+                case_sensitive = case_sens,
+                max_results = 250,
+            )
+            for i in 0..hits.len() {
+                let h = hits.get(i.as(usize)).as(GrepHit)
+                let raw_loc = h.file_path ++ ":" ++ (h.row + 1).to_string() ++ ":" ++ (h.col + 1).to_string() ++ ": " ++ h.line_text.trim()
+                let disp = telescope_file_icon(h.file_path) ++ " " ++ raw_loc
+                out.push(make_plain_item(
+                    raw_loc,
+                    disp,
+                    h.file_path,
+                    h.row,
+                    h.col,
+                    BufferId(0),
+                    h.line_text,
+                    "",
+                    "",
+                ))
+            }
         }
         state.filtered_items = out
         if state.selected_idx >= out.len() {
@@ -890,6 +1087,30 @@ fn load_preview_source_lines(world: EditorWorld, state: TelescopeState, item: Pi
         return state.preview_cache_lines
     }
 
+    if is_ssh_uri(full) {
+        let rpv_opt: ?List = remote_read_preview(full, max_bytes = 32768, max_lines = max_preview_lines) match {
+            pv! => {
+                if pv.is_binary {
+                    null
+                } else {
+                    pv.lines
+                }
+            },
+            error _ => null,
+        }
+        let rparts? = rpv_opt else {
+            state.preview_cache_key = ""
+            state.preview_cache_lines = null
+            return null
+        }
+        if rparts.is_empty() {
+            rparts.push("")
+        }
+        state.preview_cache_key = cache_key
+        state.preview_cache_lines = rparts
+        return rparts
+    }
+
     let streamed_opt: ?List = stream_preview_file_lines(full, max_preview_lines) match {
         lines! => lines,
         error _ => {
@@ -996,6 +1217,36 @@ fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: Telesco
         state.selected_idx
     }
     let item = state.filtered_items.get(sel.as(usize)).as(PickerItem)
+
+    if state.mode == "ssh" {
+        let parts = item.detail.split("|")
+        let p_host = if parts.len() > 0 { parts.get(0).as(String) } else { item.command_name }
+        let p_user = if parts.len() > 1 { parts.get(1).as(String) } else { "(default)" }
+        let p_port = if parts.len() > 2 { parts.get(2).as(String) } else { "22" }
+        let p_jump = if parts.len() > 3 { parts.get(3).as(String) } else { "(none)" }
+        let p_key = if parts.len() > 4 { parts.get(4).as(String) } else { "(default)" }
+        let lines = [
+            "Profile Alias : " ++ item.command_name,
+            "HostName      : " ++ p_host,
+            "User          : " ++ p_user,
+            "Port          : " ++ p_port,
+            "ProxyJump     : " ++ p_jump,
+            "IdentityFile  : " ++ p_key,
+            "────────────────────────────────────────────────────────",
+            "Press <Enter> to connect ssh://" ++ item.command_name ++ "/",
+        ]
+        return (FloatingWindow {
+            id: FLOAT_PREVIEW_ID,
+            owner: "ext_telescope",
+            title: "Preview — OpenSSH Host: " ++ item.command_name,
+            anchor: "bottom",
+            width_cols: 108,
+            height_rows: 12,
+            lines: lines,
+            selected_row: 0,
+            border_rgba: 0,
+        })
+    }
 
     if state.mode == "builtin" {
         let lines = [
@@ -1401,6 +1652,15 @@ fn accept_selected_item(
             open_telescope_picker(kernel, "files", resume_last = true)#!
         } else {
             open_telescope_picker(kernel, item.command_name)#!
+        }
+        return ()
+    }
+
+    if picked_mode == "ssh" {
+        if item.command_name != "" and kernel.get_command("remote-connect-profile") != null {
+            let _ = kernel.dispatch_command("remote-connect-profile", [item.command_name])#!
+        } else {
+            status_emit("SSH profile: " ++ item.command_name)#
         }
         return ()
     }

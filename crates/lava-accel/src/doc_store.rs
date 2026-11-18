@@ -618,11 +618,10 @@ pub fn doc_new(initial_lines: Vec<String>) -> i64 {
     })
 }
 
-/// Fast single-syscall file reader into a `CHUNK_TARGET` Copy-on-Write rope.
-/// Preserves exact newline roundtrip semantics of `host_read_file_lines`.
-pub fn doc_open_file(file_path: &str) -> Result<(i64, i64, bool), String> {
-    let bytes =
-        fs::read(file_path).map_err(|err| format!("cannot open file '{file_path}': {err}"))?;
+/// Fast in-memory UTF-8/lossy byte-buffer loader into a `CHUNK_TARGET` Copy-on-Write rope.
+/// Preserves exact newline roundtrip semantics of `doc_open_file` and handles 100k+ line buffers
+/// without marshaling giant line lists through the Nessa VM.
+pub fn doc_open_from_bytes(bytes: Vec<u8>) -> (i64, i64, bool) {
     if bytes.is_empty() {
         let doc = RopeDoc::from_lines(vec![String::new()]);
         let id = with_store(|store| {
@@ -631,7 +630,7 @@ pub fn doc_open_file(file_path: &str) -> Result<(i64, i64, bool), String> {
             store.docs.insert(id, doc);
             id
         });
-        return Ok((id, 1, false));
+        return (id, 1, false);
     }
 
     let has_crlf = bytes.windows(2).any(|w| w == b"\r\n");
@@ -670,7 +669,39 @@ pub fn doc_open_file(file_path: &str) -> Result<(i64, i64, bool), String> {
         store.docs.insert(id, doc);
         id
     });
-    Ok((id, line_count, has_crlf))
+    (id, line_count, has_crlf)
+}
+
+/// Serialize all untruncated rope chunks of `doc_id` into a contiguous byte buffer for remote upload.
+pub fn doc_encode_to_bytes(doc_id: i64, crlf: bool) -> Result<Vec<u8>, String> {
+    let chunks = with_store(|store| store.docs.get(&doc_id).map(|d| d.chunks.clone()))
+        .ok_or_else(|| format!("unknown document id {doc_id}"))?;
+    let sep: &[u8] = if crlf { b"\r\n" } else { b"\n" };
+    let total_lines: usize = chunks.iter().map(|c| c.len()).sum();
+    if total_lines == 1 && chunks[0].len() == 1 && chunks[0][0].is_empty() {
+        return Ok(Vec::new());
+    }
+    let approx_cap: usize = chunks
+        .iter()
+        .flat_map(|c| c.iter())
+        .map(|l| l.len() + sep.len())
+        .sum();
+    let mut out = Vec::with_capacity(approx_cap);
+    for chunk in &chunks {
+        for line in chunk.iter() {
+            out.extend_from_slice(line.as_bytes());
+            out.extend_from_slice(sep);
+        }
+    }
+    Ok(out)
+}
+
+/// Fast single-syscall file reader into a `CHUNK_TARGET` Copy-on-Write rope.
+/// Preserves exact newline roundtrip semantics of `host_read_file_lines`.
+pub fn doc_open_file(file_path: &str) -> Result<(i64, i64, bool), String> {
+    let bytes =
+        fs::read(file_path).map_err(|err| format!("cannot open file '{file_path}': {err}"))?;
+    Ok(doc_open_from_bytes(bytes))
 }
 
 /// Stream untruncated rope chunks to disk via `BufWriter<File>`, matching `host_write_file_lines(..., true)`.
@@ -1666,6 +1697,71 @@ struct OpenBracket {
     col: i64,
 }
 
+#[derive(Clone)]
+struct ActiveMultilineStr {
+    close_delim: String,
+    allow_backslash_escape: bool,
+    start_row: i64,
+    start_col: i64,
+    start_line_len: i64,
+}
+
+fn match_rust_raw_string_prefix(s: &str) -> Option<(usize, usize, usize)> {
+    let bytes = s.as_bytes();
+    let (prefix_bytes, prefix_chars) = if bytes.starts_with(b"br") || bytes.starts_with(b"cr") {
+        (2usize, 2usize)
+    } else if bytes.starts_with(b"r") {
+        (1usize, 1usize)
+    } else {
+        return None;
+    };
+    let mut hashes = 0usize;
+    while prefix_bytes + hashes < bytes.len() && bytes[prefix_bytes + hashes] == b'#' {
+        hashes += 1;
+    }
+    if prefix_bytes + hashes < bytes.len() && bytes[prefix_bytes + hashes] == b'"' {
+        Some((prefix_bytes + hashes + 1, prefix_chars + hashes + 1, hashes))
+    } else {
+        None
+    }
+}
+
+fn match_char_literal_len(s: &str) -> Option<(usize, i64)> {
+    // Recognizes `'x'`, `'\n'`, `'\''`, `'\x7f'`, `'\u{10FFFF}'` on a single line,
+    // while rejecting Rust lifetimes like `'a`, `'static`, `'_'` when not followed by `'`.
+    let bytes = s.as_bytes();
+    if bytes.first().copied() != Some(b'\'') || bytes.len() < 3 {
+        return None;
+    }
+    let after1 = 1usize;
+    let c1 = s[after1..].chars().next()?;
+    if c1 == '\'' || c1 == '\n' || c1 == '\r' {
+        return None;
+    }
+    if c1 != '\\' {
+        let after_ch = after1 + c1.len_utf8();
+        if after_ch < bytes.len() && bytes[after_ch] == b'\'' {
+            return Some((after_ch + 1, 3));
+        }
+        return None;
+    }
+    // Escape sequence `'\...'` up to 12 chars (`\u{10FFFF}`)
+    let mut idx = after1 + 1;
+    let mut chars_seen = 2i64;
+    while idx < bytes.len() && chars_seen <= 13 {
+        let cur = s[idx..].chars().next()?;
+        idx += cur.len_utf8();
+        chars_seen += 1;
+        if cur == '\'' {
+            return Some((idx, chars_seen));
+        }
+        if cur.is_whitespace() {
+            return None;
+        }
+    }
+    None
+}
+
 /// Single-pass buffer diagnostics matching `ext_trouble` rules, returning
 /// `(capped_sorted_items, total_err_count, total_warn_count)`.
 pub fn doc_analyze_diagnostics(
@@ -1682,19 +1778,37 @@ pub fn doc_analyze_diagnostics(
     let line_cmt = mode_line_comment_prefix(&mode);
     let (blk_open, blk_close) = mode_block_comment_delims(&mode);
     let single_quote_str = uses_single_quote_strings(&mode);
+    let is_rust_like = matches!(mode.as_str(), "rust" | "rs");
+    let supports_backtick_str = matches!(
+        mode.as_str(),
+        "go" | "javascript"
+            | "js"
+            | "typescript"
+            | "ts"
+            | "tsx"
+            | "jsx"
+            | "sh"
+            | "shell"
+            | "bash"
+            | "sql"
+    );
 
     let mut diags: Vec<NativeDiagHit> = Vec::new();
     let mut err_count: i64 = 0;
     let mut warn_count: i64 = 0;
     let mut bracket_stack: Vec<OpenBracket> = Vec::new();
     let mut in_block_cmt = false;
+    let mut active_str: Option<ActiveMultilineStr> = None;
 
     for (r_usize, line) in doc.iter_lines().enumerate() {
         let r = r_usize as i64;
         let llen = char_len_fast(line) as i64;
 
-        // 1) Unresolved git merge conflict markers
-        if let Some(marker) = conflict_marker_kind(line) {
+        // 1) Unresolved git merge conflict markers (outside multiline strings/comments)
+        if !in_block_cmt
+            && active_str.is_none()
+            && let Some(marker) = conflict_marker_kind(line)
+        {
             err_count += 1;
             diags.push(NativeDiagHit {
                 row: r,
@@ -1707,35 +1821,37 @@ pub fn doc_analyze_diagnostics(
             continue;
         }
 
-        // 2) Mixed tab + space leading indentation
-        let mut saw_space = false;
-        let mut saw_tab = false;
-        let mut ws_end: i64 = 0;
-        for ch in line.chars() {
-            if ch == ' ' {
-                saw_space = true;
-                ws_end += 1;
-            } else if ch == '\t' {
-                saw_tab = true;
-                ws_end += 1;
-            } else {
-                break;
+        // 2) Mixed tab + space leading indentation (only outside multiline strings)
+        if active_str.is_none() {
+            let mut saw_space = false;
+            let mut saw_tab = false;
+            let mut ws_end: i64 = 0;
+            for ch in line.chars() {
+                if ch == ' ' {
+                    saw_space = true;
+                    ws_end += 1;
+                } else if ch == '\t' {
+                    saw_tab = true;
+                    ws_end += 1;
+                } else {
+                    break;
+                }
+            }
+            if saw_space && saw_tab {
+                warn_count += 1;
+                diags.push(NativeDiagHit {
+                    row: r,
+                    col: 0,
+                    end_col: ws_end.max(1),
+                    severity: "WARN".to_string(),
+                    source: "style".to_string(),
+                    message: "Mixed tab and space indentation".to_string(),
+                });
             }
         }
-        if saw_space && saw_tab {
-            warn_count += 1;
-            diags.push(NativeDiagHit {
-                row: r,
-                col: 0,
-                end_col: ws_end.max(1),
-                severity: "WARN".to_string(),
-                source: "style".to_string(),
-                message: "Mixed tab and space indentation".to_string(),
-            });
-        }
 
-        // 3) Trailing whitespace in code buffers
-        if code_mode {
+        // 3) Trailing whitespace in code buffers (outside multiline strings)
+        if code_mode && active_str.is_none() {
             let trimmed_end = line.trim_end();
             let tlen = char_len_fast(trimmed_end) as i64;
             if tlen < llen {
@@ -1752,102 +1868,335 @@ pub fn doc_analyze_diagnostics(
         }
 
         // 4) Balanced delimiter & string literal checks in code modes
-        if code_mode && (in_block_cmt || !line.is_empty()) {
+        if code_mode && (in_block_cmt || active_str.is_some() || !line.is_empty()) {
             let bytes = line.as_bytes();
+            // Ultra-fast skip for plain identifier/whitespace lines with zero delimiters, quotes, or comment starters
+            if !in_block_cmt
+                && active_str.is_none()
+                && !bytes.iter().any(|&b| {
+                    matches!(
+                        b,
+                        b'(' | b')'
+                            | b'['
+                            | b']'
+                            | b'{'
+                            | b'}'
+                            | b'"'
+                            | b'\''
+                            | b'`'
+                            | b'/'
+                            | b'-'
+                            | b'#'
+                    )
+                })
+            {
+                continue;
+            }
+            let blk_open_b0 = blk_open.as_bytes().first().copied().unwrap_or(0);
+            let blk_close_b0 = blk_close.as_bytes().first().copied().unwrap_or(0);
+            let line_cmt_b0 = line_cmt.as_bytes().first().copied().unwrap_or(0);
             let mut b_idx = 0usize;
             let mut char_col = 0i64;
 
             while b_idx < bytes.len() {
+                let b0 = bytes[b_idx];
+                if let Some(ref ml) = active_str {
+                    if ml.allow_backslash_escape && b0 == b'\\' {
+                        b_idx += 1;
+                        char_col += 1;
+                        if b_idx < bytes.len() {
+                            let esc_b = bytes[b_idx];
+                            if esc_b.is_ascii() {
+                                b_idx += 1;
+                            } else {
+                                let esc = line[b_idx..].chars().next().unwrap_or(' ');
+                                b_idx += esc.len_utf8();
+                            }
+                            char_col += 1;
+                        }
+                        continue;
+                    }
+                    if b0 == ml.close_delim.as_bytes()[0]
+                        && line[b_idx..].starts_with(&ml.close_delim)
+                    {
+                        let d_bytes = ml.close_delim.len();
+                        let d_chars = d_bytes as i64;
+                        active_str = None;
+                        b_idx += d_bytes;
+                        char_col += d_chars;
+                        continue;
+                    }
+                    if b0.is_ascii() {
+                        b_idx += 1;
+                    } else {
+                        let cur = line[b_idx..].chars().next().unwrap_or(' ');
+                        b_idx += cur.len_utf8();
+                    }
+                    char_col += 1;
+                    continue;
+                }
+
                 if in_block_cmt {
-                    if !blk_close.is_empty() && line[b_idx..].starts_with(blk_close) {
+                    if blk_close_b0 != 0
+                        && b0 == blk_close_b0
+                        && line[b_idx..].starts_with(blk_close)
+                    {
                         in_block_cmt = false;
                         b_idx += blk_close.len();
-                        char_col += blk_close.chars().count() as i64;
+                        char_col += blk_close.len() as i64;
                     } else {
-                        let ch = line[b_idx..].chars().next().unwrap_or(' ');
-                        b_idx += ch.len_utf8();
+                        if b0.is_ascii() {
+                            b_idx += 1;
+                        } else {
+                            let ch = line[b_idx..].chars().next().unwrap_or(' ');
+                            b_idx += ch.len_utf8();
+                        }
                         char_col += 1;
                     }
                     continue;
                 }
 
-                if !blk_open.is_empty() && line[b_idx..].starts_with(blk_open) {
+                if blk_open_b0 != 0 && b0 == blk_open_b0 && line[b_idx..].starts_with(blk_open) {
                     in_block_cmt = true;
                     b_idx += blk_open.len();
-                    char_col += blk_open.chars().count() as i64;
+                    char_col += blk_open.len() as i64;
                     continue;
                 }
 
-                if !line_cmt.is_empty() && line[b_idx..].starts_with(line_cmt) {
+                if line_cmt_b0 != 0 && b0 == line_cmt_b0 && line[b_idx..].starts_with(line_cmt) {
                     break;
                 }
 
-                let ch = line[b_idx..].chars().next().unwrap_or(' ');
+                // Fast skip for ordinary ASCII identifier / number / operator bytes
+                if b0.is_ascii()
+                    && !matches!(
+                        b0,
+                        b'(' | b')'
+                            | b'['
+                            | b']'
+                            | b'{'
+                            | b'}'
+                            | b'"'
+                            | b'\''
+                            | b'`'
+                            | b'r'
+                            | b'b'
+                            | b'c'
+                    )
+                {
+                    b_idx += 1;
+                    char_col += 1;
+                    continue;
+                }
+
+                // Rust raw strings `r#"..."#`, `br#"..."#`, `cr#"..."#` and byte chars `b'x'`
+                if is_rust_like && matches!(b0, b'r' | b'b' | b'c') {
+                    let prev_ident = b_idx > 0
+                        && (bytes[b_idx - 1].is_ascii_alphanumeric() || bytes[b_idx - 1] == b'_');
+                    if !prev_ident {
+                        if let Some((open_bytes, open_chars, hashes)) =
+                            match_rust_raw_string_prefix(&line[b_idx..])
+                        {
+                            let mut close_delim = String::with_capacity(1 + hashes);
+                            close_delim.push('"');
+                            for _ in 0..hashes {
+                                close_delim.push('#');
+                            }
+                            let start_c = char_col;
+                            b_idx += open_bytes;
+                            char_col += open_chars as i64;
+                            active_str = Some(ActiveMultilineStr {
+                                close_delim,
+                                allow_backslash_escape: false,
+                                start_row: r,
+                                start_col: start_c,
+                                start_line_len: llen,
+                            });
+                            continue;
+                        }
+                        if b0 == b'b'
+                            && b_idx + 1 < bytes.len()
+                            && bytes[b_idx + 1] == b'\''
+                            && let Some((lit_bytes, lit_chars)) =
+                                match_char_literal_len(&line[b_idx + 1..])
+                        {
+                            b_idx += 1 + lit_bytes;
+                            char_col += 1 + lit_chars;
+                            continue;
+                        }
+                    }
+                    b_idx += 1;
+                    char_col += 1;
+                    continue;
+                }
+
+                // Triple-quoted strings `"""..."""` or `'''...'''`
+                if (b0 == b'"' && line[b_idx..].starts_with("\"\"\""))
+                    || (single_quote_str && b0 == b'\'' && line[b_idx..].starts_with("'''"))
+                {
+                    let delim = line[b_idx..b_idx + 3].to_string();
+                    let start_c = char_col;
+                    b_idx += 3;
+                    char_col += 3;
+                    active_str = Some(ActiveMultilineStr {
+                        close_delim: delim,
+                        allow_backslash_escape: true,
+                        start_row: r,
+                        start_col: start_c,
+                        start_line_len: llen,
+                    });
+                    continue;
+                }
+
+                let ch = if b0.is_ascii() {
+                    b0 as char
+                } else {
+                    line[b_idx..].chars().next().unwrap_or(' ')
+                };
+
+                // Backtick raw/template strings (Go, JS/TS, Shell, SQL)
+                if supports_backtick_str && ch == '`' {
+                    let allow_esc = !matches!(mode.as_str(), "go" | "sql");
+                    let start_c = char_col;
+                    b_idx += 1;
+                    char_col += 1;
+                    active_str = Some(ActiveMultilineStr {
+                        close_delim: "`".to_string(),
+                        allow_backslash_escape: allow_esc,
+                        start_row: r,
+                        start_col: start_c,
+                        start_line_len: llen,
+                    });
+                    continue;
+                }
+
                 if ch == '"' || (single_quote_str && ch == '\'') {
                     let quote = ch;
                     let start_c = char_col;
                     b_idx += quote.len_utf8();
                     char_col += 1;
+                    if is_rust_like && quote == '"' {
+                        active_str = Some(ActiveMultilineStr {
+                            close_delim: quote.to_string(),
+                            allow_backslash_escape: true,
+                            start_row: r,
+                            start_col: start_c,
+                            start_line_len: llen,
+                        });
+                        continue;
+                    }
+                    // Single-line string literal (with Nessa `{...}` interpolation & trailing `\` continuation)
+                    let nessa_interp = mode == "nessa" && quote == '"';
+                    let mut interp_depth = 0usize;
                     let mut closed = false;
+                    let mut trailing_bs = false;
                     while b_idx < bytes.len() {
-                        let cur = line[b_idx..].chars().next().unwrap_or(' ');
-                        if cur == '\\' {
+                        if bytes[b_idx] == b'\\' {
                             b_idx += 1;
                             char_col += 1;
-                            if b_idx < bytes.len() {
-                                let esc = line[b_idx..].chars().next().unwrap_or(' ');
-                                b_idx += esc.len_utf8();
-                                char_col += 1;
+                            if b_idx >= bytes.len() {
+                                trailing_bs = true;
+                                break;
                             }
-                        } else if cur == quote {
+                            let esc = line[b_idx..].chars().next().unwrap_or(' ');
+                            b_idx += esc.len_utf8();
+                            char_col += 1;
+                            continue;
+                        }
+                        if nessa_interp {
+                            if interp_depth == 0 {
+                                if line[b_idx..].starts_with("{{")
+                                    || line[b_idx..].starts_with("}}")
+                                {
+                                    b_idx += 2;
+                                    char_col += 2;
+                                    continue;
+                                }
+                                if bytes[b_idx] == b'{' {
+                                    interp_depth = 1;
+                                    b_idx += 1;
+                                    char_col += 1;
+                                    continue;
+                                }
+                            } else {
+                                if bytes[b_idx] == b'"' {
+                                    b_idx += 1;
+                                    char_col += 1;
+                                    while b_idx < bytes.len() {
+                                        if bytes[b_idx] == b'\\' {
+                                            b_idx += 1;
+                                            char_col += 1;
+                                            if b_idx < bytes.len() {
+                                                let esc =
+                                                    line[b_idx..].chars().next().unwrap_or(' ');
+                                                b_idx += esc.len_utf8();
+                                                char_col += 1;
+                                            }
+                                            continue;
+                                        }
+                                        let nch = line[b_idx..].chars().next().unwrap_or(' ');
+                                        b_idx += nch.len_utf8();
+                                        char_col += 1;
+                                        if nch == '"' {
+                                            break;
+                                        }
+                                    }
+                                    continue;
+                                }
+                                if bytes[b_idx] == b'{' {
+                                    interp_depth += 1;
+                                    b_idx += 1;
+                                    char_col += 1;
+                                    continue;
+                                }
+                                if bytes[b_idx] == b'}' {
+                                    interp_depth -= 1;
+                                    b_idx += 1;
+                                    char_col += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                        let cur = line[b_idx..].chars().next().unwrap_or(' ');
+                        b_idx += cur.len_utf8();
+                        char_col += 1;
+                        if interp_depth == 0 && cur == quote {
                             closed = true;
-                            b_idx += quote.len_utf8();
-                            char_col += 1;
                             break;
-                        } else {
-                            b_idx += cur.len_utf8();
-                            char_col += 1;
                         }
                     }
                     if !closed {
-                        err_count += 1;
-                        diags.push(NativeDiagHit {
-                            row: r,
-                            col: start_c,
-                            end_col: llen.max(start_c + 1),
-                            severity: "ERROR".to_string(),
-                            source: "syntax".to_string(),
-                            message: "Unterminated string literal".to_string(),
-                        });
+                        if trailing_bs {
+                            active_str = Some(ActiveMultilineStr {
+                                close_delim: quote.to_string(),
+                                allow_backslash_escape: true,
+                                start_row: r,
+                                start_col: start_c,
+                                start_line_len: llen,
+                            });
+                        } else {
+                            err_count += 1;
+                            diags.push(NativeDiagHit {
+                                row: r,
+                                col: start_c,
+                                end_col: llen.max(start_c + 1),
+                                severity: "ERROR".to_string(),
+                                source: "syntax".to_string(),
+                                message: "Unterminated string literal".to_string(),
+                            });
+                        }
                     }
                     continue;
                 }
 
-                // Skip short character literals `'x'` or `'\x'` in Rust/C/Nessa/Java/Go
-                if !single_quote_str && ch == '\'' {
-                    let after1 = b_idx + 1;
-                    if after1 < bytes.len() {
-                        let c1 = line[after1..].chars().next().unwrap_or(' ');
-                        if c1 == '\\' {
-                            let after2 = after1 + 1;
-                            if after2 < bytes.len() {
-                                let c2 = line[after2..].chars().next().unwrap_or(' ');
-                                let after3 = after2 + c2.len_utf8();
-                                if after3 < bytes.len() && bytes[after3] == b'\'' {
-                                    b_idx = after3 + 1;
-                                    char_col += 4;
-                                    continue;
-                                }
-                            }
-                        } else {
-                            let after2 = after1 + c1.len_utf8();
-                            if after2 < bytes.len() && bytes[after2] == b'\'' {
-                                b_idx = after2 + 1;
-                                char_col += 3;
-                                continue;
-                            }
-                        }
-                    }
+                // Skip character literals `'x'`, `'\n'`, `'\x7f'`, `'\u{10FFFF}'` in Rust/C/Nessa/Java/Go
+                if !single_quote_str
+                    && ch == '\''
+                    && let Some((lit_bytes, lit_chars)) = match_char_literal_len(&line[b_idx..])
+                {
+                    b_idx += lit_bytes;
+                    char_col += lit_chars;
+                    continue;
                 }
 
                 if matches!(ch, '(' | '[' | '{') {
@@ -1858,7 +2207,7 @@ pub fn doc_analyze_diagnostics(
                     });
                 } else if matches!(ch, ')' | ']' | '}') {
                     let want = matching_open_for_close(ch);
-                    match bracket_stack.pop() {
+                    match bracket_stack.last().copied() {
                         None => {
                             err_count += 1;
                             diags.push(NativeDiagHit {
@@ -1870,7 +2219,10 @@ pub fn doc_analyze_diagnostics(
                                 message: format!("Unmatched closing bracket '{ch}'"),
                             });
                         }
-                        Some(top) if top.ch != want => {
+                        Some(top) if top.ch == want => {
+                            let _ = bracket_stack.pop();
+                        }
+                        Some(top) => {
                             let exp = expected_close_for_open(top.ch);
                             err_count += 1;
                             diags.push(NativeDiagHit {
@@ -1885,8 +2237,19 @@ pub fn doc_analyze_diagnostics(
                                     top.row + 1
                                 ),
                             });
+                            // Recover cleanly:
+                            // - If `want` sits right below `top`, pop both so outer scopes stay aligned.
+                            // - If `top` and `ch` are inline `(`/`[` delimiters (e.g. `(1 + 2]`), pop `top`
+                            //   without popping an enclosing `{`, preventing duplicate errors and keeping `{ ... }` aligned.
+                            if bracket_stack.len() >= 2
+                                && bracket_stack[bracket_stack.len() - 2].ch == want
+                            {
+                                let _ = bracket_stack.pop();
+                                let _ = bracket_stack.pop();
+                            } else if top.ch != '{' && ch != '}' {
+                                let _ = bracket_stack.pop();
+                            }
                         }
-                        Some(_) => {}
                     }
                 }
 
@@ -1894,6 +2257,18 @@ pub fn doc_analyze_diagnostics(
                 char_col += 1;
             }
         }
+    }
+
+    if let Some(unclosed) = active_str {
+        err_count += 1;
+        diags.push(NativeDiagHit {
+            row: unclosed.start_row,
+            col: unclosed.start_col,
+            end_col: unclosed.start_line_len.max(unclosed.start_col + 1),
+            severity: "ERROR".to_string(),
+            source: "syntax".to_string(),
+            message: "Unterminated string literal".to_string(),
+        });
     }
 
     for open in bracket_stack {
@@ -3389,5 +3764,59 @@ mod tests {
         doc_free(sym_doc);
         doc_free(py_doc);
         doc_free(big_doc);
+    }
+
+    #[test]
+    fn bracket_diagnostics_rust_raw_multiline_nessa_interp_and_bytes_roundtrip() {
+        // 1) Rust raw strings, lifetimes, unicode char escapes, byte chars, and multiline strings
+        //    must produce ZERO false-positive bracket or string diagnostics.
+        let rust_doc = doc_new(vec![
+            "pub fn parse<'a>(s: &'a str) -> (&'a str, char, u8) {".to_string(),
+            "    let raw = r##\"unclosed ( [ { and \"# inside raw\"##;".to_string(),
+            "    let ch = '\\u{1F600}';".to_string(),
+            "    let bc = b'(';".to_string(),
+            "    let multi = \"line 1 ( [".to_string(),
+            "line 2\";".to_string(),
+            "    (s, ch, bc)".to_string(),
+            "}".to_string(),
+        ]);
+        let (r_diags, r_errs, r_warns) = doc_analyze_diagnostics(rust_doc, "rust", 100);
+        assert_eq!(
+            (r_errs, r_warns),
+            (0, 0),
+            "unexpected Rust diagnostics: {r_diags:?}"
+        );
+
+        // 2) Nessa string interpolation containing nested `")"` + non-cascading stray `)` inside `{ ... }`
+        let nessa_doc = doc_new(vec![
+            "pub fn check(line: String) -> bool {".to_string(),
+            "    let msg = \"value={line.contains(\")\")} literal={{ok}}\"".to_string(),
+            "    msg != \"\"".to_string(),
+            "}".to_string(),
+            "pub fn stray_paren() {".to_string(),
+            "    foo());".to_string(),
+            "}".to_string(),
+        ]);
+        let (n_diags, n_errs, _) = doc_analyze_diagnostics(nessa_doc, "nessa", 100);
+        assert_eq!(
+            n_errs, 1,
+            "expected only 1 error on stray ')' without cascading onto closing '}}': {n_diags:?}"
+        );
+        assert_eq!(n_diags[0].row, 5);
+
+        // 3) `doc_open_from_bytes` & `doc_encode_to_bytes` 150,000-line roundtrip
+        let mut raw = String::with_capacity(150_000 * 24);
+        for i in 0..150_000 {
+            raw.push_str(&format!("row_{i:06} = {i}\n"));
+        }
+        let (b_doc, lc, crlf) = doc_open_from_bytes(raw.as_bytes().to_vec());
+        assert_eq!(lc, 150_000);
+        assert!(!crlf);
+        let encoded = doc_encode_to_bytes(b_doc, false).unwrap();
+        assert_eq!(encoded, raw.as_bytes());
+
+        doc_free(rust_doc);
+        doc_free(nessa_doc);
+        doc_free(b_doc);
     }
 }

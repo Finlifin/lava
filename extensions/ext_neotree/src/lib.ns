@@ -13,6 +13,11 @@ use @lava_core.{
     log_event, status_emit
 }
 use @lava_accel.{GitFileEntry, GitStatusSummary, accel_git_status}
+use @lava_remote.{
+    RemoteDirItem, RemoteGitFileEntry, is_ssh_uri, join_ssh_uri, normalize_ssh_uri, parent_ssh_uri,
+    parse_ssh_uri, remote_find_root, remote_git_status, remote_mkdir, remote_readdir, remote_remove,
+    remote_rename, remote_stat, remote_write_lines, ssh_uri_basename
+}
 use @ext_document.{
     Buffer, EditorWorld, SidebarPanel, ext_document_id, require_editor_world
 }
@@ -46,9 +51,98 @@ pub struct NeotreeState {
     pub nodes: List,
 }
 
+fn neotree_norm_path(raw: String) -> String {
+    if is_ssh_uri(raw) {
+        let pt_res = parse_ssh_uri(raw)
+        pt_res match {
+            pt! => {
+                if pt.remote_path == "/" {
+                    return pt.prefix ++ "/"
+                }
+                return pt.prefix ++ pt.remote_path
+            },
+            error _ => {
+                return normalize_ssh_uri(raw)
+            },
+        }
+    }
+    path.normalize(raw)
+}
+
+fn neotree_exists(p: String) -> bool {
+    if is_ssh_uri(p) {
+        let st = remote_stat(p) ! { _ => return false }
+        return st.exists
+    }
+    fs.exists(p)
+}
+
+fn neotree_is_dir(p: String) -> bool {
+    if is_ssh_uri(p) {
+        let st = remote_stat(p) ! { _ => return false }
+        return st.exists and st.is_dir
+    }
+    fs.is_dir(p)
+}
+
+fn neotree_parent(p: String) -> ?String {
+    if is_ssh_uri(p) {
+        let pt = parse_ssh_uri(p) ! { _ => return null }
+        if pt.remote_path == "/" {
+            return null
+        }
+        return neotree_norm_path(parent_ssh_uri(p))
+    }
+    path.parent(p)
+}
+
+fn neotree_basename(p: String) -> String {
+    if is_ssh_uri(p) {
+        return ssh_uri_basename(p)
+    }
+    let fn_opt = path.file_name(p)
+    if fn_opt != null { fn_opt.as(String) } else { p }
+}
+
+fn neotree_join(base: String, rel: String) -> String {
+    if is_ssh_uri(rel) {
+        return neotree_norm_path(rel)
+    }
+    if is_ssh_uri(base) {
+        return neotree_norm_path(join_ssh_uri(base, rel))
+    }
+    if path.is_absolute(rel) {
+        return path.normalize(rel)
+    }
+    path.normalize(path.join(base, rel))
+}
+
+fn effective_neotree_root(world: EditorWorld) -> String {
+    if is_ssh_uri(world.cwd) {
+        return neotree_norm_path(world.cwd)
+    }
+    let fp = world.active_buffer().file_path
+    if is_ssh_uri(fp) {
+        let base_u = parent_ssh_uri(fp)
+        let r_res = remote_find_root(
+            base_u,
+            [".git", "Cargo.toml", "package.toml", "compile_commands.json", "pyproject.toml", "package.json", "go.mod"],
+        )
+        r_res match {
+            found! => {
+                return neotree_norm_path(found)
+            },
+            error _ => {
+                return neotree_norm_path(base_u)
+            },
+        }
+    }
+    neotree_norm_path(world.cwd)
+}
+
 impl NeotreeState {
     pub fn new(cwd: String) -> NeotreeState {
-        let norm = path.normalize(cwd)
+        let norm = neotree_norm_path(cwd)
         let exp = Set.new()
         exp.insert(norm)
         NeotreeState {
@@ -139,6 +233,44 @@ fn git_entry_badge(entry: GitFileEntry) -> String {
 fn collect_git_badges(root_dir: String) -> (HashMap, HashMap) {
     let file_map = HashMap.new()
     let dir_map = HashMap.new()
+    if is_ssh_uri(root_dir) {
+        let rgs = remote_git_status(root_dir) ! { _ => return (file_map, dir_map) }
+        if not rgs.is_repo {
+            return (file_map, dir_map)
+        }
+        let git_root = neotree_norm_path(rgs.root)
+        for i in 0..rgs.entries.len() {
+            let rge = rgs.entries.get(i.as(usize)).as(RemoteGitFileEntry)
+            let badge = git_entry_badge(GitFileEntry {
+                index_status: rge.index_status,
+                worktree_status: rge.worktree_status,
+                rel_path: rge.rel_path,
+            })
+            if badge == "" {
+                continue
+            }
+            let full = neotree_join(git_root, rge.rel_path)
+            file_map.insert(full, badge)
+            var cur_parent = neotree_parent(full)
+            while cur_parent != null {
+                let p_str = cur_parent.as(String)
+                if not dir_map.contains_key(p_str) {
+                    dir_map.insert(p_str, badge)
+                } else if badge == "[M]" {
+                    dir_map.insert(p_str, "[M]")
+                }
+                if p_str == root_dir or p_str == git_root {
+                    break
+                }
+                let next_p = neotree_parent(p_str)
+                if next_p != null and next_p.as(String) == p_str {
+                    break
+                }
+                cur_parent = next_p
+            }
+        }
+        return (file_map, dir_map)
+    }
     let gs: GitStatusSummary = accel_git_status(root_dir)
     if not gs.is_repo {
         return (file_map, dir_map)
@@ -183,6 +315,53 @@ fn walk_tree_nodes(
     out_nodes: List,
 ) {
     if depth > 24 {
+        return
+    }
+    if is_ssh_uri(dir_path) {
+        let ritems! = remote_readdir(dir_path, show_hidden = state.show_hidden) else {
+            return
+        }
+        for i in 0..ritems.len() {
+            let ri = ritems.get(i.as(usize)).as(RemoteDirItem)
+            if ri.name == "" or ri.name == "." or ri.name == ".." {
+                continue
+            }
+            if (not state.show_hidden) and ri.name.starts_with(".") {
+                continue
+            }
+            let norm_full = neotree_norm_path(ri.full_uri)
+            if ri.is_dir {
+                let is_exp = state.expanded_dirs.contains(norm_full)
+                let db_opt = dir_badges.get(norm_full)
+                let badge = if db_opt != null { db_opt.as(String) } else { "" }
+                out_nodes.push(NeotreeNode {
+                    name: ri.name,
+                    full_path: norm_full,
+                    parent_path: dir_path,
+                    is_dir: true,
+                    is_symlink: false,
+                    depth: depth,
+                    expanded: is_exp,
+                    git_badge: badge,
+                })
+                if is_exp {
+                    walk_tree_nodes(norm_full, depth + 1, state, file_badges, dir_badges, out_nodes)
+                }
+            } else {
+                let fb_opt = file_badges.get(norm_full)
+                let badge = if fb_opt != null { fb_opt.as(String) } else { "" }
+                out_nodes.push(NeotreeNode {
+                    name: ri.name,
+                    full_path: norm_full,
+                    parent_path: dir_path,
+                    is_dir: false,
+                    is_symlink: false,
+                    depth: depth,
+                    expanded: false,
+                    git_badge: badge,
+                })
+            }
+        }
         return
     }
     let entries! = fs.read_dir_entries(dir_path) else {
@@ -283,8 +462,8 @@ pub fn refresh_neotree(
     state: NeotreeState,
     .focus_path: String = "",
 ) {
-    if state.root_dir == "" or (not fs.exists(state.root_dir)) {
-        state.root_dir = path.normalize(world.cwd)
+    if state.root_dir == "" or (not neotree_exists(state.root_dir)) {
+        state.root_dir = effective_neotree_root(world)
         state.expanded_dirs.insert(state.root_dir)
     }
 
@@ -295,7 +474,7 @@ pub fn refresh_neotree(
 
     let lines = List()
     var target_sel = world.left_sidebar.selected_row
-    let norm_focus = if focus_path != "" { path.normalize(focus_path) } else { "" }
+    let norm_focus = if focus_path != "" { neotree_norm_path(focus_path) } else { "" }
 
     for i in 0..nodes.len() {
         let n = nodes.get(i.as(usize)).as(NeotreeNode)
@@ -400,14 +579,14 @@ fn collapse_current_or_parent(world: EditorWorld, state: NeotreeState) {
 }
 
 fn expand_ancestors_to_root(state: NeotreeState, target_full: String) {
-    var cur = path.parent(target_full)
+    var cur = neotree_parent(target_full)
     while cur != null {
-        let p = path.normalize(cur.as(String))
+        let p = neotree_norm_path(cur.as(String))
         state.expanded_dirs.insert(p)
         if p == state.root_dir {
             break
         }
-        let nxt = path.parent(p)
+        let nxt = neotree_parent(p)
         if nxt != null and nxt.as(String) == p {
             break
         }
@@ -540,8 +719,7 @@ fn cmd_neotree_add(kern: SystemKernel, args: List) -> #InteractiveEffects !Strin
     let raw_input = if (not args.is_empty()) and args.get(0).as(String).trim() != "" {
         args.get(0).as(String).trim()
     } else {
-        let base_label_opt = path.file_name(base_dir)
-        let base_label = if base_label_opt != null { base_label_opt.as(String) } else { base_dir }
+        let base_label = neotree_basename(base_dir)
         let ans? = ask_prompt(PromptRequest.text(
             "Neo-tree add in " ++ base_label ++ "/ (trailing / for dir): ",
             "",
@@ -562,17 +740,17 @@ fn cmd_neotree_add(kern: SystemKernel, args: List) -> #InteractiveEffects !Strin
     if clean_rel == "" {
         return ()
     }
-    let target_full = if path.is_absolute(clean_rel) {
-        path.normalize(clean_rel)
-    } else {
-        path.normalize(path.join(base_dir, clean_rel))
-    }
+    let target_full = neotree_join(base_dir, clean_rel)
 
     if make_dir {
-        let res = fs.create_dir(target_full, parents = true)
-        res match {
-            _! => (),
-            error err => return error ("Neo-tree mkdir failed: " ++ err.to_string()),
+        if is_ssh_uri(target_full) {
+            remote_mkdir(target_full)!
+        } else {
+            let res = fs.create_dir(target_full, parents = true)
+            res match {
+                _! => (),
+                error err => return error ("Neo-tree mkdir failed: " ++ err.to_string()),
+            }
         }
         expand_ancestors_to_root(state, target_full)
         state.expanded_dirs.insert(target_full)
@@ -582,22 +760,35 @@ fn cmd_neotree_add(kern: SystemKernel, args: List) -> #InteractiveEffects !Strin
         return target_full
     }
 
-    let pdir_opt = path.parent(target_full)
-    if pdir_opt != null {
-        let pdir = pdir_opt.as(String)
-        if pdir != "" and (not fs.exists(pdir)) {
-            let mk_res = fs.create_dir(pdir, parents = true)
-            mk_res match {
-                _! => (),
-                error err => return error ("Neo-tree mkdir parent failed: " ++ err.to_string()),
+    if is_ssh_uri(target_full) {
+        let pdir_opt = neotree_parent(target_full)
+        if pdir_opt != null {
+            let pdir = pdir_opt.as(String)
+            if pdir != "" and (not neotree_exists(pdir)) {
+                remote_mkdir(pdir)!
             }
         }
-    }
-    if not fs.exists(target_full) {
-        let w_res = fs.write_string(target_full, "")
-        w_res match {
-            _! => (),
-            error err => return error ("Neo-tree create file failed: " ++ err.to_string()),
+        if not neotree_exists(target_full) {
+            let _ = remote_write_lines(target_full, [""], false)!
+        }
+    } else {
+        let pdir_opt = path.parent(target_full)
+        if pdir_opt != null {
+            let pdir = pdir_opt.as(String)
+            if pdir != "" and (not fs.exists(pdir)) {
+                let mk_res = fs.create_dir(pdir, parents = true)
+                mk_res match {
+                    _! => (),
+                    error err => return error ("Neo-tree mkdir parent failed: " ++ err.to_string()),
+                }
+            }
+        }
+        if not fs.exists(target_full) {
+            let w_res = fs.write_string(target_full, "")
+            w_res match {
+                _! => (),
+                error err => return error ("Neo-tree create file failed: " ++ err.to_string()),
+            }
         }
     }
     expand_ancestors_to_root(state, target_full)
@@ -635,24 +826,23 @@ fn cmd_neotree_rename(kern: SystemKernel, args: List) -> #InteractiveEffects !St
         return ()
     }
 
-    let dest_full = if path.is_absolute(clean_dest) {
-        path.normalize(clean_dest)
+    let dest_full = neotree_join(node.parent_path, clean_dest)
+
+    if is_ssh_uri(dest_full) {
+        remote_rename(node.full_path, dest_full)!
     } else {
-        path.normalize(path.join(node.parent_path, clean_dest))
-    }
-
-    let pdir_opt = path.parent(dest_full)
-    if pdir_opt != null {
-        let pdir = pdir_opt.as(String)
-        if pdir != "" and (not fs.exists(pdir)) {
-            let _ = fs.create_dir(pdir, parents = true) ! { _ => () }
+        let pdir_opt = path.parent(dest_full)
+        if pdir_opt != null {
+            let pdir = pdir_opt.as(String)
+            if pdir != "" and (not fs.exists(pdir)) {
+                let _ = fs.create_dir(pdir, parents = true) ! { _ => () }
+            }
         }
-    }
-
-    let ren_res = fs.rename(node.full_path, dest_full)
-    ren_res match {
-        _! => (),
-        error err => return error ("Neo-tree rename failed: " ++ err.to_string()),
+        let ren_res = fs.rename(node.full_path, dest_full)
+        ren_res match {
+            _! => (),
+            error err => return error ("Neo-tree rename failed: " ++ err.to_string()),
+        }
     }
 
     if node.is_dir and state.expanded_dirs.contains(node.full_path) {
@@ -664,10 +854,7 @@ fn cmd_neotree_rename(kern: SystemKernel, args: List) -> #InteractiveEffects !St
     if open_opt != null {
         let ob = open_opt.as(Buffer)
         ob.file_path = dest_full
-        let bn_opt = path.file_name(dest_full)
-        if bn_opt != null {
-            ob.name = bn_opt.as(String)
-        }
+        ob.name = neotree_basename(dest_full)
     }
 
     expand_ancestors_to_root(state, dest_full)
@@ -702,7 +889,12 @@ fn cmd_neotree_delete(kern: SystemKernel, _args: List) -> #InteractiveEffects !S
         return ()
     }
 
-    if node.is_dir {
+    if is_ssh_uri(node.full_path) {
+        remote_remove(node.full_path, recursive = node.is_dir)!
+        if node.is_dir {
+            let _ = state.expanded_dirs.remove(node.full_path)
+        }
+    } else if node.is_dir {
         let rm_res = fs.remove_dir(node.full_path, recursive = true)
         rm_res match {
             _! => (),
@@ -733,7 +925,7 @@ fn cmd_neotree_toggle(kern: SystemKernel, _args: List) -> #InteractiveEffects !S
         unfocus_neotree(world, vim, state)
         status_emit("Neo-tree hidden")#
     } else {
-        state.root_dir = path.normalize(world.cwd)
+        state.root_dir = effective_neotree_root(world)
         state.expanded_dirs.insert(state.root_dir)
         refresh_neotree(world, state)
         world.left_sidebar.visible = true
@@ -749,7 +941,7 @@ fn cmd_neotree_focus(kern: SystemKernel, _args: List) -> #InteractiveEffects !St
     let state = require_neotree_state(kern)!
 
     if (not world.left_sidebar.visible) or world.left_sidebar.owner != NEOTREE_OWNER {
-        state.root_dir = path.normalize(world.cwd)
+        state.root_dir = effective_neotree_root(world)
         state.expanded_dirs.insert(state.root_dir)
         refresh_neotree(world, state)
         world.left_sidebar.visible = true
@@ -764,7 +956,7 @@ fn cmd_neotree_reveal(kern: SystemKernel, _args: List) -> #InteractiveEffects !S
     let vim = require_vim_state(kern)!
     let state = require_neotree_state(kern)!
 
-    state.root_dir = path.normalize(world.cwd)
+    state.root_dir = effective_neotree_root(world)
     state.expanded_dirs.insert(state.root_dir)
     let fpath = world.active_buffer().file_path
     if fpath != "" {
@@ -784,7 +976,7 @@ fn cmd_neotree_entry(kern: SystemKernel, args: List) -> #InteractiveEffects !Str
 
     let arg = if not args.is_empty() { args.get(0).as(String).trim() } else { "" }
     if arg == "" {
-        state.root_dir = path.normalize(world.cwd)
+        state.root_dir = effective_neotree_root(world)
         state.expanded_dirs.insert(state.root_dir)
         refresh_neotree(world, state)
         world.left_sidebar.visible = true
@@ -808,7 +1000,7 @@ fn cmd_neotree_entry(kern: SystemKernel, args: List) -> #InteractiveEffects !Str
         return ()
     }
     if arg == "show" {
-        state.root_dir = path.normalize(world.cwd)
+        state.root_dir = effective_neotree_root(world)
         state.expanded_dirs.insert(state.root_dir)
         refresh_neotree(world, state)
         world.left_sidebar.visible = true
@@ -816,8 +1008,8 @@ fn cmd_neotree_entry(kern: SystemKernel, args: List) -> #InteractiveEffects !Str
         return ()
     }
 
-    let custom_dir = world.resolve_path(arg)
-    if fs.exists(custom_dir) and fs.is_dir(custom_dir) {
+    let custom_dir = neotree_norm_path(world.resolve_path(arg))
+    if neotree_exists(custom_dir) and neotree_is_dir(custom_dir) {
         state.root_dir = custom_dir
         state.expanded_dirs.insert(custom_dir)
         refresh_neotree(world, state)
