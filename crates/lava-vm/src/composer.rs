@@ -747,7 +747,7 @@ fn resolve_lava_opt_level() -> OptLevel {
     if std::env::var_os("NESSA_OPT_LEVEL").is_some() {
         OptLevel::from_env()
     } else {
-        OptLevel::O1
+        OptLevel::O3
     }
 }
 
