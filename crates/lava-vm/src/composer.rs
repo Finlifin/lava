@@ -7,17 +7,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, UNIX_EPOCH};
 
 use driver::{
-    CompileResult, Driver, ManifestDocument, OptLevel, PackageSources, SourceFile,
-    install_artifact, load_package_sources, load_package_workspace,
+    Diagnostic, Driver, ManifestDocument, ModuleLoader, OptLevel, PackageSources, SourceFile,
+    install_artifact, load_cached_modular_artifact, load_package_sources, load_package_workspace,
 };
 use gc::GcConfig;
 use initialization::{Engine, EngineConfig, JitConfig};
-use nsbc::CompiledArtifact;
-use nsbc_io::{read_artifact, write_artifact};
+use nsbc::{CompiledArtifact, ModularArtifact};
 use pkg_manager::{ModuleSources, PackageType};
 
 use crate::host::{HostConfig, LavaHostHandler, drive_vm_loop};
@@ -111,6 +111,38 @@ pub struct ComposedBootProgram {
     pub boot_package: PackageSources,
     pub catalog: Vec<PackageSources>,
     pub extensions: Vec<ExtensionPackageInfo>,
+}
+
+/// Modular `.nsbc` compilation output for a composed Lava workspace or entry package.
+#[derive(Debug, Clone)]
+pub struct CompiledBootProgram {
+    /// Topologically ordered modular `.nsbc` archives (`std` first, root package last).
+    pub artifacts: Vec<Arc<ModularArtifact>>,
+    /// Qualified name (`domain/name`) of the root entry package.
+    pub root_qualified_name: String,
+    /// Non-`std` packages compiled from `.ns` sources during this invocation.
+    pub compiled_packages: Vec<String>,
+    /// Non-`std` packages reused from content-addressed `.nsbc` cache without recompilation.
+    pub cached_packages: Vec<String>,
+}
+
+/// Executable Nessa artifact accepted by [`run_compiled_artifact`].
+#[derive(Debug)]
+pub enum ExecutableArtifact {
+    Modular(CompiledBootProgram),
+    Monolithic(CompiledArtifact),
+}
+
+impl From<CompiledBootProgram> for ExecutableArtifact {
+    fn from(program: CompiledBootProgram) -> Self {
+        Self::Modular(program)
+    }
+}
+
+impl From<CompiledArtifact> for ExecutableArtifact {
+    fn from(artifact: CompiledArtifact) -> Self {
+        Self::Monolithic(artifact)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -276,95 +308,89 @@ impl LavaWorkspace {
         })
     }
 
-    /// Type-check and compile the composed single-VM boot graph without executing it,
-    /// reusing a sub-5ms stat-manifest pointer or content-addressed `.nsbc` disk artifact.
-    pub fn compile_boot(&self, options: &BootOptions) -> Result<CompiledArtifact, String> {
+    /// Type-check and separately compile the composed single-VM boot graph into per-package
+    /// modular `.nsbc` archives, reusing a sub-5ms stat-manifest pointer or interface-hash
+    /// DAG `.nsbc` cache so editing one package recompiles only affected downstream packages.
+    pub fn compile_boot(&self, options: &BootOptions) -> Result<CompiledBootProgram, String> {
         let stat_ptr_path = if can_use_stat_manifest_cache(options) {
             self.compute_stat_manifest_ptr_path(options)
         } else {
             None
         };
         if let Some(ptr_path) = &stat_ptr_path
-            && let Some(cached) = try_load_stat_cached_artifact(ptr_path)
+            && let Some(cached) = try_load_stat_cached_modular(ptr_path)
         {
             return Ok(cached);
         }
 
         let composed = self.compose_boot(options)?;
-        let cache_path = nsbc_cache_path_for(
-            self.cache_dir.as_deref(),
-            &composed.boot_package,
-            &composed.catalog,
-        );
-        if let Some(path) = &cache_path
-            && let Some(cached) = try_load_cached_artifact(path)
-        {
-            if let Some(ptr_path) = &stat_ptr_path {
-                store_stat_manifest_ptr(ptr_path, path);
-            }
-            return Ok(cached);
-        }
-
+        let cache_dir = resolve_nsbc_cache_dir(self.cache_dir.as_deref());
         let opt_level = resolve_lava_opt_level();
-        let ext_count = composed.extensions.len();
-        eprintln!("[lava] compiling {ext_count} Nessa extension(s) ({opt_level:?})...");
         let compile_start = Instant::now();
         let privileged = BTreeSet::new();
-        let compiled = Driver::new()
-            .with_opt_level(opt_level)
-            .compile_package_sources_with_privileged(
-                &composed.boot_package,
-                &composed.catalog,
-                &privileged,
-            );
-        let artifact = compile_result_to_artifact(compiled)?;
+        let output = make_modular_driver(opt_level, cache_dir.as_deref())
+            .compile_modular_graph_cached(&composed.boot_package, &composed.catalog, &privileged)
+            .map_err(|diags| format_modular_diagnostics(&diags))?;
         let elapsed = compile_start.elapsed().as_secs_f64();
-        if let Some(path) = &cache_path {
-            store_cached_artifact(path, &artifact);
-            if let Some(ptr_path) = &stat_ptr_path {
-                store_stat_manifest_ptr(ptr_path, path);
-            }
+
+        if !output.compiled_packages.is_empty() {
             eprintln!(
-                "[lava] compiled in {elapsed:.2}s (cached: {})",
-                path.display()
+                "[lava] compiled {} package(s), reused {} cached ({opt_level:?}) in {elapsed:.2}s",
+                output.compiled_packages.len(),
+                output.cached_packages.len(),
             );
-        } else {
-            eprintln!("[lava] compiled in {elapsed:.2}s");
         }
-        Ok(artifact)
+        if let Some(dir) = &cache_dir {
+            if let Some(ptr_path) = &stat_ptr_path {
+                store_stat_manifest_modular_ptr(
+                    ptr_path,
+                    &output.root_qualified_name,
+                    &output.cache_paths,
+                );
+            }
+            prune_old_cache_files(&dir.join("modular"), "nsbc", 512);
+            prune_old_cache_files(dir, "ptr", 36);
+        }
+
+        Ok(CompiledBootProgram {
+            artifacts: output.artifacts,
+            root_qualified_name: output.root_qualified_name,
+            compiled_packages: output.compiled_packages,
+            cached_packages: output.cached_packages,
+        })
     }
 
-    /// Validate all discovered extensions (and optional `init.ns`) in a single Nessa compile pass.
+    /// Validate all discovered extensions (and optional `init.ns`) via modular per-package
+    /// `.nsbc` compilation, warming the per-package `.nsbc` and stat-manifest caches.
     pub fn check_boot(&self, options: &BootOptions) -> Result<Vec<ExtensionPackageInfo>, String> {
         let composed = self.compose_boot(options)?;
+        let cache_dir = resolve_nsbc_cache_dir(self.cache_dir.as_deref());
         let opt_level = resolve_lava_opt_level();
         let ext_count = composed.extensions.len();
         eprintln!("[lava] checking {ext_count} Nessa extension(s) ({opt_level:?})...");
         let compile_start = Instant::now();
         let privileged = BTreeSet::new();
-        let compiled = Driver::new()
-            .with_opt_level(opt_level)
-            .compile_package_sources_with_privileged(
-                &composed.boot_package,
-                &composed.catalog,
-                &privileged,
-            );
-        let artifact = compile_result_to_artifact(compiled)?;
+        let output = make_modular_driver(opt_level, cache_dir.as_deref())
+            .compile_modular_graph_cached(&composed.boot_package, &composed.catalog, &privileged)
+            .map_err(|diags| format_modular_diagnostics(&diags))?;
         eprintln!(
-            "[lava] checked in {:.2}s",
-            compile_start.elapsed().as_secs_f64()
+            "[lava] checked in {:.2}s ({} compiled, {} cached)",
+            compile_start.elapsed().as_secs_f64(),
+            output.compiled_packages.len(),
+            output.cached_packages.len(),
         );
-        if let Some(path) = nsbc_cache_path_for(
-            self.cache_dir.as_deref(),
-            &composed.boot_package,
-            &composed.catalog,
-        ) {
-            store_cached_artifact(&path, &artifact);
+        if let Some(dir) = &cache_dir {
             if can_use_stat_manifest_cache(options)
                 && let Some(ptr_path) = self.compute_stat_manifest_ptr_path(options)
             {
-                store_stat_manifest_ptr(&ptr_path, &path);
+                store_stat_manifest_modular_ptr(
+                    &ptr_path,
+                    &output.root_qualified_name,
+                    &output.cache_paths,
+                );
             }
+            prune_old_cache_files(&dir.join("modular"), "nsbc", 512);
+            prune_old_cache_files(dir, "ptr", 36);
         }
         Ok(composed.extensions)
     }
@@ -480,34 +506,32 @@ pub fn run_entry_package(
         }
     }
 
-    let cache_path = nsbc_cache_path_for(None, &root_pkg, &catalog);
-    let artifact = if let Some(path) = &cache_path
-        && let Some(cached) = try_load_cached_artifact(path)
-    {
-        cached
-    } else {
-        let opt_level = resolve_lava_opt_level();
-        let pkg_name = root_pkg.manifest.manifest().name.clone();
-        eprintln!("[lava] compiling package '{pkg_name}' ({opt_level:?})...");
-        let compile_start = Instant::now();
-        let privileged = BTreeSet::new();
-        let compiled = Driver::new()
-            .with_opt_level(opt_level)
-            .compile_package_sources_with_privileged(&root_pkg, &catalog, &privileged);
-        let built = compile_result_to_artifact(compiled)?;
-        let elapsed = compile_start.elapsed().as_secs_f64();
-        if let Some(path) = &cache_path {
-            store_cached_artifact(path, &built);
-            eprintln!(
-                "[lava] compiled '{pkg_name}' in {elapsed:.2}s (cached: {})",
-                path.display()
-            );
-        } else {
-            eprintln!("[lava] compiled '{pkg_name}' in {elapsed:.2}s");
-        }
-        built
+    let cache_dir = resolve_nsbc_cache_dir(None);
+    let opt_level = resolve_lava_opt_level();
+    let pkg_name = root_pkg.manifest.manifest().name.clone();
+    let compile_start = Instant::now();
+    let privileged = BTreeSet::new();
+    let output = make_modular_driver(opt_level, cache_dir.as_deref())
+        .compile_modular_graph_cached(&root_pkg, &catalog, &privileged)
+        .map_err(|diags| format_modular_diagnostics(&diags))?;
+    let elapsed = compile_start.elapsed().as_secs_f64();
+    if !output.compiled_packages.is_empty() {
+        eprintln!(
+            "[lava] compiled '{pkg_name}' ({} package(s), {} cached, {opt_level:?}) in {elapsed:.2}s",
+            output.compiled_packages.len(),
+            output.cached_packages.len(),
+        );
+    }
+    if let Some(dir) = &cache_dir {
+        prune_old_cache_files(&dir.join("modular"), "nsbc", 512);
+    }
+    let program = CompiledBootProgram {
+        artifacts: output.artifacts,
+        root_qualified_name: output.root_qualified_name,
+        compiled_packages: output.compiled_packages,
+        cached_packages: output.cached_packages,
     };
-    run_compiled_artifact(artifact, host_config)
+    run_compiled_artifact(program, host_config)
 }
 
 fn resolve_vm_heap_bytes() -> usize {
@@ -522,10 +546,11 @@ fn resolve_vm_heap_bytes() -> usize {
     mb * 1024 * 1024
 }
 
-/// Install a [`CompiledArtifact`] into a fresh Nessa [`Engine`], attach [`LavaHostHandler`],
+/// Install a modular [`CompiledBootProgram`] (via demand-driven per-`mod` [`ModuleLoader`]) or
+/// monolithic [`CompiledArtifact`] into a fresh Nessa [`Engine`], attach [`LavaHostHandler`],
 /// spawn the root entry task, and drive the cooperative VM event loop to completion.
-pub fn run_compiled_artifact(
-    artifact: CompiledArtifact,
+pub fn run_compiled_artifact<A: Into<ExecutableArtifact>>(
+    artifact: A,
     host_config: HostConfig,
 ) -> Result<i32, String> {
     let heap_size = resolve_vm_heap_bytes();
@@ -541,39 +566,73 @@ pub fn run_compiled_artifact(
     if !script_args.is_empty() {
         engine.vm_mut().set_script_args(script_args);
     }
-    let entry = install_artifact(engine.vm_mut(), artifact)
-        .map_err(|err| format!("failed to install compiled Nessa artifact: {err}"))?;
-    engine.vm_mut().set_host_handler(Box::new(handler));
 
-    let Some(entry_func) = entry else {
-        return Ok(0);
-    };
-    engine.vm_mut().spawn_root(entry_func);
-    drive_vm_loop(engine.vm_mut(), &controller)
+    match artifact.into() {
+        ExecutableArtifact::Modular(program) => {
+            let mut loader = ModuleLoader::new();
+            loader
+                .register_artifacts(&program.artifacts)
+                .map_err(|err| format!("failed to register modular Nessa artifacts: {err}"))?;
+            let prepared = loader
+                .prepare_module(engine.vm_mut(), &program.root_qualified_name, &[])
+                .map_err(|err| {
+                    format!(
+                        "failed to load modular Nessa root `{}`: {err}",
+                        program.root_qualified_name
+                    )
+                })?;
+            let entry = loader
+                .synthesize_entry_sequence(engine.vm_mut(), &prepared)
+                .map_err(|err| {
+                    format!("failed to synthesize modular Nessa entry sequence: {err}")
+                })?;
+            engine.vm_mut().set_host_handler(Box::new(handler));
+            let Some(entry_func) = entry else {
+                return Ok(0);
+            };
+            engine.vm_mut().spawn_root(entry_func);
+            let exit_code = drive_vm_loop(engine.vm_mut(), &controller)?;
+            drop(loader);
+            Ok(exit_code)
+        }
+        ExecutableArtifact::Monolithic(mono) => {
+            let entry = install_artifact(engine.vm_mut(), mono)
+                .map_err(|err| format!("failed to install compiled Nessa artifact: {err}"))?;
+            engine.vm_mut().set_host_handler(Box::new(handler));
+            let Some(entry_func) = entry else {
+                return Ok(0);
+            };
+            engine.vm_mut().spawn_root(entry_func);
+            drive_vm_loop(engine.vm_mut(), &controller)
+        }
+    }
 }
 
-fn compile_result_to_artifact(compiled: CompileResult) -> Result<CompiledArtifact, String> {
-    if compiled.has_errors {
-        let mut lines = Vec::new();
-        for diag in &compiled.diagnostics {
-            let mut msg = diag.message.clone();
-            for note in &diag.notes {
-                msg.push_str(&format!(" (note: {note})"));
-            }
-            for help in &diag.helps {
-                msg.push_str(&format!(" (help: {help})"));
-            }
-            lines.push(msg);
-        }
-        return Err(format!("Nessa compilation failed:\n{}", lines.join("\n")));
+fn make_modular_driver(opt_level: OptLevel, cache_dir: Option<&Path>) -> Driver {
+    let drv = Driver::new().with_opt_level(opt_level);
+    match cache_dir {
+        Some(dir) => drv.with_cache_dir(dir.to_path_buf()),
+        None => drv.without_cache(),
     }
-    compiled
-        .into_artifact()
-        .map_err(|err| format!("failed to finalize Nessa artifact: {err}"))
+}
+
+fn format_modular_diagnostics(diagnostics: &[Diagnostic]) -> String {
+    let mut lines = Vec::with_capacity(diagnostics.len());
+    for diag in diagnostics {
+        let mut msg = diag.message.clone();
+        for note in &diag.notes {
+            msg.push_str(&format!(" (note: {note})"));
+        }
+        for help in &diag.helps {
+            msg.push_str(&format!(" (help: {help})"));
+        }
+        lines.push(msg);
+    }
+    format!("Nessa compilation failed:\n{}", lines.join("\n"))
 }
 
 // ---------------------------------------------------------------------------
-// Content-addressed `.nsbc` Bytecode Cache
+// Content-addressed Modular `.nsbc` & Stat-Manifest Cache
 // ---------------------------------------------------------------------------
 
 static CACHE_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -634,37 +693,6 @@ impl ContentHasher128 {
     }
 }
 
-fn hash_module_tree(hasher: &mut ContentHasher128, modules: &[ModuleSources]) {
-    hasher.write_u64(modules.len() as u64);
-    for m in modules {
-        hasher.write_u64(m.path.len() as u64);
-        for seg in &m.path {
-            hasher.write_str(seg);
-        }
-        hasher.write_str(&m.entry.file_path.to_string_lossy());
-        hasher.write_str(&m.entry.source);
-        hash_module_tree(hasher, &m.children);
-    }
-}
-
-fn hash_package_sources(hasher: &mut ContentHasher128, pkg: &PackageSources) {
-    let m = pkg.manifest.manifest();
-    hasher.write_str(&m.qualified_name());
-    hasher.write_str(&m.version.to_string());
-    hasher.write_u64(match m.package_type {
-        PackageType::Exe => 1,
-        PackageType::Lib => 2,
-        PackageType::Tmp => 3,
-    });
-    hasher.write_u64(m.dependencies.len() as u64);
-    for dep in &m.dependencies {
-        hasher.write_str(&format!("{dep:?}"));
-    }
-    hasher.write_str(&pkg.entry.file_path.to_string_lossy());
-    hasher.write_str(&pkg.entry.source);
-    hash_module_tree(hasher, &pkg.modules);
-}
-
 fn resolve_nsbc_cache_dir_from_vars(
     override_dir: Option<&Path>,
     env_cache_dir: Option<&str>,
@@ -723,46 +751,6 @@ fn resolve_lava_opt_level() -> OptLevel {
     }
 }
 
-fn nsbc_cache_path_for(
-    override_cache_dir: Option<&Path>,
-    boot_pkg: &PackageSources,
-    catalog: &[PackageSources],
-) -> Option<PathBuf> {
-    let dir = resolve_nsbc_cache_dir(override_cache_dir)?;
-    let mut hasher = ContentHasher128::new();
-    hasher.write_str("lava-nsbc-cache-v3");
-    hasher.write_str(std::env::consts::OS);
-    hasher.write_str(env!("CARGO_PKG_VERSION"));
-    hasher.write_u64(u64::from(nsbc::VERSION));
-    hasher.write_u64(u64::from(resolve_lava_opt_level().as_u8()));
-    hash_package_sources(&mut hasher, boot_pkg);
-
-    let mut sorted_catalog: Vec<&PackageSources> = catalog.iter().collect();
-    sorted_catalog.sort_by(|a, b| {
-        let ma = a.manifest.manifest();
-        let mb = b.manifest.manifest();
-        (ma.qualified_name(), ma.version.to_string())
-            .cmp(&(mb.qualified_name(), mb.version.to_string()))
-    });
-    hasher.write_u64(sorted_catalog.len() as u64);
-    for pkg in sorted_catalog {
-        hash_package_sources(&mut hasher, pkg);
-    }
-
-    Some(dir.join(format!("{}.nsbc", hasher.finish_hex())))
-}
-
-fn try_load_cached_artifact(path: &Path) -> Option<CompiledArtifact> {
-    let bytes = fs::read(path).ok()?;
-    match read_artifact(&bytes) {
-        Ok(artifact) => Some(artifact),
-        Err(_) => {
-            let _ = fs::remove_file(path);
-            None
-        }
-    }
-}
-
 fn prune_old_cache_files(dir: &Path, ext: &str, keep_latest: usize) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -784,36 +772,6 @@ fn prune_old_cache_files(dir: &Path, ext: &str, keep_latest: usize) {
     files.sort_by_key(|a| std::cmp::Reverse(a.0));
     for (_, old_path) in files.into_iter().skip(keep_latest) {
         let _ = fs::remove_file(old_path);
-    }
-}
-
-fn store_cached_artifact(path: &Path, artifact: &CompiledArtifact) {
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    let Ok(bytes) = write_artifact(artifact) else {
-        return;
-    };
-    let seq = CACHE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp_name = format!(
-        ".{}.tmp.{}.{}",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("artifact.nsbc"),
-        std::process::id(),
-        seq
-    );
-    let tmp_path = parent.join(tmp_name);
-    if fs::write(&tmp_path, &bytes).is_ok() {
-        if fs::rename(&tmp_path, path).is_ok() {
-            prune_old_cache_files(parent, "nsbc", 36);
-            prune_old_cache_files(parent, "ptr", 36);
-        } else {
-            let _ = fs::remove_file(&tmp_path);
-        }
     }
 }
 
@@ -954,10 +912,11 @@ impl LavaWorkspace {
         stats.sort();
 
         let mut hasher = ContentHasher128::new();
-        hasher.write_str("lava-stat-v3");
+        hasher.write_str("lava-stat-mod-v1");
         hasher.write_str(std::env::consts::OS);
         hasher.write_str(env!("CARGO_PKG_VERSION"));
         hasher.write_u64(u64::from(nsbc::VERSION));
+        hasher.write_u64(u64::from(runtime::BUILTIN_ABI_VERSION));
         hasher.write_u64(u64::from(resolve_lava_opt_level().as_u8()));
         hasher.write_str(&options.entry_pkg);
         hasher.write_u64(u64::from(self.user_script.is_some()));
@@ -973,33 +932,95 @@ impl LavaWorkspace {
     }
 }
 
-fn try_load_stat_cached_artifact(ptr_path: &Path) -> Option<CompiledArtifact> {
+fn try_load_stat_cached_modular(ptr_path: &Path) -> Option<CompiledBootProgram> {
     let cache_dir = ptr_path.parent()?;
-    let target_name_raw = fs::read_to_string(ptr_path).ok()?;
-    let target_name = target_name_raw.trim();
-    if target_name.is_empty()
-        || !target_name.ends_with(".nsbc")
-        || target_name.contains('/')
-        || target_name.contains('\\')
-    {
+    let raw = fs::read_to_string(ptr_path).ok()?;
+    let mut lines = raw.lines().map(str::trim).filter(|l| !l.is_empty());
+    let root_qualified_name = lines.next()?.to_owned();
+    let mut nsbc_paths: Vec<PathBuf> = Vec::new();
+    let modular_dir = cache_dir.join("modular");
+    for fname in lines {
+        if !fname.ends_with(".nsbc") || fname.contains('/') || fname.contains('\\') {
+            let _ = fs::remove_file(ptr_path);
+            return None;
+        }
+        nsbc_paths.push(modular_dir.join(fname));
+    }
+    if nsbc_paths.len() < 2 {
         let _ = fs::remove_file(ptr_path);
         return None;
     }
-    let nsbc_path = cache_dir.join(target_name);
-    let artifact = try_load_cached_artifact(&nsbc_path);
-    if artifact.is_none() {
-        let _ = fs::remove_file(ptr_path);
+
+    let loaded: Vec<Option<Arc<ModularArtifact>>> = if nsbc_paths.len() <= 4 {
+        nsbc_paths
+            .iter()
+            .map(|p| load_cached_modular_artifact(p))
+            .collect()
+    } else {
+        let mut out = Vec::with_capacity(nsbc_paths.len());
+        for chunk in nsbc_paths.chunks(8) {
+            let chunk_res: Vec<Option<Arc<ModularArtifact>>> = std::thread::scope(|s| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|p| s.spawn(move || load_cached_modular_artifact(p)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("modular cache reader thread panicked"))
+                    .collect()
+            });
+            out.extend(chunk_res);
+        }
+        out
+    };
+
+    let mut artifacts = Vec::with_capacity(loaded.len());
+    for item in loaded {
+        match item {
+            Some(art) => artifacts.push(art),
+            None => {
+                let _ = fs::remove_file(ptr_path);
+                return None;
+            }
+        }
     }
-    artifact
+    let cached_packages = artifacts
+        .iter()
+        .skip(1)
+        .map(|a| a.exports.qualified_name.clone())
+        .collect();
+    Some(CompiledBootProgram {
+        artifacts,
+        root_qualified_name,
+        compiled_packages: Vec::new(),
+        cached_packages,
+    })
 }
 
-fn store_stat_manifest_ptr(ptr_path: &Path, nsbc_path: &Path) {
+fn store_stat_manifest_modular_ptr(
+    ptr_path: &Path,
+    root_qualified_name: &str,
+    cache_paths: &[Option<PathBuf>],
+) {
+    if cache_paths.len() < 2 {
+        return;
+    }
     let Some(parent) = ptr_path.parent() else {
         return;
     };
-    let Some(nsbc_fname) = nsbc_path.file_name().and_then(|n| n.to_str()) else {
-        return;
-    };
+    let mut payload = String::with_capacity(64 * (cache_paths.len() + 1));
+    payload.push_str(root_qualified_name);
+    payload.push('\n');
+    for opt_path in cache_paths {
+        let Some(p) = opt_path.as_deref() else {
+            return;
+        };
+        let Some(fname) = p.file_name().and_then(|n| n.to_str()) else {
+            return;
+        };
+        payload.push_str(fname);
+        payload.push('\n');
+    }
     if fs::create_dir_all(parent).is_err() {
         return;
     }
@@ -1014,8 +1035,7 @@ fn store_stat_manifest_ptr(ptr_path: &Path, nsbc_path: &Path) {
         seq
     );
     let tmp_path = parent.join(tmp_name);
-    if fs::write(&tmp_path, nsbc_fname.as_bytes()).is_ok()
-        && fs::rename(&tmp_path, ptr_path).is_err()
+    if fs::write(&tmp_path, payload.as_bytes()).is_ok() && fs::rename(&tmp_path, ptr_path).is_err()
     {
         let _ = fs::remove_file(&tmp_path);
     }
@@ -2206,13 +2226,24 @@ fn escape_toml_string(input: &str) -> String {
 mod tests {
     use std::sync::Arc;
 
+    use driver::CompileResult;
     use interpreter::VmResult;
     use lava_proto::{EventQueue, FrameSlot};
+    use nsbc_io::{read_artifact, write_artifact};
 
     use super::*;
 
     fn test_host_config() -> HostConfig {
         HostConfig::new(Arc::new(FrameSlot::new()), Arc::new(EventQueue::new()))
+    }
+
+    fn compile_result_to_artifact(compiled: CompileResult) -> Result<CompiledArtifact, String> {
+        if compiled.has_errors {
+            return Err(format_modular_diagnostics(&compiled.diagnostics));
+        }
+        compiled
+            .into_artifact()
+            .map_err(|err| format!("failed to finalize Nessa artifact: {err}"))
     }
 
     #[test]
@@ -2526,12 +2557,11 @@ fn main() {{
 
         let art1 = ws.compile_boot(&opts).expect("cold compile_boot");
         assert!(ptr1.is_file(), "cold compile_boot must write stat-v1-*.ptr");
+        assert!(!art1.compiled_packages.is_empty());
 
         let art2 = ws.compile_boot(&opts).expect("warm compile_boot");
-        assert_eq!(
-            art1.codegen_output.functions.len(),
-            art2.codegen_output.functions.len()
-        );
+        assert_eq!(art1.artifacts.len(), art2.artifacts.len());
+        assert!(art2.compiled_packages.is_empty());
 
         let rc = run_compiled_artifact(art2, test_host_config()).expect("run mini_app");
         assert_eq!(rc, 0);

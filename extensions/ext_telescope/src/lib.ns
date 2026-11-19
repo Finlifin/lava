@@ -5,8 +5,9 @@
 
 use std.collections.{HashMap, Set}
 use std.fs
-use std.io.{File, IoError, SeekFrom}
+use std.io.{File, IoError}
 use std.path
+use std.time
 use @lava_core.{
     CommandSpec, ExtId, InteractiveEffects, KeyBindingEntry, KeyStroke, Keymap, ServiceEffects,
     SystemKernel, clipboard_get, clipboard_set, log_event, status_emit
@@ -89,6 +90,9 @@ pub struct TelescopeState {
     pub remote_preview_key: String,
     pub remote_preview_lru: HashMap,
     pub remote_preview_lru_order: List,
+    pub local_preview_lru: HashMap,
+    pub local_preview_lru_order: List,
+    pub pending_preview_due_ms: i64,
 }
 
 impl TelescopeState {
@@ -116,6 +120,9 @@ impl TelescopeState {
             remote_preview_key: "",
             remote_preview_lru: HashMap.new(),
             remote_preview_lru_order: List(),
+            local_preview_lru: HashMap.new(),
+            local_preview_lru_order: List(),
+            pending_preview_due_ms: 0,
         }
     }
 }
@@ -522,7 +529,7 @@ fn collect_base_items(kernel: SystemKernel, world: EditorWorld, state: Telescope
             -- Remote file indexing & fuzzy/Orderless ranking run on `lava-server` in `recompute_filtered_items`.
             return items
         }
-        let files = accel_workspace_files(world.cwd, max_files = 0, include_hidden = false)
+        let files = accel_workspace_files(world.cwd, max_files = 10000, include_hidden = false)
         for i in 0..files.len() {
             let rel = files.get(i.as(usize)).as(String)
             items.push(make_plain_item(rel, "", rel, 0, 0, BufferId(0), "", "", ""))
@@ -1175,26 +1182,73 @@ fn recompute_filtered_items(world: EditorWorld, state: TelescopeState) {
     }
 }
 
+fn store_local_preview_lru(state: TelescopeState, key: String, lines: List) {
+    if not state.local_preview_lru.contains_key(key) {
+        if state.local_preview_lru_order.len() >= 64 {
+            let oldest = state.local_preview_lru_order.remove(0).as(String)
+            let _ = state.local_preview_lru.remove(oldest)
+        }
+        state.local_preview_lru_order.push(key)
+    }
+    state.local_preview_lru.insert(key, lines)
+}
+
+fn preview_line_budget(item: PickerItem) -> i64 {
+    if item.row <= 0 and item.end_row <= 0 {
+        return 60
+    }
+    let needed_end = if item.end_row > item.row { item.end_row + 32 } else { item.row + 32 }
+    let min_lines = if needed_end > 120 { needed_end } else { 120 }
+    ((min_lines + 119) / 120) * 120
+}
+
+fn has_cached_preview(world: EditorWorld, state: TelescopeState, item: PickerItem) -> bool {
+    if item.buf_id.raw() > 0 {
+        return true
+    }
+    if item.file_path == "" {
+        return true
+    }
+    let full = world.resolve_path(item.file_path)
+    if world.find_buffer_by_path(full) != null {
+        return true
+    }
+    if is_ssh_uri(full) {
+        let target_r = if item.row > 0 { item.row } else { 0 }
+        let win_start = if target_r > 6 { target_r - 6 } else { 0 }
+        let rkey = full ++ "@" ++ win_start.to_string()
+        return state.remote_preview_lru.contains_key(rkey)
+    }
+    let cache_key = full ++ ":" ++ preview_line_budget(item).to_string()
+    state.local_preview_lru.contains_key(cache_key)
+        or (state.preview_cache_key == cache_key and state.preview_cache_lines != null)
+}
+
 fn stream_preview_file_lines(file_path: String, max_preview_lines: i64) -> !IoError List {
     let raw = File.with_open(file_path, mode = .read) do |f| {
-        let sample = f.read_bytes(max_bytes = 8192)!
-        for i in 0..sample.len() {
-            if sample.get(i.as(usize)).as(i64) == 0 {
-                return error IoError.InvalidInput("binary file")
-            }
+        let read_cap: i64 = if max_preview_lines <= 60 { 8192 } else { 32768 }
+        let raw_opt = f.read_chars(read_cap)!
+        let raw_text = if raw_opt != null { raw_opt.as(String) } else { "" }
+        if raw_text.contains("\0") {
+            return error IoError.InvalidInput("binary file")
         }
-        let _ = f.seek(SeekFrom.start(0))!
-        let _ = f.read_chars(4096)!
-        let _ = f.seek(SeekFrom.start(0))!
-        f.lines().take(max_preview_lines.as(usize)).collect()
+        let norm = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+        let parts = if norm == "" { [""] } else { norm.split("\n") }
+        if parts.len() > 1 and norm.ends_with("\n") {
+            let _ = parts.pop()
+        }
+        let capped = List()
+        let n = if parts.len() < max_preview_lines { parts.len() } else { max_preview_lines }
+        for i in 0..n {
+            capped.push(parts.get(i.as(usize)).as(String))
+        }
+        capped
     }!
     raw.as(List)
 }
 
 fn load_preview_source_lines(world: EditorWorld, state: TelescopeState, item: PickerItem) -> ?List {
-    let needed_end = if item.end_row > item.row { item.end_row + 32 } else { item.row + 32 }
-    let min_lines = if needed_end > 300 { needed_end } else { 300 }
-    let max_preview_lines = ((min_lines + 299) / 300) * 300
+    let max_preview_lines = preview_line_budget(item)
 
     if item.buf_id.raw() > 0 {
         let b_opt = world.buffer(item.buf_id)
@@ -1215,6 +1269,10 @@ fn load_preview_source_lines(world: EditorWorld, state: TelescopeState, item: Pi
         return b.slice_lines(0, lim)
     }
     let cache_key = full ++ ":" ++ max_preview_lines.to_string()
+    let lru_opt = state.local_preview_lru.get(cache_key)
+    if lru_opt != null {
+        return lru_opt.as(List)
+    }
     if state.preview_cache_key == cache_key and state.preview_cache_lines != null {
         return state.preview_cache_lines
     }
@@ -1279,6 +1337,7 @@ fn load_preview_source_lines(world: EditorWorld, state: TelescopeState, item: Pi
     }
     state.preview_cache_key = cache_key
     state.preview_cache_lines = parts
+    store_local_preview_lru(state, cache_key, parts)
     parts
 }
 
@@ -1309,7 +1368,7 @@ fn build_command_preview_window(kernel: SystemKernel, item: PickerItem) -> Float
         id: FLOAT_PREVIEW_ID,
         owner: "ext_telescope",
         title: "Preview — Command: " ++ item.command_name,
-        anchor: "bottom",
+        anchor: "right",
         width_cols: 108,
         height_rows: 12,
         lines: lines,
@@ -1348,7 +1407,7 @@ fn build_remote_windowed_preview(
                 id: FLOAT_PREVIEW_ID,
                 owner: "ext_telescope",
                 title: "Preview — " ++ disp_path ++ "  " ++ spin ++ " Streaming slice",
-                anchor: "bottom",
+                anchor: "right",
                 width_cols: 108,
                 height_rows: 8,
                 lines: [
@@ -1373,7 +1432,7 @@ fn build_remote_windowed_preview(
                     id: FLOAT_PREVIEW_ID,
                     owner: "ext_telescope",
                     title: "Preview — " ++ disp_path,
-                    anchor: "bottom",
+                    anchor: "right",
                     width_cols: 108,
                     height_rows: 6,
                     lines: ["(Binary or unreadable remote file: " ++ item.file_path ++ ")"],
@@ -1390,7 +1449,7 @@ fn build_remote_windowed_preview(
             id: FLOAT_PREVIEW_ID,
             owner: "ext_telescope",
             title: "Preview — " ++ disp_path,
-            anchor: "bottom",
+            anchor: "right",
             width_cols: 108,
             height_rows: 6,
             lines: ["(Binary remote file: " ++ item.file_path ++ ")"],
@@ -1430,7 +1489,7 @@ fn build_remote_windowed_preview(
         id: FLOAT_PREVIEW_ID,
         owner: "ext_telescope",
         title: "Preview — " ++ disp_path,
-        anchor: "bottom",
+        anchor: "right",
         width_cols: 108,
         height_rows: preview_rows,
         lines: out_lines,
@@ -1439,8 +1498,34 @@ fn build_remote_windowed_preview(
     })
 }
 
+fn refresh_query_and_sync(kernel: SystemKernel, world: EditorWorld, state: TelescopeState) {
+    recompute_filtered_items(world, state)
+    schedule_preview_if_uncached(world, state)
+    sync_telescope_windows(kernel, world, state)
+}
+
+fn schedule_preview_if_uncached(world: EditorWorld, state: TelescopeState) {
+    if (not remote_ui_async_enabled()) or state.filtered_items.is_empty() {
+        state.pending_preview_due_ms = 0
+        return
+    }
+    let idx = if state.selected_idx < 0 {
+        0
+    } else if state.selected_idx >= state.filtered_items.len() {
+        state.filtered_items.len() - 1
+    } else {
+        state.selected_idx
+    }
+    let item = state.filtered_items.get(idx.as(usize)).as(PickerItem)
+    if has_cached_preview(world, state, item) {
+        state.pending_preview_due_ms = 0
+    } else {
+        state.pending_preview_due_ms = time.unix_millis() + 40
+    }
+}
+
 fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: TelescopeState) -> FloatingWindow {
-    let preview_rows: i64 = 16
+    let preview_rows: i64 = 26
     if state.filtered_items.is_empty() {
         if state.remote_search_loading {
             let spin = remote_spinner_frame()
@@ -1448,7 +1533,7 @@ fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: Telesco
                 id: FLOAT_PREVIEW_ID,
                 owner: "ext_telescope",
                 title: "Telescope Preview  " ++ spin ++ " Remote refresh",
-                anchor: "bottom",
+                anchor: "right",
                 width_cols: 108,
                 height_rows: 8,
                 lines: [
@@ -1470,7 +1555,7 @@ fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: Telesco
             id: FLOAT_PREVIEW_ID,
             owner: "ext_telescope",
             title: "Telescope Preview",
-            anchor: "bottom",
+            anchor: "right",
             width_cols: 108,
             height_rows: 8,
             lines: [empty_msg],
@@ -1509,7 +1594,7 @@ fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: Telesco
             id: FLOAT_PREVIEW_ID,
             owner: "ext_telescope",
             title: "Preview — OpenSSH Host: " ++ item.command_name,
-            anchor: "bottom",
+            anchor: "right",
             width_cols: 108,
             height_rows: 12,
             lines: lines,
@@ -1531,7 +1616,7 @@ fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: Telesco
             id: FLOAT_PREVIEW_ID,
             owner: "ext_telescope",
             title: "Preview — Telescope: " ++ item.command_name,
-            anchor: "bottom",
+            anchor: "right",
             width_cols: 108,
             height_rows: 8,
             lines: lines,
@@ -1556,7 +1641,7 @@ fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: Telesco
             id: FLOAT_PREVIEW_ID,
             owner: "ext_telescope",
             title: "Preview — Theme: " ++ p.name,
-            anchor: "bottom",
+            anchor: "right",
             width_cols: 108,
             height_rows: preview_rows,
             lines: lines,
@@ -1587,7 +1672,7 @@ fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: Telesco
             id: FLOAT_PREVIEW_ID,
             owner: "ext_telescope",
             title: "Preview — Keybinding: " ++ item.command_name,
-            anchor: "bottom",
+            anchor: "right",
             width_cols: 108,
             height_rows: 8,
             lines: lines,
@@ -1597,6 +1682,20 @@ fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: Telesco
     }
 
     if item.buf_id.raw() <= 0 and item.file_path != "" {
+        if state.pending_preview_due_ms > 0 and (not has_cached_preview(world, state, item)) {
+            let disp_p = relative_to_cwd(world.resolve_path(item.file_path), world.cwd)
+            return (FloatingWindow {
+                id: FLOAT_PREVIEW_ID,
+                owner: "ext_telescope",
+                title: "Preview — " ++ disp_p,
+                anchor: "right",
+                width_cols: 108,
+                height_rows: preview_rows,
+                lines: ["  Loading preview..."],
+                selected_row: -1,
+                border_rgba: 0,
+            })
+        }
         let full_check = world.resolve_path(item.file_path)
         if is_ssh_uri(full_check) and world.find_buffer_by_path(full_check) == null {
             return build_remote_windowed_preview(world, state, item, full_check, preview_rows)
@@ -1609,7 +1708,7 @@ fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: Telesco
             id: FLOAT_PREVIEW_ID,
             owner: "ext_telescope",
             title: "Preview — " ++ item.display,
-            anchor: "bottom",
+            anchor: "right",
             width_cols: 108,
             height_rows: 6,
             lines: ["(Binary or unreadable file: " ++ item.file_path ++ ")"],
@@ -1651,7 +1750,7 @@ fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: Telesco
             id: FLOAT_PREVIEW_ID,
             owner: "ext_telescope",
             title: "Preview — " ++ hdr_label,
-            anchor: "bottom",
+            anchor: "right",
             width_cols: 108,
             height_rows: max_sec_rows,
             lines: sec_out,
@@ -1703,7 +1802,7 @@ fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: Telesco
         id: FLOAT_PREVIEW_ID,
         owner: "ext_telescope",
         title: "Preview — " ++ title_target,
-        anchor: "bottom",
+        anchor: "right",
         width_cols: 108,
         height_rows: preview_rows,
         lines: out_lines,
@@ -1724,7 +1823,7 @@ pub fn sync_telescope_windows(kernel: SystemKernel, world: EditorWorld, state: T
         apply_theme_preview(kernel, world, sel_item.command_name)
     }
 
-    let max_cand_rows: i64 = 15
+    let max_cand_rows: i64 = 26
     let total_filtered = state.filtered_items.len()
     let eff_root = effective_workspace_root(world, state)
     let is_remote_ws = (state.mode == "files" or state.mode == "live_grep") and is_ssh_uri(eff_root)
@@ -1758,7 +1857,7 @@ pub fn sync_telescope_windows(kernel: SystemKernel, world: EditorWorld, state: T
         ""
     }
     picker_lines.push(" " ++ q_left ++ "█" ++ q_right ++ spin_inline)
-    picker_lines.push("────────────────────────────────────────────────────────────────────────────────────────────────────────")
+    picker_lines.push("────────────────────────────────────────────────────────────")
 
     var win_sel_row: i64 = -1
     if total_filtered == 0 {
@@ -1805,15 +1904,15 @@ pub fn sync_telescope_windows(kernel: SystemKernel, world: EditorWorld, state: T
     }
     let picker_title = "Telescope " ++ mode_display_title(state.mode)
         ++ " (" ++ shown_num.to_string() ++ "/" ++ denom.to_string()
-        ++ ")" ++ spin_hdr ++ " [<Ret>:open <C-q>:qf <Esc>:close]"
+        ++ ")" ++ spin_hdr
 
     world.set_floating_window(FloatingWindow {
         id: FLOAT_PICKER_ID,
         owner: "ext_telescope",
         title: picker_title,
-        anchor: "center",
+        anchor: "left",
         width_cols: 108,
-        height_rows: 18,
+        height_rows: 29,
         lines: picker_lines,
         selected_row: win_sel_row,
         border_rgba: 0,
@@ -1830,6 +1929,7 @@ fn close_telescope(kernel: SystemKernel, world: EditorWorld, vim: VimState, stat
     remote_async_cancel("telescope.preview")
     state.remote_search_loading = false
     state.remote_preview_loading = false
+    state.pending_preview_due_ms = 0
     state.active = false
     let _ = world.remove_floating_window(FLOAT_PICKER_ID)
     let _ = world.remove_floating_window(FLOAT_PREVIEW_ID)
@@ -2086,8 +2186,7 @@ fn telescope_intercept_key(
         state.query = ""
         state.cursor_pos = 0
         state.selected_idx = 0
-        recompute_filtered_items(world, state)
-        sync_telescope_windows(kernel, world, state)
+        refresh_query_and_sync(kernel, world, state)
         return true
     }
 
@@ -2106,6 +2205,7 @@ fn telescope_intercept_key(
         if count > 0 {
             state.selected_idx = (state.selected_idx + 1) % count
         }
+        schedule_preview_if_uncached(world, state)
         sync_telescope_windows(kernel, world, state)
         return true
     }
@@ -2120,6 +2220,7 @@ fn telescope_intercept_key(
         if count > 0 {
             state.selected_idx = (state.selected_idx - 1 + count) % count
         }
+        schedule_preview_if_uncached(world, state)
         sync_telescope_windows(kernel, world, state)
         return true
     }
@@ -2164,8 +2265,7 @@ fn telescope_intercept_key(
         if cur < qlen {
             state.query = state.query.slice(0, cur)
             state.selected_idx = 0
-            recompute_filtered_items(world, state)
-            sync_telescope_windows(kernel, world, state)
+            refresh_query_and_sync(kernel, world, state)
         }
         return true
     }
@@ -2175,8 +2275,7 @@ fn telescope_intercept_key(
             state.query = state.query.slice(cur, qlen)
             state.cursor_pos = 0
             state.selected_idx = 0
-            recompute_filtered_items(world, state)
-            sync_telescope_windows(kernel, world, state)
+            refresh_query_and_sync(kernel, world, state)
         }
         return true
     }
@@ -2188,8 +2287,7 @@ fn telescope_intercept_key(
             state.query = state.query.slice(0, cur) ++ ytext ++ state.query.slice(cur, qlen)
             state.cursor_pos = cur + ytext.char_len()
             state.selected_idx = 0
-            recompute_filtered_items(world, state)
-            sync_telescope_windows(kernel, world, state)
+            refresh_query_and_sync(kernel, world, state)
         }
         return true
     }
@@ -2233,8 +2331,7 @@ fn telescope_intercept_key(
             world.kill_ring.push(killed, linewise = false, append = false)
             state.query = state.query.slice(0, cur) ++ state.query.slice(n, qlen)
             state.selected_idx = 0
-            recompute_filtered_items(world, state)
-            sync_telescope_windows(kernel, world, state)
+            refresh_query_and_sync(kernel, world, state)
         }
         return true
     }
@@ -2255,8 +2352,7 @@ fn telescope_intercept_key(
             state.query = before.slice(0, n) ++ after
             state.cursor_pos = n
             state.selected_idx = 0
-            recompute_filtered_items(world, state)
-            sync_telescope_windows(kernel, world, state)
+            refresh_query_and_sync(kernel, world, state)
         }
         return true
     }
@@ -2265,8 +2361,7 @@ fn telescope_intercept_key(
         if cur < qlen {
             state.query = state.query.slice(0, cur) ++ state.query.slice(cur + 1, qlen)
             state.selected_idx = 0
-            recompute_filtered_items(world, state)
-            sync_telescope_windows(kernel, world, state)
+            refresh_query_and_sync(kernel, world, state)
         }
         return true
     }
@@ -2276,8 +2371,7 @@ fn telescope_intercept_key(
             state.query = state.query.slice(0, cur - 1) ++ state.query.slice(cur, qlen)
             state.cursor_pos = cur - 1
             state.selected_idx = 0
-            recompute_filtered_items(world, state)
-            sync_telescope_windows(kernel, world, state)
+            refresh_query_and_sync(kernel, world, state)
         }
         return true
     }
@@ -2287,8 +2381,7 @@ fn telescope_intercept_key(
         state.query = state.query.slice(0, cur) ++ ch ++ state.query.slice(cur, qlen)
         state.cursor_pos = cur + ch.char_len()
         state.selected_idx = 0
-        recompute_filtered_items(world, state)
-        sync_telescope_windows(kernel, world, state)
+        refresh_query_and_sync(kernel, world, state)
         return true
     }
 
@@ -2504,6 +2597,11 @@ fn on_telescope_timer_tick(kern: SystemKernel, _arg: Any) {
             }
             changed = true
         }
+    }
+
+    if state.pending_preview_due_ms > 0 and time.unix_millis() >= state.pending_preview_due_ms {
+        state.pending_preview_due_ms = 0
+        changed = true
     }
 
     if changed or state.remote_search_loading or state.remote_preview_loading {

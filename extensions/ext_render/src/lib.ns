@@ -6227,15 +6227,50 @@ fn render_floating_windows(
         let fw = world.floating_windows.get(fi.as(usize)).as(FloatingWindow)
         let raw_w = (fw.width_cols.as(f64) * cell_w + 20.0).floor()
         let raw_h = ((fw.height_rows + 1).as(f64) * cell_h + 14.0).floor()
-        let box_w = if raw_w > win_w - 24.0 { win_w - 24.0 } else if raw_w < 160.0 { 160.0 } else { raw_w }
         let max_avail_h = echo_y - top_bar_height(world) - 16.0
-        let box_h = if raw_h > max_avail_h { max_avail_h } else if raw_h < cell_h * 3.0 { cell_h * 3.0 } else { raw_h }
-        let (box_x, box_y) = if fw.anchor == "cursor" {
-            floating_cursor_anchor_xy(world, wm, win_w, echo_y, box_w, box_h, cell_w, cell_h)
-        } else if fw.anchor == "bottom" {
-            (16.0, echo_y - box_h - 8.0)
+        let (box_x, box_y, box_w, box_h) = if fw.anchor == "left" or fw.anchor == "right" {
+            let top_y = top_bar_height(world) + 12.0
+            let avail_h = if echo_y - top_y - 12.0 > cell_h * 6.0 {
+                echo_y - top_y - 12.0
+            } else {
+                cell_h * 6.0
+            }
+            if win_w >= 900.0 {
+                let margin_x = 24.0
+                let gap = 12.0
+                let total_w = win_w - margin_x * 2.0 - gap
+                let left_w = (total_w * 0.46).floor()
+                let right_w = total_w - left_w
+                let pane_h = (avail_h * 0.88).floor()
+                let pane_y = top_y + ((avail_h - pane_h) * 0.45).floor()
+                if fw.anchor == "left" {
+                    (margin_x, pane_y, left_w, pane_h)
+                } else {
+                    (margin_x + left_w + gap, pane_y, right_w, pane_h)
+                }
+            } else {
+                let margin_x = 12.0
+                let gap = 8.0
+                let pane_w = win_w - margin_x * 2.0
+                let top_h = ((avail_h - gap) * 0.48).floor()
+                let bot_h = avail_h - gap - top_h
+                if fw.anchor == "left" {
+                    (margin_x, top_y, pane_w, top_h)
+                } else {
+                    (margin_x, top_y + top_h + gap, pane_w, bot_h)
+                }
+            }
         } else {
-            (((win_w - box_w) * 0.5).floor(), ((win_h - box_h) * 0.45).floor())
+            let bw = if raw_w > win_w - 24.0 { win_w - 24.0 } else if raw_w < 160.0 { 160.0 } else { raw_w }
+            let bh = if raw_h > max_avail_h { max_avail_h } else if raw_h < cell_h * 3.0 { cell_h * 3.0 } else { raw_h }
+            let (bx, by) = if fw.anchor == "cursor" {
+                floating_cursor_anchor_xy(world, wm, win_w, echo_y, bw, bh, cell_w, cell_h)
+            } else if fw.anchor == "bottom" {
+                (16.0, echo_y - bh - 8.0)
+            } else {
+                (((win_w - bw) * 0.5).floor(), ((win_h - bh) * 0.45).floor())
+            }
+            (bx, by, bw, bh)
         }
         let bcol = if fw.border_rgba != 0 { fw.border_rgba } else { theme.accent }
 

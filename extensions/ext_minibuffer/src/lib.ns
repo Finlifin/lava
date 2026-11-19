@@ -7,6 +7,7 @@
 use std.collections.{HashMap, Set}
 use std.env
 use std.fs
+use std.json
 use std.path
 use std.runtime
 
@@ -408,6 +409,92 @@ pub struct MinibufferController {
     pub remote_path_loading_key: String,
 }
 
+fn resolve_minibuffer_history_path() -> String {
+    let explicit = env.get_or("LAVA_MINIBUFFER_HISTORY_FILE", "").trim()
+    if explicit == "off" or explicit == "none" {
+        return ""
+    }
+    if explicit != "" {
+        return explicit
+    }
+    let state_dir = env.get_or("LAVA_STATE_DIR", "").trim()
+    if state_dir != "" {
+        return path.join(state_dir, "minibuffer_history.json")
+    }
+    let xdg_state = env.get_or("XDG_STATE_HOME", "").trim()
+    if xdg_state != "" {
+        return path.join(path.join(xdg_state, "lava"), "minibuffer_history.json")
+    }
+    let home = env.get_or("HOME", env.get_or("USERPROFILE", "")).trim()
+    if home == "" {
+        return ""
+    }
+    path.join(path.join(path.join(path.join(home, ".local"), "state"), "lava"), "minibuffer_history.json")
+}
+
+fn load_persisted_histories() -> HashMap {
+    let out = HashMap.new()
+    let hp = resolve_minibuffer_history_path()
+    if hp == "" or (not fs.exists(hp)) {
+        return out
+    }
+    let raw_opt: ?String = fs.read_to_string(hp) ! { _ => null }
+    let raw? = raw_opt else {
+        return out
+    }
+    let parsed! = json.parse(raw) else {
+        return out
+    }
+    parsed match {
+        map: Map => {
+            let ks = map.keys()
+            for ki in 0..ks.len() {
+                let k = ks.get(ki.as(usize)).as(String)
+                map.get(k) match {
+                    arr: List => {
+                        let lst = List()
+                        for ai in 0..arr.len() {
+                            arr.get(ai.as(usize)) match {
+                                s: String => {
+                                    if s != "" {
+                                        lst.push(s)
+                                    }
+                                },
+                                _ => (),
+                            }
+                        }
+                        if not lst.is_empty() {
+                            out.insert(k, lst)
+                        }
+                    },
+                    _ => (),
+                }
+            }
+        },
+        _ => (),
+    }
+    out
+}
+
+fn save_persisted_histories(histories: HashMap) {
+    let hp = resolve_minibuffer_history_path()
+    if hp == "" {
+        return
+    }
+    let parent = path.parent(hp)
+    if parent != "" and (not fs.exists(parent)) {
+        let _ = fs.create_dir(parent, parents = true) ! { _ => () }
+    }
+    let m = Map()
+    let ks = histories.keys()
+    for ki in 0..ks.len() {
+        let k = ks.get(ki.as(usize)).as(String)
+        m.insert(k, histories.get(k).as(List))
+    }
+    let encoded = json.stringify(m) ! { _ => return }
+    let _ = fs.write_string(hp, encoded) ! { _ => () }
+}
+
 impl MinibufferController {
     pub fn new() -> MinibufferController {
         MinibufferController {
@@ -420,7 +507,7 @@ impl MinibufferController {
             selected_idx: 0,
             total_matches: 0,
             selection_touched: false,
-            histories: HashMap.new(),
+            histories: load_persisted_histories(),
             history_idx: -1,
             saved_draft: "",
             history_ghost: "",
@@ -496,6 +583,13 @@ impl MinibufferController {
             if last_val == value {
                 return
             }
+            var idx = hist.len() - 1
+            while idx >= 0 {
+                if hist.get(idx.as(usize)).as(String) == value {
+                    let _ = hist.remove(idx.as(usize))
+                }
+                idx -= 1
+            }
         }
         hist.push(value)
         if hist.len() > 100 {
@@ -506,6 +600,7 @@ impl MinibufferController {
         } else if kind == PromptKind.command_name {
             self.cached_cmd_empty = null
         }
+        save_persisted_histories(self.histories)
     }
 
     pub fn compute_history_ghost(self) -> String {

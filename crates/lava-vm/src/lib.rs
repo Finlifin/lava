@@ -13,9 +13,9 @@ pub mod wire;
 pub use lava_proto;
 
 pub use composer::{
-    BootOptions, ComposedBootProgram, ExtensionPackageInfo, LavaWorkspace, PackageOrigin,
-    check_workspace, compile_and_run_boot, discover_extensions, run_compiled_artifact,
-    run_entry_package,
+    BootOptions, CompiledBootProgram, ComposedBootProgram, ExecutableArtifact,
+    ExtensionPackageInfo, LavaWorkspace, PackageOrigin, check_workspace, compile_and_run_boot,
+    discover_extensions, run_compiled_artifact, run_entry_package,
 };
 pub use host::{
     BootRuntimeArgs, ClipboardGetFn, ClipboardSetFn, HostCallbacks, HostConfig, HostWaitController,
@@ -982,17 +982,24 @@ pub fn run_session(_kernel: SystemKernel, startup_files: List, headless_keys: St
         let ws = LavaWorkspace::new(&staged_ws).with_cache_dir(&cache_dir);
         let opts = BootOptions::new().with_entry_pkg("lava.org/ext_cache_probe");
 
-        // Cold compile populates `<cache_dir>/*.nsbc`.
-        let _cold = ws.compile_boot(&opts).expect("cold compile_boot");
-        let entries_v1: Vec<_> = fs::read_dir(&cache_dir)
-            .expect("cache_dir created")
+        // Cold compile populates `<cache_dir>/modular/*.nsbc` per package.
+        let cold = ws.compile_boot(&opts).expect("cold compile_boot");
+        assert!(!cold.compiled_packages.is_empty());
+        let modular_dir = cache_dir.join("modular");
+        let entries_v1: Vec<_> = fs::read_dir(&modular_dir)
+            .expect("modular cache_dir created")
             .filter_map(Result::ok)
             .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("nsbc"))
             .collect();
-        assert_eq!(entries_v1.len(), 1);
+        assert!(
+            entries_v1.len() >= 4,
+            "expected separate modular .nsbc archives (std + core packages + ext + boot), got {}",
+            entries_v1.len()
+        );
 
-        // Warm compile loads from `.nsbc` cache and applies `with_boot_runtime` overrides!
+        // Warm compile loads from `.nsbc` cache (0 packages recompiled) and applies `with_boot_runtime` overrides!
         let warm = ws.compile_boot(&opts).expect("warm compile_boot");
+        assert!(warm.compiled_packages.is_empty());
         let fs_a = Arc::new(FrameSlot::new());
         let eq_a = Arc::new(EventQueue::new());
         let cfg_a = HostConfig::new(Arc::clone(&fs_a), eq_a).with_boot_runtime(
@@ -1004,10 +1011,14 @@ pub fn run_session(_kernel: SystemKernel, startup_files: List, headless_keys: St
         assert_eq!(code_a, 0);
         assert_eq!(fs_a.latest().window.title, "v1:alpha.ns:jk:H");
 
-        // Modifying `.ns` source invalidates content fingerprint and compiles `v2`.
+        // Modifying `ext_cache_probe` body without changing `pub` signatures recompiles ONLY `ext_cache_probe`!
         let src_v2 = src_v1.replace("\"v1:\"", "\"v2:\"");
         fs::write(ext_dir.join("src/lib.ns"), src_v2).unwrap();
         let updated = ws.compile_boot(&opts).expect("recompiled v2");
+        assert_eq!(
+            updated.compiled_packages,
+            vec!["lava.org/ext_cache_probe".to_string()]
+        );
         let fs_b = Arc::new(FrameSlot::new());
         let eq_b = Arc::new(EventQueue::new());
         let cfg_b = HostConfig::new(Arc::clone(&fs_b), eq_b).with_boot_runtime(
@@ -1018,5 +1029,245 @@ pub fn run_session(_kernel: SystemKernel, startup_files: List, headless_keys: St
         let code_b = run_compiled_artifact(updated, cfg_b).expect("v2 run");
         assert_eq!(code_b, 0);
         assert_eq!(fs_b.latest().window.title, "v2:beta.ns:ZZ:W");
+    }
+
+    #[test]
+    fn modular_extension_and_core_incremental_recompilation_and_lazy_mod_loading() {
+        use driver::{ModuleLoadState, ModuleLoader};
+        use initialization::Engine;
+
+        let tmp = TempTestDir::new("modular-incremental");
+        let staged_ws = stage_isolated_workspace(tmp.path());
+        let cache_dir = staged_ws.join("target/lava-nsbc-cache");
+
+        // Create two independent plugins (`ext_alpha`, `ext_beta`) and an entry app (`ext_entry`).
+        // `ext_alpha` also declares an unreferenced heavy submodule `mod unused_heavy` whose `__init__`
+        // panics if loaded or initialized eagerly!
+        let alpha_dir = staged_ws.join("extensions/ext_alpha");
+        fs::create_dir_all(alpha_dir.join("src")).unwrap();
+        fs::write(
+            alpha_dir.join("package.toml"),
+            r#"[package]
+name = "ext_alpha"
+domain = "lava.org"
+version = "0.1.0"
+type = "lib"
+
+[dependencies]
+"lava.org/lava_core" = "0.1.0"
+"#,
+        )
+        .unwrap();
+        let alpha_lib_v1 = r#"mod active_feature
+mod unused_heavy
+
+use @lava_core.{ExtId, SystemKernel}
+
+pub fn register_alpha_extension(kernel: SystemKernel) -> !String Unit {
+    let eid = ExtId("lava.org/ext_alpha")
+    kernel.register_extension(
+        eid,
+        "lava.org",
+        "ext_alpha",
+        "0.1.0",
+        "Alpha plugin",
+        List(),
+        |k: SystemKernel| -> !String Unit {
+            k.publish_service("alpha_banner", eid, active_feature.banner_text())
+            ()
+        },
+        |_k: SystemKernel| -> !String Unit { () },
+    )!
+    ()
+}
+"#;
+        fs::write(alpha_dir.join("src/lib.ns"), alpha_lib_v1).unwrap();
+        fs::write(
+            alpha_dir.join("src/active_feature.ns"),
+            "pub fn banner_text() -> String = \"alpha-v1\"\n",
+        )
+        .unwrap();
+        fs::write(
+            alpha_dir.join("src/unused_heavy.ns"),
+            r#"fn __init__() {
+    panic("unused_heavy module must not be loaded or initialized")
+}
+
+pub fn never_called() -> i64 = 999
+"#,
+        )
+        .unwrap();
+
+        let beta_dir = staged_ws.join("extensions/ext_beta");
+        fs::create_dir_all(beta_dir.join("src")).unwrap();
+        fs::write(
+            beta_dir.join("package.toml"),
+            r#"[package]
+name = "ext_beta"
+domain = "lava.org"
+version = "0.1.0"
+type = "lib"
+
+[dependencies]
+"lava.org/lava_core" = "0.1.0"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            beta_dir.join("src/lib.ns"),
+            r#"use @lava_core.{ExtId, SystemKernel}
+
+pub fn register_beta_extension(kernel: SystemKernel) -> !String Unit {
+    let eid = ExtId("lava.org/ext_beta")
+    kernel.register_extension(
+        eid,
+        "lava.org",
+        "ext_beta",
+        "0.1.0",
+        "beta-v1",
+        List(),
+        |_k: SystemKernel| -> !String Unit { () },
+        |_k: SystemKernel| -> !String Unit { () },
+    )!
+    ()
+}
+"#,
+        )
+        .unwrap();
+
+        let entry_dir = staged_ws.join("extensions/ext_entry");
+        fs::create_dir_all(entry_dir.join("src")).unwrap();
+        fs::write(
+            entry_dir.join("package.toml"),
+            r#"[package]
+name = "ext_entry"
+domain = "lava.org"
+version = "0.1.0"
+type = "lib"
+
+[dependencies]
+"lava.org/lava_sys" = "0.1.0"
+"lava.org/lava_core" = "0.1.0"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            entry_dir.join("src/lib.ns"),
+            r#"use @lava_sys.{PointerHint, WindowSpec, host_commit_frame, host_request_quit, rgba}
+use @lava_core.SystemKernel
+
+pub fn register_entry_extension(_kernel: SystemKernel) -> !String Unit {
+    ()
+}
+
+pub fn run_session(kernel: SystemKernel) -> !String i64 {
+    let banner = kernel.require_service("alpha_banner")!.as(String)
+    let spec = WindowSpec {
+        title: banner,
+        width: 300,
+        height: 120,
+        bg_rgba: rgba(0, 0, 0, 255),
+        pointer: PointerHint.default,
+    }
+    let _ = host_commit_frame(spec, List())
+    host_request_quit(0)
+    0
+}
+"#,
+        )
+        .unwrap();
+
+        let ws = LavaWorkspace::new(&staged_ws).with_cache_dir(&cache_dir);
+        let opts = BootOptions::new().with_entry_pkg("lava.org/ext_entry");
+
+        // 1. Cold build compiles all reachable workspace packages once.
+        let cold = ws.compile_boot(&opts).expect("cold compile");
+        assert!(
+            cold.compiled_packages
+                .contains(&"lava.org/ext_alpha".to_string())
+        );
+        assert!(
+            cold.compiled_packages
+                .contains(&"lava.org/ext_beta".to_string())
+        );
+
+        // Verify per-`mod` lazy loading via `ModuleLoader`: `unused_heavy` in `ext_alpha` and
+        // `__lava_host_abi_types` in `lava_boot` remain `Unloaded`!
+        {
+            let mut engine = Engine::with_defaults();
+            let mut loader = ModuleLoader::new();
+            loader
+                .register_artifacts(&cold.artifacts)
+                .expect("register modular artifacts");
+            let _prepared = loader
+                .prepare_module(engine.vm_mut(), &cold.root_qualified_name, &[])
+                .expect("prepare root module");
+            assert_eq!(
+                loader.module_state("lava.org/ext_alpha", &["unused_heavy".to_string()]),
+                Some(ModuleLoadState::Unloaded),
+                "unreferenced submodule `unused_heavy` must stay Unloaded"
+            );
+            assert_eq!(
+                loader.module_state("lava.org/ext_alpha", &["active_feature".to_string()]),
+                Some(ModuleLoadState::LoadedUninitialized),
+                "referenced submodule `active_feature` must be loaded"
+            );
+            assert_eq!(
+                loader.module_state("lava.org/lava_boot", &["__lava_host_abi_types".to_string()]),
+                Some(ModuleLoadState::Unloaded),
+                "internal host ABI anchor module must stay Unloaded"
+            );
+        }
+
+        let fs1 = Arc::new(FrameSlot::new());
+        let rc1 = run_compiled_artifact(
+            cold,
+            HostConfig::new(Arc::clone(&fs1), Arc::new(EventQueue::new())),
+        )
+        .expect("run cold");
+        assert_eq!(rc1, 0);
+        assert_eq!(fs1.latest().window.title, "alpha-v1");
+
+        // 2. Edit `ext_alpha/src/active_feature.ns` implementation body -> ONLY `ext_alpha` recompiles!
+        fs::write(
+            alpha_dir.join("src/active_feature.ns"),
+            "pub fn banner_text() -> String = \"alpha-v2-fast\"\n",
+        )
+        .unwrap();
+        let after_ext_edit = ws.compile_boot(&opts).expect("incremental ext edit");
+        assert_eq!(
+            after_ext_edit.compiled_packages,
+            vec!["lava.org/ext_alpha".to_string()],
+            "editing one extension body must recompile ONLY that extension"
+        );
+        let fs2 = Arc::new(FrameSlot::new());
+        let rc2 = run_compiled_artifact(
+            after_ext_edit,
+            HostConfig::new(Arc::clone(&fs2), Arc::new(EventQueue::new())),
+        )
+        .expect("run after ext edit");
+        assert_eq!(rc2, 0);
+        assert_eq!(fs2.latest().window.title, "alpha-v2-fast");
+
+        // 3. Edit `packages/lava_core/src/lib.ns` implementation body (preserving `pub` signatures) ->
+        // ONLY `lava_core` recompiles (0 extensions recompiled!).
+        let core_lib_path = staged_ws.join("packages/lava_core/src/lib.ns");
+        let mut core_src = fs::read_to_string(&core_lib_path).unwrap();
+        core_src.push_str("\nprivate fn internal_core_noop_helper() -> i64 = 42\n");
+        fs::write(&core_lib_path, core_src).unwrap();
+        let after_core_body_edit = ws.compile_boot(&opts).expect("incremental core body edit");
+        assert_eq!(
+            after_core_body_edit.compiled_packages,
+            vec!["lava.org/lava_core".to_string()],
+            "editing lava_core body without changing pub interface must recompile ONLY lava_core and 0 extensions"
+        );
+        let fs3 = Arc::new(FrameSlot::new());
+        let rc3 = run_compiled_artifact(
+            after_core_body_edit,
+            HostConfig::new(Arc::clone(&fs3), Arc::new(EventQueue::new())),
+        )
+        .expect("run after core body edit");
+        assert_eq!(rc3, 0);
+        assert_eq!(fs3.latest().window.title, "alpha-v2-fast");
     }
 }
