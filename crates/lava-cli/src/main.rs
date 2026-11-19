@@ -279,7 +279,18 @@ fn resolve_workspace_root(explicit: Option<&Path>) -> Result<PathBuf, String> {
             if is_valid_workspace_root(dir) {
                 return Ok(dir.to_path_buf());
             }
+            let share_dir = dir.join("share").join("lava");
+            if is_valid_workspace_root(&share_dir) {
+                return Ok(share_dir);
+            }
             cursor = dir.parent();
+        }
+    }
+
+    for sys_dir in ["/usr/share/lava", "/usr/local/share/lava"] {
+        let cand = Path::new(sys_dir);
+        if is_valid_workspace_root(cand) {
+            return Ok(cand.to_path_buf());
         }
     }
 

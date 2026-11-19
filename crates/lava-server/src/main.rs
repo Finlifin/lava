@@ -281,7 +281,18 @@ fn resolve_server_root(explicit: Option<&Path>) -> Result<PathBuf, String> {
             if is_valid_server_root(&sub) {
                 return Ok(sub);
             }
+            let share_sub = dir.join("share").join("lava").join("server");
+            if is_valid_server_root(&share_sub) {
+                return Ok(share_sub);
+            }
             cursor = dir.parent();
+        }
+    }
+
+    for sys_dir in ["/usr/share/lava/server", "/usr/local/share/lava/server"] {
+        let cand = Path::new(sys_dir);
+        if is_valid_server_root(cand) {
+            return Ok(cand.to_path_buf());
         }
     }
 

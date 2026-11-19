@@ -1,0 +1,59 @@
+# Maintainer: Finlifin <https://github.com/Finlifin/lava>
+pkgname=lava
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Programmable Single-VM Nessa Interactive Environment (GTK4 + PangoCairo + Evil-Vim + Emacs)"
+arch=('x86_64')
+url="https://github.com/Finlifin/lava"
+license=('MPL-2.0')
+depends=('gtk4' 'pango' 'cairo' 'glib2' 'libuv' 'ripgrep' 'fd')
+makedepends=('cargo' 'rust')
+optdepends=(
+    'openssh: remote SSH editing and :SshConnect'
+    'clang: C/C++ LSP via clangd'
+    'rust-analyzer: Rust LSP'
+    'ttf-firacode-nerd: Nerd Font icons and ligatures'
+)
+options=('!lto' '!debug')
+
+_repo_root() {
+    if [[ -n "${LAVA_REPO_ROOT:-}" && -f "$LAVA_REPO_ROOT/Cargo.toml" ]]; then
+        printf '%s\n' "$LAVA_REPO_ROOT"
+    else
+        (cd "$startdir/../.." && pwd)
+    fi
+}
+
+build() {
+    local repo_root
+    repo_root=$(_repo_root)
+    if [[ -n "${LAVA_PREBUILT_DIR:-}" && -x "$LAVA_PREBUILT_DIR/lava" && -x "$LAVA_PREBUILT_DIR/lava-server" ]]; then
+        return 0
+    fi
+    cd "$repo_root"
+    bash scripts/cargo.sh build --release -p lava -p lava-server
+}
+
+package() {
+    local repo_root bin_dir
+    repo_root=$(_repo_root)
+    bin_dir="${LAVA_PREBUILT_DIR:-$repo_root/target/release}"
+
+    install -Dm755 "$bin_dir/lava" "$pkgdir/usr/bin/lava"
+    install -Dm755 "$bin_dir/lava-server" "$pkgdir/usr/bin/lava-server"
+
+    install -dm755 "$pkgdir/usr/share/lava"
+    cp -r --no-preserve=ownership "$repo_root/packages" "$pkgdir/usr/share/lava/packages"
+    cp -r --no-preserve=ownership "$repo_root/extensions" "$pkgdir/usr/share/lava/extensions"
+    cp -r --no-preserve=ownership "$repo_root/docs" "$pkgdir/usr/share/lava/docs"
+    cp -r --no-preserve=ownership "$repo_root/examples" "$pkgdir/usr/share/lava/examples"
+    cp -r --no-preserve=ownership "$repo_root/server" "$pkgdir/usr/share/lava/server"
+
+    local ubuntu22_srv="$repo_root/dist/lava-server-linux-x86_64-ubuntu22/lava-server"
+    if [[ -f "$ubuntu22_srv" ]]; then
+        install -Dm755 "$ubuntu22_srv" "$pkgdir/usr/share/lava/share/lava-server/lava-server"
+    fi
+
+    install -Dm644 "$startdir/lava.desktop" "$pkgdir/usr/share/applications/lava.desktop"
+    install -Dm644 "$repo_root/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

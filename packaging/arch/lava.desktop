@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Lava
+GenericName=Programmable Code Editor
+Comment=Single-VM Nessa Programmable Interactive Environment (GTK4 + Evil-Vim + Emacs)
+Exec=lava %F
+Terminal=false
+Categories=Development;IDE;TextEditor;
+StartupNotify=true
+Keywords=editor;ide;vim;emacs;nessa;
