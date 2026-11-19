@@ -2698,6 +2698,14 @@ fn compute_pane_indent_arrays(
     } else {
         hi_anchor = buf_hi
     }
+    if hi_anchor - lo_anchor > 1500 {
+        let cap_hi = lo_anchor + 1500
+        if cursor_row <= cap_hi {
+            hi_anchor = cap_hi
+        } else {
+            lo_anchor = if hi_anchor - 1500 > buf_lo { hi_anchor - 1500 } else { buf_lo }
+        }
+    }
     while lo_anchor > buf_lo {
         let (blank_above, _, _, _) = inspect_line_indent(buf.line_at(lo_anchor), tabstop)
         if not blank_above {
@@ -2821,17 +2829,18 @@ fn get_cached_pane_indent_guides(
     let hit_opt = cache.get(pane_id)
     if hit_opt != null {
         let e = hit_opt.as(IndentGuideCacheEntry)
+        let first_vis = if vis_len > 0 { vis_rows.get(0).as(i64) } else { 0 }
+        let last_vis = if vis_len > 0 { vis_rows.get((vis_len - 1).as(usize)).as(i64) } else { -1 }
+        let count = e.eff_arr.len()
+        let vis_covered = vis_len == 0 or (count > 0 and first_vis >= e.lo_anchor and last_vis < e.lo_anchor + count)
         if e.buf_id == buf_id_raw
             and e.doc_id == buf.doc_id
-            and e.top_row == top_row
-            and e.max_rows == max_rows
-            and e.vis_len == vis_len
             and e.tabstop == tabstop
             and e.shiftwidth == shiftwidth
             and e.fold_count == fold_cnt
             and e.min_row == min_r
-            and e.max_row == max_r {
-            let count = e.eff_arr.len()
+            and e.max_row == max_r
+            and ((e.top_row == top_row and e.max_rows == max_rows and e.vis_len == vis_len) or vis_covered) {
             let in_bounds = count > 0 and cursor_row >= e.lo_anchor and cursor_row < e.lo_anchor + count
             if e.edit_version == buf.edit_version {
                 if e.cursor_row == cursor_row and e.is_focused == is_focused {
@@ -4461,27 +4470,31 @@ fn render_window_pane(
     } else {
         ""
     }
-    let ts_viewport_rows = if ts_lang != "" and first_vis_row >= 0 and last_vis_row >= first_vis_row {
+    let (ts_viewport_rows, ts_base_row) = if ts_lang != "" and first_vis_row >= 0 and last_vis_row >= first_vis_row {
         if _ts_vp_doc_id == buf.doc_id
             and _ts_vp_edit_ver == buf.edit_version
             and _ts_vp_lang == ts_lang
-            and _ts_vp_first_row == first_vis_row
-            and _ts_vp_last_row == last_vis_row
+            and first_vis_row >= _ts_vp_first_row
+            and last_vis_row <= _ts_vp_last_row
             and _ts_vp_rows != null {
-            _ts_vp_rows.as(List)
+            (_ts_vp_rows.as(List), _ts_vp_first_row)
         } else {
             buf.sync_external_lines()
-            let fetched = accel_ts_highlight_rows_packed(buf.doc_id, ts_lang, first_vis_row, last_vis_row)
+            let b_lo = buf.min_row()
+            let b_hi = buf.max_row()
+            let req_lo = if first_vis_row - 32 > b_lo { first_vis_row - 32 } else { b_lo }
+            let req_hi = if last_vis_row + 32 < b_hi { last_vis_row + 32 } else { b_hi }
+            let fetched = accel_ts_highlight_rows_packed(buf.doc_id, ts_lang, req_lo, req_hi)
             _ts_vp_doc_id = buf.doc_id
             _ts_vp_edit_ver = buf.edit_version
             _ts_vp_lang = ts_lang
-            _ts_vp_first_row = first_vis_row
-            _ts_vp_last_row = last_vis_row
+            _ts_vp_first_row = req_lo
+            _ts_vp_last_row = req_hi
             _ts_vp_rows = fetched
-            fetched
+            (fetched, req_lo)
         }
     } else {
-        List()
+        (List(), first_vis_row)
     }
 
     let show_indent_guides = world.options.indent_guides and should_render_indent_guides(buf.major_mode)
@@ -4720,11 +4733,11 @@ fn render_window_pane(
         let has_ts_row = (not is_markdown_buf)
             and (not has_row_ghost)
             and (not ts_viewport_rows.is_empty())
-            and buf_row >= first_vis_row
-            and (buf_row - first_vis_row) < ts_viewport_rows.len()
+            and buf_row >= ts_base_row
+            and (buf_row - ts_base_row) < ts_viewport_rows.len()
 
         if has_ts_row {
-            let row_ts = ts_viewport_rows.get((buf_row - first_vis_row).as(usize)).as(List)
+            let row_ts = ts_viewport_rows.get((buf_row - ts_base_row).as(usize)).as(List)
             cur_vcol = emit_cached_ts_row(
                 cmds,
                 _ts_row_seg_cache,
@@ -4769,8 +4782,8 @@ fn render_window_pane(
                 tokenize_toml_or_json(raw_line, "toml", theme)
             } else if is_markdown_buf and md_fence_kind == 5 {
                 [(0, raw_line, theme.syn_comment, false, true)]
-            } else if (not ts_viewport_rows.is_empty()) and buf_row >= first_vis_row and (buf_row - first_vis_row) < ts_viewport_rows.len() {
-                let row_ts = ts_viewport_rows.get((buf_row - first_vis_row).as(usize)).as(List)
+            } else if (not ts_viewport_rows.is_empty()) and buf_row >= ts_base_row and (buf_row - ts_base_row) < ts_viewport_rows.len() {
+                let row_ts = ts_viewport_rows.get((buf_row - ts_base_row).as(usize)).as(List)
                 ts_spans_to_runs(raw_line, row_ts, theme)
             } else {
                 tokenize_line(raw_line, buf.major_mode, theme)

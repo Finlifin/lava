@@ -1498,6 +1498,84 @@ fn build_remote_windowed_preview(
     })
 }
 
+fn picker_item_completion_text(world: EditorWorld, state: TelescopeState, item: PickerItem) -> String {
+    if state.mode == "files" {
+        if item.file_path != "" {
+            return relative_to_cwd(world.resolve_path(item.file_path), world.cwd)
+        }
+        return item.label
+    }
+    if state.mode == "commands" or state.mode == "ssh" or state.mode == "colorscheme" or state.mode == "builtin" {
+        if item.command_name != "" {
+            return item.command_name
+        }
+        return item.label
+    }
+    if item.command_name != "" {
+        return item.command_name
+    }
+    if item.label != "" {
+        return item.label
+    }
+    item.display
+}
+
+fn common_prefix_chars(a: String, b: String) -> String {
+    let na = a.char_len()
+    let nb = b.char_len()
+    let lim = if na < nb { na } else { nb }
+    var i: i64 = 0
+    while i < lim and a.slice(i, i + 1) == b.slice(i, i + 1) {
+        i += 1
+    }
+    a.slice(0, i)
+}
+
+fn complete_telescope_query(kernel: SystemKernel, world: EditorWorld, state: TelescopeState) {
+    if state.filtered_items.is_empty() {
+        return
+    }
+    let idx = if state.selected_idx < 0 {
+        0
+    } else if state.selected_idx >= state.filtered_items.len() {
+        state.filtered_items.len() - 1
+    } else {
+        state.selected_idx
+    }
+    let item = state.filtered_items.get(idx.as(usize)).as(PickerItem)
+    let target = picker_item_completion_text(world, state, item).trim()
+    if target == "" {
+        return
+    }
+    var completed = target
+    if state.query != "" and target.starts_with(state.query) and state.filtered_items.len() > 1 {
+        var lcp = target
+        var all_match_prefix = true
+        for i in 0..state.filtered_items.len() {
+            let cand = picker_item_completion_text(
+                world,
+                state,
+                state.filtered_items.get(i.as(usize)).as(PickerItem),
+            ).trim()
+            if not cand.starts_with(state.query) {
+                all_match_prefix = false
+                break
+            }
+            lcp = common_prefix_chars(lcp, cand)
+        }
+        if all_match_prefix and lcp.char_len() > state.query.char_len() {
+            completed = lcp
+        }
+    }
+    if completed == state.query {
+        return
+    }
+    state.query = completed
+    state.cursor_pos = state.query.char_len()
+    state.selected_idx = 0
+    refresh_query_and_sync(kernel, world, state)
+}
+
 fn refresh_query_and_sync(kernel: SystemKernel, world: EditorWorld, state: TelescopeState) {
     recompute_filtered_items(world, state)
     schedule_preview_if_uncached(world, state)
@@ -2199,7 +2277,6 @@ fn telescope_intercept_key(
         or (stroke.ctrl and stroke.key == "n")
         or (stroke.ctrl and stroke.key == "j")
         or (stroke.alt and (not stroke.ctrl) and stroke.key == "n")
-        or (stroke.key == "Tab" and (not stroke.shift_mod))
     if is_down {
         let count = state.filtered_items.len()
         if count > 0 {
@@ -2214,7 +2291,6 @@ fn telescope_intercept_key(
         or (stroke.ctrl and stroke.key == "p")
         or (stroke.ctrl and stroke.key == "k")
         or (stroke.alt and (not stroke.ctrl) and stroke.key == "p")
-        or (stroke.key == "Tab" and stroke.shift_mod)
     if is_up {
         let count = state.filtered_items.len()
         if count > 0 {
@@ -2222,6 +2298,11 @@ fn telescope_intercept_key(
         }
         schedule_preview_if_uncached(world, state)
         sync_telescope_windows(kernel, world, state)
+        return true
+    }
+
+    if stroke.key == "Tab" and (not stroke.ctrl) and (not stroke.alt) {
+        complete_telescope_query(kernel, world, state)
         return true
     }
 
