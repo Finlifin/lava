@@ -28,7 +28,15 @@ pub struct CommentSyntax {
 
 pub fn comment_syntax_for_mode(major_mode: String) -> CommentSyntax {
     let m = major_mode.to_lower()
-    if m == "nessa" or m == "lua" or m == "sql" or m == "haskell" {
+    if m == "nessa" {
+        return (CommentSyntax {
+            line_prefix: "-- ",
+            line_suffix: "",
+            block_open: "{{- ",
+            block_close: " -}}",
+        })
+    }
+    if m == "lua" or m == "sql" or m == "haskell" {
         return (CommentSyntax {
             line_prefix: "-- ",
             line_suffix: "",

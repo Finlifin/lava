@@ -52,6 +52,9 @@ pub const HL_COMMENT: u8 = 15;
 pub const HL_DOC_COMMENT: u8 = 16;
 pub const HL_TAG_HEADING: u8 = 17;
 pub const HL_MARKUP_LINK_RAW: u8 = 18;
+/// Internal sentinel for `@embedded` interpolation regions that clears outer `@string` cells
+/// while allowing inner smaller-span tokens (`{`, `}`, operators, numbers, calls) to win.
+const HL_EMBEDDED_CLEAR: u8 = 255;
 
 const DOC_TREE_LRU_CAP: usize = 32;
 const SNIPPET_LRU_CAP: usize = 64;
@@ -416,8 +419,21 @@ fn home_dir_path() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn sibling_nessa_repo_dir() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let mut cur: Option<&Path> = Some(cwd.as_path());
+    while let Some(dir) = cur {
+        let candidate = dir.join("nessa2");
+        if candidate.join("tools/tree-sitter-nessa").is_dir() {
+            return Some(candidate);
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
 fn parser_search_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::with_capacity(6);
+    let mut dirs = Vec::with_capacity(7);
     if let Some(env_dir) = std::env::var_os("LAVA_TS_PARSER_DIR")
         && !env_dir.is_empty()
     {
@@ -431,6 +447,9 @@ fn parser_search_dirs() -> Vec<PathBuf> {
     dirs.push(PathBuf::from("/usr/lib"));
     if let Some(home) = home_dir_path() {
         dirs.push(home.join(".local/share/nvim/lazy/nvim-treesitter/parser"));
+    }
+    if let Some(nessa_repo) = sibling_nessa_repo_dir() {
+        dirs.push(nessa_repo.join("target/release"));
     }
     dirs
 }
@@ -484,11 +503,18 @@ fn candidate_grammar_paths(lang: &str) -> Vec<PathBuf> {
             out.push(p.join(format!("{lang_under}.so")));
         }
     }
+    if lang == "nessa"
+        && let Some(nessa_repo) = sibling_nessa_repo_dir()
+    {
+        let rel = nessa_repo.join("target/release");
+        out.push(rel.join("nessa.so"));
+        out.push(rel.join("libtree-sitter-nessa.so"));
+    }
     out
 }
 
 fn query_search_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::with_capacity(5);
+    let mut roots = Vec::with_capacity(6);
     if let Some(home) = home_dir_path() {
         roots.push(home.join(".config/lava/queries"));
     }
@@ -496,6 +522,9 @@ fn query_search_roots() -> Vec<PathBuf> {
     roots.push(PathBuf::from("/usr/share/helix/runtime/queries"));
     roots.push(PathBuf::from("/usr/share/tree-sitter/queries"));
     roots.push(PathBuf::from("/usr/share/nvim/runtime/queries"));
+    if let Some(nessa_repo) = sibling_nessa_repo_dir() {
+        roots.push(nessa_repo.join("tools/tree-sitter-nessa/queries"));
+    }
     roots
 }
 
@@ -576,9 +605,99 @@ fn load_highlights_scm_recursive(qlang: &str, visited: &mut HashSet<String>) -> 
     Some(combined)
 }
 
+const NESSA_QUERY_AUGMENT_SCM: &str = r##"
+(package_use_path "@" @module)
+(package_use_path (identifier) @module)
+(use_list_path path: (identifier) @module)
+(scoped_use_path path: (identifier) @module)
+(qualified_type "#" @attribute qualifier: (_) @attribute)
+(postfix_expression "#" @attribute)
+((identifier) @type.builtin
+  (#match? @type.builtin "^(bool|char|i8|i16|i32|i64|i128|isize|u8|u16|u32|u64|u128|usize|f32|f64|Any|Unit|NoReturn|Type|String|Bytes|List|Map|Set|Continuation)$"))
+(const_declaration pattern: [ (identifier) (arbitrary_identifier) ] @constant)
+(enum_variant name: (identifier) @constant (#match? @constant "^[A-Z]"))
+(member_expression object: (identifier) @_error_type member: (identifier) @constant (#match? @_error_type "^[A-Z]") (#match? @constant "^[A-Z]"))
+(member_pattern object: (identifier) @_error_type member: (identifier) @constant (#match? @_error_type "^[A-Z]") (#match? @constant "^[A-Z]"))
+(call_expression function: (member_expression object: (identifier) @_error_type member: (identifier) @constant) (#match? @_error_type "^[A-Z]") (#match? @constant "^[A-Z]"))
+"##;
+
+const BUILTIN_NESSA_HIGHLIGHTS_SCM: &str = r##"
+(format_directive) @keyword.directive
+(doc_comment) @comment.documentation
+(line_comment) @comment
+(block_comment) @comment
+(integer_literal) @number
+(float_literal) @number.float
+(boolean_literal) @boolean
+(char_literal) @character
+(string_literal) @string
+(escape_sequence) @string.escape
+(null_literal) @constant.builtin
+(unit_literal) @constant.builtin
+(self_literal) @variable.builtin
+(self_type) @type.builtin
+(wildcard) @variable.builtin
+(macro_content) @embedded
+(string_interpolation "{" @punctuation.special "}" @punctuation.special) @embedded
+(symbol_literal "." @punctuation.special name: [ (identifier) (arbitrary_identifier) ] @string.special.symbol)
+(visibility) @keyword.modifier
+[ "fn" "def" "struct" "enum" "trait" "assoc" "impl" "extend" "derive" "typealias" "newtype" "mod" "global" "const" "effect" "handles" "catch" "error" "reset" "shift" "case" "lambda" "let" "var" "async" "await" "and" "or" "not" "matches" "is" "as" ] @keyword
+[ "use" ] @keyword.import
+[ "if" "else" "when" "match" "do" "for" "while" "in" "break" "continue" "return" "resume" "defer" ] @keyword.control
+[ "=" "+=" "-=" "*=" "/=" "%=" "==" "!=" "<" "<=" ">" ">=" "+" "-" "*" "/" "%" "++" "->" "=>" "|>" "|" ".." "..=" "..." "?" "!" "#" "@" "'" ] @operator
+(mod_definition name: [ (identifier) (arbitrary_identifier) ] @module)
+(use_as_clause alias: [ (identifier) (arbitrary_identifier) ] @module)
+(struct_definition name: [ (identifier) (arbitrary_identifier) ] @type.definition)
+(enum_definition name: [ (identifier) (arbitrary_identifier) ] @type.definition)
+(trait_definition name: [ (identifier) (arbitrary_identifier) ] @type.definition)
+(newtype_definition name: [ (identifier) (arbitrary_identifier) ] @type.definition)
+(typealias_definition name: [ (identifier) (arbitrary_identifier) ] @type.definition)
+(assoc_declaration name: [ (identifier) (arbitrary_identifier) ] @type.definition)
+(function_definition name: [ (identifier) (arbitrary_identifier) ] @function)
+(trait_method_signature name: [ (identifier) (arbitrary_identifier) ] @function.method)
+(trait_default_method name: [ (identifier) (arbitrary_identifier) ] @function.method)
+(effect_definition name: [ (identifier) (arbitrary_identifier) ] @function)
+(handles_statement effect: (handles_target [ (identifier) (arbitrary_identifier) ] @function))
+(enum_variant name: (identifier) @constructor (#match? @constructor "^[a-z_]"))
+(enum_variant name: (arbitrary_identifier) @constructor)
+(struct_field name: [ (identifier) (arbitrary_identifier) ] @variable.member)
+(property name: [ (identifier) (arbitrary_identifier) ] @variable.member)
+(property_pattern name: [ (identifier) (arbitrary_identifier) ] @variable.member)
+(named_argument name: [ (identifier) (arbitrary_identifier) ] @variable.parameter)
+(parameter pattern: [ (identifier) (arbitrary_identifier) ] @variable.parameter)
+(optional_parameter name: [ (identifier) (arbitrary_identifier) ] @variable.parameter)
+(varargs_parameter name: [ (identifier) (arbitrary_identifier) ] @variable.parameter)
+(catch_parameter name: [ (identifier) (arbitrary_identifier) ] @variable.parameter)
+(catch_arm name: [ (identifier) (arbitrary_identifier) ] @variable.parameter)
+(shift_expression continuation: [ (identifier) (arbitrary_identifier) ] @variable.parameter)
+(loop_label name: [ (identifier) (arbitrary_identifier) ] @label)
+(break_statement label: [ (identifier) (arbitrary_identifier) ] @label)
+(continue_statement label: [ (identifier) (arbitrary_identifier) ] @label)
+(member_expression member: (tuple_index) @number)
+(member_expression member: [ (identifier) (arbitrary_identifier) ] @variable.member)
+(member_expression object: (identifier) @_enum_type member: (identifier) @constructor (#match? @_enum_type "^[A-Z]") (#match? @constructor "^[a-z_]"))
+(member_pattern object: (identifier) @_enum_type member: (identifier) @constructor (#match? @_enum_type "^[A-Z]") (#match? @constructor "^[a-z_]"))
+(call_expression function: [ (identifier) (arbitrary_identifier) ] @function.call)
+(call_expression function: (member_expression member: [ (identifier) (arbitrary_identifier) ] @function.method.call))
+(call_expression function: (identifier) @type (#match? @type "^[A-Z]"))
+(call_expression function: (member_expression object: (identifier) @_enum_type member: (identifier) @constructor) (#match? @_enum_type "^[A-Z]") (#match? @constructor "^[a-z_]"))
+(infix_call_expression function: [ (identifier) (arbitrary_identifier) ] @function.call)
+(view_expression view: [ (identifier) (arbitrary_identifier) ] @attribute)
+((identifier) @type (#match? @type "^[A-Z][a-zA-Z0-9_]*$"))
+"##;
+
 pub(crate) fn load_highlights_query_source(lang: &str) -> Option<String> {
     let mut visited = HashSet::new();
-    load_highlights_scm_recursive(lang, &mut visited)
+    let loaded = load_highlights_scm_recursive(lang, &mut visited);
+    if normalize_ts_lang(lang) == "nessa" {
+        let mut src = loaded.unwrap_or_else(|| BUILTIN_NESSA_HIGHLIGHTS_SCM.to_string());
+        if !src.ends_with('\n') {
+            src.push('\n');
+        }
+        src.push_str(NESSA_QUERY_AUGMENT_SCM);
+        return Some(src);
+    }
+    loaded
 }
 
 // ---------------------------------------------------------------------------
@@ -811,6 +930,7 @@ struct RegexAlt {
 #[derive(Debug, Clone)]
 pub(crate) struct CompiledRegex {
     root: RegexAlt,
+    anchored_start: bool,
 }
 
 impl CompiledRegex {
@@ -818,7 +938,16 @@ impl CompiledRegex {
         let chars: Vec<char> = pattern.chars().collect();
         let mut pos = 0usize;
         let root = parse_regex_alt(&chars, &mut pos, false)?;
-        Some(Self { root })
+        let anchored_start = !root.branches.is_empty()
+            && root.branches.iter().all(|seq| {
+                seq.pieces
+                    .first()
+                    .is_some_and(|p| matches!(p.atom, RegexAtom::AnchorStart) && p.min_rep >= 1)
+            });
+        Some(Self {
+            root,
+            anchored_start,
+        })
     }
 
     pub(crate) fn compile_lua(lua_pat: &str) -> Option<Self> {
@@ -828,6 +957,9 @@ impl CompiledRegex {
 
     pub(crate) fn is_match(&self, text: &str) -> bool {
         let chars: Vec<char> = text.chars().collect();
+        if self.anchored_start {
+            return match_alt(&self.root, &chars, 0).is_some();
+        }
         for start in 0..=chars.len() {
             if match_alt(&self.root, &chars, start).is_some() {
                 return true;
@@ -1327,12 +1459,18 @@ fn match_pieces(pieces: &[RegexPiece], chars: &[char], idx: usize) -> Option<usi
 
 pub(crate) fn map_capture_name_to_hl_group(raw_name: &str) -> u8 {
     let name = raw_name.strip_prefix('@').unwrap_or(raw_name);
+    if name == "embedded" {
+        return HL_EMBEDDED_CLEAR;
+    }
+    if name == "punctuation.special" {
+        return HL_MACRO_ATTR;
+    }
     if name.is_empty()
+        || name.starts_with('_')
         || name == "variable"
         || name == "none"
         || name == "spell"
         || name == "nospell"
-        || name == "embedded"
         || name.starts_with("punctuation")
         || name.starts_with("local")
     {
@@ -2293,7 +2431,7 @@ impl RowHighlightBuffer {
         let mut i = 0usize;
         while i < self.cells.len() {
             let grp = self.cells[i].hl_group;
-            if grp == HL_NONE {
+            if grp == HL_NONE || grp == HL_EMBEDDED_CLEAR {
                 i += 1;
                 continue;
             }
@@ -2789,11 +2927,13 @@ fn is_nessa_builtin_const(w: &str) -> bool {
 fn is_nessa_builtin_type(w: &str) -> bool {
     matches!(
         w,
-        "i64"
+        "i128"
+            | "i64"
             | "i32"
             | "i16"
             | "i8"
             | "isize"
+            | "u128"
             | "u64"
             | "u32"
             | "u16"
@@ -2805,8 +2945,13 @@ fn is_nessa_builtin_type(w: &str) -> bool {
             | "char"
             | "str"
             | "String"
+            | "Bytes"
             | "List"
+            | "Map"
+            | "Set"
             | "Unit"
+            | "NoReturn"
+            | "Type"
             | "Any"
             | "Continuation"
             | "Future"
@@ -3020,10 +3165,15 @@ fn highlight_nessa_line(line: &str, state: &mut NessaLexState) -> Vec<TsHighligh
             continue;
         }
 
-        // Line comments: `---` (doc comment = 16) vs `--` (comment = 15)
+        // Line comments & format directives: `--%` (directive = 4), `---` (doc = 16), `--` (comment = 15)
         if ch == '-' && cs.get(i + 1) == Some(&'-') {
-            let is_doc = cs.get(i + 2) == Some(&'-') && cs.get(i + 3) != Some(&'-');
-            let grp = if is_doc { HL_DOC_COMMENT } else { HL_COMMENT };
+            let grp = if cs.get(i + 2) == Some(&'%') {
+                HL_MACRO_ATTR
+            } else if cs.get(i + 2) == Some(&'-') && cs.get(i + 3) != Some(&'-') {
+                HL_DOC_COMMENT
+            } else {
+                HL_COMMENT
+            };
             push_coalesced_span(&mut spans, i, n, grp);
             break;
         }
@@ -3715,14 +3865,16 @@ pub fn ts_highlight_doc_rows(
     if norm.is_empty() {
         return Vec::new();
     }
-    if norm == "nessa" {
-        return highlight_nessa_doc_rows(doc_id, start_row, end_row);
-    }
-
     let Some(api) = ts_api() else {
+        if norm == "nessa" {
+            return highlight_nessa_doc_rows(doc_id, start_row, end_row);
+        }
         return Vec::new();
     };
     let Some(loaded_lang) = get_loaded_language(&norm) else {
+        if norm == "nessa" {
+            return highlight_nessa_doc_rows(doc_id, start_row, end_row);
+        }
         return Vec::new();
     };
     let Some(_) = ensure_cached_doc_tree(api, &norm, &loaded_lang, doc_id) else {
@@ -3781,22 +3933,9 @@ pub fn ts_highlight_snippet(text: &str, lang: &str) -> Vec<Vec<TsHighlightSpan>>
         }
     }
 
-    let computed = if norm == "nessa" {
-        let mut state = NessaLexState::default();
-        text.split('\n')
-            .take(MAX_NESSA_LIST_ITEMS)
-            .map(|raw_l| {
-                let clean = raw_l.strip_suffix('\r').unwrap_or(raw_l);
-                highlight_nessa_line(clean, &mut state)
-            })
-            .collect::<Vec<_>>()
-    } else {
-        let Some(api) = ts_api() else {
-            return Vec::new();
-        };
-        let Some(loaded_lang) = get_loaded_language(&norm) else {
-            return Vec::new();
-        };
+    let computed = if let Some(api) = ts_api()
+        && let Some(loaded_lang) = get_loaded_language(&norm)
+    {
         let mut clean_source = String::with_capacity(text.len());
         let mut starts = Vec::new();
         for (idx, raw_l) in text.split('\n').take(MAX_NESSA_LIST_ITEMS).enumerate() {
@@ -3826,6 +3965,17 @@ pub fn ts_highlight_snippet(text: &str, lang: &str) -> Vec<Vec<TsHighlightSpan>>
         // SAFETY: `tree_ptr` is a temporary snippet `TSTree*` allocated above; delete immediately.
         unsafe { (api.ts_tree_delete)(tree_ptr) };
         rows
+    } else if norm == "nessa" {
+        let mut state = NessaLexState::default();
+        text.split('\n')
+            .take(MAX_NESSA_LIST_ITEMS)
+            .map(|raw_l| {
+                let clean = raw_l.strip_suffix('\r').unwrap_or(raw_l);
+                highlight_nessa_line(clean, &mut state)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        return Vec::new();
     };
 
     if !computed.is_empty() {
@@ -3925,14 +4075,16 @@ pub fn ts_inspect_doc_node(doc_id: i64, lang: &str, row: usize, col_char: usize)
     if norm.is_empty() {
         return String::new();
     }
-    if norm == "nessa" {
-        return inspect_nessa_doc_node(doc_id, row, col_char);
-    }
-
     let Some(api) = ts_api() else {
-        return inspect_nessa_doc_node(doc_id, row, col_char);
+        if norm == "nessa" {
+            return inspect_nessa_doc_node(doc_id, row, col_char);
+        }
+        return format!("Language: {norm} (libtree-sitter runtime not loaded)");
     };
     let Some(loaded_lang) = get_loaded_language(&norm) else {
+        if norm == "nessa" {
+            return inspect_nessa_doc_node(doc_id, row, col_char);
+        }
         return format!("Language: {norm} (no Tree-sitter grammar .so found)");
     };
     let Some(_) = ensure_cached_doc_tree(api, &norm, &loaded_lang, doc_id) else {
@@ -4143,6 +4295,10 @@ pub fn ts_inspect_doc_node(doc_id: i64, lang: &str, row: usize, col_char: usize)
                 }
                 (api.ts_query_cursor_delete)(cursor);
             }
+        }
+
+        if winning_winner.hl_group == HL_EMBEDDED_CLEAR {
+            winning_winner.hl_group = HL_NONE;
         }
 
         let mut flags = Vec::new();
@@ -4693,5 +4849,61 @@ mod tests {
             doc_free(fresh_rs_doc);
             doc_free(rs_doc);
         }
+    }
+
+    #[test]
+    fn nessa_treesitter_grammar_highlights_directives_enums_interpolation_and_inspect() {
+        let lines = vec![
+            "--% .max_width = 100".to_string(),
+            "pub enum IoError { pub NotFound }".to_string(),
+            "pub enum Color { pub red, pub green }".to_string(),
+            "pub fn greet(plain_var: String) -> !IoError String {".to_string(),
+            "    let c = Color.red".to_string(),
+            "    \"前缀:{plain_var + 1}!\"".to_string(),
+            "}".to_string(),
+        ];
+        let doc = doc_new(lines.clone());
+        let rows = ts_highlight_doc_rows(doc, "nessa", 0, lines.len() - 1);
+        assert_eq!(rows.len(), lines.len());
+
+        // Row 0: `--%` format directive -> HL_MACRO_ATTR (4)
+        assert_eq!(rows[0][0].hl_group, i64::from(HL_MACRO_ATTR));
+
+        if get_loaded_language("nessa").is_some() {
+            // Row 1: `NotFound` PascalCase Error enum variant -> HL_CONSTANT (10)
+            assert!(
+                rows[1]
+                    .iter()
+                    .any(|s| s.start_col == 23 && s.end_col == 31 && s.hl_group == 10)
+            );
+            // Row 2: `red` snake_case ordinary enum variant -> HL_FUNCTION / constructor (3)
+            assert!(
+                rows[2]
+                    .iter()
+                    .any(|s| s.start_col == 21 && s.end_col == 24 && s.hl_group == 3)
+            );
+            // Row 5: `"    \"前缀:{plain_var + 1}!\""`
+            // `plain_var` at char cols 9..18 must be cleared of outer string (HL_NONE, not 7)!
+            assert!(
+                !rows[5]
+                    .iter()
+                    .any(|s| s.start_col <= 10 && s.end_col > 10 && s.hl_group == 7),
+                "interpolated plain_var inside string must not inherit outer HL_STRING (7): {:?}",
+                rows[5]
+            );
+            // `1` at char col 21..22 -> HL_NUMBER_BOOL (9)
+            assert!(
+                rows[5]
+                    .iter()
+                    .any(|s| s.start_col == 21 && s.end_col == 22 && s.hl_group == 9)
+            );
+
+            let dir_inspect = ts_inspect_doc_node(doc, "nessa", 0, 2);
+            assert!(dir_inspect.contains("format_directive"), "{dir_inspect}");
+            let fn_inspect = ts_inspect_doc_node(doc, "nessa", 3, 8);
+            assert!(fn_inspect.contains("function_definition"), "{fn_inspect}");
+        }
+
+        doc_free(doc);
     }
 }

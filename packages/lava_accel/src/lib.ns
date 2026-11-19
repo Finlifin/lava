@@ -2904,7 +2904,8 @@ private fn fb_line_cmt(m: String) -> String {
 
 private fn fb_blk_delims(m: String) -> (String, String) {
     when {
-        m == "nessa" or m == "lua" => ("--[[", "]]"),
+        m == "nessa" => ("{{-", "-}}"),
+        m == "lua" => ("--[[", "]]"),
         m == "rust" or m == "c" or m == "cpp" or m == "go" or m == "javascript"
             or m == "typescript" or m == "java" or m == "css" or m == "scss" or m == "jsonc" => ("/*", "*/"),
         else => ("", ""),
@@ -4037,9 +4038,10 @@ private fn fb_highlight_line_stateful(
         }
 
         if (norm == "nessa" or norm == "lua") and i + 2 <= n and line.slice(i, i + 2) == "--" {
+            let is_dir = norm == "nessa" and i + 3 <= n and line.slice(i, i + 3) == "--%"
             let is_doc = norm == "nessa" and i + 3 <= n and line.slice(i, i + 3) == "---"
                 and (i + 4 > n or line.slice(i + 3, i + 4) != "-")
-            fb_push_ts_span(spans, i, n, if is_doc { 16 } else { 15 })
+            fb_push_ts_span(spans, i, n, if is_dir { 4 } else if is_doc { 16 } else { 15 })
             break
         }
         if (norm == "rust" or norm == "c" or norm == "cpp" or norm == "javascript"

@@ -1644,7 +1644,8 @@ fn mode_line_comment_prefix(mode: &str) -> &'static str {
 
 fn mode_block_comment_delims(mode: &str) -> (&'static str, &'static str) {
     match mode {
-        "nessa" | "lua" => ("--[[", "]]"),
+        "nessa" => ("{-", "-}"),
+        "lua" => ("--[[", "]]"),
         "rust" | "c" | "cpp" | "go" | "javascript" | "typescript" | "java" | "css" | "scss"
         | "jsonc" => ("/*", "*/"),
         _ => ("", ""),
@@ -2540,22 +2541,29 @@ fn scan_symbol_in_line(line: &str, mode_lower: &str) -> Option<(String, &'static
         return None;
     }
 
-    let clean = trimmed
+    let clean_vis = trimmed
         .strip_prefix("pub(crate) ")
         .or_else(|| trimmed.strip_prefix("pub "))
         .or_else(|| trimmed.strip_prefix("private "))
-        .or_else(|| trimmed.strip_prefix("async "))
         .unwrap_or(trimmed);
+    let clean = clean_vis
+        .strip_prefix("async ")
+        .or_else(|| clean_vis.strip_prefix("extern "))
+        .unwrap_or(clean_vis);
 
     const CHECKS: &[(&str, &str)] = &[
         ("fn ", "Function"),
         ("def ", "Function"),
+        ("effect ", "Function"),
         ("struct ", "Struct"),
+        ("newtype ", "Struct"),
+        ("typealias ", "TypeParameter"),
         ("class ", "Class"),
         ("enum ", "Enum"),
         ("trait ", "Trait"),
         ("interface ", "Interface"),
         ("impl ", "Impl"),
+        ("extend ", "Impl"),
         ("mod ", "Module"),
         ("const ", "Constant"),
         ("global ", "Variable"),

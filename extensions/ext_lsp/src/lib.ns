@@ -198,6 +198,11 @@ pub fn resolve_executable_in_path_with_dirs(bin: String, extra_dirs: List) -> ?S
     }
     let path_env = env.get_or("PATH", "")
     let parts = path_env.split(":")
+    let home_dir = env.get_or("HOME", "")
+    if home_dir != "" {
+        parts.push(path.join(home_dir, ".local/bin"))
+        parts.push(path.join(home_dir, ".cargo/bin"))
+    }
     for i in 0..parts.len() {
         let d = parts.get(i.as(usize)).as(String).trim()
         if d != "" {
@@ -2041,7 +2046,7 @@ impl LspService {
                                         self.completion_cache.insert(meta.buf_id, entry)
                                         let cur_buf = world.active_buffer()
                                         if cur_buf.id == meta.buf_id and cur_buf.point.row == meta.row {
-                                            self.pending_cmp_refresh_buf_id = meta.buf_id.as(i64)
+                                            self.pending_cmp_refresh_buf_id = meta.buf_id.raw()
                                         }
                                     }
                                 } else {
@@ -2072,7 +2077,7 @@ impl LspService {
                                     }
                                     let cur_buf = world.active_buffer()
                                     if cur_buf.id == sbuf_id {
-                                        self.pending_sig_refresh_buf_id = sbuf_id.as(i64)
+                                        self.pending_sig_refresh_buf_id = sbuf_id.raw()
                                     }
                                 }
                             },
@@ -2128,7 +2133,7 @@ impl LspService {
         if immediate != null {
             return immediate
         }
-        let deadline_ms = time.unix_millis() + 150
+        let deadline_ms = time.unix_millis() + 40
         var backoff_ms: i64 = 1
         while time.unix_millis() < deadline_ms {
             time.sleep_ms(backoff_ms)
@@ -2628,8 +2633,12 @@ private fn try_register_cmp_source(kernel: SystemKernel, svc: LspService) {
                     return (title, lines)
                 }
             }
-            -- Workspace symbol definition lookup (`accel_find_symbol_defs` cached in `ws_sig_cache`)
-            if lang == "nessa" and item.kind != "Keyword" and item.kind != "Snippet" and item.kind != "Path" {
+            -- Workspace symbol definition lookup (`accel_find_symbol_defs` cached in `ws_sig_cache`, offline fallback only)
+            if lang == "nessa"
+                and (not lsvc.has_live_external_client(buf.id))
+                and item.kind != "Keyword"
+                and item.kind != "Snippet"
+                and item.kind != "Path" {
                 let att_opt = lsvc.buf_attachments.get(buf.id)
                 let root_dir = if att_opt != null {
                     att_opt.as(BufferLspAttachment).root_dir
@@ -2638,7 +2647,9 @@ private fn try_register_cmp_source(kernel: SystemKernel, svc: LspService) {
                 } else {
                     ""
                 }
-                if root_dir != "" and (not is_ssh_uri(root_dir)) and fs.exists(root_dir) {
+                if root_dir != ""
+                    and (not is_ssh_uri(root_dir))
+                    and fs.exists(path.join(root_dir, "package.toml")) {
                     let wkey = root_dir ++ "\t" ++ item.label
                     var def_opt: ?SymbolDefHit = null
                     if lsvc.ws_sig_cache.contains_key(wkey) {
@@ -2741,10 +2752,10 @@ private fn try_register_cmp_source(kernel: SystemKernel, svc: LspService) {
                 }
             }
 
-            -- 3. Check cached workspace symbol definitions (`accel_find_symbol_defs`) for cross-package functions!
+            -- 3. Check cached workspace symbol definitions (`accel_find_symbol_defs`) for offline Nessa packages!
             let sig_lang = infer_language_id(buf)
             let att_opt = lsvc.buf_attachments.get(buf.id)
-            let root_dir = if sig_lang != "nessa" {
+            let root_dir = if sig_lang != "nessa" or lsvc.has_live_external_client(buf.id) {
                 ""
             } else if att_opt != null {
                 att_opt.as(BufferLspAttachment).root_dir
@@ -2753,7 +2764,9 @@ private fn try_register_cmp_source(kernel: SystemKernel, svc: LspService) {
             } else {
                 ""
             }
-            if root_dir != "" and (not is_ssh_uri(root_dir)) and fs.exists(root_dir) {
+            if root_dir != ""
+                and (not is_ssh_uri(root_dir))
+                and fs.exists(path.join(root_dir, "package.toml")) {
                 let wkey = root_dir ++ "\t" ++ callee
                 var def_opt: ?SymbolDefHit = null
                 if lsvc.ws_sig_cache.contains_key(wkey) {
@@ -3357,7 +3370,7 @@ pub fn register_lsp_extension(kernel: SystemKernel) -> !String Unit {
                     }
                     let w = w_opt.as(EditorWorld)
                     let manual = if payload matches _: bool { payload.as(bool) } else { false }
-                    let wait_ms: i64 = if manual { 120 } else { 0 }
+                    let wait_ms: i64 = if manual { 35 } else { 0 }
                     svc.request_completion_for_buffer(w, w.active_buffer(), wait_ms = wait_ms)
                     ()
                 },
@@ -3384,7 +3397,7 @@ pub fn register_lsp_extension(kernel: SystemKernel) -> !String Unit {
                     if svc.pending_cmp_refresh_buf_id >= 0 {
                         let rbuf_id = svc.pending_cmp_refresh_buf_id
                         svc.pending_cmp_refresh_buf_id = -1
-                        if (not w.in_key_burst) and w.active_buffer().id.as(i64) == rbuf_id {
+                        if (not w.in_key_burst) and w.active_buffer().id.raw() == rbuf_id {
                             let cmp_opt = kern.service(SERVICE_CMP)
                             if cmp_opt != null {
                                 let updated = cmp_opt.as(CmpService).refresh_from_lsp(kern) ! { _ => false }
@@ -3397,7 +3410,7 @@ pub fn register_lsp_extension(kernel: SystemKernel) -> !String Unit {
                     if svc.pending_sig_refresh_buf_id >= 0 {
                         let sbuf_id = svc.pending_sig_refresh_buf_id
                         svc.pending_sig_refresh_buf_id = -1
-                        if (not w.in_key_burst) and w.active_buffer().id.as(i64) == sbuf_id {
+                        if (not w.in_key_burst) and w.active_buffer().id.raw() == sbuf_id {
                             let cmp_opt = kern.service(SERVICE_CMP)
                             if cmp_opt != null {
                                 cmp_opt.as(CmpService).update_signature_help(kern, w)

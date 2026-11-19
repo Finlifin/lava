@@ -120,6 +120,11 @@ pub fn lsp_which(bin: String) -> String {
     }
     let path_env = env.get_or("PATH", "/usr/local/bin:/usr/bin:/bin")
     let dirs = path_env.split(":")
+    let home_dir = env.get_or("HOME", "")
+    if home_dir != "" {
+        dirs.push(path.join(home_dir, ".local/bin"))
+        dirs.push(path.join(home_dir, ".cargo/bin"))
+    }
     for i in 0..dirs.len() {
         let d = dirs.get(i.as(usize)).as(String).trim()
         if d != "" {

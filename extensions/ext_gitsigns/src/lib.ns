@@ -521,31 +521,31 @@ fn ensure_buffer_diff_current(world: EditorWorld, state: GitsignsState, buf: Buf
     if buf.kind != BufferKind.file or buf.file_path == "" {
         return
     }
-    buf.sync_external_lines()
     let last_ver_opt = state.last_ver_by_buf.get(buf.id)
-    if last_ver_opt == null or last_ver_opt.as(i64) != buf.edit_version {
-        refresh_buffer_gitsigns(world, state, buf, false)
+    if last_ver_opt != null and last_ver_opt.as(i64) == buf.edit_version {
+        let lcount = buf.line_count()
+        let win_opt = state.last_win_by_buf.get(buf.id)
+        if win_opt != null {
+            let (ws, we, prev_blame_row) = win_opt.as((i64, i64, i64))
+            let escaped = viewport_escaped_gitsigns_window(world, lcount, ws, we)
+            let blame_active_now = state.blame_enabled and world.mode_name != "INSERT"
+            if (not blame_active_now) and prev_blame_row < 0 and (not escaped) {
+                return
+            }
+            if blame_active_now and buf.point.row == prev_blame_row and (not escaped) {
+                return
+            }
+        }
+        buf.sync_external_lines()
+        let hunks = state.buffer_hunks(buf.id)
+        let tracked_opt = state.tracked_by_buf.get(buf.id)
+        let tracked = if tracked_opt != null { tracked_opt.as(bool) } else { false }
+        apply_gitsigns_decorations(world, state, buf, hunks, tracked)
         return
     }
 
-    let lcount = buf.line_count()
-    let win_opt = state.last_win_by_buf.get(buf.id)
-    if win_opt != null {
-        let (ws, we, prev_blame_row) = win_opt.as((i64, i64, i64))
-        let escaped = viewport_escaped_gitsigns_window(world, lcount, ws, we)
-        let blame_active_now = state.blame_enabled and world.mode_name != "INSERT"
-        if (not blame_active_now) and prev_blame_row < 0 and (not escaped) {
-            return
-        }
-        if blame_active_now and buf.point.row == prev_blame_row and (not escaped) {
-            return
-        }
-    }
-
-    let hunks = state.buffer_hunks(buf.id)
-    let tracked_opt = state.tracked_by_buf.get(buf.id)
-    let tracked = if tracked_opt != null { tracked_opt.as(bool) } else { false }
-    apply_gitsigns_decorations(world, state, buf, hunks, tracked)
+    buf.sync_external_lines()
+    refresh_buffer_gitsigns(world, state, buf, false)
 }
 
 fn find_hunk_at_cursor(buf: Buffer, hunks: List) -> ?(i64, DiffHunk) {
@@ -999,6 +999,9 @@ fn on_buffer_sync_hook(kernel: SystemKernel, _payload: Any) {
     let world = w_opt.as(EditorWorld)
     let state = s_opt.as(GitsignsState)
     let buf = world.active_buffer()
+    if world.mode_name == "INSERT" and buf.line_count() > 2000 {
+        return
+    }
     ensure_buffer_diff_current(world, state, buf)
 }
 
@@ -1014,6 +1017,9 @@ fn on_buffer_burst_guarded_hook(kernel: SystemKernel, _payload: Any) {
     }
     let state = s_opt.as(GitsignsState)
     let buf = world.active_buffer()
+    if world.mode_name == "INSERT" and buf.line_count() > 2000 {
+        return
+    }
     ensure_buffer_diff_current(world, state, buf)
 }
 

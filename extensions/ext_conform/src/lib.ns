@@ -5,6 +5,7 @@
 -- optional custom/external per-mode formatters, single-checkpoint undo preservation, and format-on-save.
 
 use std.collections.HashMap
+use std.env
 use std.fs
 use std.path
 use std.process
@@ -55,6 +56,52 @@ pub struct ConformService {
     pub format_count: i64,
     pub prev_buf_id: BufferId,
     upgraded_leader_u: bool,
+    nessa_fmt_checked: bool,
+    nessa_fmt_bin: String,
+}
+
+fn discover_nessa_fmt_binary() -> String {
+    let env_override = env.get_or("LAVA_NESSA_FMT", "").trim()
+    if env_override != "" {
+        if env_override == "off" or env_override == "none" or env_override == "0" {
+            return ""
+        }
+        if fs.exists(env_override) and (not fs.is_dir(env_override)) {
+            return env_override
+        }
+    }
+    let path_env = env.get_or("PATH", "")
+    let dirs = path_env.split(":")
+    let home_dir = env.get_or("HOME", "")
+    if home_dir != "" {
+        dirs.push(path.join(home_dir, ".local/bin"))
+        dirs.push(path.join(home_dir, ".cargo/bin"))
+    }
+    var cur = path.normalize(env.get_or("PWD", "."))
+    var guard: i64 = 0
+    while guard < 8 and cur != "" {
+        let sibling_rel = path.join(cur, "nessa2/target/release")
+        if fs.exists(sibling_rel) and fs.is_dir(sibling_rel) {
+            dirs.push(sibling_rel)
+            break
+        }
+        let par_opt = path.parent(cur)
+        if par_opt == null or par_opt.as(String) == cur {
+            break
+        }
+        cur = par_opt.as(String)
+        guard += 1
+    }
+    for i in 0..dirs.len() {
+        let d = dirs.get(i.as(usize)).as(String).trim()
+        if d != "" {
+            let full = path.join(d, "nessa-fmt")
+            if fs.exists(full) and (not fs.is_dir(full)) {
+                return full
+            }
+        }
+    }
+    ""
 }
 
 impl ConformService {
@@ -66,7 +113,17 @@ impl ConformService {
             format_count: 0,
             prev_buf_id: BufferId(0),
             upgraded_leader_u: false,
+            nessa_fmt_checked: false,
+            nessa_fmt_bin: "",
         }
+    }
+
+    pub fn ensure_nessa_fmt_bin(self) -> String {
+        if not self.nessa_fmt_checked {
+            self.nessa_fmt_bin = discover_nessa_fmt_binary()
+            self.nessa_fmt_checked = true
+        }
+        self.nessa_fmt_bin
     }
 
     pub fn register_formatter(
@@ -112,6 +169,9 @@ impl ConformService {
         }
         if self.external_formatters.contains_key(m) {
             return self.external_formatters.get(m).as(ExternalFormatterSpec).name ++ " (external)"
+        }
+        if m == "nessa" and self.ensure_nessa_fmt_bin() != "" {
+            return "nessa-fmt (official)"
         }
         builtin_formatter_name(m)
     }
@@ -720,6 +780,7 @@ fn scan_brace_code_line(trimmed: String, mode: String, in_block_comment_start: b
     let n = trimmed.char_len()
     var i: i64 = 0
     var in_block = in_block_comment_start
+    var nessa_block_depth: i64 = if mode == "nessa" and in_block_comment_start { 1 } else { 0 }
     var in_quote = ""
     var leading_closes: i64 = 0
     var still_leading = not in_block_comment_start
@@ -727,6 +788,24 @@ fn scan_brace_code_line(trimmed: String, mode: String, in_block_comment_start: b
 
     while i < n {
         if in_block {
+            if mode == "nessa" {
+                if i + 1 < n and trimmed.slice(i, i + 2) == "{{-" {
+                    nessa_block_depth += 1
+                    i += 2
+                    continue
+                }
+                if i + 1 < n and trimmed.slice(i, i + 2) == "-}}" {
+                    nessa_block_depth -= 1
+                    if nessa_block_depth <= 0 {
+                        nessa_block_depth = 0
+                        in_block = false
+                    }
+                    i += 2
+                    continue
+                }
+                i += 1
+                continue
+            }
             if i + 1 < n and trimmed.slice(i, i + 2) == "*/" {
                 in_block = false
                 i += 2
@@ -750,9 +829,16 @@ fn scan_brace_code_line(trimmed: String, mode: String, in_block_comment_start: b
             continue
         }
 
-        -- Line comments
+        -- Line comments & Nessa `{- ... -}` block comments
         if uses_dash_line_comment(mode) and ch == "-" and i + 1 < n and trimmed.slice(i + 1, i + 2) == "-" {
             break
+        }
+        if mode == "nessa" and ch == "{{" and i + 1 < n and trimmed.slice(i + 1, i + 2) == "-" {
+            still_leading = false
+            in_block = true
+            nessa_block_depth = 1
+            i += 2
+            continue
         }
         if uses_slash_comments(mode) and ch == "/" and i + 1 < n {
             let nxt = trimmed.slice(i + 1, i + 2)
@@ -875,6 +961,20 @@ fn normalize_internal_tabs(body: String, shiftwidth: i64, expandtab: bool) -> St
     out
 }
 
+fn parse_nessa_fmt_directive_kind(trimmed: String) -> String {
+    if not trimmed.starts_with("--%") {
+        return ""
+    }
+    let body = trimmed.slice(3, trimmed.char_len()).trim()
+    when {
+        body == ".off" or body.starts_with(".off ") or body.starts_with(".off;") => "off",
+        body == ".on" or body.starts_with(".on ") or body.starts_with(".on;") => "on",
+        body == ".skip" or body.starts_with(".skip ") or body.starts_with(".skip;") => "skip",
+        body == ".preserve" or body.starts_with(".preserve ") or body.starts_with(".preserve;") => "skip",
+        else => "directive",
+    }
+}
+
 pub fn format_brace_lines_with_context(
     all_lines: List,
     start_row: i64,
@@ -887,11 +987,25 @@ pub fn format_brace_lines_with_context(
     let unit = indent_unit_str(shiftwidth, expandtab)
     var depth: i64 = 0
     var in_block_comment = false
+    var fmt_off = false
+    var skip_next_stmt = false
 
     -- Pre-scan lines `0..start_row` when formatting a Visual/Ex sub-range
     for r in 0..start_row {
         let pre_trimmed = all_lines.get(r.as(usize)).as(String).trim()
         if pre_trimmed != "" {
+            if mode == "nessa" and (not in_block_comment) {
+                let dkind = parse_nessa_fmt_directive_kind(pre_trimmed)
+                if dkind == "off" {
+                    fmt_off = true
+                } else if dkind == "on" {
+                    fmt_off = false
+                } else if dkind == "skip" {
+                    skip_next_stmt = true
+                } else if dkind == "" and (not pre_trimmed.starts_with("--")) {
+                    skip_next_stmt = false
+                }
+            }
             let scan = scan_brace_code_line(pre_trimmed, mode, in_block_comment)
             depth += scan.net_delta
             if depth < 0 {
@@ -907,6 +1021,22 @@ pub fn format_brace_lines_with_context(
     for r in start_row..(end_row + 1) {
         let raw_line = all_lines.get(r.as(usize)).as(String)
         let trimmed = raw_line.trim()
+        if fmt_off {
+            if mode == "nessa" and (not in_block_comment) and parse_nessa_fmt_directive_kind(trimmed) == "on" {
+                fmt_off = false
+            } else {
+                if trimmed != "" {
+                    let scan = scan_brace_code_line(trimmed, mode, in_block_comment)
+                    depth += scan.net_delta
+                    if depth < 0 {
+                        depth = 0
+                    }
+                    in_block_comment = scan.next_in_block_comment
+                }
+                formatted_slice.push(raw_line)
+                continue
+            }
+        }
         if trimmed == "" {
             consecutive_blanks += 1
             if consecutive_blanks <= 1 {
@@ -917,14 +1047,39 @@ pub fn format_brace_lines_with_context(
         consecutive_blanks = 0
 
         let started_in_block = in_block_comment
+        let dkind = if mode == "nessa" and (not started_in_block) {
+            parse_nessa_fmt_directive_kind(trimmed)
+        } else {
+            ""
+        }
+        if dkind == "off" {
+            fmt_off = true
+            formatted_slice.push(raw_line)
+            continue
+        }
+        if dkind == "skip" {
+            skip_next_stmt = true
+            formatted_slice.push(unit.repeat(depth) ++ trimmed)
+            continue
+        }
         let scan = scan_brace_code_line(trimmed, mode, started_in_block)
+        if skip_next_stmt and dkind == "" and (not trimmed.starts_with("--")) {
+            skip_next_stmt = false
+            formatted_slice.push(raw_line)
+            depth += scan.net_delta
+            if depth < 0 {
+                depth = 0
+            }
+            in_block_comment = scan.next_in_block_comment
+            continue
+        }
         var line_depth = depth - scan.leading_closes
         if line_depth < 0 {
             line_depth = 0
         }
 
         let clean_body = normalize_internal_tabs(trimmed, shiftwidth, expandtab)
-        let extra_star_space = if started_in_block and clean_body.starts_with("*") {
+        let extra_star_space = if started_in_block and mode != "nessa" and clean_body.starts_with("*") {
             " "
         } else {
             ""
@@ -1106,6 +1261,46 @@ fn run_external_formatter(spec: ExternalFormatterSpec, lines: List, cwd: String)
     }
 }
 
+fn run_nessa_fmt_whole_buffer(
+    bin_path: String,
+    lines: List,
+    file_path: String,
+    cwd: String,
+    shiftwidth: i64,
+) -> !String List {
+    let text = lines.join("\n") ++ "\n"
+    let clean_fp = if is_ssh_uri(file_path) { "" } else { file_path.trim() }
+    let clean_cwd = if is_ssh_uri(cwd) or cwd.trim() == "" { "." } else { cwd.trim() }
+    let effective_path = if clean_fp != "" {
+        clean_fp
+    } else {
+        path.join(clean_cwd, "stdin.ns")
+    }
+    let fmt_args = ["-", "--stdin-filepath", effective_path]
+    if shiftwidth > 0 and shiftwidth != 4 {
+        fmt_args.push("--config")
+        fmt_args.push("tab_spaces=" ++ shiftwidth.to_string())
+    }
+    let exec_res = process.run(bin_path, args = fmt_args, stdin = text, cwd = clean_cwd)
+    exec_res match {
+        out! => {
+            if not out.is_success() {
+                let err_detail = out.stderr.trim()
+                return error (
+                    "nessa-fmt failed: "
+                    ++ (if err_detail != "" { err_detail } else { "exit status " ++ out.status.to_string() })
+                )
+            }
+            let parts = out.stdout.lines()
+            if parts.is_empty() {
+                parts.push("")
+            }
+            parts
+        },
+        error err => error ("nessa-fmt failed: " ++ err.to_string()),
+    }
+}
+
 pub fn compute_formatted_lines(
     world: EditorWorld,
     service: ConformService,
@@ -1141,6 +1336,14 @@ pub fn compute_formatted_lines(
         let ext_spec = service.external_formatters.get(mode).as(ExternalFormatterSpec)
         let fmt_cwd = if is_ssh_uri(buf.file_path) { parent_ssh_uri(buf.file_path) } else { world.cwd }
         formatted_part = run_external_formatter(ext_spec, slice_in, fmt_cwd)!
+    } else if mode == "nessa" and is_whole_buffer and service.ensure_nessa_fmt_bin() != "" {
+        formatted_part = run_nessa_fmt_whole_buffer(
+            service.ensure_nessa_fmt_bin(),
+            slice_in,
+            buf.file_path,
+            world.cwd,
+            sw,
+        )!
     } else if mode == "json" or mode == "jsonc" {
         formatted_part = format_json_lines(slice_in, sw, et)!
     } else if is_brace_structured_mode(mode) {
@@ -1301,9 +1504,10 @@ fn build_conform_info_lines(world: EditorWorld, service: ConformService, target_
         "  Total formats   : " ++ service.format_count.to_string(),
         "  Last status     : " ++ service.last_status,
         "",
-        "Built-in Deterministic Formatters:",
+        "Built-in & Official Formatters:",
+        "  • nessa         : nessa-fmt (official AST formatter + --% directives) / lava-brace-fmt[nessa]",
         "  • json / jsonc  : lava-json-pretty (strict tokenizer + AST pretty-printer)",
-        "  • brace modes   : lava-brace-fmt (nessa, rust, c, cpp, go, js, ts, css)",
+        "  • brace modes   : lava-brace-fmt (rust, c, cpp, go, js, ts, css)",
         "  • indent/prose  : lava-indent-trim (python, yaml, toml, markdown, sh, text)",
         "",
         "Press `q` to close *ConformInfo*.",

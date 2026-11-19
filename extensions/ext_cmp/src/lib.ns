@@ -440,11 +440,14 @@ fn collect_path_candidates(
 fn keywords_for_mode(mode: String) -> List {
     when {
         mode == "nessa" => [
-            "fn", "pub", "private", "let", "var", "struct", "enum", "impl", "use", "mod",
-            "const", "newtype", "effect", "handles", "async", "await", "if", "else", "while",
-            "for", "in", "match", "when", "return", "break", "continue", "true", "false",
-            "null", "and", "or", "not", "derive", "error", "String", "i64", "f64", "bool",
-            "usize", "Unit", "Any", "List", "HashMap", "Set"
+            "fn", "pub", "private", "let", "var", "struct", "enum", "trait", "assoc", "impl",
+            "extend", "extern", "use", "mod", "const", "global", "newtype", "typealias",
+            "effect", "handles", "catch", "resume", "reset", "shift", "defer", "async", "await",
+            "if", "else", "while", "for", "in", "do", "match", "matches", "when", "case",
+            "return", "break", "continue", "true", "false", "null", "self", "Self", "and", "or",
+            "not", "is", "as", "derive", "error", "lambda", "String", "Bytes", "i64", "i32",
+            "u8", "f64", "bool", "char", "usize", "isize", "Unit", "NoReturn", "Type", "Any",
+            "List", "Map", "HashMap", "Set", "Continuation"
         ],
         mode == "rust" => [
             "fn", "pub", "let", "mut", "struct", "enum", "impl", "trait", "use", "mod",
@@ -1462,6 +1465,36 @@ pub fn collect_candidates(
     let seen_non_snippet = Map.new()
 
     -- 1. Custom registered completion sources on `CmpService` (e.g. LSP) take priority
+    if buf.major_mode == "nessa" {
+        let cur_line_trimmed = buf.line_at(buf.point.row).trim_start()
+        if cur_line_trimmed.starts_with("--%") {
+            let fmt_directives = [
+                (".skip", "Skip formatting the next AST item/statement", "Directive"),
+                (".preserve", "Preserve exact source text of the next item/statement", "Directive"),
+                (".off", "Disable formatter until matching --% .on", "Directive"),
+                (".on", "Re-enable formatter after --% .off", "Directive"),
+                (".max_width = 100", "Override max line width in current scope", "Property"),
+                (".tab_spaces = 4", "Override spaces per indent level", "Property"),
+                (".newline_style = .lf", "Override newline style (.auto | .lf | .crlf)", "Property"),
+                (".use_small_heuristics = .default", "Override width heuristics (.default | .off | .max)", "Property"),
+                (".reorder_imports = true", "Toggle grouping & sorting of use imports", "Property"),
+                (".normalize_comments = false", "Toggle comment spacing normalization", "Property")
+            ]
+            for di in 0..fmt_directives.len() {
+                let (d_insert, d_doc, d_kind) = fmt_directives.get(di.as(usize)).as((String, String, String))
+                let lbl = if prefix.starts_with(".") { d_insert } else { d_insert.slice(1, d_insert.char_len()) }
+                let ditem = CompletionItem {
+                    label: lbl,
+                    insert_text: lbl,
+                    kind: d_kind,
+                    detail: d_doc,
+                }
+                raw_entries.push(ditem)
+                labels.push(lbl)
+                seen_non_snippet.set(lbl, true)
+            }
+        }
+    }
     let cmp_opt = kernel.service(SERVICE_CMP)
     if cmp_opt != null {
         let cmp = cmp_opt.as(CmpService)
@@ -1718,6 +1751,7 @@ pub fn collect_candidates(
 private global _cmp_static_pool_key: String = ""
 private global _cmp_static_pool_entries: ?List = null
 private global _cmp_static_pool_labels: ?List = null
+private global _cmp_last_sig_key: String = ""
 
 fn is_cursor_in_code_line_comment(buf: Buffer, row: i64, col: i64) -> bool {
     let m = buf.major_mode.to_lower()
@@ -2149,6 +2183,7 @@ impl CmpService {
         _last_sig_buf_raw = -1
         self.cached_path_dir = ""
         self.cached_path_entries = List()
+        _cmp_last_sig_key = ""
         if world.signature_help.owner == OWNER_CMP or world.signature_help.owner == "" {
             world.signature_help = SignatureHelpPopup.inactive()
         }
@@ -2197,7 +2232,6 @@ impl CmpService {
                 let _ = self.dismiss(world)
                 return false
             }
-            self.doc_cache.clear()
             world.completion_popup = CompletionPopup {
                 active: true,
                 anchor_pos: Pos.new(p.row, ctx.replace_start_col),
@@ -2235,7 +2269,6 @@ impl CmpService {
             return false
         }
 
-        self.doc_cache.clear()
         world.completion_popup = CompletionPopup {
             active: true,
             anchor_pos: Pos.new(p.row, ctx.replace_start_col),
@@ -2690,6 +2723,11 @@ pub fn register_cmp_extension(kernel: SystemKernel) -> !String Unit {
                         c.update_inline_ghost(w)
                     }
                     c.update_signature_help(kern, w)
+                    let sb = w.active_buffer()
+                    _cmp_last_sig_key = sb.id.raw().to_string()
+                        ++ "|" ++ sb.edit_version.to_string()
+                        ++ "|" ++ sb.point.row.to_string()
+                        ++ "|" ++ sb.point.col.to_string()
                 },
             )
 
@@ -2715,7 +2753,14 @@ pub fn register_cmp_extension(kernel: SystemKernel) -> !String Unit {
                         if ig.active and (b.point.row != ig.row or b.point.col != ig.col) {
                             w.inline_ghost = InlineGhostText.inactive()
                         }
-                        c.update_signature_help(kern, w)
+                        let cur_sig_key = b.id.raw().to_string()
+                            ++ "|" ++ b.edit_version.to_string()
+                            ++ "|" ++ b.point.row.to_string()
+                            ++ "|" ++ b.point.col.to_string()
+                        if _cmp_last_sig_key != cur_sig_key {
+                            _cmp_last_sig_key = cur_sig_key
+                            c.update_signature_help(kern, w)
+                        }
                     }
                 },
             )

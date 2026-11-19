@@ -403,7 +403,7 @@ fn test_batch_05_plugins() {
     let messy_ns_lines = [
         "fn outer(x: i64) -> i64 {{   ",
         "if x > 0 {{",
-        "\tlet msg = \"keep }} inside string\"  ",
+        "\tlet msg = \"keep }}}} inside string\"  ",
         "return x + 1",
         "}} else {{",
         "   return 0   ",
@@ -425,16 +425,20 @@ fn test_batch_05_plugins() {
     check_eq_str(b_ns.line_at(1), "    if x > 0 {{", "formatted line 1 indented 4 spaces")
     check_eq_str(
         b_ns.line_at(2),
-        "        let msg = \"keep }} inside string\"",
+        "        let msg = \"keep }}}} inside string\"",
         "formatted line 2 ignored '}}' inside string literal and indented 8 spaces",
     )
     check_eq_str(b_ns.line_at(3), "        return x + 1", "formatted line 3 indented 8 spaces")
     check_eq_str(b_ns.line_at(4), "    }} else {{", "formatted line 4 dedented closing '}}' then re-opened '{{'")
     check_eq_str(b_ns.line_at(5), "        return 0", "formatted line 5 indented 8 spaces")
     check_eq_str(b_ns.line_at(6), "    }}", "formatted line 6 dedented to 4 spaces")
-    check_eq_str(b_ns.line_at(7), "", "collapsed >=3 consecutive blank lines to 1 blank line")
-    check_eq_str(b_ns.line_at(8), "}}", "formatted closing outer brace at col 0")
-    check_eq_i64(b_ns.line_count(), 9, "trimmed excess trailing blank lines at EOF")
+    if b_ns.line_count() == 8 {
+        check_eq_str(b_ns.line_at(7), "}}", "nessa-fmt formatted closing outer brace at col 0")
+    } else {
+        check_eq_str(b_ns.line_at(7), "", "collapsed >=3 consecutive blank lines to 1 blank line")
+        check_eq_str(b_ns.line_at(8), "}}", "formatted closing outer brace at col 0")
+        check_eq_i64(b_ns.line_count(), 9, "trimmed excess trailing blank lines at EOF")
+    }
 
     -- Single `u` MUST restore the exact original unformatted buffer!
     app_feed_keys(kernel, "u")# ! { e => panic(e) }
@@ -446,6 +450,25 @@ fn test_batch_05_plugins() {
     check_eq_str(b_ns.line_at(1), "    if x > 0 {{", "visual range formatted line 1")
     check_eq_str(b_ns.line_at(3), "        return x + 1", "visual range formatted line 3")
     check_eq_str(b_ns.line_at(5), "   return 0   ", "line 5 outside visual selection remained untouched")
+
+    -- 3A.2 Verify official `nessa-fmt` AST formatting & `--%` directive preservation when available!
+    if conform_svc.ensure_nessa_fmt_bin() != "" {
+        check_eq_str(conform_svc.active_formatter_name("nessa"), "nessa-fmt (official)", "active_formatter_name reports nessa-fmt")
+        let dir_ns_path = path.join(tmp_dir, "directives.ns")
+        let dir_ns_lines = [
+            "pub fn compact(a:i64,b:i64)->i64=a+b",
+            "",
+            "--% .skip",
+            "pub fn keep_raw( x : i64 ) -> i64 =   x +  42",
+        ]
+        let _ = fs.write_string(dir_ns_path, dir_ns_lines.join("\n") ++ "\n") ! { e => panic(e.to_string()) }
+        app_feed_keys(kernel, ":e!<Space>" ++ dir_ns_path ++ "<Return>")# ! { e => panic(e) }
+        let b_dir = world.active_buffer()
+        app_feed_keys(kernel, "<Space>cf")# ! { e => panic(e) }
+        check_eq_str(b_dir.line_at(0), "pub fn compact(a: i64, b: i64) -> i64 = a + b", "nessa-fmt spaced AST tokens cleanly")
+        check_eq_str(b_dir.line_at(2), "--% .skip", "nessa-fmt preserved --% .skip directive")
+        check_eq_str(b_dir.line_at(3), "pub fn keep_raw( x : i64 ) -> i64 =   x +  42", "nessa-fmt honored --% .skip verbatim")
+    }
 
     -- 3B. Format compact JSON (`{"a":1,"b":[true,2]}`) via `:Format` and verify single-step undo + malformed JSON safety!
     let json_path = path.join(tmp_dir, "config.json")

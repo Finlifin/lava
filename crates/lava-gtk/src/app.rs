@@ -3,19 +3,21 @@
 use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, CString};
 use std::mem::transmute;
+use std::ptr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use lava_proto::{EventQueue, FrameSlot, MouseAction, PointerStyle, UiEvent};
 use libc::{c_double, c_int, c_uint, c_void};
 
-use crate::anim::{AnimController, ScrollDeltaAccumulator};
+use crate::anim::{AnimController, ScrollDeltaAccumulator, SnapshotTarget};
 use crate::ffi::{
-    self, CairoT, G_PRIORITY_DEFAULT, G_PRIORITY_DEFAULT_IDLE, G_SOURCE_CONTINUE, G_SOURCE_REMOVE,
-    GClosure, GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES, GdkFrameClock, GtkDrawingArea,
-    GtkEventController, GtkGesture, GtkGestureSingle, GtkWidget, GtkWindow,
+    self, G_PRIORITY_DEFAULT, G_PRIORITY_DEFAULT_IDLE, G_SOURCE_CONTINUE, G_SOURCE_REMOVE,
+    GClosure, GObject, GObjectClass, GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES, GType, GTypeQuery,
+    GdkFrameClock, GtkDrawingArea, GtkDrawingAreaClass, GtkEventController, GtkGesture,
+    GtkGestureSingle, GtkSnapshot, GtkWidget, GtkWidgetClass, GtkWindow,
 };
 use crate::keymap::{translate_gdk_key, translate_modifiers};
 
@@ -388,37 +390,212 @@ unsafe extern "C" fn on_drawing_area_tick(
     }
 }
 
-unsafe extern "C" fn on_drawing_area_draw(
-    area: *mut GtkDrawingArea,
-    cr: *mut CairoT,
-    width: c_int,
-    height: c_int,
-    user_data: *mut c_void,
-) {
-    if cr.is_null() || user_data.is_null() {
+static LAVA_CANVAS_SLOT_OFFSET: AtomicUsize = AtomicUsize::new(0);
+static LAVA_CANVAS_PARENT_CLASS: AtomicUsize = AtomicUsize::new(0);
+static LAVA_CANVAS_TYPE: OnceLock<GType> = OnceLock::new();
+
+unsafe extern "C" fn lava_canvas_instance_init(instance: *mut c_void, _g_class: *mut c_void) {
+    let slot_off = LAVA_CANVAS_SLOT_OFFSET.load(Ordering::Acquire);
+    if !instance.is_null() && slot_off > 0 {
+        // SAFETY: `instance` was allocated by GObject with `slot_off + size_of::<*const GtkAnimSlot>()`
+        // bytes aligned to `*const GtkAnimSlot`.
+        unsafe {
+            let field = instance
+                .cast::<u8>()
+                .add(slot_off)
+                .cast::<*const GtkAnimSlot>();
+            field.write(ptr::null());
+        }
+    }
+}
+
+unsafe extern "C" fn on_canvas_finalize(object: *mut GObject) {
+    let slot_off = LAVA_CANVAS_SLOT_OFFSET.load(Ordering::Acquire);
+    if !object.is_null() && slot_off > 0 {
+        // SAFETY: `object` is a `LavaCanvas` instance being finalized once on the GTK main thread;
+        // takes and drops the owned `Rc<GtkAnimSlot>` stored by `lava_canvas_attach_slot`.
+        unsafe {
+            let field = object
+                .cast::<u8>()
+                .add(slot_off)
+                .cast::<*const GtkAnimSlot>();
+            let slot_ptr = field.replace(ptr::null());
+            if !slot_ptr.is_null() {
+                drop(Rc::from_raw(slot_ptr));
+            }
+        }
+    }
+    let parent_cls_addr = LAVA_CANVAS_PARENT_CLASS.load(Ordering::Acquire);
+    if parent_cls_addr != 0 {
+        // SAFETY: `parent_cls_addr` is the `GtkDrawingArea` parent `GObjectClass` captured in `class_init`.
+        unsafe {
+            let parent_cls = &*(parent_cls_addr as *const GObjectClass);
+            if let Some(parent_finalize) = parent_cls.finalize {
+                parent_finalize(object);
+            }
+        }
+    }
+}
+
+unsafe extern "C" fn lava_canvas_class_init(g_class: *mut c_void, _class_data: *mut c_void) {
+    if g_class.is_null() {
         return;
     }
-    let widget_scale = if !area.is_null() {
-        // SAFETY: `area` is a valid `GtkDrawingArea` (subclass of `GtkWidget`).
-        f64::from(unsafe { ffi::gtk_widget_get_scale_factor(area.cast::<GtkWidget>()) }.max(1))
-    } else {
-        1.0
+    // SAFETY: `g_class` is the newly allocated `GtkDrawingAreaClass` (`parent_class: GtkWidgetClass`,
+    // `parent_class.parent_class: GObjectClass`) verified against `g_type_query` sizes.
+    unsafe {
+        let parent_cls = ffi::g_type_class_peek_parent(g_class);
+        LAVA_CANVAS_PARENT_CLASS.store(parent_cls as usize, Ordering::Release);
+        let obj_cls = &mut *(g_class.cast::<GObjectClass>());
+        obj_cls.finalize = Some(on_canvas_finalize);
+        let widget_cls = &mut *(g_class.cast::<GtkWidgetClass>());
+        widget_cls.snapshot = Some(on_canvas_snapshot);
+    }
+}
+
+fn ensure_lava_canvas_type() -> GType {
+    *LAVA_CANVAS_TYPE.get_or_init(|| {
+        let mut widget_q = GTypeQuery::default();
+        let mut area_q = GTypeQuery::default();
+        // SAFETY: Queries static GType metadata for `GtkWidget` and `GtkDrawingArea`.
+        unsafe {
+            ffi::g_type_query(ffi::gtk_widget_get_type(), &mut widget_q);
+            ffi::g_type_query(ffi::gtk_drawing_area_get_type(), &mut area_q);
+        }
+        assert_eq!(
+            std::mem::size_of::<GtkWidgetClass>(),
+            widget_q.class_size as usize,
+            "GtkWidgetClass C ABI size mismatch against libgtk-4"
+        );
+        assert_eq!(
+            std::mem::size_of::<GtkDrawingAreaClass>(),
+            area_q.class_size as usize,
+            "GtkDrawingAreaClass C ABI size mismatch against libgtk-4"
+        );
+        let align = std::mem::align_of::<*const GtkAnimSlot>();
+        let slot_offset = ((area_q.instance_size as usize) + align - 1) & !(align - 1);
+        let instance_size = slot_offset + std::mem::size_of::<*const GtkAnimSlot>();
+        LAVA_CANVAS_SLOT_OFFSET.store(slot_offset, Ordering::Release);
+
+        // SAFETY: Registers `LavaCanvas` as a static subtype of `GtkDrawingArea` once per process.
+        unsafe {
+            ffi::g_type_register_static_simple(
+                area_q.type_,
+                c"LavaCanvas".as_ptr(),
+                area_q.class_size,
+                Some(lava_canvas_class_init),
+                instance_size as c_uint,
+                Some(lava_canvas_instance_init),
+                0,
+            )
+        }
+    })
+}
+
+unsafe fn create_lava_canvas_widget() -> *mut GtkWidget {
+    let gtype = ensure_lava_canvas_type();
+    if gtype == 0 {
+        return ptr::null_mut();
+    }
+    // SAFETY: `gtype` is a valid `GtkWidget` subtype; `NULL` terminates the varargs property list.
+    unsafe { ffi::g_object_new(gtype, ptr::null()).cast::<GtkWidget>() }
+}
+
+unsafe fn lava_canvas_attach_slot(canvas: *mut GtkWidget, slot_ptr: *const GtkAnimSlot) {
+    let slot_off = LAVA_CANVAS_SLOT_OFFSET.load(Ordering::Acquire);
+    if !canvas.is_null() && slot_off > 0 {
+        // SAFETY: `canvas` is a live `LavaCanvas` widget on the GTK main thread; stores `slot_ptr`
+        // (reclaiming any prior pointer if ever replaced).
+        unsafe {
+            let field = canvas
+                .cast::<u8>()
+                .add(slot_off)
+                .cast::<*const GtkAnimSlot>();
+            let prev = field.replace(slot_ptr);
+            if !prev.is_null() {
+                drop(Rc::from_raw(prev));
+            }
+        }
+    }
+}
+
+/// Queries the exact Wayland/X11 `GdkSurface` fractional scale (`gdk_surface_get_scale`, e.g.
+/// `1.25`, `1.5`, `1.75` on KDE Plasma 6 / GNOME Wayland `wp_fractional_scale_v1`), falling back
+/// to `gtk_widget_get_scale_factor` before the widget is realized.
+///
+/// # Safety
+/// `widget` must be a valid `*mut GtkWidget` on the GTK main thread.
+#[inline]
+unsafe fn query_widget_fractional_scale(widget: *mut GtkWidget) -> f64 {
+    if widget.is_null() {
+        return 1.0;
+    }
+    // SAFETY: `widget` is valid on the GTK main thread; `gtk_widget_get_native` and
+    // `gtk_native_get_surface` return borrowed pointers owned by GTK/GDK.
+    unsafe {
+        let native = ffi::gtk_widget_get_native(widget);
+        if !native.is_null() {
+            let surface = ffi::gtk_native_get_surface(native);
+            if !surface.is_null() {
+                let s = ffi::gdk_surface_get_scale(surface);
+                if s.is_finite() && s > 0.25 {
+                    return s;
+                }
+            }
+        }
+        f64::from(ffi::gtk_widget_get_scale_factor(widget).max(1))
+    }
+}
+
+unsafe extern "C" fn on_canvas_snapshot(widget: *mut GtkWidget, snapshot: *mut GtkSnapshot) {
+    if widget.is_null() || snapshot.is_null() {
+        return;
+    }
+    let slot_off = LAVA_CANVAS_SLOT_OFFSET.load(Ordering::Acquire);
+    if slot_off == 0 {
+        return;
+    }
+    // SAFETY: `widget` is a live `LavaCanvas` (`GtkDrawingArea` subclass) on the GTK main thread.
+    let (slot_ptr, width, height, widget_scale, frame_clock_sec) = unsafe {
+        let ptr_val = *widget
+            .cast::<u8>()
+            .add(slot_off)
+            .cast::<*const GtkAnimSlot>();
+        let w = ffi::gtk_widget_get_width(widget);
+        let h = ffi::gtk_widget_get_height(widget);
+        let scale = query_widget_fractional_scale(widget);
+        let fc = ffi::gtk_widget_get_frame_clock(widget);
+        let fc_sec = if !fc.is_null() {
+            let us = ffi::gdk_frame_clock_get_frame_time(fc);
+            (us > 0).then_some((us as f64) * 1e-6)
+        } else {
+            None
+        };
+        (ptr_val, w, h, scale, fc_sec)
     };
-    let slot_ptr = user_data.cast::<GtkAnimSlot>().cast_const();
-    // SAFETY: `slot_ptr` is a valid `GtkAnimSlot` owned by `drawing_area`'s draw callback on the
-    // GTK main thread, and `cr` is exclusively owned by GTK for this draw invocation.
+    if slot_ptr.is_null() {
+        return;
+    }
+    // SAFETY: `slot_ptr` is owned by `widget` on the single GTK main thread until `on_canvas_finalize`.
     let slot = unsafe { &*slot_ptr };
+    if !slot.shared.alive.load(Ordering::Acquire) {
+        return;
+    }
     let frame = slot.shared.frame_slot.latest();
     let hints = slot.shared.frame_slot.anim_hints();
     let transfer_overlay = slot.shared.frame_slot.transfer_overlay();
     let anim_active = {
         let mut anim = slot.anim.borrow_mut();
-        // SAFETY: `cr` is valid and exclusively owned by GTK for this draw callback invocation.
+        // SAFETY: `snapshot` is valid and owned by GTK for this `GtkWidgetClass.snapshot` call.
         unsafe {
-            anim.render_to_cairo_scaled_with_overlay(
-                cr,
-                (width, height),
-                widget_scale,
+            anim.snapshot_to_gtk(
+                SnapshotTarget {
+                    snapshot,
+                    width,
+                    height,
+                    scale: widget_scale,
+                    frame_clock_sec,
+                },
                 &frame,
                 &hints,
                 transfer_overlay.as_ref(),
@@ -446,7 +623,9 @@ unsafe extern "C" fn on_drawing_area_resize(
     }
     // SAFETY: `area` is a `GtkDrawingArea` (subclass of `GtkWidget`) and `user_data` is valid.
     let (state, scale_factor) = unsafe {
-        let scale = ffi::gtk_widget_get_scale_factor(area.cast::<GtkWidget>()).max(1);
+        let scale = query_widget_fractional_scale(area.cast::<GtkWidget>())
+            .round()
+            .max(1.0) as c_int;
         (&*(user_data.cast::<UiSharedState>()), scale)
     };
     state.event_queue.push(UiEvent::Resize {
@@ -732,7 +911,7 @@ pub fn run_gtk_app_with_final_size(
 
     // SAFETY: GTK4 has been initialized on this thread via `is_display_available()`.
     let (window_widget, drawing_area) =
-        unsafe { (ffi::gtk_window_new(), ffi::gtk_drawing_area_new()) };
+        unsafe { (ffi::gtk_window_new(), create_lava_canvas_widget()) };
     if window_widget.is_null() || drawing_area.is_null() {
         if !window_widget.is_null() {
             // SAFETY: `window_widget` is non-null and not yet presented; destroy to avoid leak.
@@ -740,7 +919,7 @@ pub fn run_gtk_app_with_final_size(
                 ffi::gtk_window_destroy(window_widget.cast::<GtkWindow>());
             }
         }
-        return Err("failed to create GTK4 window or GtkDrawingArea".to_string());
+        return Err("failed to create GTK4 window or LavaCanvas widget".to_string());
     }
     let window = window_widget.cast::<GtkWindow>();
 
@@ -781,7 +960,7 @@ pub fn run_gtk_app_with_final_size(
         scroll_accum: Mutex::new(ScrollDeltaAccumulator::new()),
     });
 
-    // Attach Cairo draw callback and VSync animation tick callback on `GtkDrawingArea`.
+    // Attach GPU-cached `GtkSnapshot` slot on `LavaCanvas`.
     {
         let anim_slot = Rc::new(GtkAnimSlot {
             shared: Arc::clone(&state),
@@ -789,16 +968,10 @@ pub fn run_gtk_app_with_final_size(
             tick_registered: Cell::new(false),
         });
         let slot_ptr = Rc::into_raw(anim_slot);
-        // SAFETY: `drawing_area` is a valid `GtkDrawingArea` on the UI thread; `drop_anim_slot_source`
-        // releases `slot_ptr`, and `ensure_tick_callback` attaches the VSync tick callback.
+        // SAFETY: `drawing_area` is a `LavaCanvas` instance on the UI thread; `on_canvas_finalize`
+        // releases `slot_ptr` when `drawing_area` is destroyed.
         unsafe {
-            ffi::gtk_drawing_area_set_draw_func(
-                drawing_area.cast::<GtkDrawingArea>(),
-                Some(on_drawing_area_draw),
-                slot_ptr.cast_mut().cast::<c_void>(),
-                Some(drop_anim_slot_source),
-            );
-            GtkAnimSlot::ensure_tick_callback(slot_ptr);
+            lava_canvas_attach_slot(drawing_area, slot_ptr);
         }
     }
 
@@ -968,7 +1141,9 @@ pub fn run_gtk_app_with_final_size(
 
 #[cfg(test)]
 mod tests {
-    use super::{GtkAppConfig, get_system_clipboard, set_system_clipboard};
+    use super::{
+        GtkAppConfig, ensure_lava_canvas_type, get_system_clipboard, set_system_clipboard,
+    };
 
     #[test]
     fn clipboard_mirror_roundtrips_headless() {
@@ -979,5 +1154,11 @@ mod tests {
         assert_eq!(cfg.initial_title, "Lava");
         assert_eq!(cfg.initial_width, 1280);
         assert_eq!(cfg.initial_height, 800);
+    }
+
+    #[test]
+    fn lava_canvas_gtype_matches_gtk4_class_abi_sizes() {
+        let gtype = ensure_lava_canvas_type();
+        assert_ne!(gtype, 0, "LavaCanvas GType registration must succeed");
     }
 }

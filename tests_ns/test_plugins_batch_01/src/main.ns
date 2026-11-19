@@ -280,9 +280,9 @@ fn test_ext_comment() -> #[log_event, status_emit, clipboard_get, clipboard_set]
 
     let nbbuf = setup_buffer(world, "nessa", ["  compute(x)"])
     vim_feed_keys(kernel, "gbc")#!
-    assert_str_eq(nbbuf.line_at(0), "  --[[ compute(x) ]]", "nessa gbc wraps with --[[ ... ]]")
+    assert_str_eq(nbbuf.line_at(0), "  {{- compute(x) -}}", "nessa gbc wraps with {{- ... -}}")
     vim_feed_keys(kernel, "gbc")#!
-    assert_str_eq(nbbuf.line_at(0), "  compute(x)", "nessa gbc unwraps --[[ ... ]]")
+    assert_str_eq(nbbuf.line_at(0), "  compute(x)", "nessa gbc unwraps {{- ... -}}")
     ()
 }
 

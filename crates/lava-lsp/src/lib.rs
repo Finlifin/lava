@@ -432,6 +432,27 @@ pub fn which_binary(bin: &str) -> String {
             }
         }
     }
+    if let Some(home) = env::var_os("HOME").filter(|h| !h.is_empty()) {
+        let home_dir = PathBuf::from(home);
+        for rel in [".local/bin", ".cargo/bin"] {
+            let full = home_dir.join(rel).join(trimmed);
+            if let Some(found) = check_executable_with_win_exts(&full) {
+                return found;
+            }
+        }
+    }
+    if matches!(trimmed, "nessa-lsp" | "nessa-fmt" | "nessa")
+        && let Ok(cwd) = env::current_dir()
+    {
+        let mut cur: Option<&Path> = Some(cwd.as_path());
+        while let Some(dir) = cur {
+            let full = dir.join("nessa2/target/release").join(trimmed);
+            if let Some(found) = check_executable_with_win_exts(&full) {
+                return found;
+            }
+            cur = dir.parent();
+        }
+    }
     String::new()
 }
 
