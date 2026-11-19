@@ -651,6 +651,15 @@ fn main() {
     let wm2 = require_window_manager(kernel2) ! { e => panic(e) }
     let help_state = require_help_state(kernel2) ! { e => panic(e) }
     help_state.override_code_roots = [path.join(nessa_root, "src")]
+    -- Force offline builtin-index mode on `kernel2` even when `nessa-lsp` is installed on host
+    configure_lsp_server(
+        kernel2,
+        "nessa",
+        "nessa-lsp-offline-harmony-sentinel",
+        List(),
+        ["package.toml"],
+        "",
+    ) ! { e => panic("configure offline nessa sentinel: " ++ e) }
 
     handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let _cap2 = TestHostCap.new(world2)
 
@@ -690,6 +699,42 @@ fn main() {
     let ns_fw_txt = ns_fw_opt.as(FloatingWindow).lines.join("\n")
     check_true(ns_fw_txt.contains("pub fn orbital_score"), "`*lsp-hover*` shows Nessa signature")
     check_true(ns_fw_txt.contains("Evaluates orbital harmonic score"), "`*lsp-hover*` shows Nessa `--` doc comment")
+
+    -- ========================================================================
+    -- 6. Live `nessa-lsp` Stdio Integration (Auto-Detected Preset, Hover & `gd`)!
+    -- ========================================================================
+    let kernel3 = boot_full_lsp_kernel(false)
+    let world3 = require_editor_world(kernel3) ! { e => panic(e) }
+    let wm3 = require_window_manager(kernel3) ! { e => panic(e) }
+    let reg3 = require_lspconfig_registry(kernel3) ! { e => panic(e) }
+    let lsp3 = require_lsp_service(kernel3) ! { e => panic(e) }
+    handles(log_event) handles(status_emit) handles(clipboard_get) handles(clipboard_set) let _cap3 = TestHostCap.new(world3)
+
+    let nessa_preset = reg3.get_preset("nessa").as(LspLanguagePreset)
+    if nessa_preset.installed {
+        world3.cwd = nessa_root
+        let live_nbuf = world3.open_file(ns_file)# ! { e => panic("open live lib.ns: " ++ e) }
+        kernel3.emit_hook("buffer-opened", live_nbuf.id)
+        wm3.sync_from_world(world3)
+        check_true(
+            world3.statusline_right_extra.contains("[LSP: nessa"),
+            "Live nessa-lsp attached to .ns buffer: " ++ world3.statusline_right_extra,
+        )
+        let def_r = find_line_with(live_nbuf, "pub fn orbital_score")
+        let call_r = find_line_with(live_nbuf, "let res = orbital_score(6)")
+        let call_c = live_nbuf.line_at(call_r).find_indices("orbital_score").get(0).as(i64)
+        live_nbuf.point = Pos.new(call_r, call_c)
+        feed(kernel3, "gd")#
+        check_eq_i64(live_nbuf.point.row, def_r, "Live nessa-lsp `gd` jumped to `pub fn orbital_score`")
+
+        live_nbuf.point = Pos.new(call_r, call_c)
+        feed(kernel3, "K")#
+        let live_fw_opt = world3.get_floating_window(LSP_HOVER_FLOAT_ID)
+        check_true(live_fw_opt != null, "Live nessa-lsp `K` opened `*lsp-hover*` float")
+        let live_fw_txt = live_fw_opt.as(FloatingWindow).lines.join("\n")
+        check_true(live_fw_txt.contains("orbital_score"), "Live nessa-lsp hover describes `orbital_score`")
+        lsp3.notify_buffer_closed(live_nbuf.id, ns_file)
+    }
 
     -- Clean up temp fixture directory
     let _ = fs.remove_dir(base_dir, recursive = true) ! { _ => () }

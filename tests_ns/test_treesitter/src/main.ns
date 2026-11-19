@@ -97,9 +97,31 @@ fn run_treesitter_suite() {
     check_eq_i64(first_span.start_col, 0, "first span starts at col 0 ('pub')")
     check_eq_i64(first_span.end_col, 3, "first span ends at col 3 ('pub')")
 
-    let snippet_rows = accel_ts_highlight_snippet("pub fn add(a: i64, b: i64) -> i64 = a + b", "nessa")
-    check_eq_i64(snippet_rows.len(), 1, "nessa snippet returns 1 row")
-    check_true(snippet_rows.get(0).as(List).len() >= 4, "nessa snippet highlights pub, fn, add, types")
+    let snippet_rows = accel_ts_highlight_snippet("--% .skip\npub fn add(a: i64, b: i64) -> i64 = a + b", "nessa")
+    check_eq_i64(snippet_rows.len(), 2, "nessa snippet returns 2 rows")
+    check_true(snippet_rows.get(0).as(List).len() >= 1, "nessa --% directive row has highlight span")
+    check_eq_i64(snippet_rows.get(0).as(List).get(0).as(TsSpan).hl_group, 4, "nessa --% directive highlights as Macro/Attr (4)")
+    check_true(snippet_rows.get(1).as(List).len() >= 4, "nessa snippet highlights pub, fn, add, types")
+
+    let ns_demo_path = path.join(tmp_dir, "demo.ns")
+    let ns_demo_code = "--% .max_width = 100\npub fn calc(x: i64) -> i64 = x + 1\n"
+    let _ = fs.write_string(ns_demo_path, ns_demo_code) ! { e => panic(e.to_string()) }
+    app_feed_keys(kernel, ":e!<Space>" ++ ns_demo_path ++ "<Return>")# ! { e => panic(e) }
+    let nbuf = world.active_buffer()
+    check_eq_str(nbuf.major_mode, "nessa", "demo.ns major_mode == nessa")
+    nbuf.sync_external_lines()
+    nbuf.point = Pos.new(0, 2)
+    app_feed_keys(kernel, "<Space>uI")# ! { e => panic(e) }
+    let nfw_opt = find_float_by_id(world, FLOAT_TREESITTER_INSPECT)
+    check_true(nfw_opt != null, "<Space> u I opens treesitter_inspect float on demo.ns")
+    let nfw_txt = nfw_opt.as(FloatingWindow).lines.join("\n")
+    check_true(nfw_txt.contains("nessa"), "inspector float mentions nessa language")
+    if loaded {
+        check_true(nfw_txt.contains("format_directive"), "tree-sitter-nessa CST reports format_directive node")
+    }
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+    app_feed_keys(kernel, ":e!<Space>" ++ rs_path ++ "<Return>")# ! { e => panic(e) }
+    let rbuf = world.active_buffer()
 
     -- Place cursor on `Point` (row 0, col 12) and trigger `<Space> u I` (`treesitter-inspect`)
     rbuf.point = Pos.new(0, 12)

@@ -743,6 +743,19 @@ fn on_trouble_burst_guarded_hook(kern: SystemKernel, payload: Any) {
     }
     let service = t_opt.as(TroubleService)
     let buf = resolve_hook_buffer(world, payload)
+    if world.mode_name == "INSERT" and buf.line_count() > 2000 {
+        return
+    }
+    if service.last_scan_buf_id == buf.id and service.last_scan_ver == buf.edit_version {
+        let cached_opt = service.cache_by_buf.get(buf.id)
+        if cached_opt != null {
+            let cached = cached_opt.as(CachedBufState)
+            if cached.edit_version == buf.edit_version
+                and (not viewport_escaped_trouble_window(world, buf.line_count(), cached.win_start, cached.win_end)) {
+                return
+            }
+        }
+    }
     if is_analyzable_buffer(buf) {
         let _ = ensure_buffer_analyzed(world, service, buf)
     }

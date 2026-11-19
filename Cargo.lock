@@ -415,6 +415,7 @@ dependencies = [
  "runtime",
  "rustc_span",
  "sha2",
+ "source_span",
  "str_interner",
  "type_pool",
  "wasm",

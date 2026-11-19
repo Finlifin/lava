@@ -89,6 +89,28 @@ pub fn scan_executable_in_path(bin: String, extra_dirs: List) -> String {
     }
     let path_env = env.get_or("PATH", "")
     let dirs = path_env.split(":")
+    let home_dir = env.get_or("HOME", "")
+    if home_dir != "" {
+        dirs.push(path.join(home_dir, ".local/bin"))
+        dirs.push(path.join(home_dir, ".cargo/bin"))
+    }
+    if trimmed == "nessa-lsp" or trimmed == "nessa-fmt" or trimmed == "nessa" {
+        var cur = path.normalize(env.get_or("PWD", "."))
+        var guard: i64 = 0
+        while guard < 8 and cur != "" {
+            let sibling_rel = path.join(cur, "nessa2/target/release")
+            if fs.exists(sibling_rel) and fs.is_dir(sibling_rel) {
+                dirs.push(sibling_rel)
+                break
+            }
+            let par_opt = path.parent(cur)
+            if par_opt == null or par_opt.as(String) == cur {
+                break
+            }
+            cur = par_opt.as(String)
+            guard += 1
+        }
+    }
     for i in 0..dirs.len() {
         let d = dirs.get(i.as(usize)).as(String).trim()
         if d != "" {
@@ -140,13 +162,16 @@ private fn build_builtin_18_presets() -> List {
         make_preset(
             "nessa",
             "Nessa",
-            [cand("nessa-lsp", List())],
+            [
+                cand("nessa-lsp", ["--stdio"]),
+                cand("nessa", ["lsp", "--stdio"])
+            ],
             ["nessa", ".ns"],
             [".ns"],
-            ["package.toml", "AGENTS.md"],
-            "cargo build --release -p nessa-lsp (or built-in Nessa analyzer)",
+            ["package.toml", "nessafmt.toml"],
+            "cargo build --release -p nessa-lsp -p nessa-fmt && install -Dm755 target/release/nessa-lsp target/release/nessa-fmt -t ~/.local/bin",
             "{{}}",
-            "Nessa language server & built-in workspace symbol/effect analyzer",
+            "Official Nessa language server (nessa-lsp: types, effects, diagnostics, fmt & --% directives)",
         ),
         -- 2. Rust
         make_preset(

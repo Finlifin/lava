@@ -525,6 +525,9 @@ fn on_aerial_burst_guarded_hook(k: SystemKernel, _payload: Any) {
     if world.in_key_burst {
         return
     }
+    if world.mode_name == "INSERT" and world.active_buffer().line_count() > 2000 {
+        return
+    }
     update_aerial(world, s_opt.as(AerialService), force = false)
 }
 

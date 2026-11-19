@@ -1406,6 +1406,9 @@ fn on_colorizer_sync_hook(kern: SystemKernel, payload: Any) {
     let world = w_opt.as(EditorWorld)
     let service = s_opt.as(ColorizerService)
     let buf = resolve_colorizer_hook_buf(world, payload)
+    if world.mode_name == "INSERT" and buf.line_count() > 2000 {
+        return
+    }
     refresh_buffer_colorizer(world, service, buf, false)
 }
 
@@ -1421,6 +1424,9 @@ fn on_colorizer_burst_guarded_hook(kern: SystemKernel, payload: Any) {
     }
     let service = s_opt.as(ColorizerService)
     let buf = resolve_colorizer_hook_buf(world, payload)
+    if world.mode_name == "INSERT" and buf.line_count() > 2000 {
+        return
+    }
     refresh_buffer_colorizer(world, service, buf, false)
 }
 

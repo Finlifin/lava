@@ -762,6 +762,18 @@ fn on_todo_burst_guarded_hook(kern: SystemKernel, payload: Any) {
     }
     let service = s_opt.as(TodoCommentsService)
     let buf = resolve_todo_hook_buf(world, payload)
+    if world.mode_name == "INSERT" and buf.line_count() > 2000 {
+        return
+    }
+    if service.last_scan_buf_id == buf.id and service.last_scan_ver == buf.edit_version {
+        let win_opt = service.last_win_by_buf.get(buf.id)
+        if win_opt != null {
+            let (ws, we) = win_opt.as((i64, i64))
+            if not viewport_escaped_todo_window(world, buf.line_count(), ws, we) {
+                return
+            }
+        }
+    }
     let _ = sync_buffer_todos(world, service, buf, false)
 }
 

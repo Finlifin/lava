@@ -71,7 +71,7 @@ impl JsonValue {
     }
 
     pub fn to_json_string(&self) -> String {
-        let mut out = String::new();
+        let mut out = String::with_capacity(256);
         self.write_to(&mut out);
         out
     }
@@ -117,21 +117,37 @@ impl JsonValue {
 }
 
 fn write_escaped_str(out: &mut String, s: &str) {
+    out.reserve(s.len() + 2);
     out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{0008}' => out.push_str("\\b"),
-            '\u{000C}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
+    let bytes = s.as_bytes();
+    let mut chunk_start = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        let esc = match b {
+            b'"' => "\\\"",
+            b'\\' => "\\\\",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            b'\t' => "\\t",
+            0x08 => "\\b",
+            0x0C => "\\f",
+            c if c < 0x20 => {
+                if chunk_start < i {
+                    out.push_str(&s[chunk_start..i]);
+                }
+                out.push_str(&format!("\\u{:04x}", u32::from(c)));
+                chunk_start = i + 1;
+                continue;
             }
-            c => out.push(c),
+            _ => continue,
+        };
+        if chunk_start < i {
+            out.push_str(&s[chunk_start..i]);
         }
+        out.push_str(esc);
+        chunk_start = i + 1;
+    }
+    if chunk_start < s.len() {
+        out.push_str(&s[chunk_start..]);
     }
     out.push('"');
 }

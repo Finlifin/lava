@@ -588,8 +588,26 @@ fn populate_builtin_snippets(svc: SnippetService) {
     svc.register_snippet(
         "nessa",
         "enum",
-        "pub enum ${{1:Name}} {{\n\tpub ${{2:Variant}},\n\t$0\n}}",
-        "Enum declaration",
+        "pub enum ${{1:Name}} {{\n\tpub ${{2:variant}},\n\t$0\n}}",
+        "Value enum declaration (snake_case variants)",
+    )
+    svc.register_snippet(
+        "nessa",
+        "errenum",
+        "pub enum ${{1:MyError}} {{\n\tpub ${{2:Failed}},\n\t$0\n}}",
+        "Error enum declaration (PascalCase variants)",
+    )
+    svc.register_snippet(
+        "nessa",
+        "effect",
+        "pub effect ${{1:op_name}}(${{2:arg}}: ${{3:i64}}) -> ${{4:Unit}}",
+        "Algebraic effect declaration",
+    )
+    svc.register_snippet(
+        "nessa",
+        "fmtskip",
+        "--% .skip\n$0",
+        "nessa-fmt skip next item directive",
     )
     svc.register_snippet(
         "nessa",
