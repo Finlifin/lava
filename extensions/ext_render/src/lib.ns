@@ -621,20 +621,38 @@ fn is_plain_code_char(c: char) -> bool {
 }
 
 fn tokenize_code_line(line: String, mode: String, theme: ThemePalette) -> List {
+    tokenize_code_line_in_block(line, mode, theme, false)
+}
+
+fn tokenize_code_line_in_block(line: String, mode: String, theme: ThemePalette, in_block: bool) -> List {
     let runs = List()
     if line == "" {
         return runs
     }
 
+    let supports_c_block = mode == "c" or mode == "rust" or mode == "js" or mode == "css" or mode == "sql"
+    let cs = line.chars()
+    let n = cs.len()
+    var i: i64 = 0
+    if in_block and supports_c_block {
+        var end_c: i64 = 0
+        while end_c + 1 < n and not (char_at_list(cs, end_c) == '*' and char_at_list(cs, end_c + 1) == '/') {
+            end_c += 1
+        }
+        if end_c + 1 >= n {
+            push_run(runs, 0, line, theme.syn_comment, false, true)
+            return runs
+        }
+        push_run(runs, 0, line.slice(0, end_c + 2), theme.syn_comment, false, true)
+        i = end_c + 2
+    }
+
     -- C/C++ preprocessor directive (`#include`, `#define`, ...) — NOT CSS `#id` or JS `#priv`!
-    if mode == "c" and line.trim_start().starts_with("#") {
+    if i == 0 and mode == "c" and line.trim_start().starts_with("#") {
         push_run(runs, 0, line, theme.accent, false, false)
         return runs
     }
 
-    let cs = line.chars()
-    let n = cs.len()
-    var i: i64 = 0
     var prev_word = ""
     while i < n {
         let ch = char_at_list(cs, i)
@@ -2240,6 +2258,118 @@ fn tokenize_diff_line(line: String, theme: ThemePalette) -> List {
         },
     }
     runs
+}
+
+private global _bc_doc_id: i64 = -1
+private global _bc_edit_ver: i64 = -1
+private global _bc_mode: String = ""
+private global _bc_max_row: i64 = -1
+private global _bc_states: ?List = null
+
+fn block_comment_code_mode(major_mode: String) -> String {
+    let m = major_mode.to_lower()
+    when {
+        m == "c" or m == "cpp" or m == "c++" or m == "cc" or m == "h" or m == "hpp" or m == "java" => "c",
+        m == "rust" or m == "rs" or m == "go" or m == "golang" or m == "zig" => "rust",
+        m == "javascript" or m == "js" or m == "jsx" or m == "typescript" or m == "ts" or m == "tsx" => "js",
+        m == "css" or m == "scss" or m == "less" => "css",
+        m == "sql" => "sql",
+        else => "",
+    }
+}
+
+fn advance_c_block_comment_state(line: String, in_block: bool) -> bool {
+    if (not in_block) and (not line.contains("/*")) {
+        return false
+    }
+    if in_block and (not line.contains("*/")) {
+        return true
+    }
+    let cs = line.chars()
+    let n = cs.len()
+    var i: i64 = 0
+    var cur_block = in_block
+    var quote: char = '\0'
+    while i < n {
+        let ch = char_at_list(cs, i)
+        let c1 = if i + 1 < n { char_at_list(cs, i + 1) } else { '\0' }
+        if cur_block {
+            if ch == '*' and c1 == '/' {
+                cur_block = false
+                i += 2
+                continue
+            }
+            i += 1
+            continue
+        }
+        if quote != '\0' {
+            if ch == '\\' {
+                i += 2
+                continue
+            }
+            if ch == quote {
+                quote = '\0'
+            }
+            i += 1
+            continue
+        }
+        if ch == '/' and c1 == '/' {
+            break
+        }
+        if ch == '/' and c1 == '*' {
+            cur_block = true
+            i += 2
+            continue
+        }
+        if ch == '"' or ch == '\'' {
+            quote = ch
+        }
+        i += 1
+    }
+    cur_block
+}
+
+fn get_cached_block_comment_states(buf: Buffer, major_mode: String, last_vis_row: i64) -> List {
+    let bmode = block_comment_code_mode(major_mode)
+    if bmode == "" or last_vis_row < 0 {
+        return List()
+    }
+    let lim = if last_vis_row <= buf.max_row() { last_vis_row } else { buf.max_row() }
+    if _bc_doc_id == buf.doc_id
+        and _bc_edit_ver == buf.edit_version
+        and _bc_mode == bmode
+        and _bc_max_row >= lim
+        and _bc_states != null {
+        return _bc_states.as(List)
+    }
+    let lines = buf.slice_lines(0, lim + 1)
+    let states = List()
+    var in_block = false
+    for r in 0..lines.len() {
+        states.push(in_block)
+        in_block = advance_c_block_comment_state(lines.get(r.as(usize)).as(String), in_block)
+    }
+    _bc_doc_id = buf.doc_id
+    _bc_edit_ver = buf.edit_version
+    _bc_mode = bmode
+    _bc_max_row = lim
+    _bc_states = states
+    states
+}
+
+pub fn tokenize_line_with_block_state(
+    line: String,
+    major_mode: String,
+    theme: ThemePalette,
+    in_block_comment: bool,
+) -> List {
+    if in_block_comment {
+        let bmode = block_comment_code_mode(major_mode)
+        if bmode != "" {
+            return tokenize_code_line_in_block(line, bmode, theme, true)
+        }
+    }
+    tokenize_line(line, major_mode, theme)
 }
 
 -- Produce contiguous `(start_col: i64, text: String, color: i64, bold: bool, italic: bool)` runs.
@@ -4496,6 +4626,11 @@ fn render_window_pane(
     } else {
         (List(), first_vis_row)
     }
+    let bc_entry_states = if (not is_markdown_buf) and ts_viewport_rows.is_empty() and last_vis_row >= 0 {
+        get_cached_block_comment_states(buf, buf.major_mode, last_vis_row)
+    } else {
+        List()
+    }
 
     let show_indent_guides = world.options.indent_guides and should_render_indent_guides(buf.major_mode)
     let indent_step = if world.options.shiftwidth > 0 { world.options.shiftwidth } else { tabstop }
@@ -4786,7 +4921,9 @@ fn render_window_pane(
                 let row_ts = ts_viewport_rows.get((buf_row - ts_base_row).as(usize)).as(List)
                 ts_spans_to_runs(raw_line, row_ts, theme)
             } else {
-                tokenize_line(raw_line, buf.major_mode, theme)
+                let row_in_block = buf_row >= 0 and buf_row < bc_entry_states.len()
+                    and bc_entry_states.get(buf_row.as(usize)).as(bool)
+                tokenize_line_with_block_state(raw_line, buf.major_mode, theme, row_in_block)
             }
 
             if has_row_ghost {
