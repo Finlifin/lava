@@ -1558,12 +1558,25 @@ pub(crate) fn draw_transfer_progress_overlay(
         ColorRgba::from_rgba(49, 50, 68, 255),
         4.0,
     );
-    let fill_w = (bar_w * frac).max(if ov.bytes_done > 0 { 6.0 } else { 0.0 });
-    if fill_w > 0.0 {
-        canvas.fill_rect(
+    let (pill_x, pill_w) = if ov.bytes_total > 0 {
+        (
             bar_x,
+            (bar_w * frac).max(if ov.bytes_done > 0 { 6.0 } else { 0.0 }),
+        )
+    } else {
+        let phase_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| (d.as_millis() % 1400) as u64);
+        let t = phase_ms as f64 / 1400.0;
+        let wave = 0.5 - 0.5 * (t * std::f64::consts::TAU).cos();
+        let w = (bar_w * 0.28).max(24.0);
+        (bar_x + (bar_w - w).max(0.0) * wave, w)
+    };
+    if pill_w > 0.0 {
+        canvas.fill_rect(
+            pill_x,
             bar_y,
-            fill_w,
+            pill_w,
             bar_h,
             ColorRgba::from_rgba(137, 180, 250, 255),
             4.0,

@@ -90,6 +90,7 @@ pub struct RemoteTunnelInfo {
 }
 
 pub const HTTP_TRANSFER_THRESHOLD_BYTES: i64 = 524288
+pub const REMOTE_WAKE_TIMER_ID: i64 = 1380799488 -- `0x524D5400`
 
 pub struct RemoteTransferProgress {
     pub active: bool,
@@ -397,11 +398,20 @@ fn resolve_mock_local_path(uri: RemoteTarget) -> ?String {
 -- 3. Host-Bridged Remote Operations (`remote_*` + Mock Mount Fallback)
 -- ============================================================================
 
+private global g_host_avail_state: i64 = -1
+private global g_has_submitted_async: bool = false
+
 pub fn remote_host_available() -> bool {
+    if g_host_avail_state >= 0 {
+        return g_host_avail_state == 1
+    }
     let raw! = runtime.host_call("remote_available", List()) else {
+        g_host_avail_state = 0
         return false
     }
-    raw.as(bool)
+    let avail = raw.as(bool)
+    g_host_avail_state = if avail { 1 } else { 0 }
+    avail
 }
 
 pub fn remote_register_profile(
@@ -1562,4 +1572,1049 @@ pub fn remote_port_forward_list() -> List {
         }
     }
     out
+}
+
+-- ============================================================================
+-- 4. Server-Computed Minimal Render Slices, Non-Blocking Async Slots &
+--    Live Spinner / Shimmer Animation Primitives
+-- ============================================================================
+
+pub struct RemoteRankedFile {
+    pub full_uri: String,
+    pub rel_path: String,
+    pub is_dir: bool,
+    pub score: i64,
+}
+
+pub struct RemoteRankedFiles {
+    pub total_indexed: i64,
+    pub total_matched: i64,
+    pub items: List,
+}
+
+pub struct RemotePreviewWindow {
+    pub lines: List,
+    pub start_row: i64,
+    pub total_lines: i64,
+    pub is_binary: bool,
+    pub truncated: bool,
+    pub total_size: i64,
+}
+
+pub struct RemoteSnapParent {
+    pub name: String,
+    pub full_uri: String,
+    pub is_dir: bool,
+}
+
+pub struct RemoteSnapEntry {
+    pub name: String,
+    pub full_uri: String,
+    pub remote_path: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub is_exec: bool,
+    pub size: i64,
+    pub modified_secs: i64,
+    pub perms: String,
+    pub symlink_target: String,
+    pub git_badge: String,
+}
+
+pub struct RemoteSnapChild {
+    pub name: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub size: i64,
+}
+
+pub struct RemoteSnapPreview {
+    pub kind: String,
+    pub target_uri: String,
+    pub target_name: String,
+    pub total_count: i64,
+    pub total_size: i64,
+    pub lines: List,
+    pub child_entries: List,
+}
+
+pub struct RemoteDirSnap {
+    pub resolved_uri: String,
+    pub parent_uri: String,
+    pub parent_entries: List,
+    pub entries: List,
+    pub git_is_repo: bool,
+    pub git_root_uri: String,
+    pub git_branch: String,
+    pub git_staged: i64,
+    pub git_modified: i64,
+    pub git_untracked: i64,
+    pub preview: RemoteSnapPreview,
+}
+
+pub struct RemoteGitSummary {
+    pub is_repo: bool,
+    pub root: String,
+    pub branch: String,
+    pub staged_count: i64,
+    pub modified_count: i64,
+    pub untracked_count: i64,
+}
+
+pub struct RemoteGitHunk {
+    pub old_start: i64,
+    pub old_count: i64,
+    pub new_start: i64,
+    pub new_count: i64,
+    pub kind: String,
+}
+
+pub struct RemoteTodoHit {
+    pub full_uri: String,
+    pub row: i64,
+    pub col: i64,
+    pub tag: String,
+    pub text: String,
+}
+
+pub struct RemoteAsyncPoll {
+    pub status: String,
+    pub seq: i64,
+    pub elapsed_ms: i64,
+    pub payload: Any,
+    pub error_msg: String,
+}
+
+private global g_ui_async_enabled: bool = false
+private global g_anim_tick: i64 = 0
+private global g_mock_async_slots: ?HashMap = null
+private global g_mock_async_seq: i64 = 1
+
+pub fn remote_ui_async_enabled() -> bool = g_ui_async_enabled
+
+pub fn remote_set_ui_async_enabled(enabled: bool) {
+    g_ui_async_enabled = enabled
+}
+
+pub fn remote_advance_anim_tick() {
+    g_anim_tick += 1
+}
+
+pub fn remote_anim_tick_count() -> i64 = g_anim_tick
+
+pub fn remote_spinner_frame() -> String {
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    let idx = (if g_anim_tick >= 0 { g_anim_tick } else { 0 }) % frames.len()
+    frames.get(idx.as(usize)).as(String)
+}
+
+pub fn remote_shimmer_bar(.width: i64 = 12) -> String {
+    let w = if width >= 6 { width } else { 6 }
+    let span = w - 2
+    let cycle = if span > 1 { span * 2 - 2 } else { 1 }
+    let t = (if g_anim_tick >= 0 { g_anim_tick } else { 0 }) % cycle
+    let head = if t < span { t } else { cycle - t }
+    var out = ""
+    for i in 0..w {
+        if i == head or i == head + 1 {
+            out = out ++ "━"
+        } else if i == head + 2 {
+            out = out ++ "╸"
+        } else {
+            out = out ++ "─"
+        }
+    }
+    "[" ++ out ++ "]"
+}
+
+pub fn remote_set_test_delay_ms(ms: i64) {
+    let _ = runtime.host_call("remote_set_test_delay_ms", [ms]) ! { _ => () }
+}
+
+pub fn decode_remote_ranked_files(raw: Any) -> RemoteRankedFiles {
+    let f = raw.as(List)
+    let total_indexed = f.get(0).as(i64)
+    let total_matched = f.get(1).as(i64)
+    let arr = f.get(2).as(List)
+    let items = List()
+    for i in 0..arr.len() {
+        let r = arr.get(i.as(usize)).as(List)
+        items.push(RemoteRankedFile {
+            full_uri: r.get(0).as(String),
+            rel_path: r.get(1).as(String),
+            is_dir: r.get(2).as(bool),
+            score: r.get(3).as(i64),
+        })
+    }
+    RemoteRankedFiles {
+        total_indexed: total_indexed,
+        total_matched: total_matched,
+        items: items,
+    }
+}
+
+pub fn decode_remote_grep_ext(raw: Any) -> (i64, List) {
+    let f = raw.as(List)
+    let total_matched = f.get(0).as(i64)
+    let arr = f.get(1).as(List)
+    let hits = List()
+    for i in 0..arr.len() {
+        let r = arr.get(i.as(usize)).as(List)
+        hits.push(RemoteGrepMatch {
+            full_uri: r.get(0).as(String),
+            row: r.get(1).as(i64),
+            col: r.get(2).as(i64),
+            line_text: r.get(3).as(String),
+        })
+    }
+    (total_matched, hits)
+}
+
+pub fn decode_remote_preview_window(raw: Any) -> RemotePreviewWindow {
+    let f = raw.as(List)
+    RemotePreviewWindow {
+        lines: f.get(0).as(List),
+        start_row: f.get(1).as(i64),
+        total_lines: f.get(2).as(i64),
+        is_binary: f.get(3).as(bool),
+        truncated: f.get(4).as(bool),
+        total_size: f.get(5).as(i64),
+    }
+}
+
+pub fn decode_remote_snap_preview(raw: Any) -> RemoteSnapPreview {
+    let f = raw.as(List)
+    let raw_ch = f.get(6).as(List)
+    let children = List()
+    for i in 0..raw_ch.len() {
+        let c = raw_ch.get(i.as(usize)).as(List)
+        children.push(RemoteSnapChild {
+            name: c.get(0).as(String),
+            is_dir: c.get(1).as(bool),
+            is_symlink: c.get(2).as(bool),
+            size: c.get(3).as(i64),
+        })
+    }
+    RemoteSnapPreview {
+        kind: f.get(0).as(String),
+        target_uri: f.get(1).as(String),
+        target_name: f.get(2).as(String),
+        total_count: f.get(3).as(i64),
+        total_size: f.get(4).as(i64),
+        lines: f.get(5).as(List),
+        child_entries: children,
+    }
+}
+
+pub fn decode_remote_dir_snap(raw: Any) -> RemoteDirSnap {
+    let f = raw.as(List)
+    let raw_p = f.get(2).as(List)
+    let parents = List()
+    for i in 0..raw_p.len() {
+        let p = raw_p.get(i.as(usize)).as(List)
+        parents.push(RemoteSnapParent {
+            name: p.get(0).as(String),
+            full_uri: p.get(1).as(String),
+            is_dir: p.get(2).as(bool),
+        })
+    }
+    let raw_e = f.get(3).as(List)
+    let entries = List()
+    for i in 0..raw_e.len() {
+        let e = raw_e.get(i.as(usize)).as(List)
+        entries.push(RemoteSnapEntry {
+            name: e.get(0).as(String),
+            full_uri: e.get(1).as(String),
+            remote_path: e.get(2).as(String),
+            is_dir: e.get(3).as(bool),
+            is_symlink: e.get(4).as(bool),
+            is_exec: e.get(5).as(bool),
+            size: e.get(6).as(i64),
+            modified_secs: e.get(7).as(i64),
+            perms: e.get(8).as(String),
+            symlink_target: e.get(9).as(String),
+            git_badge: e.get(10).as(String),
+        })
+    }
+    RemoteDirSnap {
+        resolved_uri: f.get(0).as(String),
+        parent_uri: f.get(1).as(String),
+        parent_entries: parents,
+        entries: entries,
+        git_is_repo: f.get(4).as(bool),
+        git_root_uri: f.get(5).as(String),
+        git_branch: f.get(6).as(String),
+        git_staged: f.get(7).as(i64),
+        git_modified: f.get(8).as(i64),
+        git_untracked: f.get(9).as(i64),
+        preview: decode_remote_snap_preview(f.get(10)),
+    }
+}
+
+pub fn decode_remote_git_summary(raw: Any) -> RemoteGitSummary {
+    let f = raw.as(List)
+    RemoteGitSummary {
+        is_repo: f.get(0).as(bool),
+        root: f.get(1).as(String),
+        branch: f.get(2).as(String),
+        staged_count: f.get(3).as(i64),
+        modified_count: f.get(4).as(i64),
+        untracked_count: f.get(5).as(i64),
+    }
+}
+
+pub fn decode_remote_git_hunks(raw: Any) -> (bool, List) {
+    let f = raw.as(List)
+    let tracked = f.get(0).as(bool)
+    let arr = f.get(1).as(List)
+    let hunks = List()
+    for i in 0..arr.len() {
+        let h = arr.get(i.as(usize)).as(List)
+        hunks.push(RemoteGitHunk {
+            old_start: h.get(0).as(i64),
+            old_count: h.get(1).as(i64),
+            new_start: h.get(2).as(i64),
+            new_count: h.get(3).as(i64),
+            kind: h.get(4).as(String),
+        })
+    }
+    (tracked, hunks)
+}
+
+pub fn decode_remote_git_blame_opt(raw: Any) -> ?RemoteGitBlame {
+    let f = raw.as(List)
+    if f.is_empty() or (not f.get(0).as(bool)) {
+        return null
+    }
+    return (RemoteGitBlame {
+        commit_short: f.get(1).as(String),
+        author: f.get(2).as(String),
+        date_ymd: f.get(3).as(String),
+        summary: f.get(4).as(String),
+    })
+}
+
+pub fn decode_remote_todos(raw: Any) -> List {
+    let arr = raw.as(List)
+    let out = List()
+    for i in 0..arr.len() {
+        let r = arr.get(i.as(usize)).as(List)
+        out.push(RemoteTodoHit {
+            full_uri: r.get(0).as(String),
+            row: r.get(1).as(i64),
+            col: r.get(2).as(i64),
+            tag: r.get(3).as(String),
+            text: r.get(4).as(String),
+        })
+    }
+    out
+}
+
+pub fn decode_remote_readdir_items(raw: Any) -> List {
+    let arr = raw.as(List)
+    let out = List()
+    for i in 0..arr.len() {
+        let r = arr.get(i.as(usize)).as(List)
+        out.push(RemoteDirItem {
+            name: r.get(0).as(String),
+            full_uri: r.get(1).as(String),
+            remote_path: r.get(2).as(String),
+            is_dir: r.get(3).as(bool),
+            size: r.get(4).as(i64),
+        })
+    }
+    out
+}
+
+pub fn remote_search_files_ranked(
+    uri: String,
+    query: String,
+    .include_hidden: bool = false,
+    .include_dirs: bool = false,
+    .limit: i64 = 150,
+) -> !String RemoteRankedFiles {
+    let parsed = parse_ssh_uri(uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let lp = local_opt.as(String)
+        let accel_raw = runtime.host_call(
+            "accel_search_files_ranked",
+            [lp, query, include_hidden, include_dirs, limit],
+        )!
+        let top = accel_raw.as(List)
+        let total_indexed = top.get(0).as(i64)
+        let total_matched = top.get(1).as(i64)
+        let rows = top.get(2).as(List)
+        let items = List()
+        for i in 0..rows.len() {
+            let r = rows.get(i.as(usize)).as(List)
+            let rel = r.get(0).as(String)
+            let full_rpath = normalize_posix_remote_path(parsed.remote_path ++ "/" ++ rel)
+            items.push(RemoteRankedFile {
+                full_uri: parsed.prefix ++ full_rpath,
+                rel_path: rel,
+                is_dir: r.get(1).as(bool),
+                score: r.get(2).as(i64),
+            })
+        }
+        return (RemoteRankedFiles {
+            total_indexed: total_indexed,
+            total_matched: total_matched,
+            items: items,
+        })
+    }
+    let raw = runtime.host_call(
+        "remote_search_files_ranked",
+        [uri, query, include_hidden, include_dirs, limit],
+    )!
+    decode_remote_ranked_files(raw)
+}
+
+pub fn remote_search_grep_ext(
+    uri: String,
+    pattern: String,
+    .case_sensitive: bool = false,
+    .file_filter: String = "",
+    .limit: i64 = 200,
+) -> !String (i64, List) {
+    let parsed = parse_ssh_uri(uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let lp = local_opt.as(String)
+        let accel_raw = runtime.host_call(
+            "accel_workspace_grep_counted",
+            [lp, pattern, case_sensitive, limit, file_filter],
+        )!
+        let top = accel_raw.as(List)
+        let total_matched = top.get(0).as(i64)
+        let rows = top.get(1).as(List)
+        let out = List()
+        for i in 0..rows.len() {
+            let r = rows.get(i.as(usize)).as(List)
+            let rel = r.get(0).as(String)
+            let rpath = normalize_posix_remote_path(parsed.remote_path ++ "/" ++ rel)
+            out.push(RemoteGrepMatch {
+                full_uri: parsed.prefix ++ rpath,
+                row: r.get(1).as(i64),
+                col: r.get(2).as(i64),
+                line_text: r.get(3).as(String),
+            })
+        }
+        return (total_matched, out)
+    }
+    let raw = runtime.host_call(
+        "remote_search_grep_ext",
+        [uri, pattern, case_sensitive, file_filter, limit],
+    )!
+    decode_remote_grep_ext(raw)
+}
+
+pub fn remote_read_preview_window(
+    uri: String,
+    .start_row: i64 = 0,
+    .max_lines: i64 = 100,
+    .max_bytes: i64 = 12288,
+) -> !String RemotePreviewWindow {
+    let parsed = parse_ssh_uri(uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let raw = runtime.host_call(
+            "accel_read_preview",
+            [local_opt.as(String), start_row, max_lines, max_bytes],
+        )!
+        return decode_remote_preview_window(raw)
+    }
+    let raw = runtime.host_call(
+        "remote_read_preview_window",
+        [uri, start_row, max_lines, max_bytes],
+    )!
+    decode_remote_preview_window(raw)
+}
+
+private fn remap_mock_path_to_uri(mount_root: String, prefix: String, local_p: String) -> String {
+    if local_p == "" {
+        return ""
+    }
+    if local_p.starts_with(mount_root) {
+        return prefix ++ normalize_posix_remote_path(local_p.drop(mount_root.char_len()))
+    }
+    prefix ++ "/"
+}
+
+pub fn remote_dir_snapshot(
+    uri: String,
+    .show_hidden: bool = false,
+    .filter_query: String = "",
+    .sort_by: String = "name",
+    .sort_reverse: bool = false,
+    .focus_name: String = "",
+    .preferred_row: i64 = 0,
+    .include_parent: bool = true,
+    .include_preview: bool = true,
+) -> !String RemoteDirSnap {
+    let parsed = parse_ssh_uri(uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let _ = remote_connect(uri)!
+        let (mounts, _) = ensure_mock_maps()
+        let mount_root = mounts.get(parsed.authority).as(String)
+        let raw = runtime.host_call(
+            "accel_dir_snapshot",
+            [
+                local_opt.as(String),
+                show_hidden,
+                filter_query,
+                sort_by,
+                sort_reverse,
+                focus_name,
+                preferred_row,
+                include_parent,
+                include_preview,
+            ],
+        )!
+        let f = raw.as(List)
+        let resolved_uri = remap_mock_path_to_uri(mount_root, parsed.prefix, f.get(0).as(String))
+        let raw_par_local = f.get(1).as(String)
+        let parent_uri = if parsed.remote_path == "/" or raw_par_local == "" or (not raw_par_local.starts_with(mount_root)) {
+            ""
+        } else {
+            remap_mock_path_to_uri(mount_root, parsed.prefix, raw_par_local)
+        }
+        let raw_p = f.get(2).as(List)
+        let parents = List()
+        if parent_uri != "" {
+            for i in 0..raw_p.len() {
+                let p = raw_p.get(i.as(usize)).as(List)
+                let pu = remap_mock_path_to_uri(mount_root, parsed.prefix, p.get(1).as(String))
+                parents.push(RemoteSnapParent {
+                    name: p.get(0).as(String),
+                    full_uri: pu,
+                    is_dir: p.get(2).as(bool),
+                })
+            }
+        }
+        let raw_e = f.get(3).as(List)
+        let entries = List()
+        for i in 0..raw_e.len() {
+            let e = raw_e.get(i.as(usize)).as(List)
+            let eu = remap_mock_path_to_uri(mount_root, parsed.prefix, e.get(1).as(String))
+            let erp = if eu.starts_with(parsed.prefix) { eu.drop(parsed.prefix.char_len()) } else { "/" }
+            entries.push(RemoteSnapEntry {
+                name: e.get(0).as(String),
+                full_uri: eu,
+                remote_path: erp,
+                is_dir: e.get(2).as(bool),
+                is_symlink: e.get(3).as(bool),
+                is_exec: e.get(4).as(bool),
+                size: e.get(5).as(i64),
+                modified_secs: e.get(6).as(i64),
+                perms: e.get(7).as(String),
+                symlink_target: e.get(8).as(String),
+                git_badge: e.get(9).as(String),
+            })
+        }
+        let pv_decoded = decode_remote_snap_preview(f.get(10))
+        let pv_fixed = RemoteSnapPreview {
+            kind: pv_decoded.kind,
+            target_uri: remap_mock_path_to_uri(mount_root, parsed.prefix, pv_decoded.target_uri),
+            target_name: pv_decoded.target_name,
+            total_count: pv_decoded.total_count,
+            total_size: pv_decoded.total_size,
+            lines: pv_decoded.lines,
+            child_entries: pv_decoded.child_entries,
+        }
+        return (RemoteDirSnap {
+            resolved_uri: resolved_uri,
+            parent_uri: parent_uri,
+            parent_entries: parents,
+            entries: entries,
+            git_is_repo: f.get(4).as(bool),
+            git_root_uri: remap_mock_path_to_uri(mount_root, parsed.prefix, f.get(5).as(String)),
+            git_branch: f.get(6).as(String),
+            git_staged: f.get(7).as(i64),
+            git_modified: f.get(8).as(i64),
+            git_untracked: f.get(9).as(i64),
+            preview: pv_fixed,
+        })
+    }
+    let raw = runtime.host_call(
+        "remote_dir_snapshot",
+        [
+            uri,
+            show_hidden,
+            filter_query,
+            sort_by,
+            sort_reverse,
+            focus_name,
+            preferred_row,
+            include_parent,
+            include_preview,
+        ],
+    )!
+    decode_remote_dir_snap(raw)
+}
+
+pub fn remote_entry_preview(
+    uri: String,
+    is_dir: bool,
+    .show_hidden: bool = false,
+    .max_lines: i64 = 100,
+    .max_bytes: i64 = 8192,
+) -> !String RemoteSnapPreview {
+    let parsed = parse_ssh_uri(uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let leaf = ssh_uri_basename(parsed.canonical_uri())
+        let raw = runtime.host_call(
+            "accel_entry_preview",
+            [local_opt.as(String), leaf, is_dir, show_hidden],
+        )!
+        let pv = decode_remote_snap_preview(raw)
+        return (RemoteSnapPreview {
+            kind: pv.kind,
+            target_uri: parsed.canonical_uri(),
+            target_name: pv.target_name,
+            total_count: pv.total_count,
+            total_size: pv.total_size,
+            lines: pv.lines,
+            child_entries: pv.child_entries,
+        })
+    }
+    let raw = runtime.host_call(
+        "remote_entry_preview",
+        [uri, is_dir, show_hidden, max_lines, max_bytes],
+    )!
+    decode_remote_snap_preview(raw)
+}
+
+pub fn remote_git_summary(uri: String) -> !String RemoteGitSummary {
+    let parsed = parse_ssh_uri(uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let st = remote_git_status(uri)!
+        return (RemoteGitSummary {
+            is_repo: st.is_repo,
+            root: st.root,
+            branch: st.branch,
+            staged_count: st.staged_count,
+            modified_count: st.modified_count,
+            untracked_count: st.untracked_count,
+        })
+    }
+    let raw = runtime.host_call("remote_git_summary", [uri])!
+    decode_remote_git_summary(raw)
+}
+
+pub fn remote_git_file_hunks(
+    cwd_uri: String,
+    file_uri: String,
+    .has_override: bool = false,
+    .override_lines: List = List(),
+) -> !String (bool, List) {
+    let parsed = parse_ssh_uri(cwd_uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let fp_parsed = parse_ssh_uri(file_uri)!
+        let fp_local? = resolve_mock_local_path(fp_parsed) else {
+            return (false, List())
+        }
+        let dir_path = if fs.is_dir(local_opt.as(String)) {
+            local_opt.as(String)
+        } else {
+            let p_opt = path.parent(local_opt.as(String))
+            if p_opt != null { p_opt.as(String) } else { local_opt.as(String) }
+        }
+        let raw = runtime.host_call(
+            "accel_git_file_hunks",
+            [dir_path, fp_local, has_override, override_lines],
+        )!
+        return decode_remote_git_hunks(raw)
+    }
+    let raw = runtime.host_call(
+        "remote_git_file_hunks",
+        [cwd_uri, file_uri, has_override, override_lines],
+    )!
+    decode_remote_git_hunks(raw)
+}
+
+pub fn remote_scan_todos(root_uri: String, .limit: i64 = 300) -> !String List {
+    let parsed = parse_ssh_uri(root_uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let lp = local_opt.as(String)
+        let raw = runtime.host_call("accel_scan_workspace_todos", [lp, limit])!
+        let rows = raw.as(List)
+        let out = List()
+        for i in 0..rows.len() {
+            let r = rows.get(i.as(usize)).as(List)
+            let rel = r.get(0).as(String)
+            let rpath = normalize_posix_remote_path(parsed.remote_path ++ "/" ++ rel)
+            out.push(RemoteTodoHit {
+                full_uri: parsed.prefix ++ rpath,
+                row: r.get(1).as(i64),
+                col: r.get(2).as(i64),
+                tag: r.get(3).as(String),
+                text: r.get(4).as(String),
+            })
+        }
+        return out
+    }
+    let raw = runtime.host_call("remote_scan_todos", [root_uri, limit])!
+    decode_remote_todos(raw)
+}
+
+pub fn remote_workspace_replace(
+    root_uri: String,
+    query: String,
+    replacement: String,
+    .case_sensitive: bool = false,
+    .file_filter: String = "",
+) -> !String (i64, i64) {
+    let parsed = parse_ssh_uri(root_uri)!
+    let local_opt = resolve_mock_local_path(parsed)
+    if local_opt != null {
+        let raw = runtime.host_call(
+            "accel_workspace_replace",
+            [local_opt.as(String), query, replacement, case_sensitive, file_filter],
+        )!
+        let f = raw.as(List)
+        return (f.get(0).as(i64), f.get(1).as(i64))
+    }
+    let raw = runtime.host_call(
+        "remote_workspace_replace",
+        [root_uri, query, replacement, case_sensitive, file_filter],
+    )!
+    let f = raw.as(List)
+    (f.get(0).as(i64), f.get(1).as(i64))
+}
+
+private fn uri_uses_mock_mount(uri: String) -> bool {
+    let p! = parse_ssh_uri(uri) else {
+        return false
+    }
+    resolve_mock_local_path(p) != null
+}
+
+private fn ensure_mock_async_slots() -> HashMap {
+    if g_mock_async_slots == null {
+        g_mock_async_slots = HashMap.new()
+    }
+    g_mock_async_slots.as(HashMap)
+}
+
+pub fn remote_async_submit(slot_key: String, kind: String, params: List) -> i64 {
+    let first_uri = if not params.is_empty() and (params.get(0) matches _: String) {
+        params.get(0).as(String)
+    } else {
+        ""
+    }
+    if (not uri_uses_mock_mount(first_uri)) and remote_host_available() {
+        let raw! = runtime.host_call("remote_async_submit", [slot_key, kind, params]) else {
+            return 0
+        }
+        g_has_submitted_async = true
+        return raw.as(i64)
+    }
+    -- Mock-mount fallback stores ready result in `g_mock_async_slots` for `remote_async_poll`.
+    let slots = ensure_mock_async_slots()
+    let seq = g_mock_async_seq
+    g_mock_async_seq += 1
+    slots.insert(slot_key, (seq, kind, params))
+    seq
+}
+
+private fn execute_mock_async_job(kind: String, params: List) -> !String Any {
+    when {
+        kind == "search_files" => {
+            let res = remote_search_files_ranked(
+                params.get(0).as(String),
+                params.get(1).as(String),
+                include_hidden = params.get(2).as(bool),
+                include_dirs = params.get(3).as(bool),
+                limit = params.get(4).as(i64),
+            )!
+            let wire = List()
+            for i in 0..res.items.len() {
+                let it = res.items.get(i.as(usize)).as(RemoteRankedFile)
+                wire.push([it.full_uri, it.rel_path, it.is_dir, it.score])
+            }
+            [res.total_indexed, res.total_matched, wire]
+        },
+        kind == "search_grep" => {
+            let (tm, hits) = remote_search_grep_ext(
+                params.get(0).as(String),
+                params.get(1).as(String),
+                case_sensitive = params.get(2).as(bool),
+                file_filter = params.get(3).as(String),
+                limit = params.get(4).as(i64),
+            )!
+            let wire = List()
+            for i in 0..hits.len() {
+                let h = hits.get(i.as(usize)).as(RemoteGrepMatch)
+                wire.push([h.full_uri, h.row, h.col, h.line_text])
+            }
+            [tm, wire]
+        },
+        kind == "read_preview" => {
+            let win = remote_read_preview_window(
+                params.get(0).as(String),
+                start_row = params.get(1).as(i64),
+                max_lines = params.get(2).as(i64),
+                max_bytes = params.get(3).as(i64),
+            )!
+            [win.lines, win.start_row, win.total_lines, win.is_binary, win.truncated, win.total_size]
+        },
+        kind == "dir_snapshot" => {
+            let snap = remote_dir_snapshot(
+                params.get(0).as(String),
+                show_hidden = params.get(1).as(bool),
+                filter_query = params.get(2).as(String),
+                sort_by = params.get(3).as(String),
+                sort_reverse = params.get(4).as(bool),
+                focus_name = params.get(5).as(String),
+                preferred_row = params.get(6).as(i64),
+                include_parent = params.get(7).as(bool),
+                include_preview = params.get(8).as(bool),
+            )!
+            let p_wire = List()
+            for i in 0..snap.parent_entries.len() {
+                let p = snap.parent_entries.get(i.as(usize)).as(RemoteSnapParent)
+                p_wire.push([p.name, p.full_uri, p.is_dir])
+            }
+            let e_wire = List()
+            for i in 0..snap.entries.len() {
+                let e = snap.entries.get(i.as(usize)).as(RemoteSnapEntry)
+                e_wire.push([
+                    e.name,
+                    e.full_uri,
+                    e.remote_path,
+                    e.is_dir,
+                    e.is_symlink,
+                    e.is_exec,
+                    e.size,
+                    e.modified_secs,
+                    e.perms,
+                    e.symlink_target,
+                    e.git_badge,
+                ])
+            }
+            let ch_wire = List()
+            for i in 0..snap.preview.child_entries.len() {
+                let c = snap.preview.child_entries.get(i.as(usize)).as(RemoteSnapChild)
+                ch_wire.push([c.name, c.is_dir, c.is_symlink, c.size])
+            }
+            let pv_wire = [
+                snap.preview.kind,
+                snap.preview.target_uri,
+                snap.preview.target_name,
+                snap.preview.total_count,
+                snap.preview.total_size,
+                snap.preview.lines,
+                ch_wire,
+            ]
+            [
+                snap.resolved_uri,
+                snap.parent_uri,
+                p_wire,
+                e_wire,
+                snap.git_is_repo,
+                snap.git_root_uri,
+                snap.git_branch,
+                snap.git_staged,
+                snap.git_modified,
+                snap.git_untracked,
+                pv_wire,
+            ]
+        },
+        kind == "entry_preview" => {
+            let pv = remote_entry_preview(
+                params.get(0).as(String),
+                params.get(1).as(bool),
+                show_hidden = params.get(2).as(bool),
+                max_lines = params.get(3).as(i64),
+                max_bytes = params.get(4).as(i64),
+            )!
+            let ch_wire = List()
+            for i in 0..pv.child_entries.len() {
+                let c = pv.child_entries.get(i.as(usize)).as(RemoteSnapChild)
+                ch_wire.push([c.name, c.is_dir, c.is_symlink, c.size])
+            }
+            [
+                pv.kind,
+                pv.target_uri,
+                pv.target_name,
+                pv.total_count,
+                pv.total_size,
+                pv.lines,
+                ch_wire,
+            ]
+        },
+        kind == "git_summary" => {
+            let st = remote_git_summary(params.get(0).as(String))!
+            [st.is_repo, st.root, st.branch, st.staged_count, st.modified_count, st.untracked_count]
+        },
+        kind == "git_file_hunks" => {
+            let has_ov = params.get(2).as(bool)
+            let ov_lines = if has_ov { params.get(3).as(List) } else { List() }
+            let (tracked, hunks) = remote_git_file_hunks(
+                params.get(0).as(String),
+                params.get(1).as(String),
+                has_override = has_ov,
+                override_lines = ov_lines,
+            )!
+            let h_wire = List()
+            for i in 0..hunks.len() {
+                let h = hunks.get(i.as(usize)).as(RemoteGitHunk)
+                h_wire.push([h.old_start, h.old_count, h.new_start, h.new_count, h.kind])
+            }
+            [tracked, h_wire]
+        },
+        kind == "git_blame_line" => {
+            let bl_opt = remote_git_blame_line(
+                params.get(0).as(String),
+                params.get(1).as(String),
+                params.get(2).as(i64),
+            )!
+            if bl_opt != null {
+                let b = bl_opt.as(RemoteGitBlame)
+                [true, b.commit_short, b.author, b.date_ymd, b.summary]
+            } else {
+                [false]
+            }
+        },
+        kind == "scan_todos" => {
+            let hits = remote_scan_todos(params.get(0).as(String), limit = params.get(1).as(i64))!
+            let wire = List()
+            for i in 0..hits.len() {
+                let t = hits.get(i.as(usize)).as(RemoteTodoHit)
+                wire.push([t.full_uri, t.row, t.col, t.tag, t.text])
+            }
+            wire
+        },
+        kind == "workspace_replace" => {
+            let (fc, tr) = remote_workspace_replace(
+                params.get(0).as(String),
+                params.get(1).as(String),
+                params.get(2).as(String),
+                case_sensitive = params.get(3).as(bool),
+                file_filter = params.get(4).as(String),
+            )!
+            [fc, tr]
+        },
+        kind == "readdir" => {
+            let items = remote_readdir(params.get(0).as(String), show_hidden = params.get(1).as(bool))!
+            let wire = List()
+            for i in 0..items.len() {
+                let d = items.get(i.as(usize)).as(RemoteDirItem)
+                wire.push([d.name, d.full_uri, d.remote_path, d.is_dir, d.size])
+            }
+            wire
+        },
+        else => error ("unsupported mock async kind: " ++ kind),
+    }
+}
+
+pub fn remote_async_poll(slot_key: String) -> RemoteAsyncPoll {
+    if g_mock_async_slots != null {
+        let slots = g_mock_async_slots.as(HashMap)
+        if slots.contains_key(slot_key) {
+            let (seq, kind, params) = slots.remove(slot_key).as((i64, String, List))
+            let res = execute_mock_async_job(kind, params)
+            return res match {
+                payload! => RemoteAsyncPoll {
+                    status: "ready",
+                    seq: seq,
+                    elapsed_ms: 0,
+                    payload: payload,
+                    error_msg: "",
+                },
+                error msg => RemoteAsyncPoll {
+                    status: "error",
+                    seq: seq,
+                    elapsed_ms: 0,
+                    payload: (),
+                    error_msg: msg,
+                },
+            }
+        }
+    }
+    if not remote_host_available() {
+        return (RemoteAsyncPoll {
+            status: "idle",
+            seq: 0,
+            elapsed_ms: 0,
+            payload: (),
+            error_msg: "",
+        })
+    }
+    let raw! = runtime.host_call("remote_async_poll", [slot_key]) else {
+        return (RemoteAsyncPoll {
+            status: "idle",
+            seq: 0,
+            elapsed_ms: 0,
+            payload: (),
+            error_msg: "",
+        })
+    }
+    let f = raw.as(List)
+    let st = f.get(0).as(String)
+    let seq = f.get(1).as(i64)
+    if st == "ready" {
+        return (RemoteAsyncPoll {
+            status: "ready",
+            seq: seq,
+            elapsed_ms: f.get(2).as(i64),
+            payload: f.get(3),
+            error_msg: "",
+        })
+    }
+    if st == "error" {
+        return (RemoteAsyncPoll {
+            status: "error",
+            seq: seq,
+            elapsed_ms: 0,
+            payload: (),
+            error_msg: f.get(2).as(String),
+        })
+    }
+    RemoteAsyncPoll {
+        status: st,
+        seq: seq,
+        elapsed_ms: 0,
+        payload: (),
+        error_msg: "",
+    }
+}
+
+pub fn remote_async_cancel(slot_key: String) {
+    if g_mock_async_slots != null {
+        let _ = g_mock_async_slots.as(HashMap).remove(slot_key)
+    }
+    if remote_host_available() {
+        let _ = runtime.host_call("remote_async_cancel", [slot_key]) ! { _ => () }
+    }
+}
+
+pub fn remote_async_active_count() -> i64 {
+    let mock_cnt = if g_mock_async_slots != null {
+        g_mock_async_slots.as(HashMap).len()
+    } else {
+        0
+    }
+    if not g_has_submitted_async {
+        return mock_cnt
+    }
+    if not remote_host_available() {
+        g_has_submitted_async = false
+        return mock_cnt
+    }
+    let raw! = runtime.host_call("remote_async_active_count", List()) else {
+        g_has_submitted_async = false
+        return mock_cnt
+    }
+    let host_cnt = raw.as(i64)
+    if host_cnt <= 0 {
+        g_has_submitted_async = false
+    }
+    host_cnt + mock_cnt
 }

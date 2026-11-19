@@ -12,7 +12,11 @@ use @lava_core.{
     status_emit
 }
 use @lava_accel.{GitStatusSummary, accel_git_status}
-use @lava_remote.{is_ssh_uri, parent_ssh_uri, parse_ssh_uri, remote_git_status}
+use @lava_remote.{
+    decode_remote_git_summary, is_ssh_uri, parent_ssh_uri, parse_ssh_uri,
+    remote_async_active_count, remote_async_poll, remote_async_submit, remote_git_summary,
+    remote_spinner_frame, remote_ui_async_enabled
+}
 use @ext_document.{
     Buffer, EditorWorld, GutterSign, Pos, Span, VisualKind, ext_document_id, require_editor_world
 }
@@ -35,6 +39,8 @@ pub struct LualineService {
     pub dir_cache: HashMap,
     pub cached_active_exts: i64,
     pub git_refresh_count: i64,
+    pub pending_remote_key: String,
+    pub last_was_spinning: bool,
 }
 
 impl LualineService {
@@ -45,6 +51,8 @@ impl LualineService {
             dir_cache: HashMap.new(),
             cached_active_exts: -1,
             git_refresh_count: 0,
+            pending_remote_key: "",
+            last_was_spinning: false,
         }
     }
 
@@ -52,18 +60,33 @@ impl LualineService {
         self.git_cache = HashMap.new()
         self.dir_cache = HashMap.new()
         self.cached_active_exts = -1
+        self.pending_remote_key = ""
     }
 
     pub fn lookup_or_fetch_git(self, dir: String, force_refresh: bool) -> LualineGitCacheEntry {
         let key = if dir != "" { dir } else { "." }
-        if not force_refresh {
-            let cached_opt = self.git_cache.get(key)
-            if cached_opt != null {
-                return cached_opt.as(LualineGitCacheEntry)
-            }
+        let cached_opt = self.git_cache.get(key)
+        if (not force_refresh) and cached_opt != null {
+            return cached_opt.as(LualineGitCacheEntry)
         }
         if is_ssh_uri(key) {
-            let rsum_opt = remote_git_status(key) ! { _ => null }
+            if remote_ui_async_enabled() {
+                if self.pending_remote_key != key or force_refresh {
+                    self.pending_remote_key = key
+                    let _ = remote_async_submit("lualine.git", "git_summary", [key])
+                }
+                if cached_opt != null {
+                    return cached_opt.as(LualineGitCacheEntry)
+                }
+                return (LualineGitCacheEntry {
+                    is_repo: false,
+                    branch: "",
+                    staged_count: 0,
+                    modified_count: 0,
+                    untracked_count: 0,
+                })
+            }
+            let rsum_opt = remote_git_summary(key) ! { _ => null }
             let rentry = if rsum_opt != null {
                 let rsum = rsum_opt
                 LualineGitCacheEntry {
@@ -304,6 +327,39 @@ pub fn sync_lualine_segments(kernel: SystemKernel, force_git_refresh: bool) {
         return
     }
 
+    if svc.pending_remote_key != "" {
+        let gp = remote_async_poll("lualine.git")
+        if gp.status == "ready" {
+            let rsum = decode_remote_git_summary(gp.payload)
+            svc.git_cache.insert(
+                svc.pending_remote_key,
+                LualineGitCacheEntry {
+                    is_repo: rsum.is_repo,
+                    branch: rsum.branch,
+                    staged_count: rsum.staged_count,
+                    modified_count: rsum.modified_count,
+                    untracked_count: rsum.untracked_count,
+                },
+            )
+            svc.git_refresh_count += 1
+            svc.pending_remote_key = ""
+            world.remote_tick_dirty = true
+        } else if gp.status == "error" {
+            svc.git_cache.insert(
+                svc.pending_remote_key,
+                LualineGitCacheEntry {
+                    is_repo: false,
+                    branch: "",
+                    staged_count: 0,
+                    modified_count: 0,
+                    untracked_count: 0,
+                },
+            )
+            svc.pending_remote_key = ""
+            world.remote_tick_dirty = true
+        }
+    }
+
     let buf = world.active_buffer()
     let dir = git_dir_for_buffer(svc, world, buf)
     let git_entry = svc.lookup_or_fetch_git(dir, force_git_refresh)
@@ -322,11 +378,22 @@ pub fn sync_lualine_segments(kernel: SystemKernel, force_git_refresh: bool) {
         ""
     }
     if remote_probe != "" {
+        let async_busy = remote_async_active_count() > 0 or svc.pending_remote_key != ""
+        if async_busy or svc.last_was_spinning {
+            world.remote_tick_dirty = true
+        }
+        svc.last_was_spinning = async_busy
         let pt_res = parse_ssh_uri(remote_probe)
         pt_res match {
-            pt! => left_parts.push("[SSH: " ++ pt.authority ++ "]"),
+            pt! => {
+                let spin_sfx = if async_busy { " " ++ remote_spinner_frame() } else { "" }
+                left_parts.push("[SSH: " ++ pt.authority ++ spin_sfx ++ "]")
+            },
             error _ => (),
         }
+    } else if svc.last_was_spinning {
+        svc.last_was_spinning = false
+        world.remote_tick_dirty = true
     }
     let git_seg = format_git_segment(git_entry)
     if git_seg != "" {

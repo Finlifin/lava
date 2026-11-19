@@ -112,6 +112,42 @@ fn is_illuminatable_buffer(buf: Buffer) -> bool {
     buf.kind != BufferKind.special and buf.kind != BufferKind.directory
 }
 
+fn is_code_syntax_keyword(mode: String, word: String) -> bool {
+    let m = mode.to_lower()
+    if m == "" or m == "text" or m == "plaintext" or m == "markdown" or m == "md" or m == "gfm" or m == "org" {
+        return false
+    }
+    word == "fn"
+        or word == "pub"
+        or word == "let"
+        or word == "var"
+        or word == "mut"
+        or word == "if"
+        or word == "else"
+        or word == "for"
+        or word == "in"
+        or word == "while"
+        or word == "loop"
+        or word == "return"
+        or word == "match"
+        or word == "when"
+        or word == "struct"
+        or word == "enum"
+        or word == "impl"
+        or word == "trait"
+        or word == "use"
+        or word == "mod"
+        or word == "const"
+        or word == "private"
+        or word == "def"
+        or word == "class"
+        or word == "import"
+        or word == "from"
+        or word == "func"
+        or word == "package"
+        or word == "function"
+}
+
 pub fn extract_symbol_at_point(buf: Buffer, min_len: i64) -> String {
     if not is_illuminatable_buffer(buf) {
         return ""
@@ -137,7 +173,7 @@ pub fn extract_symbol_at_point(buf: Buffer, min_len: i64) -> String {
     }
     let word = line.slice(ws, we)
     let req_len = if min_len > 1 { min_len } else { 1 }
-    if word.char_len() < req_len or is_pure_digits(word) {
+    if word.char_len() < req_len or is_pure_digits(word) or is_code_syntax_keyword(buf.major_mode, word) {
         return ""
     }
     word

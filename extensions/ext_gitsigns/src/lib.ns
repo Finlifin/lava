@@ -14,8 +14,10 @@ use @lava_accel.{
     accel_git_head_lines, accel_git_status
 }
 use @lava_remote.{
-    RemoteGitBlame, is_ssh_uri, normalize_ssh_uri, parent_ssh_uri, parse_ssh_uri, remote_exec,
-    remote_git_blame_line, remote_git_head_lines, remote_git_status
+    RemoteGitBlame, RemoteGitHunk, decode_remote_git_blame_opt, decode_remote_git_hunks,
+    is_ssh_uri, normalize_ssh_uri, parent_ssh_uri, parse_ssh_uri, remote_async_poll,
+    remote_async_submit, remote_exec, remote_git_blame_line, remote_git_file_hunks,
+    remote_git_head_lines, remote_git_status, remote_spinner_frame, remote_ui_async_enabled
 }
 use @ext_document.{
     Buffer, BufferId, BufferKind, EditorWorld, FloatingWindow, Pos, ext_document_id,
@@ -66,6 +68,12 @@ pub struct GitsignsState {
     pub blame_file_path: String,
     pub blame_row: i64,
     pub blame_text: String,
+    pub remote_hunks_loading: bool,
+    pub remote_hunks_buf_id: BufferId,
+    pub remote_hunks_ver: i64,
+    pub remote_blame_loading: bool,
+    pub remote_blame_file_path: String,
+    pub remote_blame_row: i64,
 }
 
 impl GitsignsState {
@@ -84,6 +92,12 @@ impl GitsignsState {
             blame_file_path: "",
             blame_row: -1,
             blame_text: "",
+            remote_hunks_loading: false,
+            remote_hunks_buf_id: BufferId(0),
+            remote_hunks_ver: -1,
+            remote_blame_loading: false,
+            remote_blame_file_path: "",
+            remote_blame_row: -1,
         }
     }
 
@@ -295,6 +309,17 @@ fn apply_gitsigns_decorations(world: EditorWorld, state: GitsignsState, buf: Buf
         let cur_row = buf.point.row
         let vt_text = if state.blame_file_path == buf.file_path and state.blame_row == cur_row and state.blame_text != "" {
             state.blame_text
+        } else if is_ssh_uri(buf.file_path) and remote_ui_async_enabled() {
+            let cwd = effective_git_cwd(world, buf.file_path)
+            if state.remote_blame_file_path != buf.file_path
+                or state.remote_blame_row != cur_row
+                or (not state.remote_blame_loading) {
+                state.remote_blame_file_path = buf.file_path
+                state.remote_blame_row = cur_row
+                state.remote_blame_loading = true
+                let _ = remote_async_submit("gitsigns.blame", "git_blame_line", [cwd, buf.file_path, cur_row])
+            }
+            "   " ++ remote_spinner_frame() ++ " blaming on lava-server..."
         } else {
             let cwd = effective_git_cwd(world, buf.file_path)
             let blame = if is_ssh_uri(buf.file_path) {
@@ -338,6 +363,31 @@ fn apply_gitsigns_decorations(world: EditorWorld, state: GitsignsState, buf: Buf
     }
 }
 
+fn convert_remote_hunks_to_diff(rhunks: List) -> (List, i64, i64, i64) {
+    let out = List()
+    var r_add: i64 = 0
+    var r_chg: i64 = 0
+    var r_del: i64 = 0
+    for i in 0..rhunks.len() {
+        let rh = rhunks.get(i.as(usize)).as(RemoteGitHunk)
+        out.push(DiffHunk {
+            old_start: rh.old_start,
+            old_count: rh.old_count,
+            new_start: rh.new_start,
+            new_count: rh.new_count,
+            kind: rh.kind,
+        })
+        if rh.kind == "add" {
+            r_add += rh.new_count
+        } else if rh.kind == "change" {
+            r_chg += max_i64(rh.new_count, rh.old_count)
+        } else if rh.kind == "delete" {
+            r_del += rh.old_count
+        }
+    }
+    (out, r_add, r_chg, r_del)
+}
+
 pub fn refresh_buffer_gitsigns(
     world: EditorWorld,
     state: GitsignsState,
@@ -368,11 +418,11 @@ pub fn refresh_buffer_gitsigns(
     }
 
     let diff_opt: ?(List, i64, i64, i64) = if is_ssh_uri(buf.file_path) {
-        let base_opt = fetch_base_lines(world, state, buf.file_path, force_reload_head)
-        if base_opt != null {
+        let norm_fp = normalize_ssh_uri(buf.file_path)
+        if (not force_reload_head) and state.head_cache.contains_key(norm_fp) {
             let cap = min_i64(buf.line_count(), 50000)
             let cur_lines = buf.slice_lines(0, cap)
-            let rhunks = accel_diff_lines(base_opt.as(List), cur_lines)
+            let rhunks = accel_diff_lines(state.head_cache.get(norm_fp).as(List), cur_lines)
             var r_add: i64 = 0
             var r_chg: i64 = 0
             var r_del: i64 = 0
@@ -387,8 +437,47 @@ pub fn refresh_buffer_gitsigns(
                 }
             }
             (rhunks, r_add, r_chg, r_del)
-        } else {
+        } else if (not force_reload_head) and state.untracked_cache.contains(norm_fp) {
             null
+        } else {
+            let cwd = effective_git_cwd(world, norm_fp)
+            let send_ov = buf.modified and buf.line_count() <= 8000
+            let ov_lines = if send_ov {
+                buf.slice_lines(0, buf.line_count())
+            } else {
+                List()
+            }
+            if remote_ui_async_enabled() {
+                state.remote_hunks_loading = true
+                state.remote_hunks_buf_id = buf.id
+                state.remote_hunks_ver = buf.edit_version
+                state.last_ver_by_buf.insert(buf.id, buf.edit_version)
+                state.last_diff_buf_id = buf.id
+                state.last_diff_ver = buf.edit_version
+                let _ = remote_async_submit(
+                    "gitsigns.hunks",
+                    "git_file_hunks",
+                    [cwd, norm_fp, send_ov, ov_lines],
+                )
+                return
+            }
+            remote_git_file_hunks(
+                cwd,
+                norm_fp,
+                has_override = send_ov,
+                override_lines = ov_lines,
+            ) match {
+                pair! => {
+                    let (tracked, rhunks) = pair
+                    if tracked {
+                        convert_remote_hunks_to_diff(rhunks)
+                    } else {
+                        state.untracked_cache.insert(norm_fp)
+                        null
+                    }
+                },
+                error _ => null,
+            }
         }
     } else {
         accel_doc_diff_head(buf.doc_id, buf.file_path, force_reload_head)
@@ -946,6 +1035,88 @@ fn on_gitsigns_insert_hook(kernel: SystemKernel, _payload: Any) {
     ensure_buffer_diff_current(world, state, buf)
 }
 
+fn on_gitsigns_timer_tick(kern: SystemKernel, _payload: Any) {
+    let s_opt = kern.service(SERVICE_GITSIGNS)
+    if s_opt == null {
+        return
+    }
+    let state = s_opt.as(GitsignsState)
+    if (not state.remote_hunks_loading) and (not state.remote_blame_loading) {
+        return
+    }
+    let w_opt = kern.service("lava.document.world")
+    if w_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    var need_redecor = false
+
+    if state.remote_hunks_loading {
+        let hp = remote_async_poll("gitsigns.hunks")
+        if hp.status == "ready" {
+            state.remote_hunks_loading = false
+            let b_opt = world.buffer(state.remote_hunks_buf_id)
+            if b_opt != null {
+                let buf = b_opt.as(Buffer)
+                let (tracked, rhunks) = decode_remote_git_hunks(hp.payload)
+                if tracked {
+                    let (hunks, added, changed, deleted) = convert_remote_hunks_to_diff(rhunks)
+                    state.hunks_by_buf.insert(buf.id, hunks)
+                    state.counts_by_buf.insert(buf.id, (added, changed, deleted))
+                    state.tracked_by_buf.insert(buf.id, true)
+                    buf.vars.insert("gitsigns_counts", (added, changed, deleted))
+                    buf.vars.insert("gitsigns_added", added)
+                    buf.vars.insert("gitsigns_changed", changed)
+                    buf.vars.insert("gitsigns_deleted", deleted)
+                } else {
+                    state.hunks_by_buf.insert(buf.id, List())
+                    state.counts_by_buf.insert(buf.id, (0, 0, 0))
+                    state.tracked_by_buf.insert(buf.id, false)
+                    buf.vars.insert("gitsigns_counts", (0, 0, 0))
+                }
+                need_redecor = true
+            }
+        } else if hp.status == "error" {
+            state.remote_hunks_loading = false
+        }
+    }
+
+    if state.remote_blame_loading {
+        let bp = remote_async_poll("gitsigns.blame")
+        if bp.status == "ready" {
+            state.remote_blame_loading = false
+            let rbl_opt = decode_remote_git_blame_opt(bp.payload)
+            let built = if rbl_opt != null {
+                let rb = rbl_opt.as(RemoteGitBlame)
+                "   " ++ rb.author ++ ", " ++ rb.date_ymd ++ " • " ++ rb.summary
+            } else {
+                "   Uncommitted, recent • Not committed yet"
+            }
+            state.blame_file_path = state.remote_blame_file_path
+            state.blame_row = state.remote_blame_row
+            state.blame_text = built
+            need_redecor = true
+        } else if bp.status == "error" {
+            state.remote_blame_loading = false
+            state.blame_file_path = state.remote_blame_file_path
+            state.blame_row = state.remote_blame_row
+            state.blame_text = "   Uncommitted, recent • Not committed yet"
+            need_redecor = true
+        }
+    }
+
+    if need_redecor or state.remote_blame_loading {
+        let buf = world.active_buffer()
+        if buf.kind == BufferKind.file and buf.file_path != "" {
+            let hunks = state.buffer_hunks(buf.id)
+            let tracked_opt = state.tracked_by_buf.get(buf.id)
+            let tracked = if tracked_opt != null { tracked_opt.as(bool) } else { false }
+            apply_gitsigns_decorations(world, state, buf, hunks, tracked)
+            world.remote_tick_dirty = true
+        }
+    }
+}
+
 pub fn register_gitsigns_extension(kernel: SystemKernel) -> !String Unit {
     let ext_id = ext_gitsigns_id()
     kernel.register_extension(
@@ -1073,6 +1244,7 @@ pub fn register_gitsigns_extension(kernel: SystemKernel) -> !String Unit {
             k.add_hook("mode-changed", ext_id, on_buffer_sync_hook)
             k.add_hook("after-insert-stroke", ext_id, on_gitsigns_insert_hook)
             k.add_hook("vim-yank", ext_id, on_buffer_sync_hook)
+            k.add_hook("timer-tick", ext_id, on_gitsigns_timer_tick)
 
             let w_opt = k.service("lava.document.world")
             if w_opt != null {

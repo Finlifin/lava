@@ -549,9 +549,9 @@ fn compute_fold_ranges_in_window(buf: Buffer, scan_lo: i64, scan_hi: i64) -> Lis
             and (not line.contains("'"))
             and (not line.contains("//"))
             and (not line.contains("--")) {
-            let bs = line.bytes()
-            for bi in 0..bs.len() {
-                let b = bs.get(bi.as(usize)).as(i64)
+            let blen = line.len()
+            for bi in 0..blen {
+                let b = line.byte_at(bi)
                 if b == 123 {
                     brace_stack.push(r)
                 } else if b == 125 {
@@ -985,9 +985,12 @@ pub fn register_fold_extension(kernel: SystemKernel) -> !String Unit {
                     let f_opt = kern.service(SERVICE_FOLD)
                     if w_opt != null and f_opt != null {
                         let w = w_opt.as(EditorWorld)
+                        if w.in_key_burst {
+                            return ()
+                        }
                         let buf = w.active_buffer()
                         let f = f_opt.as(FoldService)
-                        let in_insert = w.mode_name.to_upper().contains("INSERT")
+                        let in_insert = w.mode_name == "INSERT" or w.mode_name.contains("INSERT")
                         if (not in_insert) or (not f.active_folds(buf.id).is_empty()) {
                             f.sync_buffer_folds(buf)
                         }
@@ -1003,7 +1006,7 @@ pub fn register_fold_extension(kernel: SystemKernel) -> !String Unit {
                     let f_opt = kern.service(SERVICE_FOLD)
                     if w_opt != null and f_opt != null {
                         let w = w_opt.as(EditorWorld)
-                        if not w.mode_name.to_upper().contains("INSERT") {
+                        if w.mode_name != "INSERT" and (not w.mode_name.contains("INSERT")) {
                             f_opt.as(FoldService).sync_buffer_folds(w.active_buffer())
                         }
                     }

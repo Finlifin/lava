@@ -4,7 +4,7 @@
 use std.env
 use std.fs
 use std.process
-use @server_sys.{current_working_dir, lsp_which, resolve_server_path}
+use @server_sys.{accel_invalidate_cache, current_working_dir, lsp_which, resolve_server_path}
 use @server_core.{
     JsonValue, ServerKernel, SrvExtId, expect_params_map, opt_nullable_str_param,
     opt_str_list_param, require_str_param
@@ -80,6 +80,7 @@ private fn rpc_exec_run(_k: ServerKernel, params: JsonValue) -> !String JsonValu
         v! => v,
         error err => return error ("shell command failed to spawn: " ++ err.to_string()),
     }
+    accel_invalidate_cache()
 
     let out = Map()
     out.set("exit_code", cmd_out.status)

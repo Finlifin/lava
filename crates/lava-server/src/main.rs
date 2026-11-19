@@ -86,6 +86,31 @@ where
                 opts.mode = ServerMode::ListExtensions;
                 i += 1;
             }
+            "--lsp-proxy-b64" => {
+                let b64 = raw
+                    .get(i + 1)
+                    .ok_or_else(|| "missing payload after `--lsp-proxy-b64`".to_string())?;
+                let decoded = decode_urlsafe_b64(b64)?;
+                let text = String::from_utf8(decoded)
+                    .map_err(|_| "invalid UTF-8 in `--lsp-proxy-b64` payload".to_string())?;
+                let mut parts = text.split('\0');
+                let cwd = parts
+                    .next()
+                    .ok_or_else(|| "missing cwd in `--lsp-proxy-b64`".to_string())?
+                    .to_string();
+                let cmd = parts
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "missing cmd in `--lsp-proxy-b64`".to_string())?
+                    .to_string();
+                let rest: Vec<String> = parts.map(ToString::to_string).collect();
+                opts.mode = ServerMode::LspProxy {
+                    cwd,
+                    cmd,
+                    args: rest,
+                };
+                return Ok(opts);
+            }
             "--lsp-proxy" => {
                 let cwd = raw
                     .get(i + 1)
@@ -169,6 +194,36 @@ OPTIONS:
     -V, --version                   Show version information",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+fn decode_urlsafe_b64(input: &str) -> Result<Vec<u8>, String> {
+    let mut vals = Vec::with_capacity(input.len());
+    for b in input.bytes() {
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            b'=' | b'\r' | b'\n' => continue,
+            _ => return Err(format!("invalid base64 byte 0x{b:02x}")),
+        };
+        vals.push(v);
+    }
+    let mut out = Vec::with_capacity(vals.len() * 3 / 4);
+    for chunk in vals.chunks(4) {
+        if chunk.len() < 2 {
+            break;
+        }
+        out.push((chunk[0] << 2) | (chunk[1] >> 4));
+        if chunk.len() >= 3 {
+            out.push((chunk[1] << 4) | (chunk[2] >> 2));
+        }
+        if chunk.len() >= 4 {
+            out.push((chunk[2] << 6) | chunk[3]);
+        }
+    }
+    Ok(out)
 }
 
 fn is_valid_server_root(dir: &Path) -> bool {
@@ -664,6 +719,20 @@ fn run_server(opts: ServerCliOptions) -> Result<i32, String> {
 }
 
 fn main() -> ExitCode {
+    if env::var_os("LAVA_SERVER_CACHE_DIR").is_none()
+        && env::var_os("LAVA_CACHE_DIR").is_none()
+        && let Ok(exe) = env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let sibling_cache = dir.join("cache");
+        if sibling_cache.is_dir() {
+            // SAFETY: Set before spawning any worker threads in `lava-server`.
+            unsafe {
+                env::set_var("LAVA_CACHE_DIR", &sibling_cache);
+            }
+        }
+    }
+
     let opts = match parse_args(env::args().skip(1)) {
         Ok(o) => o,
         Err(err) => {

@@ -20,6 +20,10 @@ use lava_lsp::{JsonValue, parse_json, which_binary};
 /// SSH stdio JSON-RPC channel.
 pub const HTTP_TRANSFER_THRESHOLD_BYTES: u64 = 512 * 1024;
 
+/// Dedicated UI `EventQueue` wakeup timer ID (`"RMT\0"`) pushed whenever an asynchronous
+/// `RemoteManager` background operation finishes.
+pub const REMOTE_WAKE_TIMER_ID: u64 = 0x524D_5400;
+
 // ---------------------------------------------------------------------------
 // Shared JSON-RPC 2.0 `Content-Length` Framing (`lava-remote` <-> `lava-server`)
 // ---------------------------------------------------------------------------
@@ -560,10 +564,214 @@ pub type TransferProgressCallback = Arc<dyn Fn(Option<TransferProgressSnapshot>)
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RemotePreviewResult {
     pub lines: Vec<String>,
+    pub start_row: i64,
+    pub total_lines: i64,
     pub is_binary: bool,
     pub truncated: bool,
     pub total_size: i64,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteRankedFileItem {
+    pub full_uri: String,
+    pub rel_path: String,
+    pub is_dir: bool,
+    pub score: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteRankedFilesResult {
+    pub total_indexed: i64,
+    pub total_matched: i64,
+    pub items: Vec<RemoteRankedFileItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteRichDirEntry {
+    pub name: String,
+    pub full_uri: String,
+    pub remote_path: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub is_exec: bool,
+    pub size: i64,
+    pub modified_secs: i64,
+    pub perms: String,
+    pub symlink_target: String,
+    pub git_badge: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteEntryPreview {
+    pub kind: String,
+    pub target_uri: String,
+    pub target_name: String,
+    pub total_count: i64,
+    pub total_size: i64,
+    pub lines: Vec<String>,
+    pub child_entries: Vec<(String, bool, bool, i64)>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteDirSnapshot {
+    pub resolved_uri: String,
+    pub parent_uri: String,
+    pub parent_entries: Vec<(String, String, bool)>,
+    pub entries: Vec<RemoteRichDirEntry>,
+    pub git_is_repo: bool,
+    pub git_root_uri: String,
+    pub git_branch: String,
+    pub git_staged: i64,
+    pub git_modified: i64,
+    pub git_untracked: i64,
+    pub preview: RemoteEntryPreview,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteGitSummary {
+    pub is_repo: bool,
+    pub root: String,
+    pub branch: String,
+    pub staged_count: i64,
+    pub modified_count: i64,
+    pub untracked_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteGitHunk {
+    pub old_start: i64,
+    pub old_count: i64,
+    pub new_start: i64,
+    pub new_count: i64,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum AsyncRemoteOp {
+    SearchFiles {
+        uri: String,
+        query: String,
+        include_hidden: bool,
+        include_dirs: bool,
+        limit: i64,
+    },
+    SearchGrep {
+        uri: String,
+        pattern: String,
+        case_sensitive: bool,
+        file_filter: String,
+        limit: i64,
+    },
+    ReadPreview {
+        uri: String,
+        start_row: i64,
+        max_lines: i64,
+        max_bytes: i64,
+    },
+    DirSnapshot {
+        uri: String,
+        show_hidden: bool,
+        filter_query: String,
+        sort_by: String,
+        sort_reverse: bool,
+        focus_name: String,
+        preferred_row: i64,
+        include_parent: bool,
+        include_preview: bool,
+    },
+    EntryPreview {
+        uri: String,
+        is_dir: bool,
+        show_hidden: bool,
+        max_lines: i64,
+        max_bytes: i64,
+    },
+    GitSummary {
+        uri: String,
+    },
+    GitFileHunks {
+        cwd_uri: String,
+        file_uri: String,
+        override_lines: Option<Vec<String>>,
+    },
+    GitBlameLine {
+        cwd_uri: String,
+        file_uri: String,
+        row: i64,
+    },
+    ScanTodos {
+        root_uri: String,
+        limit: i64,
+    },
+    WorkspaceReplace {
+        root_uri: String,
+        query: String,
+        replacement: String,
+        case_sensitive: bool,
+        file_filter: String,
+    },
+    ReaddirSimple {
+        uri: String,
+        show_hidden: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum AsyncRemoteResult {
+    SearchFiles(RemoteRankedFilesResult),
+    SearchGrep {
+        total_matched: i64,
+        hits: Vec<(String, i64, i64, String)>,
+    },
+    ReadPreview(RemotePreviewResult),
+    DirSnapshot(Box<RemoteDirSnapshot>),
+    EntryPreview(RemoteEntryPreview),
+    GitSummary(RemoteGitSummary),
+    GitFileHunks {
+        tracked: bool,
+        hunks: Vec<RemoteGitHunk>,
+    },
+    GitBlameLine(Option<RemoteGitBlame>),
+    ScanTodos(Vec<(String, i64, i64, String, String)>),
+    WorkspaceReplace {
+        files_changed: i64,
+        total_replacements: i64,
+    },
+    ReaddirSimple(Vec<RemoteDirEntry>),
+}
+
+#[derive(Debug, Clone)]
+pub enum AsyncPollOutcome {
+    Idle,
+    Pending {
+        seq: u64,
+    },
+    Ready {
+        seq: u64,
+        elapsed_ms: i64,
+        result: AsyncRemoteResult,
+    },
+    Error {
+        seq: u64,
+        message: String,
+    },
+}
+
+struct AsyncCompletedItem {
+    seq: u64,
+    elapsed_ms: i64,
+    outcome: Result<AsyncRemoteResult, String>,
+}
+
+#[derive(Default)]
+struct AsyncSlotState {
+    latest_seq: u64,
+    pending: Option<(u64, AsyncRemoteOp)>,
+    worker_running: bool,
+    completed: Option<AsyncCompletedItem>,
+}
+
+pub type RemoteWakeCallback = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteGitFileEntry {
@@ -744,6 +952,10 @@ impl ServerStdioClient {
         if !self.is_alive() {
             return Err("remote lava-server session is no longer alive".to_string());
         }
+        let sim_delay = GLOBAL_TEST_RPC_DELAY_MS.load(Ordering::Relaxed);
+        if sim_delay > 0 && method != "server/ping" && method != "server/shutdown" {
+            thread::sleep(Duration::from_millis(sim_delay));
+        }
         let req_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::sync_channel(1);
         self.pending
@@ -838,6 +1050,12 @@ struct PortForwardProcess {
     child: Option<Mutex<Child>>,
 }
 
+static GLOBAL_TEST_RPC_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_simulated_rpc_delay_ms(ms: u64) {
+    GLOBAL_TEST_RPC_DELAY_MS.store(ms, Ordering::SeqCst);
+}
+
 pub struct RemoteManager {
     profiles: Mutex<HashMap<String, RemoteTransportProfile>>,
     sessions: Mutex<HashMap<String, Arc<RemoteSession>>>,
@@ -845,6 +1063,9 @@ pub struct RemoteManager {
     next_forward_id: AtomicU64,
     last_progress: Mutex<TransferProgressSnapshot>,
     progress_cb: Mutex<Option<TransferProgressCallback>>,
+    waker: Mutex<Option<RemoteWakeCallback>>,
+    async_slots: Mutex<HashMap<String, AsyncSlotState>>,
+    active_async_workers: AtomicU64,
 }
 
 impl Default for RemoteManager {
@@ -861,6 +1082,7 @@ fn sh_single_quote(s: &str) -> String {
 /// `dash`, `zsh`) AND `fish` (where `\` escapes `\` and `'` even inside single quotes).
 /// Runs containing neither `'` nor `\` are wrapped in `'...'`, while `'` and `\` are emitted
 /// outside single quotes as `\'` and `\\`.
+#[cfg(not(windows))]
 fn shell_universal_quote(s: &str) -> String {
     if s.is_empty() {
         return "''".to_string();
@@ -901,10 +1123,78 @@ fn shell_universal_quote(s: &str) -> String {
 const SSH_STDOUT_SENTINEL_TAG: &str = "__LAVA_SSH_OUT_7F3A__";
 const SSH_STDOUT_SENTINEL_BYTES: &[u8] = b"__LAVA_SSH_OUT_7F3A__\n";
 
-/// Wrap a POSIX shell script in `sh -c <universal-quoted>` so SSH remote commands execute
-/// reliably regardless of whether the remote user's login shell is `fish`, `zsh`, `bash`, or `sh`.
-fn wrap_posix_sh(script: &str) -> String {
-    format!("sh -c {}", shell_universal_quote(script))
+/// Format a single argv token placed after `<ssh_dest>` on `Command::new("ssh")` so both
+/// Windows `Win32-OpenSSH` (`ssh.exe`, which forwards `CreateProcessW`'s `lpCommandLine` tail and
+/// preserves outer `"..."` around space-containing args) and Unix OpenSSH (`ssh`, which space-joins
+/// `argv` unquoted) deliver the exact token to remote `fish` as well as POSIX `sh`.
+fn ssh_exec_token(token: &str) -> String {
+    #[cfg(windows)]
+    {
+        token.to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        if !token.is_empty()
+            && token.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ':' | '=' | '+')
+            })
+        {
+            token.to_string()
+        } else {
+            shell_universal_quote(token)
+        }
+    }
+}
+
+fn encode_base64_lines(data: &[u8]) -> Vec<u8> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity((data.len() / 3 + 1) * 4 + (data.len() / 57) + 4);
+    let mut col = 0usize;
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+        out.push(TABLE[(b0 >> 2) as usize]);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize]);
+        out.push(if chunk.len() > 1 {
+            TABLE[(((b1 & 0x0F) << 2) | (b2 >> 6)) as usize]
+        } else {
+            b'='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(b2 & 0x3F) as usize]
+        } else {
+            b'='
+        });
+        col += 4;
+        if col >= 76 {
+            out.push(b'\n');
+            col = 0;
+        }
+    }
+    if col > 0 {
+        out.push(b'\n');
+    }
+    out
+}
+
+fn encode_urlsafe_b64_nopad(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity((data.len() * 4).div_ceil(3));
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(((b1 & 0x0F) << 2) | (b2 >> 6)) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(b2 & 0x3F) as usize] as char);
+        }
+    }
+    out
 }
 
 fn strip_ssh_banner_bytes(raw: &[u8]) -> &[u8] {
@@ -973,34 +1263,51 @@ fn run_ssh_posix_cmd(
     if ssh_bin.is_empty() {
         return Err("OpenSSH client 'ssh' not found in local PATH".to_string());
     }
-    let use_sentinel = remote_sh_cmd.trim() != "sh -s";
-    let wrapped_remote_cmd = if !use_sentinel {
-        "sh -s".to_string()
-    } else {
-        wrap_posix_sh(&format!(
-            "printf '{SSH_STDOUT_SENTINEL_TAG}\\n'; {remote_sh_cmd}"
-        ))
-    };
+    let is_raw_sh_s = remote_sh_cmd.trim() == "sh -s";
+    let use_sentinel = !is_raw_sh_s;
+
+    // Always pass bare `sh` and `-s` as two separate space-free, quote-free tokens!
+    // On Windows `Win32-OpenSSH` (`ssh.exe`), passing `"sh -c ..."` as a single space-containing
+    // `.arg(...)` causes `CreateProcessW` + `ssh.exe` to send `"sh -c ..."` with outer double
+    // quotes to remote `fish`, triggering `Expected a command, but instead found a string`.
+    // Separate `"sh"` + `"-s"` tokens contain zero spaces or quotes and feed pure POSIX scripts
+    // over `stdin` cleanly across every SSH client and remote login shell (`fish`, `csh`, `zsh`, `sh`).
     let mut cmd = new_hidden_command(ssh_bin);
     cmd.args(ssh_base_args(port, control_path))
         .arg(ssh_dest)
-        .arg(&wrapped_remote_cmd)
+        .arg("sh")
+        .arg("-s")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-
-    if stdin_bytes.is_some() {
-        cmd.stdin(Stdio::piped());
-    } else {
-        cmd.stdin(Stdio::null());
-    }
 
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to invoke ssh to '{ssh_dest}': {e}"))?;
-    if let Some(input) = stdin_bytes
-        && let Some(mut child_in) = child.stdin.take()
-    {
-        let _ = child_in.write_all(input);
+    if let Some(mut child_in) = child.stdin.take() {
+        if is_raw_sh_s {
+            if let Some(input) = stdin_bytes {
+                let _ = child_in.write_all(input);
+            }
+        } else if let Some(input) = stdin_bytes {
+            let _ = writeln!(child_in, "printf '{SSH_STDOUT_SENTINEL_TAG}\\n'");
+            let _ = writeln!(child_in, "__lava_in=\"${{TMPDIR:-/tmp}}/.lava-stdin.$$\"");
+            let _ = writeln!(
+                child_in,
+                "base64 -d <<'__LAVA_B64_EOF_9A4E__' > \"$__lava_in\""
+            );
+            let b64 = encode_base64_lines(input);
+            let _ = child_in.write_all(&b64);
+            let _ = writeln!(child_in, "__LAVA_B64_EOF_9A4E__");
+            let _ = writeln!(child_in, "(\n{remote_sh_cmd}\n) < \"$__lava_in\"");
+            let _ = writeln!(
+                child_in,
+                "__lava_rc=$?\nrm -f \"$__lava_in\"\nexit $__lava_rc"
+            );
+        } else {
+            let _ = writeln!(child_in, "printf '{SSH_STDOUT_SENTINEL_TAG}\\n'");
+            let _ = writeln!(child_in, "{remote_sh_cmd}");
+        }
     }
     let out = child
         .wait_with_output()
@@ -1157,8 +1464,16 @@ fn collect_server_source_files(root: &Path, rel_prefix: &str, out: &mut Vec<(Str
     }
 }
 
+pub type RemoteGrepHit = (String, i64, i64, String);
+pub type RemoteTodoItem = (String, i64, i64, String, String);
+
 impl RemoteManager {
     pub fn new() -> Self {
+        if let Ok(raw_d) = env::var("LAVA_TEST_RPC_DELAY_MS")
+            && let Ok(ms) = raw_d.trim().parse::<u64>()
+        {
+            GLOBAL_TEST_RPC_DELAY_MS.store(ms, Ordering::SeqCst);
+        }
         Self {
             profiles: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
@@ -1166,6 +1481,22 @@ impl RemoteManager {
             next_forward_id: AtomicU64::new(1),
             last_progress: Mutex::new(TransferProgressSnapshot::default()),
             progress_cb: Mutex::new(None),
+            waker: Mutex::new(None),
+            async_slots: Mutex::new(HashMap::new()),
+            active_async_workers: AtomicU64::new(0),
+        }
+    }
+
+    pub fn set_waker(&self, waker: RemoteWakeCallback) {
+        if let Ok(mut guard) = self.waker.lock() {
+            *guard = Some(waker);
+        }
+    }
+
+    fn notify_waker(&self) {
+        let cb_opt = self.waker.lock().ok().and_then(|g| g.clone());
+        if let Some(cb) = cb_opt {
+            cb();
         }
     }
 
@@ -1368,21 +1699,23 @@ impl RemoteManager {
             if !srv_bin.is_empty() {
                 let mut ssh_args = ssh_base_args(parsed.port, &control_path);
                 ssh_args.push(ssh_dest.clone());
-                let inner_launch = if !srv_root.is_empty() {
+                if !srv_root.is_empty() {
                     let cache_dir = Path::new(&srv_bin)
                         .parent()
                         .map(|p| p.join("cache").to_string_lossy().into_owned())
                         .unwrap_or_else(|| format!("{remote_home}/.lava-server/cache"));
-                    format!(
-                        "LAVA_SERVER_CACHE_DIR={} exec {} --stdio --server-root {}",
-                        sh_single_quote(&cache_dir),
-                        sh_single_quote(&srv_bin),
-                        sh_single_quote(&srv_root)
-                    )
+                    ssh_args.push("env".to_string());
+                    ssh_args.push(ssh_exec_token(&format!(
+                        "LAVA_SERVER_CACHE_DIR={cache_dir}"
+                    )));
+                    ssh_args.push(ssh_exec_token(&srv_bin));
+                    ssh_args.push("--stdio".to_string());
+                    ssh_args.push("--server-root".to_string());
+                    ssh_args.push(ssh_exec_token(&srv_root));
                 } else {
-                    format!("exec {} --stdio", sh_single_quote(&srv_bin))
-                };
-                ssh_args.push(wrap_posix_sh(&inner_launch));
+                    ssh_args.push(ssh_exec_token(&srv_bin));
+                    ssh_args.push("--stdio".to_string());
+                }
                 if let Ok(client) = ServerStdioClient::spawn("ssh", &ssh_args)
                     && let Ok(ping) =
                         client.call("server/ping", JsonValue::obj([]), Duration::from_secs(10))
@@ -2060,14 +2393,16 @@ impl RemoteManager {
         Ok(format!("{}{}", uri.prefix, norm_root))
     }
 
-    pub fn search_files(
+    pub fn search_files_ranked(
         &self,
         raw_uri: &str,
         query: &str,
+        include_hidden: bool,
+        include_dirs: bool,
         limit: i64,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<RemoteRankedFilesResult, String> {
         let (sess, uri) = self.ensure_session(raw_uri)?;
-        let cap = limit.clamp(1, 2000);
+        let cap = limit.clamp(1, 5000);
         match &sess.backend {
             RemoteBackend::LavaServer(client) => {
                 let res = client.call(
@@ -2075,12 +2410,48 @@ impl RemoteManager {
                     JsonValue::obj([
                         ("root", JsonValue::Str(uri.remote_path.clone())),
                         ("query", JsonValue::Str(query.to_string())),
+                        ("include_hidden", JsonValue::Bool(include_hidden)),
+                        ("include_dirs", JsonValue::Bool(include_dirs)),
                         ("limit", JsonValue::Int(cap)),
                     ]),
-                    Duration::from_secs(15),
+                    Duration::from_secs(20),
                 )?;
-                let mut out = Vec::new();
-                if let Some(arr) = res.get("files").and_then(JsonValue::as_array) {
+                let mut items = Vec::new();
+                if let Some(entries_arr) = res.get("entries").and_then(JsonValue::as_array) {
+                    for e in entries_arr {
+                        let Some(rel_raw) = e.get_str("path") else {
+                            continue;
+                        };
+                        let rel_clean = rel_raw.trim_start_matches('/').to_string();
+                        let full_rpath = if rel_raw.starts_with('/') {
+                            normalize_posix_path(rel_raw)
+                        } else {
+                            normalize_posix_path(&format!("{}/{rel_raw}", uri.remote_path))
+                        };
+                        let is_dir = e
+                            .get("is_dir")
+                            .and_then(JsonValue::as_bool)
+                            .unwrap_or(false);
+                        let score = e.get_i64("score").unwrap_or(100);
+                        let rel_path = if !rel_raw.starts_with('/') {
+                            rel_clean
+                        } else {
+                            full_rpath
+                                .strip_prefix(&format!(
+                                    "{}/",
+                                    uri.remote_path.trim_end_matches('/')
+                                ))
+                                .unwrap_or(&full_rpath)
+                                .to_string()
+                        };
+                        items.push(RemoteRankedFileItem {
+                            full_uri: format!("{}{}", uri.prefix, full_rpath),
+                            rel_path,
+                            is_dir,
+                            score,
+                        });
+                    }
+                } else if let Some(arr) = res.get("files").and_then(JsonValue::as_array) {
                     for f in arr {
                         let Some(s) = f.as_str() else { continue };
                         let full_rpath = if s.starts_with('/') {
@@ -2088,10 +2459,37 @@ impl RemoteManager {
                         } else {
                             normalize_posix_path(&format!("{}/{s}", uri.remote_path))
                         };
-                        out.push(format!("{}{}", uri.prefix, full_rpath));
+                        let rel_path = if !s.starts_with('/') {
+                            s.to_string()
+                        } else {
+                            full_rpath
+                                .strip_prefix(&format!(
+                                    "{}/",
+                                    uri.remote_path.trim_end_matches('/')
+                                ))
+                                .unwrap_or(&full_rpath)
+                                .to_string()
+                        };
+                        items.push(RemoteRankedFileItem {
+                            full_uri: format!("{}{}", uri.prefix, full_rpath),
+                            rel_path,
+                            is_dir: false,
+                            score: 100,
+                        });
                     }
                 }
-                Ok(out)
+                let total_matched = res
+                    .get_i64("total_matched")
+                    .or_else(|| res.get_i64("count"))
+                    .unwrap_or(items.len() as i64);
+                let total_indexed = res
+                    .get_i64("total_indexed")
+                    .unwrap_or(total_matched.max(items.len() as i64));
+                Ok(RemoteRankedFilesResult {
+                    total_indexed,
+                    total_matched,
+                    items,
+                })
             }
             RemoteBackend::SshPosix {
                 ssh_dest,
@@ -2099,43 +2497,124 @@ impl RemoteManager {
                 control_path,
             } => {
                 let q_root = sh_single_quote(&uri.remote_path);
+                let hidden_rg = if include_hidden {
+                    "--hidden -g '!.git'"
+                } else {
+                    ""
+                };
+                let hidden_find = if include_hidden {
+                    "-not -path '*/.git/*'"
+                } else {
+                    "-not -path '*/.*'"
+                };
                 let script = format!(
-                    "cd -- {q_root} && (if command -v rg >/dev/null 2>&1; then rg --files; else find . -type f -not -path '*/.git/*'; fi) | head -n {cap}"
+                    "cd -- {q_root} && (if command -v rg >/dev/null 2>&1; then rg --files {hidden_rg}; else find . -type f {hidden_find}; fi)"
                 );
                 let (code, stdout, stderr) =
                     run_ssh_posix_cmd(ssh_dest, *port, control_path, &script, None)?;
                 if code != 0 && stdout.trim().is_empty() {
                     return Err(stderr.trim().to_string());
                 }
-                let q_low = query.trim().to_lowercase();
-                let mut out = Vec::new();
+                let mut all_rels: Vec<(String, bool)> = Vec::new();
+                let mut seen_dirs = HashSet::new();
                 for line in stdout.lines() {
                     let clean = line.trim().trim_start_matches("./");
                     if clean.is_empty() {
                         continue;
                     }
-                    if !q_low.is_empty() && !clean.to_lowercase().contains(&q_low) {
-                        continue;
+                    if include_dirs {
+                        let mut from = 0usize;
+                        while let Some(sl) = clean[from..].find('/') {
+                            let end = from + sl;
+                            if end > 0 {
+                                let d = &clean[..end];
+                                if seen_dirs.insert(d.to_string()) {
+                                    all_rels.push((d.to_string(), true));
+                                }
+                            }
+                            from = end + 1;
+                        }
                     }
-                    let full_rpath = normalize_posix_path(&format!("{}/{clean}", uri.remote_path));
-                    out.push(format!("{}{}", uri.prefix, full_rpath));
+                    all_rels.push((clean.to_string(), false));
                 }
-                Ok(out)
+                let total_indexed = all_rels.len() as i64;
+                let tokens: Vec<String> = query
+                    .split_whitespace()
+                    .map(|t| t.to_lowercase())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                let mut matched: Vec<RemoteRankedFileItem> = Vec::new();
+                for (rel, is_dir) in all_rels {
+                    let low = rel.to_lowercase();
+                    let mut ok = true;
+                    let mut score = 100i64;
+                    for tok in &tokens {
+                        if let Some(neg) = tok.strip_prefix('!') {
+                            if !neg.is_empty() && low.contains(neg) {
+                                ok = false;
+                                break;
+                            }
+                        } else if let Some(pos) = low.find(tok.as_str()) {
+                            score += 5000 - (pos as i64) * 3 - (low.len() as i64);
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        let full_rpath =
+                            normalize_posix_path(&format!("{}/{rel}", uri.remote_path));
+                        matched.push(RemoteRankedFileItem {
+                            full_uri: format!("{}{}", uri.prefix, full_rpath),
+                            rel_path: rel,
+                            is_dir,
+                            score,
+                        });
+                    }
+                }
+                if !tokens.is_empty() {
+                    matched.sort_by(|a, b| {
+                        b.score
+                            .cmp(&a.score)
+                            .then_with(|| a.rel_path.cmp(&b.rel_path))
+                    });
+                }
+                let total_matched = matched.len() as i64;
+                if matched.len() > cap as usize {
+                    matched.truncate(cap as usize);
+                }
+                Ok(RemoteRankedFilesResult {
+                    total_indexed,
+                    total_matched,
+                    items: matched,
+                })
             }
         }
     }
 
-    pub fn search_grep(
+    pub fn search_files(
+        &self,
+        raw_uri: &str,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<String>, String> {
+        let ranked = self.search_files_ranked(raw_uri, query, false, false, limit)?;
+        Ok(ranked.items.into_iter().map(|it| it.full_uri).collect())
+    }
+
+    pub fn search_grep_ext(
         &self,
         raw_uri: &str,
         pattern: &str,
+        case_sensitive: bool,
+        file_filter: &str,
         limit: i64,
-    ) -> Result<Vec<(String, i64, i64, String)>, String> {
+    ) -> Result<(i64, Vec<RemoteGrepHit>), String> {
         if pattern.trim().is_empty() {
-            return Ok(Vec::new());
+            return Ok((0, Vec::new()));
         }
         let (sess, uri) = self.ensure_session(raw_uri)?;
-        let cap = limit.clamp(1, 1000);
+        let cap = limit.clamp(1, 2000);
         match &sess.backend {
             RemoteBackend::LavaServer(client) => {
                 let res = client.call(
@@ -2144,9 +2623,10 @@ impl RemoteManager {
                         ("root", JsonValue::Str(uri.remote_path.clone())),
                         ("pattern", JsonValue::Str(pattern.to_string())),
                         ("limit", JsonValue::Int(cap)),
-                        ("case_sensitive", JsonValue::Bool(false)),
+                        ("case_sensitive", JsonValue::Bool(case_sensitive)),
+                        ("file_filter", JsonValue::Str(file_filter.to_string())),
                     ]),
-                    Duration::from_secs(15),
+                    Duration::from_secs(20),
                 )?;
                 let mut out = Vec::new();
                 if let Some(arr) = res.get("hits").and_then(JsonValue::as_array) {
@@ -2165,7 +2645,11 @@ impl RemoteManager {
                         out.push((format!("{}{}", uri.prefix, rpath), row, col, txt));
                     }
                 }
-                Ok(out)
+                let total_matched = res
+                    .get_i64("total_matched")
+                    .or_else(|| res.get_i64("count"))
+                    .unwrap_or(out.len() as i64);
+                Ok((total_matched, out))
             }
             RemoteBackend::SshPosix {
                 ssh_dest,
@@ -2174,17 +2658,24 @@ impl RemoteManager {
             } => {
                 let q_root = sh_single_quote(&uri.remote_path);
                 let q_pat = sh_single_quote(pattern);
+                let rg_case = if case_sensitive { "-s" } else { "-i" };
+                let grep_case = if case_sensitive { "" } else { "-i" };
                 let script = format!(
-                    "cd -- {q_root} && if command -v rg >/dev/null 2>&1; then rg -i --line-number --column --no-heading --color=never -- {q_pat} | head -n {cap}; else grep -rnI -- {q_pat} . | head -n {cap}; fi"
+                    "cd -- {q_root} && if command -v rg >/dev/null 2>&1; then rg {rg_case} -F --line-number --column --no-heading --color=never -- {q_pat} . | head -n {cap}; else grep -rnI {grep_case} -F -- {q_pat} . | head -n {cap}; fi"
                 );
                 let (_, stdout, _) =
                     run_ssh_posix_cmd(ssh_dest, *port, control_path, &script, None)?;
+                let filt_low = file_filter.trim().to_lowercase();
                 let mut out = Vec::new();
                 for line in stdout.lines() {
                     let mut p = line.splitn(4, ':');
                     let Some(rel) = p.next() else { continue };
                     let Some(r_s) = p.next() else { continue };
                     let Some(c_or_txt) = p.next() else { continue };
+                    let clean_rel = rel.trim_start_matches("./");
+                    if !filt_low.is_empty() && !clean_rel.to_lowercase().contains(&filt_low) {
+                        continue;
+                    }
                     let row = r_s.parse::<i64>().unwrap_or(1).saturating_sub(1);
                     let (col, text) = if let Some(rest_txt) = p.next()
                         && let Ok(c_num) = c_or_txt.parse::<i64>()
@@ -2193,13 +2684,22 @@ impl RemoteManager {
                     } else {
                         (0, c_or_txt.to_string())
                     };
-                    let clean_rel = rel.trim_start_matches("./");
                     let rpath = normalize_posix_path(&format!("{}/{clean_rel}", uri.remote_path));
                     out.push((format!("{}{}", uri.prefix, rpath), row, col, text));
                 }
-                Ok(out)
+                let total = out.len() as i64;
+                Ok((total, out))
             }
         }
+    }
+
+    pub fn search_grep(
+        &self,
+        raw_uri: &str,
+        pattern: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, i64, i64, String)>, String> {
+        Ok(self.search_grep_ext(raw_uri, pattern, false, "", limit)?.1)
     }
 
     pub fn exec_command(
@@ -2378,18 +2878,26 @@ impl RemoteManager {
             Some(d) => sh_single_quote(d),
             None => "\"$HOME/.lava-server\"".to_string(),
         };
-        let bin_script = format!(
-            "DEST={dest_expr}; mkdir -p \"$DEST/cache\" && \
-             cat > \"$DEST/.lava-server.tmp.$$\" && \
-             chmod 755 \"$DEST/.lava-server.tmp.$$\" && \
+        let b64_bin = encode_base64_lines(&bytes);
+        let mut bin_stream = Vec::with_capacity(b64_bin.len() + 320);
+        let _ = writeln!(
+            bin_stream,
+            "set -e\nDEST={dest_expr}\nmkdir -p \"$DEST/cache\"\n\
+             base64 -d <<'__LAVA_SRV_BIN_EOF__' > \"$DEST/.lava-server.tmp.$$\""
+        );
+        bin_stream.extend_from_slice(&b64_bin);
+        let _ = writeln!(
+            bin_stream,
+            "__LAVA_SRV_BIN_EOF__\n\
+             chmod 755 \"$DEST/.lava-server.tmp.$$\"\n\
              mv -f \"$DEST/.lava-server.tmp.$$\" \"$DEST/lava-server\""
         );
         let (code, _, stderr) = run_ssh_posix_cmd(
             &parsed.ssh_destination(),
             parsed.port,
             &control_path,
-            &bin_script,
-            Some(&bytes),
+            "sh -s",
+            Some(&bin_stream),
         )?;
         if code != 0 {
             self.emit_progress(TransferProgressSnapshot::default());
@@ -2868,18 +3376,22 @@ impl RemoteManager {
                     return Err("OpenSSH client 'ssh' not found in local PATH".to_string());
                 }
                 let q = sh_single_quote(&uri.remote_path);
-                let remote_cat = wrap_posix_sh(&format!(
-                    "printf '{SSH_STDOUT_SENTINEL_TAG}\\n'; exec cat -- {q}"
-                ));
                 let mut child = new_hidden_command(ssh_bin)
                     .args(ssh_base_args(*port, control_path))
                     .arg(ssh_dest)
-                    .arg(&remote_cat)
-                    .stdin(Stdio::null())
+                    .arg("sh")
+                    .arg("-s")
+                    .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .spawn()
                     .map_err(|e| format!("failed to spawn ssh cat: {e}"))?;
+                if let Some(mut child_in) = child.stdin.take() {
+                    let _ = writeln!(
+                        child_in,
+                        "printf '{SSH_STDOUT_SENTINEL_TAG}\\n'; exec cat -- {q}"
+                    );
+                }
 
                 let mut raw_out = Vec::with_capacity((size_u64 as usize).min(256 * 1024 * 1024));
                 let mut lines_loaded: u64 = 0;
@@ -3017,64 +3529,86 @@ impl RemoteManager {
         }
     }
 
-    /// Read a capped preview (`max_bytes`, `max_lines`) of a remote file for Dirvish / Telescope
-    /// without downloading huge files!
-    pub fn read_preview(
+    /// Read a capped window (`start_row`, `max_lines`, `max_bytes`) of a remote file for
+    /// Dirvish / Telescope without ever downloading full multi-MB files!
+    pub fn read_preview_window(
         &self,
         raw_uri: &str,
-        max_bytes: i64,
+        start_row: i64,
         max_lines: i64,
+        max_bytes: i64,
     ) -> Result<RemotePreviewResult, String> {
         let (sess, uri) = self.ensure_session(raw_uri)?;
+        let srow = start_row.max(0);
         let cap_bytes = max_bytes.clamp(256, 262_144);
         let cap_lines = max_lines.clamp(5, 2000);
 
         match &sess.backend {
             RemoteBackend::LavaServer(client) => {
-                if let Ok(res) = client.call(
+                match client.call(
                     "fs/read_preview",
                     JsonValue::obj([
                         ("path", JsonValue::Str(uri.remote_path.clone())),
+                        ("start_row", JsonValue::Int(srow)),
                         ("max_bytes", JsonValue::Int(cap_bytes)),
                         ("max_lines", JsonValue::Int(cap_lines)),
                     ]),
-                    Duration::from_secs(6),
+                    Duration::from_secs(8),
                 ) {
-                    let is_binary = res
-                        .get("is_binary")
-                        .or_else(|| res.get("binary"))
-                        .and_then(JsonValue::as_bool)
-                        .unwrap_or(false);
-                    let truncated = res
-                        .get("truncated")
-                        .and_then(JsonValue::as_bool)
-                        .unwrap_or(false);
-                    let total_size = res
-                        .get_i64("total_size")
-                        .or_else(|| res.get_i64("size"))
-                        .unwrap_or(0);
-                    let mut lines = Vec::new();
-                    if let Some(arr) = res.get("lines").and_then(JsonValue::as_array) {
-                        for v in arr {
-                            lines.push(v.as_str().unwrap_or("").to_string());
+                    Ok(res) => {
+                        let is_binary = res
+                            .get("is_binary")
+                            .or_else(|| res.get("binary"))
+                            .and_then(JsonValue::as_bool)
+                            .unwrap_or(false);
+                        let truncated = res
+                            .get("truncated")
+                            .and_then(JsonValue::as_bool)
+                            .unwrap_or(false);
+                        let total_size = res
+                            .get_i64("total_size")
+                            .or_else(|| res.get_i64("size"))
+                            .unwrap_or(0);
+                        let res_start = res.get_i64("start_row").unwrap_or(0);
+                        let mut lines = Vec::new();
+                        if let Some(arr) = res.get("lines").and_then(JsonValue::as_array) {
+                            for v in arr {
+                                lines.push(v.as_str().unwrap_or("").to_string());
+                            }
                         }
+                        let total_lines = res
+                            .get_i64("total_lines")
+                            .unwrap_or(res_start + lines.len() as i64);
+                        Ok(RemotePreviewResult {
+                            lines,
+                            start_row: res_start,
+                            total_lines,
+                            is_binary,
+                            truncated,
+                            total_size,
+                        })
                     }
-                    return Ok(RemotePreviewResult {
-                        lines,
-                        is_binary,
-                        truncated,
-                        total_size,
-                    });
+                    Err(err) if err.contains("-32601") || err.contains("Method not found") => {
+                        let (lines, _) = self.read_lines(raw_uri)?;
+                        let total_lines = lines.len() as i64;
+                        let skip_n = (srow as usize).min(lines.len());
+                        let truncated = total_lines > (skip_n as i64 + cap_lines);
+                        let clipped = lines
+                            .into_iter()
+                            .skip(skip_n)
+                            .take(cap_lines as usize)
+                            .collect();
+                        Ok(RemotePreviewResult {
+                            lines: clipped,
+                            start_row: skip_n as i64,
+                            total_lines,
+                            is_binary: false,
+                            truncated,
+                            total_size: 0,
+                        })
+                    }
+                    Err(err) => Err(err),
                 }
-                let (lines, _) = self.read_lines(raw_uri)?;
-                let truncated = lines.len() as i64 > cap_lines;
-                let clipped = lines.into_iter().take(cap_lines as usize).collect();
-                Ok(RemotePreviewResult {
-                    lines: clipped,
-                    is_binary: false,
-                    truncated,
-                    total_size: 0,
-                })
             }
             RemoteBackend::SshPosix {
                 ssh_dest,
@@ -3082,13 +3616,23 @@ impl RemoteManager {
                 control_path,
             } => {
                 let q = sh_single_quote(&uri.remote_path);
-                let script = format!("head -c {cap_bytes} -- {q} 2>/dev/null || true");
+                let script = if srow > 0 {
+                    let start_1 = srow + 1;
+                    let end_1 = srow + cap_lines;
+                    format!(
+                        "sed -n '{start_1},{end_1}p' -- {q} 2>/dev/null | head -c {cap_bytes} || true"
+                    )
+                } else {
+                    format!("head -c {cap_bytes} -- {q} 2>/dev/null || true")
+                };
                 let (_, stdout, _) =
                     run_ssh_posix_cmd(ssh_dest, *port, control_path, &script, None)?;
                 let is_binary = stdout.as_bytes().contains(&0);
                 if is_binary {
                     return Ok(RemotePreviewResult {
                         lines: Vec::new(),
+                        start_row: 0,
+                        total_lines: 0,
                         is_binary: true,
                         truncated: true,
                         total_size: cap_bytes,
@@ -3100,14 +3644,28 @@ impl RemoteManager {
                     .map(ToString::to_string)
                     .collect();
                 let truncated = all_lines.len() as i64 > cap_lines;
+                let clipped: Vec<String> = all_lines.into_iter().take(cap_lines as usize).collect();
+                let total_lines = srow + clipped.len() as i64;
                 Ok(RemotePreviewResult {
-                    lines: all_lines.into_iter().take(cap_lines as usize).collect(),
+                    lines: clipped,
+                    start_row: srow,
+                    total_lines,
                     is_binary: false,
                     truncated,
                     total_size: stdout.len() as i64,
                 })
             }
         }
+    }
+
+    /// Read a capped preview (`max_bytes`, `max_lines`) starting at row 0.
+    pub fn read_preview(
+        &self,
+        raw_uri: &str,
+        max_bytes: i64,
+        max_lines: i64,
+    ) -> Result<RemotePreviewResult, String> {
+        self.read_preview_window(raw_uri, 0, max_lines, max_bytes)
     }
 
     pub fn git_status(&self, raw_uri: &str) -> Result<RemoteGitStatus, String> {
@@ -3437,30 +3995,46 @@ impl RemoteManager {
         ssh_args.push(sess.uri_meta.ssh_destination());
 
         if !sess.remote_server_bin.is_empty() {
-            let mut proxy_parts = vec![
-                sh_single_quote(&sess.remote_server_bin),
-                "--lsp-proxy".to_string(),
-                sh_single_quote(&clean_root),
-                sh_single_quote(server_cmd),
-            ];
+            let mut payload = Vec::new();
+            payload.extend_from_slice(clean_root.as_bytes());
+            payload.push(0);
+            payload.extend_from_slice(server_cmd.as_bytes());
             for a in server_args {
-                proxy_parts.push(sh_single_quote(a));
+                payload.push(0);
+                payload.extend_from_slice(a.as_bytes());
             }
-            let inner = format!("exec {}", proxy_parts.join(" "));
-            ssh_args.push(wrap_posix_sh(&inner));
+            ssh_args.push(ssh_exec_token(&sess.remote_server_bin));
+            ssh_args.push("--lsp-proxy-b64".to_string());
+            ssh_args.push(encode_urlsafe_b64_nopad(&payload));
             return Ok(("ssh".to_string(), ssh_args, uri.prefix, clean_root));
         }
 
-        let mut quoted_cmd = vec![sh_single_quote(server_cmd)];
-        for a in server_args {
-            quoted_cmd.push(sh_single_quote(a));
+        let remote_home = sess
+            .info
+            .lock()
+            .ok()
+            .map(|g| g.remote_home.clone())
+            .filter(|h| !h.is_empty() && h != "/")
+            .unwrap_or_default();
+        let path_val = if remote_home.is_empty() {
+            "/usr/local/bin:/usr/bin:/bin".to_string()
+        } else {
+            format!(
+                "PATH={remote_home}/.lava-server:{remote_home}/.cargo/bin:{remote_home}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+            )
+        };
+        ssh_args.push("env".to_string());
+        ssh_args.push("-C".to_string());
+        ssh_args.push(ssh_exec_token(&clean_root));
+        if !remote_home.is_empty() {
+            ssh_args.push(ssh_exec_token(&path_val));
+        } else {
+            ssh_args.push(format!("PATH={path_val}"));
         }
-        let remote_exec = format!(
-            "PATH=\"$HOME/.lava-server:$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:$PATH\"; cd -- {} && exec {}",
-            sh_single_quote(&clean_root),
-            quoted_cmd.join(" ")
-        );
-        ssh_args.push(wrap_posix_sh(&remote_exec));
+        ssh_args.push(ssh_exec_token(server_cmd));
+        for a in server_args {
+            ssh_args.push(ssh_exec_token(a));
+        }
         Ok(("ssh".to_string(), ssh_args, uri.prefix, clean_root))
     }
 
@@ -3571,6 +4145,818 @@ impl RemoteManager {
         }
         out.sort_by_key(|f| f.id);
         out
+    }
+
+    fn decode_entry_preview_json(uri_prefix: &str, pv_json: &JsonValue) -> RemoteEntryPreview {
+        let kind = pv_json.get_str("kind").unwrap_or("none").to_string();
+        let raw_tpath = pv_json.get_str("target_path").unwrap_or("");
+        let target_uri = if raw_tpath.is_empty() {
+            String::new()
+        } else {
+            format!("{uri_prefix}{}", normalize_posix_path(raw_tpath))
+        };
+        let target_name = pv_json.get_str("target_name").unwrap_or("").to_string();
+        let total_count = pv_json.get_i64("total_count").unwrap_or(0);
+        let total_size = pv_json.get_i64("total_size").unwrap_or(0);
+        let mut lines = Vec::new();
+        if let Some(arr) = pv_json.get("lines").and_then(JsonValue::as_array) {
+            for v in arr {
+                lines.push(v.as_str().unwrap_or("").to_string());
+            }
+        }
+        let mut child_entries = Vec::new();
+        if let Some(carr) = pv_json.get("child_entries").and_then(JsonValue::as_array) {
+            for c in carr {
+                let Some(cname) = c.get_str("name") else {
+                    continue;
+                };
+                let cdir = c
+                    .get("is_dir")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                let csym = c
+                    .get("is_symlink")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                let csz = c.get_i64("size").unwrap_or(0);
+                child_entries.push((cname.to_string(), cdir, csym, csz));
+            }
+        }
+        RemoteEntryPreview {
+            kind,
+            target_uri,
+            target_name,
+            total_count,
+            total_size,
+            lines,
+            child_entries,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dir_snapshot(
+        &self,
+        raw_uri: &str,
+        show_hidden: bool,
+        filter_query: &str,
+        sort_by: &str,
+        sort_reverse: bool,
+        focus_name: &str,
+        preferred_row: i64,
+        include_parent: bool,
+        include_preview: bool,
+    ) -> Result<RemoteDirSnapshot, String> {
+        let (sess, uri) = self.ensure_session(raw_uri)?;
+        if let RemoteBackend::LavaServer(client) = &sess.backend {
+            match client.call(
+                "fs/dir_snapshot",
+                JsonValue::obj([
+                    ("path", JsonValue::Str(uri.remote_path.clone())),
+                    ("show_hidden", JsonValue::Bool(show_hidden)),
+                    ("filter_query", JsonValue::Str(filter_query.to_string())),
+                    ("sort_by", JsonValue::Str(sort_by.to_string())),
+                    ("sort_reverse", JsonValue::Bool(sort_reverse)),
+                    ("focus_name", JsonValue::Str(focus_name.to_string())),
+                    ("preferred_row", JsonValue::Int(preferred_row.max(0))),
+                    ("include_parent", JsonValue::Bool(include_parent)),
+                    ("include_preview", JsonValue::Bool(include_preview)),
+                ]),
+                Duration::from_secs(12),
+            ) {
+                Ok(res) => {
+                    let res_path = res.get_str("resolved_path").unwrap_or(&uri.remote_path);
+                    let resolved_uri = format!("{}{}", uri.prefix, normalize_posix_path(res_path));
+                    let par_raw = res.get_str("parent_path").unwrap_or("");
+                    let parent_uri = if par_raw.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}{}", uri.prefix, normalize_posix_path(par_raw))
+                    };
+                    let mut parent_entries = Vec::new();
+                    if let Some(parr) = res.get("parent_entries").and_then(JsonValue::as_array) {
+                        for p in parr {
+                            let Some(pname) = p.get_str("name") else {
+                                continue;
+                            };
+                            let prpath = p
+                                .get_str("path")
+                                .map(normalize_posix_path)
+                                .unwrap_or_else(|| {
+                                    normalize_posix_path(&format!("{par_raw}/{pname}"))
+                                });
+                            let pis_dir = p
+                                .get("is_dir")
+                                .and_then(JsonValue::as_bool)
+                                .unwrap_or(false);
+                            parent_entries.push((
+                                pname.to_string(),
+                                format!("{}{}", uri.prefix, prpath),
+                                pis_dir,
+                            ));
+                        }
+                    }
+                    let mut entries = Vec::new();
+                    if let Some(earr) = res.get("entries").and_then(JsonValue::as_array) {
+                        for e in earr {
+                            let Some(ename) = e.get_str("name") else {
+                                continue;
+                            };
+                            let erpath = e
+                                .get_str("path")
+                                .map(normalize_posix_path)
+                                .unwrap_or_else(|| {
+                                    normalize_posix_path(&format!("{res_path}/{ename}"))
+                                });
+                            entries.push(RemoteRichDirEntry {
+                                name: ename.to_string(),
+                                full_uri: format!("{}{}", uri.prefix, erpath),
+                                remote_path: erpath,
+                                is_dir: e
+                                    .get("is_dir")
+                                    .and_then(JsonValue::as_bool)
+                                    .unwrap_or(false),
+                                is_symlink: e
+                                    .get("is_symlink")
+                                    .and_then(JsonValue::as_bool)
+                                    .unwrap_or(false),
+                                is_exec: e
+                                    .get("is_exec")
+                                    .and_then(JsonValue::as_bool)
+                                    .unwrap_or(false),
+                                size: e.get_i64("size").unwrap_or(0),
+                                modified_secs: e.get_i64("modified_secs").unwrap_or(0),
+                                perms: e.get_str("perms").unwrap_or("-rw-r--r--").to_string(),
+                                symlink_target: e
+                                    .get_str("symlink_target")
+                                    .unwrap_or("")
+                                    .to_string(),
+                                git_badge: e.get_str("git_badge").unwrap_or(" ").to_string(),
+                            });
+                        }
+                    }
+                    let git_is_repo = res
+                        .get("git_is_repo")
+                        .and_then(JsonValue::as_bool)
+                        .unwrap_or(false);
+                    let git_root_raw = res.get_str("git_root").unwrap_or("");
+                    let git_root_uri = if git_root_raw.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}{}", uri.prefix, normalize_posix_path(git_root_raw))
+                    };
+                    let preview = res
+                        .get("preview")
+                        .map(|pv| Self::decode_entry_preview_json(&uri.prefix, pv))
+                        .unwrap_or_default();
+                    return Ok(RemoteDirSnapshot {
+                        resolved_uri,
+                        parent_uri,
+                        parent_entries,
+                        entries,
+                        git_is_repo,
+                        git_root_uri,
+                        git_branch: res.get_str("git_branch").unwrap_or("").to_string(),
+                        git_staged: res.get_i64("git_staged").unwrap_or(0),
+                        git_modified: res.get_i64("git_modified").unwrap_or(0),
+                        git_untracked: res.get_i64("git_untracked").unwrap_or(0),
+                        preview,
+                    });
+                }
+                Err(err) if !err.contains("-32601") && !err.contains("Method not found") => {
+                    return Err(err);
+                }
+                Err(_) => {}
+            }
+        }
+
+        // Fallback path for `SshPosix` or older `lava-server` binary before `:RemoteInstallServer`:
+        let base_items = self.readdir(raw_uri, show_hidden)?;
+        let filt_low = filter_query.trim().to_lowercase();
+        let mut entries: Vec<RemoteRichDirEntry> = base_items
+            .into_iter()
+            .filter(|it| filt_low.is_empty() || it.name.to_lowercase().contains(&filt_low))
+            .map(|it| RemoteRichDirEntry {
+                name: it.name,
+                full_uri: it.full_uri,
+                remote_path: it.remote_path,
+                is_dir: it.is_dir,
+                is_symlink: false,
+                is_exec: false,
+                size: it.size,
+                modified_secs: 0,
+                perms: if it.is_dir {
+                    "drwxr-xr-x".to_string()
+                } else {
+                    "-rw-r--r--".to_string()
+                },
+                symlink_target: String::new(),
+                git_badge: " ".to_string(),
+            })
+            .collect();
+        entries.sort_by(|a, b| {
+            if a.is_dir != b.is_dir {
+                return b.is_dir.cmp(&a.is_dir);
+            }
+            let ord = match sort_by {
+                "size" => a.size.cmp(&b.size),
+                _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            };
+            if sort_reverse { ord.reverse() } else { ord }
+        });
+        let (parent_uri, parent_entries) = if include_parent && uri.remote_path != "/" {
+            let par_p = Path::new(&uri.remote_path)
+                .parent()
+                .and_then(|p| p.to_str())
+                .unwrap_or("/");
+            let par_u = format!("{}{}", uri.prefix, normalize_posix_path(par_p));
+            let pitems = self
+                .readdir(&par_u, show_hidden)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| (p.name, p.full_uri, p.is_dir))
+                .collect();
+            (par_u, pitems)
+        } else {
+            (String::new(), Vec::new())
+        };
+        let preview = if include_preview && !entries.is_empty() {
+            let idx = if !focus_name.is_empty()
+                && let Some(pos) = entries.iter().position(|e| e.name == focus_name)
+            {
+                pos
+            } else {
+                (preferred_row.max(0) as usize).min(entries.len() - 1)
+            };
+            let focused = &entries[idx];
+            self.entry_preview(&focused.full_uri, focused.is_dir, show_hidden, 80, 8192)
+                .unwrap_or_default()
+        } else {
+            RemoteEntryPreview::default()
+        };
+        Ok(RemoteDirSnapshot {
+            resolved_uri: uri.to_canonical_uri(),
+            parent_uri,
+            parent_entries,
+            entries,
+            git_is_repo: false,
+            git_root_uri: String::new(),
+            git_branch: String::new(),
+            git_staged: 0,
+            git_modified: 0,
+            git_untracked: 0,
+            preview,
+        })
+    }
+
+    pub fn entry_preview(
+        &self,
+        raw_uri: &str,
+        is_dir: bool,
+        show_hidden: bool,
+        max_lines: i64,
+        max_bytes: i64,
+    ) -> Result<RemoteEntryPreview, String> {
+        let (sess, uri) = self.ensure_session(raw_uri)?;
+        let leaf_name = Path::new(&uri.remote_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&uri.remote_path)
+            .to_string();
+        if let RemoteBackend::LavaServer(client) = &sess.backend {
+            match client.call(
+                "fs/entry_preview",
+                JsonValue::obj([
+                    ("path", JsonValue::Str(uri.remote_path.clone())),
+                    ("is_dir", JsonValue::Bool(is_dir)),
+                    ("show_hidden", JsonValue::Bool(show_hidden)),
+                    ("max_lines", JsonValue::Int(max_lines.clamp(5, 500))),
+                    ("max_bytes", JsonValue::Int(max_bytes.clamp(512, 131_072))),
+                ]),
+                Duration::from_secs(8),
+            ) {
+                Ok(res) => return Ok(Self::decode_entry_preview_json(&uri.prefix, &res)),
+                Err(err) if !err.contains("-32601") && !err.contains("Method not found") => {
+                    return Err(err);
+                }
+                Err(_) => {}
+            }
+        }
+        if is_dir {
+            let children = self.readdir(raw_uri, show_hidden)?;
+            let total = children.len() as i64;
+            let capped = children
+                .into_iter()
+                .take(80)
+                .map(|c| (c.name, c.is_dir, false, c.size))
+                .collect();
+            Ok(RemoteEntryPreview {
+                kind: "dir".to_string(),
+                target_uri: uri.to_canonical_uri(),
+                target_name: leaf_name,
+                total_count: total,
+                total_size: 0,
+                lines: Vec::new(),
+                child_entries: capped,
+            })
+        } else {
+            let pv = self.read_preview_window(raw_uri, 0, max_lines, max_bytes)?;
+            Ok(RemoteEntryPreview {
+                kind: if pv.is_binary {
+                    "binary".to_string()
+                } else {
+                    "text".to_string()
+                },
+                target_uri: uri.to_canonical_uri(),
+                target_name: leaf_name,
+                total_count: pv.total_lines,
+                total_size: pv.total_size,
+                lines: pv.lines,
+                child_entries: Vec::new(),
+            })
+        }
+    }
+
+    pub fn git_summary(&self, raw_uri: &str) -> Result<RemoteGitSummary, String> {
+        let (sess, uri) = self.ensure_session(raw_uri)?;
+        if let RemoteBackend::LavaServer(client) = &sess.backend {
+            match client.call(
+                "git/summary",
+                JsonValue::obj([("cwd", JsonValue::Str(uri.remote_path.clone()))]),
+                Duration::from_secs(8),
+            ) {
+                Ok(res) => {
+                    let root_raw = res.get_str("root").unwrap_or("");
+                    let root = if root_raw.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}{}", uri.prefix, normalize_posix_path(root_raw))
+                    };
+                    return Ok(RemoteGitSummary {
+                        is_repo: res
+                            .get("is_repo")
+                            .and_then(JsonValue::as_bool)
+                            .unwrap_or(false),
+                        root,
+                        branch: res.get_str("branch").unwrap_or("").to_string(),
+                        staged_count: res.get_i64("staged_count").unwrap_or(0),
+                        modified_count: res.get_i64("modified_count").unwrap_or(0),
+                        untracked_count: res.get_i64("untracked_count").unwrap_or(0),
+                    });
+                }
+                Err(err) if !err.contains("-32601") && !err.contains("Method not found") => {
+                    return Err(err);
+                }
+                Err(_) => {}
+            }
+        }
+        let st = self.git_status(raw_uri)?;
+        Ok(RemoteGitSummary {
+            is_repo: st.is_repo,
+            root: st.root,
+            branch: st.branch,
+            staged_count: st.staged_count,
+            modified_count: st.modified_count,
+            untracked_count: st.untracked_count,
+        })
+    }
+
+    pub fn git_file_hunks(
+        &self,
+        raw_cwd_uri: &str,
+        file_uri: &str,
+        override_lines: Option<&[String]>,
+    ) -> Result<(bool, Vec<RemoteGitHunk>), String> {
+        let (sess, cwd_u) = self.ensure_session(raw_cwd_uri)?;
+        let clean_file = if is_remote_uri(file_uri) {
+            parse_remote_uri(file_uri)?.remote_path
+        } else {
+            file_uri.to_string()
+        };
+        if let RemoteBackend::LavaServer(client) = &sess.backend {
+            let mut pairs = vec![
+                ("cwd", JsonValue::Str(cwd_u.remote_path.clone())),
+                ("path", JsonValue::Str(clean_file)),
+            ];
+            if let Some(lines) = override_lines {
+                pairs.push(("has_override", JsonValue::Bool(true)));
+                pairs.push((
+                    "lines",
+                    JsonValue::Array(lines.iter().map(|s| JsonValue::Str(s.clone())).collect()),
+                ));
+            } else {
+                pairs.push(("has_override", JsonValue::Bool(false)));
+            }
+            match client.call(
+                "git/file_hunks",
+                JsonValue::obj(pairs),
+                Duration::from_secs(10),
+            ) {
+                Ok(res) => {
+                    let tracked = res
+                        .get("tracked")
+                        .and_then(JsonValue::as_bool)
+                        .unwrap_or(false);
+                    let mut hunks = Vec::new();
+                    if let Some(arr) = res.get("hunks").and_then(JsonValue::as_array) {
+                        for h in arr {
+                            hunks.push(RemoteGitHunk {
+                                old_start: h.get_i64("old_start").unwrap_or(0),
+                                old_count: h.get_i64("old_count").unwrap_or(0),
+                                new_start: h.get_i64("new_start").unwrap_or(0),
+                                new_count: h.get_i64("new_count").unwrap_or(0),
+                                kind: h.get_str("kind").unwrap_or("change").to_string(),
+                            });
+                        }
+                    }
+                    return Ok((tracked, hunks));
+                }
+                Err(err) if !err.contains("-32601") && !err.contains("Method not found") => {
+                    return Err(err);
+                }
+                Err(_) => {}
+            }
+        }
+        let Some(head_lines) = self.git_head_lines(raw_cwd_uri, file_uri, "HEAD")? else {
+            return Ok((false, Vec::new()));
+        };
+        let cur_lines = match override_lines {
+            Some(l) => l.to_vec(),
+            None => self.read_lines(file_uri)?.0,
+        };
+        // Minimal prefix/suffix + coalesced hunk fallback when server lacks `git/file_hunks`.
+        let mut pfx = 0usize;
+        while pfx < head_lines.len() && pfx < cur_lines.len() && head_lines[pfx] == cur_lines[pfx] {
+            pfx += 1;
+        }
+        if pfx == head_lines.len() && pfx == cur_lines.len() {
+            return Ok((true, Vec::new()));
+        }
+        let mut oe = head_lines.len();
+        let mut ne = cur_lines.len();
+        while oe > pfx && ne > pfx && head_lines[oe - 1] == cur_lines[ne - 1] {
+            oe -= 1;
+            ne -= 1;
+        }
+        let oc = (oe - pfx) as i64;
+        let nc = (ne - pfx) as i64;
+        let kind = if oc == 0 {
+            "add"
+        } else if nc == 0 {
+            "delete"
+        } else {
+            "change"
+        };
+        Ok((
+            true,
+            vec![RemoteGitHunk {
+                old_start: pfx as i64,
+                old_count: oc,
+                new_start: pfx as i64,
+                new_count: nc,
+                kind: kind.to_string(),
+            }],
+        ))
+    }
+
+    pub fn scan_todos(&self, raw_uri: &str, limit: i64) -> Result<Vec<RemoteTodoItem>, String> {
+        let (sess, uri) = self.ensure_session(raw_uri)?;
+        let cap = limit.clamp(1, 2000);
+        if let RemoteBackend::LavaServer(client) = &sess.backend {
+            match client.call(
+                "search/todos",
+                JsonValue::obj([
+                    ("root", JsonValue::Str(uri.remote_path.clone())),
+                    ("limit", JsonValue::Int(cap)),
+                ]),
+                Duration::from_secs(20),
+            ) {
+                Ok(res) => {
+                    let mut out = Vec::new();
+                    if let Some(arr) = res.get("items").and_then(JsonValue::as_array) {
+                        for it in arr {
+                            let Some(fp) = it.get_str("file_path") else {
+                                continue;
+                            };
+                            let rpath = if fp.starts_with('/') {
+                                normalize_posix_path(fp)
+                            } else {
+                                normalize_posix_path(&format!("{}/{fp}", uri.remote_path))
+                            };
+                            out.push((
+                                format!("{}{}", uri.prefix, rpath),
+                                it.get_i64("row").unwrap_or(0).max(0),
+                                it.get_i64("col").unwrap_or(0).max(0),
+                                it.get_str("tag").unwrap_or("TODO").to_string(),
+                                it.get_str("text").unwrap_or("").to_string(),
+                            ));
+                        }
+                    }
+                    return Ok(out);
+                }
+                Err(err) if !err.contains("-32601") && !err.contains("Method not found") => {
+                    return Err(err);
+                }
+                Err(_) => {}
+            }
+        }
+        let mut out = Vec::new();
+        for tag in ["TODO", "FIXME", "HACK", "WARN", "PERF", "NOTE", "BUG"] {
+            if let Ok(hits) = self.search_grep_ext(raw_uri, tag, true, "", 100) {
+                for (furi, row, col, txt) in hits.1 {
+                    out.push((furi, row, col, tag.to_string(), txt.trim().to_string()));
+                    if out.len() >= cap as usize {
+                        return Ok(out);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn workspace_replace(
+        &self,
+        raw_uri: &str,
+        query: &str,
+        replacement: &str,
+        case_sensitive: bool,
+        file_filter: &str,
+    ) -> Result<(i64, i64), String> {
+        let (sess, uri) = self.ensure_session(raw_uri)?;
+        if let RemoteBackend::LavaServer(client) = &sess.backend {
+            let res = client.call(
+                "search/replace",
+                JsonValue::obj([
+                    ("root", JsonValue::Str(uri.remote_path.clone())),
+                    ("query", JsonValue::Str(query.to_string())),
+                    ("replacement", JsonValue::Str(replacement.to_string())),
+                    ("case_sensitive", JsonValue::Bool(case_sensitive)),
+                    ("file_filter", JsonValue::Str(file_filter.to_string())),
+                ]),
+                Duration::from_secs(30),
+            )?;
+            return Ok((
+                res.get_i64("files_changed").unwrap_or(0),
+                res.get_i64("total_replacements").unwrap_or(0),
+            ));
+        }
+        Err("remote search/replace requires lava-server (:RemoteInstallServer)".to_string())
+    }
+
+    fn execute_async_op(&self, op: AsyncRemoteOp) -> Result<AsyncRemoteResult, String> {
+        match op {
+            AsyncRemoteOp::SearchFiles {
+                uri,
+                query,
+                include_hidden,
+                include_dirs,
+                limit,
+            } => self
+                .search_files_ranked(&uri, &query, include_hidden, include_dirs, limit)
+                .map(AsyncRemoteResult::SearchFiles),
+            AsyncRemoteOp::SearchGrep {
+                uri,
+                pattern,
+                case_sensitive,
+                file_filter,
+                limit,
+            } => self
+                .search_grep_ext(&uri, &pattern, case_sensitive, &file_filter, limit)
+                .map(|(total_matched, hits)| AsyncRemoteResult::SearchGrep {
+                    total_matched,
+                    hits,
+                }),
+            AsyncRemoteOp::ReadPreview {
+                uri,
+                start_row,
+                max_lines,
+                max_bytes,
+            } => self
+                .read_preview_window(&uri, start_row, max_lines, max_bytes)
+                .map(AsyncRemoteResult::ReadPreview),
+            AsyncRemoteOp::DirSnapshot {
+                uri,
+                show_hidden,
+                filter_query,
+                sort_by,
+                sort_reverse,
+                focus_name,
+                preferred_row,
+                include_parent,
+                include_preview,
+            } => self
+                .dir_snapshot(
+                    &uri,
+                    show_hidden,
+                    &filter_query,
+                    &sort_by,
+                    sort_reverse,
+                    &focus_name,
+                    preferred_row,
+                    include_parent,
+                    include_preview,
+                )
+                .map(|snap| AsyncRemoteResult::DirSnapshot(Box::new(snap))),
+            AsyncRemoteOp::EntryPreview {
+                uri,
+                is_dir,
+                show_hidden,
+                max_lines,
+                max_bytes,
+            } => self
+                .entry_preview(&uri, is_dir, show_hidden, max_lines, max_bytes)
+                .map(AsyncRemoteResult::EntryPreview),
+            AsyncRemoteOp::GitSummary { uri } => {
+                self.git_summary(&uri).map(AsyncRemoteResult::GitSummary)
+            }
+            AsyncRemoteOp::GitFileHunks {
+                cwd_uri,
+                file_uri,
+                override_lines,
+            } => self
+                .git_file_hunks(&cwd_uri, &file_uri, override_lines.as_deref())
+                .map(|(tracked, hunks)| AsyncRemoteResult::GitFileHunks { tracked, hunks }),
+            AsyncRemoteOp::GitBlameLine {
+                cwd_uri,
+                file_uri,
+                row,
+            } => self
+                .git_blame_line(&cwd_uri, &file_uri, row)
+                .map(AsyncRemoteResult::GitBlameLine),
+            AsyncRemoteOp::ScanTodos { root_uri, limit } => self
+                .scan_todos(&root_uri, limit)
+                .map(AsyncRemoteResult::ScanTodos),
+            AsyncRemoteOp::WorkspaceReplace {
+                root_uri,
+                query,
+                replacement,
+                case_sensitive,
+                file_filter,
+            } => self
+                .workspace_replace(
+                    &root_uri,
+                    &query,
+                    &replacement,
+                    case_sensitive,
+                    &file_filter,
+                )
+                .map(
+                    |(files_changed, total_replacements)| AsyncRemoteResult::WorkspaceReplace {
+                        files_changed,
+                        total_replacements,
+                    },
+                ),
+            AsyncRemoteOp::ReaddirSimple { uri, show_hidden } => self
+                .readdir(&uri, show_hidden)
+                .map(AsyncRemoteResult::ReaddirSimple),
+        }
+    }
+
+    /// Submit a non-blocking remote operation into `slot_key` with latest-wins coalescing.
+    /// Returns immediately in O(1) without blocking the local UI fiber!
+    pub fn submit_async(self: &Arc<Self>, slot_key: String, op: AsyncRemoteOp) -> u64 {
+        let (seq, spawn_worker) = {
+            let mut guard = self
+                .async_slots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let slot = guard.entry(slot_key.clone()).or_default();
+            slot.latest_seq = slot.latest_seq.wrapping_add(1);
+            let seq = slot.latest_seq;
+            slot.pending = Some((seq, op));
+            slot.completed = None;
+            if slot.worker_running {
+                (seq, false)
+            } else {
+                slot.worker_running = true;
+                self.active_async_workers.fetch_add(1, Ordering::SeqCst);
+                (seq, true)
+            }
+        };
+
+        if spawn_worker {
+            let mgr = Arc::clone(self);
+            thread::spawn(move || {
+                loop {
+                    let next_job = {
+                        let mut guard = mgr
+                            .async_slots
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let Some(slot) = guard.get_mut(&slot_key) else {
+                            mgr.active_async_workers.fetch_sub(1, Ordering::SeqCst);
+                            break;
+                        };
+                        match slot.pending.take() {
+                            Some(job) => job,
+                            None => {
+                                slot.worker_running = false;
+                                mgr.active_async_workers.fetch_sub(1, Ordering::SeqCst);
+                                break;
+                            }
+                        }
+                    };
+
+                    let (run_seq, run_op) = next_job;
+                    let t0 = Instant::now();
+                    let outcome = mgr.execute_async_op(run_op);
+                    let elapsed_ms = t0.elapsed().as_millis() as i64;
+
+                    let should_wake = {
+                        let mut guard = mgr
+                            .async_slots
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if let Some(slot) = guard.get_mut(&slot_key) {
+                            if slot.pending.is_some() {
+                                // A newer request arrived on this slot; loop immediately without
+                                // publishing the superseded result!
+                                continue;
+                            }
+                            if slot.latest_seq == run_seq {
+                                slot.completed = Some(AsyncCompletedItem {
+                                    seq: run_seq,
+                                    elapsed_ms,
+                                    outcome,
+                                });
+                                slot.worker_running = false;
+                                mgr.active_async_workers.fetch_sub(1, Ordering::SeqCst);
+                                true
+                            } else {
+                                slot.worker_running = false;
+                                mgr.active_async_workers.fetch_sub(1, Ordering::SeqCst);
+                                false
+                            }
+                        } else {
+                            mgr.active_async_workers.fetch_sub(1, Ordering::SeqCst);
+                            false
+                        }
+                    };
+
+                    if should_wake {
+                        mgr.notify_waker();
+                    }
+                    break;
+                }
+            });
+        }
+
+        seq
+    }
+
+    pub fn poll_async(&self, slot_key: &str) -> AsyncPollOutcome {
+        let mut guard = self
+            .async_slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(slot) = guard.get_mut(slot_key) else {
+            return AsyncPollOutcome::Idle;
+        };
+        if let Some(done) = slot.completed.take() {
+            return match done.outcome {
+                Ok(result) => AsyncPollOutcome::Ready {
+                    seq: done.seq,
+                    elapsed_ms: done.elapsed_ms,
+                    result,
+                },
+                Err(message) => AsyncPollOutcome::Error {
+                    seq: done.seq,
+                    message,
+                },
+            };
+        }
+        if slot.worker_running || slot.pending.is_some() {
+            AsyncPollOutcome::Pending {
+                seq: slot.latest_seq,
+            }
+        } else {
+            AsyncPollOutcome::Idle
+        }
+    }
+
+    pub fn cancel_async(&self, slot_key: &str) {
+        let mut guard = self
+            .async_slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(slot) = guard.get_mut(slot_key) {
+            slot.latest_seq = slot.latest_seq.wrapping_add(1);
+            slot.pending = None;
+            slot.completed = None;
+        }
+    }
+
+    pub fn active_async_count(&self) -> i64 {
+        let workers = self.active_async_workers.load(Ordering::SeqCst);
+        if workers > 0 {
+            return workers as i64;
+        }
+        let Ok(guard) = self.async_slots.lock() else {
+            return 0;
+        };
+        guard
+            .values()
+            .filter(|s| s.worker_running || s.pending.is_some() || s.completed.is_some())
+            .count() as i64
     }
 }
 

@@ -18,7 +18,7 @@ use @lava_sys.{DrawCmd, RawUiEvent, mock_enable, mock_last_decorated}
 use @lava_core.{SystemKernel, clipboard_get, clipboard_set, log_event, status_emit}
 use @lava_remote.{
     remote_connect, remote_discover_ssh_hosts, remote_register_mock_mount,
-    remote_set_ssh_config_path, remote_stat
+    remote_set_ssh_config_path, remote_set_ui_async_enabled, remote_stat
 }
 use @ext_document.{
     Buffer, BufferId, EditorWorld, FloatingWindow, GutterSign, InlineSpanDecor,
@@ -647,6 +647,142 @@ fn run_suite() {
 
     remote_set_ssh_config_path("")
     println("  [PASS] Part 7: Fold-skipping motions, SSH profile completion & minibuffer completion <Return> submission")
+
+    -- ========================================================================
+    -- PART 8: >12,000-File Uncapped Remote Search, Viewport Slice Preview & Animated Async UI
+    -- ========================================================================
+    let huge_remote = path.join(tmp_base, "remote_bigbox")
+    for b in 0..25 {
+        let bname = if b < 10 { "bucket_0" ++ b.to_string() } else { "bucket_" ++ b.to_string() }
+        let bdir = path.join(huge_remote, bname)
+        let _ = fs.create_dir(bdir, parents = true) ! { e => panic(e.to_string()) }
+        for k in 0..482 {
+            let idx = b * 482 + k
+            let _ = fs.write_string(
+                path.join(bdir, "item_" ++ idx.to_string() ++ ".rs"),
+                "pub const ITEM: i64 = " ++ idx.to_string() ++ ";\n",
+            ) ! { e => panic(e.to_string()) }
+        }
+    }
+    let tail_dir = path.join(huge_remote, "z_tail")
+    let _ = fs.create_dir(tail_dir, parents = true) ! { e => panic(e.to_string()) }
+    let _ = fs.write_string(
+        path.join(tail_dir, "deep_needle_12049.rs"),
+        "pub fn needle_12049() -> i64 " ++ lb ++ " 12049 " ++ rb ++ "\n",
+    ) ! { e => panic(e.to_string()) }
+
+    -- Seed a 14,000-line file with a marker at line 12,500 (0-based row 12,499)
+    let tall_lines = List()
+    for r in 0..14000 {
+        if r == 12499 {
+            tall_lines.push("pub fn deep_grep_target() " ++ lb ++ " /* LINE_12500_SLICE_OK */ " ++ rb)
+        } else {
+            tall_lines.push("let pad_" ++ r.to_string() ++ " = " ++ r.to_string() ++ ";")
+        }
+    }
+    let _ = fs.write_string(
+        path.join(huge_remote, "tall_14k.rs"),
+        tall_lines.join("\n") ++ "\n",
+    ) ! { e => panic(e.to_string()) }
+
+    remote_register_mock_mount("bigbox", huge_remote)
+    world.cwd = "ssh://bigbox"
+
+    -- 8a. Synchronous uncapped >12,000-file Telescope & Dirvish-fd + 24-line preview slice at row 12,499
+    app_feed_keys(kernel, ":Telescope<Space>files<Space>z_tail<Space>12049<Return>")# ! { e => panic(e) }
+    var big_picker_title = ""
+    var big_picker_body = ""
+    for fi in 0..world.floating_windows.len() {
+        let fw = world.floating_windows.get(fi.as(usize)).as(FloatingWindow)
+        if fw.id == FLOAT_PICKER_ID {
+            big_picker_title = fw.title
+            big_picker_body = fw.lines.join("\n")
+        }
+    }
+    check_true(
+        big_picker_body.contains("z_tail/deep_needle_12049.rs"),
+        "Telescope files found z_tail/deep_needle_12049.rs past 12,000th file!",
+    )
+    check_true(
+        big_picker_title.contains("(1/12052)"),
+        "Telescope title reports (1/12052) total indexed files: " ++ big_picker_title,
+    )
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    -- Live grep on row 12,499 streams ONLY a 24-line viewport preview slice with exact line number 12500!
+    app_feed_keys(kernel, ":Telescope<Space>live_grep<Space>LINE_12500_SLICE_OK<Return>")# ! { e => panic(e) }
+    var slice_pv_lines = List()
+    for fi in 0..world.floating_windows.len() {
+        let fw = world.floating_windows.get(fi.as(usize)).as(FloatingWindow)
+        if fw.id == FLOAT_PREVIEW_ID {
+            slice_pv_lines = fw.lines
+        }
+    }
+    check_true(slice_pv_lines.len() <= 24, "Telescope remote preview transferred bounded viewport slice (<= 24 lines)")
+    check_true(
+        slice_pv_lines.join("\n").contains("12500 │ pub fn deep_grep_target()"),
+        "Telescope windowed preview preserves exact line number 12500",
+    )
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    -- Dirvish-fd (`:DirvishFd`) uncapped >12,000-file discovery
+    app_feed_keys(kernel, ":DirvishFd<Space>z_tail/deep_needle_12049<Return>")# ! { e => panic(e) }
+    check_true(
+        buf_has_substr(world.active_buffer(), "z_tail/deep_needle_12049.rs"),
+        "DirvishFd found z_tail/deep_needle_12049.rs past 12,000th file!",
+    )
+    app_feed_keys(kernel, "q")# ! { e => panic(e) }
+
+    -- 8b. Non-Blocking Async UI (`remote_set_ui_async_enabled(true)`) + Braille Spinner & Shimmer Animation
+    remote_set_ui_async_enabled(true)
+
+    app_feed_keys(kernel, ":Dirvish<Space>ssh://bigbox/z_tail<Return>")# ! { e => panic(e) }
+    let dv_async = world.active_buffer()
+    check_true(
+        buf_has_substr(dv_async, "Refreshing...") or buf_has_substr(dv_async, "Fetching render snapshot"),
+        "Dirvish renders animated loading state immediately before background RPC completes",
+    )
+    check_true(
+        buf_has_substr(dv_async, "━"),
+        "Dirvish renders sweeping shimmer bar [━━╸...] while waiting for remote snapshot",
+    )
+    -- Step a timer tick to wake & apply the completed async snapshot!
+    let _ = app_step_event(kernel, RawUiEvent.tick(0, 0))# ! { e => panic(e) }
+    check_true(
+        buf_has_substr(world.active_buffer(), "deep_needle_12049.rs"),
+        "Dirvish settled onto deep_needle_12049.rs on async timer-tick wakeup",
+    )
+    let async_pv = find_buffer_by_name(world, DIRVISH_PREVIEW_BUF_NAME).as(Buffer)
+    check_true(
+        buf_has_substr(async_pv, "needle_12049"),
+        "1-RTT dir_snapshot populated *dirvish-preview* without extra round-trip",
+    )
+
+    -- Telescope non-blocking async search + animated shimmer -> tick wakeup!
+    app_feed_keys(kernel, ":Telescope<Space>files<Space>deep_needle_12049<Return>")# ! { e => panic(e) }
+    var async_tel_loading = false
+    for fi in 0..world.floating_windows.len() {
+        let fw = world.floating_windows.get(fi.as(usize)).as(FloatingWindow)
+        if fw.id == FLOAT_PICKER_ID {
+            if fw.title.contains("Refreshing...") or fw.lines.join("\n").contains("Searching lava-server") {
+                async_tel_loading = true
+            }
+        }
+    }
+    check_true(async_tel_loading, "Telescope renders animated Refreshing/shimmer state immediately on open")
+    let _ = app_step_event(kernel, RawUiEvent.tick(0, 0))# ! { e => panic(e) }
+    var async_tel_settled = false
+    for fi in 0..world.floating_windows.len() {
+        let fw = world.floating_windows.get(fi.as(usize)).as(FloatingWindow)
+        if fw.id == FLOAT_PICKER_ID and fw.lines.join("\n").contains("z_tail/deep_needle_12049.rs") {
+            async_tel_settled = true
+        }
+    }
+    check_true(async_tel_settled, "Telescope settled onto z_tail/deep_needle_12049.rs on async timer-tick wakeup")
+    app_feed_keys(kernel, "<Escape>")# ! { e => panic(e) }
+
+    remote_set_ui_async_enabled(false)
+    println("  [PASS] Part 8: >12,000-file uncapped server search, 24-line preview slice & animated non-blocking async UI")
 
     let _ = fs.remove_dir(tmp_base, recursive = true)
     println("ALL REMOTE PLUGINS + DIRVISH-FD + MINIBUFFER + DECORATIONS + BRACKET TESTS PASSED!")

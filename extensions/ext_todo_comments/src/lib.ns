@@ -10,8 +10,10 @@ use @lava_core.{
 }
 use @lava_accel.{TodoItem, accel_doc_scan_todos, accel_scan_workspace_todos}
 use @lava_remote.{
-    RemoteDirItem, RemoteGrepMatch, is_ssh_uri, normalize_ssh_uri, parent_ssh_uri,
-    remote_find_root, remote_host_available, remote_read_lines, remote_readdir, remote_search_grep
+    RemoteDirItem, RemoteTodoHit, decode_remote_todos, is_ssh_uri, normalize_ssh_uri,
+    parent_ssh_uri, remote_async_poll, remote_async_submit, remote_find_root, remote_read_lines,
+    remote_readdir, remote_scan_todos, remote_shimmer_bar, remote_spinner_frame,
+    remote_ui_async_enabled
 }
 use @ext_document.{
     Buffer, BufferId, BufferKind, EditorWorld, Pos, QuickfixEntry, ext_document_id,
@@ -46,6 +48,7 @@ pub struct TodoCommentsService {
     pub workspace_items: List,
     pub panel_row_map: HashMap,
     pub source_buf_id: BufferId,
+    pub remote_loading: bool,
 }
 
 impl TodoCommentsService {
@@ -63,6 +66,7 @@ impl TodoCommentsService {
             workspace_items: List(),
             panel_row_map: HashMap.new(),
             source_buf_id: BufferId(1),
+            remote_loading: false,
         }
     }
 
@@ -449,28 +453,29 @@ fn walk_remote_todo_files(dir_uri: String, limit: i64, depth: i64, out: List) {
     }
 }
 
-fn scan_remote_workspace_todos(root_uri: String) -> List {
+fn convert_remote_todos(rtodos: List) -> List {
     let out = List()
-    let seen = Set.new()
-    if remote_host_available() {
-        let tags = ["TODO", "FIXME", "NOTE", "HACK", "WARN", "PERF", "BUG"]
-        for ti in 0..tags.len() {
-            let tg = tags.get(ti.as(usize)).as(String)
-            let rhits = remote_search_grep(root_uri, tg, limit = 100) ! { _ => List() }
-            for i in 0..rhits.len() {
-                let rh = rhits.get(i.as(usize)).as(RemoteGrepMatch)
-                let key = rh.full_uri ++ ":" ++ rh.row.to_string()
-                if not seen.contains(key) {
-                    let parsed_opt = extract_todo_from_line(rh.full_uri, rh.row, rh.line_text)
-                    if parsed_opt != null {
-                        seen.insert(key)
-                        out.push(parsed_opt.as(TodoItem))
-                    }
-                }
-            }
-        }
-        return out
+    for i in 0..rtodos.len() {
+        let rt = rtodos.get(i.as(usize)).as(RemoteTodoHit)
+        out.push(TodoItem {
+            file_path: rt.full_uri,
+            row: rt.row,
+            col: rt.col,
+            tag: rt.tag,
+            text: rt.text,
+        })
     }
+    out
+}
+
+fn scan_remote_workspace_todos(root_uri: String) -> List {
+    remote_scan_todos(root_uri, limit = 300) match {
+        rtodos! => {
+            return convert_remote_todos(rtodos)
+        },
+        error _ => (),
+    }
+    let out = List()
     let files = List()
     walk_remote_todo_files(root_uri, 400, 0, files)
     for fi in 0..files.len() {
@@ -507,6 +512,9 @@ fn effective_todo_workspace_root(world: EditorWorld, service: TodoCommentsServic
     }
     if is_ssh_uri(fp) {
         let base_u = parent_ssh_uri(fp)
+        if remote_ui_async_enabled() {
+            return base_u
+        }
         let r_res = remote_find_root(
             base_u,
             [".git", "Cargo.toml", "package.toml", "compile_commands.json", "pyproject.toml", "package.json", "go.mod"],
@@ -525,6 +533,12 @@ fn effective_todo_workspace_root(world: EditorWorld, service: TodoCommentsServic
 
 fn scan_and_populate_workspace_todos(world: EditorWorld, service: TodoCommentsService) -> List {
     let eff_root = effective_todo_workspace_root(world, service)
+    if is_ssh_uri(eff_root) and remote_ui_async_enabled() {
+        service.remote_loading = true
+        let _ = remote_async_submit("todo.scan", "scan_todos", [eff_root, 300])
+        return service.workspace_items
+    }
+    service.remote_loading = false
     let scanned = if is_ssh_uri(eff_root) {
         scan_remote_workspace_todos(eff_root)
     } else {
@@ -571,9 +585,14 @@ fn render_todos_panel(world: EditorWorld, service: TodoCommentsService) -> (Buff
         ++ ", BUG: " ++ bug_n.to_string()
 
     let lines = List()
+    let spin_hdr = if service.remote_loading {
+        "  " ++ remote_spinner_frame() ++ " Scanning server..."
+    } else {
+        ""
+    }
     lines.push(
         "Workspace TODOs [Filter: " ++ service.tag_filter ++ "] (" ++ all_items.len().to_string()
-        ++ " total) — " ++ summary
+        ++ " total)" ++ spin_hdr ++ " — " ++ summary
     )
     lines.push("Keys: <Return> jump to item  |  f cycle tag filter  |  r refresh  |  q close")
     lines.push("----------------------------------------------------------------------------")
@@ -605,7 +624,11 @@ fn render_todos_panel(world: EditorWorld, service: TodoCommentsService) -> (Buff
     let row_badges = List()
 
     if filtered.is_empty() {
-        lines.push("  (No matching TODO comments for filter '" ++ service.tag_filter ++ "')")
+        if service.remote_loading {
+            lines.push("  " ++ remote_spinner_frame() ++ " Scanning workspace TODOs on lava-server... " ++ remote_shimmer_bar(width = 20))
+        } else {
+            lines.push("  (No matching TODO comments for filter '" ++ service.tag_filter ++ "')")
+        }
     } else {
         for i in 0..filtered.len() {
             let item = filtered.get(i.as(usize)).as(TodoItem)
@@ -781,6 +804,40 @@ fn on_todo_insert_hook(kern: SystemKernel, payload: Any) {
         return
     }
     let _ = sync_buffer_todos(world, service, buf, false)
+}
+
+fn on_todo_timer_tick(kern: SystemKernel, _payload: Any) {
+    let s_opt = kern.service(SERVICE_TODO_COMMENTS)
+    if s_opt == null {
+        return
+    }
+    let svc = s_opt.as(TodoCommentsService)
+    if not svc.remote_loading {
+        return
+    }
+    let w_opt = kern.service("lava.document.world")
+    if w_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let tp = remote_async_poll("todo.scan")
+    if tp.status == "ready" {
+        svc.remote_loading = false
+        svc.workspace_items = convert_remote_todos(decode_remote_todos(tp.payload))
+        let (tbuf, first_row) = render_todos_panel(world, svc)
+        if world.active_buffer().name == TODOS_BUF_NAME {
+            tbuf.point = tbuf.clamp_pos(Pos.new(first_row, 0), insert_mode = false)
+            tbuf.preferred_col = 0
+            world.remote_tick_dirty = true
+        }
+    } else if tp.status == "error" {
+        svc.remote_loading = false
+        let _ = render_todos_panel(world, svc)
+        world.remote_tick_dirty = true
+    } else if world.active_buffer().name == TODOS_BUF_NAME {
+        let _ = render_todos_panel(world, svc)
+        world.remote_tick_dirty = true
+    }
 }
 
 fn unbind_owner_from_keymaps(kernel: SystemKernel, owner: ExtId) {
@@ -982,6 +1039,7 @@ pub fn register_todo_comments_extension(kernel: SystemKernel) -> !String Unit {
             k.add_hook("cursor-moved", ext_id, on_todo_burst_guarded_hook)
             k.add_hook("mode-changed", ext_id, on_todo_buffer_hook)
             k.add_hook("after-insert-stroke", ext_id, on_todo_insert_hook)
+            k.add_hook("timer-tick", ext_id, on_todo_timer_tick)
 
             let w_opt = k.service("lava.document.world")
             if w_opt != null {

@@ -206,6 +206,31 @@ fn ensure_scanned(
                 service.active_spans = cached.spans
                 return (cached.symbols, cached.spans)
             }
+            if allow_fast_reuse
+                and lcount == cached.line_count + 1
+                and buf.point.row >= 1
+                and (not row_has_cached_symbol(cached.spans, buf.point.row - 1))
+                and (not line_may_affect_outline(buf.line_at(buf.point.row - 1)))
+                and (not line_may_affect_outline(buf.line_at(buf.point.row))) {
+                let split_r = buf.point.row
+                for si in 0..cached.spans.len() {
+                    let sp = cached.spans.get(si.as(usize)).as(ScannedSymbolSpan)
+                    if sp.item.row >= split_r {
+                        sp.item.row += 1
+                    }
+                    if sp.end_row >= split_r - 1 {
+                        sp.end_row += 1
+                    }
+                }
+                cached.line_count = lcount
+                cached.edit_version = buf.edit_version
+                service.last_scan_buf_id = buf.id
+                service.last_scan_ver = buf.edit_version
+                service.active_buf_id = buf.id
+                service.active_symbols = cached.symbols
+                service.active_spans = cached.spans
+                return (cached.symbols, cached.spans)
+            }
         }
     }
     let raw_spans = accel_doc_scan_symbol_spans(buf.doc_id, buf.major_mode, 4000)

@@ -9,7 +9,8 @@
 //! - Multi-language symbol outline & `TODO`/`FIXME` comment extraction
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -599,23 +600,154 @@ fn load_simple_gitignore_names(root: &Path) -> HashSet<String> {
     ignored
 }
 
+pub const MAX_WORKSPACE_FILES: usize = 500_000;
+const WORKSPACE_INDEX_TTL: Duration = Duration::from_millis(2_000);
+
+#[derive(Clone)]
+struct CachedWorkspaceIndex {
+    built_at: Instant,
+    stamp: u128,
+    files: Arc<Vec<String>>,
+    dirs: Arc<Vec<String>>,
+}
+
+type WorkspaceIndexMap = HashMap<(PathBuf, bool), CachedWorkspaceIndex>;
+
+static WORKSPACE_INDEX_CACHE: OnceLock<Mutex<WorkspaceIndexMap>> = OnceLock::new();
+
+pub fn invalidate_workspace_cache(_path_hint: &str) {
+    if let Some(mtx) = WORKSPACE_INDEX_CACHE.get()
+        && let Ok(mut guard) = mtx.lock()
+    {
+        guard.clear();
+    }
+    if let Some(gmtx) = SERVER_GIT_STATUS_CACHE.get()
+        && let Ok(mut guard) = gmtx.lock()
+    {
+        guard.clear();
+    }
+}
+
+fn compute_workspace_quick_stamp(root: &Path) -> u128 {
+    let mut stamp: u128 = 0xcbf2_9ce4_8422_2325;
+    if let Ok(meta) = fs::metadata(root) {
+        stamp = stamp
+            .wrapping_mul(1099511628211)
+            .wrapping_add(meta.len() as u128);
+        if let Ok(mt) = meta.modified()
+            && let Ok(dur) = mt.duration_since(UNIX_EPOCH)
+        {
+            stamp = stamp
+                .wrapping_mul(1099511628211)
+                .wrapping_add(dur.as_nanos());
+        }
+    }
+    if let Ok(rd) = fs::read_dir(root) {
+        for entry in rd.flatten().take(96) {
+            if let Ok(m) = entry.metadata() {
+                stamp ^= (m.len() as u128).rotate_left(11);
+                if let Ok(mt) = m.modified()
+                    && let Ok(dur) = mt.duration_since(UNIX_EPOCH)
+                {
+                    stamp ^= dur.as_nanos().rotate_left(7);
+                }
+            }
+        }
+    }
+    stamp
+}
+
+fn is_ignored_rel_component(rel: &str, include_hidden: bool) -> bool {
+    for seg in rel.split('/') {
+        if seg.is_empty() {
+            continue;
+        }
+        if IGNORED_DIRS.contains(&seg) {
+            return true;
+        }
+        if !include_hidden && seg.starts_with('.') {
+            return true;
+        }
+    }
+    false
+}
+
+fn try_rg_workspace_files(root: &Path, cap: usize, include_hidden: bool) -> Option<Vec<String>> {
+    let mut cmd = Command::new("rg");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.arg("--files")
+        .arg("--color=never")
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if include_hidden {
+        cmd.arg("--hidden")
+            .arg("-g")
+            .arg("!.git")
+            .arg("-g")
+            .arg("!target")
+            .arg("-g")
+            .arg("!node_modules");
+    }
+    let mut child = cmd.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    let reader = BufReader::with_capacity(64 * 1024, stdout);
+    let mut out = Vec::new();
+    for line_res in reader.lines() {
+        let Ok(raw) = line_res else {
+            break;
+        };
+        let norm = raw.trim().trim_start_matches("./").replace('\\', "/");
+        if norm.is_empty() {
+            continue;
+        }
+        if is_ignored_rel_component(&norm, include_hidden) || is_probably_binary_ext(&norm) {
+            continue;
+        }
+        out.push(norm);
+        if out.len() >= cap {
+            let _ = child.kill();
+            let _ = child.wait();
+            out.sort();
+            return Some(out);
+        }
+    }
+    let status = child.wait().ok()?;
+    if !status.success() && out.is_empty() {
+        return None;
+    }
+    out.sort();
+    Some(out)
+}
+
 pub fn workspace_files(root: &str, max_files: usize, include_hidden: bool) -> Vec<String> {
     let root_path = Path::new(root);
     if !root_path.exists() {
         return Vec::new();
     }
     let cap = if max_files == 0 {
-        10_000
+        MAX_WORKSPACE_FILES
     } else {
-        max_files.min(100_000)
+        max_files.min(MAX_WORKSPACE_FILES)
     };
+    if cap >= 20_000
+        && let Some(rg_files) = try_rg_workspace_files(root_path, cap, include_hidden)
+    {
+        return rg_files;
+    }
     let ignored = load_simple_gitignore_names(root_path);
     let mut out = Vec::new();
     let mut stack: Vec<(PathBuf, String, usize)> =
         vec![(root_path.to_path_buf(), String::new(), 0)];
 
     while let Some((dir, prefix, depth)) = stack.pop() {
-        if depth > 20 || out.len() >= cap {
+        if depth > 64 || out.len() >= cap {
             continue;
         }
         let Ok(entries) = fs::read_dir(&dir) else {
@@ -659,6 +791,244 @@ pub fn workspace_files(root: &str, max_files: usize, include_hidden: bool) -> Ve
     out
 }
 
+fn synthesize_workspace_dirs(
+    root_path: &Path,
+    files: &[String],
+    include_hidden: bool,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    if let Ok(rd) = fs::read_dir(root_path) {
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().into_owned();
+            if name.is_empty() || IGNORED_DIRS.contains(&name.as_str()) {
+                continue;
+            }
+            if !include_hidden && name.starts_with('.') {
+                continue;
+            }
+            if ent.file_type().is_ok_and(|ft| ft.is_dir()) {
+                seen.insert(name);
+            }
+        }
+    }
+    for rel in files {
+        let mut search_from = 0usize;
+        while let Some(slash_off) = rel[search_from..].find('/') {
+            let end = search_from + slash_off;
+            if end > 0 {
+                let ancestor = &rel[..end];
+                if !seen.contains(ancestor) {
+                    seen.insert(ancestor.to_string());
+                }
+            }
+            search_from = end + 1;
+        }
+    }
+    let mut dirs: Vec<String> = seen.into_iter().collect();
+    dirs.sort();
+    dirs
+}
+
+fn load_cached_workspace_index(
+    root: &str,
+    include_hidden: bool,
+) -> (Arc<Vec<String>>, Arc<Vec<String>>) {
+    let root_path = Path::new(root);
+    if !root_path.exists() {
+        return (Arc::new(Vec::new()), Arc::new(Vec::new()));
+    }
+    let canon = strip_win_verbatim_buf(
+        fs::canonicalize(root_path).unwrap_or_else(|_| root_path.to_path_buf()),
+    );
+    let key = (canon.clone(), include_hidden);
+    let stamp = compute_workspace_quick_stamp(&canon);
+    let cache = WORKSPACE_INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let now = Instant::now();
+    if let Ok(guard) = cache.lock()
+        && let Some(entry) = guard.get(&key)
+        && now.duration_since(entry.built_at) < WORKSPACE_INDEX_TTL
+        && entry.stamp == stamp
+    {
+        return (Arc::clone(&entry.files), Arc::clone(&entry.dirs));
+    }
+
+    let files_vec = workspace_files(
+        &canon.to_string_lossy(),
+        MAX_WORKSPACE_FILES,
+        include_hidden,
+    );
+    let dirs_vec = synthesize_workspace_dirs(&canon, &files_vec, include_hidden);
+    let files_arc = Arc::new(files_vec);
+    let dirs_arc = Arc::new(dirs_vec);
+
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= 16 {
+            guard.clear();
+        }
+        guard.insert(
+            key,
+            CachedWorkspaceIndex {
+                built_at: Instant::now(),
+                stamp,
+                files: Arc::clone(&files_arc),
+                dirs: Arc::clone(&dirs_arc),
+            },
+        );
+    }
+    (files_arc, dirs_arc)
+}
+
+#[inline]
+fn ascii_subseq_possible(needle_lower_ascii: &[u8], haystack: &[u8]) -> bool {
+    if needle_lower_ascii.len() > haystack.len() {
+        return false;
+    }
+    let mut ni = 0usize;
+    for &hb in haystack {
+        if hb.to_ascii_lowercase() == needle_lower_ascii[ni] {
+            ni += 1;
+            if ni == needle_lower_ascii.len() {
+                return true;
+            }
+        }
+    }
+    ni == needle_lower_ascii.len()
+}
+
+fn query_uses_orderless(q_trim: &str) -> bool {
+    q_trim.contains(' ')
+        || q_trim.starts_with('!')
+        || q_trim.starts_with('^')
+        || q_trim.starts_with('=')
+        || q_trim.ends_with('$')
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RankedFileEntry {
+    pub rel_path: String,
+    pub is_dir: bool,
+    pub score: i64,
+}
+
+/// Server-side full-workspace file/directory search & ranking:
+/// indexes up to `500,000` files in memory (`WORKSPACE_INDEX_CACHE`), scores all candidates
+/// using Nucleo-tier fuzzy or Emacs Orderless matching, and returns ONLY
+/// `(total_indexed, total_matched, top_entries[..limit])` so only renderable rows cross SSH!
+pub fn search_workspace_files_ranked(
+    root: &str,
+    query: &str,
+    include_hidden: bool,
+    include_dirs: bool,
+    limit: usize,
+) -> (usize, usize, Vec<RankedFileEntry>) {
+    let (files, dirs) = load_cached_workspace_index(root, include_hidden);
+    let total_indexed = files.len() + if include_dirs { dirs.len() } else { 0 };
+    let cap = if limit == 0 { 100 } else { limit.min(2_000) };
+    let q_trim = query.trim();
+
+    if q_trim.is_empty() {
+        let mut out = Vec::with_capacity(cap.min(total_indexed));
+        if include_dirs {
+            for d in dirs.iter().take(cap) {
+                out.push(RankedFileEntry {
+                    rel_path: d.clone(),
+                    is_dir: true,
+                    score: 100,
+                });
+            }
+        }
+        if out.len() < cap {
+            let rem = cap - out.len();
+            for f in files.iter().take(rem) {
+                out.push(RankedFileEntry {
+                    rel_path: f.clone(),
+                    is_dir: false,
+                    score: 100,
+                });
+            }
+        }
+        return (total_indexed, total_indexed, out);
+    }
+
+    if query_uses_orderless(q_trim) {
+        let tokens = parse_orderless_tokens(q_trim);
+        let mut hits: Vec<RankedFileEntry> = Vec::new();
+        if include_dirs {
+            for d in dirs.iter() {
+                let d_slash = format!("{d}/");
+                if let Some((sc, _)) = orderless_score_with_tokens(&tokens, &d_slash) {
+                    hits.push(RankedFileEntry {
+                        rel_path: d.clone(),
+                        is_dir: true,
+                        score: sc,
+                    });
+                }
+            }
+        }
+        for f in files.iter() {
+            if let Some((sc, _)) = orderless_score_with_tokens(&tokens, f) {
+                hits.push(RankedFileEntry {
+                    rel_path: f.clone(),
+                    is_dir: false,
+                    score: sc,
+                });
+            }
+        }
+        let total_matched = hits.len();
+        hits.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| a.rel_path.cmp(&b.rel_path))
+        });
+        if hits.len() > cap {
+            hits.truncate(cap);
+        }
+        return (total_indexed, total_matched, hits);
+    }
+
+    let q_lower = q_trim.to_lowercase();
+    let ascii_fast = q_lower.is_ascii();
+    let q_ascii = q_lower.as_bytes();
+    let mut hits: Vec<RankedFileEntry> = Vec::new();
+
+    if include_dirs {
+        for d in dirs.iter() {
+            if ascii_fast && !ascii_subseq_possible(q_ascii, d.as_bytes()) {
+                continue;
+            }
+            if let Some(sc) = fuzzy_score_one(q_trim, &q_lower, d) {
+                hits.push(RankedFileEntry {
+                    rel_path: d.clone(),
+                    is_dir: true,
+                    score: sc,
+                });
+            }
+        }
+    }
+    for f in files.iter() {
+        if ascii_fast && !ascii_subseq_possible(q_ascii, f.as_bytes()) {
+            continue;
+        }
+        if let Some(sc) = fuzzy_score_one(q_trim, &q_lower, f) {
+            hits.push(RankedFileEntry {
+                rel_path: f.clone(),
+                is_dir: false,
+                score: sc,
+            });
+        }
+    }
+    let total_matched = hits.len();
+    hits.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.rel_path.cmp(&b.rel_path))
+    });
+    if hits.len() > cap {
+        hits.truncate(cap);
+    }
+    (total_indexed, total_matched, hits)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrepMatch {
     pub file_path: String,
@@ -667,23 +1037,117 @@ pub struct GrepMatch {
     pub line_text: String,
 }
 
-pub fn workspace_grep(
+fn try_rg_workspace_grep(
+    root: &Path,
+    query: &str,
+    case_sensitive: bool,
+    cap: usize,
+    file_filter: &str,
+) -> Option<(usize, Vec<GrepMatch>)> {
+    let mut cmd = Command::new("rg");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.arg("--fixed-strings")
+        .arg("--line-number")
+        .arg("--column")
+        .arg("--no-heading")
+        .arg("--color=never");
+    if case_sensitive {
+        cmd.arg("--case-sensitive");
+    } else {
+        cmd.arg("--ignore-case");
+    }
+    cmd.arg("--").arg(query).arg(".").current_dir(root);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let mut child = cmd.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    let reader = BufReader::with_capacity(64 * 1024, stdout);
+    let filter_trim = file_filter.trim().to_lowercase();
+    let mut results = Vec::with_capacity(cap.min(256));
+    let mut total_matched = 0usize;
+
+    for line_res in reader.lines() {
+        let Ok(raw) = line_res else {
+            break;
+        };
+        let mut parts = raw.splitn(4, ':');
+        let Some(rel_raw) = parts.next() else {
+            continue;
+        };
+        let Some(row_s) = parts.next() else { continue };
+        let Some(col_s) = parts.next() else { continue };
+        let Some(txt) = parts.next() else { continue };
+        let rel = rel_raw.trim_start_matches("./").replace('\\', "/");
+        if !filter_trim.is_empty() && !rel.to_lowercase().contains(&filter_trim) {
+            continue;
+        }
+        let Ok(row_1) = row_s.parse::<i64>() else {
+            continue;
+        };
+        let byte_col = col_s.parse::<usize>().unwrap_or(1).saturating_sub(1);
+        let char_col = txt
+            .get(..byte_col.min(txt.len()))
+            .map_or(0, |p| p.chars().count() as i64);
+        total_matched += 1;
+        if results.len() < cap {
+            let preview = if txt.chars().count() > 240 {
+                txt.chars().take(240).collect()
+            } else {
+                txt.to_string()
+            };
+            results.push(GrepMatch {
+                file_path: rel,
+                row: (row_1 - 1).max(0),
+                col: char_col,
+                line_text: preview,
+            });
+        } else if total_matched >= cap.saturating_mul(20).max(5_000) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Some((total_matched, results));
+        }
+    }
+    let status = child.wait().ok()?;
+    // `rg` exits 0 on matches, 1 on zero matches, 2 on error.
+    if matches!(status.code(), Some(0 | 1)) || !results.is_empty() {
+        Some((total_matched, results))
+    } else {
+        None
+    }
+}
+
+pub fn workspace_grep_counted(
     root: &str,
     query: &str,
     case_sensitive: bool,
     max_results: usize,
     file_filter: &str,
-) -> Vec<GrepMatch> {
+) -> (usize, Vec<GrepMatch>) {
     if query.is_empty() {
-        return Vec::new();
+        return (0, Vec::new());
     }
     let cap = if max_results == 0 {
         500
     } else {
         max_results.min(5_000)
     };
-    let files = workspace_files(root, 15_000, false);
     let root_path = Path::new(root);
+    if !root_path.exists() {
+        return (0, Vec::new());
+    }
+    if let Some(rg_res) = try_rg_workspace_grep(root_path, query, case_sensitive, cap, file_filter)
+    {
+        return rg_res;
+    }
+
+    let (files, _) = load_cached_workspace_index(root, false);
     let needle_low = if case_sensitive {
         String::new()
     } else {
@@ -691,12 +1155,13 @@ pub fn workspace_grep(
     };
     let filter_trim = file_filter.trim().to_lowercase();
     let mut results = Vec::new();
+    let mut total_matched = 0usize;
 
-    for rel in files {
+    for rel in files.iter() {
         if !filter_trim.is_empty() && !rel.to_lowercase().contains(&filter_trim) {
             continue;
         }
-        let full = root_path.join(&rel);
+        let full = root_path.join(rel);
         let Ok(bytes) = fs::read(&full) else {
             continue;
         };
@@ -713,27 +1178,39 @@ pub fn workspace_grep(
                 line.to_lowercase().find(&needle_low)
             };
             if let Some(byte_pos) = byte_hit {
-                let char_col = line
-                    .get(..byte_pos)
-                    .map_or(0, |prefix| prefix.chars().count() as i64);
-                let preview = if line.chars().count() > 240 {
-                    line.chars().take(240).collect()
-                } else {
-                    line.to_string()
-                };
-                results.push(GrepMatch {
-                    file_path: rel.clone(),
-                    row: line_idx as i64,
-                    col: char_col,
-                    line_text: preview,
-                });
-                if results.len() >= cap {
-                    return results;
+                total_matched += 1;
+                if results.len() < cap {
+                    let char_col = line
+                        .get(..byte_pos)
+                        .map_or(0, |prefix| prefix.chars().count() as i64);
+                    let preview = if line.chars().count() > 240 {
+                        line.chars().take(240).collect()
+                    } else {
+                        line.to_string()
+                    };
+                    results.push(GrepMatch {
+                        file_path: rel.clone(),
+                        row: line_idx as i64,
+                        col: char_col,
+                        line_text: preview,
+                    });
+                } else if total_matched >= cap.saturating_mul(10).max(2_000) {
+                    return (total_matched, results);
                 }
             }
         }
     }
-    results
+    (total_matched, results)
+}
+
+pub fn workspace_grep(
+    root: &str,
+    query: &str,
+    case_sensitive: bool,
+    max_results: usize,
+    file_filter: &str,
+) -> Vec<GrepMatch> {
+    workspace_grep_counted(root, query, case_sensitive, max_results, file_filter).1
 }
 
 pub fn workspace_replace(
@@ -746,7 +1223,7 @@ pub fn workspace_replace(
     if query.is_empty() {
         return Err("search query cannot be empty".to_string());
     }
-    let files = workspace_files(root, 15_000, false);
+    let files = workspace_files(root, MAX_WORKSPACE_FILES, false);
     let root_path = Path::new(root);
     let filter_trim = file_filter.trim().to_lowercase();
     let mut files_changed = 0usize;
@@ -773,6 +1250,9 @@ pub fn workspace_replace(
             files_changed += 1;
             total_replacements += count;
         }
+    }
+    if files_changed > 0 {
+        invalidate_workspace_cache(root);
     }
     Ok((files_changed, total_replacements))
 }
@@ -1009,8 +1489,11 @@ fn run_git(cwd: &str, args: &[&str]) -> Option<String> {
 }
 
 const NON_REPO_STATUS_TTL: Duration = Duration::from_millis(1_500);
+const SERVER_GIT_STATUS_TTL: Duration = Duration::from_millis(2_000);
 
 static NON_REPO_STATUS_CACHE: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
+static SERVER_GIT_STATUS_CACHE: OnceLock<Mutex<HashMap<PathBuf, (Instant, GitRepoStatus)>>> =
+    OnceLock::new();
 
 fn resolve_git_cwd_dir(cwd_or_path: &str) -> (String, PathBuf) {
     if cwd_or_path.is_empty() {
@@ -1090,6 +1573,56 @@ pub fn git_repo_status(cwd: &str) -> GitRepoStatus {
         }
     }
     status
+}
+
+pub fn git_repo_status_cached(cwd: &str) -> GitRepoStatus {
+    let (_, cache_key) = resolve_git_cwd_dir(cwd);
+    let cache = SERVER_GIT_STATUS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let now = Instant::now();
+    if let Ok(guard) = cache.lock()
+        && let Some((ts, st)) = guard.get(&cache_key)
+        && now.duration_since(*ts) < SERVER_GIT_STATUS_TTL
+    {
+        return st.clone();
+    }
+    let fresh = git_repo_status(cwd);
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() >= 32 {
+            guard.clear();
+        }
+        guard.insert(cache_key, (Instant::now(), fresh.clone()));
+    }
+    fresh
+}
+
+pub fn git_file_diff_hunks(
+    cwd: &str,
+    file_path: &str,
+    override_lines: Option<&[String]>,
+) -> (bool, Vec<DiffHunk>) {
+    let Some(head_lines) = git_head_file_lines(cwd, file_path) else {
+        return (false, Vec::new());
+    };
+    if let Some(cur) = override_lines {
+        return (true, diff_line_hunks(&head_lines, cur));
+    }
+    let full = if Path::new(file_path).is_absolute() {
+        PathBuf::from(file_path)
+    } else {
+        Path::new(cwd).join(file_path)
+    };
+    let Ok(raw) = fs::read_to_string(&full) else {
+        return (true, Vec::new());
+    };
+    let body = raw.strip_suffix('\n').unwrap_or(&raw);
+    let disk_lines: Vec<String> = if body.is_empty() && raw.is_empty() {
+        vec![String::new()]
+    } else {
+        body.split('\n')
+            .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
+            .collect()
+    };
+    (true, diff_line_hunks(&head_lines, &disk_lines))
 }
 
 pub fn git_head_file_lines(cwd: &str, file_path: &str) -> Option<Vec<String>> {
@@ -1318,8 +1851,15 @@ pub fn scan_workspace_todos(root: &str, max_results: usize) -> Vec<TodoMatch> {
     } else {
         max_results.min(2_000)
     };
-    let files = workspace_files(root, 10_000, false);
     let root_path = Path::new(root);
+    if !root_path.exists() {
+        return Vec::new();
+    }
+    // Fast path via `rg` across the entire workspace when ripgrep is available.
+    if let Some(rg_hits) = try_rg_workspace_todos(root_path, cap) {
+        return rg_hits;
+    }
+    let files = workspace_files(root, MAX_WORKSPACE_FILES, false);
     let mut out = Vec::new();
     for rel in files {
         let full = root_path.join(&rel);
@@ -1341,6 +1881,610 @@ pub fn scan_workspace_todos(root: &str, max_results: usize) -> Vec<TodoMatch> {
         }
     }
     out
+}
+
+fn try_rg_workspace_todos(root: &Path, cap: usize) -> Option<Vec<TodoMatch>> {
+    let mut cmd = Command::new("rg");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.arg("--line-number")
+        .arg("--no-heading")
+        .arg("--color=never")
+        .arg(r"\b(TODO|FIXME|HACK|WARN|WARNING|PERF|NOTE|BUG)\b")
+        .arg(".")
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    let reader = BufReader::with_capacity(64 * 1024, stdout);
+    let mut out = Vec::new();
+    for line_res in reader.lines() {
+        let Ok(raw) = line_res else { break };
+        let mut parts = raw.splitn(3, ':');
+        let Some(rel_raw) = parts.next() else {
+            continue;
+        };
+        let Some(row_s) = parts.next() else { continue };
+        let Some(txt) = parts.next() else { continue };
+        let Ok(row_1) = row_s.parse::<i64>() else {
+            continue;
+        };
+        let rel = rel_raw.trim_start_matches("./").replace('\\', "/");
+        if let Some(hit) = doc_store::scan_todo_in_line(txt, (row_1 - 1).max(0), &rel) {
+            out.push(hit);
+            if out.len() >= cap {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Some(out);
+            }
+        }
+    }
+    let status = child.wait().ok()?;
+    if matches!(status.code(), Some(0 | 1)) || !out.is_empty() {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5b. Windowed File Preview & Single-RPC Dirvish / Tree Directory Snapshot
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default)]
+pub struct PreviewWindow {
+    pub lines: Vec<String>,
+    pub start_row: i64,
+    pub total_lines: i64,
+    pub is_binary: bool,
+    pub truncated: bool,
+    pub total_size: i64,
+}
+
+/// Stream only a bounded `[start_row .. start_row + max_lines]` slice from `path` so remote
+/// Telescope / Dirvish previews never read or transmit whole files over SSH!
+pub fn read_file_preview_window(
+    path: &str,
+    start_row: usize,
+    max_lines: usize,
+    max_bytes: usize,
+) -> Result<PreviewWindow, String> {
+    let target = Path::new(path);
+    let meta = fs::metadata(target).map_err(|e| format!("cannot stat '{path}': {e}"))?;
+    if meta.is_dir() {
+        return Err(format!("path is a directory, not a file: {path}"));
+    }
+    let total_size = meta.len() as i64;
+    let cap_lines = max_lines.clamp(5, 2_000);
+    let cap_bytes = max_bytes.clamp(512, 262_144);
+
+    let mut sample_file = File::open(target).map_err(|e| format!("cannot open '{path}': {e}"))?;
+    let mut sample = [0u8; 4096];
+    let sample_n = sample_file
+        .read(&mut sample)
+        .map_err(|e| format!("cannot read '{path}': {e}"))?;
+    if sample[..sample_n].contains(&0) {
+        return Ok(PreviewWindow {
+            lines: Vec::new(),
+            start_row: 0,
+            total_lines: 0,
+            is_binary: true,
+            truncated: true,
+            total_size,
+        });
+    }
+    drop(sample_file);
+
+    let file = File::open(target).map_err(|e| format!("cannot open '{path}': {e}"))?;
+    let mut reader = BufReader::with_capacity(32 * 1024, file);
+    let mut raw_buf = Vec::with_capacity(256);
+    let mut cur_row = 0usize;
+    let mut window_bytes = 0usize;
+    let mut scanned_bytes = 0usize;
+    let max_scan_bytes = 32 * 1024 * 1024usize;
+    let mut lines = Vec::with_capacity(cap_lines.min(128));
+    let mut truncated = false;
+
+    loop {
+        raw_buf.clear();
+        let n = reader
+            .read_until(b'\n', &mut raw_buf)
+            .map_err(|e| format!("preview read error on '{path}': {e}"))?;
+        if n == 0 {
+            break;
+        }
+        scanned_bytes += n;
+        if cur_row < start_row {
+            cur_row += 1;
+            if scanned_bytes >= max_scan_bytes {
+                truncated = true;
+                break;
+            }
+            continue;
+        }
+        if lines.len() >= cap_lines || window_bytes >= cap_bytes {
+            truncated = true;
+            break;
+        }
+        if raw_buf.contains(&0) {
+            return Ok(PreviewWindow {
+                lines: Vec::new(),
+                start_row: 0,
+                total_lines: 0,
+                is_binary: true,
+                truncated: true,
+                total_size,
+            });
+        }
+        let Ok(s) = std::str::from_utf8(&raw_buf) else {
+            return Ok(PreviewWindow {
+                lines: Vec::new(),
+                start_row: 0,
+                total_lines: 0,
+                is_binary: true,
+                truncated: true,
+                total_size,
+            });
+        };
+        let clean = s.trim_end_matches(['\r', '\n']);
+        let clipped: String = if clean.chars().count() > 400 {
+            clean.chars().take(400).collect()
+        } else {
+            clean.to_string()
+        };
+        window_bytes += clipped.len() + 1;
+        lines.push(clipped);
+        cur_row += 1;
+    }
+
+    if lines.is_empty() && start_row == 0 {
+        lines.push(String::new());
+    }
+
+    Ok(PreviewWindow {
+        start_row: start_row as i64,
+        total_lines: cur_row as i64,
+        lines,
+        is_binary: false,
+        truncated,
+        total_size,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct DirSnapshotParentEntry {
+    pub name: String,
+    pub full_path: String,
+    pub is_dir: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DirSnapshotEntry {
+    pub name: String,
+    pub full_path: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub is_exec: bool,
+    pub size: i64,
+    pub modified_secs: i64,
+    pub perms: String,
+    pub symlink_target: String,
+    pub git_badge: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DirSnapshotPreview {
+    /// `"none"`, `"dir"`, `"text"`, `"binary"`, or `"unreadable"`
+    pub kind: String,
+    pub target_path: String,
+    pub target_name: String,
+    pub total_count: i64,
+    pub total_size: i64,
+    pub lines: Vec<String>,
+    pub child_entries: Vec<(String, bool, bool, i64)>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DirSnapshotResult {
+    pub resolved_path: String,
+    pub parent_path: String,
+    pub parent_entries: Vec<DirSnapshotParentEntry>,
+    pub entries: Vec<DirSnapshotEntry>,
+    pub git_is_repo: bool,
+    pub git_root: String,
+    pub git_branch: String,
+    pub git_staged: i64,
+    pub git_modified: i64,
+    pub git_untracked: i64,
+    pub preview: DirSnapshotPreview,
+}
+
+fn format_entry_perms(meta: &fs::Metadata, is_dir: bool, is_symlink: bool) -> (bool, String) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        let is_exec = !is_dir && (mode & 0o111) != 0;
+        let kind_ch = if is_symlink {
+            'l'
+        } else if is_dir {
+            'd'
+        } else {
+            '-'
+        };
+        let bit = |mask: u32, ch: char| if (mode & mask) != 0 { ch } else { '-' };
+        let s = format!(
+            "{kind_ch}{}{}{}{}{}{}{}{}{}",
+            bit(0o400, 'r'),
+            bit(0o200, 'w'),
+            bit(0o100, 'x'),
+            bit(0o040, 'r'),
+            bit(0o020, 'w'),
+            bit(0o010, 'x'),
+            bit(0o004, 'r'),
+            bit(0o002, 'w'),
+            bit(0o001, 'x'),
+        );
+        (is_exec, s)
+    }
+    #[cfg(not(unix))]
+    {
+        let ro = meta.permissions().readonly();
+        let s = if is_symlink {
+            "lrwxrwxrwx"
+        } else if is_dir {
+            if ro { "dr-xr-xr-x" } else { "drwxr-xr-x" }
+        } else if ro {
+            "-r--r--r--"
+        } else {
+            "-rw-r--r--"
+        };
+        (false, s.to_string())
+    }
+}
+
+fn git_badge_char(x: &str, y: &str) -> &'static str {
+    if x == "?" || y == "?" {
+        "?"
+    } else if x == "A" {
+        "A"
+    } else if x == "D" || y == "D" {
+        "D"
+    } else if x == "R" {
+        "R"
+    } else if x == "M" || y == "M" || x != " " || y != " " {
+        "M"
+    } else {
+        " "
+    }
+}
+
+fn entry_ext_lower(name: &str) -> String {
+    match name.rfind('.') {
+        Some(idx) if idx > 0 && idx + 1 < name.len() => name[idx + 1..].to_ascii_lowercase(),
+        _ => String::new(),
+    }
+}
+
+/// Build a complete, render-ready Dirvish / Neotree directory snapshot on `lava-server` in a
+/// single pass: parent listing + filtered/sorted directory entries (with server-attached Git
+/// badges, permissions, symlink targets, and sizes) + Git repo summary + focused item preview!
+#[allow(clippy::too_many_arguments)]
+pub fn dir_snapshot(
+    raw_dir: &str,
+    show_hidden: bool,
+    filter_query: &str,
+    sort_by: &str,
+    sort_reverse: bool,
+    focus_name: &str,
+    preferred_row: usize,
+    include_parent: bool,
+    include_preview: bool,
+) -> Result<DirSnapshotResult, String> {
+    let dir_p = Path::new(raw_dir);
+    if !dir_p.exists() {
+        return Err(format!("directory does not exist: {raw_dir}"));
+    }
+    if !dir_p.is_dir() {
+        return Err(format!("path is not a directory: {raw_dir}"));
+    }
+    let resolved =
+        strip_win_verbatim_buf(fs::canonicalize(dir_p).unwrap_or_else(|_| dir_p.to_path_buf()));
+    let resolved_str = resolved.to_string_lossy().replace('\\', "/");
+
+    // 1. Cached Git status + per-entry badge map restricted to `resolved` (zero full-repo wire dump!).
+    let git_st = git_repo_status_cached(&resolved_str);
+    let mut direct_badges: HashMap<String, String> = HashMap::new();
+    if git_st.is_repo && !git_st.root.is_empty() {
+        let git_root_norm = git_st.root.replace('\\', "/");
+        let dir_rel_prefix = if resolved_str == git_root_norm {
+            String::new()
+        } else if let Some(rest) = resolved_str.strip_prefix(&format!("{git_root_norm}/")) {
+            format!("{rest}/")
+        } else {
+            "\0__outside__".to_string()
+        };
+        if !dir_rel_prefix.starts_with('\0') {
+            for (x, y, rel) in &git_st.entries {
+                let b = git_badge_char(x, y);
+                if b == " " {
+                    continue;
+                }
+                let rel_norm = rel.replace('\\', "/");
+                let Some(sub) = (if dir_rel_prefix.is_empty() {
+                    Some(rel_norm.as_str())
+                } else {
+                    rel_norm.strip_prefix(&dir_rel_prefix)
+                }) else {
+                    continue;
+                };
+                let child_name = sub.split('/').next().unwrap_or("");
+                if child_name.is_empty() {
+                    continue;
+                }
+                match direct_badges.get(child_name).map(String::as_str) {
+                    None => {
+                        direct_badges.insert(child_name.to_string(), b.to_string());
+                    }
+                    Some(prev) if prev != "M" && b == "M" => {
+                        direct_badges.insert(child_name.to_string(), "M".to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // 2. Scan current directory entries.
+    let rd = fs::read_dir(&resolved)
+        .map_err(|e| format!("cannot read directory '{resolved_str}': {e}"))?;
+    let filt_low = filter_query.trim().to_lowercase();
+    let mut entries = Vec::new();
+    for item_res in rd {
+        let Ok(de) = item_res else { continue };
+        let name = de.file_name().to_string_lossy().into_owned();
+        if name.is_empty() || name == "." || name == ".." {
+            continue;
+        }
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
+        if !filt_low.is_empty() && !name.to_lowercase().contains(&filt_low) {
+            continue;
+        }
+        let symlink_meta = fs::symlink_metadata(de.path());
+        let is_symlink = symlink_meta
+            .as_ref()
+            .is_ok_and(|m| m.file_type().is_symlink());
+        let symlink_target = if is_symlink {
+            fs::read_link(de.path())
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let target_meta = fs::metadata(de.path()).or(symlink_meta);
+        let (is_dir, size, modified_secs, is_exec, perms) = match target_meta {
+            Ok(ref m) => {
+                let d = m.is_dir();
+                let sz = if d { 0 } else { m.len() as i64 };
+                let mt = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs() as i64);
+                let (ex, pm) = format_entry_perms(m, d, is_symlink);
+                (d, sz, mt, ex, pm)
+            }
+            Err(_) => (false, 0, 0, false, "-rw-r--r--".to_string()),
+        };
+        let full_child = if resolved_str == "/" {
+            format!("/{name}")
+        } else {
+            format!("{resolved_str}/{name}")
+        };
+        let git_badge = direct_badges
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(|| " ".to_string());
+        entries.push(DirSnapshotEntry {
+            name,
+            full_path: full_child,
+            is_dir,
+            is_symlink,
+            is_exec,
+            size,
+            modified_secs,
+            perms,
+            symlink_target,
+            git_badge,
+        });
+    }
+
+    entries.sort_by(|a, b| {
+        if a.is_dir != b.is_dir {
+            return b.is_dir.cmp(&a.is_dir);
+        }
+        let ord = match sort_by {
+            "size" => a
+                .size
+                .cmp(&b.size)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+            "ext" => entry_ext_lower(&a.name)
+                .cmp(&entry_ext_lower(&b.name))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+            _ => a
+                .name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.name.cmp(&b.name)),
+        };
+        if sort_reverse { ord.reverse() } else { ord }
+    });
+
+    // 3. Optional parent directory entries (compact for Dirvish left Miller column).
+    let (parent_path, parent_entries) = if include_parent {
+        if let Some(par) = resolved.parent()
+            && par != resolved
+        {
+            let par_str = par.to_string_lossy().replace('\\', "/");
+            let mut p_items = Vec::new();
+            if let Ok(prd) = fs::read_dir(par) {
+                for pe_res in prd.flatten() {
+                    let pname = pe_res.file_name().to_string_lossy().into_owned();
+                    if pname.is_empty() || pname == "." || pname == ".." {
+                        continue;
+                    }
+                    if !show_hidden && pname.starts_with('.') {
+                        continue;
+                    }
+                    let pis_dir = fs::metadata(pe_res.path()).is_ok_and(|m| m.is_dir());
+                    let pfull = if par_str == "/" {
+                        format!("/{pname}")
+                    } else {
+                        format!("{par_str}/{pname}")
+                    };
+                    p_items.push(DirSnapshotParentEntry {
+                        name: pname,
+                        full_path: pfull,
+                        is_dir: pis_dir,
+                    });
+                }
+            }
+            p_items.sort_by(|a, b| {
+                b.is_dir
+                    .cmp(&a.is_dir)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            });
+            (par_str, p_items)
+        } else {
+            (String::new(), Vec::new())
+        }
+    } else {
+        (String::new(), Vec::new())
+    };
+
+    // 4. Optional initial preview for the focused row so opening Dirvish needs ONLY 1 RTT!
+    let preview = if include_preview && !entries.is_empty() {
+        let idx = if !focus_name.is_empty()
+            && let Some(pos) = entries.iter().position(|e| e.name == focus_name)
+        {
+            pos
+        } else {
+            preferred_row.min(entries.len() - 1)
+        };
+        let focused = &entries[idx];
+        build_snapshot_entry_preview(
+            &focused.full_path,
+            &focused.name,
+            focused.is_dir,
+            show_hidden,
+        )
+    } else {
+        DirSnapshotPreview {
+            kind: "none".to_string(),
+            ..DirSnapshotPreview::default()
+        }
+    };
+
+    Ok(DirSnapshotResult {
+        resolved_path: resolved_str,
+        parent_path,
+        parent_entries,
+        entries,
+        git_is_repo: git_st.is_repo,
+        git_root: git_st.root.replace('\\', "/"),
+        git_branch: git_st.branch,
+        git_staged: git_st.staged_count,
+        git_modified: git_st.modified_count,
+        git_untracked: git_st.untracked_count,
+        preview,
+    })
+}
+
+pub fn build_snapshot_entry_preview(
+    target_path: &str,
+    target_name: &str,
+    is_dir: bool,
+    show_hidden: bool,
+) -> DirSnapshotPreview {
+    if is_dir {
+        let Ok(rd) = fs::read_dir(target_path) else {
+            return DirSnapshotPreview {
+                kind: "unreadable".to_string(),
+                target_path: target_path.to_string(),
+                target_name: target_name.to_string(),
+                ..DirSnapshotPreview::default()
+            };
+        };
+        let mut children: Vec<(String, bool, bool, i64)> = Vec::new();
+        for ch_res in rd.flatten() {
+            let cname = ch_res.file_name().to_string_lossy().into_owned();
+            if cname.is_empty() || cname == "." || cname == ".." {
+                continue;
+            }
+            if !show_hidden && cname.starts_with('.') {
+                continue;
+            }
+            let csym =
+                fs::symlink_metadata(ch_res.path()).is_ok_and(|m| m.file_type().is_symlink());
+            let (cdir, csz) = match fs::metadata(ch_res.path()) {
+                Ok(m) => (m.is_dir(), if m.is_dir() { 0 } else { m.len() as i64 }),
+                Err(_) => (false, 0),
+            };
+            children.push((cname, cdir, csym, csz));
+        }
+        children.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+        });
+        let total = children.len() as i64;
+        if children.len() > 80 {
+            children.truncate(80);
+        }
+        return DirSnapshotPreview {
+            kind: "dir".to_string(),
+            target_path: target_path.to_string(),
+            target_name: target_name.to_string(),
+            total_count: total,
+            total_size: 0,
+            lines: Vec::new(),
+            child_entries: children,
+        };
+    }
+
+    match read_file_preview_window(target_path, 0, 100, 8_192) {
+        Ok(win) if win.is_binary => DirSnapshotPreview {
+            kind: "binary".to_string(),
+            target_path: target_path.to_string(),
+            target_name: target_name.to_string(),
+            total_count: 0,
+            total_size: win.total_size,
+            lines: Vec::new(),
+            child_entries: Vec::new(),
+        },
+        Ok(win) => DirSnapshotPreview {
+            kind: "text".to_string(),
+            target_path: target_path.to_string(),
+            target_name: target_name.to_string(),
+            total_count: win.total_lines,
+            total_size: win.total_size,
+            lines: win.lines,
+            child_entries: Vec::new(),
+        },
+        Err(_) => DirSnapshotPreview {
+            kind: "unreadable".to_string(),
+            target_path: target_path.to_string(),
+            target_name: target_name.to_string(),
+            ..DirSnapshotPreview::default()
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------

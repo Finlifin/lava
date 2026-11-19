@@ -155,3 +155,9 @@ cargo test --workspace
 ./target/release/lava -u examples/init.ns --headless \
   --keys "<Space>nnDemoNote<Return>:q!<Return>"
 ```
+
+---
+
+## 开源协议
+
+本项目采用 **Mozilla Public License Version 2.0 (MPL-2.0)** 开源协议，完整协议文本见 [LICENSE](LICENSE)。

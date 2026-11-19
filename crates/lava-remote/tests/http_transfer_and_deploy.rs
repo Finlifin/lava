@@ -8,8 +8,9 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use lava_remote::{
-    HTTP_TRANSFER_THRESHOLD_BYTES, RemoteManager, TransferProgressSnapshot,
-    discover_ssh_config_hosts_from_path,
+    AsyncPollOutcome, AsyncRemoteOp, AsyncRemoteResult, HTTP_TRANSFER_THRESHOLD_BYTES,
+    RemoteManager, TransferProgressSnapshot, discover_ssh_config_hosts_from_path,
+    set_simulated_rpc_delay_ms,
 };
 
 fn workspace_root() -> PathBuf {
@@ -315,7 +316,8 @@ fn remote_fish_login_shell_deploy_and_env_var_launch() {
     let _ = fs::remove_dir_all(&tmp_root);
     fs::create_dir_all(&tmp_root).expect("create fish temp root");
 
-    // Simulate a remote SSH host whose user login shell is `/usr/bin/fish` AND prints a greeting!
+    // Simulate Windows `Win32-OpenSSH` (`ssh.exe` wrapping any space-containing argv element in
+    // outer `"..."`) talking to a remote host whose login shell is `/usr/bin/fish`!
     let bin_dir = tmp_root.join("fish_fake_bin");
     fs::create_dir_all(&bin_dir).expect("create fish_fake_bin");
     let ssh_shim = bin_dir.join("ssh");
@@ -340,15 +342,31 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+REMOTE_CMD=""
+for a in "$@"; do
+    case "$a" in
+        \'*\')
+            ;;
+        *" "*|*"	"*)
+            q=$(printf '%s' "$a" | sed 's/"/\\"/g')
+            a="\"$q\""
+            ;;
+    esac
+    if [ -z "$REMOTE_CMD" ]; then
+        REMOTE_CMD="$a"
+    else
+        REMOTE_CMD="$REMOTE_CMD $a"
+    fi
+done
 printf 'Welcome to fish, the friendly interactive shell\n'
-exec /usr/bin/fish --no-config -c "$*"
+exec /usr/bin/fish --no-config -c "$REMOTE_CMD"
 "#;
     fs::write(&ssh_shim, shim_script).expect("write fish ssh shim");
     fs::set_permissions(&ssh_shim, fs::Permissions::from_mode(0o755)).expect("chmod fish ssh shim");
 
     let install_dir = tmp_root.join("dot_lava_server_fish");
-    let remote_work_dir = tmp_root.join("fish_workspace");
-    fs::create_dir_all(&remote_work_dir).expect("create fish_workspace");
+    let remote_work_dir = tmp_root.join("fish workspace");
+    fs::create_dir_all(&remote_work_dir).expect("create fish workspace");
 
     let orig_path = env::var("PATH").unwrap_or_default();
     let orig_install = env::var("LAVA_REMOTE_INSTALL_DIR").ok();
@@ -379,7 +397,7 @@ exec /usr/bin/fish --no-config -c "$*"
     assert!(exists && !is_dir);
     assert_eq!(read_back, payload);
 
-    // Verify `lsp_launch_command` in `ssh-posix` mode (`PATH=...; cd -- ... && exec ...`) executes cleanly under `fish`!
+    // Verify `lsp_launch_command` in `ssh-posix` mode executes cleanly through Win32-OpenSSH + `fish`!
     let (_ssh_prog, lsp_ssh_args, _pfx, _root) = mgr
         .lsp_launch_command(
             "ssh://127.0.0.1",
@@ -388,19 +406,21 @@ exec /usr/bin/fish --no-config -c "$*"
             &[],
         )
         .expect("lsp_launch_command in ssh-posix mode");
-    let lsp_remote_arg = lsp_ssh_args.last().expect("remote command arg");
-    let fish_lsp_out = Command::new("/usr/bin/fish")
-        .args(["--no-config", "-c", lsp_remote_arg])
+    let fish_lsp_out = Command::new(&ssh_shim)
+        .args(&lsp_ssh_args)
         .output()
-        .expect("run lsp_launch_command through fish");
+        .expect("run lsp_launch_command through Win32-OpenSSH + fish shim");
     assert!(
         fish_lsp_out.status.success(),
         "fish failed on lsp_launch_command: {}",
         String::from_utf8_lossy(&fish_lsp_out.stderr)
     );
-    assert_eq!(
-        String::from_utf8_lossy(&fish_lsp_out.stdout).trim(),
-        remote_work_dir.display().to_string()
+    assert!(
+        String::from_utf8_lossy(&fish_lsp_out.stdout)
+            .lines()
+            .any(|l| l.trim() == remote_work_dir.display().to_string()),
+        "unexpected lsp_launch_command output: {}",
+        String::from_utf8_lossy(&fish_lsp_out.stdout)
     );
 
     // 2. Deploy `lava-server` (`DEST=...; cat > ...$$` + `LAVA_SERVER_CACHE_DIR=... lava-server --stdio`) over `fish`!
@@ -432,6 +452,298 @@ exec /usr/bin/fish --no-config -c "$*"
     assert!(ex2 && !dir2);
     assert_eq!(tx_get, "SSH");
     assert_eq!(fetched, srv_payload);
+
+    // 4. Verify `lsp_launch_command` in `--lsp-proxy` mode over Win32-OpenSSH + `fish`!
+    let (_ssh_prog2, lsp_proxy_args, _pfx2, _root2) = mgr
+        .lsp_launch_command(
+            "ssh://127.0.0.1",
+            remote_work_dir.to_str().expect("utf8 work_dir"),
+            "pwd",
+            &[],
+        )
+        .expect("lsp_launch_command in lava-server --lsp-proxy mode");
+    let proxy_out = Command::new(&ssh_shim)
+        .args(&lsp_proxy_args)
+        .output()
+        .expect("run --lsp-proxy through Win32-OpenSSH + fish shim");
+    assert!(
+        proxy_out.status.success(),
+        "fish failed on --lsp-proxy: {}",
+        String::from_utf8_lossy(&proxy_out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&proxy_out.stdout)
+            .lines()
+            .any(|l| l.trim() == remote_work_dir.display().to_string()),
+        "unexpected --lsp-proxy output: {}",
+        String::from_utf8_lossy(&proxy_out.stdout)
+    );
+
+    let _ = mgr.disconnect("ssh://127.0.0.1");
+    // SAFETY: Restore environment variables under `ENV_LOCK`.
+    unsafe {
+        env::set_var("PATH", orig_path);
+        match orig_install {
+            Some(v) => env::set_var("LAVA_REMOTE_INSTALL_DIR", v),
+            None => env::remove_var("LAVA_REMOTE_INSTALL_DIR"),
+        }
+    }
+    let _ = fs::remove_dir_all(&tmp_root);
+}
+
+#[test]
+fn server_side_12k_index_render_slices_and_async_coalescing() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp_root = env::temp_dir().join(format!("lava_remote_12k_slice_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp_root);
+    fs::create_dir_all(&tmp_root).expect("create temp root");
+
+    let bin_dir = tmp_root.join("fake_bin");
+    fs::create_dir_all(&bin_dir).expect("create fake_bin");
+    let ssh_shim = bin_dir.join("ssh");
+    let shim_script = r#"#!/bin/sh
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -O) exit 0 ;;
+        -p|-o|-S|-L|-i|-J|-F|-l) shift 2 ;;
+        -N|-T|-t|-q|-v|-C|-f) shift 1 ;;
+        -*) shift 1 ;;
+        *) shift 1; break ;;
+    esac
+done
+exec /bin/sh -c "$*"
+"#;
+    fs::write(&ssh_shim, shim_script).expect("write ssh shim");
+    fs::set_permissions(&ssh_shim, fs::Permissions::from_mode(0o755)).expect("chmod ssh shim");
+
+    let install_dir = tmp_root.join("dot_lava_server");
+    let ws_dir = tmp_root.join("huge_repo");
+    fs::create_dir_all(&ws_dir).expect("create huge_repo");
+
+    // Seed 12,050 files across 25 buckets + `z_tail/deep_needle_12049.rs` (past old 2k/2.5k/3k/10k caps!)
+    for b in 0..25 {
+        let bdir = ws_dir.join(format!("bucket_{b:02}"));
+        fs::create_dir_all(&bdir).expect("create bucket dir");
+        for k in 0..482 {
+            let idx = b * 482 + k;
+            fs::write(
+                bdir.join(format!("mod_{idx:05}.rs")),
+                format!("pub const VAL_{idx}: usize = {idx};\n"),
+            )
+            .expect("write bucket file");
+        }
+    }
+    let tail_dir = ws_dir.join("z_tail");
+    fs::create_dir_all(&tail_dir).expect("create z_tail");
+    fs::write(
+        tail_dir.join("deep_needle_12049.rs"),
+        "// TODO: verify uncapped server ranking\npub fn needle_target() -> i32 { 12049 }\n",
+    )
+    .expect("write deep needle");
+
+    // Seed a 15,000-line source file to verify bounded viewport slice preview (`start_row = 12494`).
+    let mut big_lines = String::with_capacity(480_000);
+    for r in 0..15_000 {
+        if r == 12_500 {
+            big_lines.push_str("pub fn hit_here() { /* DEEP_ROW_12500_MARKER */ }\n");
+        } else {
+            big_lines.push_str(&format!("let row_{r} = {r};\n"));
+        }
+    }
+    let big_file = ws_dir.join("tall_source.rs");
+    fs::write(&big_file, &big_lines).expect("write tall_source.rs");
+
+    // Initialize git repo and modify `z_tail/deep_needle_12049.rs` so server git badges/hunks/summary fire.
+    let _ = Command::new("git")
+        .args(["init"])
+        .current_dir(&ws_dir)
+        .output();
+    let _ = Command::new("git")
+        .args(["config", "user.email", "ci@lava.org"])
+        .current_dir(&ws_dir)
+        .output();
+    let _ = Command::new("git")
+        .args(["config", "user.name", "Lava CI"])
+        .current_dir(&ws_dir)
+        .output();
+    let _ = Command::new("git")
+        .args(["add", "z_tail/deep_needle_12049.rs"])
+        .current_dir(&ws_dir)
+        .output();
+    let _ = Command::new("git")
+        .args(["commit", "-m", "seed needle"])
+        .current_dir(&ws_dir)
+        .output();
+    fs::write(
+        tail_dir.join("deep_needle_12049.rs"),
+        "// TODO: verify uncapped server ranking\npub fn needle_target() -> i32 { 12049 }\npub fn added_after_commit() -> i32 { 7 }\n",
+    )
+    .expect("modify needle");
+
+    let orig_path = env::var("PATH").unwrap_or_default();
+    let orig_install = env::var("LAVA_REMOTE_INSTALL_DIR").ok();
+    // SAFETY: Guarded by `ENV_LOCK`.
+    unsafe {
+        env::set_var("PATH", format!("{}:{orig_path}", bin_dir.display()));
+        env::set_var("LAVA_REMOTE_INSTALL_DIR", &install_dir);
+    }
+
+    let server_bin = find_lava_server_bin();
+    let mgr = Arc::new(RemoteManager::new());
+    let wake_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let wake_clone = Arc::clone(&wake_counter);
+    mgr.set_waker(Arc::new(move || {
+        wake_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+
+    let deployed = mgr
+        .deploy_server(
+            "ssh://127.0.0.1",
+            server_bin.to_str().expect("utf8 server_bin"),
+        )
+        .expect("deploy lava-server");
+    assert_eq!(deployed.mode, "lava-server");
+
+    let ws_uri = format!("ssh://127.0.0.1{}", ws_dir.display());
+    let tail_uri = format!("ssh://127.0.0.1{}", tail_dir.display());
+    let needle_uri = format!(
+        "ssh://127.0.0.1{}",
+        tail_dir.join("deep_needle_12049.rs").display()
+    );
+    let tall_uri = format!("ssh://127.0.0.1{}", big_file.display());
+
+    // 1. Uncapped >12,000-file index + minimal render slice transfer (<= 150 items)
+    let empty_rank = mgr
+        .search_files_ranked(&ws_uri, "", false, false, 150)
+        .expect("empty ranked search");
+    assert!(
+        empty_rank.total_indexed >= 12_052,
+        "expected >= 12,052 indexed files on lava-server, got {}",
+        empty_rank.total_indexed
+    );
+    assert_eq!(
+        empty_rank.items.len(),
+        150,
+        "must transmit ONLY 150 renderable items over SSH, not all 12,052 paths"
+    );
+
+    let needle_rank = mgr
+        .search_files_ranked(&ws_uri, "z_tail 12049", false, true, 150)
+        .expect("Orderless ranked search past 12,000th file");
+    assert_eq!(needle_rank.total_matched, 1);
+    assert_eq!(needle_rank.items[0].rel_path, "z_tail/deep_needle_12049.rs");
+
+    // 2. Windowed viewport preview slice around row 12,500 (transfers ~1 KiB instead of 480 KiB!)
+    let pv = mgr
+        .read_preview_window(&tall_uri, 12_494, 24, 8192)
+        .expect("windowed preview at row 12,494");
+    assert_eq!(pv.start_row, 12_494);
+    assert_eq!(pv.lines.len(), 24);
+    assert!(
+        pv.lines[6].contains("DEEP_ROW_12500_MARKER"),
+        "expected row 12,500 marker at window offset 6, got: {:?}",
+        pv.lines[6]
+    );
+
+    // 3. Single-RTT `dir_snapshot` with server-joined git badge & preview
+    let snap = mgr
+        .dir_snapshot(
+            &tail_uri,
+            false,
+            "",
+            "name",
+            false,
+            "deep_needle_12049.rs",
+            0,
+            true,
+            true,
+        )
+        .expect("1-RTT dir_snapshot");
+    assert!(!snap.parent_entries.is_empty(), "parent entries included");
+    assert_eq!(snap.entries.len(), 1);
+    assert_eq!(
+        snap.entries[0].git_badge, "M",
+        "server joined modified git badge"
+    );
+    assert_eq!(snap.preview.kind, "text");
+    assert!(
+        snap.preview
+            .lines
+            .iter()
+            .any(|l| l.contains("needle_target")),
+        "focus preview included in same single RPC"
+    );
+
+    // 4. Minimal `git_summary`, `git_file_hunks`, `scan_todos`, and `workspace_replace`
+    let gsum = mgr.git_summary(&ws_uri).expect("git_summary");
+    assert!(gsum.is_repo && gsum.modified_count >= 1);
+
+    let (tracked, hunks) = mgr
+        .git_file_hunks(&tail_uri, &needle_uri, None)
+        .expect("git_file_hunks");
+    assert!(tracked && !hunks.is_empty());
+
+    let todos = mgr.scan_todos(&tail_uri, 50).expect("scan_todos");
+    assert_eq!(todos.len(), 1);
+    assert_eq!(todos[0].3, "TODO");
+
+    let (fc, tr) = mgr
+        .workspace_replace(
+            &tail_uri,
+            "added_after_commit",
+            "replaced_on_server",
+            true,
+            ".rs",
+        )
+        .expect("workspace_replace");
+    assert_eq!((fc, tr), (1, 1));
+
+    // 5. Non-blocking `submit_async` + latest-wins coalescing under 70ms simulated latency!
+    set_simulated_rpc_delay_ms(70);
+    let t0 = std::time::Instant::now();
+    for q in ["mod_00001", "mod_00002", "mod_00003", "z_tail 12049"] {
+        let _ = mgr.submit_async(
+            "telescope.search".to_string(),
+            AsyncRemoteOp::SearchFiles {
+                uri: ws_uri.clone(),
+                query: q.to_string(),
+                include_hidden: false,
+                include_dirs: false,
+                limit: 50,
+            },
+        );
+    }
+    assert!(
+        t0.elapsed().as_millis() < 20,
+        "submit_async burst must never block caller thread!"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut final_hit = None;
+    while std::time::Instant::now() < deadline {
+        match mgr.poll_async("telescope.search") {
+            AsyncPollOutcome::Ready {
+                result: AsyncRemoteResult::SearchFiles(rf),
+                ..
+            } => {
+                if rf.items.len() == 1 && rf.items[0].rel_path == "z_tail/deep_needle_12049.rs" {
+                    final_hit = Some(rf);
+                    break;
+                }
+            }
+            AsyncPollOutcome::Error { message, .. } => panic!("async error: {message}"),
+            _ => std::thread::sleep(std::time::Duration::from_millis(15)),
+        }
+    }
+    set_simulated_rpc_delay_ms(0);
+    assert!(
+        final_hit.is_some(),
+        "coalesced async slot must settle on final query 'z_tail 12049'"
+    );
+    assert!(
+        wake_counter.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "completion must invoke registered UI waker"
+    );
 
     let _ = mgr.disconnect("ssh://127.0.0.1");
     // SAFETY: Restore environment variables under `ENV_LOCK`.

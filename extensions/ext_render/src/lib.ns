@@ -10,7 +10,7 @@ use @lava_core.{
     CommandSpec, ExtId, InteractiveEffects, KeyBindingEntry, PromptKind, PromptRequest,
     SystemKernel, ask_prompt, log_event, status_emit
 }
-use @lava_accel.{TsSpan, accel_ts_highlight_rows, accel_ts_highlight_snippet}
+use @lava_accel.{TsSpan, accel_ts_highlight_rows_packed, accel_ts_highlight_snippet}
 use @ext_document.{
     ActiveBgJob, Buffer, BufferId, CompletionItem, CompletionPopup, EditorOptions, EditorWorld,
     FloatingWindow, GutterSign, InlineGhostText, InlineSpanDecor, MinibufferRichItem,
@@ -2317,14 +2317,22 @@ fn ts_spans_to_runs(raw_line: String, spans: List, theme: ThemePalette) -> List 
     }
     var pos: i64 = 0
     for i in 0..spans.len() {
-        let sp = spans.get(i.as(usize)).as(TsSpan)
-        let s0 = if sp.start_col < pos { pos } else if sp.start_col > n { n } else { sp.start_col }
-        let e0 = if sp.end_col > n { n } else { sp.end_col }
+        let raw_sp = spans.get(i.as(usize))
+        let (sp_start, sp_end, sp_grp) = if raw_sp matches _: i64 {
+            let pk = raw_sp.as(i64)
+            let rem = pk % 4294967296
+            (pk / 4294967296, rem / 256, rem % 256)
+        } else {
+            let sp = raw_sp.as(TsSpan)
+            (sp.start_col, sp.end_col, sp.hl_group)
+        }
+        let s0 = if sp_start < pos { pos } else if sp_start > n { n } else { sp_start }
+        let e0 = if sp_end > n { n } else { sp_end }
         if s0 > pos {
             push_run(runs, pos, raw_line.slice(pos, s0), theme.fg, false, false)
         }
         if e0 > s0 {
-            let (col, is_it) = ts_hl_group_style(sp.hl_group, theme)
+            let (col, is_it) = ts_hl_group_style(sp_grp, theme)
             push_run(runs, s0, raw_line.slice(s0, e0), col, false, is_it)
             pos = e0
         }
@@ -2613,17 +2621,64 @@ fn inspect_line_indent(line: String, tabstop: i64) -> (bool, i64, bool, bool) {
     (true, 0, false, false)
 }
 
--- Precompute `(lo_anchor, eff_arr, active_guide_vcol, scope_start_row, scope_end_row)` for `vis_rows`.
-fn compute_pane_indent_guides(
+fn resolve_active_indent_scope(
+    lo_anchor: i64,
+    count: i64,
+    indent_step: i64,
+    blank_arr: List,
+    close_arr: List,
+    eff_arr: List,
+    cursor_row: i64,
+    is_focused: bool,
+) -> (i64, i64, i64) {
+    let hi_anchor = lo_anchor + count - 1
+    if (not is_focused) or count <= 0 or cursor_row < lo_anchor or cursor_row > hi_anchor {
+        return (-1, -1, -1)
+    }
+    let cur_idx = cursor_row - lo_anchor
+    let cur_eff = eff_arr.get(cur_idx.as(usize)).as(i64)
+    let cur_close = close_arr.get(cur_idx.as(usize)).as(bool)
+    let next_eff = if cur_idx + 1 < count { eff_arr.get((cur_idx + 1).as(usize)).as(i64) } else { 0 }
+    let prev_eff = if cur_idx > 0 { eff_arr.get((cur_idx - 1).as(usize)).as(i64) } else { 0 }
+
+    var active_vcol: i64 = -1
+    var seed_idx: i64 = cur_idx
+    if (not blank_arr.get(cur_idx.as(usize)).as(bool)) and next_eff > cur_eff {
+        active_vcol = (cur_eff / indent_step) * indent_step
+        seed_idx = cur_idx + 1
+    } else if cur_close and prev_eff > cur_eff {
+        active_vcol = (cur_eff / indent_step) * indent_step
+        seed_idx = cur_idx - 1
+    } else if cur_eff > 0 {
+        active_vcol = ((cur_eff - 1) / indent_step) * indent_step
+        seed_idx = cur_idx
+    }
+
+    if active_vcol < 0 {
+        return (-1, -1, -1)
+    }
+
+    var s_idx = seed_idx
+    while s_idx > 0 and eff_arr.get((s_idx - 1).as(usize)).as(i64) > active_vcol {
+        s_idx -= 1
+    }
+    var e_idx = seed_idx
+    while e_idx + 1 < count and eff_arr.get((e_idx + 1).as(usize)).as(i64) > active_vcol {
+        e_idx += 1
+    }
+    (active_vcol, lo_anchor + s_idx, lo_anchor + e_idx)
+}
+
+-- Precompute `(lo_anchor, blank_arr, raw_arr, close_arr, open_arr, eff_arr)` for `vis_rows`.
+fn compute_pane_indent_arrays(
     buf: Buffer,
     vis_rows: List,
     cursor_row: i64,
-    is_focused: bool,
     tabstop: i64,
     shiftwidth: i64,
-) -> (i64, List, i64, i64, i64) {
+) -> (i64, List, List, List, List, List) {
     if vis_rows.is_empty() {
-        return (0, List(), -1, -1, -1)
+        return (0, List(), List(), List(), List(), List())
     }
     let indent_step = if shiftwidth > 0 { shiftwidth } else { if tabstop > 0 { tabstop } else { 4 } }
     let buf_lo = buf.min_row()
@@ -2663,6 +2718,7 @@ fn compute_pane_indent_guides(
     let blank_arr = List()
     let raw_arr = List()
     let close_arr = List()
+    let open_arr = List()
     let prev_nb_arr = List()
     var prev_for_blank: i64 = -1
 
@@ -2676,6 +2732,7 @@ fn compute_pane_indent_guides(
         blank_arr.push(is_blank)
         raw_arr.push(raw_vcol)
         close_arr.push(starts_close)
+        open_arr.push(ends_open)
         prev_nb_arr.push(prev_for_blank)
         if not is_blank {
             prev_for_blank = if ends_open { raw_vcol + indent_step } else { raw_vcol }
@@ -2706,42 +2763,7 @@ fn compute_pane_indent_guides(
         rev_i -= 1
     }
 
-    if (not is_focused) or cursor_row < lo_anchor or cursor_row > hi_anchor {
-        return (lo_anchor, eff_arr, -1, -1, -1)
-    }
-
-    let cur_idx = cursor_row - lo_anchor
-    let cur_eff = eff_arr.get(cur_idx.as(usize)).as(i64)
-    let cur_close = close_arr.get(cur_idx.as(usize)).as(bool)
-    let next_eff = if cur_idx + 1 < count { eff_arr.get((cur_idx + 1).as(usize)).as(i64) } else { 0 }
-    let prev_eff = if cur_idx > 0 { eff_arr.get((cur_idx - 1).as(usize)).as(i64) } else { 0 }
-
-    var active_vcol: i64 = -1
-    var seed_idx: i64 = cur_idx
-    if (not blank_arr.get(cur_idx.as(usize)).as(bool)) and next_eff > cur_eff {
-        active_vcol = (cur_eff / indent_step) * indent_step
-        seed_idx = cur_idx + 1
-    } else if cur_close and prev_eff > cur_eff {
-        active_vcol = (cur_eff / indent_step) * indent_step
-        seed_idx = cur_idx - 1
-    } else if cur_eff > 0 {
-        active_vcol = ((cur_eff - 1) / indent_step) * indent_step
-        seed_idx = cur_idx
-    }
-
-    if active_vcol < 0 {
-        return (lo_anchor, eff_arr, -1, -1, -1)
-    }
-
-    var s_idx = seed_idx
-    while s_idx > 0 and eff_arr.get((s_idx - 1).as(usize)).as(i64) > active_vcol {
-        s_idx -= 1
-    }
-    var e_idx = seed_idx
-    while e_idx + 1 < count and eff_arr.get((e_idx + 1).as(usize)).as(i64) > active_vcol {
-        e_idx += 1
-    }
-    (lo_anchor, eff_arr, active_vcol, lo_anchor + s_idx, lo_anchor + e_idx)
+    (lo_anchor, blank_arr, raw_arr, close_arr, open_arr, eff_arr)
 }
 
 private struct IndentGuideCacheEntry {
@@ -2760,6 +2782,10 @@ private struct IndentGuideCacheEntry {
     min_row: i64,
     max_row: i64,
     lo_anchor: i64,
+    blank_arr: List,
+    raw_arr: List,
+    close_arr: List,
+    open_arr: List,
     eff_arr: List,
     active_vcol: i64,
     scope_start: i64,
@@ -2786,6 +2812,7 @@ fn get_cached_pane_indent_guides(
         _indent_guide_cache = m
         m
     }
+    let indent_step = if shiftwidth > 0 { shiftwidth } else { if tabstop > 0 { tabstop } else { 4 } }
     let buf_id_raw = buf.id.raw()
     let vis_len = vis_rows.len()
     let fold_cnt = buf.folded_rows.len()
@@ -2796,25 +2823,61 @@ fn get_cached_pane_indent_guides(
         let e = hit_opt.as(IndentGuideCacheEntry)
         if e.buf_id == buf_id_raw
             and e.doc_id == buf.doc_id
-            and e.edit_version == buf.edit_version
             and e.top_row == top_row
             and e.max_rows == max_rows
             and e.vis_len == vis_len
-            and e.cursor_row == cursor_row
-            and e.is_focused == is_focused
             and e.tabstop == tabstop
             and e.shiftwidth == shiftwidth
             and e.fold_count == fold_cnt
             and e.min_row == min_r
             and e.max_row == max_r {
-            return (e.lo_anchor, e.eff_arr, e.active_vcol, e.scope_start, e.scope_end)
+            let count = e.eff_arr.len()
+            let in_bounds = count > 0 and cursor_row >= e.lo_anchor and cursor_row < e.lo_anchor + count
+            if e.edit_version == buf.edit_version {
+                if e.cursor_row == cursor_row and e.is_focused == is_focused {
+                    return (e.lo_anchor, e.eff_arr, e.active_vcol, e.scope_start, e.scope_end)
+                }
+                if in_bounds {
+                    let (av, ss, se) = resolve_active_indent_scope(
+                        e.lo_anchor, count, indent_step, e.blank_arr, e.close_arr, e.eff_arr, cursor_row, is_focused,
+                    )
+                    e.cursor_row = cursor_row
+                    e.is_focused = is_focused
+                    e.active_vcol = av
+                    e.scope_start = ss
+                    e.scope_end = se
+                    return (e.lo_anchor, e.eff_arr, av, ss, se)
+                }
+            } else if in_bounds and e.cursor_row == cursor_row {
+                let c_u = (cursor_row - e.lo_anchor).as(usize)
+                let (ib, rv, sc, eo) = inspect_line_indent(buf.line_at(cursor_row), tabstop)
+                if ib == e.blank_arr.get(c_u).as(bool)
+                    and rv == e.raw_arr.get(c_u).as(i64)
+                    and sc == e.close_arr.get(c_u).as(bool)
+                    and eo == e.open_arr.get(c_u).as(bool) {
+                    e.edit_version = buf.edit_version
+                    if e.is_focused != is_focused {
+                        let (av, ss, se) = resolve_active_indent_scope(
+                            e.lo_anchor, count, indent_step, e.blank_arr, e.close_arr, e.eff_arr, cursor_row, is_focused,
+                        )
+                        e.is_focused = is_focused
+                        e.active_vcol = av
+                        e.scope_start = ss
+                        e.scope_end = se
+                    }
+                    return (e.lo_anchor, e.eff_arr, e.active_vcol, e.scope_start, e.scope_end)
+                }
+            }
         }
     }
     if cache.len() > 16 {
         cache.clear()
     }
-    let (lo_anchor, eff_arr, active_vcol, scope_start, scope_end) =
-        compute_pane_indent_guides(buf, vis_rows, cursor_row, is_focused, tabstop, shiftwidth)
+    let (lo_anchor, blank_arr, raw_arr, close_arr, open_arr, eff_arr) =
+        compute_pane_indent_arrays(buf, vis_rows, cursor_row, tabstop, shiftwidth)
+    let (active_vcol, scope_start, scope_end) = resolve_active_indent_scope(
+        lo_anchor, eff_arr.len(), indent_step, blank_arr, close_arr, eff_arr, cursor_row, is_focused,
+    )
     cache.insert(
         pane_id,
         IndentGuideCacheEntry {
@@ -2833,6 +2896,10 @@ fn get_cached_pane_indent_guides(
             min_row: min_r,
             max_row: max_r,
             lo_anchor: lo_anchor,
+            blank_arr: blank_arr,
+            raw_arr: raw_arr,
+            close_arr: close_arr,
+            open_arr: open_arr,
             eff_arr: eff_arr,
             active_vcol: active_vcol,
             scope_start: scope_start,
@@ -3350,6 +3417,16 @@ fn index_inline_decors_by_row(decors: List) -> HashMap {
     by_row
 }
 
+fn is_all_ascii_spaces(s: String) -> bool {
+    let n = s.len()
+    for i in 0..n {
+        if s.byte_at(i) != 32 {
+            return false
+        }
+    }
+    true
+}
+
 fn emit_single_text_segment(
     cmds: List,
     seg_text: String,
@@ -3375,7 +3452,7 @@ fn emit_single_text_segment(
         }
         let draw_vcol = if cur_vcol < left_col { extra_off } else { cur_vcol - left_col }
         let draw_x = text_x0 + draw_vcol.as(f64) * cell_w
-        if draw_x < pane_right_x and vis_text != "" {
+        if draw_x < pane_right_x and vis_text != "" and (ul or (not is_all_ascii_spaces(vis_text))) {
             cmds.push(DrawCmd.text_run(
                 draw_x, row_y, vis_text, font_fam, font_sz, fg, false, italic, ul,
             ))
@@ -3418,9 +3495,13 @@ fn emit_ts_row_spans(
     var has_run = false
 
     for i in 0..spans.len() {
-        let sp = spans.get(i.as(usize)).as(TsSpan)
-        let s0 = if sp.start_col < pos { pos } else if sp.start_col > n { n } else { sp.start_col }
-        let e0 = if sp.end_col > n { n } else { sp.end_col }
+        let pk = spans.get(i.as(usize)).as(i64)
+        let sp_start = pk / 4294967296
+        let sp_rem = pk % 4294967296
+        let sp_end = sp_rem / 256
+        let sp_grp = sp_rem % 256
+        let s0 = if sp_start < pos { pos } else if sp_start > n { n } else { sp_start }
+        let e0 = if sp_end > n { n } else { sp_end }
         if s0 > pos {
             if not has_run {
                 run_start = pos
@@ -3440,7 +3521,7 @@ fn emit_ts_row_spans(
             pos = s0
         }
         if e0 > s0 {
-            let (tok_col, is_it) = ts_hl_group_style(sp.hl_group, theme)
+            let (tok_col, is_it) = ts_hl_group_style(sp_grp, theme)
             if not has_run {
                 run_start = s0
                 cur_raw_fg = tok_col
@@ -3528,14 +3609,17 @@ fn emit_ts_row_spans_with_fg_decs(
         var it = false
         var ul = false
         while ts_idx < ts_len {
-            let sp = spans.get(ts_idx).as(TsSpan)
-            let s0 = clamp_col_bound(sp.start_col, n)
-            let e0 = clamp_col_bound(sp.end_col, n)
+            let pk = spans.get(ts_idx).as(i64)
+            let sp_start = pk / 4294967296
+            let sp_rem = pk % 4294967296
+            let sp_end = sp_rem / 256
+            let s0 = clamp_col_bound(sp_start, n)
+            let e0 = clamp_col_bound(sp_end, n)
             if e0 <= pos {
                 ts_idx += 1
             } else {
                 if s0 <= pos {
-                    let (tok_col, is_it) = ts_hl_group_style(sp.hl_group, theme)
+                    let (tok_col, is_it) = ts_hl_group_style(sp_rem % 256, theme)
                     fg = if dim_row { theme.fg_muted } else { tok_col }
                     it = is_it
                     if e0 < next_pos {
@@ -3605,24 +3689,18 @@ fn ts_spans_exact_eq(a: List, b: List) -> bool {
     if n == 0 {
         return true
     }
-    let a0 = a.get(0).as(TsSpan)
-    let b0 = b.get(0).as(TsSpan)
-    if a0.start_col != b0.start_col or a0.end_col != b0.end_col or a0.hl_group != b0.hl_group {
+    if a.get(0).as(i64) != b.get(0).as(i64) {
         return false
     }
     if n > 1 {
         let last_u = (n - 1).as(usize)
-        let al = a.get(last_u).as(TsSpan)
-        let bl = b.get(last_u).as(TsSpan)
-        if al.start_col != bl.start_col or al.end_col != bl.end_col or al.hl_group != bl.hl_group {
+        if a.get(last_u).as(i64) != b.get(last_u).as(i64) {
             return false
         }
     }
     if n > 2 {
         let mid_u = (n / 2).as(usize)
-        let am = a.get(mid_u).as(TsSpan)
-        let bm = b.get(mid_u).as(TsSpan)
-        if am.start_col != bm.start_col or am.end_col != bm.end_col or am.hl_group != bm.hl_group {
+        if a.get(mid_u).as(i64) != b.get(mid_u).as(i64) {
             return false
         }
     }
@@ -3662,11 +3740,20 @@ fn emit_cached_ts_row(
     theme: ThemePalette,
 ) -> i64 {
     let can_cache = cache_opt != null and raw_line.len() <= 256
+    let ckey = if not can_cache {
+        ""
+    } else if fg_decs.is_empty() {
+        raw_line
+    } else {
+        let d0 = fg_decs.get(0).as(InlineSpanDecor)
+        let dl = fg_decs.get((fg_decs.len() - 1).as(usize)).as(InlineSpanDecor)
+        raw_line ++ "\x1f" ++ fg_decs.len().to_string() ++ ":" ++ d0.start_col.to_string() ++ ":" ++ dl.start_col.to_string()
+    }
     if can_cache {
         let cmap = cache_opt.as(Map)
-        if cmap.contains(raw_line) {
+        if cmap.contains(ckey) {
             let (c_ts, c_decs, c_dim, c_vcol, c_runs) =
-                cmap.get(raw_line).as((List, List, bool, i64, List))
+                cmap.get(ckey).as((List, List, bool, i64, List))
             if c_dim == dim_row and fg_decs_exact_eq(c_decs, fg_decs) and ts_spans_exact_eq(c_ts, row_ts) {
                 for ri in 0..c_runs.len() {
                     let (rx, rtxt, rcol, rit, rul) =
@@ -3691,7 +3778,7 @@ fn emit_cached_ts_row(
     }
     if can_cache {
         let cmap = cache_opt.as(Map)
-        if cmap.len() > 256 {
+        if cmap.len() > 512 {
             _ts_row_seg_cache = Map.new()
         } else {
             let captured = List()
@@ -3704,7 +3791,7 @@ fn emit_cached_ts_row(
                     _ => (),
                 }
             }
-            cmap.set(raw_line, (row_ts, fg_decs, dim_row, out_vcol, captured))
+            cmap.set(ckey, (row_ts, fg_decs, dim_row, out_vcol, captured))
         }
     }
     out_vcol
@@ -4218,15 +4305,43 @@ fn get_cached_closing_scope_hints(
     let lcount = buf.line_count()
     let win_lo = if first_vis_row > 32 { first_vis_row - 32 } else { 0 }
     let win_hi = if last_vis_row + 32 < lcount { last_vis_row + 32 } else { lcount - 1 }
-    let cur_line = buf.line_at(buf.point.row)
+    let cur_r = buf.point.row
+    let cur_line = buf.line_at(cur_r)
+    let prev_line = if cur_r >= 1 { buf.line_at(cur_r - 1) } else { "" }
     let blocks = if _scope_shadow_doc_id == buf.doc_id
         and _scope_shadow_line_cnt == lcount
         and _scope_shadow_blocks != null
         and (not cur_line.contains("{{"))
         and (not cur_line.contains("}}")) {
         _scope_shadow_blocks.as(List)
+    } else if _scope_shadow_doc_id == buf.doc_id
+        and lcount == _scope_shadow_line_cnt + 1
+        and cur_r >= 1
+        and _scope_shadow_blocks != null
+        and (not cur_line.contains("{{"))
+        and (not cur_line.contains("}}"))
+        and (not prev_line.contains("{{"))
+        and (not prev_line.contains("}}")) {
+        let prev_blks = _scope_shadow_blocks.as(List)
+        let shifted = List()
+        for bi in 0..prev_blks.len() {
+            let (bn, bk, bsr, ber) = prev_blks.get(bi.as(usize)).as((String, String, i64, i64))
+            let nsr = if bsr >= cur_r { bsr + 1 } else { bsr }
+            let ner = if ber >= cur_r - 1 { ber + 1 } else { ber }
+            shifted.push((bn, bk, nsr, ner))
+        }
+        shifted
     } else {
-        buf.scan_symbol_blocks(max_items = 600)
+        let raw_blks = buf.scan_symbol_blocks(max_items = 600)
+        let multi_only = List()
+        for bi in 0..raw_blks.len() {
+            let blk = raw_blks.get(bi.as(usize)).as((String, String, i64, i64))
+            let (_, _, bsr, ber) = blk
+            if ber > bsr {
+                multi_only.push(blk)
+            }
+        }
+        multi_only
     }
     let m = Map.new()
     let cmt_pfx = if mode_lc == "nessa" or mode_lc == "lua" { "-- " } else { "// " }
@@ -4356,7 +4471,7 @@ fn render_window_pane(
             _ts_vp_rows.as(List)
         } else {
             buf.sync_external_lines()
-            let fetched = accel_ts_highlight_rows(buf.doc_id, ts_lang, first_vis_row, last_vis_row)
+            let fetched = accel_ts_highlight_rows_packed(buf.doc_id, ts_lang, first_vis_row, last_vis_row)
             _ts_vp_doc_id = buf.doc_id
             _ts_vp_edit_ver = buf.edit_version
             _ts_vp_lang = ts_lang
@@ -4402,6 +4517,8 @@ fn render_window_pane(
 
     let has_any_folds = not buf.folded_rows.is_empty()
     let is_narrowed = buf.is_narrowed()
+    let mode_upper = if is_focused { world.mode_name.to_upper() } else { "" }
+    let in_insert_mode = is_focused and (mode_upper.contains("INSERT") or mode_upper.contains("REPLACE"))
     let contiguous_vis = row_count > 0 and first_vis_row >= 0 and (last_vis_row - first_vis_row + 1 == row_count)
     let batched_lines = if contiguous_vis {
         buf.slice_lines(first_vis_row, last_vis_row + 1)
@@ -4799,10 +4916,6 @@ fn render_window_pane(
         }
 
         -- 5c. End-of-line `VirtualTextDecor` (git blame, inline diagnostics, hints) + Closing-Scope Shadow Labels
-        let in_insert_mode = is_focused and (
-            world.mode_name.to_upper().contains("INSERT")
-            or world.mode_name.to_upper().contains("REPLACE")
-        )
         let row_vts_opt = row_vts_map.get(buf_row_key)
         var rendered_row_vt = false
         if row_vts_opt != null {

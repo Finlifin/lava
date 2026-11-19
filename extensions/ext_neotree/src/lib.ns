@@ -14,9 +14,11 @@ use @lava_core.{
 }
 use @lava_accel.{GitFileEntry, GitStatusSummary, accel_git_status}
 use @lava_remote.{
-    RemoteDirItem, RemoteGitFileEntry, is_ssh_uri, join_ssh_uri, normalize_ssh_uri, parent_ssh_uri,
-    parse_ssh_uri, remote_find_root, remote_git_status, remote_mkdir, remote_readdir, remote_remove,
-    remote_rename, remote_stat, remote_write_lines, ssh_uri_basename
+    RemoteDirSnap, RemoteSnapEntry, RemoteSnapPreview, decode_remote_dir_snap, is_ssh_uri,
+    join_ssh_uri, normalize_ssh_uri, parent_ssh_uri, parse_ssh_uri, remote_async_poll,
+    remote_async_submit, remote_dir_snapshot, remote_find_root, remote_mkdir, remote_remove,
+    remote_rename, remote_spinner_frame, remote_stat, remote_ui_async_enabled, remote_write_lines,
+    ssh_uri_basename
 }
 use @ext_document.{
     Buffer, EditorWorld, SidebarPanel, ext_document_id, require_editor_world
@@ -49,6 +51,9 @@ pub struct NeotreeState {
     pub show_hidden: bool,
     pub focused: bool,
     pub nodes: List,
+    pub remote_snap_cache: HashMap,
+    pub remote_loading_key: String,
+    pub remote_focus_path: String,
 }
 
 fn neotree_norm_path(raw: String) -> String {
@@ -124,6 +129,9 @@ fn effective_neotree_root(world: EditorWorld) -> String {
     let fp = world.active_buffer().file_path
     if is_ssh_uri(fp) {
         let base_u = parent_ssh_uri(fp)
+        if remote_ui_async_enabled() {
+            return neotree_norm_path(base_u)
+        }
         let r_res = remote_find_root(
             base_u,
             [".git", "Cargo.toml", "package.toml", "compile_commands.json", "pyproject.toml", "package.json", "go.mod"],
@@ -151,6 +159,9 @@ impl NeotreeState {
             show_hidden: false,
             focused: false,
             nodes: List(),
+            remote_snap_cache: HashMap.new(),
+            remote_loading_key: "",
+            remote_focus_path: "",
         }
     }
 
@@ -234,41 +245,7 @@ fn collect_git_badges(root_dir: String) -> (HashMap, HashMap) {
     let file_map = HashMap.new()
     let dir_map = HashMap.new()
     if is_ssh_uri(root_dir) {
-        let rgs = remote_git_status(root_dir) ! { _ => return (file_map, dir_map) }
-        if not rgs.is_repo {
-            return (file_map, dir_map)
-        }
-        let git_root = neotree_norm_path(rgs.root)
-        for i in 0..rgs.entries.len() {
-            let rge = rgs.entries.get(i.as(usize)).as(RemoteGitFileEntry)
-            let badge = git_entry_badge(GitFileEntry {
-                index_status: rge.index_status,
-                worktree_status: rge.worktree_status,
-                rel_path: rge.rel_path,
-            })
-            if badge == "" {
-                continue
-            }
-            let full = neotree_join(git_root, rge.rel_path)
-            file_map.insert(full, badge)
-            var cur_parent = neotree_parent(full)
-            while cur_parent != null {
-                let p_str = cur_parent.as(String)
-                if not dir_map.contains_key(p_str) {
-                    dir_map.insert(p_str, badge)
-                } else if badge == "[M]" {
-                    dir_map.insert(p_str, "[M]")
-                }
-                if p_str == root_dir or p_str == git_root {
-                    break
-                }
-                let next_p = neotree_parent(p_str)
-                if next_p != null and next_p.as(String) == p_str {
-                    break
-                }
-                cur_parent = next_p
-            }
-        }
+        -- Remote git badges are already joined per-entry on `lava-server` in `remote_dir_snapshot`.
         return (file_map, dir_map)
     }
     let gs: GitStatusSummary = accel_git_status(root_dir)
@@ -318,28 +295,59 @@ fn walk_tree_nodes(
         return
     }
     if is_ssh_uri(dir_path) {
-        let ritems! = remote_readdir(dir_path, show_hidden = state.show_hidden) else {
-            return
-        }
-        for i in 0..ritems.len() {
-            let ri = ritems.get(i.as(usize)).as(RemoteDirItem)
-            if ri.name == "" or ri.name == "." or ri.name == ".." {
-                continue
-            }
-            if (not state.show_hidden) and ri.name.starts_with(".") {
-                continue
-            }
-            let norm_full = neotree_norm_path(ri.full_uri)
-            if ri.is_dir {
-                let is_exp = state.expanded_dirs.contains(norm_full)
-                let db_opt = dir_badges.get(norm_full)
-                let badge = if db_opt != null { db_opt.as(String) } else { "" }
+        let rkey = neotree_norm_path(dir_path) ++ "\n" ++ state.show_hidden.to_string()
+        if not state.remote_snap_cache.contains_key(rkey) {
+            if remote_ui_async_enabled() {
+                if state.remote_loading_key == "" {
+                    state.remote_loading_key = rkey
+                    let _ = remote_async_submit(
+                        "neotree.snap",
+                        "dir_snapshot",
+                        [dir_path, state.show_hidden, "", "name", false, "", 0, false, false],
+                    )
+                }
                 out_nodes.push(NeotreeNode {
-                    name: ri.name,
+                    name: remote_spinner_frame() ++ " loading...",
+                    full_path: dir_path,
+                    parent_path: dir_path,
+                    is_dir: false,
+                    is_symlink: false,
+                    depth: depth,
+                    expanded: false,
+                    git_badge: "",
+                })
+                return
+            }
+            let snap! = remote_dir_snapshot(
+                dir_path,
+                show_hidden = state.show_hidden,
+                include_parent = false,
+                include_preview = false,
+            ) else {
+                return
+            }
+            state.remote_snap_cache.insert(rkey, snap)
+        }
+        let snap = state.remote_snap_cache.get(rkey).as(RemoteDirSnap)
+        for i in 0..snap.entries.len() {
+            let se = snap.entries.get(i.as(usize)).as(RemoteSnapEntry)
+            if se.name == "" or se.name == "." or se.name == ".." {
+                continue
+            }
+            if (not state.show_hidden) and se.name.starts_with(".") {
+                continue
+            }
+            let norm_full = neotree_norm_path(se.full_uri)
+            let b_raw = se.git_badge.trim()
+            let badge = if b_raw != "" { "[" ++ b_raw ++ "]" } else { "" }
+            if se.is_dir {
+                let is_exp = state.expanded_dirs.contains(norm_full)
+                out_nodes.push(NeotreeNode {
+                    name: se.name,
                     full_path: norm_full,
                     parent_path: dir_path,
                     is_dir: true,
-                    is_symlink: false,
+                    is_symlink: se.is_symlink,
                     depth: depth,
                     expanded: is_exp,
                     git_badge: badge,
@@ -348,14 +356,12 @@ fn walk_tree_nodes(
                     walk_tree_nodes(norm_full, depth + 1, state, file_badges, dir_badges, out_nodes)
                 }
             } else {
-                let fb_opt = file_badges.get(norm_full)
-                let badge = if fb_opt != null { fb_opt.as(String) } else { "" }
                 out_nodes.push(NeotreeNode {
-                    name: ri.name,
+                    name: se.name,
                     full_path: norm_full,
                     parent_path: dir_path,
                     is_dir: false,
-                    is_symlink: false,
+                    is_symlink: se.is_symlink,
                     depth: depth,
                     expanded: false,
                     git_badge: badge,
@@ -462,9 +468,12 @@ pub fn refresh_neotree(
     state: NeotreeState,
     .focus_path: String = "",
 ) {
-    if state.root_dir == "" or (not neotree_exists(state.root_dir)) {
+    if state.root_dir == "" or ((not is_ssh_uri(state.root_dir)) and (not neotree_exists(state.root_dir))) {
         state.root_dir = effective_neotree_root(world)
         state.expanded_dirs.insert(state.root_dir)
+    }
+    if focus_path != "" {
+        state.remote_focus_path = focus_path
     }
 
     let (file_badges, dir_badges) = collect_git_badges(state.root_dir)
@@ -506,10 +515,16 @@ pub fn refresh_neotree(
         30
     }
 
+    let sb_title = if state.remote_loading_key != "" {
+        "EXPLORER " ++ remote_spinner_frame()
+    } else {
+        "EXPLORER"
+    }
+
     world.left_sidebar = SidebarPanel {
         visible: prev_vis,
         side: "left",
-        title: "EXPLORER",
+        title: sb_title,
         width_cols: width,
         lines: lines,
         selected_row: target_sel,
@@ -669,6 +684,7 @@ fn neotree_intercept_key(
 
     if k == "H" or k == "." {
         state.show_hidden = not state.show_hidden
+        state.remote_snap_cache.clear()
         let cur_opt = state.selected_node(world.left_sidebar.selected_row)
         let keep_p = if cur_opt != null { cur_opt.as(NeotreeNode).full_path } else { "" }
         refresh_neotree(world, state, focus_path = keep_p)
@@ -678,6 +694,7 @@ fn neotree_intercept_key(
     }
 
     if k == "R" {
+        state.remote_snap_cache.clear()
         let cur_opt = state.selected_node(world.left_sidebar.selected_row)
         let keep_p = if cur_opt != null { cur_opt.as(NeotreeNode).full_path } else { "" }
         refresh_neotree(world, state, focus_path = keep_p)
@@ -754,6 +771,7 @@ fn cmd_neotree_add(kern: SystemKernel, args: List) -> #InteractiveEffects !Strin
         }
         expand_ancestors_to_root(state, target_full)
         state.expanded_dirs.insert(target_full)
+        state.remote_snap_cache.clear()
         refresh_neotree(world, state, focus_path = target_full)
         world.left_sidebar.visible = true
         status_emit("Neo-tree created dir: " ++ clean_rel ++ "/")#
@@ -792,6 +810,7 @@ fn cmd_neotree_add(kern: SystemKernel, args: List) -> #InteractiveEffects !Strin
         }
     }
     expand_ancestors_to_root(state, target_full)
+    state.remote_snap_cache.clear()
     refresh_neotree(world, state, focus_path = target_full)
     world.left_sidebar.visible = true
     status_emit("Neo-tree created: " ++ clean_rel)#
@@ -858,6 +877,7 @@ fn cmd_neotree_rename(kern: SystemKernel, args: List) -> #InteractiveEffects !St
     }
 
     expand_ancestors_to_root(state, dest_full)
+    state.remote_snap_cache.clear()
     refresh_neotree(world, state, focus_path = dest_full)
     world.left_sidebar.visible = true
     status_emit("Neo-tree renamed " ++ node.name ++ " -> " ++ clean_dest)#
@@ -909,6 +929,7 @@ fn cmd_neotree_delete(kern: SystemKernel, _args: List) -> #InteractiveEffects !S
         }
     }
 
+    state.remote_snap_cache.clear()
     refresh_neotree(world, state)
     world.left_sidebar.visible = true
     status_emit("Neo-tree deleted: " ++ node.name)#
@@ -1132,10 +1153,74 @@ pub fn register_neotree_extension(kernel: SystemKernel) -> !String Unit {
                     if w_opt != null and n_opt != null {
                         let w = w_opt.as(EditorWorld)
                         let st = n_opt.as(NeotreeState)
+                        st.remote_snap_cache.clear()
                         if w.left_sidebar.visible and w.left_sidebar.owner == NEOTREE_OWNER {
                             refresh_neotree(w, st)
                         }
                     }
+                },
+            )
+
+            k.add_hook(
+                "timer-tick",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| -> Unit {
+                    let n_opt = kern.service(SERVICE_NEOTREE)
+                    if n_opt == null {
+                        return ()
+                    }
+                    let st = n_opt.as(NeotreeState)
+                    if st.remote_loading_key == "" {
+                        return ()
+                    }
+                    let w_opt = kern.service("lava.document.world")
+                    if w_opt == null {
+                        return ()
+                    }
+                    let w = w_opt.as(EditorWorld)
+                    let sp = remote_async_poll("neotree.snap")
+                    if sp.status == "ready" {
+                        let done_key = st.remote_loading_key
+                        st.remote_loading_key = ""
+                        st.remote_snap_cache.insert(done_key, decode_remote_dir_snap(sp.payload))
+                        let fp = st.remote_focus_path
+                        st.remote_focus_path = ""
+                        refresh_neotree(w, st, focus_path = fp)
+                        w.remote_tick_dirty = true
+                    } else if sp.status == "error" {
+                        let done_key = st.remote_loading_key
+                        st.remote_loading_key = ""
+                        st.remote_snap_cache.insert(
+                            done_key,
+                            RemoteDirSnap {
+                                resolved_uri: "",
+                                parent_uri: "",
+                                parent_entries: List(),
+                                entries: List(),
+                                git_is_repo: false,
+                                git_root_uri: "",
+                                git_branch: "",
+                                git_staged: 0,
+                                git_modified: 0,
+                                git_untracked: 0,
+                                preview: RemoteSnapPreview {
+                                    kind: "none",
+                                    target_uri: "",
+                                    target_name: "",
+                                    total_count: 0,
+                                    total_size: 0,
+                                    lines: List(),
+                                    child_entries: List(),
+                                },
+                            },
+                        )
+                        refresh_neotree(w, st)
+                        w.remote_tick_dirty = true
+                    } else if w.left_sidebar.visible and w.left_sidebar.owner == NEOTREE_OWNER {
+                        refresh_neotree(w, st)
+                        w.remote_tick_dirty = true
+                    }
+                    ()
                 },
             )
 

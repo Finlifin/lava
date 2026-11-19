@@ -1802,13 +1802,15 @@ pub fn doc_analyze_diagnostics(
 
     for (r_usize, line) in doc.iter_lines().enumerate() {
         let r = r_usize as i64;
-        let llen = char_len_fast(line) as i64;
+        let bytes = line.as_bytes();
 
         // 1) Unresolved git merge conflict markers (outside multiline strings/comments)
         if !in_block_cmt
             && active_str.is_none()
+            && matches!(bytes.first(), Some(b'<' | b'=' | b'>' | b'|'))
             && let Some(marker) = conflict_marker_kind(line)
         {
+            let llen = char_len_fast(line) as i64;
             err_count += 1;
             diags.push(NativeDiagHit {
                 row: r,
@@ -1822,15 +1824,15 @@ pub fn doc_analyze_diagnostics(
         }
 
         // 2) Mixed tab + space leading indentation (only outside multiline strings)
-        if active_str.is_none() {
+        if active_str.is_none() && matches!(bytes.first(), Some(b' ' | b'\t')) {
             let mut saw_space = false;
             let mut saw_tab = false;
             let mut ws_end: i64 = 0;
-            for ch in line.chars() {
-                if ch == ' ' {
+            for &b in bytes {
+                if b == b' ' {
                     saw_space = true;
                     ws_end += 1;
-                } else if ch == '\t' {
+                } else if b == b'\t' {
                     saw_tab = true;
                     ws_end += 1;
                 } else {
@@ -1851,25 +1853,30 @@ pub fn doc_analyze_diagnostics(
         }
 
         // 3) Trailing whitespace in code buffers (outside multiline strings)
-        if code_mode && active_str.is_none() {
+        if code_mode
+            && active_str.is_none()
+            && bytes.last().is_some_and(|b| b.is_ascii_whitespace())
+        {
             let trimmed_end = line.trim_end();
-            let tlen = char_len_fast(trimmed_end) as i64;
-            if tlen < llen {
-                warn_count += 1;
-                diags.push(NativeDiagHit {
-                    row: r,
-                    col: tlen,
-                    end_col: llen,
-                    severity: "WARN".to_string(),
-                    source: "style".to_string(),
-                    message: "Trailing whitespace".to_string(),
-                });
+            if trimmed_end.len() < line.len() {
+                let llen = char_len_fast(line) as i64;
+                let tlen = char_len_fast(trimmed_end) as i64;
+                if tlen < llen {
+                    warn_count += 1;
+                    diags.push(NativeDiagHit {
+                        row: r,
+                        col: tlen,
+                        end_col: llen,
+                        severity: "WARN".to_string(),
+                        source: "style".to_string(),
+                        message: "Trailing whitespace".to_string(),
+                    });
+                }
             }
         }
 
         // 4) Balanced delimiter & string literal checks in code modes
         if code_mode && (in_block_cmt || active_str.is_some() || !line.is_empty()) {
-            let bytes = line.as_bytes();
             // Ultra-fast skip for plain identifier/whitespace lines with zero delimiters, quotes, or comment starters
             if !in_block_cmt
                 && active_str.is_none()
@@ -1892,6 +1899,7 @@ pub fn doc_analyze_diagnostics(
             {
                 continue;
             }
+            let llen = char_len_fast(line) as i64;
             let blk_open_b0 = blk_open.as_bytes().first().copied().unwrap_or(0);
             let blk_close_b0 = blk_close.as_bytes().first().copied().unwrap_or(0);
             let line_cmt_b0 = line_cmt.as_bytes().first().copied().unwrap_or(0);

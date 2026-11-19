@@ -16,15 +16,15 @@ use @lava_core.{
     ask_prompt, clipboard_set, log_event, status_emit
 }
 use @lava_remote.{
-    RemoteConnectionInfo, RemoteDirItem, RemoteGrepMatch, RemoteTarget,
-    RemoteTunnelInfo, SshHostConfigEntry, is_ssh_uri, join_ssh_uri,
-    normalize_ssh_uri, parent_ssh_uri, parse_ssh_uri, remote_connect,
-    remote_copy, remote_deploy_server, remote_disconnect,
-    remote_discover_ssh_hosts, remote_exec, remote_find_root,
-    remote_host_available, remote_list_connections, remote_mkdir, remote_port_forward_list,
-    remote_port_forward_start, remote_port_forward_stop, remote_probe_tcp, remote_read_lines,
-    remote_readdir, remote_remove, remote_rename, remote_search_files,
-    remote_search_grep, remote_stat, remote_write_lines, ssh_uri_basename
+    RemoteConnectionInfo, RemoteDirItem, RemoteGrepMatch, RemoteRankedFile, RemoteTarget,
+    RemoteTunnelInfo, SshHostConfigEntry, is_ssh_uri, join_ssh_uri, normalize_ssh_uri,
+    parent_ssh_uri, parse_ssh_uri, remote_async_active_count, remote_connect, remote_copy,
+    remote_deploy_server, remote_disconnect, remote_discover_ssh_hosts, remote_exec,
+    remote_find_root, remote_host_available, remote_list_connections, remote_mkdir,
+    remote_port_forward_list, remote_port_forward_start, remote_port_forward_stop,
+    remote_probe_tcp, remote_read_lines, remote_readdir, remote_remove, remote_rename,
+    remote_search_files_ranked, remote_search_grep_ext, remote_spinner_frame, remote_stat,
+    remote_write_lines, ssh_uri_basename
 }
 use @lava_term.pty_available
 use @ext_document.{
@@ -115,12 +115,13 @@ private fn ensure_vim_normal(kernel: SystemKernel, _world: EditorWorld) {
 
 private fn sync_remote_statusline(world: EditorWorld, svc: RemoteService) {
     let buf = world.active_buffer()
+    let spin_sfx = if remote_async_active_count() > 0 { " " ++ remote_spinner_frame() } else { "" }
     if is_ssh_uri(buf.file_path) {
         let pt_res = parse_ssh_uri(buf.file_path)
         pt_res match {
             pt! => {
                 svc.active_target = pt.prefix
-                world.statusline_left_extra = "[SSH: " ++ pt.authority ++ "]"
+                world.statusline_left_extra = "[SSH: " ++ pt.authority ++ spin_sfx ++ "]"
                 return
             },
             error _ => (),
@@ -131,7 +132,7 @@ private fn sync_remote_statusline(world: EditorWorld, svc: RemoteService) {
         pt_res match {
             pt! => {
                 svc.active_target = pt.prefix
-                world.statusline_left_extra = "[SSH: " ++ pt.authority ++ "]"
+                world.statusline_left_extra = "[SSH: " ++ pt.authority ++ spin_sfx ++ "]"
                 return
             },
             error _ => (),
@@ -141,7 +142,7 @@ private fn sync_remote_statusline(world: EditorWorld, svc: RemoteService) {
         let pt_res = parse_ssh_uri(svc.active_target)
         pt_res match {
             pt! => {
-                world.statusline_left_extra = "[SSH: " ++ pt.authority ++ "]"
+                world.statusline_left_extra = "[SSH: " ++ pt.authority ++ spin_sfx ++ "]"
                 return
             },
             error _ => (),
@@ -384,7 +385,7 @@ pub fn build_remote_ssh_shell_command(target: RemoteTarget, remote_dir: String) 
         port_flag = "-p " ++ target.port.to_string() ++ " "
     }
     "ssh -t " ++ port_flag ++ target.ssh_destination()
-        ++ " \"sh -c \\\"cd '" ++ safe_dir ++ "' && exec \\\\\\\"\\\\\\${{SHELL:-/bin/sh}}\\\\\\\" -l\\\"\""
+        ++ " sh -c \"cd '" ++ safe_dir ++ "' && exec \\\"\\${{SHELL:-/bin/sh}}\\\" -l\""
 }
 
 private fn store_to_clipboard_and_registers(world: EditorWorld, text: String) -> #clipboard_set Unit {
@@ -876,10 +877,97 @@ fn cmd_remote_connect(kernel: SystemKernel, args: List) -> #InteractiveEffects !
     connect_and_route(kernel, world, svc, ans.trim())#!
 }
 
+private fn parse_ssh_connect_args(args: List) -> (String, String) {
+    if args.is_empty() {
+        return ("", "")
+    }
+    let parts = List()
+    for i in 0..args.len() {
+        let s = args.get(i.as(usize)).as(String).trim()
+        if s != "" {
+            parts.push(s)
+        }
+    }
+    let raw = parts.join(" ").trim()
+    if raw == "" {
+        return ("", "")
+    }
+    let sp_opt = raw.split_once(" ")
+    if sp_opt != null {
+        let (h, p) = sp_opt.as((String, String))
+        return (h.trim(), p.trim())
+    }
+    if not is_ssh_uri(raw) {
+        let colon_opt = raw.split_once(":")
+        if colon_opt != null {
+            let (h, p) = colon_opt.as((String, String))
+            if h.trim() != "" and p.trim() != "" {
+                return (h.trim(), p.trim())
+            }
+        }
+        let slash_opt = raw.split_once("/")
+        if slash_opt != null {
+            let (h, p) = slash_opt.as((String, String))
+            if h.trim() != "" {
+                return (h.trim(), "/" ++ p.trim())
+            }
+        }
+    }
+    (raw, "")
+}
+
+private fn resolve_ssh_connect_dir_uri(
+    prefix: String,
+    remote_home: String,
+    remote_cwd: String,
+    target_spec: String,
+    requested_path: String,
+) -> String {
+    let base_prefix = if prefix.ends_with("/") { prefix } else { prefix ++ "/" }
+    let cwd_uri = if remote_cwd != "" and remote_cwd != "/" {
+        join_ssh_uri(base_prefix, remote_cwd)
+    } else {
+        base_prefix
+    }
+    let home_uri = if remote_home != "" and remote_home != "/" {
+        join_ssh_uri(base_prefix, remote_home)
+    } else {
+        cwd_uri
+    }
+    let req = requested_path.trim()
+    if req != "" {
+        if req == "~" {
+            return home_uri
+        }
+        if req.starts_with("~/") {
+            let sub = req.drop(2).trim()
+            return if sub == "" { home_uri } else { join_ssh_uri(home_uri, sub) }
+        }
+        if req.starts_with("/") {
+            return join_ssh_uri(base_prefix, req)
+        }
+        return join_ssh_uri(cwd_uri, req)
+    }
+    if is_ssh_uri(target_spec) {
+        let p_res = parse_ssh_uri(target_spec)
+        p_res match {
+            p! => {
+                if p.remote_path != "" and p.remote_path != "/" {
+                    return join_ssh_uri(base_prefix, p.remote_path)
+                }
+            },
+            error _ => (),
+        }
+    }
+    cwd_uri
+}
+
 fn cmd_remote_connect_profile(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
     let world = require_editor_world(kernel)!
     let svc = require_remote_service(kernel)!
-    var chosen = if not args.is_empty() { args.get(0).as(String).trim() } else { "" }
+    let (parsed_target, parsed_path) = parse_ssh_connect_args(args)
+    var chosen = parsed_target
+    var chosen_path = parsed_path
     if chosen == "" {
         let profiles = collect_ssh_profile_candidates()
         if profiles.is_empty() {
@@ -894,7 +982,9 @@ fn cmd_remote_connect_profile(kernel: SystemKernel, args: List) -> #InteractiveE
         ))# else {
             return ()
         }
-        chosen = ans.trim()
+        let (p_target, p_path) = parse_ssh_connect_args([ans])
+        chosen = p_target
+        chosen_path = p_path
     }
     if chosen == "" {
         return ()
@@ -902,11 +992,13 @@ fn cmd_remote_connect_profile(kernel: SystemKernel, args: List) -> #InteractiveE
     let target_uri = resolve_ssh_profile_to_uri(chosen)
     let info = remote_connect(target_uri)!
     svc.active_target = info.prefix
-    let remote_dir_uri = if info.remote_cwd != "" and info.remote_cwd != "/" {
-        join_ssh_uri(info.prefix ++ "/", info.remote_cwd)
-    } else {
-        info.prefix ++ "/"
-    }
+    let remote_dir_uri = resolve_ssh_connect_dir_uri(
+        info.prefix,
+        info.remote_home,
+        info.remote_cwd,
+        chosen,
+        chosen_path,
+    )
     world.cwd = remote_dir_uri
     svc.current_uri = canonical_dir_uri(remote_dir_uri) ! { _ => remote_dir_uri }
     refresh_remote_status_if_open(world, svc)
@@ -1459,7 +1551,18 @@ private fn walk_mock_remote_files(
 
 private fn query_remote_files(root_uri: String, query: String, limit: i64) -> !String List {
     if remote_host_available() {
-        return remote_search_files(root_uri, query, limit = limit)!
+        let rf = remote_search_files_ranked(
+            root_uri,
+            query,
+            include_hidden = false,
+            include_dirs = false,
+            limit = limit,
+        )!
+        let out = List()
+        for i in 0..rf.items.len() {
+            out.push(rf.items.get(i.as(usize)).as(RemoteRankedFile).full_uri)
+        }
+        return out
     }
     let out = List()
     walk_mock_remote_files(root_uri, query.trim().to_lower(), limit, 0, out)
@@ -1468,7 +1571,8 @@ private fn query_remote_files(root_uri: String, query: String, limit: i64) -> !S
 
 private fn query_remote_grep(root_uri: String, pattern: String, limit: i64) -> !String List {
     if remote_host_available() {
-        return remote_search_grep(root_uri, pattern, limit = limit)!
+        let (_, hits) = remote_search_grep_ext(root_uri, pattern, limit = limit)!
+        return hits
     }
     let files = List()
     walk_mock_remote_files(root_uri, "", 400, 0, files)
@@ -2041,7 +2145,7 @@ pub fn register_remote_extension(kernel: SystemKernel) -> !String Unit {
             k.register_command("remote-connect-profile", ext_id, "Select & connect an OpenSSH profile from ~/.ssh/config (`:RemoteConnectProfile`).", cmd_remote_connect_profile)
             k.register_command("ssh-connect-profile", ext_id, "Select & connect an OpenSSH profile from ~/.ssh/config (`:SshConnect`).", cmd_remote_connect_profile)
             k.register_command("ex:RemoteConnectProfile", ext_id, ":RemoteConnectProfile [alias]", cmd_remote_connect_profile, interactive = false)
-            k.register_command("ex:SshConnect", ext_id, ":SshConnect [alias]", cmd_remote_connect_profile, interactive = false)
+            k.register_command("ex:SshConnect", ext_id, ":SshConnect [alias] [dir]", cmd_remote_connect_profile, interactive = false)
 
             k.register_command("remote-disconnect", ext_id, "Disconnect an active SSH remote session (`:RemoteDisconnect`).", cmd_remote_disconnect)
             k.register_command("ex:RemoteDisconnect", ext_id, ":RemoteDisconnect [target]", cmd_remote_disconnect, interactive = false)

@@ -13,9 +13,11 @@ use @lava_core.{
 }
 use @lava_accel.{GrepHit, accel_workspace_grep}
 use @lava_remote.{
-    RemoteDirItem, RemoteGrepMatch, is_ssh_uri, join_ssh_uri, normalize_ssh_uri, parent_ssh_uri,
-    remote_find_root, remote_host_available, remote_read_lines, remote_readdir, remote_search_grep,
-    remote_write_lines
+    RemoteDirItem, RemoteGrepMatch, decode_remote_grep_ext, is_ssh_uri, join_ssh_uri,
+    normalize_ssh_uri, parent_ssh_uri, remote_async_cancel, remote_async_poll,
+    remote_async_submit, remote_find_root, remote_read_lines, remote_readdir,
+    remote_search_grep_ext, remote_shimmer_bar, remote_spinner_frame, remote_ui_async_enabled,
+    remote_workspace_replace, remote_write_lines
 }
 use @ext_document.{
     Buffer, BufferId, EditorWorld, Pos, ext_document_id, require_editor_world
@@ -52,6 +54,8 @@ pub struct SpectreService {
     pub items: List,
     pub row_targets: List,
     pub prev_buf_id: BufferId,
+    pub remote_loading: bool,
+    pub remote_disabled_keys: ?Set,
 }
 
 fn is_word_ch(ch: String) -> bool {
@@ -122,6 +126,27 @@ fn walk_spectre_remote_files(dir_uri: String, limit: i64, depth: i64, out: List)
     }
 }
 
+fn convert_remote_grep_for_spectre(norm_root: String, file_filter: String, rhits: List) -> List {
+    let pfx = if norm_root.ends_with("/") { norm_root } else { norm_root ++ "/" }
+    let filt_low = file_filter.trim().to_lower()
+    let out = List()
+    for i in 0..rhits.len() {
+        let rh = rhits.get(i.as(usize)).as(RemoteGrepMatch)
+        let full_u = normalize_ssh_uri(rh.full_uri)
+        let rel = if full_u.starts_with(pfx) { full_u.drop(pfx.char_len()) } else { full_u }
+        if filt_low != "" and (not rel.to_lower().contains(filt_low)) {
+            continue
+        }
+        out.push(GrepHit {
+            file_path: rel,
+            row: rh.row,
+            col: rh.col,
+            line_text: rh.line_text,
+        })
+    }
+    out
+}
+
 fn spectre_grep_any(
     root: String,
     query: String,
@@ -139,27 +164,22 @@ fn spectre_grep_any(
         )
     }
     let norm_root = normalize_ssh_uri(root)
+    remote_search_grep_ext(
+        norm_root,
+        query,
+        case_sensitive = case_sensitive,
+        file_filter = file_filter,
+        limit = max_results,
+    ) match {
+        pair! => {
+            let (_, rhits) = pair
+            return convert_remote_grep_for_spectre(norm_root, file_filter, rhits)
+        },
+        error _ => (),
+    }
     let pfx = if norm_root.ends_with("/") { norm_root } else { norm_root ++ "/" }
     let filt_low = file_filter.trim().to_lower()
     let out = List()
-    if remote_host_available() {
-        let rhits = remote_search_grep(norm_root, query, limit = max_results) ! { _ => List() }
-        for i in 0..rhits.len() {
-            let rh = rhits.get(i.as(usize)).as(RemoteGrepMatch)
-            let full_u = normalize_ssh_uri(rh.full_uri)
-            let rel = if full_u.starts_with(pfx) { full_u.drop(pfx.char_len()) } else { full_u }
-            if filt_low != "" and (not rel.to_lower().contains(filt_low)) {
-                continue
-            }
-            out.push(GrepHit {
-                file_path: rel,
-                row: rh.row,
-                col: rh.col,
-                line_text: rh.line_text,
-            })
-        }
-        return out
-    }
     let files = List()
     walk_spectre_remote_files(norm_root, 500, 0, files)
     let q_cmp = if case_sensitive { query } else { query.to_lower() }
@@ -247,6 +267,8 @@ impl SpectreService {
             items: List(),
             row_targets: List(),
             prev_buf_id: BufferId(1),
+            remote_loading: false,
+            remote_disabled_keys: null,
         }
     }
 
@@ -260,31 +282,14 @@ impl SpectreService {
         cnt
     }
 
-    pub fn refresh_matches(self, .disabled_keys: ?Set = null) {
+    pub fn populate_from_grep_hits(self, hits: List, disabled_keys: ?Set) {
         self.items = List()
-        if self.search_query == "" {
-            return
-        }
         let raw_filt = self.file_filter.trim()
         let suffix_glob = if raw_filt.starts_with("*.") and raw_filt.char_len() > 2 {
             raw_filt.slice(1, raw_filt.char_len()).to_lower()
         } else {
             ""
         }
-        let accel_filt = if raw_filt == "*" {
-            ""
-        } else if suffix_glob != "" {
-            suffix_glob
-        } else {
-            raw_filt
-        }
-        let hits = spectre_grep_any(
-            self.root,
-            self.search_query,
-            self.case_sensitive,
-            400,
-            accel_filt,
-        )
         let seen_file_rows = Set.new()
         let q_cmp = if self.case_sensitive {
             self.search_query
@@ -348,6 +353,47 @@ impl SpectreService {
         }
     }
 
+    pub fn refresh_matches(self, .disabled_keys: ?Set = null) {
+        self.items = List()
+        if self.search_query == "" {
+            self.remote_loading = false
+            remote_async_cancel("spectre.grep")
+            return
+        }
+        let raw_filt = self.file_filter.trim()
+        let suffix_glob = if raw_filt.starts_with("*.") and raw_filt.char_len() > 2 {
+            raw_filt.slice(1, raw_filt.char_len()).to_lower()
+        } else {
+            ""
+        }
+        let accel_filt = if raw_filt == "*" {
+            ""
+        } else if suffix_glob != "" {
+            suffix_glob
+        } else {
+            raw_filt
+        }
+        if is_ssh_uri(self.root) and remote_ui_async_enabled() {
+            self.remote_loading = true
+            self.remote_disabled_keys = disabled_keys
+            let _ = remote_async_submit(
+                "spectre.grep",
+                "search_grep",
+                [normalize_ssh_uri(self.root), self.search_query, self.case_sensitive, accel_filt, 400],
+            )
+            return
+        }
+        self.remote_loading = false
+        let hits = spectre_grep_any(
+            self.root,
+            self.search_query,
+            self.case_sensitive,
+            400,
+            accel_filt,
+        )
+        self.populate_from_grep_hits(hits, disabled_keys)
+    }
+
     pub fn render_into_buffer(self, world: EditorWorld, .focus_first_match: bool = false) -> Buffer {
         let lines = List()
         let targets = List()
@@ -362,8 +408,13 @@ impl SpectreService {
         let case_label = if self.case_sensitive { "sensitive" } else { "insensitive" }
         let filt_label = if self.file_filter == "" { "*" } else { self.file_filter }
 
+        let spin_hdr = if self.remote_loading {
+            "  " ++ remote_spinner_frame() ++ " Searching server..."
+        } else {
+            ""
+        }
         let hdr = [
-            "╭── Spectre Project Search & Replace ──────────────────────────────────────╮",
+            "╭── Spectre Project Search & Replace" ++ spin_hdr ++ " ──────────────────────────────────────╮",
             "│ Search:  " ++ self.search_query,
             "│ Replace: " ++ self.replace_text,
             "│ Filter:  " ++ filt_label ++ "   |   Case: " ++ case_label,
@@ -384,7 +435,9 @@ impl SpectreService {
         let qlen = self.search_query.char_len()
 
         if total == 0 {
-            let empty_msg = if self.search_query == "" {
+            let empty_msg = if self.remote_loading {
+                "  " ++ remote_spinner_frame() ++ " Searching workspace on lava-server... " ++ remote_shimmer_bar(width = 20)
+            } else if self.search_query == "" {
                 "  (No search query set — press 's' to search workspace)"
             } else {
                 "  (0 matches found for '" ++ self.search_query ++ "')"
@@ -514,6 +567,71 @@ fn apply_spectre_replacements(kernel: SystemKernel) -> #InteractiveEffects !Stri
     if file_order.is_empty() {
         status_emit("Spectre: 0 enabled matches to apply")#
         return (0, 0)
+    }
+
+    -- Fast 1-RTT server-side bulk replace when all matched items are enabled on `ssh://`!
+    if is_ssh_uri(svc.root) and disabled_by_file.is_empty() {
+        var any_dirty_open = false
+        for fi in 0..file_order.len() {
+            let rel_path = file_order.get(fi.as(usize)).as(String)
+            let full_path = spectre_resolve_full_path(svc.root, rel_path)
+            let open_opt = world.find_buffer_by_path(full_path)
+            if open_opt != null and open_opt.as(Buffer).modified {
+                any_dirty_open = true
+                break
+            }
+        }
+        if not any_dirty_open {
+            let raw_filt = svc.file_filter.trim()
+            let suffix_glob = if raw_filt.starts_with("*.") and raw_filt.char_len() > 2 {
+                raw_filt.slice(1, raw_filt.char_len()).to_lower()
+            } else {
+                ""
+            }
+            let accel_filt = if raw_filt == "*" { "" } else if suffix_glob != "" { suffix_glob } else { raw_filt }
+            let srv_res = remote_workspace_replace(
+                svc.root,
+                svc.search_query,
+                svc.replace_text,
+                case_sensitive = svc.case_sensitive,
+                file_filter = accel_filt,
+            )
+            srv_res match {
+                pair! => {
+                    let (fc, tr) = pair
+                    for fi in 0..file_order.len() {
+                        let rel_path = file_order.get(fi.as(usize)).as(String)
+                        let full_path = spectre_resolve_full_path(svc.root, rel_path)
+                        let open_opt = world.find_buffer_by_path(full_path)
+                        if open_opt != null {
+                            let ob = open_opt.as(Buffer)
+                            remote_read_lines(full_path) match {
+                                rpair! => {
+                                    let (rlines, _) = rpair
+                                    let was_ro = ob.read_only
+                                    ob.read_only = false
+                                    ob.set_lines(rlines, record_undo = false)
+                                    ob.point = ob.clamp_pos(ob.point, insert_mode = false)
+                                    ob.preferred_col = ob.point.col
+                                    ob.modified = false
+                                    ob.read_only = was_ro
+                                    kernel.emit_hook("buffer-modified", ob.id)
+                                },
+                                error _ => (),
+                            }
+                        }
+                    }
+                    svc.refresh_matches()
+                    let _ = svc.render_into_buffer(world, focus_first_match = false)
+                    let summary = "Applied " ++ tr.to_string() ++ " replacement(s) across " ++ fc.to_string() ++ " file(s) on server"
+                    let _ = world.push_notification("info", "Spectre", summary)
+                    log_event("info", "ext_spectre", summary)#
+                    status_emit("Spectre: " ++ summary)#
+                    return (fc, tr)
+                },
+                error _ => (),
+            }
+        }
     }
 
     let qlen = svc.search_query.char_len()
@@ -895,6 +1013,8 @@ fn cmd_spectre_apply(kern: SystemKernel, _args: List) -> #InteractiveEffects !St
 fn cmd_spectre_close(kern: SystemKernel, _args: List) -> #InteractiveEffects !String Any {
     let world = require_editor_world(kern)!
     let svc = require_spectre_service(kern)!
+    remote_async_cancel("spectre.grep")
+    svc.remote_loading = false
     let existing_opt = world.find_buffer_by_name(SPECTRE_BUF_NAME)
     if existing_opt != null {
         let sb = existing_opt.as(Buffer)
@@ -906,6 +1026,46 @@ fn cmd_spectre_close(kern: SystemKernel, _args: List) -> #InteractiveEffects !St
         status_emit("Closed *Spectre*")#
     }
     ()
+}
+
+fn on_spectre_timer_tick(kern: SystemKernel, _payload: Any) {
+    let s_opt = kern.service(SERVICE_SPECTRE)
+    if s_opt == null {
+        return
+    }
+    let svc = s_opt.as(SpectreService)
+    if not svc.remote_loading {
+        return
+    }
+    let w_opt = kern.service("lava.document.world")
+    if w_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let gp = remote_async_poll("spectre.grep")
+    if gp.status == "ready" {
+        svc.remote_loading = false
+        let (_, rhits) = decode_remote_grep_ext(gp.payload)
+        let raw_filt = svc.file_filter.trim()
+        let suffix_glob = if raw_filt.starts_with("*.") and raw_filt.char_len() > 2 {
+            raw_filt.slice(1, raw_filt.char_len()).to_lower()
+        } else {
+            ""
+        }
+        let accel_filt = if raw_filt == "*" { "" } else if suffix_glob != "" { suffix_glob } else { raw_filt }
+        let hits = convert_remote_grep_for_spectre(normalize_ssh_uri(svc.root), accel_filt, rhits)
+        svc.populate_from_grep_hits(hits, svc.remote_disabled_keys)
+        svc.remote_disabled_keys = null
+        let _ = svc.render_into_buffer(world, focus_first_match = true)
+        world.remote_tick_dirty = true
+    } else if gp.status == "error" {
+        svc.remote_loading = false
+        let _ = svc.render_into_buffer(world, focus_first_match = false)
+        world.remote_tick_dirty = true
+    } else if world.active_buffer().name == SPECTRE_BUF_NAME {
+        let _ = svc.render_into_buffer(world, focus_first_match = false)
+        world.remote_tick_dirty = true
+    }
 }
 
 pub fn register_spectre_extension(kernel: SystemKernel) -> !String Unit {
@@ -1003,6 +1163,8 @@ pub fn register_spectre_extension(kernel: SystemKernel) -> !String Unit {
                 "Close *Spectre* buffer (`q`).",
                 cmd_spectre_close,
             )
+
+            k.add_hook("timer-tick", ext_id, on_spectre_timer_tick)
 
             ()
         },

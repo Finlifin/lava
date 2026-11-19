@@ -3,14 +3,18 @@
 -- `fs/mkdir`, `fs/remove`, `fs/rename`, `fs/copy`, `fs/realpath`, and `fs/find_root`.
 
 use std.fs
-use std.io.{File, IoError, OpenMode, SeekFrom}
+use std.io.{File, IoError, OpenMode}
 use std.ordering.Ordering
 use std.path
 use std.process
-use @server_sys.{expand_tilde, find_project_root, resolve_server_path}
+use @server_sys.{
+    SrvDirEntry, SrvDirParentEntry, SrvEntryPreview, accel_dir_snapshot, accel_entry_preview,
+    accel_invalidate_cache, accel_read_preview, expand_tilde, find_project_root,
+    resolve_server_path
+}
 use @server_core.{
     JsonValue, ServerKernel, SrvExtId, expect_params_map, opt_bool_param, opt_i64_param,
-    opt_str_list_param, require_str_list_param, require_str_param
+    opt_str_list_param, opt_str_param, require_str_list_param, require_str_param
 }
 
 pub fn srv_fs_id() -> SrvExtId = SrvExtId("lava.server/srv_fs")
@@ -206,6 +210,7 @@ private fn rpc_fs_write(_k: ServerKernel, params: JsonValue) -> !String JsonValu
     }
 
     let final_path = resolve_server_path(target)
+    accel_invalidate_cache(path_hint = final_path)
     let out = Map()
     out.set("bytes", content.len())
     out.set("lines", lines.len())
@@ -292,7 +297,9 @@ private fn rpc_fs_mkdir(_k: ServerKernel, params: JsonValue) -> !String JsonValu
     }
     let out = Map()
     out.set("ok", true)
-    out.set("path", resolve_server_path(target))
+    let final_mkdir = resolve_server_path(target)
+    accel_invalidate_cache(path_hint = final_mkdir)
+    out.set("path", final_mkdir)
     out
 }
 
@@ -322,6 +329,7 @@ private fn rpc_fs_remove(_k: ServerKernel, params: JsonValue) -> !String JsonVal
             error err => return error ("cannot remove file '" ++ target ++ "': " ++ err.to_string()),
         }
     }
+    accel_invalidate_cache(path_hint = target)
     let out = Map()
     out.set("ok", true)
     out.set("path", target)
@@ -341,6 +349,7 @@ private fn rpc_fs_rename(_k: ServerKernel, params: JsonValue) -> !String JsonVal
         _! => (),
         error err => return error ("cannot rename '" ++ src ++ "' -> '" ++ dst ++ "': " ++ err.to_string()),
     }
+    accel_invalidate_cache(path_hint = dst)
     let out = Map()
     out.set("ok", true)
     out.set("src", src)
@@ -365,6 +374,7 @@ private fn rpc_fs_copy(_k: ServerKernel, params: JsonValue) -> !String JsonValue
             error err => return error ("cannot copy '" ++ src ++ "' -> '" ++ dst ++ "': " ++ err.to_string()),
         }
     }
+    accel_invalidate_cache(path_hint = dst)
     let out = Map()
     out.set("ok", true)
     out.set("bytes", copied_bytes)
@@ -402,9 +412,32 @@ private fn rpc_fs_find_root(_k: ServerKernel, params: JsonValue) -> !String Json
     out
 }
 
+private fn encode_entry_preview_map(pv: SrvEntryPreview) -> Map {
+    let out = Map()
+    out.set("kind", pv.kind)
+    out.set("target_path", pv.target_path)
+    out.set("target_name", pv.target_name)
+    out.set("total_count", pv.total_count)
+    out.set("total_size", pv.total_size)
+    out.set("lines", pv.lines)
+    let children = List()
+    for i in 0..pv.child_entries.len() {
+        let ch = pv.child_entries.get(i.as(usize)).as(List)
+        let cm = Map()
+        cm.set("name", ch.get(0).as(String))
+        cm.set("is_dir", ch.get(1).as(bool))
+        cm.set("is_symlink", ch.get(2).as(bool))
+        cm.set("size", ch.get(3).as(i64))
+        children.push(cm)
+    }
+    out.set("child_entries", children)
+    out
+}
+
 private fn rpc_fs_read_preview(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
     let m = expect_params_map(params)!
     let raw_path = require_str_param(m, "path")!
+    let start_row = opt_i64_param(m, "start_row", 0)!
     let max_bytes = opt_i64_param(m, "max_bytes", 8192)!
     let max_lines = opt_i64_param(m, "max_lines", 120)!
     let resolved = resolve_server_path(raw_path)
@@ -414,65 +447,106 @@ private fn rpc_fs_read_preview(_k: ServerKernel, params: JsonValue) -> !String J
     if fs.is_dir(resolved) {
         return error ("path is a directory, not a file: " ++ resolved)
     }
-    let cap_bytes = if max_bytes > 0 and max_bytes <= 131072 { max_bytes } else { 8192 }
+    let cap_bytes = if max_bytes > 0 and max_bytes <= 262144 { max_bytes } else { 8192 }
     let cap_lines = if max_lines > 0 and max_lines <= 2000 { max_lines } else { 120 }
-    let meta_size = fs.metadata(resolved) match {
-        mt! => mt.size,
-        error _ => 0,
-    }
-    let (is_bin, lines) = File.with_open(resolved, mode = OpenMode.read) do |f| {
-        let sample = f.read_bytes(max_bytes = cap_bytes)!
-        var has_null = false
-        for i in 0..sample.len() {
-            if sample.get(i.as(usize)).as(i64) == 0 {
-                has_null = true
-                break
-            }
-        }
-        if has_null {
-            (true, List())
-        } else {
-            let _ = f.seek(SeekFrom.start(0))!
-            var bad_utf8 = false
-            let txt_opt: ?String = f.read_chars(cap_bytes) ! {
-                _ => {
-                    bad_utf8 = true
-                    null
-                }
-            }
-            if bad_utf8 {
-                (true, List())
-            } else {
-                let raw_txt = if txt_opt != null { txt_opt.as(String) } else { "" }
-                let norm = raw_txt.replace("\r\n", "\n").replace("\r", "\n")
-                let parts = if norm == "" { [""] } else { norm.split("\n") }
-                if parts.len() > 1 and norm.ends_with("\n") {
-                    let _ = parts.pop()
-                }
-                let out_l = List()
-                let take_n = if parts.len() < cap_lines { parts.len() } else { cap_lines }
-                for li in 0..take_n {
-                    out_l.push(parts.get(li.as(usize)).as(String))
-                }
-                if out_l.is_empty() {
-                    out_l.push("")
-                }
-                (false, out_l)
-            }
-        }
-    } ! {
-        err => return error ("cannot read preview '" ++ resolved ++ "': " ++ err.to_string())
-    }
-    let is_trunc = meta_size > cap_bytes or lines.len() >= cap_lines
+    let win = accel_read_preview(
+        resolved,
+        start_row = if start_row > 0 { start_row } else { 0 },
+        max_lines = cap_lines,
+        max_bytes = cap_bytes,
+    )!
     let out = Map()
-    out.set("binary", is_bin)
-    out.set("is_binary", is_bin)
-    out.set("truncated", is_trunc)
-    out.set("lines", lines)
-    out.set("size", meta_size)
-    out.set("total_size", meta_size)
+    out.set("binary", win.is_binary)
+    out.set("is_binary", win.is_binary)
+    out.set("truncated", win.truncated)
+    out.set("lines", win.lines)
+    out.set("start_row", win.start_row)
+    out.set("total_lines", win.total_lines)
+    out.set("size", win.total_size)
+    out.set("total_size", win.total_size)
     out.set("path", resolved)
     out
+}
+
+private fn rpc_fs_dir_snapshot(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_path = require_str_param(m, "path")!
+    let show_hidden = opt_bool_param(m, "show_hidden", false)!
+    let filter_query = opt_str_param(m, "filter_query", "")!
+    let sort_by = opt_str_param(m, "sort_by", "name")!
+    let sort_reverse = opt_bool_param(m, "sort_reverse", false)!
+    let focus_name = opt_str_param(m, "focus_name", "")!
+    let preferred_row = opt_i64_param(m, "preferred_row", 0)!
+    let include_parent = opt_bool_param(m, "include_parent", true)!
+    let include_preview = opt_bool_param(m, "include_preview", true)!
+
+    let dir_path = resolve_server_path(raw_path)
+    let snap = accel_dir_snapshot(
+        dir_path,
+        show_hidden,
+        filter_query,
+        sort_by,
+        sort_reverse,
+        focus_name,
+        preferred_row,
+        include_parent,
+        include_preview,
+    )!
+
+    let parents_json = List()
+    for i in 0..snap.parent_entries.len() {
+        let p = snap.parent_entries.get(i.as(usize)).as(SrvDirParentEntry)
+        let pm = Map()
+        pm.set("name", p.name)
+        pm.set("path", p.full_path)
+        pm.set("is_dir", p.is_dir)
+        parents_json.push(pm)
+    }
+
+    let entries_json = List()
+    for i in 0..snap.entries.len() {
+        let e = snap.entries.get(i.as(usize)).as(SrvDirEntry)
+        let em = Map()
+        em.set("name", e.name)
+        em.set("path", e.full_path)
+        em.set("is_dir", e.is_dir)
+        em.set("is_symlink", e.is_symlink)
+        em.set("is_exec", e.is_exec)
+        em.set("size", e.size)
+        em.set("modified_secs", e.modified_secs)
+        em.set("perms", e.perms)
+        em.set("symlink_target", e.symlink_target)
+        em.set("git_badge", e.git_badge)
+        entries_json.push(em)
+    }
+
+    let out = Map()
+    out.set("resolved_path", snap.resolved_path)
+    out.set("parent_path", snap.parent_path)
+    out.set("parent_entries", parents_json)
+    out.set("entries", entries_json)
+    out.set("git_is_repo", snap.git_is_repo)
+    out.set("git_root", snap.git_root)
+    out.set("git_branch", snap.git_branch)
+    out.set("git_staged", snap.git_staged)
+    out.set("git_modified", snap.git_modified)
+    out.set("git_untracked", snap.git_untracked)
+    out.set("preview", encode_entry_preview_map(snap.preview))
+    out
+}
+
+private fn rpc_fs_entry_preview(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_path = require_str_param(m, "path")!
+    let is_dir = opt_bool_param(m, "is_dir", false)!
+    let show_hidden = opt_bool_param(m, "show_hidden", false)!
+    let resolved = resolve_server_path(raw_path)
+    let leaf = path.file_name(resolved) match {
+        n? => n,
+        null => resolved,
+    }
+    let pv = accel_entry_preview(resolved, leaf, is_dir, show_hidden)
+    encode_entry_preview_map(pv)
 }
 
 pub fn register_fs_extension(kernel: ServerKernel) -> !String Unit {
@@ -482,12 +556,14 @@ pub fn register_fs_extension(kernel: ServerKernel) -> !String Unit {
         "lava.server",
         "srv_fs",
         "0.1.0",
-        "Server-side filesystem operations, atomic file writes, directory listing, and project root discovery.",
+        "Server-side filesystem operations, atomic file writes, directory snapshots, and project root discovery.",
         List(),
         |k: ServerKernel| -> !String Unit {
             k.register_rpc("fs/stat", ext_id, "Stat a server path.", rpc_fs_stat)
             k.register_rpc("fs/read", ext_id, "Read file lines and CRLF status.", rpc_fs_read)
-            k.register_rpc("fs/read_preview", ext_id, "Read capped file preview snippet.", rpc_fs_read_preview)
+            k.register_rpc("fs/read_preview", ext_id, "Read capped windowed file preview snippet.", rpc_fs_read_preview)
+            k.register_rpc("fs/dir_snapshot", ext_id, "Fetch composite Dirvish/tree snapshot in 1 RPC.", rpc_fs_dir_snapshot)
+            k.register_rpc("fs/entry_preview", ext_id, "Fetch bounded directory or file preview.", rpc_fs_entry_preview)
             k.register_rpc("fs/write", ext_id, "Atomically write lines to a server file.", rpc_fs_write)
             k.register_rpc("fs/readdir", ext_id, "List directory entries sorted directories-first.", rpc_fs_readdir)
             k.register_rpc("fs/mkdir", ext_id, "Create directory on server.", rpc_fs_mkdir)

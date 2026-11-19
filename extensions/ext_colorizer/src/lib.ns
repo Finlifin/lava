@@ -684,11 +684,10 @@ fn scan_single_line_rainbow(
         and (not line.contains("/*"))
         and (not line.contains("#"))
         and ((not dash_cmt) or (not line.contains("--"))) {
-        let bs = line.bytes()
-        let blen = bs.len()
+        let blen = line.len()
         var touched_ascii = false
         for idx in 0..blen {
-            let b = bs.get(idx.as(usize)).as(i64)
+            let b = line.byte_at(idx)
             if b == 40 or b == 91 or b == 123 {
                 touched_ascii = true
                 let open_str = if b == 40 { "(" } else if b == 91 { "[" } else { "{{" }
@@ -1154,9 +1153,9 @@ fn compute_scan_window(world: EditorWorld, buf: Buffer) -> (i64, i64) {
         return (0, lcount)
     }
     let vrows = if world.viewport_rows > 0 { world.viewport_rows } else { 36 }
-    let raw_start = world.viewport_top_row - 60
+    let raw_start = world.viewport_top_row - 24
     let win_start = if raw_start > 0 { raw_start } else { 0 }
-    let raw_end = world.viewport_top_row + vrows + 80
+    let raw_end = world.viewport_top_row + vrows + 32
     let win_end = if raw_end < lcount { raw_end } else { lcount }
     (win_start, win_end)
 }
@@ -1234,18 +1233,32 @@ pub fn refresh_buffer_colorizer(
                     }
                 }
                 let cur_row_key = cur_row.to_string()
+                let mode_low = buf.major_mode.to_lower()
+                let is_pure_slash_cmt = (not is_double_dash_comment_mode(mode_low))
+                    and mode_low != "markdown"
+                    and mode_low != "md"
+                    and mode_low != "gfm"
+                    and mode_low != "python"
+                    and mode_low != "py"
+                    and mode_low != "sh"
+                    and mode_low != "shell"
+                    and mode_low != "bash"
+                    and mode_low != "toml"
+                    and mode_low != "yaml"
+                    and cur_line.trim_start().starts_with("//")
+                    and (not cur_line.contains("/*"))
+                    and (not cur_line.contains("*/"))
                 if (not service.rainbow_enabled)
                     or (
                         ldelta == 0
                         and (not cached.rainbow_rows.contains(cur_row_key))
-                        and (not line_has_rainbow_syntax(cur_line))
+                        and (is_pure_slash_cmt or (not line_has_rainbow_syntax(cur_line)))
                     ) {
                     skip_rainbow_scan = true
                     prev_rainbow_rows = cached.rainbow_rows
                     prev_entry_stacks = cached.row_entry_stacks
                     prev_exit_stacks = cached.row_exit_stacks
                 } else if ldelta == 0 and cached.row_entry_stacks.contains(cur_row_key) and cached.row_exit_stacks.contains(cur_row_key) {
-                    let mode_low = buf.major_mode.to_lower()
                     let is_md = mode_low == "markdown" or mode_low == "md" or mode_low == "gfm"
                     if not is_md {
                         let work_stack = clone_rainbow_stack(cached.row_entry_stacks.get(cur_row_key).as(List))

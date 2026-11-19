@@ -17,9 +17,13 @@ use @lava_accel.{
     accel_workspace_files, accel_workspace_grep
 }
 use @lava_remote.{
-    RemoteDirItem, RemoteGrepMatch, SshHostConfigEntry, is_ssh_uri, normalize_ssh_uri,
-    parent_ssh_uri, remote_discover_ssh_hosts, remote_find_root, remote_host_available,
-    remote_read_lines, remote_read_preview, remote_readdir, remote_search_files, remote_search_grep
+    RemoteDirItem, RemoteGrepMatch, RemotePreviewWindow, RemoteRankedFile, RemoteRankedFiles,
+    SshHostConfigEntry, decode_remote_grep_ext, decode_remote_preview_window,
+    decode_remote_ranked_files, is_ssh_uri, normalize_ssh_uri, parent_ssh_uri, remote_async_cancel,
+    remote_async_poll, remote_async_submit, remote_discover_ssh_hosts, remote_find_root,
+    remote_host_available, remote_read_lines, remote_read_preview_window, remote_readdir,
+    remote_search_files, remote_search_files_ranked, remote_search_grep_ext, remote_shimmer_bar,
+    remote_spinner_frame, remote_ui_async_enabled
 }
 use @ext_document.{
     Buffer, BufferId, EditorWorld, FloatingWindow, Pos, QuickfixEntry, RegisterValue,
@@ -55,6 +59,13 @@ pub struct PickerItem {
     pub detail: String,
 }
 
+pub struct RemotePreviewCacheItem {
+    pub is_binary: bool,
+    pub start_row: i64,
+    pub total_lines: i64,
+    pub lines: List,
+}
+
 pub struct TelescopeState {
     pub active: bool,
     pub mode: String,
@@ -70,6 +81,14 @@ pub struct TelescopeState {
     pub qf_header_rows: i64,
     pub preview_cache_key: String,
     pub preview_cache_lines: ?List,
+    pub remote_root: String,
+    pub remote_total_indexed: i64,
+    pub remote_total_matched: i64,
+    pub remote_search_loading: bool,
+    pub remote_preview_loading: bool,
+    pub remote_preview_key: String,
+    pub remote_preview_lru: HashMap,
+    pub remote_preview_lru_order: List,
 }
 
 impl TelescopeState {
@@ -89,6 +108,14 @@ impl TelescopeState {
             qf_header_rows: 2,
             preview_cache_key: "",
             preview_cache_lines: null,
+            remote_root: "",
+            remote_total_indexed: 0,
+            remote_total_matched: 0,
+            remote_search_loading: false,
+            remote_preview_loading: false,
+            remote_preview_key: "",
+            remote_preview_lru: HashMap.new(),
+            remote_preview_lru_order: List(),
         }
     }
 }
@@ -133,8 +160,13 @@ pub fn collect_help_doc_roots(world: EditorWorld) -> List {
 }
 
 fn effective_workspace_root(world: EditorWorld, state: TelescopeState) -> String {
+    if state.remote_root != "" and is_ssh_uri(state.remote_root) {
+        return state.remote_root
+    }
     if is_ssh_uri(world.cwd) {
-        return normalize_ssh_uri(world.cwd)
+        let nr = normalize_ssh_uri(world.cwd)
+        state.remote_root = nr
+        return nr
     }
     let src_opt = world.buffer(state.source_buf_id)
     let src_fp = if src_opt != null {
@@ -144,18 +176,20 @@ fn effective_workspace_root(world: EditorWorld, state: TelescopeState) -> String
     }
     if is_ssh_uri(src_fp) {
         let base_u = parent_ssh_uri(src_fp)
+        if remote_ui_async_enabled() {
+            state.remote_root = base_u
+            return base_u
+        }
         let r_res = remote_find_root(
             base_u,
             [".git", "Cargo.toml", "package.toml", "compile_commands.json", "pyproject.toml", "package.json", "go.mod"],
         )
-        r_res match {
-            found! => {
-                return found
-            },
-            error _ => {
-                return base_u
-            },
+        let resolved = r_res match {
+            found! => found,
+            error _ => base_u,
         }
+        state.remote_root = resolved
+        return resolved
     }
     world.cwd
 }
@@ -197,17 +231,19 @@ fn collect_remote_workspace_files(root_uri: String, limit: i64) -> List {
     out
 }
 
-fn collect_remote_workspace_grep(root_uri: String, query: String, case_sens: bool, limit: i64) -> List {
-    if remote_host_available() {
-        let res = remote_search_grep(root_uri, query, limit = limit)
-        res match {
-            hits! => {
-                return hits
-            },
-            error _ => {
-                return List()
-            },
-        }
+fn collect_remote_workspace_grep(root_uri: String, query: String, case_sens: bool, limit: i64) -> (i64, List) {
+    let res = remote_search_grep_ext(
+        root_uri,
+        query,
+        case_sensitive = case_sens,
+        file_filter = "",
+        limit = limit,
+    )
+    res match {
+        pair! => {
+            return pair
+        },
+        error _ => (),
     }
     let files = collect_remote_workspace_files(root_uri, 500)
     let q_cmp = if case_sens { query } else { query.to_lower() }
@@ -230,7 +266,7 @@ fn collect_remote_workspace_grep(root_uri: String, query: String, case_sens: boo
                             line_text: ln,
                         })
                         if out.len() >= limit {
-                            return out
+                            return (out.len(), out)
                         }
                     }
                 }
@@ -238,7 +274,7 @@ fn collect_remote_workspace_grep(root_uri: String, query: String, case_sens: boo
             error _ => (),
         }
     }
-    out
+    (out.len(), out)
 }
 
 fn picker_printable_char(stroke: KeyStroke) -> String {
@@ -483,15 +519,10 @@ fn collect_base_items(kernel: SystemKernel, world: EditorWorld, state: Telescope
     if mode == "files" {
         let eff_root = effective_workspace_root(world, state)
         if is_ssh_uri(eff_root) {
-            let rfiles = collect_remote_workspace_files(eff_root, 3000)
-            for i in 0..rfiles.len() {
-                let furi = rfiles.get(i.as(usize)).as(String)
-                let rel = relative_to_cwd(furi, eff_root)
-                items.push(make_plain_item(rel, "", furi, 0, 0, BufferId(0), "", "", ""))
-            }
+            -- Remote file indexing & fuzzy/Orderless ranking run on `lava-server` in `recompute_filtered_items`.
             return items
         }
-        let files = accel_workspace_files(world.cwd, max_files = 10000, include_hidden = false)
+        let files = accel_workspace_files(world.cwd, max_files = 0, include_hidden = false)
         for i in 0..files.len() {
             let rel = files.get(i.as(usize)).as(String)
             items.push(make_plain_item(rel, "", rel, 0, 0, BufferId(0), "", "", ""))
@@ -903,67 +934,168 @@ fn normalize_doc_search_query(raw_q: String) -> String {
     norm_parts.join(" ")
 }
 
+fn clamp_picker_selection(state: TelescopeState) {
+    if state.selected_idx >= state.filtered_items.len() {
+        state.selected_idx = if state.filtered_items.is_empty() { 0 } else { state.filtered_items.len() - 1 }
+    }
+    if state.selected_idx < 0 {
+        state.selected_idx = 0
+    }
+}
+
+fn apply_remote_ranked_files(state: TelescopeState, eff_root: String, rf: RemoteRankedFiles) {
+    let out = List()
+    for i in 0..rf.items.len() {
+        let it = rf.items.get(i.as(usize)).as(RemoteRankedFile)
+        let rel = if it.rel_path != "" {
+            it.rel_path
+        } else {
+            relative_to_cwd(it.full_uri, eff_root)
+        }
+        out.push(make_plain_item(rel, "", it.full_uri, 0, 0, BufferId(0), "", "", ""))
+    }
+    state.remote_total_indexed = rf.total_indexed
+    state.remote_total_matched = rf.total_matched
+    state.filtered_items = out
+    clamp_picker_selection(state)
+}
+
+fn apply_remote_grep_hits(state: TelescopeState, eff_root: String, total_matched: i64, rhits: List) {
+    let out = List()
+    for i in 0..rhits.len() {
+        let rh = rhits.get(i.as(usize)).as(RemoteGrepMatch)
+        let rel_p = relative_to_cwd(rh.full_uri, eff_root)
+        let raw_loc = rel_p ++ ":" ++ (rh.row + 1).to_string() ++ ":" ++ (rh.col + 1).to_string() ++ ": " ++ rh.line_text.trim()
+        let disp = telescope_file_icon(rel_p) ++ " " ++ raw_loc
+        out.push(make_plain_item(
+            raw_loc,
+            disp,
+            rh.full_uri,
+            rh.row,
+            rh.col,
+            BufferId(0),
+            rh.line_text,
+            "",
+            "",
+        ))
+    }
+    state.remote_total_matched = total_matched
+    state.filtered_items = out
+    clamp_picker_selection(state)
+}
+
+fn store_remote_preview_lru(
+    state: TelescopeState,
+    key: String,
+    win: RemotePreviewWindow,
+) -> RemotePreviewCacheItem {
+    let lines = if win.lines.is_empty() and (not win.is_binary) {
+        [""]
+    } else {
+        win.lines
+    }
+    let item = RemotePreviewCacheItem {
+        is_binary: win.is_binary,
+        start_row: win.start_row,
+        total_lines: if win.total_lines > 0 { win.total_lines } else { win.start_row + lines.len() },
+        lines: lines,
+    }
+    if not state.remote_preview_lru.contains_key(key) {
+        if state.remote_preview_lru_order.len() >= 48 {
+            let oldest = state.remote_preview_lru_order.remove(0).as(String)
+            let _ = state.remote_preview_lru.remove(oldest)
+        }
+        state.remote_preview_lru_order.push(key)
+    }
+    state.remote_preview_lru.insert(key, item)
+    item
+}
+
 fn recompute_filtered_items(world: EditorWorld, state: TelescopeState) {
+    if state.mode == "files" {
+        let eff_root = effective_workspace_root(world, state)
+        if is_ssh_uri(eff_root) {
+            if remote_ui_async_enabled() {
+                state.remote_search_loading = true
+                let _ = remote_async_submit(
+                    "telescope.search",
+                    "search_files",
+                    [eff_root, state.query, false, false, 150],
+                )
+                return
+            }
+            state.remote_search_loading = false
+            remote_search_files_ranked(
+                eff_root,
+                state.query,
+                include_hidden = false,
+                include_dirs = false,
+                limit = 150,
+            ) match {
+                rf! => apply_remote_ranked_files(state, eff_root, rf),
+                error _ => {
+                    state.remote_total_indexed = 0
+                    state.remote_total_matched = 0
+                    state.filtered_items = List()
+                    state.selected_idx = 0
+                },
+            }
+            return
+        }
+    }
+
     if state.mode == "live_grep" {
         let q = state.query.trim()
         if q == "" {
+            remote_async_cancel("telescope.search")
+            state.remote_search_loading = false
+            state.remote_total_matched = 0
             state.filtered_items = List()
             state.selected_idx = 0
             return
         }
         let case_sens = not world.effective_ignore_case(q)
         let eff_root = effective_workspace_root(world, state)
-        let out = List()
         if is_ssh_uri(eff_root) {
-            let rhits = collect_remote_workspace_grep(eff_root, q, case_sens, 250)
-            for i in 0..rhits.len() {
-                let rh = rhits.get(i.as(usize)).as(RemoteGrepMatch)
-                let rel_p = relative_to_cwd(rh.full_uri, eff_root)
-                let raw_loc = rel_p ++ ":" ++ (rh.row + 1).to_string() ++ ":" ++ (rh.col + 1).to_string() ++ ": " ++ rh.line_text.trim()
-                let disp = telescope_file_icon(rel_p) ++ " " ++ raw_loc
-                out.push(make_plain_item(
-                    raw_loc,
-                    disp,
-                    rh.full_uri,
-                    rh.row,
-                    rh.col,
-                    BufferId(0),
-                    rh.line_text,
-                    "",
-                    "",
-                ))
+            if remote_ui_async_enabled() {
+                state.remote_search_loading = true
+                let _ = remote_async_submit(
+                    "telescope.search",
+                    "search_grep",
+                    [eff_root, q, case_sens, "", 150],
+                )
+                return
             }
-        } else {
-            let hits = accel_workspace_grep(
-                world.cwd,
-                q,
-                case_sensitive = case_sens,
-                max_results = 250,
-            )
-            for i in 0..hits.len() {
-                let h = hits.get(i.as(usize)).as(GrepHit)
-                let raw_loc = h.file_path ++ ":" ++ (h.row + 1).to_string() ++ ":" ++ (h.col + 1).to_string() ++ ": " ++ h.line_text.trim()
-                let disp = telescope_file_icon(h.file_path) ++ " " ++ raw_loc
-                out.push(make_plain_item(
-                    raw_loc,
-                    disp,
-                    h.file_path,
-                    h.row,
-                    h.col,
-                    BufferId(0),
-                    h.line_text,
-                    "",
-                    "",
-                ))
-            }
+            state.remote_search_loading = false
+            let (tm, rhits) = collect_remote_workspace_grep(eff_root, q, case_sens, 150)
+            apply_remote_grep_hits(state, eff_root, tm, rhits)
+            return
+        }
+        let out = List()
+        let hits = accel_workspace_grep(
+            world.cwd,
+            q,
+            case_sensitive = case_sens,
+            max_results = 250,
+        )
+        for i in 0..hits.len() {
+            let h = hits.get(i.as(usize)).as(GrepHit)
+            let raw_loc = h.file_path ++ ":" ++ (h.row + 1).to_string() ++ ":" ++ (h.col + 1).to_string() ++ ": " ++ h.line_text.trim()
+            let disp = telescope_file_icon(h.file_path) ++ " " ++ raw_loc
+            out.push(make_plain_item(
+                raw_loc,
+                disp,
+                h.file_path,
+                h.row,
+                h.col,
+                BufferId(0),
+                h.line_text,
+                "",
+                "",
+            ))
         }
         state.filtered_items = out
-        if state.selected_idx >= out.len() {
-            state.selected_idx = if out.is_empty() { 0 } else { out.len() - 1 }
-        }
-        if state.selected_idx < 0 {
-            state.selected_idx = 0
-        }
+        clamp_picker_selection(state)
         return
     }
 
@@ -1088,7 +1220,7 @@ fn load_preview_source_lines(world: EditorWorld, state: TelescopeState, item: Pi
     }
 
     if is_ssh_uri(full) {
-        let rpv_opt: ?List = remote_read_preview(full, max_bytes = 32768, max_lines = max_preview_lines) match {
+        let rpv_opt: ?List = remote_read_preview_window(full, start_row = 0, max_lines = max_preview_lines, max_bytes = 32768) match {
             pv! => {
                 if pv.is_binary {
                     null
@@ -1186,9 +1318,147 @@ fn build_command_preview_window(kernel: SystemKernel, item: PickerItem) -> Float
     }
 }
 
+fn build_remote_windowed_preview(
+    world: EditorWorld,
+    state: TelescopeState,
+    item: PickerItem,
+    full_uri: String,
+    preview_rows: i64,
+) -> FloatingWindow {
+    let target_r = if item.row > 0 { item.row } else { 0 }
+    let win_start = if target_r > 6 { target_r - 6 } else { 0 }
+    let win_lines: i64 = 24
+    let max_bytes: i64 = 8192
+    let rkey = full_uri ++ "@" ++ win_start.to_string()
+    let disp_path = relative_to_cwd(full_uri, world.cwd) ++ ":" ++ (target_r + 1).to_string()
+
+    if not state.remote_preview_lru.contains_key(rkey) {
+        if remote_ui_async_enabled() {
+            if state.remote_preview_key != rkey or (not state.remote_preview_loading) {
+                state.remote_preview_key = rkey
+                state.remote_preview_loading = true
+                let _ = remote_async_submit(
+                    "telescope.preview",
+                    "read_preview",
+                    [full_uri, win_start, win_lines, max_bytes],
+                )
+            }
+            let spin = remote_spinner_frame()
+            return (FloatingWindow {
+                id: FLOAT_PREVIEW_ID,
+                owner: "ext_telescope",
+                title: "Preview — " ++ disp_path ++ "  " ++ spin ++ " Streaming slice",
+                anchor: "bottom",
+                width_cols: 108,
+                height_rows: 8,
+                lines: [
+                    "  " ++ spin ++ " Fetching lines " ++ (win_start + 1).to_string() ++ ".." ++ (win_start + win_lines).to_string() ++ " from lava-server...",
+                    "  " ++ remote_shimmer_bar(width = 24) ++ "  (viewport-only slice, <= 8 KiB)",
+                ],
+                selected_row: -1,
+                border_rgba: 0,
+            })
+        }
+        remote_read_preview_window(
+            full_uri,
+            start_row = win_start,
+            max_lines = win_lines,
+            max_bytes = max_bytes,
+        ) match {
+            win! => {
+                let _ = store_remote_preview_lru(state, rkey, win)
+            },
+            error _ => {
+                return (FloatingWindow {
+                    id: FLOAT_PREVIEW_ID,
+                    owner: "ext_telescope",
+                    title: "Preview — " ++ disp_path,
+                    anchor: "bottom",
+                    width_cols: 108,
+                    height_rows: 6,
+                    lines: ["(Binary or unreadable remote file: " ++ item.file_path ++ ")"],
+                    selected_row: -1,
+                    border_rgba: 0,
+                })
+            },
+        }
+    }
+
+    let cached = state.remote_preview_lru.get(rkey).as(RemotePreviewCacheItem)
+    if cached.is_binary {
+        return (FloatingWindow {
+            id: FLOAT_PREVIEW_ID,
+            owner: "ext_telescope",
+            title: "Preview — " ++ disp_path,
+            anchor: "bottom",
+            width_cols: 108,
+            height_rows: 6,
+            lines: ["(Binary remote file: " ++ item.file_path ++ ")"],
+            selected_row: -1,
+            border_rgba: 0,
+        })
+    }
+
+    let wlen = cached.lines.len()
+    let rel_target = if target_r >= cached.start_row {
+        let off = target_r - cached.start_row
+        if off < wlen { off } else if wlen > 0 { wlen - 1 } else { 0 }
+    } else {
+        0
+    }
+    var sub_start = rel_target - 3
+    if sub_start + preview_rows > wlen {
+        sub_start = wlen - preview_rows
+    }
+    if sub_start < 0 {
+        sub_start = 0
+    }
+    let sub_end = if sub_start + preview_rows < wlen { sub_start + preview_rows } else { wlen }
+    let out_lines = List()
+    var highlight_row: i64 = -1
+    for off in sub_start..sub_end {
+        let abs_row = cached.start_row + off
+        if off == rel_target {
+            highlight_row = off - sub_start
+        }
+        let lnum = (abs_row + 1).to_string().pad_start(5, " ")
+        let marker = if off == rel_target { ">" } else { " " }
+        out_lines.push(marker ++ lnum ++ " │ " ++ cached.lines.get(off.as(usize)).as(String))
+    }
+
+    return (FloatingWindow {
+        id: FLOAT_PREVIEW_ID,
+        owner: "ext_telescope",
+        title: "Preview — " ++ disp_path,
+        anchor: "bottom",
+        width_cols: 108,
+        height_rows: preview_rows,
+        lines: out_lines,
+        selected_row: highlight_row,
+        border_rgba: 0,
+    })
+}
+
 fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: TelescopeState) -> FloatingWindow {
     let preview_rows: i64 = 16
     if state.filtered_items.is_empty() {
+        if state.remote_search_loading {
+            let spin = remote_spinner_frame()
+            return (FloatingWindow {
+                id: FLOAT_PREVIEW_ID,
+                owner: "ext_telescope",
+                title: "Telescope Preview  " ++ spin ++ " Remote refresh",
+                anchor: "bottom",
+                width_cols: 108,
+                height_rows: 8,
+                lines: [
+                    "  " ++ spin ++ " Computing ranked matches on lava-server...",
+                    "  " ++ remote_shimmer_bar(width = 24),
+                ],
+                selected_row: -1,
+                border_rgba: 0,
+            })
+        }
         let empty_msg = if state.mode == "live_grep" and state.query.trim() == "" {
             "(Type a pattern above to search across workspace files)"
         } else if state.mode == "docs" and state.query.trim() == "" {
@@ -1205,7 +1475,7 @@ fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: Telesco
             height_rows: 8,
             lines: [empty_msg],
             selected_row: -1,
-            border_rgba: 0,
+            border_rgba: -0 + 0,
         })
     }
 
@@ -1324,6 +1594,13 @@ fn build_preview_window(kernel: SystemKernel, world: EditorWorld, state: Telesco
             selected_row: 0,
             border_rgba: 0,
         })
+    }
+
+    if item.buf_id.raw() <= 0 and item.file_path != "" {
+        let full_check = world.resolve_path(item.file_path)
+        if is_ssh_uri(full_check) and world.find_buffer_by_path(full_check) == null {
+            return build_remote_windowed_preview(world, state, item, full_check, preview_rows)
+        }
     }
 
     let src_lines_opt = load_preview_source_lines(world, state, item)
@@ -1449,7 +1726,20 @@ pub fn sync_telescope_windows(kernel: SystemKernel, world: EditorWorld, state: T
 
     let max_cand_rows: i64 = 15
     let total_filtered = state.filtered_items.len()
-    let denom = if state.mode == "live_grep" or state.mode == "docs" {
+    let eff_root = effective_workspace_root(world, state)
+    let is_remote_ws = (state.mode == "files" or state.mode == "live_grep") and is_ssh_uri(eff_root)
+    let shown_num = if is_remote_ws and state.mode == "files" and state.remote_total_matched > total_filtered {
+        state.remote_total_matched
+    } else {
+        total_filtered
+    }
+    let denom = if is_remote_ws {
+        if state.mode == "files" {
+            if state.remote_total_indexed > 0 { state.remote_total_indexed } else { shown_num }
+        } else {
+            if state.remote_total_matched > total_filtered { state.remote_total_matched } else { total_filtered }
+        }
+    } else if state.mode == "live_grep" or state.mode == "docs" {
         total_filtered
     } else {
         state.base_items.len()
@@ -1462,12 +1752,19 @@ pub fn sync_telescope_windows(kernel: SystemKernel, world: EditorWorld, state: T
     let q_right = state.query.slice(cur, qlen)
 
     let picker_lines = List()
-    picker_lines.push(" " ++ q_left ++ "█" ++ q_right)
+    let spin_inline = if state.remote_search_loading {
+        "  " ++ remote_spinner_frame() ++ " " ++ remote_shimmer_bar(width = 10)
+    } else {
+        ""
+    }
+    picker_lines.push(" " ++ q_left ++ "█" ++ q_right ++ spin_inline)
     picker_lines.push("────────────────────────────────────────────────────────────────────────────────────────────────────────")
 
     var win_sel_row: i64 = -1
     if total_filtered == 0 {
-        let hint = if state.mode == "live_grep" and state.query.trim() == "" {
+        let hint = if state.remote_search_loading {
+            "  " ++ remote_spinner_frame() ++ " Searching lava-server... " ++ remote_shimmer_bar(width = 18)
+        } else if state.mode == "live_grep" and state.query.trim() == "" {
             "  (Type search query — <C-n>/<C-p> move, <C-q> quickfix, <Esc> close)"
         } else {
             "  (0 matches)"
@@ -1501,9 +1798,14 @@ pub fn sync_telescope_windows(kernel: SystemKernel, world: EditorWorld, state: T
         }
     }
 
+    let spin_hdr = if state.remote_search_loading {
+        "  " ++ remote_spinner_frame() ++ " Refreshing..."
+    } else {
+        ""
+    }
     let picker_title = "Telescope " ++ mode_display_title(state.mode)
-        ++ " (" ++ total_filtered.to_string() ++ "/" ++ denom.to_string()
-        ++ ") [<Ret>:open <C-q>:qf <Esc>:close]"
+        ++ " (" ++ shown_num.to_string() ++ "/" ++ denom.to_string()
+        ++ ")" ++ spin_hdr ++ " [<Ret>:open <C-q>:qf <Esc>:close]"
 
     world.set_floating_window(FloatingWindow {
         id: FLOAT_PICKER_ID,
@@ -1524,6 +1826,10 @@ fn close_telescope(kernel: SystemKernel, world: EditorWorld, vim: VimState, stat
     if restore_theme and state.mode == "colorscheme" {
         apply_theme_preview(kernel, world, state.original_theme)
     }
+    remote_async_cancel("telescope.search")
+    remote_async_cancel("telescope.preview")
+    state.remote_search_loading = false
+    state.remote_preview_loading = false
     state.active = false
     let _ = world.remove_floating_window(FLOAT_PICKER_ID)
     let _ = world.remove_floating_window(FLOAT_PREVIEW_ID)
@@ -2005,6 +2311,10 @@ pub fn open_telescope_picker(
     if resume_last and state.has_history {
         state.active = true
         state.original_theme = world.options.theme_name
+        state.remote_root = ""
+        state.remote_search_loading = false
+        state.remote_preview_loading = false
+        state.remote_preview_key = ""
         if state.mode != "live_grep" and state.mode != "docs" {
             state.base_items = collect_base_items(kernel, world, state)
             state.base_labels = List()
@@ -2031,6 +2341,13 @@ pub fn open_telescope_picker(
         state.source_buf_id = world.active_buffer_id
         state.original_theme = world.options.theme_name
         state.has_history = true
+        state.remote_root = ""
+        state.remote_total_indexed = 0
+        state.remote_total_matched = 0
+        state.remote_search_loading = false
+        state.remote_preview_loading = false
+        state.remote_preview_key = ""
+        state.filtered_items = List()
         state.base_items = collect_base_items(kernel, world, state)
         state.base_labels = List()
         state.preview_cache_key = ""
@@ -2122,6 +2439,77 @@ fn cmd_quickfix_open_at_cursor(kern: SystemKernel, _args: List) -> #InteractiveE
     status_emit(
         "(" ++ (idx + 1).to_string() ++ "/" ++ world.quickfix.len().to_string() ++ ") " ++ qf.text
     )#
+    ()
+}
+
+fn on_telescope_timer_tick(kern: SystemKernel, _arg: Any) {
+    let st_opt = kern.service(SERVICE_TELESCOPE)
+    if st_opt == null {
+        return
+    }
+    let state = st_opt.as(TelescopeState)
+    if not state.active {
+        return
+    }
+    let w_opt = kern.service("lava.document.world")
+    if w_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    var changed = false
+
+    if state.remote_search_loading {
+        let sp = remote_async_poll("telescope.search")
+        if sp.status == "ready" {
+            state.remote_search_loading = false
+            let eff_root = effective_workspace_root(world, state)
+            if state.mode == "files" {
+                let rf = decode_remote_ranked_files(sp.payload)
+                apply_remote_ranked_files(state, eff_root, rf)
+            } else if state.mode == "live_grep" and state.query.trim() != "" {
+                let (tm, rhits) = decode_remote_grep_ext(sp.payload)
+                apply_remote_grep_hits(state, eff_root, tm, rhits)
+            }
+            changed = true
+        } else if sp.status == "error" {
+            state.remote_search_loading = false
+            changed = true
+        }
+    }
+
+    if state.remote_preview_loading {
+        let pp = remote_async_poll("telescope.preview")
+        if pp.status == "ready" {
+            state.remote_preview_loading = false
+            if state.remote_preview_key != "" {
+                let win = decode_remote_preview_window(pp.payload)
+                let _ = store_remote_preview_lru(state, state.remote_preview_key, win)
+            }
+            changed = true
+        } else if pp.status == "error" {
+            state.remote_preview_loading = false
+            if state.remote_preview_key != "" {
+                let _ = store_remote_preview_lru(
+                    state,
+                    state.remote_preview_key,
+                    RemotePreviewWindow {
+                        lines: ["(Preview unavailable: " ++ pp.error_msg ++ ")"],
+                        start_row: 0,
+                        total_lines: 1,
+                        is_binary: false,
+                        truncated: false,
+                        total_size: 0,
+                    },
+                )
+            }
+            changed = true
+        }
+    }
+
+    if changed or state.remote_search_loading or state.remote_preview_loading {
+        sync_telescope_windows(kern, world, state)
+        world.remote_tick_dirty = true
+    }
     ()
 }
 
@@ -2276,6 +2664,8 @@ pub fn register_telescope_extension(kernel: SystemKernel) -> !String Unit {
 
             let qf_km = k.ensure_keymap("mode:quickfix")
             qf_km.bind("<Return>", "telescope-quickfix-open", ext_id, description = "Open Quickfix entry")
+
+            k.add_hook("timer-tick", ext_id, on_telescope_timer_tick)
 
             ()
         },

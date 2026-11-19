@@ -4267,6 +4267,35 @@ pub fn accel_ts_highlight_rows(
     decode_host_ts_rows(raw.as(List))
 }
 
+pub fn accel_ts_highlight_rows_packed(
+    doc_id: i64,
+    lang: String,
+    start_row: i64,
+    end_row: i64,
+) -> List {
+    if end_row < start_row or start_row < 0 {
+        return List()
+    }
+    let raw! = runtime.host_call("accel_ts_highlight_rows_packed", [doc_id, lang, start_row, end_row]) else {
+        let rows = accel_ts_highlight_rows(doc_id, lang, start_row, end_row)
+        let out = List()
+        for r in 0..rows.len() {
+            let row = rows.get(r.as(usize)).as(List)
+            let packed_row = List()
+            for j in 0..row.len() {
+                let sp = row.get(j.as(usize)).as(TsSpan)
+                let s = if sp.start_col < 0 { 0 } else if sp.start_col > 16777215 { 16777215 } else { sp.start_col }
+                let e = if sp.end_col < 0 { 0 } else if sp.end_col > 16777215 { 16777215 } else { sp.end_col }
+                let g = if sp.hl_group < 0 { 0 } else if sp.hl_group > 255 { 255 } else { sp.hl_group }
+                packed_row.push(s * 4294967296 + e * 256 + g)
+            }
+            out.push(packed_row)
+        }
+        return out
+    }
+    raw.as(List)
+}
+
 pub fn accel_ts_highlight_snippet(text: String, lang: String) -> List {
     if text == "" {
         return List()

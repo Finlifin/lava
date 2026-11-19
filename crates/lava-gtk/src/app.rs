@@ -426,7 +426,8 @@ unsafe extern "C" fn on_drawing_area_draw(
         }
         anim.is_active()
     };
-    if anim_active {
+    let overlay_anim = transfer_overlay.as_ref().is_some_and(|o| o.active);
+    if anim_active || overlay_anim {
         // SAFETY: `slot_ptr` was registered via `Rc::into_raw` on this GTK main thread.
         unsafe {
             GtkAnimSlot::ensure_tick_callback(slot_ptr);

@@ -4,8 +4,9 @@
 use std.fs
 use std.path
 use @server_sys.{
-    SrvFuzzyHit, SrvGrepHit, SrvSymbolItem, accel_fuzzy_rank, accel_scan_symbols,
-    accel_workspace_files, accel_workspace_grep, resolve_server_path
+    SrvGrepHit, SrvRankedFileItem, SrvSymbolItem, SrvTodoItem, accel_invalidate_cache,
+    accel_scan_symbols, accel_scan_workspace_todos, accel_search_files_ranked,
+    accel_workspace_grep_counted, accel_workspace_replace, resolve_server_path
 }
 use @server_core.{
     JsonValue, ServerKernel, SrvExtId, expect_params_map, invalid_params, opt_bool_param,
@@ -45,33 +46,38 @@ private fn rpc_search_files(_k: ServerKernel, params: JsonValue) -> !String Json
     let query = opt_str_param(m, "query", "")!
     let limit = opt_i64_param(m, "limit", 200)!
     let include_hidden = opt_bool_param(m, "include_hidden", false)!
+    let include_dirs = opt_bool_param(m, "include_dirs", false)!
 
     let root = resolve_server_path(raw_root)
     if not fs.exists(root) or (not fs.is_dir(root)) {
         return error ("workspace root directory does not exist: " ++ root)
     }
 
-    let all_files = accel_workspace_files(root, max_files = 10000, include_hidden = include_hidden)
-    let effective_limit = if limit > 0 { limit } else { all_files.len() }
+    let (total_indexed, total_matched, items) = accel_search_files_ranked(
+        root,
+        query,
+        include_hidden = include_hidden,
+        include_dirs = include_dirs,
+        limit = if limit > 0 { limit } else { 200 },
+    )
 
-    let matched = List()
-    if query.trim() == "" {
-        let take_n = if effective_limit < all_files.len() { effective_limit } else { all_files.len() }
-        for i in 0..take_n {
-            matched.push(all_files.get(i.as(usize)).as(String))
-        }
-    } else {
-        let ranked = accel_fuzzy_rank(query, all_files, limit = effective_limit)
-        for i in 0..ranked.len() {
-            let hit = ranked.get(i.as(usize)).as(SrvFuzzyHit)
-            if hit.index >= 0 and hit.index < all_files.len() {
-                matched.push(all_files.get(hit.index.as(usize)).as(String))
-            }
-        }
+    let files = List()
+    let entries = List()
+    for i in 0..items.len() {
+        let it = items.get(i.as(usize)).as(SrvRankedFileItem)
+        files.push(it.rel_path)
+        let em = Map()
+        em.set("path", it.rel_path)
+        em.set("is_dir", it.is_dir)
+        em.set("score", it.score)
+        entries.push(em)
     }
 
     let out = Map()
-    out.set("files", matched)
+    out.set("files", files)
+    out.set("entries", entries)
+    out.set("total_indexed", total_indexed)
+    out.set("total_matched", total_matched)
     out
 }
 
@@ -95,15 +101,17 @@ private fn rpc_search_grep(_k: ServerKernel, params: JsonValue) -> !String JsonV
         return error ("workspace root directory does not exist: " ++ root)
     }
 
+    var total_matched: i64 = 0
     let hits_json = List()
     if pattern != "" {
-        let hits = accel_workspace_grep(
+        let (tm, hits) = accel_workspace_grep_counted(
             root,
             pattern,
             case_sensitive = case_sensitive,
             max_results = limit,
             file_filter = file_filter,
         )
+        total_matched = tm
         for i in 0..hits.len() {
             let h = hits.get(i.as(usize)).as(SrvGrepHit)
             let item = Map()
@@ -117,6 +125,66 @@ private fn rpc_search_grep(_k: ServerKernel, params: JsonValue) -> !String JsonV
 
     let out = Map()
     out.set("hits", hits_json)
+    out.set("total_matched", total_matched)
+    out
+}
+
+private fn rpc_search_todos(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_root = require_str_param(m, "root")!
+    let limit = opt_i64_param(m, "limit", 300)!
+
+    let root = resolve_server_path(raw_root)
+    if not fs.exists(root) or (not fs.is_dir(root)) {
+        return error ("workspace root directory does not exist: " ++ root)
+    }
+
+    let todos = accel_scan_workspace_todos(root, max_results = if limit > 0 { limit } else { 300 })
+    let items_json = List()
+    for i in 0..todos.len() {
+        let t = todos.get(i.as(usize)).as(SrvTodoItem)
+        let item = Map()
+        item.set("file_path", t.file_path)
+        item.set("row", t.row)
+        item.set("col", t.col)
+        item.set("tag", t.tag)
+        item.set("text", t.text)
+        items_json.push(item)
+    }
+
+    let out = Map()
+    out.set("items", items_json)
+    out.set("total_count", items_json.len())
+    out
+}
+
+private fn rpc_search_replace(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_root = require_str_param(m, "root")!
+    let query = require_str_param(m, "query")!
+    let replacement = opt_str_param(m, "replacement", "")!
+    let case_sensitive = opt_bool_param(m, "case_sensitive", false)!
+    let file_filter = opt_str_param(m, "file_filter", "")!
+
+    let root = resolve_server_path(raw_root)
+    if not fs.exists(root) or (not fs.is_dir(root)) {
+        return error ("workspace root directory does not exist: " ++ root)
+    }
+
+    let (files_changed, total_replacements) = accel_workspace_replace(
+        root,
+        query,
+        replacement,
+        case_sensitive = case_sensitive,
+        file_filter = file_filter,
+    )!
+    if files_changed > 0 {
+        accel_invalidate_cache(path_hint = root)
+    }
+
+    let out = Map()
+    out.set("files_changed", files_changed)
+    out.set("total_replacements", total_replacements)
     out
 }
 
@@ -179,8 +247,10 @@ pub fn register_search_extension(kernel: ServerKernel) -> !String Unit {
         "Server-side workspace file finder, ripgrep live search, and multi-language symbol scanner.",
         List(),
         |k: ServerKernel| -> !String Unit {
-            k.register_rpc("search/files", ext_id, "Fuzzy-find workspace files on server.", rpc_search_files)
+            k.register_rpc("search/files", ext_id, "Fuzzy/Orderless-find workspace files on server.", rpc_search_files)
             k.register_rpc("search/grep", ext_id, "Live grep across workspace files on server.", rpc_search_grep)
+            k.register_rpc("search/todos", ext_id, "Scan TODO/FIXME/HACK tags across workspace on server.", rpc_search_todos)
+            k.register_rpc("search/replace", ext_id, "Multi-file search & replace across workspace on server.", rpc_search_replace)
             k.register_rpc("search/symbols", ext_id, "Extract symbol outline for a file or lines.", rpc_search_symbols)
             ()
         },

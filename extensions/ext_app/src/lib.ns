@@ -16,6 +16,10 @@ use @lava_core.{
     ExtId, InteractiveEffects, KeyStroke, PromptRequest, ServiceEffects, SystemKernel,
     clipboard_get, clipboard_set, log_event, parse_key_sequence, status_emit
 }
+use @lava_remote.{
+    REMOTE_WAKE_TIMER_ID, remote_advance_anim_tick, remote_async_active_count,
+    remote_set_ui_async_enabled
+}
 use @ext_document.{
     Buffer, EditorWorld, FloatingWindow, MinibufferView, Pos, RegisterValue, SidebarPanel, Span,
     VisualKind, VisualSelection, ext_document_id, register_document_extension, require_editor_world
@@ -816,16 +820,26 @@ pub fn app_step_event(
         RawUiEvent.focus(_focused) => false,
         RawUiEvent.tick(timer_id, _now_ms) => {
             world.lsp_tick_dirty = false
+            world.remote_tick_dirty = false
+            let was_remote_active = remote_async_active_count() > 0 or timer_id == REMOTE_WAKE_TIMER_ID
+            if was_remote_active {
+                remote_advance_anim_tick()
+            }
             let prev_n = world.notifications.len()
             world.tick_notifications()
             let expired = world.notifications.len() < prev_n
             kernel.emit_hook("timer-tick", timer_id)
             let pty_tick = timer_id == 1347705088
             let lsp_dirty = world.lsp_tick_dirty
+            let rmt_dirty = world.remote_tick_dirty or was_remote_active or remote_async_active_count() > 0
             world.lsp_tick_dirty = false
+            world.remote_tick_dirty = false
+            if kernel.active_prompt != null and rmt_dirty {
+                sync_prompt_view(kernel, world)
+            }
             let term_visible = world.active_buffer().major_mode == "terminal"
                 or world.floating_window_spans.contains_key("toggleterm")
-            expired or pty_tick or lsp_dirty or term_visible
+            expired or pty_tick or lsp_dirty or rmt_dirty or term_visible
         },
         RawUiEvent.async_job_done(job_id, ok, exit_code, stdout, stderr) => {
             let res = tools_on_async_job_done(kernel, job_id, ok, exit_code, stdout, stderr)#
@@ -846,15 +860,18 @@ pub fn app_step_event(
     }
 }
 
-private global _last_measured_font_key: String = ""
+private global _last_measured_font_family: String = ""
+private global _last_measured_font_size: f64 = -1.0
 
 fn sync_font_metrics_if_changed(world: EditorWorld, wm: WindowManager) {
-    let key = world.options.font_family ++ "|" ++ world.options.font_size_pt.to_string()
-    if _last_measured_font_key != "" and _last_measured_font_key != key {
-        wm.metrics = host_measure_font(world.options.font_family, world.options.font_size_pt)
+    let fam = world.options.font_family
+    let sz = world.options.font_size_pt
+    if _last_measured_font_family != "" and (_last_measured_font_family != fam or _last_measured_font_size != sz) {
+        wm.metrics = host_measure_font(fam, sz)
         wm.sync_from_world(world)
     }
-    _last_measured_font_key = key
+    _last_measured_font_family = fam
+    _last_measured_font_size = sz
 }
 
 fn push_anim_viewport_hints(world: EditorWorld, wm: WindowManager) {
@@ -870,8 +887,8 @@ fn push_anim_viewport_hints(world: EditorWorld, wm: WindowManager) {
         let b_opt = world.buffer(p.buffer_id)
         let doc_num: i64 = if b_opt != null {
             let b = b_opt.as(Buffer)
-            let m = b.major_mode.to_lower()
-            if m == "dirvish" or m == "dirvish-parent" or m == "dirvish-preview" or m == "terminal" {
+            let m = b.major_mode
+            if m == "dirvish" or m == "dirvish-parent" or m == "dirvish-preview" or m == "terminal" or m == "Dirvish" {
                 -1
             } else {
                 b.id.raw()
@@ -1008,6 +1025,7 @@ fn run_session_with_caps(
     -- 1. Measure monospace font cell metrics from PangoCairo (or mock metrics in headless tests).
     wm.metrics = host_measure_font(world.options.font_family, world.options.font_size_pt)
     wm.sync_from_world(world)
+    remote_set_ui_async_enabled(not headless)
 
     -- 2. Drain any initial platform events (e.g. initial window `resize(width, height, scale)`).
     let init_events = host_poll_events()
@@ -1127,21 +1145,27 @@ fn run_session_with_caps(
         return world.exit_code
     }
 
-    -- 7. Interactive event loop: suspend VM task via `host_wait_events` until UI/job wakeup.
+    -- 7. Interactive event loop: suspend VM task via `host_wait_events` until UI/job/remote wakeup.
     while not session_should_exit(world) {
+        let remote_pending = remote_async_active_count() > 0
         let wait_ms = if not world.active_jobs.is_empty() {
             50
+        } else if remote_pending {
+            60
         } else if not world.notifications.is_empty() {
             250
         } else {
             -1
         }
         let events = host_wait_events(wait_ms)
-        if not events.is_empty() {
-            let batch = List()
-            for i in 0..events.len() {
-                batch.push(events.get(i.as(usize)).as(RawUiEvent))
-            }
+        let batch = List()
+        for i in 0..events.len() {
+            batch.push(events.get(i.as(usize)).as(RawUiEvent))
+        }
+        if batch.is_empty() and wait_ms > 0 {
+            batch.push(RawUiEvent.tick(0, 0))
+        }
+        if not batch.is_empty() {
             while batch.len() < 64 {
                 let more = host_poll_events()
                 if more.is_empty() {

@@ -4,12 +4,12 @@
 use std.fs
 use std.process
 use @server_sys.{
-    SrvGitBlame, SrvGitFileEntry, accel_git_blame_line, accel_git_head_lines, accel_git_status,
-    resolve_server_path
+    SrvDiffHunk, SrvGitBlame, SrvGitFileEntry, accel_git_blame_line, accel_git_file_hunks,
+    accel_git_head_lines, accel_git_status, accel_git_status_cached, resolve_server_path
 }
 use @server_core.{
-    JsonValue, ServerKernel, SrvExtId, expect_params_map, opt_i64_param, opt_str_param,
-    require_i64_param, require_str_param
+    JsonValue, ServerKernel, SrvExtId, expect_params_map, opt_bool_param, opt_i64_param,
+    opt_nullable_str_list_param, opt_str_param, require_i64_param, require_str_param
 }
 
 pub fn srv_git_id() -> SrvExtId = SrvExtId("lava.server/srv_git")
@@ -179,6 +179,58 @@ private fn rpc_git_log(_k: ServerKernel, params: JsonValue) -> !String JsonValue
     out
 }
 
+private fn rpc_git_summary(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_cwd = require_str_param(m, "cwd")!
+    let cwd = resolve_server_path(raw_cwd)
+    let out = Map()
+    if not fs.exists(cwd) {
+        out.set("is_repo", false)
+        out.set("root", "")
+        out.set("branch", "")
+        out.set("staged_count", 0)
+        out.set("modified_count", 0)
+        out.set("untracked_count", 0)
+        return out
+    }
+    let st = accel_git_status_cached(cwd)
+    out.set("is_repo", st.is_repo)
+    out.set("root", st.root)
+    out.set("branch", st.branch)
+    out.set("staged_count", st.staged_count)
+    out.set("modified_count", st.modified_count)
+    out.set("untracked_count", st.untracked_count)
+    out
+}
+
+private fn rpc_git_file_hunks(_k: ServerKernel, params: JsonValue) -> !String JsonValue {
+    let m = expect_params_map(params)!
+    let raw_cwd = require_str_param(m, "cwd")!
+    let raw_path = require_str_param(m, "path")!
+    let has_override = opt_bool_param(m, "has_override", false)!
+    let lines_opt = opt_nullable_str_list_param(m, "lines")!
+    let override_lines = if lines_opt != null { lines_opt.as(List) } else { List() }
+
+    let cwd = resolve_server_path(raw_cwd)
+    let resolved_file = resolve_server_path(raw_path)
+    let (tracked, hunks) = accel_git_file_hunks(cwd, resolved_file, has_override, override_lines)
+    let hunks_json = List()
+    for i in 0..hunks.len() {
+        let h = hunks.get(i.as(usize)).as(SrvDiffHunk)
+        let hm = Map()
+        hm.set("old_start", h.old_start)
+        hm.set("old_count", h.old_count)
+        hm.set("new_start", h.new_start)
+        hm.set("new_count", h.new_count)
+        hm.set("kind", h.kind)
+        hunks_json.push(hm)
+    }
+    let out = Map()
+    out.set("tracked", tracked)
+    out.set("hunks", hunks_json)
+    out
+}
+
 pub fn register_git_extension(kernel: ServerKernel) -> !String Unit {
     let ext_id = srv_git_id()
     kernel.register_extension(
@@ -186,10 +238,12 @@ pub fn register_git_extension(kernel: ServerKernel) -> !String Unit {
         "lava.server",
         "srv_git",
         "0.1.0",
-        "Server-side Git repository status, HEAD blob retrieval, unified diff, blame, and commit log.",
+        "Server-side Git repository status, lightweight summary, line-diff hunks, HEAD blob retrieval, unified diff, blame, and commit log.",
         List(),
         |k: ServerKernel| -> !String Unit {
             k.register_rpc("git/status", ext_id, "Query Git porcelain status summary.", rpc_git_status)
+            k.register_rpc("git/summary", ext_id, "Query compact Git branch & counts without file list.", rpc_git_summary)
+            k.register_rpc("git/file_hunks", ext_id, "Compute compact HEAD line-diff hunks on server.", rpc_git_file_hunks)
             k.register_rpc("git/head_lines", ext_id, "Fetch tracked blob lines at HEAD or rev.", rpc_git_head_lines)
             k.register_rpc("git/diff", ext_id, "Generate unified Git patch diff.", rpc_git_diff)
             k.register_rpc("git/blame", ext_id, "Blame single 0-based line.", rpc_git_blame)

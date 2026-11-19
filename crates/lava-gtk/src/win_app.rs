@@ -477,7 +477,7 @@ impl WinWindowState {
                     );
                 }
             }
-            anim.is_animating()
+            anim.is_animating() || overlay.as_ref().is_some_and(|o| o.active)
         };
 
         self.ensure_anim_timer(hwnd, still_animating);

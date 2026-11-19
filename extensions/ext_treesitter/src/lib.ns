@@ -59,7 +59,11 @@ fn migrate_leader_u_prefix(leader_km: Keymap) {
 fn dismiss_inspect_float(kernel: SystemKernel) {
     let w_opt = kernel.service("lava.document.world")
     if w_opt != null {
-        let _ = w_opt.as(EditorWorld).remove_floating_window(FLOAT_TREESITTER_INSPECT)
+        let w = w_opt.as(EditorWorld)
+        if w.floating_windows.is_empty() {
+            return
+        }
+        let _ = w.remove_floating_window(FLOAT_TREESITTER_INSPECT)
     }
     let v_opt = kernel.service(SERVICE_VIM)
     if v_opt != null {

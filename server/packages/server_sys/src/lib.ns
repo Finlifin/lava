@@ -1397,3 +1397,616 @@ pub fn lsp_stop(session_id: i64) -> bool {
     sess.events.push(["exited", 0])
     true
 }
+
+-- ============================================================================
+-- 6. High-Throughput Render-Slice Accelerators (`search_files_ranked`,
+--    `dir_snapshot`, `read_preview`, `git_file_hunks`, `scan_todos`, `replace`)
+-- ============================================================================
+
+pub struct SrvRankedFileItem {
+    pub rel_path: String,
+    pub is_dir: bool,
+    pub score: i64,
+}
+derive Eq, PartialEq, Display for SrvRankedFileItem
+
+pub struct SrvTodoItem {
+    pub file_path: String,
+    pub row: i64,
+    pub col: i64,
+    pub tag: String,
+    pub text: String,
+}
+derive Eq, PartialEq, Display for SrvTodoItem
+
+pub struct SrvDiffHunk {
+    pub old_start: i64,
+    pub old_count: i64,
+    pub new_start: i64,
+    pub new_count: i64,
+    pub kind: String,
+}
+derive Eq, PartialEq, Display for SrvDiffHunk
+
+pub struct SrvPreviewWindow {
+    pub lines: List,
+    pub start_row: i64,
+    pub total_lines: i64,
+    pub is_binary: bool,
+    pub truncated: bool,
+    pub total_size: i64,
+}
+
+pub struct SrvDirParentEntry {
+    pub name: String,
+    pub full_path: String,
+    pub is_dir: bool,
+}
+
+pub struct SrvDirEntry {
+    pub name: String,
+    pub full_path: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub is_exec: bool,
+    pub size: i64,
+    pub modified_secs: i64,
+    pub perms: String,
+    pub symlink_target: String,
+    pub git_badge: String,
+}
+
+pub struct SrvEntryPreview {
+    pub kind: String,
+    pub target_path: String,
+    pub target_name: String,
+    pub total_count: i64,
+    pub total_size: i64,
+    pub lines: List,
+    pub child_entries: List,
+}
+
+pub struct SrvDirSnapshot {
+    pub resolved_path: String,
+    pub parent_path: String,
+    pub parent_entries: List,
+    pub entries: List,
+    pub git_is_repo: bool,
+    pub git_root: String,
+    pub git_branch: String,
+    pub git_staged: i64,
+    pub git_modified: i64,
+    pub git_untracked: i64,
+    pub preview: SrvEntryPreview,
+}
+
+pub fn accel_invalidate_cache(.path_hint: String = "") {
+    let _ = runtime.host_call("accel_invalidate_cache", [path_hint]) ! { _ => () }
+}
+
+pub fn accel_search_files_ranked(
+    root: String,
+    query: String,
+    .include_hidden: bool = false,
+    .include_dirs: bool = false,
+    .limit: i64 = 200,
+) -> (i64, i64, List) {
+    let raw! = runtime.host_call(
+        "accel_search_files_ranked",
+        [root, query, include_hidden, include_dirs, limit],
+    ) else {
+        let all_files = accel_workspace_files(root, max_files = 0, include_hidden = include_hidden)
+        let cands = List()
+        let cand_is_dir = List()
+        if include_dirs {
+            let seen_d = HashMap.new()
+            for i in 0..all_files.len() {
+                let rel = all_files.get(i.as(usize)).as(String)
+                let segs = rel.split("/")
+                if segs.len() > 1 {
+                    var acc = ""
+                    for si in 0..(segs.len() - 1) {
+                        let s = segs.get(si.as(usize)).as(String)
+                        acc = if acc == "" { s } else { acc ++ "/" ++ s }
+                        if not seen_d.contains_key(acc) {
+                            seen_d.insert(acc, true)
+                            cands.push(acc)
+                            cand_is_dir.push(true)
+                        }
+                    }
+                }
+            }
+        }
+        for i in 0..all_files.len() {
+            cands.push(all_files.get(i.as(usize)).as(String))
+            cand_is_dir.push(false)
+        }
+        let total_indexed = cands.len()
+        let eff_limit = if limit > 0 { limit } else { 200 }
+        let out = List()
+        if query.trim() == "" {
+            let take_n = if eff_limit < total_indexed { eff_limit } else { total_indexed }
+            for i in 0..take_n {
+                out.push(SrvRankedFileItem {
+                    rel_path: cands.get(i.as(usize)).as(String),
+                    is_dir: cand_is_dir.get(i.as(usize)).as(bool),
+                    score: 100,
+                })
+            }
+            return (total_indexed, total_indexed, out)
+        }
+        let all_ranked = accel_fuzzy_rank(query, cands, limit = 0)
+        let total_matched = all_ranked.len()
+        let take_n = if eff_limit < total_matched { eff_limit } else { total_matched }
+        for i in 0..take_n {
+            let hit = all_ranked.get(i.as(usize)).as(SrvFuzzyHit)
+            if hit.index >= 0 and hit.index < total_indexed {
+                out.push(SrvRankedFileItem {
+                    rel_path: cands.get(hit.index.as(usize)).as(String),
+                    is_dir: cand_is_dir.get(hit.index.as(usize)).as(bool),
+                    score: hit.score,
+                })
+            }
+        }
+        return (total_indexed, total_matched, out)
+    }
+    let top = raw.as(List)
+    let total_indexed = top.get(0).as(i64)
+    let total_matched = top.get(1).as(i64)
+    let rows = top.get(2).as(List)
+    let out = List()
+    for i in 0..rows.len() {
+        let r = rows.get(i.as(usize)).as(List)
+        out.push(SrvRankedFileItem {
+            rel_path: r.get(0).as(String),
+            is_dir: r.get(1).as(bool),
+            score: r.get(2).as(i64),
+        })
+    }
+    (total_indexed, total_matched, out)
+}
+
+pub fn accel_workspace_grep_counted(
+    root: String,
+    query: String,
+    .case_sensitive: bool = false,
+    .max_results: i64 = 300,
+    .file_filter: String = "",
+) -> (i64, List) {
+    if query == "" or (not fs.exists(root)) {
+        return (0, List())
+    }
+    let raw! = runtime.host_call(
+        "accel_workspace_grep_counted",
+        [root, query, case_sensitive, max_results, file_filter],
+    ) else {
+        let hits = accel_workspace_grep(
+            root,
+            query,
+            case_sensitive = case_sensitive,
+            max_results = max_results,
+            file_filter = file_filter,
+        )
+        return (hits.len(), hits)
+    }
+    let top = raw.as(List)
+    let total_matched = top.get(0).as(i64)
+    let rows = top.get(1).as(List)
+    let out = List()
+    for i in 0..rows.len() {
+        let row = rows.get(i.as(usize)).as(List)
+        out.push(SrvGrepHit {
+            file_path: row.get(0).as(String),
+            row: row.get(1).as(i64),
+            col: row.get(2).as(i64),
+            line_text: row.get(3).as(String),
+        })
+    }
+    (total_matched, out)
+}
+
+pub fn accel_scan_workspace_todos(root: String, .max_results: i64 = 300) -> List {
+    let raw! = runtime.host_call("accel_scan_workspace_todos", [root, max_results]) else {
+        let out = List()
+        let tags = ["TODO", "FIXME", "HACK", "WARN", "PERF", "NOTE", "BUG"]
+        for ti in 0..tags.len() {
+            let tg = tags.get(ti.as(usize)).as(String)
+            let hits = accel_workspace_grep(root, tg, case_sensitive = true, max_results = 100)
+            for hi in 0..hits.len() {
+                let h = hits.get(hi.as(usize)).as(SrvGrepHit)
+                out.push(SrvTodoItem {
+                    file_path: h.file_path,
+                    row: h.row,
+                    col: h.col,
+                    tag: tg,
+                    text: h.line_text.trim(),
+                })
+                if max_results > 0 and out.len() >= max_results {
+                    return out
+                }
+            }
+        }
+        return out
+    }
+    let rows = raw.as(List)
+    let out = List()
+    for i in 0..rows.len() {
+        let r = rows.get(i.as(usize)).as(List)
+        out.push(SrvTodoItem {
+            file_path: r.get(0).as(String),
+            row: r.get(1).as(i64),
+            col: r.get(2).as(i64),
+            tag: r.get(3).as(String),
+            text: r.get(4).as(String),
+        })
+    }
+    out
+}
+
+pub fn accel_workspace_replace(
+    root: String,
+    query: String,
+    replacement: String,
+    .case_sensitive: bool = false,
+    .file_filter: String = "",
+) -> !String (i64, i64) {
+    let raw = runtime.host_call(
+        "accel_workspace_replace",
+        [root, query, replacement, case_sensitive, file_filter],
+    ) match {
+        v! => v,
+        error err => {
+            if err.to_string().contains("unknown lava_sys host operation") {
+                let files = accel_workspace_files(root, max_files = 0)
+                let filt_low = file_filter.trim().to_lower()
+                var fc: i64 = 0
+                var tr: i64 = 0
+                for i in 0..files.len() {
+                    let rel = files.get(i.as(usize)).as(String)
+                    if filt_low != "" and (not rel.to_lower().contains(filt_low)) {
+                        continue
+                    }
+                    let full = path.join(root, rel)
+                    let txt! = fs.read_to_string(full) else { continue }
+                    let hits = txt.find_indices(query)
+                    if not hits.is_empty() {
+                        let updated = txt.replace(query, replacement)
+                        let _ = fs.write_string(full, updated) ! { _ => () }
+                        fc += 1
+                        tr += hits.len()
+                    }
+                }
+                return (fc, tr)
+            }
+            return error err.to_string()
+        },
+    }
+    let pair = raw.as(List)
+    (pair.get(0).as(i64), pair.get(1).as(i64))
+}
+
+pub fn accel_read_preview(
+    target_path: String,
+    .start_row: i64 = 0,
+    .max_lines: i64 = 120,
+    .max_bytes: i64 = 8192,
+) -> !String SrvPreviewWindow {
+    let raw = runtime.host_call(
+        "accel_read_preview",
+        [target_path, start_row, max_lines, max_bytes],
+    ) match {
+        v! => v,
+        error err => {
+            if not err.to_string().contains("unknown lava_sys host operation") {
+                return error err.to_string()
+            }
+            let meta_sz = fs.metadata(target_path) match {
+                m! => m.size,
+                error e => return error e.to_string(),
+            }
+            let txt! = fs.read_to_string(target_path) else {
+                return (SrvPreviewWindow {
+                    lines: List(),
+                    start_row: 0,
+                    total_lines: 0,
+                    is_binary: true,
+                    truncated: true,
+                    total_size: meta_sz,
+                })
+            }
+            let norm = txt.replace("\r\n", "\n").replace("\r", "\n")
+            let parts = if norm == "" { [""] } else { norm.split("\n") }
+            if parts.len() > 1 and norm.ends_with("\n") {
+                let _ = parts.pop()
+            }
+            let srow = if start_row > 0 { start_row } else { 0 }
+            let out_l = List()
+            let end_r = if srow + max_lines < parts.len() { srow + max_lines } else { parts.len() }
+            if srow < end_r {
+                for li in srow..end_r {
+                    out_l.push(parts.get(li.as(usize)).as(String))
+                }
+            }
+            if out_l.is_empty() and srow == 0 {
+                out_l.push("")
+            }
+            return (SrvPreviewWindow {
+                lines: out_l,
+                start_row: srow,
+                total_lines: parts.len(),
+                is_binary: false,
+                truncated: end_r < parts.len(),
+                total_size: meta_sz,
+            })
+        },
+    }
+    let f = raw.as(List)
+    SrvPreviewWindow {
+        lines: f.get(0).as(List),
+        start_row: f.get(1).as(i64),
+        total_lines: f.get(2).as(i64),
+        is_binary: f.get(3).as(bool),
+        truncated: f.get(4).as(bool),
+        total_size: f.get(5).as(i64),
+    }
+}
+
+private fn decode_srv_entry_preview(raw_pv: List) -> SrvEntryPreview {
+    SrvEntryPreview {
+        kind: raw_pv.get(0).as(String),
+        target_path: raw_pv.get(1).as(String),
+        target_name: raw_pv.get(2).as(String),
+        total_count: raw_pv.get(3).as(i64),
+        total_size: raw_pv.get(4).as(i64),
+        lines: raw_pv.get(5).as(List),
+        child_entries: raw_pv.get(6).as(List),
+    }
+}
+
+pub fn accel_entry_preview(
+    target_path: String,
+    target_name: String,
+    is_dir: bool,
+    show_hidden: bool,
+) -> SrvEntryPreview {
+    let raw! = runtime.host_call(
+        "accel_entry_preview",
+        [target_path, target_name, is_dir, show_hidden],
+    ) else {
+        if is_dir {
+            let entries! = fs.read_dir_entries(target_path) else {
+                return (SrvEntryPreview {
+                    kind: "unreadable",
+                    target_path: target_path,
+                    target_name: target_name,
+                    total_count: 0,
+                    total_size: 0,
+                    lines: List(),
+                    child_entries: List(),
+                })
+            }
+            let children = List()
+            for i in 0..entries.len() {
+                let e = entries.get(i.as(usize)).as(fs.DirEntry)
+                if (not show_hidden) and e.name.starts_with(".") {
+                    continue
+                }
+                children.push([e.name, e.is_dir(), e.is_symlink(), e.size])
+            }
+            let total = children.len()
+            let capped = if total > 80 { children.take(80.as(usize)) } else { children }
+            return (SrvEntryPreview {
+                kind: "dir",
+                target_path: target_path,
+                target_name: target_name,
+                total_count: total,
+                total_size: 0,
+                lines: List(),
+                child_entries: capped,
+            })
+        }
+        let win! = accel_read_preview(target_path, start_row = 0, max_lines = 80, max_bytes = 8192) else {
+            return (SrvEntryPreview {
+                kind: "unreadable",
+                target_path: target_path,
+                target_name: target_name,
+                total_count: 0,
+                total_size: 0,
+                lines: List(),
+                child_entries: List(),
+            })
+        }
+        return (SrvEntryPreview {
+            kind: if win.is_binary { "binary" } else { "text" },
+            target_path: target_path,
+            target_name: target_name,
+            total_count: win.total_lines,
+            total_size: win.total_size,
+            lines: win.lines,
+            child_entries: List(),
+        })
+    }
+    decode_srv_entry_preview(raw.as(List))
+}
+
+pub fn accel_dir_snapshot(
+    dir_path: String,
+    show_hidden: bool,
+    filter_query: String,
+    sort_by: String,
+    sort_reverse: bool,
+    focus_name: String,
+    preferred_row: i64,
+    include_parent: bool,
+    include_preview: bool,
+) -> !String SrvDirSnapshot {
+    let raw = runtime.host_call(
+        "accel_dir_snapshot",
+        [
+            dir_path,
+            show_hidden,
+            filter_query,
+            sort_by,
+            sort_reverse,
+            focus_name,
+            preferred_row,
+            include_parent,
+            include_preview,
+        ],
+    ) match {
+        v! => v,
+        error err => {
+            if not err.to_string().contains("unknown lava_sys host operation") {
+                return error err.to_string()
+            }
+            if not fs.exists(dir_path) or (not fs.is_dir(dir_path)) {
+                return error ("directory does not exist: " ++ dir_path)
+            }
+            let raw_entries = fs.read_dir_entries(dir_path) match {
+                re! => re,
+                error e => return error e.to_string(),
+            }
+            let filt_low = filter_query.trim().to_lower()
+            let entries = List()
+            for i in 0..raw_entries.len() {
+                let de = raw_entries.get(i.as(usize)).as(fs.DirEntry)
+                if (not show_hidden) and de.name.starts_with(".") {
+                    continue
+                }
+                if filt_low != "" and (not de.name.to_lower().contains(filt_low)) {
+                    continue
+                }
+                entries.push(SrvDirEntry {
+                    name: de.name,
+                    full_path: de.path,
+                    is_dir: de.is_dir(),
+                    is_symlink: de.is_symlink(),
+                    is_exec: false,
+                    size: de.size,
+                    modified_secs: de.modified_unix_secs,
+                    perms: if de.is_dir() { "drwxr-xr-x" } else { "-rw-r--r--" },
+                    symlink_target: "",
+                    git_badge: " ",
+                })
+            }
+            let gst = accel_git_status(dir_path)
+            let pv = if include_preview and (not entries.is_empty()) {
+                let first = entries.get(0).as(SrvDirEntry)
+                accel_entry_preview(first.full_path, first.name, first.is_dir, show_hidden)
+            } else {
+                SrvEntryPreview {
+                    kind: "none",
+                    target_path: "",
+                    target_name: "",
+                    total_count: 0,
+                    total_size: 0,
+                    lines: List(),
+                    child_entries: List(),
+                }
+            }
+            return (SrvDirSnapshot {
+                resolved_path: dir_path,
+                parent_path: "",
+                parent_entries: List(),
+                entries: entries,
+                git_is_repo: gst.is_repo,
+                git_root: gst.root,
+                git_branch: gst.branch,
+                git_staged: gst.staged_count,
+                git_modified: gst.modified_count,
+                git_untracked: gst.untracked_count,
+                preview: pv,
+            })
+        },
+    }
+    let f = raw.as(List)
+    let raw_parents = f.get(2).as(List)
+    let parents = List()
+    for i in 0..raw_parents.len() {
+        let p = raw_parents.get(i.as(usize)).as(List)
+        parents.push(SrvDirParentEntry {
+            name: p.get(0).as(String),
+            full_path: p.get(1).as(String),
+            is_dir: p.get(2).as(bool),
+        })
+    }
+    let raw_entries = f.get(3).as(List)
+    let entries = List()
+    for i in 0..raw_entries.len() {
+        let e = raw_entries.get(i.as(usize)).as(List)
+        entries.push(SrvDirEntry {
+            name: e.get(0).as(String),
+            full_path: e.get(1).as(String),
+            is_dir: e.get(2).as(bool),
+            is_symlink: e.get(3).as(bool),
+            is_exec: e.get(4).as(bool),
+            size: e.get(5).as(i64),
+            modified_secs: e.get(6).as(i64),
+            perms: e.get(7).as(String),
+            symlink_target: e.get(8).as(String),
+            git_badge: e.get(9).as(String),
+        })
+    }
+    SrvDirSnapshot {
+        resolved_path: f.get(0).as(String),
+        parent_path: f.get(1).as(String),
+        parent_entries: parents,
+        entries: entries,
+        git_is_repo: f.get(4).as(bool),
+        git_root: f.get(5).as(String),
+        git_branch: f.get(6).as(String),
+        git_staged: f.get(7).as(i64),
+        git_modified: f.get(8).as(i64),
+        git_untracked: f.get(9).as(i64),
+        preview: decode_srv_entry_preview(f.get(10).as(List)),
+    }
+}
+
+pub fn accel_git_status_cached(cwd: String) -> SrvGitStatus {
+    let raw! = runtime.host_call("accel_git_status_cached", [cwd]) else {
+        return accel_git_status(cwd)
+    }
+    let f = raw.as(List)
+    SrvGitStatus {
+        is_repo: f.get(0).as(bool),
+        root: f.get(1).as(String),
+        branch: f.get(2).as(String),
+        staged_count: f.get(3).as(i64),
+        modified_count: f.get(4).as(i64),
+        untracked_count: f.get(5).as(i64),
+        entries: List(),
+    }
+}
+
+pub fn accel_git_file_hunks(
+    cwd: String,
+    file_path: String,
+    has_override: bool,
+    override_lines: List,
+) -> (bool, List) {
+    let raw! = runtime.host_call(
+        "accel_git_file_hunks",
+        [cwd, file_path, has_override, override_lines],
+    ) else {
+        let head_opt = accel_git_head_lines(cwd, file_path)
+        if head_opt == null {
+            return (false, List())
+        }
+        return (true, List())
+    }
+    let f = raw.as(List)
+    let tracked = f.get(0).as(bool)
+    let rows = f.get(1).as(List)
+    let out = List()
+    for i in 0..rows.len() {
+        let r = rows.get(i.as(usize)).as(List)
+        out.push(SrvDiffHunk {
+            old_start: r.get(0).as(i64),
+            old_count: r.get(1).as(i64),
+            new_start: r.get(2).as(i64),
+            new_count: r.get(3).as(i64),
+            kind: r.get(4).as(String),
+        })
+    }
+    (tracked, out)
+}

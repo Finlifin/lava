@@ -358,12 +358,26 @@ fn dispatch_if_available(
     kernel: SystemKernel,
     cmd_name: String,
     args: List,
-) -> #[log_event, status_emit, clipboard_get, clipboard_set] !String bool {
-    if kernel.get_command(cmd_name) == null {
+) -> #InteractiveEffects !String bool {
+    let spec? = kernel.get_command(cmd_name) else {
         return false
     }
-    let _ = kernel.dispatch_command(cmd_name, args)#!
+    let act = spec.action
+    let _ = act(kernel, args)#!
     true
+}
+
+fn invoke_command_bool(
+    kernel: SystemKernel,
+    cmd_name: String,
+    args: List,
+) -> #InteractiveEffects !String bool {
+    let spec? = kernel.get_command(cmd_name) else {
+        return false
+    }
+    let act = spec.action
+    let v = act(kernel, args)#!
+    (v matches _: bool) and v.as(bool)
 }
 
 fn render_marks_lines(world: EditorWorld, buf: Buffer) -> List {
@@ -691,13 +705,6 @@ fn apply_set_options(world: EditorWorld, arg_str: String) -> !String String {
         }
     }
     "set " ++ applied.join(" ")
-}
-
-fn prompt_turn_bool(turn: PromptTurn) -> bool {
-    turn match {
-        PromptTurn.completed(v) => (v matches _: bool) and v.as(bool),
-        _ => false,
-    }
 }
 
 pub fn execute_ex_command(kernel: SystemKernel, raw_cmd: String) -> #InteractiveEffects !String Unit {
@@ -1053,9 +1060,11 @@ pub fn execute_ex_command(kernel: SystemKernel, raw_cmd: String) -> #Interactive
             status_emit("\"" ++ arg ++ "\" " ++ sub_lines.len().to_string() ++ "L, " ++ written.to_string() ++ "B written")#
             return ()
         }
-        if arg == "" and kernel.get_command("write-buffer-mode:" ++ buf.major_mode) != null {
-            let _ = kernel.dispatch_command("write-buffer-mode:" ++ buf.major_mode, List())#!
-            return ()
+        if arg == "" {
+            let handled_wb = dispatch_if_available(kernel, "write-buffer-mode:" ++ buf.major_mode, List())#!
+            if handled_wb {
+                return ()
+            }
         }
         if buf.file_path == "" and arg == "" {
             let _ = dispatch_if_available(kernel, "save-buffer", List())#!
@@ -1068,15 +1077,13 @@ pub fn execute_ex_command(kernel: SystemKernel, raw_cmd: String) -> #Interactive
     }
 
     if verb == "q" or verb == "quit" {
-        if kernel.get_command("delete-window") != null {
-            if prompt_turn_bool(kernel.dispatch_command("delete-window", List())#!) {
-                return ()
-            }
+        let closed_win = invoke_command_bool(kernel, "delete-window", List())#!
+        if closed_win {
+            return ()
         }
-        if kernel.get_command("tab-close") != null {
-            if prompt_turn_bool(kernel.dispatch_command("tab-close", List())#!) {
-                return ()
-            }
+        let closed_tab = invoke_command_bool(kernel, "tab-close", List())#!
+        if closed_tab {
+            return ()
         }
         if not bang {
             let unsaved = world.unsaved_file_buffers()
@@ -1115,23 +1122,24 @@ pub fn execute_ex_command(kernel: SystemKernel, raw_cmd: String) -> #Interactive
 
     if verb == "wq" or verb == "x" or verb == "xit" {
         if verb == "wq" or buf.modified or arg != "" {
-            if arg == "" and kernel.get_command("write-buffer-mode:" ++ buf.major_mode) != null {
-                let _ = kernel.dispatch_command("write-buffer-mode:" ++ buf.major_mode, List())#!
+            let handled_wb = if arg == "" {
+                dispatch_if_available(kernel, "write-buffer-mode:" ++ buf.major_mode, List())#!
             } else {
+                false
+            }
+            if not handled_wb {
                 kernel.emit_hook("buffer-will-save", buf.id)
                 world.save_buffer(buf.id, override_path = arg)#!
                 kernel.emit_hook("buffer-saved", buf.id)
             }
         }
-        if kernel.get_command("delete-window") != null {
-            if prompt_turn_bool(kernel.dispatch_command("delete-window", List())#!) {
-                return ()
-            }
+        let closed_win = invoke_command_bool(kernel, "delete-window", List())#!
+        if closed_win {
+            return ()
         }
-        if kernel.get_command("tab-close") != null {
-            if prompt_turn_bool(kernel.dispatch_command("tab-close", List())#!) {
-                return ()
-            }
+        let closed_tab = invoke_command_bool(kernel, "tab-close", List())#!
+        if closed_tab {
+            return ()
         }
         if not bang {
             let unsaved = world.unsaved_file_buffers()
@@ -1403,9 +1411,11 @@ pub fn execute_ex_command(kernel: SystemKernel, raw_cmd: String) -> #Interactive
     ]
     for cand_i in 0..candidates.len() {
         let cand_cmd = candidates.get(cand_i.as(usize)).as(String)
-        if cand_cmd != "" and kernel.get_command(cand_cmd) != null {
-            let _ = kernel.dispatch_command(cand_cmd, call_args)#!
-            return ()
+        if cand_cmd != "" {
+            let handled_cand = dispatch_if_available(kernel, cand_cmd, call_args)#!
+            if handled_cand {
+                return ()
+            }
         }
     }
 

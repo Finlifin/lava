@@ -12,8 +12,9 @@ use @lava_core.{
 }
 use @lava_accel.{FuzzyHit, accel_doc_collect_words, accel_fuzzy_rank}
 use @lava_remote.{
-    RemoteDirItem, is_ssh_uri, join_ssh_uri, normalize_ssh_uri, parent_ssh_uri, parse_ssh_uri,
-    remote_readdir, remote_stat
+    RemoteDirItem, decode_remote_readdir_items, is_ssh_uri, join_ssh_uri, normalize_ssh_uri,
+    parent_ssh_uri, parse_ssh_uri, remote_async_poll, remote_async_submit, remote_readdir,
+    remote_stat, remote_ui_async_enabled
 }
 use @ext_document.{
     Buffer, BufferId, CompletionItem, CompletionPopup, EditorWorld, InlineGhostText, Pos,
@@ -57,6 +58,7 @@ pub struct CmpService {
     pub bg_word_cache: HashMap,
     pub cached_path_dir: String,
     pub cached_path_entries: List,
+    pub remote_path_loading_key: String,
     pub suppress_next_hook: bool,
 }
 
@@ -294,6 +296,15 @@ fn collect_path_candidates(
         let cache_key = search_dir ++ (if show_hidden { "#1" } else { "#0" })
         let ritems = if cmp != null and cmp.as(CmpService).cached_path_dir == cache_key {
             cmp.as(CmpService).cached_path_entries
+        } else if remote_ui_async_enabled() {
+            if cmp != null {
+                let c = cmp.as(CmpService)
+                if c.remote_path_loading_key != cache_key {
+                    c.remote_path_loading_key = cache_key
+                    let _ = remote_async_submit("cmp.readdir", "readdir", [search_dir, show_hidden])
+                }
+            }
+            return List()
         } else {
             let fetched! = remote_readdir(search_dir, show_hidden = show_hidden) else {
                 return List()
@@ -684,6 +695,24 @@ fn get_cached_buf_sym_index(buf: Buffer) -> CachedBufSymIndex {
             if prev.line_count == lcount
                 and (not prev.decl_rows.contains(cur_row.to_string()))
                 and (not line_may_declare_symbol(buf.line_at(cur_row))) {
+                prev.edit_version = buf.edit_version
+                return prev
+            }
+            if lcount == prev.line_count + 1
+                and cur_row >= 1
+                and (not prev.decl_rows.contains((cur_row - 1).to_string()))
+                and (not line_may_declare_symbol(buf.line_at(cur_row - 1)))
+                and (not line_may_declare_symbol(buf.line_at(cur_row))) {
+                let shifted_decl_rows = Map.new()
+                for si in 0..prev.ordered.len() {
+                    let sm = prev.ordered.get(si.as(usize)).as(BufSymMeta)
+                    if sm.row >= cur_row {
+                        sm.row += 1
+                    }
+                    shifted_decl_rows.set(sm.row.to_string(), true)
+                }
+                prev.decl_rows = shifted_decl_rows
+                prev.line_count = lcount
                 prev.edit_version = buf.edit_version
                 return prev
             }
@@ -1726,6 +1755,12 @@ fn has_member_trigger_before(buf: Buffer, row: i64, col: i64) -> bool {
     false
 }
 
+private global _last_sig_buf_raw: i64 = -1
+private global _last_sig_edit_ver: i64 = -1
+private global _last_sig_row: i64 = -1
+private global _last_sig_col: i64 = -1
+private global _last_sig_prov_len: i64 = -1
+
 impl CmpService {
     pub fn new() -> CmpService {
         CmpService {
@@ -1739,6 +1774,7 @@ impl CmpService {
             bg_word_cache: HashMap.new(),
             cached_path_dir: "",
             cached_path_entries: List(),
+            remote_path_loading_key: "",
             suppress_next_hook: false,
         }
     }
@@ -1976,6 +2012,7 @@ impl CmpService {
 
     pub fn update_signature_help(self, _kernel: SystemKernel, world: EditorWorld) {
         if not self.enabled {
+            _last_sig_buf_raw = -1
             if world.signature_help.owner == OWNER_CMP or world.signature_help.owner == "" {
                 world.signature_help = SignatureHelpPopup.inactive()
             }
@@ -1983,10 +2020,24 @@ impl CmpService {
         }
         let buf = world.active_buffer()
         if buf.read_only {
+            _last_sig_buf_raw = -1
             world.signature_help = SignatureHelpPopup.inactive()
             return
         }
         let p = buf.clamp_pos(buf.point, insert_mode = true)
+        let prov_len = self.sig_providers.len()
+        if _last_sig_buf_raw == buf.id.raw()
+            and _last_sig_edit_ver == buf.edit_version
+            and _last_sig_row == p.row
+            and _last_sig_col == p.col
+            and _last_sig_prov_len == prov_len {
+            return
+        }
+        _last_sig_buf_raw = buf.id.raw()
+        _last_sig_edit_ver = buf.edit_version
+        _last_sig_row = p.row
+        _last_sig_col = p.col
+        _last_sig_prov_len = prov_len
         if is_cursor_in_code_line_comment(buf, p.row, p.col) {
             if world.signature_help.owner == OWNER_CMP or world.signature_help.owner == "" {
                 world.signature_help = SignatureHelpPopup.inactive()
@@ -2095,6 +2146,7 @@ impl CmpService {
 
     pub fn dismiss_all(self, world: EditorWorld) -> bool {
         let was_active = self.dismiss(world)
+        _last_sig_buf_raw = -1
         self.cached_path_dir = ""
         self.cached_path_entries = List()
         if world.signature_help.owner == OWNER_CMP or world.signature_help.owner == "" {
@@ -2693,6 +2745,44 @@ pub fn register_cmp_extension(kernel: SystemKernel) -> !String Unit {
                     if cmp_opt != null and w_opt != null {
                         let _ = cmp_opt.as(CmpService).dismiss_all(w_opt.as(EditorWorld))
                     }
+                },
+            )
+
+            k.add_hook(
+                "timer-tick",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| -> Unit {
+                    let cmp_opt = kern.service(SERVICE_CMP)
+                    if cmp_opt == null {
+                        return ()
+                    }
+                    let c = cmp_opt.as(CmpService)
+                    if c.remote_path_loading_key == "" {
+                        return ()
+                    }
+                    let rp = remote_async_poll("cmp.readdir")
+                    if rp.status == "ready" {
+                        let done_key = c.remote_path_loading_key
+                        c.remote_path_loading_key = ""
+                        c.cached_path_dir = done_key
+                        c.cached_path_entries = decode_remote_readdir_items(rp.payload)
+                        let w_opt = kern.service("lava.document.world")
+                        let v_opt = kern.service(SERVICE_VIM)
+                        if w_opt != null and v_opt != null {
+                            let w = w_opt.as(EditorWorld)
+                            let vs = v_opt.as(VimState)
+                            if c.enabled and vs.mode == VimMode.insert and (not vs.block_insert_active) {
+                                let _ = c.trigger(kern, manual = false) ! { _ => false }
+                                w.remote_tick_dirty = true
+                            }
+                        }
+                    } else if rp.status == "error" {
+                        let done_key = c.remote_path_loading_key
+                        c.remote_path_loading_key = ""
+                        c.cached_path_dir = done_key
+                        c.cached_path_entries = List()
+                    }
+                    ()
                 },
             )
 

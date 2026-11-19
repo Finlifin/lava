@@ -2566,6 +2566,7 @@ pub struct EditorWorld {
     pub floating_window_cursor: HashMap,
     pub in_key_burst: bool,
     pub lsp_tick_dirty: bool,
+    pub remote_tick_dirty: bool,
 }
 
 impl EditorWorld {
@@ -2657,6 +2658,7 @@ impl EditorWorld {
             floating_window_cursor: HashMap.new(),
             in_key_burst: false,
             lsp_tick_dirty: false,
+            remote_tick_dirty: false,
         }
     }
 

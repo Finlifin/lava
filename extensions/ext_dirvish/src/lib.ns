@@ -18,6 +18,7 @@ use std.fs
 use std.fs.DirEntry
 use std.io.{File, SeekFrom}
 use std.path
+use std.time
 use @lava_sys.{rgb, rgba}
 use @lava_core.{
     ExtId, InteractiveEffects, PromptKind, PromptRequest, SystemKernel, ask_prompt, clipboard_set,
@@ -25,10 +26,15 @@ use @lava_core.{
 }
 use @lava_accel.{GitFileEntry, OrderlessHit, accel_git_status, accel_orderless_rank, accel_workspace_files}
 use @lava_remote.{
-    RemoteDirItem, RemoteGitFileEntry, is_ssh_uri, join_ssh_uri, normalize_ssh_uri, parent_ssh_uri,
-    parse_ssh_uri, remote_copy, remote_git_status, remote_host_available, remote_mkdir,
-    remote_read_lines, remote_read_preview, remote_readdir, remote_remove, remote_rename,
-    remote_search_files, remote_stat, remote_write_lines, ssh_uri_basename
+    RemoteDirItem, RemoteDirSnap, RemoteGitFileEntry, RemoteGitStatus, RemoteRankedFile,
+    RemoteRankedFiles, RemoteSnapChild, RemoteSnapEntry, RemoteSnapParent, RemoteSnapPreview,
+    decode_remote_dir_snap, decode_remote_ranked_files, decode_remote_snap_preview, is_ssh_uri,
+    join_ssh_uri, normalize_ssh_uri, parent_ssh_uri, parse_ssh_uri, remote_async_cancel,
+    remote_async_poll, remote_async_submit, remote_copy, remote_dir_snapshot, remote_entry_preview,
+    remote_git_status, remote_host_available, remote_mkdir, remote_read_lines,
+    remote_read_preview_window, remote_readdir, remote_remove, remote_rename, remote_search_files,
+    remote_search_files_ranked, remote_shimmer_bar, remote_spinner_frame, remote_stat,
+    remote_ui_async_enabled, remote_write_lines, ssh_uri_basename
 }
 use @ext_document.{
     Buffer, BufferId, BufferKind, EditorWorld, Pos, RegisterValue, detect_major_mode,
@@ -74,7 +80,27 @@ pub struct DirvishPreviewCacheEntry {
     pub kind: String,
     pub major_mode: String,
     pub lines: List,
+    pub child_is_dir: List,
 }
+
+pub struct RemoteDirCacheEntry {
+    pub fetched_ms: i64,
+    pub items: List,
+}
+
+pub struct RemoteGitCacheEntry {
+    pub fetched_ms: i64,
+    pub status: RemoteGitStatus,
+}
+
+pub struct RemoteSnapCacheEntry {
+    pub fetched_ms: i64,
+    pub snap: RemoteDirSnap,
+}
+
+const REMOTE_DIR_CACHE_TTL_MS: i64 = 5000
+const REMOTE_GIT_CACHE_TTL_MS: i64 = 5000
+const REMOTE_SNAP_CACHE_TTL_MS: i64 = 5000
 
 pub struct DirvishState {
     pub current_dir: String,
@@ -94,6 +120,26 @@ pub struct DirvishState {
     pub cursor_by_dir: HashMap,
     pub preview_cache: HashMap,
     pub preview_cache_order: List,
+    pub remote_dir_cache: HashMap,
+    pub remote_dir_cache_order: List,
+    pub remote_git_cache: HashMap,
+    pub remote_snap_cache: HashMap,
+    pub remote_snap_cache_order: List,
+    pub remote_snap_loaded_dir: String,
+    pub remote_snap_loading: bool,
+    pub remote_snap_key: String,
+    pub remote_snap_focus: String,
+    pub remote_snap_pref_row: i64,
+    pub remote_preview_loading: bool,
+    pub remote_preview_key: String,
+    pub remote_preview_uri: String,
+    pub remote_preview_is_symlink: bool,
+    pub remote_preview_is_exec: bool,
+    pub remote_preview_size: i64,
+    pub remote_fd_loading: bool,
+    pub remote_fd_total_indexed: i64,
+    pub remote_fd_total_matched: i64,
+    pub remote_git_branch: String,
     pub fd_mode: bool,
     pub fd_root: String,
     pub fd_pattern: String,
@@ -120,11 +166,39 @@ impl DirvishState {
             cursor_by_dir: HashMap.new(),
             preview_cache: HashMap.new(),
             preview_cache_order: List(),
+            remote_dir_cache: HashMap.new(),
+            remote_dir_cache_order: List(),
+            remote_git_cache: HashMap.new(),
+            remote_snap_cache: HashMap.new(),
+            remote_snap_cache_order: List(),
+            remote_snap_loaded_dir: "",
+            remote_snap_loading: false,
+            remote_snap_key: "",
+            remote_snap_focus: "",
+            remote_snap_pref_row: 0,
+            remote_preview_loading: false,
+            remote_preview_key: "",
+            remote_preview_uri: "",
+            remote_preview_is_symlink: false,
+            remote_preview_is_exec: false,
+            remote_preview_size: 0,
+            remote_fd_loading: false,
+            remote_fd_total_indexed: 0,
+            remote_fd_total_matched: 0,
+            remote_git_branch: "",
             fd_mode: false,
             fd_root: "",
             fd_pattern: "",
             fd_all_entries: List(),
         }
+    }
+
+    pub fn invalidate_remote_caches(self) {
+        self.remote_dir_cache.clear()
+        self.remote_dir_cache_order = List()
+        self.remote_git_cache.clear()
+        self.remote_snap_cache.clear()
+        self.remote_snap_cache_order = List()
     }
 
     pub fn record_history(self, dir_path: String) {
@@ -475,15 +549,68 @@ fn normalize_git_badge(idx_st: String, wt_st: String) -> String {
     " "
 }
 
-fn collect_dir_git_badges(dir_path: String) -> HashMap {
+fn lookup_cached_remote_git(state: DirvishState, dir_clean: String, now_ms: i64) -> ?RemoteGitStatus {
+    let direct_opt = state.remote_git_cache.get(dir_clean)
+    if direct_opt != null {
+        let ent = direct_opt.as(RemoteGitCacheEntry)
+        if now_ms - ent.fetched_ms <= REMOTE_GIT_CACHE_TTL_MS {
+            return ent.status
+        }
+    }
+    var probe = dir_clean
+    var depth: i64 = 0
+    while depth < 12 and not is_dir_root_path(probe) {
+        let par = any_parent_dir(probe)
+        if par == "" or par == probe {
+            break
+        }
+        probe = par
+        let anc_opt = state.remote_git_cache.get(probe)
+        if anc_opt != null {
+            let ent = anc_opt.as(RemoteGitCacheEntry)
+            if now_ms - ent.fetched_ms <= REMOTE_GIT_CACHE_TTL_MS {
+                return ent.status
+            }
+        }
+        depth += 1
+    }
+    null
+}
+
+fn collect_dir_git_badges(dir_path: String, .state: ?DirvishState = null) -> HashMap {
     let badges = HashMap.new()
     if is_ssh_uri(dir_path) {
-        let rsum = remote_git_status(dir_path) ! { _ => return badges }
+        let dir_clean = clean_dir_path(dir_path, "/")
+        let now_ms = time.unix_millis()
+        let cached_opt = if state != null {
+            lookup_cached_remote_git(state.as(DirvishState), dir_clean, now_ms)
+        } else {
+            null
+        }
+        let rsum = if cached_opt != null {
+            cached_opt.as(RemoteGitStatus)
+        } else {
+            let fetched = remote_git_status(dir_path) ! { _ => return badges }
+            if state != null {
+                let st = state.as(DirvishState)
+                if st.remote_git_cache.len() >= 32 {
+                    st.remote_git_cache.clear()
+                }
+                let ce = RemoteGitCacheEntry {
+                    fetched_ms: now_ms,
+                    status: fetched,
+                }
+                st.remote_git_cache.insert(dir_clean, ce)
+                if fetched.is_repo and fetched.root != "" {
+                    st.remote_git_cache.insert(clean_dir_path(fetched.root, "/"), ce)
+                }
+            }
+            fetched
+        }
         if not rsum.is_repo {
             return badges
         }
         let repo_root = clean_dir_path(rsum.root, "/")
-        let dir_clean = clean_dir_path(dir_path, "/")
         var rel_prefix = ""
         if dir_clean == repo_root {
             rel_prefix = ""
@@ -638,6 +765,39 @@ fn sort_dirvish_entries(entries: List, sort_by: String, sort_reverse: bool) {
     }
 }
 
+fn cached_remote_readdir(
+    state: ?DirvishState,
+    dir_path: String,
+    show_hidden: bool,
+) -> !String List {
+    if state == null {
+        return remote_readdir(dir_path, show_hidden = show_hidden)!
+    }
+    let st = state.as(DirvishState)
+    let key = clean_dir_path(dir_path, "/") ++ "\n" ++ show_hidden.to_string()
+    let now_ms = time.unix_millis()
+    let cached_opt = st.remote_dir_cache.get(key)
+    if cached_opt != null {
+        let ent = cached_opt.as(RemoteDirCacheEntry)
+        if now_ms - ent.fetched_ms <= REMOTE_DIR_CACHE_TTL_MS {
+            return ent.items
+        }
+    }
+    let ritems = remote_readdir(dir_path, show_hidden = show_hidden)!
+    if not st.remote_dir_cache.contains_key(key) {
+        if st.remote_dir_cache_order.len() >= 64 {
+            let oldest = st.remote_dir_cache_order.remove(0).as(String)
+            let _ = st.remote_dir_cache.remove(oldest)
+        }
+        st.remote_dir_cache_order.push(key)
+    }
+    st.remote_dir_cache.insert(key, RemoteDirCacheEntry {
+        fetched_ms: now_ms,
+        items: ritems,
+    })
+    ritems
+}
+
 fn scan_directory_entries(
     dir_path: String,
     show_hidden: bool,
@@ -645,11 +805,12 @@ fn scan_directory_entries(
     sort_by: String,
     sort_reverse: bool,
     include_git: bool,
+    .state: ?DirvishState = null,
 ) -> !String List {
     if is_ssh_uri(dir_path) {
-        let ritems = remote_readdir(dir_path, show_hidden = show_hidden)!
+        let ritems = cached_remote_readdir(state, dir_path, show_hidden)!
         let git_badges = if include_git {
-            collect_dir_git_badges(dir_path)
+            collect_dir_git_badges(dir_path, state = state)
         } else {
             HashMap.new()
         }
@@ -828,6 +989,15 @@ fn render_parent_buffer(world: EditorWorld, state: DirvishState) -> Buffer {
     parent_buf.read_only = false
     parent_buf.clear_owner_decors(DIRVISH_DECOR_OWNER)
 
+    if not state.miller_mode {
+        parent_buf.major_mode = "dirvish-parent-hidden"
+        parent_buf.file_path = ""
+        parent_buf.point = Pos.zero()
+        parent_buf.modified = false
+        parent_buf.read_only = true
+        return parent_buf
+    }
+
     if is_dir_root_path(state.current_dir) {
         state.parent_entries = List()
         parent_buf.file_path = ""
@@ -852,20 +1022,46 @@ fn render_parent_buffer(world: EditorWorld, state: DirvishState) -> Buffer {
 
     let cur_base = any_basename(state.current_dir)
 
-    -- Always include `cur_base` even if it starts with `.` and `show_hidden` is false
-    let show_dots = state.show_hidden or cur_base.starts_with(".")
-    let p_entries = scan_directory_entries(
-        parent_dir,
-        show_dots,
-        "",
-        "name",
-        false,
-        false,
-    ) ! { _ => List() }
-    state.parent_entries = p_entries
+    let p_entries = if is_ssh_uri(state.current_dir) {
+        if (not state.parent_entries.is_empty()) or state.remote_snap_loading or remote_ui_async_enabled() {
+            state.parent_entries
+        } else {
+            let show_dots = state.show_hidden or cur_base.starts_with(".")
+            let scanned = scan_directory_entries(
+                parent_dir,
+                show_dots,
+                "",
+                "name",
+                false,
+                false,
+                state = state,
+            ) ! { _ => List() }
+            state.parent_entries = scanned
+            scanned
+        }
+    } else {
+        -- Always include `cur_base` even if it starts with `.` and `show_hidden` is false
+        let show_dots = state.show_hidden or cur_base.starts_with(".")
+        let scanned = scan_directory_entries(
+            parent_dir,
+            show_dots,
+            "",
+            "name",
+            false,
+            false,
+            state = state,
+        ) ! { _ => List() }
+        state.parent_entries = scanned
+        scanned
+    }
 
     let lines = List()
-    let hdr = " " ++ abbreviate_path(parent_dir)
+    let p_spin = if is_ssh_uri(state.current_dir) and state.remote_snap_loading and p_entries.is_empty() {
+        " " ++ remote_spinner_frame()
+    } else {
+        ""
+    }
+    let hdr = " " ++ abbreviate_path(parent_dir) ++ p_spin
     lines.push(hdr)
 
     var active_row: i64 = 0
@@ -975,7 +1171,6 @@ fn entry_icon(ent: DirvishEntry) -> String {
 }
 
 fn format_center_header(state: DirvishState) -> String {
-    let count_tag = "[" ++ state.entries.len().to_string() ++ "]"
     let hidden_tag = if state.show_hidden { "  ·hidden" } else { "" }
     let ring_tag = if not state.yank_ring.is_empty() {
         "  " ++ state.yank_mode ++ ":" ++ state.yank_ring.len().to_string()
@@ -983,9 +1178,20 @@ fn format_center_header(state: DirvishState) -> String {
         ""
     }
     if state.fd_mode {
+        let count_tag = if is_ssh_uri(state.fd_root) and state.remote_fd_total_indexed > 0 {
+            "[" ++ state.remote_fd_total_matched.to_string() ++ "/" ++ state.remote_fd_total_indexed.to_string() ++ "]"
+        } else {
+            "[" ++ state.entries.len().to_string() ++ "]"
+        }
+        let spin_tag = if state.remote_fd_loading {
+            "  " ++ remote_spinner_frame() ++ " Searching server..."
+        } else {
+            ""
+        }
         let pat_lbl = if state.fd_pattern != "" { state.fd_pattern } else { "*" }
-        return "   fd " ++ abbreviate_path(state.fd_root) ++ "  " ++ count_tag ++ "  fd:" ++ pat_lbl ++ hidden_tag ++ ring_tag
+        return "   fd " ++ abbreviate_path(state.fd_root) ++ "  " ++ count_tag ++ "  fd:" ++ pat_lbl ++ hidden_tag ++ ring_tag ++ spin_tag
     }
+    let count_tag = "[" ++ state.entries.len().to_string() ++ "]"
     let sort_arrow = if state.sort_reverse { "↓" } else { "↑" }
     let sort_tag = "sort:" ++ state.sort_by ++ " " ++ sort_arrow
     let filter_tag = if state.filter_query != "" {
@@ -993,7 +1199,17 @@ fn format_center_header(state: DirvishState) -> String {
     } else {
         ""
     }
-    "   " ++ abbreviate_path(state.current_dir) ++ "  " ++ count_tag ++ "  " ++ sort_tag ++ hidden_tag ++ filter_tag ++ ring_tag
+    let git_tag = if is_ssh_uri(state.current_dir) and state.remote_git_branch != "" {
+        "   " ++ state.remote_git_branch
+    } else {
+        ""
+    }
+    let spin_tag = if state.remote_snap_loading {
+        "  " ++ remote_spinner_frame() ++ " Refreshing..."
+    } else {
+        ""
+    }
+    "   " ++ abbreviate_path(state.current_dir) ++ "  " ++ count_tag ++ git_tag ++ "  " ++ sort_tag ++ hidden_tag ++ filter_tag ++ ring_tag ++ spin_tag
 }
 
 fn render_center_buffer(
@@ -1017,7 +1233,44 @@ fn render_center_buffer(
     lines.push(header)
 
     if state.entries.is_empty() {
-        let empty_msg = if state.filter_query != "" {
+        let is_loading = (state.fd_mode and state.remote_fd_loading)
+            or ((not state.fd_mode) and state.remote_snap_loading)
+        if is_loading {
+            let spin_line = "    " ++ remote_spinner_frame() ++ " Fetching render snapshot from lava-server..."
+            let bar_line = "    " ++ remote_shimmer_bar(width = 22)
+            lines.push(spin_line)
+            lines.push(bar_line)
+            buf.set_lines(lines, record_undo = false)
+            buf.add_inline_decor(
+                DIRVISH_DECOR_OWNER,
+                0,
+                0,
+                header.char_len(),
+                bg_rgba = color_header_bg(),
+                fg_rgba = color_accent_blue(),
+            )
+            buf.add_inline_decor(
+                DIRVISH_DECOR_OWNER,
+                1,
+                0,
+                spin_line.char_len(),
+                fg_rgba = color_accent_blue(),
+            )
+            buf.add_inline_decor(
+                DIRVISH_DECOR_OWNER,
+                2,
+                0,
+                bar_line.char_len(),
+                fg_rgba = color_muted_gray(),
+            )
+            buf.point = Pos.new(1, 4)
+            buf.modified = false
+            buf.read_only = true
+            return buf
+        }
+        let empty_msg = if state.fd_mode and state.fd_pattern != "" {
+            "    (no matches for '" ++ state.fd_pattern ++ "')"
+        } else if state.filter_query != "" {
             "    (no entries matching filter '" ++ state.filter_query ++ "')"
         } else {
             "    (empty directory)"
@@ -1291,6 +1544,145 @@ fn cache_dirvish_preview(state: DirvishState, key: String, entry: DirvishPreview
     state.preview_cache.insert(key, entry)
 }
 
+fn preview_cache_key_for_entry(ent: DirvishEntry, show_hidden: bool) -> String {
+    if ent.is_dir {
+        return "dir:" ++ ent.full_path ++ "\n" ++ show_hidden.to_string()
+    }
+    ent.full_path ++ "\n" ++ ent.modified_unix_secs.to_string() ++ ":" ++ ent.size.to_string()
+}
+
+fn build_preview_cache_from_remote_snap(
+    pv: RemoteSnapPreview,
+    full_uri: String,
+    is_symlink: bool,
+    is_exec: bool,
+    fallback_size: i64,
+) -> DirvishPreviewCacheEntry {
+    if pv.kind == "dir" {
+        let disp_name = if pv.target_name != "" { pv.target_name } else { any_basename(full_uri) }
+        let hdr = "   " ++ disp_name ++ "/  (" ++ pv.total_count.to_string() ++ " items)"
+        let lines = List()
+        lines.push(hdr)
+        let dir_flags = List()
+        let shown = pv.child_entries.len()
+        if pv.total_count == 0 or shown == 0 {
+            lines.push("    (empty directory)")
+        } else {
+            for i in 0..shown {
+                let ch = pv.child_entries.get(i.as(usize)).as(RemoteSnapChild)
+                dir_flags.push(ch.is_dir)
+                if ch.is_dir {
+                    let ch_icon = if ch.is_symlink { " " } else { " " }
+                    lines.push("  " ++ ch_icon ++ ch.name ++ "/")
+                } else {
+                    let dname = if ch.name.char_len() > 26 {
+                        ch.name.take(23) ++ "..."
+                    } else {
+                        ch.name
+                    }
+                    let fake_ent = DirvishEntry {
+                        name: ch.name,
+                        full_path: "",
+                        is_dir: false,
+                        is_symlink: ch.is_symlink,
+                        is_exec: false,
+                        size: ch.size,
+                        modified_unix_secs: 0,
+                        symlink_target: "",
+                        git_badge: " ",
+                        perms: "-rw-r--r--",
+                    }
+                    let cicon = entry_icon(fake_ent)
+                    lines.push("  " ++ cicon ++ " " ++ pad_right(dname, 26) ++ "  " ++ format_human_size(ch.size))
+                }
+            }
+            if pv.total_count > shown {
+                lines.push("    ... (" ++ (pv.total_count - shown).to_string() ++ " more items)")
+            }
+        }
+        return (DirvishPreviewCacheEntry {
+            kind: "dir_snap",
+            major_mode: "dirvish-preview",
+            lines: lines,
+            child_is_dir: dir_flags,
+        })
+    }
+    if pv.kind == "binary" {
+        let mode_oct = if is_symlink {
+            "120777"
+        } else if is_exec {
+            "100755"
+        } else {
+            "100644"
+        }
+        let sz_val = if pv.total_size > 0 { pv.total_size } else { fallback_size }
+        let bin_msg = "[Binary file — " ++ format_human_size(sz_val).trim() ++ ", mode " ++ mode_oct ++ "]"
+        return (DirvishPreviewCacheEntry {
+            kind: "binary",
+            major_mode: "text",
+            lines: [bin_msg],
+            child_is_dir: List(),
+        })
+    }
+    if pv.kind == "text" {
+        let plines = if pv.lines.is_empty() { [""] } else { pv.lines }
+        return (DirvishPreviewCacheEntry {
+            kind: "text",
+            major_mode: detect_major_mode(full_uri),
+            lines: plines,
+            child_is_dir: List(),
+        })
+    }
+    return (DirvishPreviewCacheEntry {
+        kind: "unreadable",
+        major_mode: "text",
+        lines: ["  [Unable to read remote entry]"],
+        child_is_dir: List(),
+    })
+}
+
+fn apply_cached_dir_preview_to_buf(preview_buf: Buffer, cached: DirvishPreviewCacheEntry) {
+    preview_buf.major_mode = "dirvish-preview"
+    preview_buf.set_lines(cached.lines, record_undo = false)
+    if not cached.lines.is_empty() {
+        let hdr = cached.lines.get(0).as(String)
+        preview_buf.add_inline_decor(
+            DIRVISH_DECOR_OWNER,
+            0,
+            0,
+            hdr.char_len(),
+            bg_rgba = color_header_bg(),
+            fg_rgba = color_accent_blue(),
+        )
+    }
+    let limit = cached.child_is_dir.len()
+    for i in 0..limit {
+        let row = i + 1
+        if row >= preview_buf.line_count() {
+            break
+        }
+        let is_d = cached.child_is_dir.get(i.as(usize)).as(bool)
+        let llen = preview_buf.line_char_len(row)
+        if is_d {
+            preview_buf.add_inline_decor(
+                DIRVISH_DECOR_OWNER,
+                row,
+                0,
+                llen,
+                fg_rgba = color_accent_blue(),
+            )
+        } else if llen >= 8 {
+            preview_buf.add_inline_decor(
+                DIRVISH_DECOR_OWNER,
+                row,
+                llen - 6,
+                llen,
+                fg_rgba = color_muted_gray(),
+            )
+        }
+    }
+}
+
 fn render_preview_buffer(world: EditorWorld, state: DirvishState, center_buf: Buffer) -> Buffer {
     let preview_buf = ensure_dirvish_buffer(
         world,
@@ -1302,19 +1694,50 @@ fn render_preview_buffer(world: EditorWorld, state: DirvishState, center_buf: Bu
     preview_buf.read_only = false
     preview_buf.clear_owner_decors(DIRVISH_DECOR_OWNER)
 
+    if not state.miller_mode {
+        preview_buf.major_mode = "dirvish-preview-hidden"
+        preview_buf.file_path = ""
+        preview_buf.point = Pos.zero()
+        preview_buf.modified = false
+        preview_buf.read_only = true
+        return preview_buf
+    }
+
     let ent_opt = entry_at_cursor(state, center_buf)
     if ent_opt == null {
         preview_buf.major_mode = "dirvish-preview"
         preview_buf.file_path = ""
-        let msg = "  [No entry selected]"
-        preview_buf.set_lines([msg], record_undo = false)
-        preview_buf.add_inline_decor(
-            DIRVISH_DECOR_OWNER,
-            0,
-            0,
-            msg.char_len(),
-            fg_rgba = color_muted_gray(),
-        )
+        let is_loading = (state.fd_mode and state.remote_fd_loading)
+            or ((not state.fd_mode) and state.remote_snap_loading)
+        if is_loading {
+            let l0 = "  " ++ remote_spinner_frame() ++ " Waiting for remote snapshot..."
+            let l1 = "  " ++ remote_shimmer_bar(width = 20)
+            preview_buf.set_lines([l0, l1], record_undo = false)
+            preview_buf.add_inline_decor(
+                DIRVISH_DECOR_OWNER,
+                0,
+                0,
+                l0.char_len(),
+                fg_rgba = color_accent_blue(),
+            )
+            preview_buf.add_inline_decor(
+                DIRVISH_DECOR_OWNER,
+                1,
+                0,
+                l1.char_len(),
+                fg_rgba = color_muted_gray(),
+            )
+        } else {
+            let msg = "  [No entry selected]"
+            preview_buf.set_lines([msg], record_undo = false)
+            preview_buf.add_inline_decor(
+                DIRVISH_DECOR_OWNER,
+                0,
+                0,
+                msg.char_len(),
+                fg_rgba = color_muted_gray(),
+            )
+        }
         preview_buf.point = Pos.zero()
         preview_buf.modified = false
         preview_buf.read_only = true
@@ -1323,6 +1746,94 @@ fn render_preview_buffer(world: EditorWorld, state: DirvishState, center_buf: Bu
 
     let ent = ent_opt.as(DirvishEntry)
     preview_buf.file_path = ""
+
+    if is_ssh_uri(ent.full_path) {
+        let rkey = preview_cache_key_for_entry(ent, state.show_hidden)
+        let rcached_opt = state.preview_cache.get(rkey)
+        if rcached_opt == null {
+            if remote_ui_async_enabled() {
+                if state.remote_preview_key != rkey or (not state.remote_preview_loading) {
+                    state.remote_preview_key = rkey
+                    state.remote_preview_uri = ent.full_path
+                    state.remote_preview_is_symlink = ent.is_symlink
+                    state.remote_preview_is_exec = ent.is_exec
+                    state.remote_preview_size = ent.size
+                    state.remote_preview_loading = true
+                    let _ = remote_async_submit(
+                        "dirvish.preview",
+                        "entry_preview",
+                        [ent.full_path, ent.is_dir, state.show_hidden, 100, 8192],
+                    )
+                }
+                preview_buf.major_mode = "dirvish-preview"
+                let spin_hdr = "  " ++ remote_spinner_frame() ++ " Previewing " ++ ent.name ++ (if ent.is_dir { "/" } else { "" })
+                let bar_row = "  " ++ remote_shimmer_bar(width = 22)
+                preview_buf.set_lines([spin_hdr, bar_row], record_undo = false)
+                preview_buf.add_inline_decor(
+                    DIRVISH_DECOR_OWNER,
+                    0,
+                    0,
+                    spin_hdr.char_len(),
+                    bg_rgba = color_header_bg(),
+                    fg_rgba = color_accent_blue(),
+                )
+                preview_buf.add_inline_decor(
+                    DIRVISH_DECOR_OWNER,
+                    1,
+                    0,
+                    bar_row.char_len(),
+                    fg_rgba = color_muted_gray(),
+                )
+                preview_buf.point = Pos.zero()
+                preview_buf.modified = false
+                preview_buf.read_only = true
+                return preview_buf
+            }
+            let built = remote_entry_preview(
+                ent.full_path,
+                ent.is_dir,
+                show_hidden = state.show_hidden,
+                max_lines = 100,
+                max_bytes = 8192,
+            ) match {
+                pv! => build_preview_cache_from_remote_snap(
+                    pv,
+                    ent.full_path,
+                    ent.is_symlink,
+                    ent.is_exec,
+                    ent.size,
+                ),
+                error _ => DirvishPreviewCacheEntry {
+                    kind: "unreadable",
+                    major_mode: "text",
+                    lines: ["  [Unable to read remote entry]"],
+                    child_is_dir: List(),
+                },
+            }
+            cache_dirvish_preview(state, rkey, built)
+        }
+        let resolved_remote = state.preview_cache.get(rkey).as(DirvishPreviewCacheEntry)
+        if resolved_remote.kind == "dir_snap" {
+            apply_cached_dir_preview_to_buf(preview_buf, resolved_remote)
+        } else {
+            preview_buf.major_mode = resolved_remote.major_mode
+            preview_buf.set_lines(resolved_remote.lines, record_undo = false)
+            if resolved_remote.kind == "binary" and (not resolved_remote.lines.is_empty()) {
+                let bin_hdr = resolved_remote.lines.get(0).as(String)
+                preview_buf.add_inline_decor(
+                    DIRVISH_DECOR_OWNER,
+                    0,
+                    0,
+                    bin_hdr.char_len(),
+                    fg_rgba = color_mark_yellow(),
+                )
+            }
+        }
+        preview_buf.point = Pos.zero()
+        preview_buf.modified = false
+        preview_buf.read_only = true
+        return preview_buf
+    }
 
     if ent.is_dir {
         preview_buf.major_mode = "dirvish-preview"
@@ -1333,6 +1844,7 @@ fn render_preview_buffer(world: EditorWorld, state: DirvishState, center_buf: Bu
             "name",
             false,
             false,
+            state = state,
         ) ! { _ => null }
         let children? = children_maybe else {
             preview_buf.set_lines(["  [Directory unreadable]"], record_undo = false)
@@ -1405,7 +1917,7 @@ fn render_preview_buffer(world: EditorWorld, state: DirvishState, center_buf: Bu
         return preview_buf
     }
 
-    -- Regular file / symlink preview: inspect up to 8 KiB (`8192` bytes) and `120` lines
+    -- Regular local file / symlink preview: inspect up to 8 KiB (`8192` bytes) and `120` lines
     let mode_oct = if ent.is_symlink {
         "120777"
     } else if ent.is_exec {
@@ -1414,49 +1926,17 @@ fn render_preview_buffer(world: EditorWorld, state: DirvishState, center_buf: Bu
         "100644"
     }
 
-    let (eff_mtime, eff_size) = if is_ssh_uri(ent.full_path) {
-        (ent.modified_unix_secs, ent.size)
+    let meta_opt: ?fs.FileMetadata = fs.metadata(ent.full_path) ! { _ => null }
+    let (eff_mtime, eff_size) = if meta_opt != null {
+        let m = meta_opt.as(fs.FileMetadata)
+        (m.modified_unix_secs, m.size)
     } else {
-        let meta_opt: ?fs.FileMetadata = fs.metadata(ent.full_path) ! { _ => null }
-        if meta_opt != null {
-            let m = meta_opt.as(fs.FileMetadata)
-            (m.modified_unix_secs, m.size)
-        } else {
-            (ent.modified_unix_secs, ent.size)
-        }
+        (ent.modified_unix_secs, ent.size)
     }
     let cache_key = ent.full_path ++ "\n" ++ eff_mtime.to_string() ++ ":" ++ eff_size.to_string()
     let cached_opt = state.preview_cache.get(cache_key)
     let resolved_preview = if cached_opt != null {
         cached_opt.as(DirvishPreviewCacheEntry)
-    } else if is_ssh_uri(ent.full_path) {
-        let built = remote_read_preview(ent.full_path, max_bytes = 8192, max_lines = 120) match {
-            pv! => {
-                if pv.is_binary {
-                    let sz_val = if pv.total_size > 0 { pv.total_size } else { eff_size }
-                    let bin_msg = "[Binary file — " ++ format_human_size(sz_val).trim() ++ ", mode " ++ mode_oct ++ "]"
-                    DirvishPreviewCacheEntry {
-                        kind: "binary",
-                        major_mode: "text",
-                        lines: [bin_msg],
-                    }
-                } else {
-                    let plines = if pv.lines.is_empty() { [""] } else { pv.lines }
-                    DirvishPreviewCacheEntry {
-                        kind: "text",
-                        major_mode: detect_major_mode(ent.full_path),
-                        lines: plines,
-                    }
-                }
-            },
-            error _ => DirvishPreviewCacheEntry {
-                kind: "unreadable",
-                major_mode: "text",
-                lines: ["[Unable to read remote file]"],
-            },
-        }
-        cache_dirvish_preview(state, cache_key, built)
-        built
     } else {
         let built = inspect_preview_file_single_open(ent.full_path) match {
             res! => {
@@ -1467,12 +1947,14 @@ fn render_preview_buffer(world: EditorWorld, state: DirvishState, center_buf: Bu
                         kind: "binary",
                         major_mode: "text",
                         lines: [bin_msg],
+                        child_is_dir: List(),
                     }
                 } else {
                     DirvishPreviewCacheEntry {
                         kind: "text",
                         major_mode: detect_major_mode(ent.full_path),
                         lines: plines,
+                        child_is_dir: List(),
                     }
                 }
             },
@@ -1480,6 +1962,7 @@ fn render_preview_buffer(world: EditorWorld, state: DirvishState, center_buf: Bu
                 kind: "unreadable",
                 major_mode: "text",
                 lines: ["[Unable to read file]"],
+                child_is_dir: List(),
             },
         }
         cache_dirvish_preview(state, cache_key, built)
@@ -1738,73 +2221,135 @@ fn walk_remote_fd_entries(
     }
 }
 
+fn make_snap_cache_key(
+    dir_path: String,
+    show_hidden: bool,
+    filter_query: String,
+    sort_by: String,
+    sort_reverse: bool,
+) -> String {
+    clean_dir_path(dir_path, "/")
+        ++ "\n" ++ show_hidden.to_string()
+        ++ "\n" ++ filter_query.trim()
+        ++ "\n" ++ sort_by
+        ++ "\n" ++ sort_reverse.to_string()
+}
+
+fn cache_remote_snap(state: DirvishState, key: String, snap: RemoteDirSnap) {
+    if not state.remote_snap_cache.contains_key(key) {
+        if state.remote_snap_cache_order.len() >= 48 {
+            let oldest = state.remote_snap_cache_order.remove(0).as(String)
+            let _ = state.remote_snap_cache.remove(oldest)
+        }
+        state.remote_snap_cache_order.push(key)
+    }
+    state.remote_snap_cache.insert(key, RemoteSnapCacheEntry {
+        fetched_ms: time.unix_millis(),
+        snap: snap,
+    })
+}
+
+fn apply_remote_dir_snap(state: DirvishState, snap: RemoteDirSnap) {
+    let entries = List()
+    for i in 0..snap.entries.len() {
+        let se = snap.entries.get(i.as(usize)).as(RemoteSnapEntry)
+        entries.push(DirvishEntry {
+            name: se.name,
+            full_path: clean_dir_path(se.full_uri, state.current_dir),
+            is_dir: se.is_dir,
+            is_symlink: se.is_symlink,
+            is_exec: se.is_exec,
+            size: se.size,
+            modified_unix_secs: se.modified_secs,
+            symlink_target: se.symlink_target,
+            git_badge: if se.git_badge != "" { se.git_badge } else { " " },
+            perms: se.perms,
+        })
+    }
+    let parents = List()
+    for i in 0..snap.parent_entries.len() {
+        let sp = snap.parent_entries.get(i.as(usize)).as(RemoteSnapParent)
+        parents.push(DirvishEntry {
+            name: sp.name,
+            full_path: clean_dir_path(sp.full_uri, "/"),
+            is_dir: sp.is_dir,
+            is_symlink: false,
+            is_exec: false,
+            size: 0,
+            modified_unix_secs: 0,
+            symlink_target: "",
+            git_badge: " ",
+            perms: if sp.is_dir { "drwxr-xr-x" } else { "-rw-r--r--" },
+        })
+    }
+    state.entries = entries
+    state.parent_entries = parents
+    state.remote_git_branch = if snap.git_is_repo { snap.git_branch } else { "" }
+    state.remote_snap_loaded_dir = state.current_dir
+
+    if snap.preview.target_uri != "" and snap.preview.kind != "none" {
+        let t_clean = clean_dir_path(snap.preview.target_uri, state.current_dir)
+        var found_ent: ?DirvishEntry = null
+        for i in 0..entries.len() {
+            let e = entries.get(i.as(usize)).as(DirvishEntry)
+            if e.full_path == t_clean {
+                found_ent = e
+                break
+            }
+        }
+        if found_ent != null {
+            let fe = found_ent.as(DirvishEntry)
+            let pkey = preview_cache_key_for_entry(fe, state.show_hidden)
+            let built = build_preview_cache_from_remote_snap(
+                snap.preview,
+                fe.full_path,
+                fe.is_symlink,
+                fe.is_exec,
+                fe.size,
+            )
+            cache_dirvish_preview(state, pkey, built)
+        }
+    }
+}
+
+fn apply_remote_fd_ranked(state: DirvishState, clean_root: String, rf: RemoteRankedFiles) {
+    let out = List()
+    for i in 0..rf.items.len() {
+        let it = rf.items.get(i.as(usize)).as(RemoteRankedFile)
+        let full_u = clean_dir_path(it.full_uri, clean_root)
+        let rel = if it.rel_path != "" { it.rel_path } else { any_basename(full_u) }
+        out.push(DirvishEntry {
+            name: rel,
+            full_path: full_u,
+            is_dir: it.is_dir,
+            is_symlink: false,
+            is_exec: false,
+            size: 0,
+            modified_unix_secs: 0,
+            symlink_target: "",
+            git_badge: " ",
+            perms: if it.is_dir { "drwxr-xr-x" } else { "-rw-r--r--" },
+        })
+    }
+    if state.fd_pattern.trim() == "" {
+        sort_dirvish_entries(out, state.sort_by, state.sort_reverse)
+    }
+    state.remote_fd_total_indexed = rf.total_indexed
+    state.remote_fd_total_matched = rf.total_matched
+    state.entries = out
+}
+
 fn scan_fd_all_entries(root_dir: String, show_hidden: bool) -> !String List {
     let clean_root = clean_dir_path(root_dir, "/")
     if is_ssh_uri(clean_root) {
-        if remote_host_available() {
-            let uris = remote_search_files(clean_root, "", limit = 2500)!
-            let seen_dirs = Set.new()
-            let out = List()
-            let root_prefix = if clean_root.ends_with("/") { clean_root } else { clean_root ++ "/" }
-            for i in 0..uris.len() {
-                let raw_u = uris.get(i.as(usize)).as(String)
-                let u = clean_dir_path(raw_u, clean_root)
-                let rel = if u.starts_with(root_prefix) {
-                    u.slice(root_prefix.char_len(), u.char_len())
-                } else {
-                    any_basename(u)
-                }
-                if rel == "" {
-                    continue
-                }
-                -- Synthesize ancestor relative directories so `dirvish-fd` finds dirs too
-                let segs = rel.split("/")
-                if segs.len() > 1 {
-                    var acc = ""
-                    for si in 0..(segs.len() - 1) {
-                        let seg = segs.get(si.as(usize)).as(String)
-                        acc = if acc == "" { seg } else { acc ++ "/" ++ seg }
-                        if not seen_dirs.contains(acc) {
-                            seen_dirs.insert(acc)
-                            out.push(DirvishEntry {
-                                name: acc,
-                                full_path: any_join_path(clean_root, acc),
-                                is_dir: true,
-                                is_symlink: false,
-                                is_exec: false,
-                                size: 0,
-                                modified_unix_secs: 0,
-                                symlink_target: "",
-                                git_badge: " ",
-                                perms: "drwxr-xr-x",
-                            })
-                        }
-                    }
-                }
-                out.push(DirvishEntry {
-                    name: rel,
-                    full_path: u,
-                    is_dir: false,
-                    is_symlink: false,
-                    is_exec: false,
-                    size: 0,
-                    modified_unix_secs: 0,
-                    symlink_target: "",
-                    git_badge: " ",
-                    perms: "-rw-r--r--",
-                })
-            }
-            return out
-        }
-        let mock_out = List()
-        walk_remote_fd_entries(clean_root, clean_root, "", show_hidden, 2500, 0, mock_out)
-        return mock_out
+        -- Remote `dirvish-fd` runs directly on `lava-server` in `refresh_dirvish_all`.
+        return List()
     }
 
-    let rel_files = accel_workspace_files(clean_root, max_files = 4000, include_hidden = show_hidden)
+    let rel_files = accel_workspace_files(clean_root, max_files = 0, include_hidden = show_hidden)
+    let probe_meta = rel_files.len() <= 800
     let seen_dirs = Set.new()
     let out = List()
-    -- Also capture top-level / empty subdirectories via a shallow walk when small
     let top_entries = fs.read_dir_entries(clean_root) ! { _ => List() }
     for ti in 0..top_entries.len() {
         let tde = top_entries.get(ti.as(usize)).as(DirEntry)
@@ -1859,10 +2404,14 @@ fn scan_fd_all_entries(root_dir: String, show_hidden: bool) -> !String List {
             }
         }
         let full_p = path.join(clean_root, rel)
-        let meta_opt: ?fs.FileMetadata = fs.metadata(full_p) ! { _ => null }
-        let (sz, mt) = if meta_opt != null {
-            let m = meta_opt.as(fs.FileMetadata)
-            (m.size, m.modified_unix_secs)
+        let (sz, mt) = if probe_meta {
+            let meta_opt: ?fs.FileMetadata = fs.metadata(full_p) ! { _ => null }
+            if meta_opt != null {
+                let m = meta_opt.as(fs.FileMetadata)
+                (m.size, m.modified_unix_secs)
+            } else {
+                (0, 0)
+            }
         } else {
             (0, 0)
         }
@@ -1886,7 +2435,8 @@ fn filter_fd_entries(all_entries: List, pattern: String, sort_by: String, sort_r
     let q = pattern.trim()
     if q == "" {
         let copied = List()
-        for i in 0..all_entries.len() {
+        let cap = if all_entries.len() > 500 { 500 } else { all_entries.len() }
+        for i in 0..cap {
             copied.push(all_entries.get(i.as(usize)))
         }
         sort_dirvish_entries(copied, sort_by, sort_reverse)
@@ -1917,12 +2467,106 @@ fn refresh_dirvish_all(
     .preferred_row: i64 = 0,
 ) -> #[log_event, status_emit] !String Unit {
     if state.fd_mode {
-        state.entries = filter_fd_entries(
-            state.fd_all_entries,
-            state.fd_pattern,
+        if is_ssh_uri(state.fd_root) {
+            state.remote_snap_loading = false
+            remote_async_cancel("dirvish.snapshot")
+            if remote_ui_async_enabled() {
+                state.remote_fd_loading = true
+                let _ = remote_async_submit(
+                    "dirvish.fd",
+                    "search_files",
+                    [state.fd_root, state.fd_pattern, state.show_hidden, true, 300],
+                )
+            } else {
+                state.remote_fd_loading = false
+                let rf = remote_search_files_ranked(
+                    state.fd_root,
+                    state.fd_pattern,
+                    include_hidden = state.show_hidden,
+                    include_dirs = true,
+                    limit = 300,
+                )!
+                apply_remote_fd_ranked(state, state.fd_root, rf)
+            }
+        } else {
+            state.entries = filter_fd_entries(
+                state.fd_all_entries,
+                state.fd_pattern,
+                state.sort_by,
+                state.sort_reverse,
+            )
+        }
+    } else if is_ssh_uri(state.current_dir) {
+        state.remote_fd_loading = false
+        remote_async_cancel("dirvish.fd")
+        let skey = make_snap_cache_key(
+            state.current_dir,
+            state.show_hidden,
+            state.filter_query,
             state.sort_by,
             state.sort_reverse,
         )
+        let now_ms = time.unix_millis()
+        let sc_opt = state.remote_snap_cache.get(skey)
+        var used_fresh_cache = false
+        if sc_opt != null {
+            let sce = sc_opt.as(RemoteSnapCacheEntry)
+            if now_ms - sce.fetched_ms <= REMOTE_SNAP_CACHE_TTL_MS {
+                state.remote_snap_loading = false
+                apply_remote_dir_snap(state, sce.snap)
+                used_fresh_cache = true
+            }
+        }
+        if not used_fresh_cache {
+            let remembered_opt = state.cursor_by_dir.get(state.current_dir)
+            let eff_focus = if focus_name != "" {
+                focus_name
+            } else if remembered_opt != null and preferred_row < 1 {
+                remembered_opt.as(String)
+            } else {
+                ""
+            }
+            if remote_ui_async_enabled() {
+                if state.remote_snap_loaded_dir != state.current_dir {
+                    state.entries = List()
+                    state.parent_entries = List()
+                }
+                state.remote_snap_loading = true
+                state.remote_snap_key = skey
+                state.remote_snap_focus = focus_name
+                state.remote_snap_pref_row = preferred_row
+                let _ = remote_async_submit(
+                    "dirvish.snapshot",
+                    "dir_snapshot",
+                    [
+                        state.current_dir,
+                        state.show_hidden,
+                        state.filter_query,
+                        state.sort_by,
+                        state.sort_reverse,
+                        eff_focus,
+                        preferred_row,
+                        state.miller_mode,
+                        state.miller_mode,
+                    ],
+                )
+            } else {
+                state.remote_snap_loading = false
+                let snap = remote_dir_snapshot(
+                    state.current_dir,
+                    show_hidden = state.show_hidden,
+                    filter_query = state.filter_query,
+                    sort_by = state.sort_by,
+                    sort_reverse = state.sort_reverse,
+                    focus_name = eff_focus,
+                    preferred_row = preferred_row,
+                    include_parent = state.miller_mode,
+                    include_preview = state.miller_mode,
+                )!
+                cache_remote_snap(state, skey, snap)
+                apply_remote_dir_snap(state, snap)
+            }
+        }
     } else {
         let entries = scan_directory_entries(
             state.current_dir,
@@ -1931,6 +2575,7 @@ fn refresh_dirvish_all(
             state.sort_by,
             state.sort_reverse,
             true,
+            state = state,
         )!
         state.entries = entries
     }
@@ -1948,8 +2593,8 @@ fn refresh_preview_for_cursor(world: EditorWorld, wm: WindowManager, state: Dirv
     if ent_opt != null {
         state.cursor_by_dir.insert(state.current_dir, ent_opt.as(DirvishEntry).name)
     }
-    let preview_buf = render_preview_buffer(world, state, center_buf)
     if state.miller_mode {
+        let preview_buf = render_preview_buffer(world, state, center_buf)
         let pvid_opt = find_win_id_for_buffer_in_tab(wm, preview_buf.id)
         if pvid_opt != null {
             let pvp = wm.panes.get(pvid_opt.as(WinId)).as(WindowPane)
@@ -1987,7 +2632,7 @@ fn open_dirvish_at(
         raw_dir
     }
     let target_dir = clean_dir_path(effective_raw, world.cwd)
-    if not any_is_dir(target_dir) {
+    if (not is_ssh_uri(target_dir)) and (not any_is_dir(target_dir)) {
         return error ("Dirvish target is not a directory: " ++ target_dir)
     }
 
@@ -2203,6 +2848,19 @@ fn target_paths_for_action(state: DirvishState, center_buf: Buffer) -> List {
 -- 6. Entry & Navigation Commands
 -- ============================================================================
 
+fn buffer_represents_dir(buf: Buffer) -> bool {
+    if buf.kind == BufferKind.directory {
+        return true
+    }
+    if buf.kind == BufferKind.file {
+        return false
+    }
+    if is_ssh_uri(buf.file_path) {
+        return buf.file_path.ends_with("/")
+    }
+    any_is_dir(buf.file_path)
+}
+
 fn cmd_dirvish(kernel: SystemKernel, args: List) -> #InteractiveEffects !String Any {
     let world = require_editor_world(kernel)!
     let state = require_dirvish_state(kernel)!
@@ -2220,14 +2878,18 @@ fn cmd_dirvish(kernel: SystemKernel, args: List) -> #InteractiveEffects !String 
         }
     } else if cur_buf.name == DIRVISH_BUF_NAME and cur_buf.file_path != "" {
         target_dir = cur_buf.file_path
+    } else if is_ssh_uri(world.cwd) and (not is_ssh_uri(cur_buf.file_path)) {
+        target_dir = world.cwd
     } else if cur_buf.file_path != "" {
-        if any_is_dir(cur_buf.file_path) {
+        if buffer_represents_dir(cur_buf) {
             target_dir = cur_buf.file_path
         } else {
             target_dir = any_parent_dir(cur_buf.file_path)
         }
-    } else if state.current_dir != "" and (not is_dir_root_path(state.current_dir)) and any_is_dir(state.current_dir) {
-        target_dir = state.current_dir
+    } else if state.current_dir != "" and (not is_dir_root_path(state.current_dir)) {
+        if is_ssh_uri(state.current_dir) or any_is_dir(state.current_dir) {
+            target_dir = state.current_dir
+        }
     }
     open_dirvish_at(kernel, target_dir, "", true)#!
 }
@@ -2244,7 +2906,7 @@ fn cmd_dirvish_jump(kernel: SystemKernel, _args: List) -> #InteractiveEffects !S
     var target_dir = world.cwd
     var focus_name = ""
     if cur_buf.file_path != "" {
-        if any_is_dir(cur_buf.file_path) {
+        if buffer_represents_dir(cur_buf) {
             let clean_cur = clean_dir_path(cur_buf.file_path, world.cwd)
             if not is_dir_root_path(clean_cur) {
                 target_dir = any_parent_dir(clean_cur)
@@ -2279,8 +2941,10 @@ fn cmd_dirvish_fd(kernel: SystemKernel, args: List) -> #InteractiveEffects !Stri
 
     var base_dir = if cur_buf.name == DIRVISH_BUF_NAME and state.current_dir != "" {
         if state.fd_mode and state.fd_root != "" { state.fd_root } else { state.current_dir }
+    } else if is_ssh_uri(world.cwd) and (not is_ssh_uri(cur_buf.file_path)) {
+        world.cwd
     } else if cur_buf.file_path != "" {
-        if any_is_dir(cur_buf.file_path) {
+        if buffer_represents_dir(cur_buf) {
             cur_buf.file_path
         } else {
             any_parent_dir(cur_buf.file_path)
@@ -2309,8 +2973,12 @@ fn cmd_dirvish_fd(kernel: SystemKernel, args: List) -> #InteractiveEffects !Stri
         let a0 = args.get(0).as(String).trim()
         if a0 != "" {
             let resolved_a0 = clean_dir_path(world.resolve_path(a0), world.cwd)
-            if (is_ssh_uri(a0) or a0.starts_with("/") or a0.starts_with("./") or a0.starts_with("../") or a0 == "~")
-                and any_is_dir(resolved_a0) {
+            let looks_like_dir_arg = is_ssh_uri(a0)
+                or a0.starts_with("/")
+                or a0.starts_with("./")
+                or a0.starts_with("../")
+                or a0 == "~"
+            if looks_like_dir_arg and (is_ssh_uri(resolved_a0) or any_is_dir(resolved_a0)) {
                 base_dir = resolved_a0
                 should_prompt = true
             } else {
@@ -2320,7 +2988,7 @@ fn cmd_dirvish_fd(kernel: SystemKernel, args: List) -> #InteractiveEffects !Stri
         }
     }
 
-    if not any_is_dir(base_dir) {
+    if (not is_ssh_uri(base_dir)) and (not any_is_dir(base_dir)) {
         return error ("dirvish-fd root is not a directory: " ++ base_dir)
     }
 
@@ -2342,13 +3010,20 @@ fn cmd_dirvish_fd(kernel: SystemKernel, args: List) -> #InteractiveEffects !Stri
     state.fd_pattern = pattern
     state.fd_all_entries = all_entries
     state.current_dir = base_dir
+    if is_ssh_uri(base_dir) and remote_ui_async_enabled() {
+        state.entries = List()
+    }
 
     refresh_dirvish_all(kernel, world, wm, state)#!
     let pat_lbl = if pattern != "" { "'" ++ pattern ++ "'" } else { "*" }
-    status_emit(
-        "Dirvish fd: " ++ abbreviate_path(base_dir) ++ " [" ++ pat_lbl ++ "] ("
-        ++ state.entries.len().to_string() ++ " match(es))",
-    )#
+    if state.remote_fd_loading {
+        status_emit("Dirvish fd: searching lava-server " ++ abbreviate_path(base_dir) ++ " [" ++ pat_lbl ++ "]...")#
+    } else {
+        status_emit(
+            "Dirvish fd: " ++ abbreviate_path(base_dir) ++ " [" ++ pat_lbl ++ "] ("
+            ++ state.entries.len().to_string() ++ " match(es))",
+        )#
+    }
     ()
 }
 
@@ -2684,6 +3359,7 @@ fn execute_paste(kernel: SystemKernel, overwrite: bool) -> #[log_event, status_e
         state.yank_ring = List()
         state.yank_mode = ""
     }
+    state.invalidate_remote_caches()
 
     refresh_dirvish_all(kernel, world, wm, state, focus_name = last_created_name)#!
     let action_lbl = if is_cut { "Moved " } else { "Pasted " }
@@ -2734,6 +3410,7 @@ fn cmd_dirvish_delete(kernel: SystemKernel, _args: List) -> #InteractiveEffects 
         let _ = state.marked_paths.remove(p)
         purge_deleted_buffers(world, p)
     }
+    state.invalidate_remote_caches()
 
     refresh_dirvish_all(kernel, world, wm, state, preferred_row = cur_row)#!
     status_emit("Deleted " ++ targets.len().to_string() ++ " item(s)")#
@@ -2785,6 +3462,7 @@ fn apply_entry_rename(
     }
 
     let focus = any_basename(dst)
+    state.invalidate_remote_caches()
     if state.fd_mode {
         state.fd_all_entries = scan_fd_all_entries(state.fd_root, state.show_hidden)!
     }
@@ -2915,6 +3593,7 @@ fn cmd_dirvish_create_file(kernel: SystemKernel, _args: List) -> #InteractiveEff
     if focus_item.starts_with(".") {
         state.show_hidden = true
     }
+    state.invalidate_remote_caches()
     if state.fd_mode {
         state.fd_all_entries = scan_fd_all_entries(state.fd_root, state.show_hidden)!
     }
@@ -2965,6 +3644,7 @@ fn cmd_dirvish_mkdir(kernel: SystemKernel, _args: List) -> #InteractiveEffects !
     if focus_item.starts_with(".") {
         state.show_hidden = true
     }
+    state.invalidate_remote_caches()
     if state.fd_mode {
         state.fd_all_entries = scan_fd_all_entries(state.fd_root, state.show_hidden)!
     }
@@ -3172,6 +3852,7 @@ fn cmd_dirvish_refresh(kernel: SystemKernel, _args: List) -> #InteractiveEffects
     let state = require_dirvish_state(kernel)!
     state.preview_cache.clear()
     state.preview_cache_order = List()
+    state.invalidate_remote_caches()
     let cur_opt = entry_at_cursor(state, world.active_buffer())
     let keep_name = if cur_opt != null { cur_opt.as(DirvishEntry).name } else { "" }
     if state.fd_mode and state.fd_root != "" {
@@ -3222,6 +3903,13 @@ fn cmd_dirvish_quit(kernel: SystemKernel, _args: List) -> #InteractiveEffects !S
     let wm = require_window_manager(kernel)!
     let state = require_dirvish_state(kernel)!
 
+    remote_async_cancel("dirvish.snapshot")
+    remote_async_cancel("dirvish.preview")
+    remote_async_cancel("dirvish.fd")
+    state.remote_snap_loading = false
+    state.remote_preview_loading = false
+    state.remote_fd_loading = false
+
     collapse_dirvish_splits(world, wm)
 
     let restored_id = resolve_quit_buffer_id(world, state)
@@ -3234,6 +3922,118 @@ fn cmd_dirvish_quit(kernel: SystemKernel, _args: List) -> #InteractiveEffects !S
     ensure_vim_normal(kernel, world)
     status_emit("Restored buffer " ++ world.active_buffer().name)#
     ()
+}
+
+fn on_dirvish_timer_tick(kern: SystemKernel, _arg: Any) {
+    let st_opt = kern.service(SERVICE_DIRVISH)
+    if st_opt == null {
+        return
+    }
+    let state = st_opt.as(DirvishState)
+    if (not state.remote_snap_loading) and (not state.remote_preview_loading) and (not state.remote_fd_loading) {
+        return
+    }
+    let w_opt = kern.service("lava.document.world")
+    let wm_opt = kern.service("lava.window.manager")
+    if w_opt == null or wm_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let wm = wm_opt.as(WindowManager)
+    let dirvish_active = world.active_buffer().name == DIRVISH_BUF_NAME
+
+    var snap_updated = false
+    var preview_updated = false
+
+    if state.remote_snap_loading {
+        let sp = remote_async_poll("dirvish.snapshot")
+        if sp.status == "ready" {
+            state.remote_snap_loading = false
+            let snap = decode_remote_dir_snap(sp.payload)
+            if state.remote_snap_key != "" {
+                cache_remote_snap(state, state.remote_snap_key, snap)
+            }
+            if not state.fd_mode {
+                apply_remote_dir_snap(state, snap)
+                snap_updated = true
+            }
+        } else if sp.status == "error" {
+            state.remote_snap_loading = false
+            snap_updated = true
+        }
+    }
+
+    if state.remote_fd_loading {
+        let fp = remote_async_poll("dirvish.fd")
+        if fp.status == "ready" {
+            state.remote_fd_loading = false
+            if state.fd_mode and is_ssh_uri(state.fd_root) {
+                let rf = decode_remote_ranked_files(fp.payload)
+                apply_remote_fd_ranked(state, state.fd_root, rf)
+                snap_updated = true
+            }
+        } else if fp.status == "error" {
+            state.remote_fd_loading = false
+            snap_updated = true
+        }
+    }
+
+    if state.remote_preview_loading {
+        let pp = remote_async_poll("dirvish.preview")
+        if pp.status == "ready" {
+            state.remote_preview_loading = false
+            if state.remote_preview_key != "" {
+                let pv = decode_remote_snap_preview(pp.payload)
+                let built = build_preview_cache_from_remote_snap(
+                    pv,
+                    state.remote_preview_uri,
+                    state.remote_preview_is_symlink,
+                    state.remote_preview_is_exec,
+                    state.remote_preview_size,
+                )
+                cache_dirvish_preview(state, state.remote_preview_key, built)
+                preview_updated = true
+            }
+        } else if pp.status == "error" {
+            state.remote_preview_loading = false
+            if state.remote_preview_key != "" {
+                cache_dirvish_preview(
+                    state,
+                    state.remote_preview_key,
+                    DirvishPreviewCacheEntry {
+                        kind: "unreadable",
+                        major_mode: "text",
+                        lines: ["  [Preview failed: " ++ pp.error_msg ++ "]"],
+                        child_is_dir: List(),
+                    },
+                )
+                preview_updated = true
+            }
+        }
+    }
+
+    if not dirvish_active {
+        return
+    }
+
+    if snap_updated or state.remote_snap_loading or state.remote_fd_loading {
+        let focus = if snap_updated { state.remote_snap_focus } else { "" }
+        let pref_row = if snap_updated { state.remote_snap_pref_row } else { world.active_buffer().point.row }
+        if snap_updated {
+            state.remote_snap_focus = ""
+            state.remote_snap_pref_row = 0
+        }
+        let parent_buf = render_parent_buffer(world, state)
+        let center_buf = render_center_buffer(world, state, focus, pref_row)
+        let preview_buf = render_preview_buffer(world, state, center_buf)
+        sync_dirvish_layout(world, wm, state, parent_buf, center_buf, preview_buf)
+        world.remote_tick_dirty = true
+    } else if preview_updated or state.remote_preview_loading {
+        let center_buf = world.active_buffer()
+        let _ = render_preview_buffer(world, state, center_buf)
+        wm.sync_from_world(world)
+        world.remote_tick_dirty = true
+    }
 }
 
 -- ============================================================================
@@ -3409,6 +4209,8 @@ pub fn register_dirvish_extension(kernel: SystemKernel) -> !String Unit {
             km.bind("g R", "dirvish-refresh", ext_id, description = "Refresh Dirvish")
             km.bind("r", "dirvish-refresh", ext_id, description = "Refresh Dirvish")
             km.bind("q", "dirvish-quit", ext_id, description = "Quit Dirvish and restore buffer")
+
+            k.add_hook("timer-tick", ext_id, on_dirvish_timer_tick)
 
             ()
         },

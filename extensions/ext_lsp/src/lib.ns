@@ -3324,7 +3324,10 @@ pub fn register_lsp_extension(kernel: SystemKernel) -> !String Unit {
                 |kern: SystemKernel, _payload: Any| -> Unit {
                     let w_opt = kern.service("lava.document.world")
                     if w_opt != null {
-                        let _ = w_opt.as(EditorWorld).remove_floating_window(LSP_HOVER_FLOAT_ID)
+                        let w = w_opt.as(EditorWorld)
+                        if not w.floating_windows.is_empty() {
+                            let _ = w.remove_floating_window(LSP_HOVER_FLOAT_ID)
+                        }
                     }
                 },
                 priority = 40,

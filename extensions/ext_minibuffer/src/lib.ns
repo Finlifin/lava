@@ -16,8 +16,10 @@ use @lava_core.{
 }
 use @lava_accel.{OrderlessHit, accel_doc_search_preview, accel_orderless_rank}
 use @lava_remote.{
-    RemoteConnectionInfo, RemoteDirItem, SshHostConfigEntry, is_ssh_uri, join_ssh_uri,
-    parse_ssh_uri, remote_discover_ssh_hosts, remote_list_connections, remote_readdir
+    RemoteConnectionInfo, RemoteDirItem, SshHostConfigEntry, decode_remote_readdir_items,
+    is_ssh_uri, join_ssh_uri, parse_ssh_uri, remote_async_poll, remote_async_submit,
+    remote_discover_ssh_hosts, remote_list_connections, remote_readdir, remote_shimmer_bar,
+    remote_spinner_frame, remote_ui_async_enabled
 }
 use @ext_document.{
     Buffer, BufferId, EditorWorld, MinibufferRichItem, MinibufferView, Pos, RegisterValue,
@@ -403,6 +405,7 @@ pub struct MinibufferController {
     pub cached_path_dir: String,
     pub cached_path_entries: ?List,
     pub cached_dir_map: HashMap,
+    pub remote_path_loading_key: String,
 }
 
 impl MinibufferController {
@@ -446,6 +449,7 @@ impl MinibufferController {
             cached_path_dir: "",
             cached_path_entries: null,
             cached_dir_map: HashMap.new(),
+            remote_path_loading_key: "",
         }
     }
 
@@ -555,7 +559,12 @@ impl MinibufferController {
         }
         world.minibuffer_rich_items = self.rich_items
         world.minibuffer_mode_badge = mode_badge_for_kind(self.request.kind)
-        world.minibuffer_hint_bar = hint_bar_for_kind(self.request.kind)
+        let base_hint = hint_bar_for_kind(self.request.kind)
+        world.minibuffer_hint_bar = if self.remote_path_loading_key != "" {
+            remote_spinner_frame() ++ " Loading remote path " ++ remote_shimmer_bar(width = 10) ++ "  |  " ++ base_hint
+        } else {
+            base_hint
+        }
         world.minibuffer_history_ghost = self.history_ghost
     }
 }
@@ -814,6 +823,45 @@ private fn split_file_input(raw_input: String, cwd: String) -> (String, String, 
     (raw_dir_prefix, resolved_dir, base_prefix)
 }
 
+private fn convert_remote_dir_items_for_minibuffer(entries: List) -> List {
+    let dirs = List()
+    let files = List()
+    for i in 0..entries.len() {
+        let de = entries.get(i.as(usize)).as(RemoteDirItem)
+        let ename = de.name
+        let dir_flag = de.is_dir
+        let kbadge = file_kind_badge(ename, dir_flag)
+        let size_txt = format_human_size(de.size, dir_flag).pad_start(6, " ")
+        let mode_txt = format_unix_mode(ename, dir_flag, false)
+        let marg = size_txt ++ "  " ++ mode_txt ++ "  [ssh]"
+        let item = CachedDirEntry {
+            ename: ename,
+            dir_flag: dir_flag,
+            kbadge: kbadge,
+            marg: marg,
+        }
+        if dir_flag {
+            dirs.push(item)
+        } else {
+            files.push(item)
+        }
+    }
+    dirs.sort_by(|a: Any, b: Any| {
+        a.as(CachedDirEntry).ename.cmp(b.as(CachedDirEntry).ename)
+    })
+    files.sort_by(|a: Any, b: Any| {
+        a.as(CachedDirEntry).ename.cmp(b.as(CachedDirEntry).ename)
+    })
+    let out = List()
+    for i in 0..dirs.len() {
+        out.push(dirs.get(i.as(usize)))
+    }
+    for i in 0..files.len() {
+        out.push(files.get(i.as(usize)))
+    }
+    out
+}
+
 private fn ensure_cached_remote_dir_entries(
     ctrl: MinibufferController,
     remote_dir_uri: String,
@@ -835,46 +883,16 @@ private fn ensure_cached_remote_dir_entries(
         ctrl.cached_path_entries = hit
         return hit
     }
-    let dirs = List()
-    let files = List()
-    let entries_res = remote_readdir(remote_dir_uri, show_hidden = show_hidden)
-    entries_res match {
-        entries! => {
-            for i in 0..entries.len() {
-                let de = entries.get(i.as(usize)).as(RemoteDirItem)
-                let ename = de.name
-                let dir_flag = de.is_dir
-                let kbadge = file_kind_badge(ename, dir_flag)
-                let size_txt = format_human_size(de.size, dir_flag).pad_start(6, " ")
-                let mode_txt = format_unix_mode(ename, dir_flag, false)
-                let marg = size_txt ++ "  " ++ mode_txt ++ "  [ssh]"
-                let item = CachedDirEntry {
-                    ename: ename,
-                    dir_flag: dir_flag,
-                    kbadge: kbadge,
-                    marg: marg,
-                }
-                if dir_flag {
-                    dirs.push(item)
-                } else {
-                    files.push(item)
-                }
-            }
-        },
-        error _ => (),
+    if remote_ui_async_enabled() {
+        if ctrl.remote_path_loading_key != cache_key {
+            ctrl.remote_path_loading_key = cache_key
+            let _ = remote_async_submit("minibuffer.readdir", "readdir", [remote_dir_uri, show_hidden])
+        }
+        return List()
     }
-    dirs.sort_by(|a: Any, b: Any| {
-        a.as(CachedDirEntry).ename.cmp(b.as(CachedDirEntry).ename)
-    })
-    files.sort_by(|a: Any, b: Any| {
-        a.as(CachedDirEntry).ename.cmp(b.as(CachedDirEntry).ename)
-    })
-    let out = List()
-    for i in 0..dirs.len() {
-        out.push(dirs.get(i.as(usize)))
-    }
-    for i in 0..files.len() {
-        out.push(files.get(i.as(usize)))
+    let out = remote_readdir(remote_dir_uri, show_hidden = show_hidden) match {
+        entries! => convert_remote_dir_items_for_minibuffer(entries),
+        error _ => List(),
     }
     ctrl.cached_path_dir = cache_key
     ctrl.cached_path_entries = out
@@ -1682,7 +1700,7 @@ private fn builtin_ex_verbs() -> List {
         ("ConformFormat", "Format active buffer  :ConformFormat"),
         ("TodoQuickfix", "Populate quickfix with TODO/FIXME items  :TodoQuickfix"),
         ("RemoteConnectProfile", "Connect OpenSSH ~/.ssh/config profile  :RemoteConnectProfile <profile>"),
-        ("SshConnect", "Connect OpenSSH ~/.ssh/config profile  :SshConnect <profile>"),
+        ("SshConnect", "Connect OpenSSH ~/.ssh/config profile  :SshConnect <profile> [dir]"),
         ("RemoteConnect", "Connect SSH host or profile  :RemoteConnect <profile|ssh://host>"),
         ("RemoteBrowse", "Browse remote SSH directory  :RemoteBrowse [profile|ssh://host/dir]"),
         ("RemoteInstallServer", "Install/update ~/.lava-server over SSH  :RemoteInstallServer [profile]"),
@@ -3863,7 +3881,11 @@ private fn ex_stage2_auto_accepts_top_candidate(v: String, arg_part: String) -> 
         return false
     }
     if is_ex_buffer_verb(v) or is_ex_theme_verb(v) or is_ex_telescope_verb(v)
-        or is_ex_ssh_profile_verb(v) or is_ex_ssh_disconnect_verb(v) {
+        or is_ex_ssh_disconnect_verb(v) {
+        return true
+    }
+    if is_ex_ssh_profile_verb(v) and (not trimmed.contains(" "))
+        and (not trimmed.contains(":")) and (not trimmed.contains("/")) {
         return true
     }
     if is_ex_set_verb(v) and (not trimmed.contains("=")) and (not trimmed.contains(" ")) {
@@ -4690,6 +4712,51 @@ pub fn register_minibuffer_extension(kernel: SystemKernel) -> !String Unit {
                     if c_opt != null and (payload matches _: BufferId) {
                         c_opt.as(MinibufferController).note_buffer_visited(payload.as(BufferId))
                     }
+                },
+            )
+
+            k.add_hook(
+                "timer-tick",
+                ext_id,
+                |kern: SystemKernel, _payload: Any| -> Unit {
+                    let c_opt = kern.service(SERVICE_MINIBUFFER)
+                    if c_opt == null {
+                        return ()
+                    }
+                    let c = c_opt.as(MinibufferController)
+                    if c.remote_path_loading_key == "" {
+                        return ()
+                    }
+                    let w_opt = kern.service(SERVICE_EDITOR_WORLD)
+                    if w_opt == null {
+                        return ()
+                    }
+                    let w = w_opt.as(EditorWorld)
+                    let rp = remote_async_poll("minibuffer.readdir")
+                    if rp.status == "ready" {
+                        let done_key = c.remote_path_loading_key
+                        c.remote_path_loading_key = ""
+                        let items = convert_remote_dir_items_for_minibuffer(decode_remote_readdir_items(rp.payload))
+                        c.cached_dir_map.insert("remote:" ++ done_key, items)
+                        c.cached_path_dir = done_key
+                        c.cached_path_entries = items
+                        if c.active {
+                            refresh_controller(kern, w, c)
+                            w.remote_tick_dirty = true
+                        }
+                    } else if rp.status == "error" {
+                        let done_key = c.remote_path_loading_key
+                        c.remote_path_loading_key = ""
+                        c.cached_dir_map.insert("remote:" ++ done_key, List())
+                        if c.active {
+                            c.sync_to_world(w)
+                            w.remote_tick_dirty = true
+                        }
+                    } else if c.active {
+                        c.sync_to_world(w)
+                        w.remote_tick_dirty = true
+                    }
+                    ()
                 },
             )
             ()

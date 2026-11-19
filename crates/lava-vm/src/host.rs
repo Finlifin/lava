@@ -14,7 +14,9 @@ use lava_proto::{
     AnimHints, EventQueue, FontMetrics, FrameSlot, ScrollViewport, TransferOverlay, UiEvent,
 };
 use lava_remote::{
-    RemoteConnInfo, RemoteManager, discover_ssh_config_hosts, read_rpc_frame, write_rpc_frame,
+    AsyncPollOutcome, AsyncRemoteOp, AsyncRemoteResult, REMOTE_WAKE_TIMER_ID, RemoteConnInfo,
+    RemoteDirSnapshot, RemoteEntryPreview, RemoteManager, RemoteRankedFilesResult,
+    discover_ssh_config_hosts, read_rpc_frame, set_simulated_rpc_delay_ms, write_rpc_frame,
 };
 use lava_term::PtyManager;
 use runtime::TaskId;
@@ -354,6 +356,18 @@ impl LavaHostHandler {
                 .unwrap_or(0);
             eq_for_lsp.push(UiEvent::Tick {
                 timer_id: LSP_WAKE_TIMER_ID,
+                now_ms,
+            });
+        }));
+
+        let eq_for_remote = Arc::clone(&config.event_queue);
+        config.remotes.set_waker(Arc::new(move || {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            eq_for_remote.push(UiEvent::Tick {
+                timer_id: REMOTE_WAKE_TIMER_ID,
                 now_ms,
             });
         }));
@@ -821,10 +835,18 @@ impl HostHandler for LavaHostHandler {
             "accel_fuzzy_rank" => handle_accel_fuzzy_rank(args),
             "accel_orderless_rank" => handle_accel_orderless_rank(args),
             "accel_workspace_files" => handle_accel_workspace_files(args),
+            "accel_invalidate_cache" => handle_accel_invalidate_cache(args),
+            "accel_search_files_ranked" => handle_accel_search_files_ranked(args),
             "accel_workspace_grep" => handle_accel_workspace_grep(args),
+            "accel_workspace_grep_counted" => handle_accel_workspace_grep_counted(args),
             "accel_workspace_replace" => handle_accel_workspace_replace(args),
+            "accel_read_preview" => handle_accel_read_preview(args),
+            "accel_dir_snapshot" => handle_accel_dir_snapshot(args),
+            "accel_entry_preview" => handle_accel_entry_preview(args),
             "accel_diff_lines" => handle_accel_diff_lines(args),
             "accel_git_status" => handle_accel_git_status(args),
+            "accel_git_status_cached" => handle_accel_git_status_cached(args),
+            "accel_git_file_hunks" => handle_accel_git_file_hunks(args),
             "accel_git_head_lines" => handle_accel_git_head_lines(args),
             "accel_git_blame_line" => handle_accel_git_blame_line(args),
             "accel_scan_symbols" => handle_accel_scan_symbols(args),
@@ -867,6 +889,7 @@ impl HostHandler for LavaHostHandler {
             "accel_doc_collect_words" => handle_accel_doc_collect_words(args),
             "accel_doc_search_preview" => handle_accel_doc_search_preview(args),
             "accel_ts_highlight_rows" => handle_accel_ts_highlight_rows(args),
+            "accel_ts_highlight_rows_packed" => handle_accel_ts_highlight_rows_packed(args),
             "accel_ts_highlight_snippet" => handle_accel_ts_highlight_snippet(args),
             "accel_ts_inspect_node" => handle_accel_ts_inspect_node(args),
             "accel_ts_status" => handle_accel_ts_status(args),
@@ -936,6 +959,20 @@ impl HostHandler for LavaHostHandler {
             "remote_git_status" => handle_remote_git_status(&self.remotes, args),
             "remote_git_head_lines" => handle_remote_git_head_lines(&self.remotes, args),
             "remote_git_blame_line" => handle_remote_git_blame_line(&self.remotes, args),
+            "remote_search_files_ranked" => handle_remote_search_files_ranked(&self.remotes, args),
+            "remote_search_grep_ext" => handle_remote_search_grep_ext(&self.remotes, args),
+            "remote_read_preview_window" => handle_remote_read_preview_window(&self.remotes, args),
+            "remote_dir_snapshot" => handle_remote_dir_snapshot(&self.remotes, args),
+            "remote_entry_preview" => handle_remote_entry_preview(&self.remotes, args),
+            "remote_git_summary" => handle_remote_git_summary(&self.remotes, args),
+            "remote_git_file_hunks" => handle_remote_git_file_hunks(&self.remotes, args),
+            "remote_scan_todos" => handle_remote_scan_todos(&self.remotes, args),
+            "remote_workspace_replace" => handle_remote_workspace_replace(&self.remotes, args),
+            "remote_async_submit" => handle_remote_async_submit(&self.remotes, args),
+            "remote_async_poll" => handle_remote_async_poll(&self.remotes, args),
+            "remote_async_cancel" => handle_remote_async_cancel(&self.remotes, args),
+            "remote_async_active_count" => handle_remote_async_active_count(&self.remotes, args),
+            "remote_set_test_delay_ms" => handle_remote_set_test_delay_ms(args),
             other => HostCallOutcome::Error(format!("unknown lava_sys host operation: {other}")),
         }
     }
@@ -2458,6 +2495,63 @@ fn encode_ts_highlight_rows(rows: Vec<Vec<lava_accel::TsHighlightSpan>>) -> Nati
             })
             .collect(),
     )
+}
+
+#[cfg(not(windows))]
+fn encode_ts_highlight_rows_packed(rows: Vec<Vec<lava_accel::TsHighlightSpan>>) -> NativeValue {
+    NativeValue::List(
+        rows.into_iter()
+            .map(|row| {
+                NativeValue::List(
+                    row.into_iter()
+                        .map(|sp| {
+                            let s = sp.start_col.clamp(0, 16_777_215);
+                            let e = sp.end_col.clamp(0, 16_777_215);
+                            let g = sp.hl_group.clamp(0, 255);
+                            NativeValue::I64((s << 32) | (e << 8) | g)
+                        })
+                        .collect(),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn handle_accel_ts_highlight_rows_packed(args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 4 {
+        return HostCallOutcome::Error(
+            "accel_ts_highlight_rows_packed expects 4 arguments".to_string(),
+        );
+    }
+    #[cfg(windows)]
+    {
+        HostCallOutcome::Return(NativeValue::List(Vec::new()))
+    }
+    #[cfg(not(windows))]
+    {
+        let doc_id = match expect_i64(&args[0], "accel_ts_highlight_rows_packed.doc_id") {
+            Ok(v) => v,
+            Err(e) => return HostCallOutcome::Error(e),
+        };
+        let lang = match expect_str(&args[1], "accel_ts_highlight_rows_packed.lang") {
+            Ok(s) => s,
+            Err(e) => return HostCallOutcome::Error(e),
+        };
+        let start_row = match expect_i64(&args[2], "accel_ts_highlight_rows_packed.start_row") {
+            Ok(v) => v,
+            Err(e) => return HostCallOutcome::Error(e),
+        };
+        let end_row = match expect_i64(&args[3], "accel_ts_highlight_rows_packed.end_row") {
+            Ok(v) => v,
+            Err(e) => return HostCallOutcome::Error(e),
+        };
+        let s = start_row.max(0);
+        if end_row < s {
+            return HostCallOutcome::Return(NativeValue::List(Vec::new()));
+        }
+        let rows = lava_accel::ts_highlight_doc_rows(doc_id, &lang, s as usize, end_row as usize);
+        HostCallOutcome::Return(encode_ts_highlight_rows_packed(rows))
+    }
 }
 
 fn handle_accel_ts_highlight_rows(args: &[NativeValue]) -> HostCallOutcome {
@@ -4080,6 +4174,1135 @@ fn handle_remote_git_blame_line(remotes: &RemoteManager, args: &[NativeValue]) -
         Ok(None) => HostCallOutcome::Return(NativeValue::List(vec![NativeValue::Bool(false)])),
         Err(err) => HostCallOutcome::Error(err),
     }
+}
+
+fn handle_accel_invalidate_cache(args: &[NativeValue]) -> HostCallOutcome {
+    let hint = if args.is_empty() {
+        String::new()
+    } else {
+        expect_str(&args[0], "accel_invalidate_cache.path").unwrap_or_default()
+    };
+    lava_accel::invalidate_workspace_cache(&hint);
+    HostCallOutcome::Return(NativeValue::Unit)
+}
+
+fn handle_accel_search_files_ranked(args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 5 {
+        return HostCallOutcome::Error("accel_search_files_ranked expects 5 arguments".to_string());
+    }
+    let root = match expect_str(&args[0], "accel_search_files_ranked.root") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let query = match expect_str(&args[1], "accel_search_files_ranked.query") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let include_hidden = match expect_bool(&args[2], "accel_search_files_ranked.include_hidden") {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let include_dirs = match expect_bool(&args[3], "accel_search_files_ranked.include_dirs") {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let limit = match expect_i64(&args[4], "accel_search_files_ranked.limit") {
+        Ok(v) => v.max(0) as usize,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let (total_indexed, total_matched, items) = lava_accel::search_workspace_files_ranked(
+        &root,
+        &query,
+        include_hidden,
+        include_dirs,
+        limit,
+    );
+    let encoded = items
+        .into_iter()
+        .map(|it| {
+            NativeValue::List(vec![
+                NativeValue::Str(it.rel_path),
+                NativeValue::Bool(it.is_dir),
+                NativeValue::I64(it.score),
+            ])
+        })
+        .collect();
+    HostCallOutcome::Return(NativeValue::List(vec![
+        NativeValue::I64(total_indexed as i64),
+        NativeValue::I64(total_matched as i64),
+        NativeValue::List(encoded),
+    ]))
+}
+
+fn handle_accel_workspace_grep_counted(args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 5 {
+        return HostCallOutcome::Error(
+            "accel_workspace_grep_counted expects 5 arguments".to_string(),
+        );
+    }
+    let root = match expect_str(&args[0], "accel_workspace_grep_counted.root") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let query = match expect_str(&args[1], "accel_workspace_grep_counted.query") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let case_sensitive = match expect_bool(&args[2], "accel_workspace_grep_counted.case_sensitive")
+    {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let max_results = match expect_i64(&args[3], "accel_workspace_grep_counted.max_results") {
+        Ok(v) => v.max(0) as usize,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let file_filter = match expect_str(&args[4], "accel_workspace_grep_counted.file_filter") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let (total_matched, hits) = lava_accel::workspace_grep_counted(
+        &root,
+        &query,
+        case_sensitive,
+        max_results,
+        &file_filter,
+    );
+    let items = hits
+        .into_iter()
+        .map(|h| {
+            NativeValue::List(vec![
+                NativeValue::Str(h.file_path),
+                NativeValue::I64(h.row),
+                NativeValue::I64(h.col),
+                NativeValue::Str(h.line_text),
+            ])
+        })
+        .collect();
+    HostCallOutcome::Return(NativeValue::List(vec![
+        NativeValue::I64(total_matched as i64),
+        NativeValue::List(items),
+    ]))
+}
+
+fn handle_accel_read_preview(args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 4 {
+        return HostCallOutcome::Error("accel_read_preview expects 4 arguments".to_string());
+    }
+    let path = match expect_str(&args[0], "accel_read_preview.path") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let start_row = match expect_i64(&args[1], "accel_read_preview.start_row") {
+        Ok(v) => v.max(0) as usize,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let max_lines = match expect_i64(&args[2], "accel_read_preview.max_lines") {
+        Ok(v) => v.max(1) as usize,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let max_bytes = match expect_i64(&args[3], "accel_read_preview.max_bytes") {
+        Ok(v) => v.max(256) as usize,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    match lava_accel::read_file_preview_window(&path, start_row, max_lines, max_bytes) {
+        Ok(win) => HostCallOutcome::Return(NativeValue::List(vec![
+            NativeValue::List(win.lines.into_iter().map(NativeValue::Str).collect()),
+            NativeValue::I64(win.start_row),
+            NativeValue::I64(win.total_lines),
+            NativeValue::Bool(win.is_binary),
+            NativeValue::Bool(win.truncated),
+            NativeValue::I64(win.total_size),
+        ])),
+        Err(err) => HostCallOutcome::Error(err),
+    }
+}
+
+fn encode_accel_snapshot_preview(pv: lava_accel::DirSnapshotPreview) -> NativeValue {
+    let children = pv
+        .child_entries
+        .into_iter()
+        .map(|(n, d, s, sz)| {
+            NativeValue::List(vec![
+                NativeValue::Str(n),
+                NativeValue::Bool(d),
+                NativeValue::Bool(s),
+                NativeValue::I64(sz),
+            ])
+        })
+        .collect();
+    NativeValue::List(vec![
+        NativeValue::Str(pv.kind),
+        NativeValue::Str(pv.target_path),
+        NativeValue::Str(pv.target_name),
+        NativeValue::I64(pv.total_count),
+        NativeValue::I64(pv.total_size),
+        NativeValue::List(pv.lines.into_iter().map(NativeValue::Str).collect()),
+        NativeValue::List(children),
+    ])
+}
+
+fn handle_accel_dir_snapshot(args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 9 {
+        return HostCallOutcome::Error("accel_dir_snapshot expects 9 arguments".to_string());
+    }
+    let dir = match expect_str(&args[0], "accel_dir_snapshot.dir") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let show_hidden = match expect_bool(&args[1], "accel_dir_snapshot.show_hidden") {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let filter_query = match expect_str(&args[2], "accel_dir_snapshot.filter_query") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let sort_by = match expect_str(&args[3], "accel_dir_snapshot.sort_by") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let sort_reverse = match expect_bool(&args[4], "accel_dir_snapshot.sort_reverse") {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let focus_name = match expect_str(&args[5], "accel_dir_snapshot.focus_name") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let preferred_row = match expect_i64(&args[6], "accel_dir_snapshot.preferred_row") {
+        Ok(v) => v.max(0) as usize,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let include_parent = match expect_bool(&args[7], "accel_dir_snapshot.include_parent") {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let include_preview = match expect_bool(&args[8], "accel_dir_snapshot.include_preview") {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    match lava_accel::dir_snapshot(
+        &dir,
+        show_hidden,
+        &filter_query,
+        &sort_by,
+        sort_reverse,
+        &focus_name,
+        preferred_row,
+        include_parent,
+        include_preview,
+    ) {
+        Ok(snap) => {
+            let parents = snap
+                .parent_entries
+                .into_iter()
+                .map(|p| {
+                    NativeValue::List(vec![
+                        NativeValue::Str(p.name),
+                        NativeValue::Str(p.full_path),
+                        NativeValue::Bool(p.is_dir),
+                    ])
+                })
+                .collect();
+            let entries = snap
+                .entries
+                .into_iter()
+                .map(|e| {
+                    NativeValue::List(vec![
+                        NativeValue::Str(e.name),
+                        NativeValue::Str(e.full_path),
+                        NativeValue::Bool(e.is_dir),
+                        NativeValue::Bool(e.is_symlink),
+                        NativeValue::Bool(e.is_exec),
+                        NativeValue::I64(e.size),
+                        NativeValue::I64(e.modified_secs),
+                        NativeValue::Str(e.perms),
+                        NativeValue::Str(e.symlink_target),
+                        NativeValue::Str(e.git_badge),
+                    ])
+                })
+                .collect();
+            HostCallOutcome::Return(NativeValue::List(vec![
+                NativeValue::Str(snap.resolved_path),
+                NativeValue::Str(snap.parent_path),
+                NativeValue::List(parents),
+                NativeValue::List(entries),
+                NativeValue::Bool(snap.git_is_repo),
+                NativeValue::Str(snap.git_root),
+                NativeValue::Str(snap.git_branch),
+                NativeValue::I64(snap.git_staged),
+                NativeValue::I64(snap.git_modified),
+                NativeValue::I64(snap.git_untracked),
+                encode_accel_snapshot_preview(snap.preview),
+            ]))
+        }
+        Err(err) => HostCallOutcome::Error(err),
+    }
+}
+
+fn handle_accel_entry_preview(args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 4 {
+        return HostCallOutcome::Error("accel_entry_preview expects 4 arguments".to_string());
+    }
+    let path = match expect_str(&args[0], "accel_entry_preview.path") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let name = match expect_str(&args[1], "accel_entry_preview.name") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let is_dir = match expect_bool(&args[2], "accel_entry_preview.is_dir") {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let show_hidden = match expect_bool(&args[3], "accel_entry_preview.show_hidden") {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let pv = lava_accel::build_snapshot_entry_preview(&path, &name, is_dir, show_hidden);
+    HostCallOutcome::Return(encode_accel_snapshot_preview(pv))
+}
+
+fn handle_accel_git_status_cached(args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 1 {
+        return HostCallOutcome::Error("accel_git_status_cached expects 1 argument".to_string());
+    }
+    let cwd = match expect_str(&args[0], "accel_git_status_cached.cwd") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let st = lava_accel::git_repo_status_cached(&cwd);
+    HostCallOutcome::Return(NativeValue::List(vec![
+        NativeValue::Bool(st.is_repo),
+        NativeValue::Str(st.root),
+        NativeValue::Str(st.branch),
+        NativeValue::I64(st.staged_count),
+        NativeValue::I64(st.modified_count),
+        NativeValue::I64(st.untracked_count),
+    ]))
+}
+
+fn handle_accel_git_file_hunks(args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 4 {
+        return HostCallOutcome::Error("accel_git_file_hunks expects 4 arguments".to_string());
+    }
+    let cwd = match expect_str(&args[0], "accel_git_file_hunks.cwd") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let file_path = match expect_str(&args[1], "accel_git_file_hunks.file_path") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let has_override = match expect_bool(&args[2], "accel_git_file_hunks.has_override") {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let override_vec = if has_override {
+        let raw_l = match expect_list(&args[3], "accel_git_file_hunks.lines") {
+            Ok(l) => l,
+            Err(e) => return HostCallOutcome::Error(e),
+        };
+        match extract_str_vec(raw_l, "accel_git_file_hunks.line") {
+            Ok(v) => Some(v),
+            Err(e) => return HostCallOutcome::Error(e),
+        }
+    } else {
+        None
+    };
+    let (tracked, hunks) =
+        lava_accel::git_file_diff_hunks(&cwd, &file_path, override_vec.as_deref());
+    let items = hunks
+        .into_iter()
+        .map(|h| {
+            NativeValue::List(vec![
+                NativeValue::I64(h.old_start as i64),
+                NativeValue::I64(h.old_count as i64),
+                NativeValue::I64(h.new_start as i64),
+                NativeValue::I64(h.new_count as i64),
+                NativeValue::Str(h.kind),
+            ])
+        })
+        .collect();
+    HostCallOutcome::Return(NativeValue::List(vec![
+        NativeValue::Bool(tracked),
+        NativeValue::List(items),
+    ]))
+}
+
+fn encode_remote_ranked_files(res: RemoteRankedFilesResult) -> NativeValue {
+    let items = res
+        .items
+        .into_iter()
+        .map(|it| {
+            NativeValue::List(vec![
+                NativeValue::Str(it.full_uri),
+                NativeValue::Str(it.rel_path),
+                NativeValue::Bool(it.is_dir),
+                NativeValue::I64(it.score),
+            ])
+        })
+        .collect();
+    NativeValue::List(vec![
+        NativeValue::I64(res.total_indexed),
+        NativeValue::I64(res.total_matched),
+        NativeValue::List(items),
+    ])
+}
+
+fn encode_remote_entry_preview(pv: RemoteEntryPreview) -> NativeValue {
+    let children = pv
+        .child_entries
+        .into_iter()
+        .map(|(n, d, s, sz)| {
+            NativeValue::List(vec![
+                NativeValue::Str(n),
+                NativeValue::Bool(d),
+                NativeValue::Bool(s),
+                NativeValue::I64(sz),
+            ])
+        })
+        .collect();
+    NativeValue::List(vec![
+        NativeValue::Str(pv.kind),
+        NativeValue::Str(pv.target_uri),
+        NativeValue::Str(pv.target_name),
+        NativeValue::I64(pv.total_count),
+        NativeValue::I64(pv.total_size),
+        NativeValue::List(pv.lines.into_iter().map(NativeValue::Str).collect()),
+        NativeValue::List(children),
+    ])
+}
+
+fn encode_remote_dir_snapshot(snap: RemoteDirSnapshot) -> NativeValue {
+    let parents = snap
+        .parent_entries
+        .into_iter()
+        .map(|(n, u, d)| {
+            NativeValue::List(vec![
+                NativeValue::Str(n),
+                NativeValue::Str(u),
+                NativeValue::Bool(d),
+            ])
+        })
+        .collect();
+    let entries = snap
+        .entries
+        .into_iter()
+        .map(|e| {
+            NativeValue::List(vec![
+                NativeValue::Str(e.name),
+                NativeValue::Str(e.full_uri),
+                NativeValue::Str(e.remote_path),
+                NativeValue::Bool(e.is_dir),
+                NativeValue::Bool(e.is_symlink),
+                NativeValue::Bool(e.is_exec),
+                NativeValue::I64(e.size),
+                NativeValue::I64(e.modified_secs),
+                NativeValue::Str(e.perms),
+                NativeValue::Str(e.symlink_target),
+                NativeValue::Str(e.git_badge),
+            ])
+        })
+        .collect();
+    NativeValue::List(vec![
+        NativeValue::Str(snap.resolved_uri),
+        NativeValue::Str(snap.parent_uri),
+        NativeValue::List(parents),
+        NativeValue::List(entries),
+        NativeValue::Bool(snap.git_is_repo),
+        NativeValue::Str(snap.git_root_uri),
+        NativeValue::Str(snap.git_branch),
+        NativeValue::I64(snap.git_staged),
+        NativeValue::I64(snap.git_modified),
+        NativeValue::I64(snap.git_untracked),
+        encode_remote_entry_preview(snap.preview),
+    ])
+}
+
+fn handle_remote_search_files_ranked(
+    remotes: &RemoteManager,
+    args: &[NativeValue],
+) -> HostCallOutcome {
+    if args.len() != 5 {
+        return HostCallOutcome::Error(
+            "remote_search_files_ranked expects 5 arguments".to_string(),
+        );
+    }
+    let uri = match expect_str(&args[0], "remote_search_files_ranked.uri") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let query = match expect_str(&args[1], "remote_search_files_ranked.query") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let include_hidden = match expect_bool(&args[2], "remote_search_files_ranked.include_hidden") {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let include_dirs = match expect_bool(&args[3], "remote_search_files_ranked.include_dirs") {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let limit = match expect_i64(&args[4], "remote_search_files_ranked.limit") {
+        Ok(v) => v,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    match remotes.search_files_ranked(&uri, &query, include_hidden, include_dirs, limit) {
+        Ok(res) => HostCallOutcome::Return(encode_remote_ranked_files(res)),
+        Err(err) => HostCallOutcome::Error(err),
+    }
+}
+
+fn handle_remote_search_grep_ext(remotes: &RemoteManager, args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 5 {
+        return HostCallOutcome::Error("remote_search_grep_ext expects 5 arguments".to_string());
+    }
+    let uri = match expect_str(&args[0], "remote_search_grep_ext.uri") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let pattern = match expect_str(&args[1], "remote_search_grep_ext.pattern") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let case_sensitive = match expect_bool(&args[2], "remote_search_grep_ext.case_sensitive") {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let file_filter = match expect_str(&args[3], "remote_search_grep_ext.file_filter") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let limit = match expect_i64(&args[4], "remote_search_grep_ext.limit") {
+        Ok(v) => v,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    match remotes.search_grep_ext(&uri, &pattern, case_sensitive, &file_filter, limit) {
+        Ok((total_matched, hits)) => {
+            let list = hits
+                .into_iter()
+                .map(|(fp, r, c, txt)| {
+                    NativeValue::List(vec![
+                        NativeValue::Str(fp),
+                        NativeValue::I64(r),
+                        NativeValue::I64(c),
+                        NativeValue::Str(txt),
+                    ])
+                })
+                .collect();
+            HostCallOutcome::Return(NativeValue::List(vec![
+                NativeValue::I64(total_matched),
+                NativeValue::List(list),
+            ]))
+        }
+        Err(err) => HostCallOutcome::Error(err),
+    }
+}
+
+fn handle_remote_read_preview_window(
+    remotes: &RemoteManager,
+    args: &[NativeValue],
+) -> HostCallOutcome {
+    if args.len() != 4 {
+        return HostCallOutcome::Error(
+            "remote_read_preview_window expects 4 arguments".to_string(),
+        );
+    }
+    let uri = match expect_str(&args[0], "remote_read_preview_window.uri") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let start_row = match expect_i64(&args[1], "remote_read_preview_window.start_row") {
+        Ok(v) => v,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let max_lines = match expect_i64(&args[2], "remote_read_preview_window.max_lines") {
+        Ok(v) => v,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let max_bytes = match expect_i64(&args[3], "remote_read_preview_window.max_bytes") {
+        Ok(v) => v,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    match remotes.read_preview_window(&uri, start_row, max_lines, max_bytes) {
+        Ok(prev) => HostCallOutcome::Return(NativeValue::List(vec![
+            NativeValue::List(prev.lines.into_iter().map(NativeValue::Str).collect()),
+            NativeValue::I64(prev.start_row),
+            NativeValue::I64(prev.total_lines),
+            NativeValue::Bool(prev.is_binary),
+            NativeValue::Bool(prev.truncated),
+            NativeValue::I64(prev.total_size),
+        ])),
+        Err(err) => HostCallOutcome::Error(err),
+    }
+}
+
+fn handle_remote_dir_snapshot(remotes: &RemoteManager, args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 9 {
+        return HostCallOutcome::Error("remote_dir_snapshot expects 9 arguments".to_string());
+    }
+    let uri = match expect_str(&args[0], "remote_dir_snapshot.uri") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let show_hidden = match expect_bool(&args[1], "remote_dir_snapshot.show_hidden") {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let filter_query = match expect_str(&args[2], "remote_dir_snapshot.filter_query") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let sort_by = match expect_str(&args[3], "remote_dir_snapshot.sort_by") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let sort_reverse = match expect_bool(&args[4], "remote_dir_snapshot.sort_reverse") {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let focus_name = match expect_str(&args[5], "remote_dir_snapshot.focus_name") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let preferred_row = match expect_i64(&args[6], "remote_dir_snapshot.preferred_row") {
+        Ok(v) => v,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let include_parent = match expect_bool(&args[7], "remote_dir_snapshot.include_parent") {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let include_preview = match expect_bool(&args[8], "remote_dir_snapshot.include_preview") {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    match remotes.dir_snapshot(
+        &uri,
+        show_hidden,
+        &filter_query,
+        &sort_by,
+        sort_reverse,
+        &focus_name,
+        preferred_row,
+        include_parent,
+        include_preview,
+    ) {
+        Ok(snap) => HostCallOutcome::Return(encode_remote_dir_snapshot(snap)),
+        Err(err) => HostCallOutcome::Error(err),
+    }
+}
+
+fn handle_remote_entry_preview(remotes: &RemoteManager, args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 5 {
+        return HostCallOutcome::Error("remote_entry_preview expects 5 arguments".to_string());
+    }
+    let uri = match expect_str(&args[0], "remote_entry_preview.uri") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let is_dir = match expect_bool(&args[1], "remote_entry_preview.is_dir") {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let show_hidden = match expect_bool(&args[2], "remote_entry_preview.show_hidden") {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let max_lines = match expect_i64(&args[3], "remote_entry_preview.max_lines") {
+        Ok(v) => v,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let max_bytes = match expect_i64(&args[4], "remote_entry_preview.max_bytes") {
+        Ok(v) => v,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    match remotes.entry_preview(&uri, is_dir, show_hidden, max_lines, max_bytes) {
+        Ok(pv) => HostCallOutcome::Return(encode_remote_entry_preview(pv)),
+        Err(err) => HostCallOutcome::Error(err),
+    }
+}
+
+fn handle_remote_git_summary(remotes: &RemoteManager, args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 1 {
+        return HostCallOutcome::Error("remote_git_summary expects 1 argument".to_string());
+    }
+    let uri = match expect_str(&args[0], "remote_git_summary.uri") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    match remotes.git_summary(&uri) {
+        Ok(st) => HostCallOutcome::Return(NativeValue::List(vec![
+            NativeValue::Bool(st.is_repo),
+            NativeValue::Str(st.root),
+            NativeValue::Str(st.branch),
+            NativeValue::I64(st.staged_count),
+            NativeValue::I64(st.modified_count),
+            NativeValue::I64(st.untracked_count),
+        ])),
+        Err(err) => HostCallOutcome::Error(err),
+    }
+}
+
+fn handle_remote_git_file_hunks(remotes: &RemoteManager, args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 4 {
+        return HostCallOutcome::Error("remote_git_file_hunks expects 4 arguments".to_string());
+    }
+    let cwd_uri = match expect_str(&args[0], "remote_git_file_hunks.cwd_uri") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let file_uri = match expect_str(&args[1], "remote_git_file_hunks.file_uri") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let has_override = match expect_bool(&args[2], "remote_git_file_hunks.has_override") {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let override_lines = if has_override {
+        let raw_l = match expect_list(&args[3], "remote_git_file_hunks.lines") {
+            Ok(l) => l,
+            Err(e) => return HostCallOutcome::Error(e),
+        };
+        match extract_str_vec(raw_l, "remote_git_file_hunks.line") {
+            Ok(v) => Some(v),
+            Err(e) => return HostCallOutcome::Error(e),
+        }
+    } else {
+        None
+    };
+    match remotes.git_file_hunks(&cwd_uri, &file_uri, override_lines.as_deref()) {
+        Ok((tracked, hunks)) => {
+            let items = hunks
+                .into_iter()
+                .map(|h| {
+                    NativeValue::List(vec![
+                        NativeValue::I64(h.old_start),
+                        NativeValue::I64(h.old_count),
+                        NativeValue::I64(h.new_start),
+                        NativeValue::I64(h.new_count),
+                        NativeValue::Str(h.kind),
+                    ])
+                })
+                .collect();
+            HostCallOutcome::Return(NativeValue::List(vec![
+                NativeValue::Bool(tracked),
+                NativeValue::List(items),
+            ]))
+        }
+        Err(err) => HostCallOutcome::Error(err),
+    }
+}
+
+fn handle_remote_scan_todos(remotes: &RemoteManager, args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 2 {
+        return HostCallOutcome::Error("remote_scan_todos expects 2 arguments".to_string());
+    }
+    let uri = match expect_str(&args[0], "remote_scan_todos.uri") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let limit = match expect_i64(&args[1], "remote_scan_todos.limit") {
+        Ok(v) => v,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    match remotes.scan_todos(&uri, limit) {
+        Ok(items) => {
+            let list = items
+                .into_iter()
+                .map(|(fp, r, c, tag, txt)| {
+                    NativeValue::List(vec![
+                        NativeValue::Str(fp),
+                        NativeValue::I64(r),
+                        NativeValue::I64(c),
+                        NativeValue::Str(tag),
+                        NativeValue::Str(txt),
+                    ])
+                })
+                .collect();
+            HostCallOutcome::Return(NativeValue::List(list))
+        }
+        Err(err) => HostCallOutcome::Error(err),
+    }
+}
+
+fn handle_remote_workspace_replace(
+    remotes: &RemoteManager,
+    args: &[NativeValue],
+) -> HostCallOutcome {
+    if args.len() != 5 {
+        return HostCallOutcome::Error("remote_workspace_replace expects 5 arguments".to_string());
+    }
+    let uri = match expect_str(&args[0], "remote_workspace_replace.uri") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let query = match expect_str(&args[1], "remote_workspace_replace.query") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let replacement = match expect_str(&args[2], "remote_workspace_replace.replacement") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let case_sensitive = match expect_bool(&args[3], "remote_workspace_replace.case_sensitive") {
+        Ok(b) => b,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let file_filter = match expect_str(&args[4], "remote_workspace_replace.file_filter") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    match remotes.workspace_replace(&uri, &query, &replacement, case_sensitive, &file_filter) {
+        Ok((fc, tr)) => HostCallOutcome::Return(NativeValue::List(vec![
+            NativeValue::I64(fc),
+            NativeValue::I64(tr),
+        ])),
+        Err(err) => HostCallOutcome::Error(err),
+    }
+}
+
+fn parse_async_remote_op(kind: &str, params: &[NativeValue]) -> Result<AsyncRemoteOp, String> {
+    match kind {
+        "search_files" => {
+            if params.len() < 5 {
+                return Err("async search_files requires 5 params".to_string());
+            }
+            Ok(AsyncRemoteOp::SearchFiles {
+                uri: expect_str(&params[0], "async.search_files.uri")?,
+                query: expect_str(&params[1], "async.search_files.query")?,
+                include_hidden: expect_bool(&params[2], "async.search_files.include_hidden")?,
+                include_dirs: expect_bool(&params[3], "async.search_files.include_dirs")?,
+                limit: expect_i64(&params[4], "async.search_files.limit")?,
+            })
+        }
+        "search_grep" => {
+            if params.len() < 5 {
+                return Err("async search_grep requires 5 params".to_string());
+            }
+            Ok(AsyncRemoteOp::SearchGrep {
+                uri: expect_str(&params[0], "async.search_grep.uri")?,
+                pattern: expect_str(&params[1], "async.search_grep.pattern")?,
+                case_sensitive: expect_bool(&params[2], "async.search_grep.case_sensitive")?,
+                file_filter: expect_str(&params[3], "async.search_grep.file_filter")?,
+                limit: expect_i64(&params[4], "async.search_grep.limit")?,
+            })
+        }
+        "read_preview" => {
+            if params.len() < 4 {
+                return Err("async read_preview requires 4 params".to_string());
+            }
+            Ok(AsyncRemoteOp::ReadPreview {
+                uri: expect_str(&params[0], "async.read_preview.uri")?,
+                start_row: expect_i64(&params[1], "async.read_preview.start_row")?,
+                max_lines: expect_i64(&params[2], "async.read_preview.max_lines")?,
+                max_bytes: expect_i64(&params[3], "async.read_preview.max_bytes")?,
+            })
+        }
+        "dir_snapshot" => {
+            if params.len() < 9 {
+                return Err("async dir_snapshot requires 9 params".to_string());
+            }
+            Ok(AsyncRemoteOp::DirSnapshot {
+                uri: expect_str(&params[0], "async.dir_snapshot.uri")?,
+                show_hidden: expect_bool(&params[1], "async.dir_snapshot.show_hidden")?,
+                filter_query: expect_str(&params[2], "async.dir_snapshot.filter_query")?,
+                sort_by: expect_str(&params[3], "async.dir_snapshot.sort_by")?,
+                sort_reverse: expect_bool(&params[4], "async.dir_snapshot.sort_reverse")?,
+                focus_name: expect_str(&params[5], "async.dir_snapshot.focus_name")?,
+                preferred_row: expect_i64(&params[6], "async.dir_snapshot.preferred_row")?,
+                include_parent: expect_bool(&params[7], "async.dir_snapshot.include_parent")?,
+                include_preview: expect_bool(&params[8], "async.dir_snapshot.include_preview")?,
+            })
+        }
+        "entry_preview" => {
+            if params.len() < 5 {
+                return Err("async entry_preview requires 5 params".to_string());
+            }
+            Ok(AsyncRemoteOp::EntryPreview {
+                uri: expect_str(&params[0], "async.entry_preview.uri")?,
+                is_dir: expect_bool(&params[1], "async.entry_preview.is_dir")?,
+                show_hidden: expect_bool(&params[2], "async.entry_preview.show_hidden")?,
+                max_lines: expect_i64(&params[3], "async.entry_preview.max_lines")?,
+                max_bytes: expect_i64(&params[4], "async.entry_preview.max_bytes")?,
+            })
+        }
+        "git_summary" => {
+            if params.is_empty() {
+                return Err("async git_summary requires 1 param".to_string());
+            }
+            Ok(AsyncRemoteOp::GitSummary {
+                uri: expect_str(&params[0], "async.git_summary.uri")?,
+            })
+        }
+        "git_file_hunks" => {
+            if params.len() < 4 {
+                return Err("async git_file_hunks requires 4 params".to_string());
+            }
+            let has_override = expect_bool(&params[2], "async.git_file_hunks.has_override")?;
+            let override_lines = if has_override {
+                let raw_l = expect_list(&params[3], "async.git_file_hunks.lines")?;
+                Some(extract_str_vec(raw_l, "async.git_file_hunks.line")?)
+            } else {
+                None
+            };
+            Ok(AsyncRemoteOp::GitFileHunks {
+                cwd_uri: expect_str(&params[0], "async.git_file_hunks.cwd_uri")?,
+                file_uri: expect_str(&params[1], "async.git_file_hunks.file_uri")?,
+                override_lines,
+            })
+        }
+        "git_blame_line" => {
+            if params.len() < 3 {
+                return Err("async git_blame_line requires 3 params".to_string());
+            }
+            Ok(AsyncRemoteOp::GitBlameLine {
+                cwd_uri: expect_str(&params[0], "async.git_blame_line.cwd_uri")?,
+                file_uri: expect_str(&params[1], "async.git_blame_line.file_uri")?,
+                row: expect_i64(&params[2], "async.git_blame_line.row")?,
+            })
+        }
+        "scan_todos" => {
+            if params.len() < 2 {
+                return Err("async scan_todos requires 2 params".to_string());
+            }
+            Ok(AsyncRemoteOp::ScanTodos {
+                root_uri: expect_str(&params[0], "async.scan_todos.root_uri")?,
+                limit: expect_i64(&params[1], "async.scan_todos.limit")?,
+            })
+        }
+        "workspace_replace" => {
+            if params.len() < 5 {
+                return Err("async workspace_replace requires 5 params".to_string());
+            }
+            Ok(AsyncRemoteOp::WorkspaceReplace {
+                root_uri: expect_str(&params[0], "async.workspace_replace.root_uri")?,
+                query: expect_str(&params[1], "async.workspace_replace.query")?,
+                replacement: expect_str(&params[2], "async.workspace_replace.replacement")?,
+                case_sensitive: expect_bool(&params[3], "async.workspace_replace.case_sensitive")?,
+                file_filter: expect_str(&params[4], "async.workspace_replace.file_filter")?,
+            })
+        }
+        "readdir" => {
+            if params.len() < 2 {
+                return Err("async readdir requires 2 params".to_string());
+            }
+            Ok(AsyncRemoteOp::ReaddirSimple {
+                uri: expect_str(&params[0], "async.readdir.uri")?,
+                show_hidden: expect_bool(&params[1], "async.readdir.show_hidden")?,
+            })
+        }
+        other => Err(format!("unknown remote_async_submit op '{other}'")),
+    }
+}
+
+fn encode_async_remote_result(res: AsyncRemoteResult) -> NativeValue {
+    match res {
+        AsyncRemoteResult::SearchFiles(rf) => encode_remote_ranked_files(rf),
+        AsyncRemoteResult::SearchGrep {
+            total_matched,
+            hits,
+        } => {
+            let list = hits
+                .into_iter()
+                .map(|(fp, r, c, txt)| {
+                    NativeValue::List(vec![
+                        NativeValue::Str(fp),
+                        NativeValue::I64(r),
+                        NativeValue::I64(c),
+                        NativeValue::Str(txt),
+                    ])
+                })
+                .collect();
+            NativeValue::List(vec![
+                NativeValue::I64(total_matched),
+                NativeValue::List(list),
+            ])
+        }
+        AsyncRemoteResult::ReadPreview(prev) => NativeValue::List(vec![
+            NativeValue::List(prev.lines.into_iter().map(NativeValue::Str).collect()),
+            NativeValue::I64(prev.start_row),
+            NativeValue::I64(prev.total_lines),
+            NativeValue::Bool(prev.is_binary),
+            NativeValue::Bool(prev.truncated),
+            NativeValue::I64(prev.total_size),
+        ]),
+        AsyncRemoteResult::DirSnapshot(snap) => encode_remote_dir_snapshot(*snap),
+        AsyncRemoteResult::EntryPreview(pv) => encode_remote_entry_preview(pv),
+        AsyncRemoteResult::GitSummary(st) => NativeValue::List(vec![
+            NativeValue::Bool(st.is_repo),
+            NativeValue::Str(st.root),
+            NativeValue::Str(st.branch),
+            NativeValue::I64(st.staged_count),
+            NativeValue::I64(st.modified_count),
+            NativeValue::I64(st.untracked_count),
+        ]),
+        AsyncRemoteResult::GitFileHunks { tracked, hunks } => {
+            let items = hunks
+                .into_iter()
+                .map(|h| {
+                    NativeValue::List(vec![
+                        NativeValue::I64(h.old_start),
+                        NativeValue::I64(h.old_count),
+                        NativeValue::I64(h.new_start),
+                        NativeValue::I64(h.new_count),
+                        NativeValue::Str(h.kind),
+                    ])
+                })
+                .collect();
+            NativeValue::List(vec![NativeValue::Bool(tracked), NativeValue::List(items)])
+        }
+        AsyncRemoteResult::GitBlameLine(opt) => match opt {
+            Some(b) => NativeValue::List(vec![
+                NativeValue::Bool(true),
+                NativeValue::Str(b.commit_short),
+                NativeValue::Str(b.author),
+                NativeValue::Str(b.date_ymd),
+                NativeValue::Str(b.summary),
+            ]),
+            None => NativeValue::List(vec![NativeValue::Bool(false)]),
+        },
+        AsyncRemoteResult::ScanTodos(items) => {
+            let list = items
+                .into_iter()
+                .map(|(fp, r, c, tag, txt)| {
+                    NativeValue::List(vec![
+                        NativeValue::Str(fp),
+                        NativeValue::I64(r),
+                        NativeValue::I64(c),
+                        NativeValue::Str(tag),
+                        NativeValue::Str(txt),
+                    ])
+                })
+                .collect();
+            NativeValue::List(list)
+        }
+        AsyncRemoteResult::WorkspaceReplace {
+            files_changed,
+            total_replacements,
+        } => NativeValue::List(vec![
+            NativeValue::I64(files_changed),
+            NativeValue::I64(total_replacements),
+        ]),
+        AsyncRemoteResult::ReaddirSimple(entries) => {
+            let list = entries
+                .into_iter()
+                .map(|e| {
+                    NativeValue::List(vec![
+                        NativeValue::Str(e.name),
+                        NativeValue::Str(e.full_uri),
+                        NativeValue::Str(e.remote_path),
+                        NativeValue::Bool(e.is_dir),
+                        NativeValue::I64(e.size),
+                    ])
+                })
+                .collect();
+            NativeValue::List(list)
+        }
+    }
+}
+
+fn handle_remote_async_submit(
+    remotes: &Arc<RemoteManager>,
+    args: &[NativeValue],
+) -> HostCallOutcome {
+    if args.len() != 3 {
+        return HostCallOutcome::Error("remote_async_submit expects 3 arguments".to_string());
+    }
+    let slot_key = match expect_str(&args[0], "remote_async_submit.slot_key") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let kind = match expect_str(&args[1], "remote_async_submit.kind") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let params = match expect_list(&args[2], "remote_async_submit.params") {
+        Ok(l) => l,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let op = match parse_async_remote_op(&kind, params) {
+        Ok(o) => o,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    let seq = remotes.submit_async(slot_key, op);
+    HostCallOutcome::Return(NativeValue::I64(seq as i64))
+}
+
+fn handle_remote_async_poll(remotes: &RemoteManager, args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 1 {
+        return HostCallOutcome::Error("remote_async_poll expects 1 argument".to_string());
+    }
+    let slot_key = match expect_str(&args[0], "remote_async_poll.slot_key") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    match remotes.poll_async(&slot_key) {
+        AsyncPollOutcome::Idle => HostCallOutcome::Return(NativeValue::List(vec![
+            NativeValue::Str("idle".to_string()),
+            NativeValue::I64(0),
+        ])),
+        AsyncPollOutcome::Pending { seq } => HostCallOutcome::Return(NativeValue::List(vec![
+            NativeValue::Str("pending".to_string()),
+            NativeValue::I64(seq as i64),
+        ])),
+        AsyncPollOutcome::Ready {
+            seq,
+            elapsed_ms,
+            result,
+        } => HostCallOutcome::Return(NativeValue::List(vec![
+            NativeValue::Str("ready".to_string()),
+            NativeValue::I64(seq as i64),
+            NativeValue::I64(elapsed_ms),
+            encode_async_remote_result(result),
+        ])),
+        AsyncPollOutcome::Error { seq, message } => {
+            HostCallOutcome::Return(NativeValue::List(vec![
+                NativeValue::Str("error".to_string()),
+                NativeValue::I64(seq as i64),
+                NativeValue::Str(message),
+            ]))
+        }
+    }
+}
+
+fn handle_remote_async_cancel(remotes: &RemoteManager, args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 1 {
+        return HostCallOutcome::Error("remote_async_cancel expects 1 argument".to_string());
+    }
+    let slot_key = match expect_str(&args[0], "remote_async_cancel.slot_key") {
+        Ok(s) => s,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    remotes.cancel_async(&slot_key);
+    HostCallOutcome::Return(NativeValue::Unit)
+}
+
+fn handle_remote_async_active_count(
+    remotes: &RemoteManager,
+    args: &[NativeValue],
+) -> HostCallOutcome {
+    if !args.is_empty() {
+        return HostCallOutcome::Error("remote_async_active_count expects 0 arguments".to_string());
+    }
+    HostCallOutcome::Return(NativeValue::I64(remotes.active_async_count()))
+}
+
+fn handle_remote_set_test_delay_ms(args: &[NativeValue]) -> HostCallOutcome {
+    if args.len() != 1 {
+        return HostCallOutcome::Error("remote_set_test_delay_ms expects 1 argument".to_string());
+    }
+    let ms = match expect_i64(&args[0], "remote_set_test_delay_ms.ms") {
+        Ok(v) => v.max(0) as u64,
+        Err(e) => return HostCallOutcome::Error(e),
+    };
+    set_simulated_rpc_delay_ms(ms);
+    HostCallOutcome::Return(NativeValue::Unit)
 }
 
 /// Drive `vm` inside a single continuous Nessa `Scheduler` + `libuv` session, waking
