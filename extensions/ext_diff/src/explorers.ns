@@ -34,6 +34,17 @@ pub struct DiffDirEntry {
     pub deleted: i64,
 }
 
+fn normalize_slash_path(p: String) -> String {
+    var s = p.replace("\\", "/")
+    if s.char_len() >= 2 and s.slice(1, 2) == ":" {
+        s = s.slice(0, 1).to_upper() ++ s.slice(1, s.char_len())
+    }
+    while s.char_len() > 1 and s.ends_with("/") and not (s.char_len() == 3 and s.slice(1, 3) == ":/") {
+        s = s.slice(0, s.char_len() - 1)
+    }
+    s
+}
+
 pub fn effective_git_cwd(world: EditorWorld, file_path: String) -> String {
     if file_path != "" {
         if is_ssh_uri(file_path) {
@@ -126,11 +137,13 @@ pub fn fetch_git_revision_lines(
     } else {
         path.normalize(path.join(cwd, file_path))
     }
-    let root_pfx = st.root ++ "/"
-    if not full.starts_with(root_pfx) {
+    let root_norm = normalize_slash_path(st.root)
+    let full_norm = normalize_slash_path(full)
+    let root_pfx = if root_norm.ends_with("/") { root_norm } else { root_norm ++ "/" }
+    if not full_norm.starts_with(root_pfx) {
         return error ("File is outside Git repository root (" ++ st.root ++ "): " ++ full)
     }
-    let rel = full.drop(root_pfx.char_len())
+    let rel = full_norm.drop(root_pfx.char_len())
     let target_rev = if rev.trim() == "" { "HEAD" } else { rev.trim() }
 
     if target_rev == "HEAD" {
@@ -203,19 +216,55 @@ pub fn scan_git_diffview_entries(
             return error ("Not inside a remote Git repository: " ++ cwd)
         }
         let target_rev = if rev.trim() == "" { "HEAD" } else { rev.trim() }
-        let has_rev = verify_git_rev(rst.root, target_rev)
+        let has_rev = if target_rev == "HEAD" { true } else { verify_git_rev(rst.root, target_rev) }
         if rev.trim() != "" and rev.trim() != "HEAD" and (not has_rev) {
             return error ("Unknown Git revision: " ++ target_rev)
         }
-        let status_by_rel = HashMap.new()
-        let rel_list = List()
+        let entries = List()
         let seen = Set.new()
+        if rev.trim() != "" and rev.trim() != "HEAD" {
+            let safe_rev = "'" ++ target_rev.replace("'", "'\\''") ++ "'"
+            let ex_res = remote_exec(rst.root, "git diff --name-status " ++ safe_rev)
+            ex_res match {
+                ex! => {
+                    let (ex_code, ex_out, _) = ex
+                    if ex_code == 0 {
+                        let dlines = split_file_text_lines(ex_out)
+                        for di in 0..dlines.len() {
+                            let ln = dlines.get(di.as(usize)).as(String)
+                            let sp_opt = ln.split_once("\t")
+                            if sp_opt != null {
+                                let (code_raw, rest_path) = sp_opt.as((String, String))
+                                let code = code_raw.trim().take(1)
+                                let final_rel = if rest_path.contains("\t") {
+                                    let (_, r2) = rest_path.split_once("\t").as((String, String))
+                                    r2.trim()
+                                } else {
+                                    rest_path.trim()
+                                }
+                                if final_rel != "" and (not seen.contains(final_rel)) {
+                                    seen.insert(final_rel)
+                                    let full = join_ssh_uri(rst.root, final_rel)
+                                    entries.push(DiffViewEntry {
+                                        status: if code != "" { code } else { "M" },
+                                        rel_path: final_rel,
+                                        full_path: full,
+                                        added: -1,
+                                        deleted: -1,
+                                    })
+                                }
+                            }
+                        }
+                    }
+                },
+                error _ => (),
+            }
+        }
         for i in 0..rst.entries.len() {
             let ge = rst.entries.get(i.as(usize)).as(RemoteGitFileEntry)
             let rel = ge.rel_path
             if rel != "" and (not seen.contains(rel)) {
                 seen.insert(rel)
-                rel_list.push(rel)
                 let badge = if ge.index_status == "?" {
                     "?"
                 } else if ge.index_status == "A" {
@@ -225,40 +274,15 @@ pub fn scan_git_diffview_entries(
                 } else {
                     "M"
                 }
-                status_by_rel.insert(rel, badge)
+                let full = join_ssh_uri(rst.root, rel)
+                entries.push(DiffViewEntry {
+                    status: badge,
+                    rel_path: rel,
+                    full_path: full,
+                    added: -1,
+                    deleted: -1,
+                })
             }
-        }
-        rel_list.sort()
-        let entries = List()
-        for i in 0..rel_list.len() {
-            let rel = rel_list.get(i.as(usize)).as(String)
-            let badge = status_by_rel.get(rel).as(String)
-            let full = join_ssh_uri(rst.root, rel)
-            let open_opt = world.find_buffer_by_path(full)
-            let cur_lines = if open_opt != null {
-                let ob = open_opt.as(Buffer)
-                let cap = if ob.line_count() < 50000 { ob.line_count() } else { 50000 }
-                ob.slice_lines(0, cap)
-            } else {
-                read_disk_lines_or_empty(full)
-            }
-            let base_lines = if has_rev and badge != "?" {
-                let rev_tup = fetch_git_revision_lines(rst.root, full, target_rev) ! {
-                    _ => ("", "", List()),
-                }
-                let (_, _, bl) = rev_tup
-                bl
-            } else {
-                List()
-            }
-            let (add_n, del_n) = count_lines_added_deleted(base_lines, cur_lines)
-            entries.push(DiffViewEntry {
-                status: badge,
-                rel_path: rel,
-                full_path: full,
-                added: add_n,
-                deleted: del_n,
-            })
         }
         let label_rev = if rst.branch != "" and target_rev == "HEAD" {
             rst.branch ++ " (HEAD)"
@@ -333,12 +357,21 @@ pub fn scan_git_diffview_entries(
         }
     }
 
-    rel_list.sort()
     let entries = List()
     for i in 0..rel_list.len() {
         let rel = rel_list.get(i.as(usize)).as(String)
         let badge = status_by_rel.get(rel).as(String)
         let full = path.normalize(path.join(st.root, rel))
+        if rel.ends_with("/") or fs.is_dir(full) {
+            entries.push(DiffViewEntry {
+                status: badge,
+                rel_path: rel,
+                full_path: full,
+                added: -1,
+                deleted: -1,
+            })
+            continue
+        }
 
         let open_opt = world.find_buffer_by_path(full)
         let cur_lines = if open_opt != null {
@@ -394,11 +427,15 @@ pub fn render_diffview_buffer(
 ) {
     var total_add: i64 = 0
     var total_del: i64 = 0
+    var has_counts = false
     var max_path_w: i64 = 24
     for i in 0..entries.len() {
         let e = entries.get(i.as(usize)).as(DiffViewEntry)
-        total_add += e.added
-        total_del += e.deleted
+        if e.added >= 0 and e.deleted >= 0 {
+            total_add += e.added
+            total_del += e.deleted
+            has_counts = true
+        }
         if e.rel_path.char_len() + 4 > max_path_w {
             max_path_w = e.rel_path.char_len() + 4
         }
@@ -408,10 +445,14 @@ pub fn render_diffview_buffer(
     }
 
     let lines = List()
+    let count_suffix = if has_counts {
+        " (+" ++ total_add.to_string() ++ " -" ++ total_del.to_string() ++ ")"
+    } else {
+        ""
+    }
     lines.push(
         "  DIFFVIEW: " ++ repo_root ++ " @ " ++ rev_label
-        ++ "  │  " ++ entries.len().to_string() ++ " changed files (+"
-        ++ total_add.to_string() ++ " -" ++ total_del.to_string() ++ ")"
+        ++ "  │  " ++ entries.len().to_string() ++ " changed files" ++ count_suffix
     )
     lines.push("   RET open file diff   ]f/[f/Tab cycle files   R/gr refresh   q close")
 
@@ -420,10 +461,16 @@ pub fn render_diffview_buffer(
     } else {
         for i in 0..entries.len() {
             let e = entries.get(i.as(usize)).as(DiffViewEntry)
+            let stats_txt = if e.rel_path.ends_with("/") {
+                "dir"
+            } else if e.added < 0 or e.deleted < 0 {
+                "remote"
+            } else {
+                "+" ++ e.added.to_string() ++ "  -" ++ e.deleted.to_string()
+            }
             let row_str = " [" ++ e.status ++ "]  "
                 ++ pad_right(e.rel_path, max_path_w)
-                ++ "+" ++ e.added.to_string()
-                ++ "  -" ++ e.deleted.to_string()
+                ++ stats_txt
             lines.push(row_str)
         }
     }
@@ -468,7 +515,8 @@ pub fn render_diffview_buffer(
 }
 
 fn is_skipped_dir_rel(rel: String) -> bool {
-    rel.starts_with(".git/") or rel.contains("/.git/") or rel == ".git"
+    let norm = rel.replace("\\", "/")
+    norm.starts_with(".git/") or norm.contains("/.git/") or norm == ".git"
 }
 
 pub fn scan_directory_diff_entries(left_dir: String, right_dir: String) -> !String (List, i64) {
@@ -505,7 +553,7 @@ pub fn scan_directory_diff_entries(left_dir: String, right_dir: String) -> !Stri
     let all_rels = List()
 
     for i in 0..l_walk.len() {
-        let rel = l_walk.get(i.as(usize)).as(String)
+        let rel = l_walk.get(i.as(usize)).as(String).replace("\\", "/")
         if not is_skipped_dir_rel(rel) {
             l_set.insert(rel)
             if not all_set.contains(rel) {
@@ -515,7 +563,7 @@ pub fn scan_directory_diff_entries(left_dir: String, right_dir: String) -> !Stri
         }
     }
     for j in 0..r_walk.len() {
-        let rel = r_walk.get(j.as(usize)).as(String)
+        let rel = r_walk.get(j.as(usize)).as(String).replace("\\", "/")
         if not is_skipped_dir_rel(rel) {
             r_set.insert(rel)
             if not all_set.contains(rel) {

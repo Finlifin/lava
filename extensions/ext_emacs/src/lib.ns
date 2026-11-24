@@ -2149,6 +2149,23 @@ private fn setup_emacs_keymaps(kernel: SystemKernel, ext_id: ExtId) {
     global_km.bind("<C-h> b", "describe-bindings", ext_id, description = "List all key bindings")
     global_km.bind("<C-h> e", "view-echo-area-messages", ext_id, description = "View *Messages*")
     global_km.bind("<C-h> p", "describe-extensions", ext_id, description = "Inspect extensions & services")
+    kernel.register_command(
+        "clipboard-paste",
+        ext_id,
+        "Paste text from system clipboard at point (`<S-Insert>`).",
+        |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
+            let w = require_editor_world(kern)!
+            let buf = w.active_buffer()
+            let clip = clipboard_get()#
+            if clip != "" {
+                let _ = buf.insert_text(buf.point, clip)!
+                buf.preferred_col = buf.point.col
+                buf.checkpoint(buf.point, "clipboard-paste")
+            }
+            ()
+        },
+    )
+    global_km.bind("<S-Insert>", "clipboard-paste", ext_id, description = "Paste from system clipboard")
 
     -- Insert + Emacs shared editing keys
     let insert_km = kernel.ensure_keymap(KEYMAP_EMACS_INSERT, parent = global_km)

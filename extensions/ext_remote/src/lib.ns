@@ -18,13 +18,14 @@ use @lava_core.{
 use @lava_remote.{
     RemoteConnectionInfo, RemoteDirItem, RemoteGrepMatch, RemoteRankedFile, RemoteTarget,
     RemoteTunnelInfo, SshHostConfigEntry, is_ssh_uri, join_ssh_uri, normalize_ssh_uri,
-    parent_ssh_uri, parse_ssh_uri, remote_async_active_count, remote_connect, remote_copy,
+    parent_ssh_uri, parse_ssh_uri, remote_async_active_count, remote_async_decode_connect,
+    remote_async_poll, remote_async_submit, remote_connect, remote_copy,
     remote_deploy_server, remote_disconnect, remote_discover_ssh_hosts, remote_exec,
     remote_find_root, remote_host_available, remote_list_connections, remote_mkdir,
     remote_port_forward_list, remote_port_forward_start, remote_port_forward_stop,
     remote_probe_tcp, remote_read_lines, remote_readdir, remote_remove, remote_rename,
     remote_search_files_ranked, remote_search_grep_ext, remote_spinner_frame, remote_stat,
-    remote_write_lines, ssh_uri_basename
+    remote_ui_async_enabled, remote_write_lines, ssh_uri_basename
 }
 use @lava_term.pty_available
 use @ext_document.{
@@ -66,6 +67,12 @@ pub struct RemoteService {
     pub last_shell_cmd: String,
     pub origin_buf_id: ?BufferId,
     pub status_row_targets: HashMap,
+    pub pending_connect_active: bool,
+    pub pending_connect_chosen: String,
+    pub pending_connect_path: String,
+    pub pending_connect_target_uri: String,
+    pub pending_connect_has_subpath: bool,
+    pub pending_connect_is_profile: bool,
 }
 
 impl RemoteService {
@@ -83,6 +90,12 @@ impl RemoteService {
             last_shell_cmd: "",
             origin_buf_id: null,
             status_row_targets: HashMap.new(),
+            pending_connect_active: false,
+            pending_connect_chosen: "",
+            pending_connect_path: "",
+            pending_connect_target_uri: "",
+            pending_connect_has_subpath: false,
+            pending_connect_is_profile: false,
         }
         svc
     }
@@ -802,11 +815,6 @@ private fn connect_and_route(
     } else {
         raw_trimmed
     }
-    let info = remote_connect(trimmed)!
-    svc.active_target = info.prefix
-    log_event("info", "ext_remote", "Connected to " ++ info.authority ++ " [" ++ info.mode ++ "]")#
-
-    -- Check if target specifies an existing remote directory or file
     let has_explicit_subpath = if is_bare_profile {
         false
     } else if trimmed.starts_with("ssh://") {
@@ -816,6 +824,23 @@ private fn connect_and_route(
     } else {
         false
     }
+
+    if remote_ui_async_enabled() and kernel.get_command("dirvish-connecting") != null {
+        svc.pending_connect_active = true
+        svc.pending_connect_chosen = raw_trimmed
+        svc.pending_connect_path = ""
+        svc.pending_connect_target_uri = trimmed
+        svc.pending_connect_has_subpath = has_explicit_subpath
+        svc.pending_connect_is_profile = false
+        let _ = kernel.dispatch_command("dirvish-connecting", [trimmed])#!
+        let _ = remote_async_submit("remote.connect", "connect", [trimmed])
+        sync_remote_statusline(world, svc)
+        return ()
+    }
+
+    let info = remote_connect(trimmed)!
+    svc.active_target = info.prefix
+    log_event("info", "ext_remote", "Connected to " ++ info.authority ++ " [" ++ info.mode ++ "]")#
 
     if has_explicit_subpath {
         let st_res = remote_stat(trimmed)
@@ -990,6 +1015,23 @@ fn cmd_remote_connect_profile(kernel: SystemKernel, args: List) -> #InteractiveE
         return ()
     }
     let target_uri = resolve_ssh_profile_to_uri(chosen)
+    if remote_ui_async_enabled() and kernel.get_command("dirvish-connecting") != null {
+        let preview_dir = if chosen_path != "" {
+            resolve_ssh_connect_dir_uri(target_uri, "", "", chosen, chosen_path)
+        } else {
+            target_uri
+        }
+        svc.pending_connect_active = true
+        svc.pending_connect_chosen = chosen
+        svc.pending_connect_path = chosen_path
+        svc.pending_connect_target_uri = target_uri
+        svc.pending_connect_has_subpath = chosen_path != ""
+        svc.pending_connect_is_profile = true
+        let _ = kernel.dispatch_command("dirvish-connecting", [preview_dir])#!
+        let _ = remote_async_submit("remote.connect", "connect", [target_uri])
+        sync_remote_statusline(world, svc)
+        return ()
+    }
     let info = remote_connect(target_uri)!
     svc.active_target = info.prefix
     let remote_dir_uri = resolve_ssh_connect_dir_uri(
@@ -2112,6 +2154,101 @@ fn cmd_remote_probe(kernel: SystemKernel, args: List) -> #InteractiveEffects !St
     ms
 }
 
+private fn finish_async_remote_connect(kernel: SystemKernel, world: EditorWorld, svc: RemoteService) -> #InteractiveEffects !String Unit {
+    let poll = remote_async_poll("remote.connect")
+    if poll.status == "pending" {
+        sync_remote_statusline(world, svc)
+        return ()
+    }
+    if poll.status == "idle" {
+        return ()
+    }
+    svc.pending_connect_active = false
+    if poll.status == "error" {
+        sync_remote_statusline(world, svc)
+        status_emit("Remote connect failed: " ++ poll.error_msg)#
+        return ()
+    }
+    let info = remote_async_decode_connect(poll.payload)
+    svc.active_target = info.prefix
+    if svc.pending_connect_is_profile {
+        let remote_dir_uri = resolve_ssh_connect_dir_uri(
+            info.prefix,
+            info.remote_home,
+            info.remote_cwd,
+            svc.pending_connect_chosen,
+            svc.pending_connect_path,
+        )
+        world.cwd = remote_dir_uri
+        svc.current_uri = canonical_dir_uri(remote_dir_uri) ! { _ => remote_dir_uri }
+        refresh_remote_status_if_open(world, svc)
+        log_event(
+            "info",
+            "ext_remote",
+            "Connected OpenSSH profile `" ++ svc.pending_connect_chosen ++ "` -> " ++ info.authority ++ " [" ++ info.mode ++ "]",
+        )#
+        if kernel.get_command("dirvish") != null {
+            let _ = kernel.dispatch_command("dirvish", [remote_dir_uri])#!
+        }
+        sync_remote_statusline(world, svc)
+        status_emit(
+            "Connected OpenSSH profile `" ++ svc.pending_connect_chosen ++ "` -> " ++ info.authority
+            ++ " [" ++ info.mode ++ "] (" ++ remote_dir_uri ++ ")",
+        )#
+        return ()
+    }
+
+    let trimmed = svc.pending_connect_target_uri
+    log_event("info", "ext_remote", "Connected to " ++ info.authority ++ " [" ++ info.mode ++ "]")#
+    if svc.pending_connect_has_subpath {
+        let st_res = remote_stat(trimmed)
+        st_res match {
+            st! => {
+                if st.exists and st.is_file {
+                    let fbuf = world.open_file(trimmed)#!
+                    sync_wm(kernel, world)
+                    ensure_vim_normal(kernel, world)
+                    kernel.emit_hook("buffer-opened", fbuf.id)
+                    kernel.emit_hook("buffer-switched", fbuf.id)
+                    sync_remote_statusline(world, svc)
+                    status_emit("Opened remote file " ++ fbuf.file_path)#
+                    return ()
+                }
+            },
+            error _ => (),
+        }
+    }
+    let remote_dir_uri = resolve_ssh_connect_dir_uri(
+        info.prefix,
+        info.remote_home,
+        info.remote_cwd,
+        trimmed,
+        "",
+    )
+    world.cwd = remote_dir_uri
+    svc.current_uri = canonical_dir_uri(remote_dir_uri) ! { _ => remote_dir_uri }
+    if kernel.get_command("dirvish") != null {
+        let _ = kernel.dispatch_command("dirvish", [remote_dir_uri])#!
+    }
+    sync_remote_statusline(world, svc)
+    status_emit("Connected to " ++ info.authority ++ " [" ++ info.mode ++ "]")#
+    ()
+}
+
+private fn on_remote_timer_tick(kernel: SystemKernel, _payload: Any) {
+    let w_opt = kernel.service("lava.document.world")
+    let s_opt = kernel.service(SERVICE_REMOTE)
+    if w_opt == null or s_opt == null {
+        return
+    }
+    let world = w_opt.as(EditorWorld)
+    let svc = s_opt.as(RemoteService)
+    if not svc.pending_connect_active {
+        return
+    }
+    let _ = finish_async_remote_connect(kernel, world, svc)# ! { _ => () }
+}
+
 -- ============================================================================
 -- 5. Extension Registration (single-line signature contract)
 -- ============================================================================
@@ -2137,6 +2274,7 @@ pub fn register_remote_extension(kernel: SystemKernel) -> !String Unit {
             }
             k.add_hook("buffer-switched", ext_id, on_buf_sync, priority = 60)
             k.add_hook("buffer-opened", ext_id, on_buf_sync, priority = 60)
+            k.add_hook("timer-tick", ext_id, on_remote_timer_tick, priority = 55)
 
             -- Core interactive commands + Ex aliases
             k.register_command("remote-connect", ext_id, "Connect to an SSH remote host (`:RemoteConnect [ssh://user@host]`).", cmd_remote_connect)

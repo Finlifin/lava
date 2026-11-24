@@ -17,8 +17,8 @@ use @lava_core.{
     clipboard_get, clipboard_set, log_event, status_emit
 }
 use @ext_document.{
-    Buffer, BufferId, BufferKind, EditorWorld, FloatingWindow, Pos, RegisterValue, Span,
-    ext_document_id, require_editor_world
+    Buffer, BufferId, BufferKind, BufferLifetime, EditorWorld, FloatingWindow, Pos, RegisterValue,
+    Span, ext_document_id, require_editor_world
 }
 use @ext_window.{
     SERVICE_WINDOW_MANAGER, SplitAxis, WinId, WindowManager, WindowPane, ext_window_id
@@ -612,7 +612,7 @@ fn compute_pipeline_and_hunks(
 fn render_active_diff_buffers(world: EditorWorld, wm_opt: ?WindowManager, session: DiffSession) {
     let max_orig = max_i64(session.left_raw_lines.len(), session.right_raw_lines.len())
     if session.layout == "unified" {
-        let ubuf = world.ensure_special_buffer(BUF_DIFF_UNIFIED, "diff", [""], read_only = true)
+        let ubuf = world.ensure_special_buffer(BUF_DIFF_UNIFIED, "diff", [""], read_only = true, lifetime = BufferLifetime.kill_on_quit)
         session.unified_diff_buf_id = ubuf.id
         session.unified_rows = render_unified_buffer(
             ubuf,
@@ -643,8 +643,8 @@ fn render_active_diff_buffers(world: EditorWorld, wm_opt: ?WindowManager, sessio
     }
 
     -- Default `"side-by-side"` synchronized split layout
-    let lbuf = world.ensure_special_buffer(BUF_DIFF_LEFT, "diff", [""], read_only = true)
-    let rbuf = world.ensure_special_buffer(BUF_DIFF_RIGHT, "diff", [""], read_only = true)
+    let lbuf = world.ensure_special_buffer(BUF_DIFF_LEFT, "diff", [""], read_only = true, lifetime = BufferLifetime.kill_on_quit)
+    let rbuf = world.ensure_special_buffer(BUF_DIFF_RIGHT, "diff", [""], read_only = true, lifetime = BufferLifetime.kill_on_quit)
     session.left_diff_buf_id = lbuf.id
     session.right_diff_buf_id = rbuf.id
     session.sbs_rows = render_side_by_side_buffers(
@@ -727,9 +727,11 @@ fn start_diff_session(
     let session = service.session
     let wm_opt = optional_wm(kernel)
 
-    -- Record pre-diff window & buffer context if entering diff from normal editing
+    -- Record pre-diff window & buffer context if entering diff from normal editing or an explorer
     let cur_buf = world.active_buffer()
-    if not is_internal_diff_buffer_name(cur_buf.name) {
+    if (not is_internal_diff_buffer_name(cur_buf.name))
+        or cur_buf.name == BUF_DIFF_VIEW
+        or cur_buf.name == BUF_DIFF_DIRS {
         session.prev_buffer_id = cur_buf.id
         if wm_opt != null {
             session.prev_single_window = wm_opt.as(WindowManager).visible_panes().len() <= 1
@@ -1167,21 +1169,34 @@ fn cmd_diff_view(kernel: SystemKernel, args: List) -> #InteractiveEffects !Strin
     let rev = if rev_raw == "" { "HEAD" } else { rev_raw }
 
     let cur = world.active_buffer()
+    let is_refresh_in_diffview = cur.major_mode == "diffview"
     if cur.name != BUF_DIFF_VIEW and (not is_internal_diff_buffer_name(cur.name)) {
         service.diffview_prev_buf_id = cur.id
     }
 
-    let cwd = effective_git_cwd(world, cur.file_path)
+    let cwd = if is_refresh_in_diffview and service.diffview_repo_root != "" {
+        service.diffview_repo_root
+    } else {
+        effective_git_cwd(world, cur.file_path)
+    }
+    if is_ssh_uri(cwd) {
+        status_emit("DiffView: fetching remote Git status...")#
+    }
     let (repo_root, rev_label, entries) = scan_git_diffview_entries(world, cwd, rev)!
     service.diffview_repo_root = repo_root
     service.diffview_rev = rev
     service.diffview_rev_label = rev_label
     service.diffview_entries = entries
-    service.diffview_active_idx = 0
+    let target_idx = if is_refresh_in_diffview and (not entries.is_empty()) {
+        min_i64(max_i64(0, service.diffview_active_idx), entries.len() - 1)
+    } else {
+        0
+    }
+    service.diffview_active_idx = target_idx
 
-    let vbuf = world.ensure_special_buffer(BUF_DIFF_VIEW, "diffview", [""], read_only = true)
+    let vbuf = world.ensure_special_buffer(BUF_DIFF_VIEW, "diffview", [""], read_only = true, lifetime = BufferLifetime.kill_on_quit)
     render_diffview_buffer(vbuf, repo_root, rev_label, entries)
-    vbuf.point = vbuf.clamp_pos(Pos.new(DIFF_HEADER_ROWS, 0), insert_mode = false)
+    vbuf.point = vbuf.clamp_pos(Pos.new(DIFF_HEADER_ROWS + target_idx, 0), insert_mode = false)
 
     let wm_opt = optional_wm(kernel)
     if wm_opt != null {
@@ -1211,6 +1226,17 @@ fn open_diffview_entry_by_index(
     let clamped = min_i64(max_i64(0, idx), service.diffview_entries.len() - 1)
     service.diffview_active_idx = clamped
     let entry = service.diffview_entries.get(clamped.as(usize)).as(DiffViewEntry)
+    if entry.rel_path.ends_with("/") {
+        if kernel.get_command("dirvish") != null {
+            let _ = kernel.dispatch_command("dirvish", [entry.full_path])#!
+        } else {
+            status_emit("Untracked directory: " ++ entry.rel_path)#
+        }
+        return ()
+    }
+    if is_ssh_uri(entry.full_path) {
+        status_emit("DiffView: loading " ++ entry.rel_path ++ "...")#
+    }
 
     let (_, _, base_lines) = if entry.status == "?" {
         (service.diffview_repo_root, entry.rel_path, List())
@@ -1227,7 +1253,7 @@ fn open_diffview_entry_by_index(
         service.diffview_rev,
         base_lines,
     )
-    let right_src = if fs.is_file(entry.full_path) or world.find_buffer_by_path(entry.full_path) != null {
+    let right_src = if (entry.status != "D") and (is_ssh_uri(entry.full_path) or fs.is_file(entry.full_path) or world.find_buffer_by_path(entry.full_path) != null) {
         let rbuf = open_or_load_file_buffer(kernel, world, entry.full_path)#!
         DiffSource.from_buffer(rbuf)
     } else {
@@ -1293,7 +1319,7 @@ fn cmd_diff_dirs(kernel: SystemKernel, args: List) -> #InteractiveEffects !Strin
     service.diffdirs_entries = entries
     service.diffdirs_identical_count = ident_cnt
 
-    let dbuf = world.ensure_special_buffer(BUF_DIFF_DIRS, "diffdirs", [""], read_only = true)
+    let dbuf = world.ensure_special_buffer(BUF_DIFF_DIRS, "diffdirs", [""], read_only = true, lifetime = BufferLifetime.kill_on_quit)
     render_diffdirs_buffer(dbuf, left_dir, right_dir, entries, ident_cnt)
     dbuf.point = dbuf.clamp_pos(Pos.new(DIFF_HEADER_ROWS, 0), insert_mode = false)
 
@@ -2427,11 +2453,20 @@ fn cmd_cycle_explorer_entry(kernel: SystemKernel, delta: i64) -> #InteractiveEff
     -- Inside an open file diff launched from DiffView: `]f` / `[f` cycles directly to next/prev repo file!
     if service.session.active and (not service.diffview_entries.is_empty()) {
         let n = service.diffview_entries.len()
-        var nxt = (service.diffview_active_idx + delta) % n
-        if nxt < 0 {
-            nxt += n
+        var step = 1
+        var nxt = service.diffview_active_idx
+        while step <= n {
+            nxt = (service.diffview_active_idx + delta * step) % n
+            if nxt < 0 {
+                nxt += n
+            }
+            let cand = service.diffview_entries.get(nxt.as(usize)).as(DiffViewEntry)
+            if not cand.rel_path.ends_with("/") {
+                open_diffview_entry_by_index(kernel, world, service, nxt)#!
+                return ()
+            }
+            step += 1
         }
-        open_diffview_entry_by_index(kernel, world, service, nxt)#!
     }
     ()
 }
@@ -2440,8 +2475,13 @@ fn find_fallback_restore_buffer(world: EditorWorld, preferred: ?BufferId) -> Buf
     if preferred != null {
         let pid = preferred.as(BufferId)
         let b_opt = world.buffer(pid)
-        if b_opt != null and (not is_internal_diff_buffer_name(b_opt.as(Buffer).name)) {
-            return pid
+        if b_opt != null {
+            let bname = b_opt.as(Buffer).name
+            if (not is_internal_diff_buffer_name(bname))
+                or bname == BUF_DIFF_VIEW
+                or bname == BUF_DIFF_DIRS {
+                return pid
+            }
         }
     }
     for i in 0..world.buffer_order.len() {
@@ -2496,6 +2536,11 @@ fn cmd_quit_diff(kernel: SystemKernel) -> #InteractiveEffects !String Any {
     let session = service.session
     session.active = false
     let restore_id = find_fallback_restore_buffer(world, session.prev_buffer_id)
+    let rbuf_opt = world.buffer(restore_id)
+    if rbuf_opt != null and rbuf_opt.as(Buffer).major_mode == "diffview" {
+        let dv_buf = rbuf_opt.as(Buffer)
+        dv_buf.point = dv_buf.clamp_pos(Pos.new(DIFF_HEADER_ROWS + service.diffview_active_idx, 0), insert_mode = false)
+    }
 
     if wm_opt != null {
         let wm = wm_opt.as(WindowManager)

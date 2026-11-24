@@ -511,9 +511,20 @@ fn run_cli(opts: CliOptions) -> Result<i32, String> {
                 .with_extra_ext_dirs(opts.extra_ext_dirs.clone())
                 .with_user_script(user_init);
 
-            // Compile (or load content-addressed `.nsbc` cache for) the single-VM Nessa program
-            // upfront so any syntax/type error reports cleanly before opening a native window.
-            let artifact = workspace.compile_boot(&boot_opts)?;
+            // On a warm pre-linked `.nsbc` hit in interactive GUI mode, open the GTK4 window
+            // immediately (~2.5ms stat probe) while the VM thread loads the archive and renders
+            // frame #1 in parallel; on any cache miss or headless run, compile upfront so syntax
+            // or type errors report cleanly before opening a window.
+            let warm_linked_for_gui = if !use_headless {
+                workspace.probe_warm_linked_boot(&boot_opts)
+            } else {
+                None
+            };
+            let precompiled_artifact = if warm_linked_for_gui.is_none() {
+                Some(workspace.compile_boot_executable(&boot_opts)?)
+            } else {
+                None
+            };
 
             let (init_width, init_height) =
                 if !use_headless && !opts.width_overridden && !opts.height_overridden {
@@ -545,6 +556,7 @@ fn run_cli(opts: CliOptions) -> Result<i32, String> {
                 );
 
             let exit_code = if use_headless {
+                let artifact = precompiled_artifact.expect("headless mode precompiles boot");
                 run_compiled_artifact(artifact, host_cfg)?
             } else {
                 if !is_display_available() {
@@ -554,10 +566,20 @@ fn run_cli(opts: CliOptions) -> Result<i32, String> {
                     );
                 }
                 let eq_for_vm = Arc::clone(&event_queue);
+                let ws_for_vm = workspace;
+                let boot_opts_for_vm = boot_opts;
                 let vm_handle = thread::Builder::new()
                     .name("lava-nessa-vm".to_string())
                     .spawn(move || {
-                        let res = run_compiled_artifact(artifact, host_cfg);
+                        let res = match precompiled_artifact {
+                            Some(artifact) => run_compiled_artifact(artifact, host_cfg),
+                            None => ws_for_vm
+                                .load_warm_linked_or_compile(
+                                    &boot_opts_for_vm,
+                                    warm_linked_for_gui.as_deref(),
+                                )
+                                .and_then(|artifact| run_compiled_artifact(artifact, host_cfg)),
+                        };
                         let code = match &res {
                             Ok(c) => *c,
                             Err(_) => 1,

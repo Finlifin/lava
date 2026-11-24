@@ -1073,18 +1073,20 @@ fn run_session_with_caps(
         wm.sync_from_world(world)
     }
 
-    -- Pre-warm Minibuffer command/keymap/Ex snapshots so the first `:`, `M-x`, or `C-x C-f` is O(1).
-    if not headless {
-        prewarm_minibuffer(kernel)
-    }
-
     -- 4. Inject `--headless-keys` startup key sequence if supplied.
     if headless_keys != "" {
         app_feed_keys(kernel, headless_keys)#!
     }
 
-    -- 5. Commit initial 2D scene frame to `FrameSlot` for GTK4 / `--dump-frame-png`.
+    -- 5. Commit initial 2D scene frame to `FrameSlot` for GTK4 / `--dump-frame-png` immediately
+    --    so interactive windows present the first frame before background minibuffer prewarming.
     let _ = app_commit_frame(kernel)!
+
+    -- Pre-warm Minibuffer command/keymap/Ex snapshots right after the first frame is committed
+    -- so the first `:`, `M-x`, or `C-x C-f` is O(1) without delaying initial window paint.
+    if not headless {
+        prewarm_minibuffer(kernel)
+    }
 
     -- 6. In `--headless` mode, drain any background jobs spawned during startup keys,
     --    commit the updated frame, and exit cleanly without blocking on an absent UI window.

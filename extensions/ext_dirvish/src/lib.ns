@@ -2606,6 +2606,38 @@ fn refresh_preview_for_cursor(world: EditorWorld, wm: WindowManager, state: Dirv
     wm.sync_from_world(world)
 }
 
+fn open_dirvish_connecting(kernel: SystemKernel, raw_dir: String) -> #[log_event, status_emit] !String Unit {
+    let world = require_editor_world(kernel)!
+    let wm = require_window_manager(kernel)!
+    let state = require_dirvish_state(kernel)!
+
+    let cur_buf = world.active_buffer()
+    if (
+        cur_buf.name != DIRVISH_BUF_NAME
+        and cur_buf.name != DIRVISH_PARENT_BUF_NAME
+        and cur_buf.name != DIRVISH_PREVIEW_BUF_NAME
+    ) {
+        state.origin_buf_id = cur_buf.id
+    }
+
+    let target_dir = if raw_dir.trim() == "" { "ssh://connecting/" } else { raw_dir.trim() }
+    state.fd_mode = false
+    state.current_dir = target_dir
+    state.entries = List()
+    state.parent_entries = List()
+    state.remote_snap_loaded_dir = ""
+    state.remote_snap_loading = true
+    state.remote_fd_loading = false
+
+    let parent_buf = render_parent_buffer(world, state)
+    let center_buf = render_center_buffer(world, state, "", 0)
+    let preview_buf = render_preview_buffer(world, state, center_buf)
+    sync_dirvish_layout(world, wm, state, parent_buf, center_buf, preview_buf)
+    ensure_vim_normal(kernel, world)
+    status_emit("Connecting to " ++ target_dir ++ "...")#
+    ()
+}
+
 fn open_dirvish_at(
     kernel: SystemKernel,
     raw_dir: String,
@@ -4208,6 +4240,18 @@ pub fn register_dirvish_extension(kernel: SystemKernel) -> !String Unit {
             km.bind("S", "dirvish-open-shell", ext_id, description = "Open shell in current dir")
             km.bind("g R", "dirvish-refresh", ext_id, description = "Refresh Dirvish")
             km.bind("r", "dirvish-refresh", ext_id, description = "Refresh Dirvish")
+
+            k.register_command(
+                "dirvish-connecting",
+                ext_id,
+                "Open Dirvish immediately in connecting/loading state while remote session connects.",
+                |kern: SystemKernel, args: List| -> #InteractiveEffects !String Any {
+                    let target = if args.is_empty() { "" } else { args.get(0).as(String) }
+                    open_dirvish_connecting(kern, target)#!
+                    ()
+                },
+                interactive = false,
+            )
             km.bind("q", "dirvish-quit", ext_id, description = "Quit Dirvish and restore buffer")
 
             k.add_hook("timer-tick", ext_id, on_dirvish_timer_tick)

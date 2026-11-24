@@ -5040,6 +5040,14 @@ fn parse_async_remote_op(kind: &str, params: &[NativeValue]) -> Result<AsyncRemo
                 uri: expect_str(&params[0], "async.git_summary.uri")?,
             })
         }
+        "connect" => {
+            if params.is_empty() {
+                return Err("async connect requires 1 param".to_string());
+            }
+            Ok(AsyncRemoteOp::Connect {
+                uri: expect_str(&params[0], "async.connect.uri")?,
+            })
+        }
         "git_file_hunks" => {
             if params.len() < 4 {
                 return Err("async git_file_hunks requires 4 params".to_string());
@@ -5204,6 +5212,19 @@ fn encode_async_remote_result(res: AsyncRemoteResult) -> NativeValue {
                 .collect();
             NativeValue::List(list)
         }
+        AsyncRemoteResult::Connect(info) => NativeValue::List(vec![
+            NativeValue::Str(info.authority),
+            NativeValue::Str(info.prefix),
+            NativeValue::Str(info.mode),
+            NativeValue::Bool(info.alive),
+            NativeValue::Str(info.hostname),
+            NativeValue::Str(info.os),
+            NativeValue::Str(info.arch),
+            NativeValue::Str(info.remote_home),
+            NativeValue::Str(info.remote_cwd),
+            NativeValue::Str(info.server_version),
+            NativeValue::I64(info.latency_us),
+        ]),
     }
 }
 

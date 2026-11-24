@@ -34,7 +34,7 @@ use @lava_remote.{
     remote_write_lines, ssh_uri_basename
 }
 use @ext_document.{
-    Buffer, BufferId, BufferKind, CompletionItem, EditorWorld, FloatingWindow,
+    Buffer, BufferId, BufferKind, BufferLifetime, CompletionItem, EditorWorld, FloatingWindow,
     Pos, QuickfixEntry, Span, detect_major_mode, ext_document_id, require_editor_world
 }
 use @ext_window.{SERVICE_WINDOW_MANAGER, WindowManager}
@@ -3676,7 +3676,7 @@ pub fn register_lsp_extension(kernel: SystemKernel) -> !String Unit {
                         )
                     }
                     svc.prev_buf_before_panel = buf.id
-                    let rbuf = w.ensure_special_buffer(LSP_REFS_BUF_NAME, MODE_LSP_REFS, lines, read_only = true)
+                    let rbuf = w.ensure_special_buffer(LSP_REFS_BUF_NAME, MODE_LSP_REFS, lines, read_only = true, lifetime = BufferLifetime.kill_on_quit)
                     rbuf.point = Pos.new(if qf_entries.is_empty() { 0 } else { 2 }, 0)
                     w.active_buffer_id = rbuf.id
                     sync_wm(kern, w)
@@ -4436,10 +4436,16 @@ pub fn register_lsp_extension(kernel: SystemKernel) -> !String Unit {
                 "Close *LspInfo* / *LspLog* / *LSP References* buffer and restore previous buffer.",
                 |kern: SystemKernel, _args: List| -> #InteractiveEffects !String Any {
                     let w = require_editor_world(kern)!
-                    if w.buffers.contains_key(svc.prev_buf_before_panel) {
-                        w.active_buffer_id = svc.prev_buf_before_panel
+                    let cur_id = w.active_buffer_id
+                    let cur = w.active_buffer()
+                    let should_kill = cur.lifetime != BufferLifetime.persistent
+                    if w.buffers.contains_key(svc.prev_buf_before_panel) and svc.prev_buf_before_panel != cur_id {
+                        let _ = w.switch_to_buffer(svc.prev_buf_before_panel)
                     } else {
                         let _ = w.cycle_buffer(-1)
+                    }
+                    if should_kill and cur_id != w.active_buffer_id {
+                        let _ = w.kill_buffer(cur_id) ! { _ => cur_id }
                     }
                     sync_wm(kern, w)
                     ()

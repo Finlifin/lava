@@ -7,7 +7,10 @@ use std.fs
 use std.process
 
 use @lava_sys.{host_request_quit, host_write_file_lines}
-use @lava_remote.{is_ssh_uri, parent_ssh_uri, remote_exec, remote_stat, remote_write_lines}
+use @lava_remote.{
+    is_ssh_uri, parent_ssh_uri, remote_exec, remote_list_connections, remote_stat,
+    remote_write_lines
+}
 use @lava_core.{
     CommandSpec, ExtensionRecord, InteractiveEffects, PromptTurn, ServiceEntry, SystemKernel,
     clipboard_get, clipboard_set, log_event, status_emit
@@ -1094,6 +1097,13 @@ pub fn execute_ex_command(kernel: SystemKernel, raw_cmd: String) -> #Interactive
                 status_emit(msg)#
                 return ()
             }
+            let rconns = remote_list_connections()
+            if not rconns.is_empty() {
+                let msg = "Active remote connection (" ++ rconns.len().to_string() ++ "); add ! (:q!) to force quit"
+                world.append_message(msg)
+                status_emit(msg)#
+                return ()
+            }
         }
         world.quit_requested = true
         world.exit_code = 0
@@ -1108,6 +1118,13 @@ pub fn execute_ex_command(kernel: SystemKernel, raw_cmd: String) -> #Interactive
             if not unsaved.is_empty() {
                 let first_b = unsaved.get(0).as(Buffer)
                 let msg = "E37: No write since last change for buffer \"" ++ first_b.name ++ "\" (add ! to override)"
+                world.append_message(msg)
+                status_emit(msg)#
+                return ()
+            }
+            let rconns = remote_list_connections()
+            if not rconns.is_empty() {
+                let msg = "Active remote connection (" ++ rconns.len().to_string() ++ "); add ! (:qa!) to force quit"
                 world.append_message(msg)
                 status_emit(msg)#
                 return ()

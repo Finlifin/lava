@@ -13,7 +13,8 @@ use std::time::{Instant, UNIX_EPOCH};
 
 use driver::{
     Diagnostic, Driver, ManifestDocument, ModuleLoader, OptLevel, PackageSources, SourceFile,
-    install_artifact, load_cached_modular_artifact, load_package_sources, load_package_workspace,
+    install_validated_artifact, load_cached_modular_artifact, load_package_sources,
+    load_package_workspace,
 };
 use gc::GcConfig;
 use initialization::{Engine, EngineConfig, JitConfig};
@@ -124,13 +125,15 @@ pub struct CompiledBootProgram {
     pub compiled_packages: Vec<String>,
     /// Non-`std` packages reused from content-addressed `.nsbc` cache without recompilation.
     pub cached_packages: Vec<String>,
+    /// Optional path where `run_compiled_artifact` persists a pre-linked fast-boot `.nsbc` image.
+    pub(crate) linked_cache_path: Option<PathBuf>,
 }
 
 /// Executable Nessa artifact accepted by [`run_compiled_artifact`].
 #[derive(Debug)]
 pub enum ExecutableArtifact {
     Modular(CompiledBootProgram),
-    Monolithic(CompiledArtifact),
+    Monolithic(Box<CompiledArtifact>),
 }
 
 impl From<CompiledBootProgram> for ExecutableArtifact {
@@ -141,7 +144,7 @@ impl From<CompiledBootProgram> for ExecutableArtifact {
 
 impl From<CompiledArtifact> for ExecutableArtifact {
     fn from(artifact: CompiledArtifact) -> Self {
-        Self::Monolithic(artifact)
+        Self::Monolithic(Box::new(artifact))
     }
 }
 
@@ -312,15 +315,30 @@ impl LavaWorkspace {
     /// modular `.nsbc` archives, reusing a sub-5ms stat-manifest pointer or interface-hash
     /// DAG `.nsbc` cache so editing one package recompiles only affected downstream packages.
     pub fn compile_boot(&self, options: &BootOptions) -> Result<CompiledBootProgram, String> {
+        let profile = startup_profile_enabled();
+        let t0 = Instant::now();
         let stat_ptr_path = if can_use_stat_manifest_cache(options) {
             self.compute_stat_manifest_ptr_path(options)
         } else {
             None
         };
-        if let Some(ptr_path) = &stat_ptr_path
-            && let Some(cached) = try_load_stat_cached_modular(ptr_path)
-        {
-            return Ok(cached);
+        let stat_hash_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let linked_cache_path = stat_ptr_path
+            .as_deref()
+            .and_then(linked_cache_path_for_stat_ptr);
+        if let Some(ptr_path) = &stat_ptr_path {
+            let t_load = Instant::now();
+            if let Some(mut cached) = try_load_stat_cached_modular(ptr_path) {
+                cached.linked_cache_path = linked_cache_path;
+                if profile {
+                    eprintln!(
+                        "[lava-profile] stat_hash={stat_hash_ms:.2}ms stat_load={:.2}ms (hit, {} artifacts)",
+                        t_load.elapsed().as_secs_f64() * 1000.0,
+                        cached.artifacts.len(),
+                    );
+                }
+                return Ok(cached);
+            }
         }
 
         let composed = self.compose_boot(options)?;
@@ -357,7 +375,77 @@ impl LavaWorkspace {
             root_qualified_name: output.root_qualified_name,
             compiled_packages: output.compiled_packages,
             cached_packages: output.cached_packages,
+            linked_cache_path,
         })
+    }
+
+    /// Compile or load a pre-linked fast-boot [`ExecutableArtifact`] for launching Lava.
+    ///
+    /// On a warm stat-manifest hit with an existing pre-linked `.nsbc` image, loads the single
+    /// compact executable archive directly (~12-18ms) instead of reading and re-linking all 55
+    /// per-package modular `.nsbc` archives; on any edit, recompiles only affected packages via
+    /// [`Self::compile_boot`] and refreshes the pre-linked image asynchronously during execution.
+    pub fn compile_boot_executable(
+        &self,
+        options: &BootOptions,
+    ) -> Result<ExecutableArtifact, String> {
+        let profile = startup_profile_enabled();
+        if can_use_stat_manifest_cache(options) {
+            let t0 = Instant::now();
+            if let Some(ptr_path) = self.compute_stat_manifest_ptr_path(options) {
+                let stat_hash_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                if ptr_path.is_file()
+                    && let Some(linked_path) = linked_cache_path_for_stat_ptr(&ptr_path)
+                {
+                    let t_load = Instant::now();
+                    if let Some(mono) = try_load_linked_boot_artifact(&linked_path) {
+                        if profile {
+                            eprintln!(
+                                "[lava-profile] stat_hash={stat_hash_ms:.2}ms linked_load={:.2}ms (fast-boot hit)",
+                                t_load.elapsed().as_secs_f64() * 1000.0,
+                            );
+                        }
+                        return Ok(ExecutableArtifact::Monolithic(Box::new(mono)));
+                    }
+                }
+            }
+        }
+        Ok(ExecutableArtifact::Modular(self.compile_boot(options)?))
+    }
+
+    /// Fast ~2.5ms stat-manifest probe returning the pre-linked `.nsbc` image path when warm.
+    pub fn probe_warm_linked_boot(&self, options: &BootOptions) -> Option<PathBuf> {
+        if !can_use_stat_manifest_cache(options) {
+            return None;
+        }
+        let ptr_path = self.compute_stat_manifest_ptr_path(options)?;
+        if !ptr_path.is_file() {
+            return None;
+        }
+        let linked_path = linked_cache_path_for_stat_ptr(&ptr_path)?;
+        linked_path.is_file().then_some(linked_path)
+    }
+
+    /// Load a probed pre-linked `.nsbc` image on a worker thread, falling back to
+    /// [`Self::compile_boot_executable`] if the cache file was concurrently invalidated.
+    pub fn load_warm_linked_or_compile(
+        &self,
+        options: &BootOptions,
+        probed_linked_path: Option<&Path>,
+    ) -> Result<ExecutableArtifact, String> {
+        if let Some(linked_path) = probed_linked_path {
+            let t_load = Instant::now();
+            if let Some(mono) = try_load_linked_boot_artifact(linked_path) {
+                if startup_profile_enabled() {
+                    eprintln!(
+                        "[lava-profile] linked_load={:.2}ms (async gui fast-boot hit)",
+                        t_load.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
+                return Ok(ExecutableArtifact::Monolithic(Box::new(mono)));
+            }
+        }
+        self.compile_boot_executable(options)
     }
 
     /// Validate all discovered extensions (and optional `init.ns`) via modular per-package
@@ -401,7 +489,7 @@ impl LavaWorkspace {
         options: &BootOptions,
         host_config: HostConfig,
     ) -> Result<i32, String> {
-        let artifact = self.compile_boot(options)?;
+        let artifact = self.compile_boot_executable(options)?;
         run_compiled_artifact(artifact, host_config)
     }
 }
@@ -530,6 +618,7 @@ pub fn run_entry_package(
         root_qualified_name: output.root_qualified_name,
         compiled_packages: output.compiled_packages,
         cached_packages: output.cached_packages,
+        linked_cache_path: None,
     };
     run_compiled_artifact(program, host_config)
 }
@@ -546,6 +635,12 @@ fn resolve_vm_heap_bytes() -> usize {
     mb * 1024 * 1024
 }
 
+fn startup_profile_enabled() -> bool {
+    std::env::var("LAVA_PROFILE_STARTUP")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
 /// Install a modular [`CompiledBootProgram`] (via demand-driven per-`mod` [`ModuleLoader`]) or
 /// monolithic [`CompiledArtifact`] into a fresh Nessa [`Engine`], attach [`LavaHostHandler`],
 /// spawn the root entry task, and drive the cooperative VM event loop to completion.
@@ -553,6 +648,8 @@ pub fn run_compiled_artifact<A: Into<ExecutableArtifact>>(
     artifact: A,
     host_config: HostConfig,
 ) -> Result<i32, String> {
+    let profile = startup_profile_enabled();
+    let t_engine = Instant::now();
     let heap_size = resolve_vm_heap_bytes();
     let mut engine = Engine::new(EngineConfig {
         gc: GcConfig {
@@ -562,6 +659,7 @@ pub fn run_compiled_artifact<A: Into<ExecutableArtifact>>(
         jit: JitConfig::default(),
         debug: false,
     });
+    let engine_ms = t_engine.elapsed().as_secs_f64() * 1000.0;
     let (handler, controller, script_args) = LavaHostHandler::from_config(host_config);
     if !script_args.is_empty() {
         engine.vm_mut().set_script_args(script_args);
@@ -569,10 +667,19 @@ pub fn run_compiled_artifact<A: Into<ExecutableArtifact>>(
 
     match artifact.into() {
         ExecutableArtifact::Modular(program) => {
-            let mut loader = ModuleLoader::new();
+            let save_linked_path = program.linked_cache_path.clone().filter(|p| !p.is_file());
+            let t_reg = Instant::now();
+            let mut loader = if save_linked_path.is_some() {
+                ModuleLoader::new_recording()
+            } else {
+                ModuleLoader::new()
+            };
             loader
                 .register_artifacts(&program.artifacts)
                 .map_err(|err| format!("failed to register modular Nessa artifacts: {err}"))?;
+            let reg_ms = t_reg.elapsed().as_secs_f64() * 1000.0;
+
+            let t_prep = Instant::now();
             let prepared = loader
                 .prepare_module(engine.vm_mut(), &program.root_qualified_name, &[])
                 .map_err(|err| {
@@ -581,29 +688,69 @@ pub fn run_compiled_artifact<A: Into<ExecutableArtifact>>(
                         program.root_qualified_name
                     )
                 })?;
+            let prep_ms = t_prep.elapsed().as_secs_f64() * 1000.0;
+
+            let t_entry = Instant::now();
             let entry = loader
                 .synthesize_entry_sequence(engine.vm_mut(), &prepared)
                 .map_err(|err| {
                     format!("failed to synthesize modular Nessa entry sequence: {err}")
                 })?;
+            let entry_ms = t_entry.elapsed().as_secs_f64() * 1000.0;
+
+            let save_handle = if let Some(dst_path) = save_linked_path {
+                match loader.into_linked_artifact(engine.vm_mut(), entry) {
+                    Ok(linked_artifact) => std::thread::Builder::new()
+                        .name("lava-nsbc-cache-writer".to_string())
+                        .spawn(move || store_linked_boot_artifact(&dst_path, &linked_artifact))
+                        .ok(),
+                    Err(_) => None,
+                }
+            } else {
+                drop(loader);
+                None
+            };
+
             engine.vm_mut().set_host_handler(Box::new(handler));
             let Some(entry_func) = entry else {
+                if let Some(h) = save_handle {
+                    let _ = h.join();
+                }
                 return Ok(0);
             };
             engine.vm_mut().spawn_root(entry_func);
+            let t_vm = Instant::now();
             let exit_code = drive_vm_loop(engine.vm_mut(), &controller)?;
-            drop(loader);
+            if profile {
+                eprintln!(
+                    "[lava-profile] engine_new={engine_ms:.2}ms register={reg_ms:.2}ms prepare_module={prep_ms:.2}ms entry_seq={entry_ms:.2}ms vm_run={:.2}ms",
+                    t_vm.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+            if let Some(h) = save_handle {
+                let _ = h.join();
+            }
             Ok(exit_code)
         }
         ExecutableArtifact::Monolithic(mono) => {
-            let entry = install_artifact(engine.vm_mut(), mono)
+            let t_inst = Instant::now();
+            let entry = install_validated_artifact(engine.vm_mut(), *mono)
                 .map_err(|err| format!("failed to install compiled Nessa artifact: {err}"))?;
+            let inst_ms = t_inst.elapsed().as_secs_f64() * 1000.0;
             engine.vm_mut().set_host_handler(Box::new(handler));
             let Some(entry_func) = entry else {
                 return Ok(0);
             };
             engine.vm_mut().spawn_root(entry_func);
-            drive_vm_loop(engine.vm_mut(), &controller)
+            let t_vm = Instant::now();
+            let exit_code = drive_vm_loop(engine.vm_mut(), &controller)?;
+            if profile {
+                eprintln!(
+                    "[lava-profile] engine_new={engine_ms:.2}ms install_mono={inst_ms:.2}ms vm_run={:.2}ms",
+                    t_vm.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+            Ok(exit_code)
         }
     }
 }
@@ -994,7 +1141,52 @@ fn try_load_stat_cached_modular(ptr_path: &Path) -> Option<CompiledBootProgram> 
         root_qualified_name,
         compiled_packages: Vec::new(),
         cached_packages,
+        linked_cache_path: None,
     })
+}
+
+fn linked_cache_path_for_stat_ptr(ptr_path: &Path) -> Option<PathBuf> {
+    let cache_dir = ptr_path.parent()?;
+    let stem = ptr_path.file_stem()?.to_str()?;
+    Some(cache_dir.join("linked").join(format!("boot-{stem}.nsbc")))
+}
+
+fn try_load_linked_boot_artifact(linked_path: &Path) -> Option<CompiledArtifact> {
+    let bytes = fs::read(linked_path).ok()?;
+    match nsbc_io::read_artifact(&bytes[..]) {
+        Ok(artifact) => Some(artifact),
+        Err(_) => {
+            let _ = fs::remove_file(linked_path);
+            None
+        }
+    }
+}
+
+fn store_linked_boot_artifact(linked_path: &Path, artifact: &CompiledArtifact) {
+    let Some(parent) = linked_path.parent() else {
+        return;
+    };
+    let Ok(bytes) = nsbc_io::write_artifact(artifact) else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let seq = CACHE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_name = format!(
+        ".{}.tmp.{}.{}",
+        linked_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("boot.nsbc"),
+        std::process::id(),
+        seq
+    );
+    let tmp_path = parent.join(tmp_name);
+    if fs::write(&tmp_path, &bytes).is_ok() && fs::rename(&tmp_path, linked_path).is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    prune_old_cache_files(parent, "nsbc", 16);
 }
 
 fn store_stat_manifest_modular_ptr(
@@ -2226,7 +2418,7 @@ fn escape_toml_string(input: &str) -> String {
 mod tests {
     use std::sync::Arc;
 
-    use driver::CompileResult;
+    use driver::{CompileResult, install_artifact};
     use interpreter::VmResult;
     use lava_proto::{EventQueue, FrameSlot};
     use nsbc_io::{read_artifact, write_artifact};
@@ -2630,5 +2822,78 @@ fn main() {{
             resolve_nsbc_cache_dir_from_vars(None, None, None, Some("/tmp/home")),
             Some(PathBuf::from("/tmp/home/.cache/lava/nsbc"))
         );
+    }
+
+    #[test]
+    fn linked_fast_boot_cache_hit_corruption_fallback_and_edit_invalidation() {
+        let tmp_ws = std::env::temp_dir().join(format!(
+            "lava_linked_cache_ws_{}_{}",
+            std::process::id(),
+            CACHE_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let pkg_dir = tmp_ws.join("packages/fast_app/src");
+        let cache_dir = tmp_ws.join("target/lava-nsbc-cache");
+        fs::create_dir_all(&pkg_dir).expect("create fast_app/src");
+        fs::create_dir_all(&cache_dir).expect("create target/lava-nsbc-cache");
+
+        fs::write(
+            tmp_ws.join("packages/fast_app/package.toml"),
+            "[package]\nname = \"fast_app\"\ndomain = \"lava.org\"\nversion = \"0.1.0\"\ntype = \"lib\"\n",
+        )
+        .expect("write package.toml");
+        let lib_ns = pkg_dir.join("lib.ns");
+        fs::write(
+            &lib_ns,
+            "pub fn launch() -> i64 {\n    let vals = [1, 2, 3]\n    return vals.len() - 3\n}\n",
+        )
+        .expect("write lib.ns");
+
+        let ws = LavaWorkspace::new(&tmp_ws).with_cache_dir(&cache_dir);
+        let opts = BootOptions::default().with_entry_pkg("lava.org/fast_app");
+
+        assert!(ws.probe_warm_linked_boot(&opts).is_none());
+
+        // 1. Cold boot compiles modular `.nsbc`s and writes the pre-linked fast-boot `.nsbc`.
+        let cold_exec = ws.compile_boot_executable(&opts).expect("cold boot");
+        assert!(matches!(cold_exec, ExecutableArtifact::Modular(_)));
+        let rc1 = run_compiled_artifact(cold_exec, test_host_config()).expect("run cold");
+        assert_eq!(rc1, 0);
+
+        // 2. Warm boot hits the pre-linked `.nsbc` image directly (`ExecutableArtifact::Monolithic`).
+        let linked_path = ws
+            .probe_warm_linked_boot(&opts)
+            .expect("linked fast-boot nsbc must exist after first run");
+        assert!(linked_path.is_file());
+        let warm_exec = ws.compile_boot_executable(&opts).expect("warm boot");
+        assert!(matches!(warm_exec, ExecutableArtifact::Monolithic(_)));
+        let rc2 = run_compiled_artifact(warm_exec, test_host_config()).expect("run warm");
+        assert_eq!(rc2, 0);
+
+        // 3. Corrupted linked `.nsbc` is rejected and seamlessly falls back to modular artifacts.
+        fs::write(&linked_path, b"corrupted-nsbc-bytes").expect("corrupt linked cache");
+        let recovered = ws
+            .load_warm_linked_or_compile(&opts, Some(&linked_path))
+            .expect("recover from corrupted linked cache");
+        assert!(matches!(recovered, ExecutableArtifact::Modular(_)));
+        let rc3 = run_compiled_artifact(recovered, test_host_config()).expect("run recovered");
+        assert_eq!(rc3, 0);
+        assert!(
+            ws.probe_warm_linked_boot(&opts).is_some(),
+            "recovered run should rewrite valid linked cache"
+        );
+
+        // 4. Editing source invalidates both `stat-v1-*.ptr` and `boot-stat-v1-*.nsbc`.
+        fs::write(
+            &lib_ns,
+            "pub fn extra_val() -> i64 { 42 }\npub fn launch() -> i64 {\n    return extra_val() - 42\n}\n",
+        )
+        .expect("edit lib.ns");
+        assert!(ws.probe_warm_linked_boot(&opts).is_none());
+        let edited_exec = ws.compile_boot_executable(&opts).expect("edited boot");
+        assert!(matches!(edited_exec, ExecutableArtifact::Modular(_)));
+        let rc4 = run_compiled_artifact(edited_exec, test_host_config()).expect("run edited");
+        assert_eq!(rc4, 0);
+
+        let _ = fs::remove_dir_all(&tmp_ws);
     }
 }

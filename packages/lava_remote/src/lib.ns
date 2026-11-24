@@ -2510,6 +2510,22 @@ private fn execute_mock_async_job(kind: String, params: List) -> !String Any {
             }
             wire
         },
+        kind == "connect" => {
+            let info = remote_connect(params.get(0).as(String))!
+            [
+                info.authority,
+                info.prefix,
+                info.mode,
+                info.alive,
+                info.hostname,
+                info.os,
+                info.arch,
+                info.remote_home,
+                info.remote_cwd,
+                info.server_version,
+                info.latency_us,
+            ]
+        },
         else => error ("unsupported mock async kind: " ++ kind),
     }
 }
@@ -2617,4 +2633,21 @@ pub fn remote_async_active_count() -> i64 {
         g_has_submitted_async = false
     }
     host_cnt + mock_cnt
+}
+
+pub fn remote_async_decode_connect(payload: Any) -> RemoteConnectionInfo {
+    let f = payload.as(List)
+    RemoteConnectionInfo {
+        authority: f.get(0).as(String),
+        prefix: f.get(1).as(String),
+        mode: f.get(2).as(String),
+        alive: f.get(3).as(bool),
+        hostname: f.get(4).as(String),
+        os: f.get(5).as(String),
+        arch: f.get(6).as(String),
+        remote_home: f.get(7).as(String),
+        remote_cwd: f.get(8).as(String),
+        server_version: f.get(9).as(String),
+        latency_us: f.get(10).as(i64),
+    }
 }

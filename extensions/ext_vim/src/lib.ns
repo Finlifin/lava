@@ -2312,7 +2312,7 @@ fn handle_insert_mode_key(
     buf: Buffer,
     vim: VimState,
     stroke: KeyStroke,
-) -> !String bool {
+) -> #[clipboard_get] !String bool {
     record_change_stroke(vim, stroke)
 
     if (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod) and stroke.key.len() == 1 {
@@ -2494,6 +2494,17 @@ fn handle_insert_mode_key(
         vim.block_insert_active = false
         let new_r = buf.step_visible_row_down(buf.point.row, 1)
         buf.point = buf.clamp_pos(Pos.new(new_r, buf.point.col), insert_mode = true)
+        return true
+    }
+
+    if stroke.shift_mod and (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod) and stroke.key == "Insert" {
+        vim.block_insert_active = false
+        let clip = clipboard_get()#
+        if clip != "" {
+            let _ = buf.insert_text(buf.point, clip)!
+            buf.preferred_col = buf.point.col
+            buf.checkpoint(buf.point, "vim-paste")
+        }
         return true
     }
 
@@ -4017,7 +4028,7 @@ fn vim_dispatch_stroke_core(
                 }
             }
         }
-        let handled = handle_insert_mode_key(world, buf, vim, stroke)!
+        let handled = handle_insert_mode_key(world, buf, vim, stroke)#!
         if vim.mode == VimMode.insert {
             kernel.emit_hook("after-insert-stroke", stroke)
         }

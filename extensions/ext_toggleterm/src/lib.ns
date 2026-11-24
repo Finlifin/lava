@@ -20,7 +20,7 @@ use std.process
 use @lava_sys.{host_schedule_timer, rgb, rgba}
 use @lava_core.{
     ExtId, InteractiveEffects, KeyStroke, PromptKind, PromptRequest, ServiceEffects, SystemKernel,
-    ask_prompt, log_event, status_emit
+    ask_prompt, clipboard_get, log_event, status_emit
 }
 use @lava_term.{
     PTY_WAKE_TIMER_ID, TermSnapshot, TermSpan, pty_available, pty_kill, pty_resize, pty_send_key,
@@ -1559,7 +1559,14 @@ fn terminal_modal_interceptor(kernel: SystemKernel, stroke: KeyStroke) -> #Servi
                 svc.float_sel_anchor = null
                 svc.float_sel_cursor = null
                 svc.float_scroll_offset = 0
-                let _ = pty_send_key(session.pty_id, stroke.key, stroke.text, stroke.ctrl, stroke.alt, stroke.shift_mod) ! { _ => () }
+                if stroke.shift_mod and (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod) and k == "Insert" {
+                    let clip = clipboard_get()#
+                    if clip != "" {
+                        let _ = pty_write(session.pty_id, clip) ! { _ => () }
+                    }
+                } else {
+                    let _ = pty_send_key(session.pty_id, stroke.key, stroke.text, stroke.ctrl, stroke.alt, stroke.shift_mod) ! { _ => () }
+                }
                 let _ = sync_session_from_pty(session, false)
                 if not session.alive {
                     let sid = session.id
@@ -1671,7 +1678,14 @@ fn terminal_modal_interceptor(kernel: SystemKernel, stroke: KeyStroke) -> #Servi
         let cur_mode = abuf.major_mode
         let _ = sync_terminal_buffer_with_wm(kernel, world, svc, session, cur_mode, false)
         if session.pty_id > 0 {
-            let _ = pty_send_key(session.pty_id, stroke.key, stroke.text, stroke.ctrl, stroke.alt, stroke.shift_mod) ! { _ => () }
+            if stroke.shift_mod and (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod) and k == "Insert" {
+                let clip = clipboard_get()#
+                if clip != "" {
+                    let _ = pty_write(session.pty_id, clip) ! { _ => () }
+                }
+            } else {
+                let _ = pty_send_key(session.pty_id, stroke.key, stroke.text, stroke.ctrl, stroke.alt, stroke.shift_mod) ! { _ => () }
+            }
             let _ = sync_session_from_pty(session, false)
             if not session.alive {
                 let sid = session.id

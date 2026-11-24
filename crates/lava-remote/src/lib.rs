@@ -714,6 +714,9 @@ pub enum AsyncRemoteOp {
         uri: String,
         show_hidden: bool,
     },
+    Connect {
+        uri: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -738,6 +741,7 @@ pub enum AsyncRemoteResult {
         total_replacements: i64,
     },
     ReaddirSimple(Vec<RemoteDirEntry>),
+    Connect(RemoteConnInfo),
 }
 
 #[derive(Debug, Clone)]
@@ -3726,7 +3730,7 @@ impl RemoteManager {
                      root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0; \
                      branch=$(git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo HEAD); \
                      printf 'ROOT=%s\\nBRANCH=%s\\n' \"$root\" \"$branch\"; \
-                     git status --porcelain=v1 -uall 2>/dev/null || true"
+                     git status --porcelain=v1 2>/dev/null || true"
                 );
                 let (_, stdout, _) =
                     run_ssh_posix_cmd(ssh_dest, *port, control_path, &script, None)?;
@@ -3749,7 +3753,14 @@ impl RemoteManager {
                     }
                     let idx_s = &l[0..1];
                     let wt_s = &l[1..2];
-                    let rel = l[3..].trim().to_string();
+                    let raw_rel = l[3..].trim();
+                    let rel = if (idx_s == "R" || idx_s == "C")
+                        && let Some((_, new_path)) = raw_rel.split_once(" -> ")
+                    {
+                        new_path.trim().to_string()
+                    } else {
+                        raw_rel.to_string()
+                    };
                     if idx_s == "?" && wt_s == "?" {
                         untracked += 1;
                     } else {
@@ -4808,6 +4819,7 @@ impl RemoteManager {
             AsyncRemoteOp::ReaddirSimple { uri, show_hidden } => self
                 .readdir(&uri, show_hidden)
                 .map(AsyncRemoteResult::ReaddirSimple),
+            AsyncRemoteOp::Connect { uri } => self.connect(&uri).map(AsyncRemoteResult::Connect),
         }
     }
 

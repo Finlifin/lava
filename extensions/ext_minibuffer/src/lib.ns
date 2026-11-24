@@ -4708,6 +4708,21 @@ pub fn minibuffer_handle_key(
         return true
     }
 
+    if stroke.shift_mod and (not stroke.ctrl) and (not stroke.alt) and (not stroke.super_mod) and stroke.key == "Insert" {
+        let clip = clipboard_get()#
+        if clip != "" {
+            let ptext = clip.replace("\r\n", " ").replace("\n", " ")
+            let s = ctrl.input_text
+            ctrl.input_text = s.slice(0, ctrl.cursor_col) ++ ptext ++ s.slice(ctrl.cursor_col, s.char_len())
+            ctrl.cursor_col += ptext.char_len()
+            ctrl.history_idx = -1
+            ctrl.selection_touched = false
+            ctrl.selected_idx = 0
+            refresh_controller(kernel, world, ctrl)
+        }
+        return true
+    }
+
     -- 8. Printable Text Insertion
     let ch_opt = stroke_printable_text(stroke)
     if ch_opt != null {

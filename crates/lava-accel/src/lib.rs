@@ -1551,14 +1551,21 @@ pub fn git_repo_status(cwd: &str) -> GitRepoStatus {
         ..GitRepoStatus::default()
     };
 
-    if let Some(porcelain) = run_git(&root, &["status", "--porcelain=v1", "-uall"]) {
+    if let Some(porcelain) = run_git(&root, &["status", "--porcelain=v1"]) {
         for line in porcelain.lines() {
             if line.len() < 3 {
                 continue;
             }
             let x = line[0..1].to_string();
             let y = line[1..2].to_string();
-            let rel = line[3..].trim().to_string();
+            let raw_rel = line[3..].trim();
+            let rel = if (x == "R" || x == "C")
+                && let Some((_, new_path)) = raw_rel.split_once(" -> ")
+            {
+                new_path.trim().to_string()
+            } else {
+                raw_rel.to_string()
+            };
             if x == "?" && y == "?" {
                 status.untracked_count += 1;
             } else {

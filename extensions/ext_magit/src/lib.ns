@@ -18,7 +18,8 @@ use @lava_remote.{
     parse_ssh_uri, remote_exec, remote_git_status, remote_read_lines, remote_remove, remote_stat
 }
 use @ext_document.{
-    Buffer, BufferId, BufferKind, EditorWorld, Pos, ext_document_id, require_editor_world
+    Buffer, BufferId, BufferKind, BufferLifetime, EditorWorld, Pos, ext_document_id,
+    require_editor_world
 }
 use @ext_vim.{KEYMAP_VIM_LEADER, ext_vim_id}
 
@@ -629,7 +630,7 @@ pub fn render_magit_status(
 
     let existing_opt = world.find_buffer_by_name(MAGIT_BUF_NAME)
     let prev_row = if existing_opt != null { existing_opt.as(Buffer).point.row } else { 0 }
-    let magit_buf = world.ensure_special_buffer(MAGIT_BUF_NAME, "magit", lines, read_only = true)
+    let magit_buf = world.ensure_special_buffer(MAGIT_BUF_NAME, "magit", lines, read_only = true, lifetime = BufferLifetime.kill_on_quit)
     decorate_magit_buffer(magit_buf, state)
 
     var target_r = prev_row
@@ -1077,7 +1078,7 @@ fn cmd_magit_log(kernel: SystemKernel) -> #InteractiveEffects !String Any {
     } else {
         lines.push("(no commits yet)")
     }
-    let lbuf = world.ensure_special_buffer(MAGIT_LOG_BUF_NAME, "magit-log", lines, read_only = true)
+    let lbuf = world.ensure_special_buffer(MAGIT_LOG_BUF_NAME, "magit-log", lines, read_only = true, lifetime = BufferLifetime.kill_on_quit)
     let _ = world.switch_to_buffer(lbuf.id)
     kernel.emit_hook("buffer-switched", lbuf.id)
     status_emit("Showing *magit-log*")#
@@ -1125,7 +1126,7 @@ fn cmd_magit_visit(kernel: SystemKernel) -> #InteractiveEffects !String Any {
         )
         if show_ok {
             let show_lines = show_out.replace("\r\n", "\n").split("\n")
-            let cbuf = world.ensure_special_buffer(MAGIT_LOG_BUF_NAME, "magit-log", show_lines, read_only = true)
+            let cbuf = world.ensure_special_buffer(MAGIT_LOG_BUF_NAME, "magit-log", show_lines, read_only = true, lifetime = BufferLifetime.kill_on_quit)
             let _ = world.switch_to_buffer(cbuf.id)
             kernel.emit_hook("buffer-switched", cbuf.id)
             status_emit("Commit " ++ meta.commit_hash)#
@@ -1150,11 +1151,15 @@ fn cmd_magit_quit(kernel: SystemKernel) -> #InteractiveEffects !String Any {
     let world = require_editor_world(kernel)!
     let state = require_magit_state(kernel)!
     let cur = world.active_buffer()
+    let should_kill = cur.lifetime == BufferLifetime.kill_on_quit
     if cur.major_mode == "magit-log" {
         let m_opt = world.find_buffer_by_name(MAGIT_BUF_NAME)
         if m_opt != null {
             let mb = m_opt.as(Buffer)
             let _ = world.switch_to_buffer(mb.id)
+            if should_kill and cur.id != world.active_buffer_id {
+                let _ = world.kill_buffer(cur.id) ! { _ => cur.id }
+            }
             kernel.emit_hook("buffer-switched", mb.id)
             status_emit("Buffer: *magit*")#
             return ()
@@ -1165,6 +1170,9 @@ fn cmd_magit_quit(kernel: SystemKernel) -> #InteractiveEffects !String Any {
             let pb_opt = world.buffer(pid)
             if pb_opt != null and pb_opt.as(Buffer).name != MAGIT_BUF_NAME {
                 let _ = world.switch_to_buffer(pid)
+                if should_kill and cur.id != world.active_buffer_id {
+                    let _ = world.kill_buffer(cur.id) ! { _ => cur.id }
+                }
                 kernel.emit_hook("buffer-switched", pid)
                 status_emit("Buffer: " ++ world.active_buffer().name)#
                 return ()
@@ -1173,6 +1181,9 @@ fn cmd_magit_quit(kernel: SystemKernel) -> #InteractiveEffects !String Any {
         _ => (),
     }
     let next_id = world.cycle_buffer(-1)
+    if should_kill and cur.id != world.active_buffer_id {
+        let _ = world.kill_buffer(cur.id) ! { _ => cur.id }
+    }
     kernel.emit_hook("buffer-switched", next_id)
     status_emit("Buffer: " ++ world.active_buffer().name)#
     ()

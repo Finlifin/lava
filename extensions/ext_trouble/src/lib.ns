@@ -9,8 +9,8 @@ use @lava_core.{
 }
 use @lava_accel.{NativeDiagHit, accel_doc_analyze_diagnostics}
 use @ext_document.{
-    Buffer, BufferId, BufferKind, EditorWorld, Pos, QuickfixEntry, ext_document_id,
-    require_editor_world
+    Buffer, BufferId, BufferKind, BufferLifetime, EditorWorld, Pos, QuickfixEntry,
+    ext_document_id, require_editor_world
 }
 use @ext_vim.{
     KEYMAP_VIM_LEADER, KEYMAP_VIM_NORMAL, VimMode, VimState, ext_vim_id, require_vim_state,
@@ -544,7 +544,7 @@ pub fn refresh_trouble_panel(world: EditorWorld, service: TroubleService) -> (Bu
         }
     }
 
-    let tbuf = world.ensure_special_buffer(TROUBLE_BUF_NAME, "trouble", lines, read_only = true)
+    let tbuf = world.ensure_special_buffer(TROUBLE_BUF_NAME, "trouble", lines, read_only = true, lifetime = BufferLifetime.kill_on_quit)
     let cursor_row = if first_item_row >= 0 { first_item_row } else { 0 }
     (tbuf, cursor_row)
 }
@@ -637,7 +637,12 @@ fn close_trouble_panel(
             }
         }
     }
+    let cur = world.active_buffer()
+    let should_kill = cur.lifetime == BufferLifetime.kill_on_quit
     let _ = world.switch_to_buffer(dest_id)
+    if should_kill and cur.id != world.active_buffer_id {
+        let _ = world.kill_buffer(cur.id) ! { _ => cur.id }
+    }
     vim.mode = VimMode.normal
     vim.clear_transient()
     sync_world_from_vim(world, vim)

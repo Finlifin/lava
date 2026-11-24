@@ -865,6 +865,13 @@ fn split_text_preserving_empty_lines(text: String) -> List {
     parts
 }
 
+pub enum BufferLifetime {
+    pub persistent,
+    pub kill_on_leave,
+    pub kill_on_quit,
+}
+derive Eq, PartialEq for BufferLifetime
+
 pub struct Buffer {
     pub id: BufferId,
     pub name: String,
@@ -879,6 +886,7 @@ pub struct Buffer {
     pub crlf: bool,
     pub modified: bool,
     pub read_only: bool,
+    pub lifetime: BufferLifetime,
     pub point: Pos,
     pub preferred_col: i64,
     pub mark: ?Pos,
@@ -988,6 +996,7 @@ impl Buffer {
             crlf: false,
             modified: false,
             read_only: false,
+            lifetime: BufferLifetime.persistent,
             point: p0,
             preferred_col: 0,
             mark: null,
@@ -1049,6 +1058,7 @@ impl Buffer {
             crlf: crlf,
             modified: false,
             read_only: false,
+            lifetime: BufferLifetime.persistent,
             point: p0,
             preferred_col: 0,
             mark: null,
@@ -2271,7 +2281,7 @@ impl EditorOptions {
             format_on_save: false,
             theme_name: "catppuccin-mocha",
             font_family: "Fira Code",
-            font_size_pt: 13.0,
+            font_size_pt: 11.0,
             cursor_blink: true,
             evil_mode: true,
             show_tab_bar: false,
@@ -2792,6 +2802,7 @@ impl EditorWorld {
         major_mode: String,
         lines: List,
         .read_only: bool = true,
+        .lifetime: BufferLifetime = BufferLifetime.kill_on_leave,
     ) -> Buffer {
         let existing_opt = self.find_buffer_by_name(name)
         if existing_opt != null {
@@ -2801,6 +2812,7 @@ impl EditorWorld {
             b.set_lines(lines, record_undo = false)
             b.modified = false
             b.read_only = read_only
+            b.lifetime = lifetime
             return b
         }
         let b = self.create_buffer(
@@ -2811,6 +2823,7 @@ impl EditorWorld {
         )
         b.modified = false
         b.read_only = read_only
+        b.lifetime = lifetime
         b
     }
 
@@ -2852,7 +2865,7 @@ impl EditorWorld {
         let existing_opt = self.find_buffer_by_path(full_path)
         if existing_opt != null {
             let b = existing_opt.as(Buffer)
-            self.active_buffer_id = b.id
+            let _ = self.switch_to_buffer(b.id)
             let msg = "Switched to " ++ b.name
             self.status_message = msg
             status_emit(msg)#
@@ -2903,7 +2916,7 @@ impl EditorWorld {
                 )
                 buf.read_only = opened.readonly
                 buf.modified = false
-                self.active_buffer_id = buf.id
+                let _ = self.switch_to_buffer(buf.id)
                 log_event("info", "ext_document", "Opened remote file " ++ full_path ++ " via " ++ opened.transport)#
                 let proto_tag = if opened.transport == "HTTP" { "[HTTP]" } else { "[SSH]" }
                 let msg = proto_tag ++ " \"" ++ rbase ++ "\" " ++ buf.line_count().to_string() ++ "L (" ++ full_path ++ ")"
@@ -2919,7 +2932,7 @@ impl EditorWorld {
                 initial_lines = [""],
             )
             buf.modified = false
-            self.active_buffer_id = buf.id
+            let _ = self.switch_to_buffer(buf.id)
             let msg = "[SSH] \"" ++ rbase ++ "\" [New Remote File] (" ++ full_path ++ ")"
             self.status_message = msg
             status_emit(msg)#
@@ -2943,7 +2956,7 @@ impl EditorWorld {
                 major_mode = mode,
             )
             buf.modified = false
-            self.active_buffer_id = buf.id
+            let _ = self.switch_to_buffer(buf.id)
             log_event("info", "ext_document", "Opened file " ++ full_path)#
             let msg = "\"" ++ base_name ++ "\" " ++ buf.line_count().to_string() ++ "L"
             self.status_message = msg
@@ -2959,7 +2972,7 @@ impl EditorWorld {
             initial_lines = [""],
         )
         buf.modified = false
-        self.active_buffer_id = buf.id
+        let _ = self.switch_to_buffer(buf.id)
         let msg = "\"" ++ base_name ++ "\" [New File]"
         self.status_message = msg
         status_emit(msg)#
@@ -3030,7 +3043,17 @@ impl EditorWorld {
         if not self.buffers.contains_key(id) {
             return false
         }
+        let prev_id = self.active_buffer_id
         self.active_buffer_id = id
+        if prev_id != id and prev_id != self.messages_id and prev_id != self.scratch_id {
+            let prev_opt = self.buffer(prev_id)
+            if prev_opt != null {
+                let pb = prev_opt.as(Buffer)
+                if pb.lifetime == BufferLifetime.kill_on_leave and (not pb.modified) {
+                    let _ = self.kill_buffer(prev_id) ! { _ => prev_id }
+                }
+            }
+        }
         true
     }
 
@@ -3051,8 +3074,8 @@ impl EditorWorld {
             next_idx += n
         }
         let next_id = self.buffer_order.get(next_idx.as(usize)).as(BufferId)
-        self.active_buffer_id = next_id
-        next_id
+        let _ = self.switch_to_buffer(next_id)
+        self.active_buffer_id
     }
 
     pub fn kill_buffer(self, id: BufferId, .force: bool = false) -> !String BufferId {

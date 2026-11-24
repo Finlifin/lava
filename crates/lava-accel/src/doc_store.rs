@@ -2576,7 +2576,142 @@ fn scan_symbol_in_line(line: &str, mode_lower: &str) -> Option<(String, &'static
             return Some((name, kind, indent_cols, level));
         }
     }
+    if is_c_like_symbol_mode(mode_lower) {
+        return scan_c_like_symbol(trimmed, indent_cols);
+    }
     None
+}
+
+fn is_c_like_symbol_mode(mode_lower: &str) -> bool {
+    matches!(
+        mode_lower,
+        "c" | "cpp"
+            | "c++"
+            | "cc"
+            | "h"
+            | "hpp"
+            | "java"
+            | "javascript"
+            | "js"
+            | "jsx"
+            | "typescript"
+            | "ts"
+            | "tsx"
+    )
+}
+
+fn scan_c_like_symbol(trimmed: &str, indent_cols: i64) -> Option<(String, &'static str, i64, i64)> {
+    if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+        return None;
+    }
+    let level = if indent_cols > 0 { 2 } else { 1 };
+    if let Some(rest) = trimmed.strip_prefix("#define ")
+        && let Some(name) = extract_ident_after(rest)
+    {
+        return Some((name, "Constant", indent_cols, level));
+    }
+    if trimmed.starts_with('#') {
+        return None;
+    }
+    let no_export = trimmed
+        .strip_prefix("export ")
+        .unwrap_or(trimmed)
+        .strip_prefix("default ")
+        .unwrap_or_else(|| trimmed.strip_prefix("export ").unwrap_or(trimmed))
+        .strip_prefix("async ")
+        .unwrap_or_else(|| {
+            trimmed
+                .strip_prefix("export ")
+                .unwrap_or(trimmed)
+                .strip_prefix("default ")
+                .unwrap_or_else(|| trimmed.strip_prefix("export ").unwrap_or(trimmed))
+        });
+    if let Some(rest) = no_export.strip_prefix("function ")
+        && let Some(name) = extract_ident_after(rest)
+    {
+        return Some((name, "Function", indent_cols, level));
+    }
+    if let Some(rest) = trimmed.strip_prefix("namespace ")
+        && let Some(name) = extract_ident_after(rest)
+    {
+        return Some((name, "Module", indent_cols, level));
+    }
+    if let Some(rest) = trimmed.strip_prefix("union ")
+        && let Some(name) = extract_ident_after(rest)
+    {
+        return Some((name, "Struct", indent_cols, level));
+    }
+    if let Some(td_rest) = trimmed.strip_prefix("typedef ") {
+        for (kw, kind) in [("struct ", "Struct"), ("enum ", "Enum"), ("union ", "Struct")] {
+            if let Some(rest) = td_rest.strip_prefix(kw)
+                && let Some(name) = extract_ident_after(rest)
+            {
+                return Some((name, kind, indent_cols, level));
+            }
+        }
+    }
+
+    let paren_idx = trimmed.find('(')?;
+    let before_paren = trimmed[..paren_idx].trim_end();
+    if before_paren.is_empty() || before_paren.contains('=') || before_paren.contains(';') {
+        return None;
+    }
+    // Require a function definition/prototype shape (not a control-flow keyword or statement call)
+    if trimmed.ends_with(';') && indent_cols > 0 {
+        return None;
+    }
+    let name_end = before_paren.len();
+    let mut name_start = name_end;
+    for (idx, ch) in before_paren.char_indices().rev() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            name_start = idx;
+        } else {
+            break;
+        }
+    }
+    if name_start == name_end {
+        return None;
+    }
+    let name = &before_paren[name_start..name_end];
+    if name.is_empty()
+        || name.starts_with(|c: char| c.is_ascii_digit())
+        || matches!(
+            name,
+            "if" | "for"
+                | "while"
+                | "switch"
+                | "catch"
+                | "return"
+                | "sizeof"
+                | "typeof"
+                | "alignof"
+                | "decltype"
+                | "defined"
+                | "do"
+                | "else"
+        )
+    {
+        return None;
+    }
+    let prefix_before_name = before_paren[..name_start].trim_end();
+    // Reject member/call expressions like `obj.foo(` or `ptr->foo(` or `func(` without return type
+    if prefix_before_name.is_empty() && !trimmed.ends_with('{') {
+        return None;
+    }
+    if prefix_before_name.ends_with('.')
+        || prefix_before_name.ends_with("->")
+        || prefix_before_name.ends_with('(')
+        || prefix_before_name.ends_with(',')
+        || prefix_before_name.ends_with('!')
+        || prefix_before_name.ends_with('?')
+    {
+        return None;
+    }
+    if prefix_before_name.is_empty() && indent_cols > 0 {
+        // Inside a block, a bare `foo(...) {` without return type is likely a control construct
+        return None;
+    }
+    Some((name.to_string(), "Function", indent_cols, level))
 }
 
 #[derive(Clone, Copy)]
@@ -3750,6 +3885,25 @@ mod tests {
         assert_eq!((py_spans[0].row, py_spans[0].end_row), (0, 2));
         assert_eq!((py_spans[1].row, py_spans[1].end_row), (1, 2));
         assert_eq!((py_spans[2].row, py_spans[2].end_row), (4, 5));
+
+        let c_doc = doc_new(vec![
+            "#define MAX_ITEMS 64".to_string(),
+            "typedef struct Node {".to_string(),
+            "    int val;".to_string(),
+            "} Node;".to_string(),
+            "static inline int compute_sum(int a, int b) {".to_string(),
+            "    if (a > 0) {".to_string(),
+            "        return a + b;".to_string(),
+            "    }".to_string(),
+            "    return b;".to_string(),
+            "}".to_string(),
+        ]);
+        let c_spans = doc_scan_symbol_spans(c_doc, "c", 50);
+        assert_eq!(c_spans.len(), 3);
+        assert_eq!(c_spans[0].name, "MAX_ITEMS");
+        assert_eq!(c_spans[1].name, "Node");
+        assert_eq!(c_spans[2].name, "compute_sum");
+        assert_eq!((c_spans[2].row, c_spans[2].end_row), (4, 9));
 
         // 5) Whole-word occurrences & completion word collection
         let occ = doc_find_word_occurrences(doc, "TODOS", 0, 10, 50);
